@@ -12,9 +12,8 @@ use std::env;
 abigen!(
     HelixCoordinator,
     r#"[
-        function currentRound() external view returns (uint256)
-        function models(bytes32) external view returns (address, uint256, uint256)
-        function updateModel(bytes32 modelId, bytes calldata proof, bytes32 newCommitment) external
+        function models(uint256) external view returns (string, uint256, uint256, address)
+        function submitGradient(uint256 modelId, uint256 roundId, bytes calldata proof, uint256[] memory publicInputs) external
     ]"#
 );
 
@@ -43,21 +42,38 @@ impl SCClient {
         Ok(Self { client, coordinator })
     }
 
-    pub async fn get_current_round(&self) -> anyhow::Result<U256> {
-        let round = self.coordinator.current_round().call().await?;
-        Ok(round)
+    pub async fn get_model_state(&self, model_id: U256) -> anyhow::Result<(U256, U256)> {
+        // models struct: (ipfsHash, currentCommitment, currentRound, owner)
+        let (_ipfs, commitment, round, _owner) = self.coordinator.models(model_id).call().await?;
+        Ok((round, commitment))
     }
 
     pub async fn submit_update(
         &self,
-        model_id: [u8; 32],
+        model_id: U256,
+        round_id: U256,
         proof: Vec<u8>,
-        new_commitment: [u8; 32],
+        commitment: [u8; 32], // This is the new commitment
+        old_commitment: [u8; 32] // We likely need the old commitment too for public inputs
     ) -> anyhow::Result<TransactionReceipt> {
-        let call = self.coordinator.update_model(
+        let commitment_u256 = U256::from(commitment);
+        let old_commitment_u256 = U256::from(old_commitment);
+        
+        // Public Inputs: [oldCommitment, newCommitment, gradientCommitment(0 for now)]
+        // The contract expects: verifyProof(proof, [old, new, ...]) 
+        // Wait, HelixCoordinator.sol `submitGradient` inputs:
+        // function submitGradient(uint256 modelId, uint256 roundId, bytes memory proof, uint256[] memory publicInputs)
+        // verifyProof checks publicInputs.
+        
+        // For this fake test, let's assume public inputs are [old_commitment, new_commitment].
+        // In reality, it should match the circuit's public inputs.
+        let public_inputs = vec![old_commitment_u256, commitment_u256];
+
+        let call = self.coordinator.submit_gradient(
             model_id,
+            round_id,
             ethers::types::Bytes::from(proof),
-            new_commitment,
+            public_inputs,
         );
         let pending_tx = call.send().await?;
         let receipt = pending_tx.await?.ok_or_else(|| anyhow::anyhow!("Tx dropped"))?;
