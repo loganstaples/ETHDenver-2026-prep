@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package helix.gradient;
+
+import "helix/common.proto";
+
+// Gradient update from a single node
+message GradientUpdate {
+  helix.common.NodeId contributor = 1;
+  uint64 round_number = 2;
+  bytes gradient_commitment = 3;
+  helix.common.BoundedValue error_bound = 4;
+  bytes signature = 5;
+}
+
+// Aggregated gradients
+message AggregatedGradient {
+  uint64 round_number = 1;
+  bytes aggregated_commitment = 2;
+  repeated GradientUpdate contributions = 3;
+  bytes aggregation_proof = 4;
+}
+
+// Gradient submission request
+message SubmitGradientRequest {
+  GradientUpdate update = 1;
+  bytes proof = 2;
+}
+
+message SubmitGradientResponse {
+  bool accepted = 1;
+  string message = 2;
+}

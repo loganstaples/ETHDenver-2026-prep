@@ -1,0 +1,1 @@
+// Proves: accumulated error < bound

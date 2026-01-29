@@ -1,0 +1,54 @@
+syntax = "proto3";
+
+package helix.network;
+
+import "helix/common.proto";
+
+// Peer discovery
+message PeerInfo {
+  helix.common.NodeId node_id = 1;
+  string multiaddr = 2;
+  NodeRole role = 3;
+  helix.common.Timestamp last_seen = 4;
+}
+
+enum NodeRole {
+  NODE_ROLE_UNSPECIFIED = 0;
+  NODE_ROLE_COMPUTE = 1;
+  NODE_ROLE_AGGREGATOR = 2;
+  NODE_ROLE_VERIFIER = 3;
+}
+
+// Gossip messages
+message GossipMessage {
+  oneof payload {
+    GradientAnnouncement gradient_announcement = 1;
+    RoundUpdate round_update = 2;
+    PeerAnnouncement peer_announcement = 3;
+  }
+}
+
+message GradientAnnouncement {
+  helix.common.NodeId from = 1;
+  uint64 round_number = 2;
+  bytes gradient_hash = 3;
+}
+
+message RoundUpdate {
+  uint64 round_number = 1;
+  bytes model_commitment = 2;
+}
+
+message PeerAnnouncement {
+  PeerInfo peer = 1;
+}
+
+// Sync messages
+message SyncRequest {
+  uint64 from_round = 1;
+  uint64 to_round = 2;
+}
+
+message SyncResponse {
+  repeated RoundUpdate rounds = 1;
+}

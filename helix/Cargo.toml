@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/helix-core",
+    "crates/helix-avm",
+    "crates/helix-circuits",
+    "crates/helix-prover",
+    "crates/helix-node",
+    "crates/helix-client",
+]

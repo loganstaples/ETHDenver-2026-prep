@@ -1,0 +1,6 @@
+[submodule "helix/contracts/lib/forge-std"]
+	path = helix/contracts/lib/forge-std
+	url = https://github.com/foundry-rs/forge-std
+[submodule "helix/contracts/lib/openzeppelin-contracts"]
+	path = helix/contracts/lib/openzeppelin-contracts
+	url = https://github.com/OpenZeppelin/openzeppelin-contracts

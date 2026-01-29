@@ -1,0 +1,11 @@
+[package]
+name = "helix-client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+helix-core = { path = "../helix-core" }
+clap = { version = "4.0", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }

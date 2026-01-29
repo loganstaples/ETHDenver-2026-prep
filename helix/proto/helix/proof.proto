@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package helix.proof;
+
+import "helix/common.proto";
+
+// ZK Proof wrapper
+message Proof {
+  bytes proof_bytes = 1;
+  repeated bytes public_inputs = 2;
+  ProofType proof_type = 3;
+}
+
+enum ProofType {
+  PROOF_TYPE_UNSPECIFIED = 0;
+  PROOF_TYPE_MATMUL = 1;
+  PROOF_TYPE_LAYER = 2;
+  PROOF_TYPE_GRADIENT = 3;
+  PROOF_TYPE_AGGREGATION = 4;
+  PROOF_TYPE_STEP = 5;
+}
+
+// Proof verification request
+message VerifyProofRequest {
+  Proof proof = 1;
+  helix.common.ModelRef model_ref = 2;
+}
+
+message VerifyProofResponse {
+  bool valid = 1;
+  string error_message = 2;
+}
+
+// Proof bundle with metadata
+message ProofBundle {
+  Proof proof = 1;
+  helix.common.NodeId prover = 2;
+  helix.common.Timestamp created_at = 3;
+  uint64 round_number = 4;
+  bytes metadata = 5;
+}

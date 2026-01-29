@@ -1,0 +1,2 @@
+# Clippy configuration for HELIX project
+cognitive-complexity-threshold = 30

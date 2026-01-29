@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package helix.training;
+
+import "helix/common.proto";
+
+// Training round state
+message TrainingRound {
+  uint64 round_number = 1;
+  helix.common.ModelRef current_model = 2;
+  helix.common.Timestamp start_time = 3;
+  helix.common.Timestamp deadline = 4;
+  uint32 min_contributors = 5;
+  repeated helix.common.NodeId participants = 6;
+}
+
+// Training configuration
+message TrainingConfig {
+  string model_architecture = 1;
+  uint64 batch_size = 2;
+  double learning_rate = 3;
+  double max_error_bound = 4;
+  uint32 rounds_per_epoch = 5;
+}
+
+// Training status request/response
+message TrainingStatusRequest {
+  uint64 round_number = 1;
+}
+
+message TrainingStatusResponse {
+  TrainingRound round = 1;
+  uint32 contributions_count = 2;
+  bool is_finalized = 3;
+}

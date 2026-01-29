@@ -1,0 +1,8 @@
+[package]
+name = "helix-circuits"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+helix-core = { path = "../helix-core" }
+halo2_proofs = { version = "0.3.0", features = ["dev-graph"] } # Assuming halo2 usage based on context

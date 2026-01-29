@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package helix.common;
+
+// Common timestamp type
+message Timestamp {
+  int64 seconds = 1;
+  int32 nanos = 2;
+}
+
+// Bounded value with error margins
+message BoundedValue {
+  double value = 1;
+  double lower_bound = 2;
+  double upper_bound = 3;
+}
+
+// Node identifier
+message NodeId {
+  bytes public_key = 1;
+  string address = 2;
+}
+
+// Model version reference
+message ModelRef {
+  bytes commitment = 1;
+  uint64 version = 2;
+  uint64 round = 3;
+}
