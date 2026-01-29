@@ -7,6 +7,8 @@ edition = "2021"
 helix-core = { path = "../helix-core" }
 thiserror = "1.0"
 serde = { version = "1.0", features = ["derive"] }
+rand = "0.8"
 
 [dev-dependencies]
 proptest = "1.4"
+

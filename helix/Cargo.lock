@@ -943,7 +943,7 @@ dependencies = [
  "sha2",
  "sha3",
  "thiserror 1.0.69",
- "uuid",
+ "uuid 0.8.2",
 ]
 
 [[package]]
@@ -1637,6 +1637,7 @@ version = "0.1.0"
 dependencies = [
  "helix-core",
  "proptest",
+ "rand 0.8.5",
  "serde",
  "thiserror 1.0.69",
 ]
@@ -1667,8 +1668,11 @@ name = "helix-core"
 version = "0.1.0"
 dependencies = [
  "proptest",
+ "rand 0.8.5",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]
@@ -1684,8 +1688,11 @@ dependencies = [
  "helix-prover",
  "hex",
  "log",
+ "rand 0.8.5",
  "serde",
+ "serde_json",
  "tokio",
+ "uuid 1.20.0",
 ]
 
 [[package]]
@@ -1695,8 +1702,10 @@ dependencies = [
  "helix-avm",
  "helix-circuits",
  "helix-core",
+ "num_cpus",
  "rand 0.8.5",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3984,6 +3993,18 @@ checksum = "bc5cf98d8186244414c848017f0e2676b3fcb46807f6668a97dfe67359a3c4b7"
 dependencies = [
  "getrandom 0.2.17",
  "serde",
+]
+
+[[package]]
+name = "uuid"
+version = "1.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee48d38b119b0cd71fe4141b30f5ba9c7c5d9f4e7a3a8b4a674e4b6ef789976f"
+dependencies = [
+ "getrandom 0.3.4",
+ "js-sys",
+ "serde_core",
+ "wasm-bindgen",
 ]
 
 [[package]]

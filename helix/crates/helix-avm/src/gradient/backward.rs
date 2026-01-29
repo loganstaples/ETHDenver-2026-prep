@@ -155,9 +155,6 @@ pub fn backward(loss: &Variable) -> Result<HashMap<NodeIndex, BoundedTensor>, St
                 // dL/dx = dL/dy * (1 if x > 0 else 0)
                 let input_node = &tape.nodes[*input_idx];
                 if let Some(input_val) = &input_node.cached_value {
-                    let zero = BoundedValue::exact(0.0);
-                    
-                    // Create mask manually since we don't have a generic map on BoundedTensor exposed yet
                     let mask_data: Vec<BoundedValue<f64>> = input_val.data().iter().map(|v| {
                         if v.value() > 0.0 {
                             BoundedValue::exact(1.0)
@@ -172,8 +169,211 @@ pub fn backward(loss: &Variable) -> Result<HashMap<NodeIndex, BoundedTensor>, St
                     accumulate_grad(&mut grads, *input_idx, &grad_input);
                 }
             }
-            _ => {
-                // Implement other ops
+            Operation::Sigmoid(input_idx) => {
+                // y = sigmoid(x)
+                // dL/dx = dL/dy * y * (1 - y)
+                let current_node = &tape.nodes[idx];
+                if let Some(output_val) = &current_node.cached_value {
+                    let grad_input_data: Vec<BoundedValue<f64>> = output_val.data()
+                        .iter()
+                        .zip(grad_output.data().iter())
+                        .map(|(y, g)| {
+                            let y_val = y.value();
+                            let derivative = y_val * (1.0 - y_val);
+                            let grad_val = g.value() * derivative;
+                            // Error: d(derivative)/dy = 1 - 2y, so error compounds
+                            let error = g.absolute_error() * derivative.abs() 
+                                + g.value().abs() * (1.0 - 2.0 * y_val).abs() * y.absolute_error();
+                            BoundedValue::new(grad_val, helix_core::types::ErrorMargin::absolute(error))
+                        })
+                        .collect();
+                    
+                    let grad_input = BoundedTensor::new(grad_input_data, output_val.shape().clone());
+                    accumulate_grad(&mut grads, *input_idx, &grad_input);
+                }
+            }
+            Operation::Softmax(input_idx) => {
+                // y_i = softmax(x)_i = exp(x_i) / sum(exp(x))
+                // dL/dx_i = sum_j(dL/dy_j * dy_j/dx_i)
+                // dy_j/dx_i = y_i * (delta_ij - y_j)
+                // Simplified: dL/dx = y * (dL/dy - sum(dL/dy * y))
+                let current_node = &tape.nodes[idx];
+                if let Some(softmax_output) = &current_node.cached_value {
+                    // Compute sum(dL/dy * y)
+                    let weighted_sum: f64 = grad_output.data()
+                        .iter()
+                        .zip(softmax_output.data().iter())
+                        .map(|(g, y)| g.value() * y.value())
+                        .sum();
+                    
+                    let grad_input_data: Vec<BoundedValue<f64>> = softmax_output.data()
+                        .iter()
+                        .zip(grad_output.data().iter())
+                        .map(|(y, g)| {
+                            let y_val = y.value();
+                            let grad_val = y_val * (g.value() - weighted_sum);
+                            // Softmax gradient error is complex; approximate
+                            let error = y.absolute_error() * g.value().abs() 
+                                + g.absolute_error() * y_val;
+                            BoundedValue::new(grad_val, helix_core::types::ErrorMargin::absolute(error))
+                        })
+                        .collect();
+                    
+                    let grad_input = BoundedTensor::new(grad_input_data, softmax_output.shape().clone());
+                    accumulate_grad(&mut grads, *input_idx, &grad_input);
+                }
+            }
+            Operation::LayerNorm(input_idx, gamma_idx, beta_idx) => {
+                // LayerNorm is complex; simplified backward
+                // dL/dx_i ≈ (1/std) * (dL/dy_i - mean(dL/dy) - normalized_i * mean(dL/dy * normalized))
+                let input_node = &tape.nodes[*input_idx];
+                let current_node = &tape.nodes[idx];
+                
+                if let (Some(input_val), Some(output_val)) = (&input_node.cached_value, &current_node.cached_value) {
+                    let n = input_val.len() as f64;
+                    
+                    // Compute mean and std of input
+                    let mean: f64 = input_val.data().iter().map(|v| v.value()).sum::<f64>() / n;
+                    let variance: f64 = input_val.data().iter()
+                        .map(|v| (v.value() - mean).powi(2))
+                        .sum::<f64>() / n;
+                    let std = (variance + 1e-5).sqrt();
+                    
+                    // Compute normalized values
+                    let normalized: Vec<f64> = input_val.data()
+                        .iter()
+                        .map(|v| (v.value() - mean) / std)
+                        .collect();
+                    
+                    // Compute dL/dy mean and dL/dy * normalized mean
+                    let grad_mean: f64 = grad_output.data().iter().map(|g| g.value()).sum::<f64>() / n;
+                    let grad_norm_mean: f64 = grad_output.data()
+                        .iter()
+                        .zip(normalized.iter())
+                        .map(|(g, &norm)| g.value() * norm)
+                        .sum::<f64>() / n;
+                    
+                    let grad_input_data: Vec<BoundedValue<f64>> = grad_output.data()
+                        .iter()
+                        .zip(normalized.iter())
+                        .map(|(g, &norm)| {
+                            let grad_val = (1.0 / std) * (g.value() - grad_mean - norm * grad_norm_mean);
+                            let error = g.absolute_error() / std;
+                            BoundedValue::new(grad_val, helix_core::types::ErrorMargin::absolute(error))
+                        })
+                        .collect();
+                    
+                    let grad_input = BoundedTensor::new(grad_input_data, input_val.shape().clone());
+                    accumulate_grad(&mut grads, *input_idx, &grad_input);
+                    
+                    // Gamma gradient (if present): dL/dgamma = sum(dL/dy * normalized)
+                    if let Some(g_idx) = gamma_idx {
+                        let gamma_grad_data: Vec<BoundedValue<f64>> = grad_output.data()
+                            .iter()
+                            .zip(normalized.iter())
+                            .map(|(g, &norm)| {
+                                BoundedValue::exact(g.value() * norm)
+                            })
+                            .collect();
+                        let gamma_grad = BoundedTensor::new(gamma_grad_data, input_val.shape().clone());
+                        accumulate_grad(&mut grads, *g_idx, &gamma_grad);
+                    }
+                    
+                    // Beta gradient (if present): dL/dbeta = sum(dL/dy)
+                    if let Some(b_idx) = beta_idx {
+                        accumulate_grad(&mut grads, *b_idx, &grad_output);
+                    }
+                }
+            }
+            Operation::Mul(lhs_idx, rhs_idx) => {
+                // y = a * b (element-wise)
+                // dL/da = dL/dy * b
+                // dL/db = dL/dy * a
+                let lhs_node = &tape.nodes[*lhs_idx];
+                let rhs_node = &tape.nodes[*rhs_idx];
+                
+                if let (Some(lhs_val), Some(rhs_val)) = (&lhs_node.cached_value, &rhs_node.cached_value) {
+                    let grad_lhs = grad_output.hadamard(rhs_val);
+                    let grad_rhs = grad_output.hadamard(lhs_val);
+                    
+                    accumulate_grad(&mut grads, *lhs_idx, &grad_lhs);
+                    accumulate_grad(&mut grads, *rhs_idx, &grad_rhs);
+                }
+            }
+            Operation::Div(lhs_idx, rhs_idx) => {
+                // y = a / b
+                // dL/da = dL/dy / b
+                // dL/db = -dL/dy * a / b^2
+                let lhs_node = &tape.nodes[*lhs_idx];
+                let rhs_node = &tape.nodes[*rhs_idx];
+                
+                if let (Some(lhs_val), Some(rhs_val)) = (&lhs_node.cached_value, &rhs_node.cached_value) {
+                    let grad_lhs_data: Vec<BoundedValue<f64>> = grad_output.data()
+                        .iter()
+                        .zip(rhs_val.data().iter())
+                        .map(|(g, b)| {
+                            let val = g.value() / b.value();
+                            let error = g.absolute_error() / b.value().abs();
+                            BoundedValue::new(val, helix_core::types::ErrorMargin::absolute(error))
+                        })
+                        .collect();
+                    
+                    let grad_rhs_data: Vec<BoundedValue<f64>> = grad_output.data()
+                        .iter()
+                        .zip(lhs_val.data().iter())
+                        .zip(rhs_val.data().iter())
+                        .map(|((g, a), b)| {
+                            let b_sq = b.value() * b.value();
+                            let val = -g.value() * a.value() / b_sq;
+                            let error = g.absolute_error() * a.value().abs() / b_sq;
+                            BoundedValue::new(val, helix_core::types::ErrorMargin::absolute(error))
+                        })
+                        .collect();
+                    
+                    let grad_lhs = BoundedTensor::new(grad_lhs_data, lhs_val.shape().clone());
+                    let grad_rhs = BoundedTensor::new(grad_rhs_data, rhs_val.shape().clone());
+                    
+                    accumulate_grad(&mut grads, *lhs_idx, &grad_lhs);
+                    accumulate_grad(&mut grads, *rhs_idx, &grad_rhs);
+                }
+            }
+            Operation::Sum(input_idx) => {
+                // y = sum(x) (scalar output)
+                // dL/dx_i = dL/dy (broadcast)
+                let input_node = &tape.nodes[*input_idx];
+                if let Some(input_val) = &input_node.cached_value {
+                    // Broadcast the scalar gradient to input shape
+                    let grad_scalar = if !grad_output.is_empty() {
+                        grad_output.data()[0].value()
+                    } else {
+                        1.0
+                    };
+                    
+                    let grad_input = BoundedTensor::full(
+                        input_val.shape().clone(),
+                        BoundedValue::exact(grad_scalar),
+                    );
+                    accumulate_grad(&mut grads, *input_idx, &grad_input);
+                }
+            }
+            Operation::Mean(input_idx) => {
+                // y = mean(x)
+                // dL/dx_i = dL/dy / n
+                let input_node = &tape.nodes[*input_idx];
+                if let Some(input_val) = &input_node.cached_value {
+                    let n = input_val.len() as f64;
+                    let grad_scalar = if !grad_output.is_empty() {
+                        grad_output.data()[0].value() / n
+                    } else {
+                        1.0 / n
+                    };
+                    
+                    let grad_input = BoundedTensor::full(
+                        input_val.shape().clone(),
+                        BoundedValue::exact(grad_scalar),
+                    );
+                    accumulate_grad(&mut grads, *input_idx, &grad_input);
+                }
             }
         }
     }

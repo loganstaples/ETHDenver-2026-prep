@@ -1,6 +1,7 @@
 //! Library exports for helix-avm.
 
 pub mod arithmetic;
+pub mod bounds;
 pub mod gradient;
 pub mod nn;
 pub mod ops;
@@ -18,3 +19,4 @@ pub use vm::{
 // Re-export witness types
 pub use witness::collector::WitnessCollector;
 pub use witness::AVMWitness;
+
