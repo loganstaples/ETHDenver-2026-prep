@@ -5,4 +5,6 @@ edition = "2021"
 
 [dependencies]
 helix-core = { path = "../helix-core" }
-halo2_proofs = { version = "0.3.0", features = ["dev-graph"] } # Assuming halo2 usage based on context
+halo2_proofs = { version = "0.3.0", features = ["dev-graph"] }
+halo2curves = { version = "0.1.0" }
+halo2_gadgets = "0.4.0"

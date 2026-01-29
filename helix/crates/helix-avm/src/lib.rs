@@ -16,4 +16,5 @@ pub use vm::{
 };
 
 // Re-export witness types
-pub use witness::{AVMWitness, WitnessBuilder};
+pub use witness::collector::WitnessCollector;
+pub use witness::AVMWitness;
