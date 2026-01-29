@@ -1,12 +1,13 @@
-import type { Metadata } from 'next';
-import '@/styles/globals.css';
-import Header from '@/components/layout/Header';
-import Sidebar from '@/components/layout/Sidebar';
-import Footer from '@/components/layout/Footer';
+import { Providers } from "@/components/Providers";
+import { Layout } from "@/components/Layout";
+import './globals.css';
+import { Inter } from 'next/font/google';
 
-export const metadata: Metadata = {
+const inter = Inter({ subsets: ['latin'] });
+
+export const metadata = {
     title: 'Helix Dashboard',
-    description: 'Decentralized Training Network',
+    description: 'Verifiable Machine Learning Network',
 };
 
 export default function RootLayout({
@@ -16,15 +17,10 @@ export default function RootLayout({
 }) {
     return (
         <html lang="en">
-            <body className="flex h-screen bg-gray-900 text-white">
-                <Sidebar />
-                <div className="flex-1 flex flex-col overflow-hidden">
-                    <Header />
-                    <main className="flex-1 overflow-x-hidden overflow-y-auto bg-gray-900">
-                        {children}
-                    </main>
-                    <Footer />
-                </div>
+            <body className={inter.className}>
+                <Providers>
+                    <Layout>{children}</Layout>
+                </Providers>
             </body>
         </html>
     );
