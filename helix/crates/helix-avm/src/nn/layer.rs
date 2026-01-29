@@ -1,0 +1,1 @@
+//! Generic layer trait (placeholder).

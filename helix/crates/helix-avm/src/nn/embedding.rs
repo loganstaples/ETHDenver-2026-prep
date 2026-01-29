@@ -1,1 +1,1 @@
-// Embedding lookup
+//! Embedding layers (placeholder).

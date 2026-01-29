@@ -1,1 +1,1 @@
-// Transformer block composition
+//! Transformer blocks (placeholder).

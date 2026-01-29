@@ -1,3 +1,5 @@
-pub mod dequantize;
-pub mod quantize;
-pub mod schemes;
+//! Quantization module (placeholder).
+
+pub mod calibration;
+pub mod dynamic;
+pub mod static_quant;

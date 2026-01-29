@@ -1,1 +1,1 @@
-// Backward pass implementation
+//! Backward pass for gradient computation (placeholder).

@@ -1,1 +1,1 @@
-// Linear layer execution
+//! Linear layers (placeholder).

@@ -1,1 +1,1 @@
-// Multi-head attention
+//! Attention mechanisms (placeholder).

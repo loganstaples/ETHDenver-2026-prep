@@ -398,6 +398,9 @@ name = "helix-avm"
 version = "0.1.0"
 dependencies = [
  "helix-core",
+ "proptest",
+ "serde",
+ "thiserror",
 ]
 
 [[package]]
