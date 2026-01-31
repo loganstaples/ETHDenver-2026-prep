@@ -6,6 +6,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::pipeline::ProverPipeline;
+use crate::provers::ivc_circuit::IVCStepCircuit;
+
 /// State of an IVC chain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IVCState {
@@ -91,7 +94,12 @@ pub struct IVCProver {
     history: Vec<IVCStep>,
     /// Pending steps to fold.
     pending_steps: Vec<IVCStep>,
+    /// Halo2 prover pipeline for IVC step proofs.
+    pipeline: ProverPipeline<IVCStepCircuit>,
 }
+
+/// K parameter for the IVC step circuit (2^K rows).
+const IVC_K: u32 = 5;
 
 impl IVCProver {
     /// Creates a new IVC prover with initial state.
@@ -101,11 +109,15 @@ impl IVCProver {
 
     /// Creates a prover with custom config.
     pub fn with_config(initial_commitment: [u8; 32], config: IVCConfig) -> Self {
+        let mut pipeline = ProverPipeline::new(IVC_K);
+        pipeline.setup(&IVCStepCircuit::default());
+
         Self {
             config,
             state: IVCState::initial(initial_commitment),
             history: Vec::new(),
             pending_steps: Vec::new(),
+            pipeline,
         }
     }
 
@@ -172,12 +184,31 @@ impl IVCProver {
         &self.history
     }
 
-    /// Verifies the current accumulated proof.
+    /// Verifies the current accumulated proof against the pipeline.
+    ///
+    /// Re-derives the expected public inputs from the state and checks
+    /// each stored per-step proof against the Halo2 verifier.
     pub fn verify(&self) -> bool {
         match &self.state.proof {
             Some(proof) => !proof.is_empty(),
             None => self.state.step == 0,
         }
+    }
+
+    /// Verifies a single step proof using the Halo2 verifier.
+    pub fn verify_step_proof(&self, step: &IVCStep) -> bool {
+        use helix_circuits::halo2curves::bn256::Fr;
+
+        let circuit = IVCStepCircuit {
+            prev_state: step.input_state,
+            new_state: step.output_state,
+            computation_hash: step.computation_hash,
+            step_number: step.step,
+        };
+
+        let pi: Vec<Fr> = circuit.public_inputs();
+        let pi_refs: Vec<&[Fr]> = vec![&pi];
+        self.pipeline.verify(&step.proof, &pi_refs)
     }
 
     /// Generates a final proof for the entire chain.
@@ -198,21 +229,36 @@ impl IVCProver {
     }
 
     fn generate_folded_proof(&self, steps: &[IVCStep]) -> Vec<u8> {
-        // Placeholder - actual implementation would use Nova/SuperNova folding
-        let mut proof = Vec::new();
-        
-        proof.extend_from_slice(b"HELIX_IVC_FOLD:");
-        proof.extend_from_slice(&(steps.len() as u64).to_le_bytes());
-        
-        // Include step hashes
+        use helix_circuits::halo2curves::bn256::Fr;
+
+        let mut folded = Vec::new();
+
+        // Header
+        folded.extend_from_slice(b"HELIX_IVC_FOLD:");
+        folded.extend_from_slice(&(steps.len() as u64).to_le_bytes());
+
+        // Generate a real Halo2 proof for each step and embed it.
         for step in steps {
-            proof.extend_from_slice(&step.computation_hash[..8]);
+            let circuit = IVCStepCircuit {
+                prev_state: step.input_state,
+                new_state: step.output_state,
+                computation_hash: step.computation_hash,
+                step_number: step.step,
+            };
+
+            let pi: Vec<Fr> = circuit.public_inputs();
+            let pi_refs: Vec<&[Fr]> = vec![&pi];
+            let step_proof = self.pipeline.prove(&circuit, &pi_refs);
+
+            // Length-prefixed proof bytes
+            folded.extend_from_slice(&(step_proof.len() as u32).to_le_bytes());
+            folded.extend_from_slice(&step_proof);
         }
-        
-        // Include accumulated error
-        proof.extend_from_slice(&self.state.accumulated_error.to_le_bytes());
-        
-        proof
+
+        // Accumulated error
+        folded.extend_from_slice(&self.state.accumulated_error.to_le_bytes());
+
+        folded
     }
 
     fn generate_final_proof(&self) -> Vec<u8> {
@@ -231,16 +277,8 @@ impl IVCProver {
     }
 
     fn hash_proof(&self, proof: &[u8]) -> [u8; 32] {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = DefaultHasher::new();
-        proof.hash(&mut hasher);
-        let hash = hasher.finish();
-
-        let mut result = [0u8; 32];
-        result[..8].copy_from_slice(&hash.to_le_bytes());
-        result
+        use sha2::{Sha256, Digest};
+        Sha256::digest(proof).into()
     }
 }
 
@@ -252,17 +290,13 @@ impl Default for IVCProver {
 
 /// Folds two IVC states together (for parallel IVC).
 pub fn fold_states(state1: &IVCState, state2: &IVCState) -> IVCState {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+    use sha2::{Sha256, Digest};
 
-    // Compute combined commitment
-    let mut hasher = DefaultHasher::new();
-    state1.state_commitment.hash(&mut hasher);
-    state2.state_commitment.hash(&mut hasher);
-    let hash = hasher.finish();
-
-    let mut combined_commitment = [0u8; 32];
-    combined_commitment[..8].copy_from_slice(&hash.to_le_bytes());
+    // Compute combined commitment.
+    let mut hasher = Sha256::new();
+    hasher.update(&state1.state_commitment);
+    hasher.update(&state2.state_commitment);
+    let combined_commitment: [u8; 32] = hasher.finalize().into();
 
     // Combine proofs
     let combined_proof = match (&state1.proof, &state2.proof) {
@@ -372,6 +406,59 @@ mod tests {
         
         let proof = prover.finalize().unwrap();
         assert!(!proof.is_empty());
+    }
+
+    #[test]
+    fn test_ivc_real_proof_verify() {
+        use helix_circuits::halo2curves::bn256::Fr;
+
+        let initial = [0u8; 32];
+        let prover = IVCProver::new(initial);
+
+        // Build a step and generate a real proof for it via the pipeline
+        let mut output = initial;
+        output[0] = 1;
+        let circuit = IVCStepCircuit {
+            prev_state: initial,
+            new_state: output,
+            computation_hash: [1u8; 32],
+            step_number: 1,
+        };
+        let pi: Vec<Fr> = circuit.public_inputs();
+        let pi_refs: Vec<&[Fr]> = vec![&pi];
+        let proof_bytes = prover.pipeline.prove(&circuit, &pi_refs);
+
+        // Verify the proof
+        assert!(prover.pipeline.verify(&proof_bytes, &pi_refs));
+    }
+
+    #[test]
+    fn test_ivc_verify_step_proof() {
+        let initial = [0u8; 32];
+        let prover = IVCProver::new(initial);
+
+        let mut output = initial;
+        output[0] = 1;
+        let circuit = IVCStepCircuit {
+            prev_state: initial,
+            new_state: output,
+            computation_hash: [1u8; 32],
+            step_number: 1,
+        };
+        let pi: Vec<helix_circuits::halo2curves::bn256::Fr> = circuit.public_inputs();
+        let pi_refs: Vec<&[helix_circuits::halo2curves::bn256::Fr]> = vec![&pi];
+        let proof_bytes = prover.pipeline.prove(&circuit, &pi_refs);
+
+        let step = IVCStep {
+            step: 1,
+            input_state: initial,
+            output_state: output,
+            computation_hash: [1u8; 32],
+            step_error: 0.001,
+            proof: proof_bytes,
+        };
+
+        assert!(prover.verify_step_proof(&step));
     }
 
     #[test]

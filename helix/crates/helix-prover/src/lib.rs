@@ -34,12 +34,15 @@ pub use ivc::{IVCConfig, IVCProver, IVCState, IVCStep};
 pub use keys::{FileKeyStore, InMemoryKeyStore, KeyId, KeyMetadata};
 pub use parallel::{BatchProofResult, ChunkProof, ParallelConfig, ParallelProver, ProofStatus};
 pub use pipeline::ProverPipeline;
+pub use provers::step_prover::{MLTrainingStepProof, TrainingStepData, TrainingStepProver};
+pub use provers::training_prover::{MLTrainingProver, TrainingProofResult};
 pub use serialization::{ProofFormat, ProofSerializer, SerializedProof};
 
 /// Prelude for convenient imports.
 pub mod prelude {
     pub use super::{
-        ChunkId, ComputationChunker, IVCProver, ParallelProver,
-        ProofAggregator, ProofSerializer, ProverPipeline,
+        ChunkId, ComputationChunker, IVCProver, MLTrainingProver,
+        ParallelProver, ProofAggregator, ProofSerializer, ProverPipeline,
+        TrainingStepData, TrainingStepProver,
     };
 }

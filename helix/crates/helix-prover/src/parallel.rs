@@ -10,6 +10,10 @@ use std::thread;
 use super::chunking::{ChunkId, ComputationChunk};
 use serde::{Deserialize, Serialize};
 
+use crate::pipeline::ProverPipeline;
+use crate::provers::ivc_circuit::IVCStepCircuit;
+use helix_circuits::halo2curves::bn256::Fr;
+
 /// Result of proving a chunk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkProof {
@@ -297,15 +301,32 @@ impl ParallelProver {
     }
 
     fn generate_proof(chunk: &ComputationChunk) -> Result<Vec<u8>, String> {
-        // Placeholder - actual implementation would call the circuit prover
-        // For now, generate a mock proof
-        let mock_proof = format!(
-            "HELIX_PROOF:{:?}:layers({}-{})",
-            chunk.computation_type,
-            chunk.layer_range.0,
-            chunk.layer_range.1
-        );
-        Ok(mock_proof.into_bytes())
+        // Build an IVCStepCircuit representing this chunk's computation.
+        let circuit = IVCStepCircuit {
+            prev_state: chunk.input_commitment,
+            new_state: chunk.output_commitment,
+            computation_hash: {
+                // Derive a deterministic computation hash from the chunk identity.
+                use sha2::{Sha256, Digest};
+                let mut h = Sha256::new();
+                h.update(chunk.id.0.to_le_bytes());
+                h.update(chunk.layer_range.0.to_le_bytes());
+                h.update(chunk.layer_range.1.to_le_bytes());
+                h.finalize().into()
+            },
+            step_number: chunk.id.0,
+        };
+
+        let pi: Vec<Fr> = circuit.public_inputs();
+        let pi_refs: Vec<&[Fr]> = vec![&pi];
+
+        // Each worker creates its own pipeline (keygen is deterministic for a
+        // given circuit shape, so all workers produce compatible proofs).
+        let mut pipeline = ProverPipeline::<IVCStepCircuit>::new(5);
+        pipeline.setup(&IVCStepCircuit::default());
+
+        let proof = pipeline.prove(&circuit, &pi_refs);
+        Ok(proof)
     }
 }
 

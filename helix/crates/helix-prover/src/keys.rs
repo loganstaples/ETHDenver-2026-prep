@@ -358,39 +358,28 @@ impl FileKeyStore {
     }
 
     fn hash_bytes(data: &[u8]) -> [u8; 32] {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = DefaultHasher::new();
-        data.hash(&mut hasher);
-        let hash1 = hasher.finish();
-
-        hasher = DefaultHasher::new();
-        hash1.hash(&mut hasher);
-        let hash2 = hasher.finish();
-
-        let mut result = [0u8; 32];
-        result[..8].copy_from_slice(&hash1.to_le_bytes());
-        result[8..16].copy_from_slice(&hash2.to_le_bytes());
-        result
+        use sha2::{Sha256, Digest};
+        Sha256::digest(data).into()
     }
 }
 
-/// Generates a key set for a circuit.
+/// Generates a key set for a circuit (stub — returns deterministic placeholder bytes).
+///
+/// For real Halo2 key generation use [`generate_keys_for_circuit`].
 pub fn generate_keys<C>(
     circuit_name: &str,
     version: u32,
     k: u32,
 ) -> (KeyId, Vec<u8>, Vec<u8>, KeyMetadata) {
     let id = KeyId::new(circuit_name, version);
-    
-    // Placeholder - actual implementation would use Halo2 keygen
+
+    // Deterministic placeholder keys derived from circuit identity
     let pk = format!("HELIX_PK:{}:k={}", id.0, k).into_bytes();
     let vk = format!("HELIX_VK:{}:k={}", id.0, k).into_bytes();
-    
+
     let pk_hash = FileKeyStore::hash_bytes(&pk);
     let vk_hash = FileKeyStore::hash_bytes(&vk);
-    
+
     let metadata = KeyMetadata {
         id: id.clone(),
         circuit_name: circuit_name.to_string(),
@@ -405,8 +394,45 @@ pub fn generate_keys<C>(
         pk_size: pk.len(),
         vk_size: vk.len(),
     };
-    
+
     (id, pk, vk, metadata)
+}
+
+/// Result of real Halo2 key generation.
+pub struct CircuitKeys {
+    /// Key identifier.
+    pub id: KeyId,
+    /// KZG parameters.
+    pub params: helix_circuits::halo2_proofs::poly::commitment::Params<helix_circuits::halo2curves::bn256::G1Affine>,
+    /// Proving key.
+    pub pk: helix_circuits::halo2_proofs::plonk::ProvingKey<helix_circuits::halo2curves::bn256::G1Affine>,
+    /// Verification key.
+    pub vk: helix_circuits::halo2_proofs::plonk::VerifyingKey<helix_circuits::halo2curves::bn256::G1Affine>,
+}
+
+/// Generates real Halo2 proving/verification keys for a concrete circuit.
+///
+/// Runs trusted setup and returns the raw key objects for use with the prover pipeline.
+pub fn generate_keys_for_circuit<C: helix_circuits::halo2_proofs::plonk::Circuit<helix_circuits::halo2curves::bn256::Fr>>(
+    circuit: &C,
+    circuit_name: &str,
+    version: u32,
+    k: u32,
+) -> CircuitKeys {
+    use helix_circuits::halo2_proofs::poly::commitment::Params;
+    use helix_circuits::halo2_proofs::plonk::{keygen_pk, keygen_vk};
+    use helix_circuits::halo2curves::bn256::G1Affine;
+
+    let id = KeyId::new(circuit_name, version);
+
+    // Trusted setup
+    let params = Params::<G1Affine>::new(k);
+
+    // Generate verification key then proving key
+    let vk = keygen_vk(&params, circuit).expect("keygen_vk failed");
+    let pk = keygen_pk(&params, vk.clone(), circuit).expect("keygen_pk failed");
+
+    CircuitKeys { id, params, pk, vk }
 }
 
 #[cfg(test)]

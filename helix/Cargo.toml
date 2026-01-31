@@ -7,4 +7,5 @@ members = [
     "crates/helix-prover",
     "crates/helix-node",
     "crates/helix-client",
+    "crates/helix-mpc",
 ]

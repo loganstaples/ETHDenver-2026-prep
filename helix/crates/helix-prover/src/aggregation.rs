@@ -271,45 +271,45 @@ impl ProofAggregator {
     }
 
     fn compute_root(&self, inputs: &[[u8; 32]]) -> [u8; 32] {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = DefaultHasher::new();
+        let mut tree = CommitmentTree::new();
         for input in inputs {
-            input.hash(&mut hasher);
+            tree.add_leaf(*input);
         }
-        let hash = hasher.finish();
-
-        let mut root = [0u8; 32];
-        root[..8].copy_from_slice(&hash.to_le_bytes());
-        
-        // Double hash for Merkle-like structure
-        hasher = DefaultHasher::new();
-        root.hash(&mut hasher);
-        let hash2 = hasher.finish();
-        root[8..16].copy_from_slice(&hash2.to_le_bytes());
-        
-        root
+        tree.build()
     }
 
     fn generate_aggregated_proof(&self, proofs: &[ChunkProof]) -> Vec<u8> {
-        // Placeholder - actual implementation would use folding or SNARK composition
-        let mut aggregated = Vec::new();
-        
-        // Header
-        aggregated.extend_from_slice(b"HELIX_AGG_V1:");
-        aggregated.extend_from_slice(&(proofs.len() as u32).to_le_bytes());
-        
-        // Include proof hashes (simulating commitment aggregation)
+        use sha2::{Sha256, Digest};
+
+        // Build Merkle tree over proof commitments.
+        let mut tree = CommitmentTree::new();
         for proof in proofs {
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            
-            let mut hasher = DefaultHasher::new();
-            proof.proof.hash(&mut hasher);
-            aggregated.extend_from_slice(&hasher.finish().to_le_bytes());
+            let hash: [u8; 32] = Sha256::digest(&proof.proof).into();
+            tree.add_leaf(hash);
         }
-        
+        let root = tree.build();
+
+        let mut aggregated = Vec::new();
+
+        // Header: version 2 = real aggregation
+        aggregated.push(2u8);
+        aggregated.extend_from_slice(&(proofs.len() as u32).to_le_bytes());
+
+        // Merkle root
+        aggregated.extend_from_slice(&root);
+
+        // Each proof's Merkle path
+        for (i, _proof) in proofs.iter().enumerate() {
+            if let Some(path) = tree.proof(i) {
+                aggregated.extend_from_slice(&(path.len() as u32).to_le_bytes());
+                for node in &path {
+                    aggregated.extend_from_slice(node);
+                }
+            } else {
+                aggregated.extend_from_slice(&0u32.to_le_bytes());
+            }
+        }
+
         aggregated
     }
 }
@@ -402,17 +402,11 @@ impl CommitmentTree {
     }
 
     fn hash_pair(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = DefaultHasher::new();
-        a.hash(&mut hasher);
-        b.hash(&mut hasher);
-        let hash = hasher.finish();
-
-        let mut result = [0u8; 32];
-        result[..8].copy_from_slice(&hash.to_le_bytes());
-        result
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(a);
+        hasher.update(b);
+        hasher.finalize().into()
     }
 }
 

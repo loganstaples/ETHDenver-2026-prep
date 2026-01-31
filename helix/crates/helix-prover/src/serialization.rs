@@ -364,22 +364,10 @@ impl ProofSerializer {
     }
 
     fn compute_checksum(data: &[u8]) -> [u8; 32] {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = DefaultHasher::new();
-        data.hash(&mut hasher);
-        let hash1 = hasher.finish();
-
-        hasher = DefaultHasher::new();
-        hash1.hash(&mut hasher);
-        data.len().hash(&mut hasher);
-        let hash2 = hasher.finish();
-
-        let mut result = [0u8; 32];
-        result[..8].copy_from_slice(&hash1.to_le_bytes());
-        result[8..16].copy_from_slice(&hash2.to_le_bytes());
-        result
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        hasher.finalize().into()
     }
 }
 

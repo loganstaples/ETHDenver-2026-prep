@@ -292,18 +292,13 @@ impl ComputationChunker {
         id
     }
 
-    fn compute_intermediate_commitment(&self, _start: usize, _end: usize) -> [u8; 32] {
-        // Placeholder - actual implementation would hash intermediate state
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        
-        let mut hasher = DefaultHasher::new();
-        self.next_id.hash(&mut hasher);
-        let hash = hasher.finish();
-        
-        let mut commitment = [0u8; 32];
-        commitment[..8].copy_from_slice(&hash.to_le_bytes());
-        commitment
+    fn compute_intermediate_commitment(&self, start: usize, end: usize) -> [u8; 32] {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(self.next_id.to_le_bytes());
+        hasher.update(start.to_le_bytes());
+        hasher.update(end.to_le_bytes());
+        hasher.finalize().into()
     }
 }
 
