@@ -12,8 +12,8 @@
 //! - Sumcheck partial sums
 //! - Matrix operations
 
-use helix_circuits::halo2curves::bn256::Fr;
 use helix_circuits::halo2_proofs::arithmetic::Field;
+use helix_circuits::halo2curves::bn256::Fr;
 use std::time::{Duration, Instant};
 
 use super::{BenchmarkHarness, BenchmarkMetrics, TimingHelper};
@@ -220,25 +220,21 @@ impl MetalVsCpuBenchmarks {
             let (a, b) = generate_test_data(size);
 
             // CPU benchmark
-            harness.run_benchmark(
-                &format!("cpu_add_{}", size),
-                "cpu",
-                || CpuFieldOps::batch_add(&a, &b),
-            );
+            harness.run_benchmark(&format!("cpu_add_{}", size), "cpu", || {
+                CpuFieldOps::batch_add(&a, &b)
+            });
 
             // Metal benchmark (if available)
             #[cfg(all(target_os = "macos", feature = "metal"))]
             if Self::is_metal_available() {
-                use helix_prover::metal::{MetalFieldOps, BatchFieldOperation};
+                use helix_prover::metal::{BatchFieldOperation, MetalFieldOps};
 
                 let mut ops = MetalFieldOps::new();
                 let op = BatchFieldOperation::add(a.clone(), b.clone());
 
-                harness.run_benchmark(
-                    &format!("metal_add_{}", size),
-                    "metal",
-                    || ops.execute(&op).unwrap(),
-                );
+                harness.run_benchmark(&format!("metal_add_{}", size), "metal", || {
+                    ops.execute(&op).unwrap()
+                });
             }
         }
     }
@@ -248,24 +244,20 @@ impl MetalVsCpuBenchmarks {
         for size in [1_000, 10_000, 100_000, 1_000_000] {
             let (a, b) = generate_test_data(size);
 
-            harness.run_benchmark(
-                &format!("cpu_mul_{}", size),
-                "cpu",
-                || CpuFieldOps::batch_mul(&a, &b),
-            );
+            harness.run_benchmark(&format!("cpu_mul_{}", size), "cpu", || {
+                CpuFieldOps::batch_mul(&a, &b)
+            });
 
             #[cfg(all(target_os = "macos", feature = "metal"))]
             if Self::is_metal_available() {
-                use helix_prover::metal::{MetalFieldOps, BatchFieldOperation};
+                use helix_prover::metal::{BatchFieldOperation, MetalFieldOps};
 
                 let mut ops = MetalFieldOps::new();
                 let op = BatchFieldOperation::mul(a.clone(), b.clone());
 
-                harness.run_benchmark(
-                    &format!("metal_mul_{}", size),
-                    "metal",
-                    || ops.execute(&op).unwrap(),
-                );
+                harness.run_benchmark(&format!("metal_mul_{}", size), "metal", || {
+                    ops.execute(&op).unwrap()
+                });
             }
         }
     }
@@ -275,24 +267,20 @@ impl MetalVsCpuBenchmarks {
         for size in [1_000, 10_000, 100_000] {
             let (a, _) = generate_test_data(size);
 
-            harness.run_benchmark(
-                &format!("cpu_inv_{}", size),
-                "cpu",
-                || CpuFieldOps::batch_inv(&a),
-            );
+            harness.run_benchmark(&format!("cpu_inv_{}", size), "cpu", || {
+                CpuFieldOps::batch_inv(&a)
+            });
 
             #[cfg(all(target_os = "macos", feature = "metal"))]
             if Self::is_metal_available() {
-                use helix_prover::metal::{MetalFieldOps, BatchFieldOperation};
+                use helix_prover::metal::{BatchFieldOperation, MetalFieldOps};
 
                 let mut ops = MetalFieldOps::new();
                 let op = BatchFieldOperation::inv(a.clone());
 
-                harness.run_benchmark(
-                    &format!("metal_inv_{}", size),
-                    "metal",
-                    || ops.execute(&op).unwrap(),
-                );
+                harness.run_benchmark(&format!("metal_inv_{}", size), "metal", || {
+                    ops.execute(&op).unwrap()
+                });
             }
         }
     }
@@ -303,11 +291,9 @@ impl MetalVsCpuBenchmarks {
             let coeffs: Vec<Fr> = (0..degree).map(|i| Fr::from(i as u64)).collect();
             let point = Fr::from(42u64);
 
-            harness.run_benchmark(
-                &format!("cpu_poly_eval_{}", degree),
-                "cpu",
-                || CpuFieldOps::poly_eval(&coeffs, &point),
-            );
+            harness.run_benchmark(&format!("cpu_poly_eval_{}", degree), "cpu", || {
+                CpuFieldOps::poly_eval(&coeffs, &point)
+            });
         }
     }
 
@@ -317,11 +303,9 @@ impl MetalVsCpuBenchmarks {
             let matrix: Vec<Fr> = (0..dim * dim).map(|i| Fr::from(i as u64)).collect();
             let vector: Vec<Fr> = (0..dim).map(|i| Fr::from(i as u64)).collect();
 
-            harness.run_benchmark(
-                &format!("cpu_matmul_{}x{}", dim, dim),
-                "cpu",
-                || CpuFieldOps::matmul(&matrix, &vector, dim, dim),
-            );
+            harness.run_benchmark(&format!("cpu_matmul_{}x{}", dim, dim), "cpu", || {
+                CpuFieldOps::matmul(&matrix, &vector, dim, dim)
+            });
         }
     }
 
@@ -330,17 +314,13 @@ impl MetalVsCpuBenchmarks {
         for size in [10_000, 100_000, 1_000_000] {
             let (a, b) = generate_test_data(size);
 
-            harness.run_benchmark(
-                &format!("cpu_seq_add_{}", size),
-                "cpu_seq",
-                || CpuFieldOps::batch_add(&a, &b),
-            );
+            harness.run_benchmark(&format!("cpu_seq_add_{}", size), "cpu_seq", || {
+                CpuFieldOps::batch_add(&a, &b)
+            });
 
-            harness.run_benchmark(
-                &format!("cpu_par_add_{}", size),
-                "cpu_par",
-                || CpuFieldOps::parallel_batch_add(&a, &b),
-            );
+            harness.run_benchmark(&format!("cpu_par_add_{}", size), "cpu_par", || {
+                CpuFieldOps::parallel_batch_add(&a, &b)
+            });
         }
     }
 
@@ -381,15 +361,21 @@ pub fn generate_metal_summary(harness: &BenchmarkHarness) -> String {
     }
 
     // Group results by operation
-    let cpu_results: Vec<_> = report.results.iter()
+    let cpu_results: Vec<_> = report
+        .results
+        .iter()
         .filter(|r| r.category == "cpu")
         .collect();
-    let metal_results: Vec<_> = report.results.iter()
+    let metal_results: Vec<_> = report
+        .results
+        .iter()
         .filter(|r| r.category == "metal")
         .collect();
 
-    summary.push_str(&format!("{:<25} {:>12} {:>12} {:>12}\n",
-        "Operation", "CPU (μs)", "Metal (μs)", "Speedup"));
+    summary.push_str(&format!(
+        "{:<25} {:>12} {:>12} {:>12}\n",
+        "Operation", "CPU (μs)", "Metal (μs)", "Speedup"
+    ));
     summary.push_str(&format!("{}\n", "-".repeat(65)));
 
     for cpu_result in &cpu_results {
@@ -402,11 +388,15 @@ pub fn generate_metal_summary(harness: &BenchmarkHarness) -> String {
         if let Some(metal) = metal_result {
             let metal_us = metal.metrics.mean_us();
             let speedup = cpu_us / metal_us;
-            summary.push_str(&format!("{:<25} {:>12.1} {:>12.1} {:>11.2}x\n",
-                cpu_result.name, cpu_us, metal_us, speedup));
+            summary.push_str(&format!(
+                "{:<25} {:>12.1} {:>12.1} {:>11.2}x\n",
+                cpu_result.name, cpu_us, metal_us, speedup
+            ));
         } else {
-            summary.push_str(&format!("{:<25} {:>12.1} {:>12} {:>12}\n",
-                cpu_result.name, cpu_us, "N/A", "N/A"));
+            summary.push_str(&format!(
+                "{:<25} {:>12.1} {:>12} {:>12}\n",
+                cpu_result.name, cpu_us, "N/A", "N/A"
+            ));
         }
     }
 
@@ -470,8 +460,10 @@ mod tests {
     fn test_cpu_matmul() {
         // 2x2 identity matrix
         let matrix = vec![
-            Fr::from(1u64), Fr::from(0u64),
-            Fr::from(0u64), Fr::from(1u64),
+            Fr::from(1u64),
+            Fr::from(0u64),
+            Fr::from(0u64),
+            Fr::from(1u64),
         ];
         let vector = vec![Fr::from(5u64), Fr::from(7u64)];
 

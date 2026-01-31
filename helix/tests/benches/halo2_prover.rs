@@ -181,14 +181,10 @@ impl Halo2Benchmarks {
     /// Benchmarks parameter generation (trusted setup).
     pub fn bench_params_generation(&self, harness: &mut BenchmarkHarness) {
         for k in [8, 10, 12] {
-            harness.run_benchmark(
-                &format!("halo2_params_k{}", k),
-                "halo2_setup",
-                || {
-                    let params: ParamsKZG<Bn256> = ParamsKZG::new(k);
-                    params
-                },
-            );
+            harness.run_benchmark(&format!("halo2_params_k{}", k), "halo2_setup", || {
+                let params: ParamsKZG<Bn256> = ParamsKZG::new(k);
+                params
+            });
         }
     }
 
@@ -198,11 +194,9 @@ impl Halo2Benchmarks {
             let circuit = Halo2BenchCircuit::for_k(k);
             let params = self.get_params(k).clone();
 
-            harness.run_benchmark(
-                &format!("halo2_vk_k{}", k),
-                "halo2_setup",
-                || keygen_vk(&params, &circuit).expect("vk generation"),
-            );
+            harness.run_benchmark(&format!("halo2_vk_k{}", k), "halo2_setup", || {
+                keygen_vk(&params, &circuit).expect("vk generation")
+            });
         }
     }
 
@@ -213,11 +207,9 @@ impl Halo2Benchmarks {
             let params = self.get_params(k).clone();
             let vk = keygen_vk(&params, &circuit).expect("vk generation");
 
-            harness.run_benchmark(
-                &format!("halo2_pk_k{}", k),
-                "halo2_setup",
-                || keygen_pk(&params, vk.clone(), &circuit).expect("pk generation"),
-            );
+            harness.run_benchmark(&format!("halo2_pk_k{}", k), "halo2_setup", || {
+                keygen_pk(&params, vk.clone(), &circuit).expect("pk generation")
+            });
         }
     }
 
@@ -229,32 +221,27 @@ impl Halo2Benchmarks {
             let vk = keygen_vk(&params, &circuit).expect("vk generation");
             let pk = keygen_pk(&params, vk, &circuit).expect("pk generation");
 
-            harness.run_benchmark(
-                &format!("halo2_prove_k{}", k),
-                "halo2_prove",
-                || {
-                    let mut rng = ChaCha20Rng::seed_from_u64(42);
-                    let mut transcript =
-                        Blake2bWrite::<_, G1Affine, Challenge255<_>>::init(Vec::new());
-                    create_proof::<
-                        KZGCommitmentScheme<Bn256>,
-                        ProverGWC<'_, Bn256>,
-                        Challenge255<G1Affine>,
-                        _,
-                        Blake2bWrite<Vec<u8>, G1Affine, Challenge255<G1Affine>>,
-                        _,
-                    >(
-                        &params,
-                        &pk,
-                        &[circuit.clone()],
-                        &[&[]],
-                        &mut rng,
-                        &mut transcript,
-                    )
-                    .expect("proof creation");
-                    transcript.finalize()
-                },
-            );
+            harness.run_benchmark(&format!("halo2_prove_k{}", k), "halo2_prove", || {
+                let mut rng = ChaCha20Rng::seed_from_u64(42);
+                let mut transcript = Blake2bWrite::<_, G1Affine, Challenge255<_>>::init(Vec::new());
+                create_proof::<
+                    KZGCommitmentScheme<Bn256>,
+                    ProverGWC<'_, Bn256>,
+                    Challenge255<G1Affine>,
+                    _,
+                    Blake2bWrite<Vec<u8>, G1Affine, Challenge255<G1Affine>>,
+                    _,
+                >(
+                    &params,
+                    &pk,
+                    &[circuit.clone()],
+                    &[&[]],
+                    &mut rng,
+                    &mut transcript,
+                )
+                .expect("proof creation");
+                transcript.finalize()
+            });
         }
     }
 
@@ -268,8 +255,7 @@ impl Halo2Benchmarks {
 
             // Generate a proof to verify
             let mut rng = ChaCha20Rng::seed_from_u64(42);
-            let mut transcript =
-                Blake2bWrite::<_, G1Affine, Challenge255<_>>::init(Vec::new());
+            let mut transcript = Blake2bWrite::<_, G1Affine, Challenge255<_>>::init(Vec::new());
             create_proof::<
                 KZGCommitmentScheme<Bn256>,
                 ProverGWC<'_, Bn256>,
@@ -288,23 +274,18 @@ impl Halo2Benchmarks {
             .expect("proof creation");
             let proof = transcript.finalize();
 
-            harness.run_benchmark(
-                &format!("halo2_verify_k{}", k),
-                "halo2_verify",
-                || {
-                    let mut transcript = Blake2bRead::<_, G1Affine, Challenge255<_>>::init(
-                        proof.as_slice(),
-                    );
-                    let strategy = SingleStrategy::new(&params);
-                    verify_proof::<
-                        KZGCommitmentScheme<Bn256>,
-                        VerifierGWC<'_, Bn256>,
-                        Challenge255<G1Affine>,
-                        Blake2bRead<&[u8], G1Affine, Challenge255<G1Affine>>,
-                        SingleStrategy<'_, Bn256>,
-                    >(&params, &vk, strategy, &[&[]], &mut transcript)
-                },
-            );
+            harness.run_benchmark(&format!("halo2_verify_k{}", k), "halo2_verify", || {
+                let mut transcript =
+                    Blake2bRead::<_, G1Affine, Challenge255<_>>::init(proof.as_slice());
+                let strategy = SingleStrategy::new(&params);
+                verify_proof::<
+                    KZGCommitmentScheme<Bn256>,
+                    VerifierGWC<'_, Bn256>,
+                    Challenge255<G1Affine>,
+                    Blake2bRead<&[u8], G1Affine, Challenge255<G1Affine>>,
+                    SingleStrategy<'_, Bn256>,
+                >(&params, &vk, strategy, &[&[]], &mut transcript)
+            });
         }
     }
 
@@ -313,14 +294,10 @@ impl Halo2Benchmarks {
         for k in [8, 10, 12] {
             let circuit = Halo2BenchCircuit::for_k(k);
 
-            harness.run_benchmark(
-                &format!("halo2_mock_k{}", k),
-                "halo2_mock",
-                || {
-                    let prover = MockProver::run(k, &circuit, vec![]).expect("mock prover");
-                    prover.verify()
-                },
-            );
+            harness.run_benchmark(&format!("halo2_mock_k{}", k), "halo2_mock", || {
+                let prover = MockProver::run(k, &circuit, vec![]).expect("mock prover");
+                prover.verify()
+            });
         }
     }
 
@@ -335,8 +312,7 @@ impl Halo2Benchmarks {
             let pk = keygen_pk(&params, vk, &circuit).expect("pk generation");
 
             let mut rng = ChaCha20Rng::seed_from_u64(42);
-            let mut transcript =
-                Blake2bWrite::<_, G1Affine, Challenge255<_>>::init(Vec::new());
+            let mut transcript = Blake2bWrite::<_, G1Affine, Challenge255<_>>::init(Vec::new());
             create_proof::<
                 KZGCommitmentScheme<Bn256>,
                 ProverGWC<'_, Bn256>,
@@ -344,14 +320,7 @@ impl Halo2Benchmarks {
                 _,
                 Blake2bWrite<Vec<u8>, G1Affine, Challenge255<G1Affine>>,
                 _,
-            >(
-                &params,
-                &pk,
-                &[circuit],
-                &[&[]],
-                &mut rng,
-                &mut transcript,
-            )
+            >(&params, &pk, &[circuit], &[&[]], &mut rng, &mut transcript)
             .expect("proof creation");
             let proof = transcript.finalize();
 
@@ -443,32 +412,27 @@ pub fn run_halo2_for_k(harness: &mut BenchmarkHarness, k: u32) -> BenchmarkMetri
     let vk = keygen_vk(&params, &circuit).expect("vk generation");
     let pk = keygen_pk(&params, vk, &circuit).expect("pk generation");
 
-    let result = harness.run_benchmark(
-        &format!("halo2_full_k{}", k),
-        "halo2",
-        || {
-            let mut rng = ChaCha20Rng::seed_from_u64(42);
-            let mut transcript =
-                Blake2bWrite::<_, G1Affine, Challenge255<_>>::init(Vec::new());
-            create_proof::<
-                KZGCommitmentScheme<Bn256>,
-                ProverGWC<'_, Bn256>,
-                Challenge255<G1Affine>,
-                _,
-                Blake2bWrite<Vec<u8>, G1Affine, Challenge255<G1Affine>>,
-                _,
-            >(
-                &params,
-                &pk,
-                &[circuit.clone()],
-                &[&[]],
-                &mut rng,
-                &mut transcript,
-            )
-            .expect("proof creation");
-            transcript.finalize()
-        },
-    );
+    let result = harness.run_benchmark(&format!("halo2_full_k{}", k), "halo2", || {
+        let mut rng = ChaCha20Rng::seed_from_u64(42);
+        let mut transcript = Blake2bWrite::<_, G1Affine, Challenge255<_>>::init(Vec::new());
+        create_proof::<
+            KZGCommitmentScheme<Bn256>,
+            ProverGWC<'_, Bn256>,
+            Challenge255<G1Affine>,
+            _,
+            Blake2bWrite<Vec<u8>, G1Affine, Challenge255<G1Affine>>,
+            _,
+        >(
+            &params,
+            &pk,
+            &[circuit.clone()],
+            &[&[]],
+            &mut rng,
+            &mut transcript,
+        )
+        .expect("proof creation");
+        transcript.finalize()
+    });
 
     result.metrics.clone()
 }

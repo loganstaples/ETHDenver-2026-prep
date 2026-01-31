@@ -13,22 +13,20 @@
 //! - Proof size measurements
 //! - Parallel vs sequential performance
 
-use helix_circuits::halo2curves::bn256::Fr;
 use helix_circuits::halo2_proofs::arithmetic::Field;
+use helix_circuits::halo2curves::bn256::Fr;
 use helix_prover::gkr::{
-    GKRProver, GKRConfig, GKRVerifier, GKRProof,
-    LayeredCircuit, CircuitBuilder, Gate, Wire, GateType,
     layered_circuit::NeuralNetworkCircuit,
-    sumcheck::{SumcheckProver, Blake3Transcript},
     multilinear::{DenseMultilinear, MultilinearPolynomial},
+    sumcheck::{Blake3Transcript, SumcheckProver},
+    CircuitBuilder, GKRConfig, GKRProof, GKRProver, GKRVerifier, Gate, GateType, LayeredCircuit,
+    Wire,
 };
 
-use super::{
-    BenchmarkHarness, BenchmarkMetrics, ModelSize, CircuitSize, TimingHelper,
-};
+use super::{BenchmarkHarness, BenchmarkMetrics, CircuitSize, ModelSize, TimingHelper};
 
-use std::time::{Duration, Instant};
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 /// Creates a layered circuit for benchmarking with the given gate count.
 pub fn create_benchmark_circuit(num_gates: usize) -> LayeredCircuit {
@@ -124,14 +122,10 @@ impl GKRBenchmarks {
 
             let config = self.config.clone();
 
-            harness.run_benchmark(
-                &format!("gkr_prove_{}", size.name()),
-                "gkr_prove",
-                || {
-                    let mut prover = GKRProver::new(config.clone());
-                    prover.prove(&circuit, &inputs).unwrap()
-                },
-            );
+            harness.run_benchmark(&format!("gkr_prove_{}", size.name()), "gkr_prove", || {
+                let mut prover = GKRProver::new(config.clone());
+                prover.prove(&circuit, &inputs).unwrap()
+            });
         }
     }
 
@@ -147,14 +141,10 @@ impl GKRBenchmarks {
             let proof = prover.prove(&circuit, &inputs).unwrap();
             let config = self.config.clone();
 
-            harness.run_benchmark(
-                &format!("gkr_verify_{}", size.name()),
-                "gkr_verify",
-                || {
-                    let verifier = GKRVerifier::new(config.clone());
-                    verifier.verify_structure(&proof).unwrap()
-                },
-            );
+            harness.run_benchmark(&format!("gkr_verify_{}", size.name()), "gkr_verify", || {
+                let verifier = GKRVerifier::new(config.clone());
+                verifier.verify_structure(&proof).unwrap()
+            });
         }
     }
 
@@ -165,14 +155,10 @@ impl GKRBenchmarks {
             let inputs: Vec<Fr> = (0..dim).map(|i| Fr::from(i as u64)).collect();
             let config = self.config.clone();
 
-            harness.run_benchmark(
-                &format!("gkr_matmul_{}x{}", dim, dim),
-                "gkr_matmul",
-                || {
-                    let mut prover = GKRProver::new(config.clone());
-                    prover.prove(&circuit, &inputs).unwrap()
-                },
-            );
+            harness.run_benchmark(&format!("gkr_matmul_{}x{}", dim, dim), "gkr_matmul", || {
+                let mut prover = GKRProver::new(config.clone());
+                prover.prove(&circuit, &inputs).unwrap()
+            });
         }
     }
 
@@ -184,14 +170,10 @@ impl GKRBenchmarks {
             let inputs: Vec<Fr> = (0..d_in).map(|i| Fr::from(i as u64 + 1)).collect();
             let config = self.config.clone();
 
-            harness.run_benchmark(
-                &format!("gkr_mlp_{}", size.name()),
-                "gkr_mlp",
-                || {
-                    let mut prover = GKRProver::new(config.clone());
-                    prover.prove(&circuit, &inputs).unwrap()
-                },
-            );
+            harness.run_benchmark(&format!("gkr_mlp_{}", size.name()), "gkr_mlp", || {
+                let mut prover = GKRProver::new(config.clone());
+                prover.prove(&circuit, &inputs).unwrap()
+            });
         }
     }
 
@@ -209,7 +191,9 @@ impl GKRBenchmarks {
                 || {
                     let mut transcript = Blake3Transcript::new(b"bench");
                     let mut prover = SumcheckProver::new(&poly);
-                    prover.prove_with_transcript(&mut transcript, claimed_sum).unwrap()
+                    prover
+                        .prove_with_transcript(&mut transcript, claimed_sum)
+                        .unwrap()
                 },
             );
         }
@@ -284,12 +268,18 @@ impl ProofSizeMeasurements {
     /// Prints a summary table.
     pub fn print_summary(&self) {
         println!("\nGKR Proof Size Summary:");
-        println!("{:<15} {:>12} {:>15} {:>15}", "Circuit", "Gates", "Proof (bytes)", "Bytes/Gate");
+        println!(
+            "{:<15} {:>12} {:>15} {:>15}",
+            "Circuit", "Gates", "Proof (bytes)", "Bytes/Gate"
+        );
         println!("{}", "-".repeat(60));
 
         for (name, gates, bytes) in &self.measurements {
             let bytes_per_gate = *bytes as f64 / *gates as f64;
-            println!("{:<15} {:>12} {:>15} {:>15.2}", name, gates, bytes, bytes_per_gate);
+            println!(
+                "{:<15} {:>12} {:>15} {:>15.2}",
+                name, gates, bytes, bytes_per_gate
+            );
         }
     }
 }
@@ -314,23 +304,16 @@ pub fn run_gkr_benchmarks(harness: &mut BenchmarkHarness) {
 }
 
 /// Runs GKR benchmarks for a specific model size (for overhead comparison).
-pub fn run_gkr_for_model_size(
-    harness: &mut BenchmarkHarness,
-    size: ModelSize,
-) -> BenchmarkMetrics {
+pub fn run_gkr_for_model_size(harness: &mut BenchmarkHarness, size: ModelSize) -> BenchmarkMetrics {
     let (d_in, d_hid, d_out) = size.dimensions();
     let circuit = create_mlp_circuit(d_in, d_hid, d_out);
     let inputs: Vec<Fr> = (0..d_in).map(|i| Fr::from(i as u64 + 1)).collect();
     let config = GKRConfig::default();
 
-    let result = harness.run_benchmark(
-        &format!("gkr_full_{}", size.name()),
-        "gkr",
-        || {
-            let mut prover = GKRProver::new(config.clone());
-            prover.prove(&circuit, &inputs).unwrap()
-        },
-    );
+    let result = harness.run_benchmark(&format!("gkr_full_{}", size.name()), "gkr", || {
+        let mut prover = GKRProver::new(config.clone());
+        prover.prove(&circuit, &inputs).unwrap()
+    });
 
     result.metrics.clone()
 }

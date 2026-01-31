@@ -13,17 +13,17 @@
 //! - Memory per operation type
 //! - Memory scaling with model size
 
-use helix_circuits::halo2curves::bn256::Fr;
 use helix_circuits::halo2_proofs::arithmetic::Field;
-use helix_prover::gkr::{GKRProver, GKRConfig, LayeredCircuit};
+use helix_circuits::halo2curves::bn256::Fr;
+use helix_prover::gkr::{GKRConfig, GKRProver, LayeredCircuit};
 use serde::{Deserialize, Serialize};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use super::{BenchmarkHarness, BenchmarkMetrics, ModelSize, CircuitSize, TimingHelper};
 use super::gkr_prover::{create_benchmark_circuit, create_mlp_circuit};
+use super::{BenchmarkHarness, BenchmarkMetrics, CircuitSize, ModelSize, TimingHelper};
 
 /// Global allocator wrapper for tracking memory usage.
 #[global_allocator]
@@ -205,8 +205,17 @@ impl MemoryProfiler {
             return MemoryProfileSummary::default();
         }
 
-        let total_peak: usize = self.profiles.iter().map(|p| p.peak_bytes).max().unwrap_or(0);
-        let avg_peak: f64 = self.profiles.iter().map(|p| p.peak_bytes as f64).sum::<f64>()
+        let total_peak: usize = self
+            .profiles
+            .iter()
+            .map(|p| p.peak_bytes)
+            .max()
+            .unwrap_or(0);
+        let avg_peak: f64 = self
+            .profiles
+            .iter()
+            .map(|p| p.peak_bytes as f64)
+            .sum::<f64>()
             / self.profiles.len() as f64;
 
         MemoryProfileSummary {

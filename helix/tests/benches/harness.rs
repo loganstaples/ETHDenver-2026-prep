@@ -10,7 +10,10 @@ use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use super::{TARGET_OVERHEAD_MULTIPLE, MAX_REGRESSION_PERCENT, TARGET_PROOF_TIME_MS};
+use super::{
+    MAX_REGRESSION_PERCENT, REGRESSION_ALERT_THRESHOLD, TARGET_OVERHEAD_MULTIPLE,
+    TARGET_PROOF_TIME_MS,
+};
 
 /// Configuration for the benchmark harness.
 #[derive(Debug, Clone)]
@@ -91,7 +94,11 @@ impl BenchmarkConfig {
             output_dir: PathBuf::from("target/helix-benchmarks"),
             save_baseline: true,
             baseline_path: None,
-            output_formats: vec![OutputFormat::Json, OutputFormat::Markdown, OutputFormat::Terminal],
+            output_formats: vec![
+                OutputFormat::Json,
+                OutputFormat::Markdown,
+                OutputFormat::Terminal,
+            ],
             fail_on_regression: false,
             regression_threshold_pct: MAX_REGRESSION_PERCENT,
         }
@@ -358,7 +365,10 @@ impl BenchmarkReport {
     pub fn to_markdown(&self) -> String {
         let mut md = String::new();
 
-        md.push_str(&format!("# HELIX Benchmark Report: {}\n\n", self.suite_name));
+        md.push_str(&format!(
+            "# HELIX Benchmark Report: {}\n\n",
+            self.suite_name
+        ));
         md.push_str(&format!("**Generated:** {}\n\n", self.timestamp));
 
         if let Some(ref commit) = self.git_commit {
@@ -369,18 +379,36 @@ impl BenchmarkReport {
         md.push_str("## Summary\n\n");
         md.push_str(&format!("| Metric | Value |\n"));
         md.push_str(&format!("|--------|-------|\n"));
-        md.push_str(&format!("| Total Benchmarks | {} |\n", self.summary.total_benchmarks));
-        md.push_str(&format!("| Regressions | {} {} |\n",
-            self.summary.regressions,
-            if self.summary.regressions > 0 { "🔴" } else { "" }
+        md.push_str(&format!(
+            "| Total Benchmarks | {} |\n",
+            self.summary.total_benchmarks
         ));
-        md.push_str(&format!("| Improvements | {} {} |\n",
+        md.push_str(&format!(
+            "| Regressions | {} {} |\n",
+            self.summary.regressions,
+            if self.summary.regressions > 0 {
+                "🔴"
+            } else {
+                ""
+            }
+        ));
+        md.push_str(&format!(
+            "| Improvements | {} {} |\n",
             self.summary.improvements,
-            if self.summary.improvements > 0 { "🟢" } else { "" }
+            if self.summary.improvements > 0 {
+                "🟢"
+            } else {
+                ""
+            }
         ));
         md.push_str(&format!("| Stable | {} |\n", self.summary.stable));
-        md.push_str(&format!("| Status | {} |\n\n",
-            if self.summary.passed { "✅ PASSED" } else { "❌ FAILED" }
+        md.push_str(&format!(
+            "| Status | {} |\n\n",
+            if self.summary.passed {
+                "✅ PASSED"
+            } else {
+                "❌ FAILED"
+            }
         ));
 
         // Results table
@@ -396,7 +424,8 @@ impl BenchmarkReport {
                 RegressionStatus::NoBaseline => "➖",
             };
 
-            let change_str = result.change_pct
+            let change_str = result
+                .change_pct
                 .map(|c| format!("{:+.1}%", c))
                 .unwrap_or_else(|| "N/A".to_string());
 
@@ -412,8 +441,18 @@ impl BenchmarkReport {
         }
 
         md.push_str("\n## Overhead Analysis\n\n");
-        md.push_str(&format!("Target overhead: **≤{:.0}x**\n\n", TARGET_OVERHEAD_MULTIPLE));
-        md.push_str(&format!("Target proof time: **≤{}ms** per step\n\n", TARGET_PROOF_TIME_MS));
+        md.push_str(&format!(
+            "- **Target overhead:** ≤{:.0}x\n",
+            TARGET_OVERHEAD_MULTIPLE
+        ));
+        md.push_str(&format!(
+            "- **Alert threshold:** ≤{:.0}x\n",
+            REGRESSION_ALERT_THRESHOLD
+        ));
+        md.push_str(&format!(
+            "- **Target proof time:** ≤{}ms per step\n\n",
+            TARGET_PROOF_TIME_MS
+        ));
 
         md
     }
@@ -433,21 +472,43 @@ impl BenchmarkReport {
         println!("┌─────────────────────────────────────────────┐");
         println!("│ Summary                                     │");
         println!("├─────────────────────────────────────────────┤");
-        println!("│ Total:       {:>5}                          │", self.summary.total_benchmarks);
-        println!("│ Regressions: {:>5} {}                          │",
-            self.summary.regressions,
-            if self.summary.regressions > 0 { "(!)" } else { "   " }
+        println!(
+            "│ Total:       {:>5}                          │",
+            self.summary.total_benchmarks
         );
-        println!("│ Improvements:{:>5}                          │", self.summary.improvements);
-        println!("│ Stable:      {:>5}                          │", self.summary.stable);
-        println!("│ Status:      {}                       │",
-            if self.summary.passed { "PASSED" } else { "FAILED" }
+        println!(
+            "│ Regressions: {:>5} {}                          │",
+            self.summary.regressions,
+            if self.summary.regressions > 0 {
+                "(!)"
+            } else {
+                "   "
+            }
+        );
+        println!(
+            "│ Improvements:{:>5}                          │",
+            self.summary.improvements
+        );
+        println!(
+            "│ Stable:      {:>5}                          │",
+            self.summary.stable
+        );
+        println!(
+            "│ Status:      {}                       │",
+            if self.summary.passed {
+                "PASSED"
+            } else {
+                "FAILED"
+            }
         );
         println!("└─────────────────────────────────────────────┘");
         println!();
 
         // Results
-        println!("{:<40} {:>12} {:>12} {:>10}", "Benchmark", "Mean (ms)", "Stddev", "Change");
+        println!(
+            "{:<40} {:>12} {:>12} {:>10}",
+            "Benchmark", "Mean (ms)", "Stddev", "Change"
+        );
         println!("{}", "-".repeat(78));
 
         for result in &self.results {
@@ -458,7 +519,8 @@ impl BenchmarkReport {
                 RegressionStatus::NoBaseline => "[-]",
             };
 
-            let change_str = result.change_pct
+            let change_str = result
+                .change_pct
                 .map(|c| format!("{:+.1}%", c))
                 .unwrap_or_else(|| "N/A".to_string());
 
@@ -490,9 +552,10 @@ impl BenchmarkHarness {
         let report = BenchmarkReport::new(&config.suite_name);
 
         // Load baseline if specified
-        let baseline = config.baseline_path.as_ref().and_then(|path| {
-            BenchmarkReport::load_json(path).ok()
-        });
+        let baseline = config
+            .baseline_path
+            .as_ref()
+            .and_then(|path| BenchmarkReport::load_json(path).ok());
 
         Self {
             config,
@@ -513,12 +576,7 @@ impl BenchmarkHarness {
     }
 
     /// Runs a benchmark function and records the result.
-    pub fn run_benchmark<F, R>(
-        &mut self,
-        name: &str,
-        category: &str,
-        mut f: F,
-    ) -> &BenchmarkResult
+    pub fn run_benchmark<F, R>(&mut self, name: &str, category: &str, mut f: F) -> &BenchmarkResult
     where
         F: FnMut() -> R,
     {
@@ -628,7 +686,10 @@ impl BenchmarkHarness {
     /// Saves the report as CSV.
     fn save_csv(&self, path: &PathBuf) -> std::io::Result<()> {
         let mut file = File::create(path)?;
-        writeln!(file, "name,category,mean_ns,stddev_ns,min_ns,max_ns,iterations,change_pct,status")?;
+        writeln!(
+            file,
+            "name,category,mean_ns,stddev_ns,min_ns,max_ns,iterations,change_pct,status"
+        )?;
 
         for result in &self.report.results {
             let status = match result.regression_status {

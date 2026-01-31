@@ -15,8 +15,8 @@
 //! These measurements form the denominator in our overhead calculations:
 //! `overhead = proof_time / native_time`
 
-use helix_circuits::halo2curves::bn256::Fr;
 use helix_circuits::halo2_proofs::arithmetic::Field;
+use helix_circuits::halo2curves::bn256::Fr;
 use std::time::{Duration, Instant};
 
 use super::{BenchmarkHarness, BenchmarkMetrics, ModelSize, TimingHelper, TimingResult};
@@ -124,16 +124,12 @@ impl NativeBaseline {
 
     /// Generates a random input vector.
     pub fn random_input(&self) -> Vec<Fr> {
-        (0..self.dims.0)
-            .map(|i| Fr::from((i + 1) as u64))
-            .collect()
+        (0..self.dims.0).map(|i| Fr::from((i + 1) as u64)).collect()
     }
 
     /// Generates a random target vector.
     pub fn random_target(&self) -> Vec<Fr> {
-        (0..self.dims.2)
-            .map(|i| Fr::from((i + 5) as u64))
-            .collect()
+        (0..self.dims.2).map(|i| Fr::from((i + 5) as u64)).collect()
     }
 
     /// Performs native matrix-vector multiplication.
@@ -321,21 +317,18 @@ pub fn run_native_baselines(harness: &mut BenchmarkHarness, size: ModelSize) {
     // Matrix multiplication (first layer)
     {
         let input = baseline.random_input();
-        let result = harness.run_benchmark(
-            &format!("native_matmul_{}", size.name()),
-            "native",
-            || baseline.matmul(&baseline.w1, &input, d_hid, d_in),
-        );
+        let result =
+            harness.run_benchmark(&format!("native_matmul_{}", size.name()), "native", || {
+                baseline.matmul(&baseline.w1, &input, d_hid, d_in)
+            });
     }
 
     // Forward pass
     {
         let input = baseline.random_input();
-        harness.run_benchmark(
-            &format!("native_forward_{}", size.name()),
-            "native",
-            || baseline.forward_pass(&input),
-        );
+        harness.run_benchmark(&format!("native_forward_{}", size.name()), "native", || {
+            baseline.forward_pass(&input)
+        });
     }
 
     // Gradient computation

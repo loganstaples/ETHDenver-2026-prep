@@ -7,9 +7,11 @@
 //! - MLP blocks (standard and gated)
 //! - Full transformer blocks and stacks
 //! - Quantized layers with INT8/INT4 support
+//! - Large model support with memory-efficient execution
 
 pub mod attention;
 pub mod embedding;
+pub mod large_model;
 pub mod layer;
 pub mod linear;
 pub mod mlp;
@@ -17,7 +19,11 @@ pub mod quantized;
 pub mod transformer;
 
 // Re-export commonly used types
-pub use attention::{AttentionConfig, AttentionError, MultiHeadAttention, scaled_dot_product_attention};
+pub use attention::{
+    AttentionConfig, AttentionError, MultiHeadAttention, scaled_dot_product_attention,
+    EfficientAttentionConfig, EfficientMultiHeadAttention, chunked_scaled_dot_product_attention,
+    estimate_attention_memory,
+};
 pub use embedding::{Embedding, EmbeddingError, PositionalEncoding};
 pub use layer::{Layer, Sequential};
 pub use linear::{Linear, LinearConfig, LinearError};
@@ -33,4 +39,10 @@ pub use quantized::{
     QuantizedActivationType, QuantizedGELU, QuantizedLayer, QuantizedLayerError,
     QuantizedLinear, QuantizedLinearConfig, QuantizedLinearGradients, QuantizedReLU,
     QuantizedSequential, QuantizedSiLU, Trainable, TrainingState,
+};
+
+// Re-export large model support
+pub use large_model::{
+    LargeModelConfig, LargeModelError, LargeModelExecutor,
+    chunked_attention, compute_optimal_batch_size, estimate_forward_memory,
 };

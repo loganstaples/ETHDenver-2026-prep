@@ -39,23 +39,25 @@
 //! - **<500ms per step**: Proof generation for demo model sizes
 //! - **Regression detection**: CI fails if overhead increases by >10%
 
-pub mod harness;
-pub mod native_baseline;
+pub mod chart_generator;
+pub mod ci_runner;
 pub mod gkr_prover;
 pub mod halo2_prover;
-pub mod overhead_report;
-pub mod metal_vs_cpu;
+pub mod harness;
 pub mod memory_profile;
+pub mod metal_vs_cpu;
+pub mod native_baseline;
+pub mod overhead_report;
 pub mod scaling;
-pub mod ci_runner;
 
 // Re-exports for convenience
+pub use chart_generator::{ChartConfig, ChartDataPoint, ChartGenerator};
 pub use harness::{
-    BenchmarkHarness, BenchmarkConfig, BenchmarkResult, BenchmarkReport,
-    BenchmarkMetrics, RegressionStatus, OutputFormat,
+    BenchmarkConfig, BenchmarkHarness, BenchmarkMetrics, BenchmarkReport, BenchmarkResult,
+    OutputFormat, RegressionStatus,
 };
-pub use native_baseline::{NativeBaseline, ComputationType};
-pub use overhead_report::{OverheadReport, OverheadMetrics};
+pub use native_baseline::{ComputationType, NativeBaseline};
+pub use overhead_report::{OverheadMetrics, OverheadReport};
 pub use scaling::{ScalingAnalysis, ScalingPoint};
 
 use std::time::Duration;
@@ -63,16 +65,23 @@ use std::time::Duration;
 /// Target overhead multiple for HELIX (ZK time / native time).
 pub const TARGET_OVERHEAD_MULTIPLE: f64 = 30.0;
 
+/// Alert threshold for regression detection - alerts if overhead exceeds this.
+pub const REGRESSION_ALERT_THRESHOLD: f64 = 35.0;
+
 /// Maximum acceptable overhead regression percentage for CI.
 pub const MAX_REGRESSION_PERCENT: f64 = 10.0;
 
 /// Target proof generation time for demo model sizes.
 pub const TARGET_PROOF_TIME_MS: u64 = 500;
 
+/// Standard model parameter sizes for benchmarking.
+/// These match the requirements: 10K, 100K, 500K, 1M, 2M params.
+pub const MODEL_PARAM_SIZES: &[usize] = &[10_000, 100_000, 500_000, 1_000_000, 2_000_000];
+
 /// Model size categories for benchmarking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ModelSize {
-    /// ~500 parameters (2x2x1 MLP)
+    /// ~500 parameters (2x2x1 MLP) - for quick tests
     Tiny,
     /// ~5K parameters (8x16x4 MLP)
     Small,
@@ -82,10 +91,22 @@ pub enum ModelSize {
     Large,
     /// ~2M parameters (256x512x128 MLP)
     XLarge,
+    /// Exactly 10K parameters for standardized benchmarking
+    Params10K,
+    /// Exactly 100K parameters for standardized benchmarking
+    Params100K,
+    /// Exactly 500K parameters for standardized benchmarking
+    Params500K,
+    /// Exactly 1M parameters for standardized benchmarking
+    Params1M,
+    /// Exactly 2M parameters for standardized benchmarking
+    Params2M,
 }
 
 impl ModelSize {
     /// Returns the model dimensions (d_in, d_hid, d_out).
+    /// Dimensions are calculated to achieve approximately the target parameter count.
+    /// Params = d_in * d_hid + d_hid + d_hid * d_out + d_out ≈ d_in * d_hid + d_hid * d_out
     pub fn dimensions(&self) -> (usize, usize, usize) {
         match self {
             ModelSize::Tiny => (2, 2, 1),
@@ -93,6 +114,13 @@ impl ModelSize {
             ModelSize::Medium => (32, 64, 16),
             ModelSize::Large => (128, 256, 64),
             ModelSize::XLarge => (256, 512, 128),
+            // Standardized sizes: dimensions chosen to achieve target param count
+            // For 2-layer MLP: params ≈ d_in * d_hid + d_hid * d_out
+            ModelSize::Params10K => (32, 128, 64), // ~10,272 params
+            ModelSize::Params100K => (128, 384, 192), // ~110,016 params
+            ModelSize::Params500K => (256, 768, 384), // ~491,520 params
+            ModelSize::Params1M => (384, 1024, 512), // ~917,504 params
+            ModelSize::Params2M => (512, 1536, 768), // ~1,966,080 params
         }
     }
 
@@ -113,6 +141,22 @@ impl ModelSize {
         ]
     }
 
+    /// Returns standardized benchmark model sizes (10K, 100K, 500K, 1M, 2M).
+    pub fn benchmark_sizes() -> &'static [ModelSize] {
+        &[
+            ModelSize::Params10K,
+            ModelSize::Params100K,
+            ModelSize::Params500K,
+            ModelSize::Params1M,
+            ModelSize::Params2M,
+        ]
+    }
+
+    /// Returns quick benchmark sizes (for CI).
+    pub fn quick_sizes() -> &'static [ModelSize] {
+        &[ModelSize::Tiny, ModelSize::Small, ModelSize::Params10K]
+    }
+
     /// Returns the appropriate K value for Halo2 circuits.
     pub fn halo2_k(&self) -> u32 {
         match self {
@@ -121,6 +165,11 @@ impl ModelSize {
             ModelSize::Medium => 14,
             ModelSize::Large => 16,
             ModelSize::XLarge => 18,
+            ModelSize::Params10K => 13,
+            ModelSize::Params100K => 16,
+            ModelSize::Params500K => 18,
+            ModelSize::Params1M => 19,
+            ModelSize::Params2M => 20,
         }
     }
 
@@ -132,6 +181,27 @@ impl ModelSize {
             ModelSize::Medium => "medium",
             ModelSize::Large => "large",
             ModelSize::XLarge => "xlarge",
+            ModelSize::Params10K => "10k_params",
+            ModelSize::Params100K => "100k_params",
+            ModelSize::Params500K => "500k_params",
+            ModelSize::Params1M => "1m_params",
+            ModelSize::Params2M => "2m_params",
+        }
+    }
+
+    /// Returns the target parameter count category for human display.
+    pub fn target_params_display(&self) -> &'static str {
+        match self {
+            ModelSize::Tiny => "~500",
+            ModelSize::Small => "~5K",
+            ModelSize::Medium => "~50K",
+            ModelSize::Large => "~500K",
+            ModelSize::XLarge => "~2M",
+            ModelSize::Params10K => "10K",
+            ModelSize::Params100K => "100K",
+            ModelSize::Params500K => "500K",
+            ModelSize::Params1M => "1M",
+            ModelSize::Params2M => "2M",
         }
     }
 }

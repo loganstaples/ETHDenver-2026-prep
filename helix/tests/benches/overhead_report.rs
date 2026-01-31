@@ -28,16 +28,15 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use super::{
-    BenchmarkHarness, BenchmarkConfig, BenchmarkMetrics,
-    ModelSize, TARGET_OVERHEAD_MULTIPLE, TARGET_PROOF_TIME_MS,
-    native_baseline::{NativeBaseline, NativeBaselineCollection},
-    gkr_prover::{GKRBenchmarks, create_mlp_circuit},
+    gkr_prover::{create_mlp_circuit, GKRBenchmarks},
     halo2_prover::Halo2Benchmarks,
-    TimingHelper,
+    native_baseline::{NativeBaseline, NativeBaselineCollection},
+    BenchmarkConfig, BenchmarkHarness, BenchmarkMetrics, ModelSize, TimingHelper,
+    REGRESSION_ALERT_THRESHOLD, TARGET_OVERHEAD_MULTIPLE, TARGET_PROOF_TIME_MS,
 };
 
 use helix_circuits::halo2curves::bn256::Fr;
-use helix_prover::gkr::{GKRProver, GKRConfig};
+use helix_prover::gkr::{GKRConfig, GKRProver};
 
 /// Overhead metrics for a single measurement.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,8 +47,10 @@ pub struct OverheadMetrics {
     pub proof_time: Duration,
     /// Computed overhead multiple.
     pub overhead: f64,
-    /// Whether overhead meets target.
+    /// Whether overhead meets target (≤30x).
     pub meets_target: bool,
+    /// Whether overhead exceeds alert threshold (>35x).
+    pub exceeds_alert: bool,
     /// Proof size in bytes.
     pub proof_size_bytes: Option<usize>,
 }
@@ -67,7 +68,19 @@ impl OverheadMetrics {
             proof_time: proof,
             overhead,
             meets_target: overhead <= TARGET_OVERHEAD_MULTIPLE,
+            exceeds_alert: overhead > REGRESSION_ALERT_THRESHOLD,
             proof_size_bytes: proof_size,
+        }
+    }
+
+    /// Returns a status string for display.
+    pub fn status(&self) -> &'static str {
+        if self.meets_target {
+            "PASS"
+        } else if !self.exceeds_alert {
+            "WARN"
+        } else {
+            "ALERT"
         }
     }
 }
@@ -137,12 +150,16 @@ pub struct OverheadSummary {
     pub min_overhead: f64,
     /// Maximum overhead observed.
     pub max_overhead: f64,
-    /// Number of measurements meeting target.
+    /// Number of measurements meeting target (≤30x).
     pub measurements_meeting_target: usize,
+    /// Number of measurements exceeding alert threshold (>35x).
+    pub measurements_exceeding_alert: usize,
     /// Total measurements.
     pub total_measurements: usize,
-    /// Overall pass/fail status.
+    /// Overall pass/fail status (all meet target).
     pub passed: bool,
+    /// Whether any measurement exceeded alert threshold.
+    pub has_alerts: bool,
     /// Human-readable summary message.
     pub message: String,
 }
@@ -172,8 +189,10 @@ impl OverheadReport {
                 min_overhead: f64::INFINITY,
                 max_overhead: 0.0,
                 measurements_meeting_target: 0,
+                measurements_exceeding_alert: 0,
                 total_measurements: 0,
                 passed: false,
+                has_alerts: false,
                 message: String::new(),
             },
         }
@@ -192,7 +211,8 @@ impl OverheadReport {
         let mut gkr_overheads = Vec::new();
         let mut gkr_proof_sizes = Vec::new();
 
-        for &size in ModelSize::all() {
+        // Use benchmark sizes (10K, 100K, 500K, 1M, 2M params)
+        for &size in ModelSize::benchmark_sizes() {
             if let Some(native_timing) = native_baselines.get(size) {
                 let (d_in, d_hid, d_out) = size.dimensions();
                 let circuit = create_mlp_circuit(d_in, d_hid, d_out);
@@ -237,21 +257,44 @@ impl OverheadReport {
             let avg = gkr_overheads.iter().sum::<f64>() / gkr_overheads.len() as f64;
             let min = gkr_overheads.iter().cloned().fold(f64::INFINITY, f64::min);
             let max = gkr_overheads.iter().cloned().fold(0.0f64, f64::max);
-            let meeting_target = gkr_overheads.iter().filter(|&&o| o <= TARGET_OVERHEAD_MULTIPLE).count();
+            let meeting_target = gkr_overheads
+                .iter()
+                .filter(|&&o| o <= TARGET_OVERHEAD_MULTIPLE)
+                .count();
+            let exceeding_alert = gkr_overheads
+                .iter()
+                .filter(|&&o| o > REGRESSION_ALERT_THRESHOLD)
+                .count();
 
             report.summary = OverheadSummary {
                 avg_overhead: avg,
                 min_overhead: min,
                 max_overhead: max,
                 measurements_meeting_target: meeting_target,
+                measurements_exceeding_alert: exceeding_alert,
                 total_measurements: gkr_overheads.len(),
                 passed: meeting_target == gkr_overheads.len(),
+                has_alerts: exceeding_alert > 0,
                 message: if meeting_target == gkr_overheads.len() {
-                    format!("All {} measurements meet the {:.0}x overhead target",
-                            gkr_overheads.len(), TARGET_OVERHEAD_MULTIPLE)
+                    format!(
+                        "All {} measurements meet the {:.0}x overhead target",
+                        gkr_overheads.len(),
+                        TARGET_OVERHEAD_MULTIPLE
+                    )
+                } else if exceeding_alert > 0 {
+                    format!(
+                        "ALERT: {}/{} measurements exceed {:.0}x alert threshold",
+                        exceeding_alert,
+                        gkr_overheads.len(),
+                        REGRESSION_ALERT_THRESHOLD
+                    )
                 } else {
-                    format!("{}/{} measurements meet the {:.0}x overhead target",
-                            meeting_target, gkr_overheads.len(), TARGET_OVERHEAD_MULTIPLE)
+                    format!(
+                        "{}/{} measurements meet the {:.0}x overhead target",
+                        meeting_target,
+                        gkr_overheads.len(),
+                        TARGET_OVERHEAD_MULTIPLE
+                    )
                 },
             };
 
@@ -289,21 +332,53 @@ impl OverheadReport {
 
         // Target section
         md.push_str("## Targets\n\n");
-        md.push_str(&format!("- **Overhead Target:** ≤{:.0}x\n", self.target_overhead));
-        md.push_str(&format!("- **Proof Time Target:** ≤{}ms per step\n\n", self.target_proof_time_ms));
+        md.push_str(&format!(
+            "- **Overhead Target:** ≤{:.0}x\n",
+            self.target_overhead
+        ));
+        md.push_str(&format!(
+            "- **Alert Threshold:** ≤{:.0}x\n",
+            REGRESSION_ALERT_THRESHOLD
+        ));
+        md.push_str(&format!(
+            "- **Proof Time Target:** ≤{}ms per step\n\n",
+            self.target_proof_time_ms
+        ));
 
         // Summary section
         md.push_str("## Summary\n\n");
-        md.push_str(&format!("| Metric | Value |\n"));
-        md.push_str(&format!("|--------|-------|\n"));
-        md.push_str(&format!("| Average Overhead | **{:.1}x** |\n", self.summary.avg_overhead));
-        md.push_str(&format!("| Min Overhead | {:.1}x |\n", self.summary.min_overhead));
-        md.push_str(&format!("| Max Overhead | {:.1}x |\n", self.summary.max_overhead));
-        md.push_str(&format!("| Measurements Meeting Target | {}/{} |\n",
+        md.push_str("| Metric | Value |\n");
+        md.push_str("|--------|-------|\n");
+        md.push_str(&format!(
+            "| Average Overhead | **{:.1}x** |\n",
+            self.summary.avg_overhead
+        ));
+        md.push_str(&format!(
+            "| Min Overhead | {:.1}x |\n",
+            self.summary.min_overhead
+        ));
+        md.push_str(&format!(
+            "| Max Overhead | {:.1}x |\n",
+            self.summary.max_overhead
+        ));
+        md.push_str(&format!(
+            "| Measurements Meeting Target (≤{:.0}x) | {}/{} |\n",
+            TARGET_OVERHEAD_MULTIPLE,
             self.summary.measurements_meeting_target,
-            self.summary.total_measurements));
-        md.push_str(&format!("| Status | {} |\n\n",
-            if self.summary.passed { "✅ PASSED" } else { "❌ FAILED" }));
+            self.summary.total_measurements
+        ));
+        md.push_str(&format!(
+            "| Measurements Exceeding Alert (>{:.0}x) | {} |\n",
+            REGRESSION_ALERT_THRESHOLD, self.summary.measurements_exceeding_alert
+        ));
+        let status = if self.summary.has_alerts {
+            "🚨 ALERT"
+        } else if self.summary.passed {
+            "✅ PASSED"
+        } else {
+            "⚠️ WARNING"
+        };
+        md.push_str(&format!("| Status | {} |\n\n", status));
 
         // Model size breakdown
         md.push_str("## Overhead by Model Size\n\n");
@@ -314,7 +389,12 @@ impl OverheadReport {
             if let Some(ref gkr) = data.gkr_overhead {
                 let native_us = gkr.native_time.as_secs_f64() * 1_000_000.0;
                 let proof_us = gkr.proof_time.as_secs_f64() * 1_000_000.0;
-                let status = if gkr.meets_target { "✅" } else { "❌" };
+                let status = match gkr.status() {
+                    "PASS" => "✅",
+                    "WARN" => "⚠️",
+                    "ALERT" => "🚨",
+                    _ => "❓",
+                };
 
                 md.push_str(&format!(
                     "| {} | {} | {:.1} | {:.1} | **{:.1}x** | {} |\n",
@@ -343,9 +423,10 @@ impl OverheadReport {
         // Recommendations
         md.push_str("## Recommendations\n\n");
         md.push_str(&format!("- {}\n", self.prover_comparison.recommendation));
-        md.push_str(&format!("- Average GKR overhead: **{:.1}x** (target: {:.0}x)\n",
-            self.prover_comparison.gkr_avg_overhead,
-            TARGET_OVERHEAD_MULTIPLE));
+        md.push_str(&format!(
+            "- Average GKR overhead: **{:.1}x** (target: {:.0}x)\n",
+            self.prover_comparison.gkr_avg_overhead, TARGET_OVERHEAD_MULTIPLE
+        ));
 
         md
     }
@@ -370,22 +451,43 @@ impl OverheadReport {
         println!("┌─────────────────────────────────────────────────────────┐");
         println!("│ SUMMARY                                                 │");
         println!("├─────────────────────────────────────────────────────────┤");
-        println!("│ Average Overhead:    {:>8.1}x {:>22} │",
+        println!(
+            "│ Average Overhead:    {:>8.1}x {:>22} │",
             self.summary.avg_overhead,
-            if self.summary.avg_overhead <= self.target_overhead { "(OK)" } else { "(OVER TARGET)" });
-        println!("│ Min Overhead:        {:>8.1}x                          │", self.summary.min_overhead);
-        println!("│ Max Overhead:        {:>8.1}x                          │", self.summary.max_overhead);
-        println!("│ Meeting Target:      {:>8}/{:<8}                    │",
-            self.summary.measurements_meeting_target,
-            self.summary.total_measurements);
-        println!("│ Status:              {:>8}                           │",
-            if self.summary.passed { "PASSED" } else { "FAILED" });
+            if self.summary.avg_overhead <= self.target_overhead {
+                "(OK)"
+            } else {
+                "(OVER TARGET)"
+            }
+        );
+        println!(
+            "│ Min Overhead:        {:>8.1}x                          │",
+            self.summary.min_overhead
+        );
+        println!(
+            "│ Max Overhead:        {:>8.1}x                          │",
+            self.summary.max_overhead
+        );
+        println!(
+            "│ Meeting Target:      {:>8}/{:<8}                    │",
+            self.summary.measurements_meeting_target, self.summary.total_measurements
+        );
+        println!(
+            "│ Status:              {:>8}                           │",
+            if self.summary.passed {
+                "PASSED"
+            } else {
+                "FAILED"
+            }
+        );
         println!("└─────────────────────────────────────────────────────────┘");
         println!();
 
         // Detailed results
-        println!("{:<12} {:>10} {:>12} {:>12} {:>10} {:>8}",
-            "Model", "Params", "Native(μs)", "GKR(μs)", "Overhead", "Status");
+        println!(
+            "{:<12} {:>10} {:>12} {:>12} {:>10} {:>8}",
+            "Model", "Params", "Native(μs)", "GKR(μs)", "Overhead", "Status"
+        );
         println!("{}", "-".repeat(70));
 
         for (name, data) in &self.by_model_size {
@@ -394,8 +496,10 @@ impl OverheadReport {
                 let proof_us = gkr.proof_time.as_secs_f64() * 1_000_000.0;
                 let status = if gkr.meets_target { "[OK]" } else { "[!!]" };
 
-                println!("{:<12} {:>10} {:>12.1} {:>12.1} {:>9.1}x {:>8}",
-                    name, data.param_count, native_us, proof_us, gkr.overhead, status);
+                println!(
+                    "{:<12} {:>10} {:>12.1} {:>12.1} {:>9.1}x {:>8}",
+                    name, data.param_count, native_us, proof_us, gkr.overhead, status
+                );
             }
         }
 
@@ -444,9 +548,7 @@ pub fn quick_overhead_check() -> OverheadReport {
 
         // Native timing
         let mut baseline_clone = NativeBaseline::new(size);
-        let native_timing = timing.measure(|| {
-            baseline_clone.training_step(&input, &target)
-        });
+        let native_timing = timing.measure(|| baseline_clone.training_step(&input, &target));
 
         // GKR timing
         let circuit = create_mlp_circuit(d_in, d_hid, d_out);
@@ -458,11 +560,7 @@ pub fn quick_overhead_check() -> OverheadReport {
             prover.prove(&circuit, &inputs).unwrap()
         });
 
-        let gkr_metrics = OverheadMetrics::compute(
-            native_timing.mean,
-            gkr_timing.mean,
-            None,
-        );
+        let gkr_metrics = OverheadMetrics::compute(native_timing.mean, gkr_timing.mean, None);
 
         report.by_model_size.insert(
             size.name().to_string(),
@@ -477,7 +575,9 @@ pub fn quick_overhead_check() -> OverheadReport {
     }
 
     // Compute summary
-    let overheads: Vec<f64> = report.by_model_size.values()
+    let overheads: Vec<f64> = report
+        .by_model_size
+        .values()
         .filter_map(|m| m.gkr_overhead.as_ref().map(|o| o.overhead))
         .collect();
 
@@ -485,20 +585,42 @@ pub fn quick_overhead_check() -> OverheadReport {
         let avg = overheads.iter().sum::<f64>() / overheads.len() as f64;
         let min = overheads.iter().cloned().fold(f64::INFINITY, f64::min);
         let max = overheads.iter().cloned().fold(0.0f64, f64::max);
-        let meeting_target = overheads.iter().filter(|&&o| o <= TARGET_OVERHEAD_MULTIPLE).count();
+        let meeting_target = overheads
+            .iter()
+            .filter(|&&o| o <= TARGET_OVERHEAD_MULTIPLE)
+            .count();
+        let exceeding_alert = overheads
+            .iter()
+            .filter(|&&o| o > REGRESSION_ALERT_THRESHOLD)
+            .count();
 
         report.summary = OverheadSummary {
             avg_overhead: avg,
             min_overhead: min,
             max_overhead: max,
             measurements_meeting_target: meeting_target,
+            measurements_exceeding_alert: exceeding_alert,
             total_measurements: overheads.len(),
             passed: meeting_target == overheads.len(),
+            has_alerts: exceeding_alert > 0,
             message: if meeting_target == overheads.len() {
-                format!("CI check passed: all measurements within {:.0}x overhead", TARGET_OVERHEAD_MULTIPLE)
+                format!(
+                    "CI check passed: all measurements within {:.0}x overhead",
+                    TARGET_OVERHEAD_MULTIPLE
+                )
+            } else if exceeding_alert > 0 {
+                format!(
+                    "CI check ALERT: {}/{} measurements exceeded {:.0}x alert threshold",
+                    exceeding_alert,
+                    overheads.len(),
+                    REGRESSION_ALERT_THRESHOLD
+                )
             } else {
-                format!("CI check FAILED: {}/{} measurements exceeded target",
-                        overheads.len() - meeting_target, overheads.len())
+                format!(
+                    "CI check FAILED: {}/{} measurements exceeded target",
+                    overheads.len() - meeting_target,
+                    overheads.len()
+                )
             },
         };
     }
@@ -542,13 +664,43 @@ mod tests {
             min_overhead: 10.0,
             max_overhead: 20.0,
             measurements_meeting_target: 3,
+            measurements_exceeding_alert: 0,
             total_measurements: 3,
             passed: true,
+            has_alerts: false,
             message: "All tests passed".to_string(),
         };
 
         let md = report.to_markdown();
         assert!(md.contains("Test Report"));
         assert!(md.contains("PASSED"));
+    }
+
+    #[test]
+    fn test_overhead_metrics_alert_threshold() {
+        // Test a measurement that exceeds alert threshold (>35x)
+        let native = Duration::from_micros(100);
+        let proof = Duration::from_millis(4); // 4000us = 40x overhead
+
+        let metrics = OverheadMetrics::compute(native, proof, None);
+
+        assert!((metrics.overhead - 40.0).abs() < 0.1);
+        assert!(!metrics.meets_target); // 40x > 30x
+        assert!(metrics.exceeds_alert); // 40x > 35x
+        assert_eq!(metrics.status(), "ALERT");
+    }
+
+    #[test]
+    fn test_overhead_metrics_warning_zone() {
+        // Test a measurement in warning zone (30x < overhead <= 35x)
+        let native = Duration::from_micros(100);
+        let proof = Duration::from_micros(3200); // 3200us = 32x overhead
+
+        let metrics = OverheadMetrics::compute(native, proof, None);
+
+        assert!((metrics.overhead - 32.0).abs() < 0.1);
+        assert!(!metrics.meets_target); // 32x > 30x
+        assert!(!metrics.exceeds_alert); // 32x <= 35x
+        assert_eq!(metrics.status(), "WARN");
     }
 }

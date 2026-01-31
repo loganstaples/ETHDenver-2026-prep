@@ -17,18 +17,16 @@
 //! - Crossover point analysis (where one prover beats another)
 //! - Projected overhead for production model sizes
 
-use helix_circuits::halo2curves::bn256::Fr;
 use helix_circuits::halo2_proofs::arithmetic::Field;
-use helix_prover::gkr::{GKRProver, GKRConfig};
+use helix_circuits::halo2curves::bn256::Fr;
+use helix_prover::gkr::{GKRConfig, GKRProver};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use super::{
-    BenchmarkHarness, BenchmarkMetrics, ModelSize, CircuitSize, TimingHelper,
-    TARGET_OVERHEAD_MULTIPLE,
-    native_baseline::NativeBaseline,
-    gkr_prover::create_mlp_circuit,
+    gkr_prover::create_mlp_circuit, native_baseline::NativeBaseline, BenchmarkHarness,
+    BenchmarkMetrics, CircuitSize, ModelSize, TimingHelper, TARGET_OVERHEAD_MULTIPLE,
 };
 
 /// A single data point in scaling analysis.
@@ -49,15 +47,14 @@ pub struct ScalingPoint {
 }
 
 impl ScalingPoint {
-    pub fn new(
-        size: usize,
-        native: Duration,
-        proof: Duration,
-        proof_size: usize,
-    ) -> Self {
+    pub fn new(size: usize, native: Duration, proof: Duration, proof_size: usize) -> Self {
         let native_us = native.as_secs_f64() * 1_000_000.0;
         let proof_us = proof.as_secs_f64() * 1_000_000.0;
-        let overhead = if native_us > 0.0 { proof_us / native_us } else { f64::INFINITY };
+        let overhead = if native_us > 0.0 {
+            proof_us / native_us
+        } else {
+            f64::INFINITY
+        };
 
         Self {
             size,
@@ -138,23 +135,26 @@ impl ScalingAnalysis {
         // Basic summary
         let min_size = self.points.first().map(|p| p.size).unwrap_or(0);
         let max_size = self.points.last().map(|p| p.size).unwrap_or(0);
-        let min_overhead = self.points.iter()
+        let min_overhead = self
+            .points
+            .iter()
             .map(|p| p.overhead)
             .fold(f64::INFINITY, f64::min);
-        let max_overhead = self.points.iter()
+        let max_overhead = self
+            .points
+            .iter()
             .map(|p| p.overhead)
             .fold(0.0f64, f64::max);
-        let all_within = self.points.iter().all(|p| p.overhead <= TARGET_OVERHEAD_MULTIPLE);
+        let all_within = self
+            .points
+            .iter()
+            .all(|p| p.overhead <= TARGET_OVERHEAD_MULTIPLE);
 
         // Fit power law: overhead = a * size^b
         // log(overhead) = log(a) + b * log(size)
         if self.points.len() >= 3 {
-            let log_sizes: Vec<f64> = self.points.iter()
-                .map(|p| (p.size as f64).ln())
-                .collect();
-            let log_overheads: Vec<f64> = self.points.iter()
-                .map(|p| p.overhead.ln())
-                .collect();
+            let log_sizes: Vec<f64> = self.points.iter().map(|p| (p.size as f64).ln()).collect();
+            let log_overheads: Vec<f64> = self.points.iter().map(|p| p.overhead.ln()).collect();
 
             // Simple linear regression on log-log
             if let Some(exponent) = fit_linear_slope(&log_sizes, &log_overheads) {
@@ -189,9 +189,13 @@ impl ScalingAnalysis {
         // Determine scaling description
         let scaling_desc = match self.power_law_exponent {
             Some(exp) if exp < 0.1 => "constant (O(1))".to_string(),
-            Some(exp) if exp < 0.6 => "sub-linear (O(n^{:.2}))".to_string().replace("{:.2}", &format!("{:.2}", exp)),
+            Some(exp) if exp < 0.6 => "sub-linear (O(n^{:.2}))"
+                .to_string()
+                .replace("{:.2}", &format!("{:.2}", exp)),
             Some(exp) if exp < 1.1 => "linear (O(n))".to_string(),
-            Some(exp) if exp < 1.6 => "slightly super-linear (O(n^{:.2}))".to_string().replace("{:.2}", &format!("{:.2}", exp)),
+            Some(exp) if exp < 1.6 => "slightly super-linear (O(n^{:.2}))"
+                .to_string()
+                .replace("{:.2}", &format!("{:.2}", exp)),
             Some(exp) if exp < 2.1 => "quadratic (O(n^2))".to_string(),
             Some(exp) => format!("polynomial (O(n^{:.2}))", exp),
             None => "unknown".to_string(),
@@ -217,11 +221,26 @@ impl ScalingAnalysis {
         md.push_str("### Summary\n\n");
         md.push_str("| Metric | Value |\n");
         md.push_str("|--------|-------|\n");
-        md.push_str(&format!("| Size Range | {} - {} |\n", self.summary.min_size, self.summary.max_size));
-        md.push_str(&format!("| Overhead Range | {:.1}x - {:.1}x |\n", self.summary.min_overhead, self.summary.max_overhead));
-        md.push_str(&format!("| Scaling | {} |\n", self.summary.scaling_description));
-        md.push_str(&format!("| All Within Target | {} |\n",
-            if self.summary.all_within_target { "Yes" } else { "No" }));
+        md.push_str(&format!(
+            "| Size Range | {} - {} |\n",
+            self.summary.min_size, self.summary.max_size
+        ));
+        md.push_str(&format!(
+            "| Overhead Range | {:.1}x - {:.1}x |\n",
+            self.summary.min_overhead, self.summary.max_overhead
+        ));
+        md.push_str(&format!(
+            "| Scaling | {} |\n",
+            self.summary.scaling_description
+        ));
+        md.push_str(&format!(
+            "| All Within Target | {} |\n",
+            if self.summary.all_within_target {
+                "Yes"
+            } else {
+                "No"
+            }
+        ));
 
         if let Some(exponent) = self.power_law_exponent {
             md.push_str(&format!("| Power Law Exponent | {:.3} |\n", exponent));
@@ -256,23 +275,39 @@ impl ScalingAnalysis {
         println!("{}", "=".repeat(70));
 
         println!("\nSummary:");
-        println!("  Size range: {} - {}", self.summary.min_size, self.summary.max_size);
-        println!("  Overhead range: {:.1}x - {:.1}x", self.summary.min_overhead, self.summary.max_overhead);
+        println!(
+            "  Size range: {} - {}",
+            self.summary.min_size, self.summary.max_size
+        );
+        println!(
+            "  Overhead range: {:.1}x - {:.1}x",
+            self.summary.min_overhead, self.summary.max_overhead
+        );
         println!("  Scaling behavior: {}", self.summary.scaling_description);
-        println!("  All within {:.0}x target: {}", TARGET_OVERHEAD_MULTIPLE,
-            if self.summary.all_within_target { "Yes" } else { "No" });
+        println!(
+            "  All within {:.0}x target: {}",
+            TARGET_OVERHEAD_MULTIPLE,
+            if self.summary.all_within_target {
+                "Yes"
+            } else {
+                "No"
+            }
+        );
 
         if let Some(exp) = self.power_law_exponent {
             println!("  Power law exponent: {:.3}", exp);
         }
 
         println!("\nData Points:");
-        println!("{:<12} {:>12} {:>12} {:>10} {:>12}",
-            "Size", "Native(μs)", "Proof(μs)", "Overhead", "Proof Size");
+        println!(
+            "{:<12} {:>12} {:>12} {:>10} {:>12}",
+            "Size", "Native(μs)", "Proof(μs)", "Overhead", "Proof Size"
+        );
         println!("{}", "-".repeat(60));
 
         for point in &self.points {
-            println!("{:<12} {:>12.1} {:>12.1} {:>9.1}x {:>12}",
+            println!(
+                "{:<12} {:>12.1} {:>12.1} {:>9.1}x {:>12}",
                 point.size,
                 point.native_time_us,
                 point.proof_time_us,
@@ -305,11 +340,17 @@ fn fit_linear_slope(x: &[f64], y: &[f64]) -> Option<f64> {
 }
 
 /// Runs scaling analysis for GKR proving on model sizes.
+/// Uses the standard benchmark sizes (10K, 100K, 500K, 1M, 2M params).
 pub fn analyze_model_size_scaling() -> ScalingAnalysis {
+    analyze_model_size_scaling_with_sizes(ModelSize::benchmark_sizes())
+}
+
+/// Runs scaling analysis for GKR proving on specified model sizes.
+pub fn analyze_model_size_scaling_with_sizes(sizes: &[ModelSize]) -> ScalingAnalysis {
     let mut analysis = ScalingAnalysis::new("GKR Proving vs Model Size");
     let timing = TimingHelper::quick();
 
-    for &size in ModelSize::all() {
+    for &size in sizes {
         let baseline = NativeBaseline::new(size);
         let (d_in, d_hid, d_out) = baseline.dimensions();
         let input = baseline.random_input();
@@ -447,11 +488,7 @@ pub fn run_scaling_tests(harness: &mut BenchmarkHarness) {
             memory_bytes: point.memory_bytes,
             tags: BTreeMap::new(),
         };
-        harness.record_benchmark(
-            &format!("scaling_model_{}", point.size),
-            "scaling",
-            metrics,
-        );
+        harness.record_benchmark(&format!("scaling_model_{}", point.size), "scaling", metrics);
     }
 }
 
@@ -464,7 +501,10 @@ pub fn generate_scaling_report() -> String {
     let mut report = String::new();
     report.push_str("# HELIX Scaling Analysis Report\n\n");
 
-    report.push_str(&format!("**Target Overhead:** ≤{:.0}x\n\n", TARGET_OVERHEAD_MULTIPLE));
+    report.push_str(&format!(
+        "**Target Overhead:** ≤{:.0}x\n\n",
+        TARGET_OVERHEAD_MULTIPLE
+    ));
 
     report.push_str(&model_analysis.to_markdown());
     report.push_str("\n");
@@ -506,13 +546,22 @@ mod tests {
         let mut analysis = ScalingAnalysis::new("Test");
 
         analysis.add_point(ScalingPoint::new(
-            10, Duration::from_micros(1), Duration::from_micros(10), 100
+            10,
+            Duration::from_micros(1),
+            Duration::from_micros(10),
+            100,
         ));
         analysis.add_point(ScalingPoint::new(
-            100, Duration::from_micros(10), Duration::from_micros(150), 500
+            100,
+            Duration::from_micros(10),
+            Duration::from_micros(150),
+            500,
         ));
         analysis.add_point(ScalingPoint::new(
-            1000, Duration::from_micros(100), Duration::from_micros(2000), 2000
+            1000,
+            Duration::from_micros(100),
+            Duration::from_micros(2000),
+            2000,
         ));
 
         analysis.analyze();
