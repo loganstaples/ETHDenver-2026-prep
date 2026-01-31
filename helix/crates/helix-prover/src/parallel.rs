@@ -1010,7 +1010,8 @@ impl PriorityTaskQueue {
         let pt = PriorityTask::new(task, deadline);
         let mut tasks = self.tasks.lock().unwrap();
         tasks.push(pt);
-        tasks.sort_by(|a, b| b.effective_priority.cmp(&a.effective_priority));
+        // Sort ascending so pop() returns highest priority (from end of vec)
+        tasks.sort_by(|a, b| a.effective_priority.cmp(&b.effective_priority));
     }
 
     /// Pops the highest priority task.
@@ -1035,7 +1036,8 @@ impl PriorityTaskQueue {
         for task in tasks.iter_mut() {
             task.compute_priority();
         }
-        tasks.sort_by(|a, b| b.effective_priority.cmp(&a.effective_priority));
+        // Sort ascending so pop() returns highest priority (from end of vec)
+        tasks.sort_by(|a, b| a.effective_priority.cmp(&b.effective_priority));
     }
 }
 

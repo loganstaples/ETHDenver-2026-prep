@@ -2,12 +2,24 @@
 //!
 //! Combines multiple proofs into a single aggregated proof.
 //! Essential for recursive proving and reducing verification costs.
+//!
+//! ## Submodules
+//!
+//! - `gkr_to_halo2`: Aggregates GKR proofs into Halo2 proofs for on-chain verification
+
+pub mod gkr_to_halo2;
 
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::chunking::ChunkId;
 use super::parallel::ChunkProof;
+
+// Re-export GKR aggregation types
+pub use gkr_to_halo2::{
+    GKRToHalo2Aggregator, AggregatedGKRProof, GKRProofCommitment,
+    AggregationConfig as GKRAggregationConfig, BatchAggregator,
+};
 
 /// An aggregated proof combining multiple chunk proofs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,7 +178,7 @@ impl ProofAggregator {
         // Placeholder verification
         // Actual implementation would verify the aggregated proof
         // against the root commitment and public inputs
-        
+
         if agg.proof.is_empty() {
             return false;
         }
@@ -185,7 +197,7 @@ impl ProofAggregator {
         // Find the top-level aggregation (highest depth)
         let top = self.aggregations.values()
             .max_by_key(|a| a.depth)?;
-        
+
         Some(top.root_commitment)
     }
 
@@ -353,12 +365,12 @@ impl CommitmentTree {
         }
 
         self.nodes.clear();
-        
+
         let mut current_level = self.leaves.clone();
-        
+
         while current_level.len() > 1 {
             let mut next_level = Vec::new();
-            
+
             for chunk in current_level.chunks(2) {
                 let node = if chunk.len() == 2 {
                     Self::hash_pair(&chunk[0], &chunk[1])
@@ -367,11 +379,11 @@ impl CommitmentTree {
                 };
                 next_level.push(node);
             }
-            
+
             self.nodes.push(current_level);
             current_level = next_level;
         }
-        
+
         self.root = Some(current_level[0]);
         current_level[0]
     }
@@ -419,7 +431,6 @@ impl Default for CommitmentTree {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chunking::ComputationType;
 
     fn make_test_proof(id: u64) -> ChunkProof {
         ChunkProof {
@@ -434,11 +445,11 @@ mod tests {
     #[test]
     fn test_aggregator_basic() {
         let mut aggregator = ProofAggregator::new();
-        
+
         for i in 0..4 {
             aggregator.add_proof(make_test_proof(i));
         }
-        
+
         let ids = aggregator.aggregate_all();
         assert!(!ids.is_empty());
     }
@@ -446,14 +457,14 @@ mod tests {
     #[test]
     fn test_commitment_tree() {
         let mut tree = CommitmentTree::new();
-        
+
         for i in 0..4 {
             tree.add_leaf([i as u8; 32]);
         }
-        
+
         let root = tree.build();
         assert_ne!(root, [0; 32]);
-        
+
         let proof = tree.proof(0);
         assert!(proof.is_some());
     }
@@ -461,11 +472,11 @@ mod tests {
     #[test]
     fn test_verify_aggregation() {
         let mut aggregator = ProofAggregator::new();
-        
+
         for i in 0..4 {
             aggregator.add_proof(make_test_proof(i));
         }
-        
+
         let agg = aggregator.aggregate_single().unwrap();
         assert!(aggregator.verify(&agg));
     }

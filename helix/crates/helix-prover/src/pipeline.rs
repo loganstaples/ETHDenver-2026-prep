@@ -179,10 +179,15 @@ impl<C: Circuit<Fr> + Clone> ProverPipeline<C> {
     ///
     /// This provides better performance for large batches.
     #[cfg(feature = "parallel")]
-    pub fn prove_batch_parallel(&self, circuits: &[C], public_inputs: &[Vec<Fr>]) -> Vec<Vec<u8>> {
+    pub fn prove_batch_parallel(&self, circuits: &[C], public_inputs: &[Vec<Fr>]) -> Vec<Vec<u8>>
+    where
+        C: Send + Sync,
+    {
         use rayon::prelude::*;
 
-        circuits.par_iter().zip(public_inputs.par_iter())
+        let pairs: Vec<(&C, &Vec<Fr>)> = circuits.iter().zip(public_inputs.iter()).collect();
+
+        pairs.par_iter()
             .map(|(circuit, pi)| {
                 let pi_refs: Vec<&[Fr]> = vec![pi.as_slice()];
                 self.prove(circuit, &pi_refs)
