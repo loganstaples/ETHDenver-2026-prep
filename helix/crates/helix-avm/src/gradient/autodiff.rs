@@ -42,6 +42,45 @@ pub enum Operation {
     Mean(NodeIndex),
     /// Layer Normalization (input, gamma, beta)
     LayerNorm(NodeIndex, Option<NodeIndex>, Option<NodeIndex>),
+    /// 1D Convolution: Conv1d(input, kernel, stride, padding)
+    Conv1d {
+        input: NodeIndex,
+        kernel: NodeIndex,
+        stride: usize,
+        padding: usize,
+    },
+    /// 2D Convolution: Conv2d(input, kernel, stride, padding, dilation, groups)
+    Conv2d {
+        input: NodeIndex,
+        kernel: NodeIndex,
+        stride: (usize, usize),
+        padding: (usize, usize),
+        dilation: (usize, usize),
+        groups: usize,
+    },
+    /// Max pooling 2D with indices for backward
+    MaxPool2d {
+        input: NodeIndex,
+        kernel_size: (usize, usize),
+        stride: (usize, usize),
+        padding: (usize, usize),
+        /// Indices of max elements for backward pass
+        indices: Vec<usize>,
+    },
+    /// Average pooling 2D
+    AvgPool2d {
+        input: NodeIndex,
+        kernel_size: (usize, usize),
+        stride: (usize, usize),
+        padding: (usize, usize),
+    },
+    /// Depthwise 2D convolution
+    DepthwiseConv2d {
+        input: NodeIndex,
+        kernel: NodeIndex,
+        stride: (usize, usize),
+        padding: (usize, usize),
+    },
 }
 
 /// Metadata for a node in the computation graph.
@@ -206,13 +245,206 @@ impl Variable {
     }
     
     pub fn relu(&self) -> Variable {
-         let result = self.tensor.clone(); // Dummy activation
+         let result = crate::ops::relu(&self.tensor);
          let op = if let (Some(idx), Some(_)) = (self.node_index, &self.tape) {
              Operation::Relu(idx)
          } else {
              Operation::Input
          };
          Self::with_op(result, op, self.tape.clone())
+    }
+
+    /// 1D convolution with kernel.
+    pub fn conv1d(&self, kernel: &Variable, stride: usize, padding: usize) -> Variable {
+        let precision = helix_core::types::Precision::F32;
+
+        let result = crate::ops::conv1d(&self.tensor, &kernel.tensor, stride, padding, precision)
+            .expect("Conv1d shape mismatch in Variable::conv1d");
+
+        let tape = merge_tapes(&self.tape, &kernel.tape);
+        let op = if let (Some(input_idx), Some(kernel_idx), Some(_)) =
+            (self.node_index, kernel.node_index, &tape)
+        {
+            Operation::Conv1d {
+                input: input_idx,
+                kernel: kernel_idx,
+                stride,
+                padding,
+            }
+        } else {
+            Operation::Input
+        };
+
+        Self::with_op(result, op, tape)
+    }
+
+    /// 2D convolution with kernel.
+    pub fn conv2d(
+        &self,
+        kernel: &Variable,
+        stride: (usize, usize),
+        padding: (usize, usize),
+    ) -> Variable {
+        self.conv2d_with_config(kernel, stride, padding, (1, 1), 1)
+    }
+
+    /// 2D convolution with full configuration.
+    pub fn conv2d_with_config(
+        &self,
+        kernel: &Variable,
+        stride: (usize, usize),
+        padding: (usize, usize),
+        dilation: (usize, usize),
+        groups: usize,
+    ) -> Variable {
+        let precision = helix_core::types::Precision::F32;
+
+        let config = crate::ops::Conv2dConfig {
+            stride,
+            padding,
+            dilation,
+            groups,
+        };
+
+        let result = crate::ops::conv2d_with_config(&self.tensor, &kernel.tensor, config, precision)
+            .expect("Conv2d shape mismatch in Variable::conv2d");
+
+        let tape = merge_tapes(&self.tape, &kernel.tape);
+        let op = if let (Some(input_idx), Some(kernel_idx), Some(_)) =
+            (self.node_index, kernel.node_index, &tape)
+        {
+            Operation::Conv2d {
+                input: input_idx,
+                kernel: kernel_idx,
+                stride,
+                padding,
+                dilation,
+                groups,
+            }
+        } else {
+            Operation::Input
+        };
+
+        Self::with_op(result, op, tape)
+    }
+
+    /// Max pooling 2D.
+    pub fn max_pool2d(
+        &self,
+        kernel_size: (usize, usize),
+        stride: (usize, usize),
+        padding: (usize, usize),
+    ) -> Variable {
+        let config = crate::ops::Pool2dConfig {
+            kernel_size,
+            stride,
+            padding,
+        };
+
+        let pool_result = crate::ops::max_pool2d(&self.tensor, config)
+            .expect("MaxPool2d failed in Variable::max_pool2d");
+
+        let op = if let (Some(idx), Some(_)) = (self.node_index, &self.tape) {
+            Operation::MaxPool2d {
+                input: idx,
+                kernel_size,
+                stride,
+                padding,
+                indices: pool_result.indices.clone(),
+            }
+        } else {
+            Operation::Input
+        };
+
+        Self::with_op(pool_result.output, op, self.tape.clone())
+    }
+
+    /// Average pooling 2D.
+    pub fn avg_pool2d(
+        &self,
+        kernel_size: (usize, usize),
+        stride: (usize, usize),
+        padding: (usize, usize),
+    ) -> Variable {
+        let precision = helix_core::types::Precision::F32;
+        let config = crate::ops::Pool2dConfig {
+            kernel_size,
+            stride,
+            padding,
+        };
+
+        let result = crate::ops::avg_pool2d(&self.tensor, config, precision)
+            .expect("AvgPool2d failed in Variable::avg_pool2d");
+
+        let op = if let (Some(idx), Some(_)) = (self.node_index, &self.tape) {
+            Operation::AvgPool2d {
+                input: idx,
+                kernel_size,
+                stride,
+                padding,
+            }
+        } else {
+            Operation::Input
+        };
+
+        Self::with_op(result, op, self.tape.clone())
+    }
+
+    /// Depthwise 2D convolution.
+    pub fn depthwise_conv2d(
+        &self,
+        kernel: &Variable,
+        stride: (usize, usize),
+        padding: (usize, usize),
+    ) -> Variable {
+        let precision = helix_core::types::Precision::F32;
+
+        let result = crate::ops::depthwise_conv2d(&self.tensor, &kernel.tensor, stride, padding, precision)
+            .expect("DepthwiseConv2d shape mismatch in Variable::depthwise_conv2d");
+
+        let tape = merge_tapes(&self.tape, &kernel.tape);
+        let op = if let (Some(input_idx), Some(kernel_idx), Some(_)) =
+            (self.node_index, kernel.node_index, &tape)
+        {
+            Operation::DepthwiseConv2d {
+                input: input_idx,
+                kernel: kernel_idx,
+                stride,
+                padding,
+            }
+        } else {
+            Operation::Input
+        };
+
+        Self::with_op(result, op, tape)
+    }
+
+    /// Global average pooling.
+    pub fn global_avg_pool2d(&self) -> Variable {
+        let precision = helix_core::types::Precision::F32;
+
+        let result = crate::ops::global_avg_pool2d(&self.tensor, precision)
+            .expect("GlobalAvgPool2d failed in Variable::global_avg_pool2d");
+
+        // Global pooling is just a special case of avg pooling
+        let (h, w) = if self.tensor.ndim() == 4 {
+            (self.tensor.shape()[2], self.tensor.shape()[3])
+        } else {
+            (self.tensor.shape()[1], self.tensor.shape()[2])
+        };
+
+        let op = if let (Some(idx), Some(_)) = (self.node_index, &self.tape) {
+            Operation::AvgPool2d {
+                input: idx,
+                kernel_size: (h, w),
+                stride: (h, w),
+                padding: (0, 0),
+            }
+        } else {
+            Operation::Input
+        };
+
+        Self::with_op(result, op, self.tape.clone())
     }
 }
 

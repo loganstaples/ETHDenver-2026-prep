@@ -1,7 +1,7 @@
 //! Backward pass implementation for automatic differentiation.
 
 use super::autodiff::{GradientTape, NodeIndex, Operation, Variable};
-use crate::ops::matmul;
+use crate::ops::{matmul, conv};
 use helix_core::types::{BoundedTensor, BoundedValue, Precision};
 use std::collections::HashMap;
 
@@ -367,12 +367,141 @@ pub fn backward(loss: &Variable) -> Result<HashMap<NodeIndex, BoundedTensor>, St
                     } else {
                         1.0 / n
                     };
-                    
+
                     let grad_input = BoundedTensor::full(
                         input_val.shape().clone(),
                         BoundedValue::exact(grad_scalar),
                     );
                     accumulate_grad(&mut grads, *input_idx, &grad_input);
+                }
+            }
+            Operation::Conv1d { input, kernel, stride, padding } => {
+                // Backward for 1D convolution
+                let input_node = &tape.nodes[*input];
+                let kernel_node = &tape.nodes[*kernel];
+                let precision = Precision::F32;
+
+                if let (Some(input_val), Some(kernel_val)) = (&input_node.cached_value, &kernel_node.cached_value) {
+                    // dL/dInput
+                    if let Ok(grad_input) = conv::conv1d_backward_input(
+                        &grad_output,
+                        kernel_val,
+                        input_val.shape(),
+                        *stride,
+                        *padding,
+                        precision,
+                    ) {
+                        accumulate_grad(&mut grads, *input, &grad_input);
+                    }
+
+                    // dL/dKernel
+                    if let Ok(grad_kernel) = conv::conv1d_backward_weight(
+                        input_val,
+                        &grad_output,
+                        kernel_val.shape(),
+                        *stride,
+                        *padding,
+                        precision,
+                    ) {
+                        accumulate_grad(&mut grads, *kernel, &grad_kernel);
+                    }
+                }
+            }
+            Operation::Conv2d { input, kernel, stride, padding, dilation: _, groups: _ } => {
+                // Backward for 2D convolution
+                let input_node = &tape.nodes[*input];
+                let kernel_node = &tape.nodes[*kernel];
+                let precision = Precision::F32;
+
+                if let (Some(input_val), Some(kernel_val)) = (&input_node.cached_value, &kernel_node.cached_value) {
+                    // dL/dInput - use transposed convolution
+                    if let Ok(grad_input) = conv::conv2d_backward_input(
+                        &grad_output,
+                        kernel_val,
+                        input_val.shape(),
+                        *stride,
+                        *padding,
+                        precision,
+                    ) {
+                        accumulate_grad(&mut grads, *input, &grad_input);
+                    }
+
+                    // dL/dKernel
+                    if let Ok(grad_kernel) = conv::conv2d_backward_weight(
+                        input_val,
+                        &grad_output,
+                        kernel_val.shape(),
+                        *stride,
+                        *padding,
+                        precision,
+                    ) {
+                        accumulate_grad(&mut grads, *kernel, &grad_kernel);
+                    }
+                }
+            }
+            Operation::MaxPool2d { input, kernel_size, stride: _, padding: _, indices } => {
+                // Backward for max pooling - gradient flows only to max positions
+                let input_node = &tape.nodes[*input];
+
+                if let Some(input_val) = &input_node.cached_value {
+                    let grad_input = conv::max_pool2d_backward(
+                        &grad_output,
+                        indices,
+                        input_val.shape(),
+                    );
+                    accumulate_grad(&mut grads, *input, &grad_input);
+                }
+            }
+            Operation::AvgPool2d { input, kernel_size, stride, padding } => {
+                // Backward for average pooling - gradient is distributed evenly
+                let input_node = &tape.nodes[*input];
+
+                if let Some(input_val) = &input_node.cached_value {
+                    let config = conv::Pool2dConfig {
+                        kernel_size: *kernel_size,
+                        stride: *stride,
+                        padding: *padding,
+                    };
+                    let grad_input = conv::avg_pool2d_backward(
+                        &grad_output,
+                        input_val.shape(),
+                        config,
+                    );
+                    accumulate_grad(&mut grads, *input, &grad_input);
+                }
+            }
+            Operation::DepthwiseConv2d { input, kernel, stride, padding } => {
+                // Backward for depthwise convolution
+                // Depthwise conv is essentially groups=channels, so we can use similar logic
+                let input_node = &tape.nodes[*input];
+                let kernel_node = &tape.nodes[*kernel];
+                let precision = Precision::F32;
+
+                if let (Some(input_val), Some(kernel_val)) = (&input_node.cached_value, &kernel_node.cached_value) {
+                    // For depthwise, each channel is independent
+                    // dL/dInput
+                    if let Ok(grad_input) = conv::conv2d_backward_input(
+                        &grad_output,
+                        kernel_val,
+                        input_val.shape(),
+                        *stride,
+                        *padding,
+                        precision,
+                    ) {
+                        accumulate_grad(&mut grads, *input, &grad_input);
+                    }
+
+                    // dL/dKernel
+                    if let Ok(grad_kernel) = conv::conv2d_backward_weight(
+                        input_val,
+                        &grad_output,
+                        kernel_val.shape(),
+                        *stride,
+                        *padding,
+                        precision,
+                    ) {
+                        accumulate_grad(&mut grads, *kernel, &grad_kernel);
+                    }
                 }
             }
         }
