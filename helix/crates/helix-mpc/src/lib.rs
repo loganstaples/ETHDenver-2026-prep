@@ -8,23 +8,27 @@
 //!
 //! - `sharing`: Additive and Shamir secret sharing for scalars, tensors, and model weights
 //! - `beaver`: Beaver triple generation and pool management for secure multiplication
-//! - `protocols`: Core MPC protocols (secure arithmetic, matrix ops, activations)
+//! - `protocols`: Core MPC protocols (secure arithmetic, matrix ops, activations, aggregation)
 //! - `nn`: Secure neural network layers that operate on secret-shared weights
-//! - `session`: MPC session management and inter-party communication
-//! - `security`: Share commitments, verification, and audit trails
+//! - `session`: MPC session management, key rotation, and channel multiplexing
+//! - `security`: Share commitments, MAC batching, verification, and audit trails
 //! - `integration`: Bridge to helix-node training coordinator
 //! - `field`: Finite field arithmetic for proper MPC (replaces f64)
+//! - `verification`: Formal verification stubs and protocol invariants
+//! - `profiling`: Performance profiling and bottleneck identification
 
 pub mod beaver;
 pub mod error;
 pub mod field;
 pub mod integration;
 pub mod nn;
+pub mod profiling;
 pub mod protocols;
 pub mod security;
 pub mod session;
 pub mod sharing;
 pub mod types;
+pub mod verification;
 
 pub use error::MPCError;
 pub use field::{FieldConfig, FieldElement, FieldShare, FieldSharing, FieldBeaverTriple, FieldSecureMultiply};

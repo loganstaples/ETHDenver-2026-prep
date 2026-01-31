@@ -8,9 +8,11 @@
 //! - `byzantine`: Byzantine fault detection and handling
 
 pub mod audit;
+pub mod batch_commitment;
 pub mod byzantine;
 pub mod commitment;
 pub mod mac;
+pub mod mac_batching;
 pub mod verification;
 
 pub use audit::AuditLog;
@@ -29,4 +31,13 @@ pub use mac::{
 pub use verification::{
     BeaverTripleVerifier, CrossPartyVerifier, OutputVerifier, ShareConsistencyTracker,
     ShareVerifier,
+};
+pub use batch_commitment::{
+    BatchCommitmentConfig, BatchCommitmentGenerator, BatchVerifier, CommitmentBatch,
+    CommitmentEntry, IncrementalHasher, VectorCommitment, VectorProof,
+    VerificationFailure, VerificationStats,
+};
+pub use mac_batching::{
+    BatchMACConfig, BatchMACVerifier, BatchMACStatsSnapshot, BatchVerificationResult,
+    MACFailure, ParallelMACVerifier, StreamingMACVerifier,
 };

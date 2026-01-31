@@ -23,8 +23,14 @@
 
 pub mod channel;
 pub mod establishment;
+pub mod key_rotation;
 pub mod manager;
+pub mod multiplexer;
 pub mod network;
+pub mod party_selection;
+
+#[cfg(test)]
+mod integration_tests;
 
 pub use channel::{LocalChannel, MPCChannel, Message, MessageType};
 pub use establishment::{
@@ -33,3 +39,15 @@ pub use establishment::{
 };
 pub use manager::MPCSession;
 pub use network::{AsyncMPCChannel, ConnectionState, NetworkChannel, NetworkConfig, TlsConfig};
+pub use key_rotation::{
+    KeyRotationConfig, KeyRotationManager, KeyRotationStats, PFSManager,
+    RotationMessage, RotationState, VersionedKey,
+};
+pub use multiplexer::{
+    BatchedMessage, MessageAggregator, MultiplexedChannel, MultiplexerConfig,
+    MultiplexerStats, StreamId, StreamMessage, StreamStats,
+};
+pub use party_selection::{
+    HeartbeatMessage, PartyMetricsSummary, PartySelector, RoundRobinSelector,
+    SelectionConfig,
+};

@@ -15,8 +15,10 @@
 //! - `comparison`: Secure comparison and sign computation
 //! - `normalization`: Layer normalization and batch normalization
 //! - `reshare`: Periodic share refreshing
+//! - `aggregation`: Secure gradient aggregation with compression
 
 pub mod activation;
+pub mod aggregation;
 pub mod arithmetic;
 pub mod comparison;
 pub mod matmul;
@@ -24,6 +26,11 @@ pub mod normalization;
 pub mod reshare;
 
 pub use activation::SecureActivation;
+pub use aggregation::{
+    AggregationConfig, AggregationContribution, AggregationResult, AggregationStatsSnapshot,
+    CompressedGradient, CompressionConfig, DropoutTolerantAggregator, GradientCompressor,
+    SecureAggregator, WeightedAggregator,
+};
 pub use arithmetic::SecureArithmetic;
 pub use comparison::{
     BitDecomposition, ComparisonConfig, GarbledComparison, SecureComparison, SecureReLUWithGradient,

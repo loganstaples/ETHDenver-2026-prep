@@ -750,6 +750,7 @@ mod tests {
 
         let scaled = a.scale(&config.from_f64(2.0));
         // Note: scaling in fixed-point needs adjustment
-        assert!(scaled.value > a.value); // At least verify it grew
+        // Verify scaled value is larger by converting to f64
+        assert!(config.to_f64(&scaled.value) > config.to_f64(&a.value));
     }
 }

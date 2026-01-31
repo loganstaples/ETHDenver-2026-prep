@@ -24,6 +24,7 @@
 pub mod dealer;
 pub mod distributed;
 pub mod ot;
+pub mod pipeline;
 pub mod pool;
 pub mod triple;
 
@@ -32,3 +33,7 @@ pub use distributed::DistributedTripleGen;
 pub use ot::{OTTripleGenerator, OTSender, OTReceiver, OTExtension, CorrelatedOT};
 pub use pool::BeaverPool;
 pub use triple::{BeaverTriple, MatrixBeaverTriple, VectorBeaverTriple};
+pub use pipeline::{
+    BeaverPipeline, DemandPredictor, GenerationRequest, PipelineBuilder,
+    PipelineConfig, PipelineStats, Priority,
+};

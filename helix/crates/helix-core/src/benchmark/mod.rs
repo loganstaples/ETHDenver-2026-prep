@@ -6,9 +6,17 @@
 //! - Circuit-specific metrics (constraints, proof size)
 //! - Gas cost estimation for on-chain verification
 //! - JSON export for CI/CD integration
+//! - Standardized model architectures for consistent benchmarking
 
 use std::time::{Duration, Instant};
 use std::collections::HashMap;
+
+// Standard model benchmarks
+pub mod standard_models;
+pub use standard_models::{
+    Architecture, BenchmarkComparison, ErrorStats, ModelBenchmarkResult,
+    ModelConfig, ModelSize, StandardBenchmarkSuite, compare_results,
+};
 
 // =============================================================================
 // Statistical Analysis

@@ -91,6 +91,15 @@ pub enum MPCError {
 
     #[error("error bound exceeded: computed {computed}, maximum allowed {maximum}")]
     ErrorBoundExceeded { computed: f64, maximum: f64 },
+
+    #[error("invalid round: expected {expected}, got {got}")]
+    InvalidRound { expected: u64, got: u64 },
+
+    #[error("key rotation error: {0}")]
+    KeyRotationError(String),
+
+    #[error("channel multiplexing error: {0}")]
+    MultiplexError(String),
 }
 
 /// Result type for MPC operations.
