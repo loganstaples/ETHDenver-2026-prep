@@ -1,0 +1,162 @@
+name: Performance Benchmarks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      save_baseline:
+        description: 'Save as new baseline'
+        required: false
+        default: 'false'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  benchmark:
+    name: Run Benchmarks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-bench-
+            ${{ runner.os }}-cargo-
+
+      - name: Cache benchmark baselines
+        uses: actions/cache@v4
+        with:
+          path: target/criterion
+          key: ${{ runner.os }}-criterion-${{ github.ref_name }}
+          restore-keys: |
+            ${{ runner.os }}-criterion-main
+            ${{ runner.os }}-criterion-
+
+      - name: Run benchmarks
+        run: |
+          cd helix/tests
+          cargo bench --bench performance_regression -- \
+            --noplot \
+            --save-baseline ${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || 'main' }}
+        continue-on-error: true
+
+      - name: Compare with baseline (PR only)
+        if: github.event_name == 'pull_request'
+        run: |
+          cd helix/tests
+          if [ -d "../../target/criterion/main" ]; then
+            cargo bench --bench performance_regression -- \
+              --noplot \
+              --baseline main \
+              2>&1 | tee benchmark_comparison.txt
+          else
+            echo "No baseline found for comparison"
+          fi
+        continue-on-error: true
+
+      - name: Check for regressions
+        if: github.event_name == 'pull_request'
+        run: |
+          cd helix/tests
+          if [ -f "benchmark_comparison.txt" ]; then
+            # Check for significant regressions (>10% slower)
+            if grep -q "Performance has regressed" benchmark_comparison.txt; then
+              echo "::warning::Performance regression detected!"
+              cat benchmark_comparison.txt
+            fi
+          fi
+
+      - name: Generate benchmark summary
+        run: |
+          cd helix/tests
+          echo "## Benchmark Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Benchmarks completed for commit: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ -f "benchmark_comparison.txt" ]; then
+            echo "### Comparison with Main Branch" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            cat benchmark_comparison.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ github.sha }}
+          path: |
+            target/criterion
+            helix/tests/benchmark_comparison.txt
+          if-no-files-found: ignore
+          retention-days: 30
+
+  regression-gate:
+    name: Regression Gate
+    needs: benchmark
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Download benchmark results
+        uses: actions/download-artifact@v4
+        with:
+          name: benchmark-results-${{ github.sha }}
+          path: benchmark-results
+        continue-on-error: true
+
+      - name: Check regression threshold
+        run: |
+          if [ -f "benchmark-results/helix/tests/benchmark_comparison.txt" ]; then
+            # Count regressions exceeding 15% threshold
+            REGRESSION_COUNT=$(grep -c "regressed by.*[1-9][5-9]\|[2-9][0-9]" benchmark-results/helix/tests/benchmark_comparison.txt || true)
+
+            if [ "$REGRESSION_COUNT" -gt 0 ]; then
+              echo "::error::$REGRESSION_COUNT benchmarks exceeded 15% regression threshold"
+              exit 1
+            else
+              echo "All benchmarks within acceptable range"
+            fi
+          else
+            echo "No comparison data available"
+          fi
+
+  update-baseline:
+    name: Update Baseline
+    needs: benchmark
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Download benchmark results
+        uses: actions/download-artifact@v4
+        with:
+          name: benchmark-results-${{ github.sha }}
+          path: benchmark-results
+
+      - name: Cache updated baseline
+        uses: actions/cache/save@v4
+        with:
+          path: benchmark-results/target/criterion
+          key: ${{ runner.os }}-criterion-main-${{ github.sha }}

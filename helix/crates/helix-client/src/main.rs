@@ -15,10 +15,14 @@ use tokio::sync::broadcast;
 mod commands;
 mod config;
 mod dashboard;
+mod demo;
+mod help;
 mod orchestrator;
 mod progress;
 mod health;
 mod benchmark;
+mod visualization;
+mod wallet;
 
 use commands::{
     init::InitCommand,
@@ -95,6 +99,12 @@ enum Commands {
 
     /// Watch and reload configuration
     Watch(WatchArgs),
+
+    /// Launch interactive training visualization
+    Visualize(VisualizeArgs),
+
+    /// Show detailed help for a topic or command
+    Help(HelpArgs),
 }
 
 // ============================================================================
@@ -394,6 +404,40 @@ struct WatchArgs {
     on_change: String,
 }
 
+#[derive(Args)]
+struct VisualizeArgs {
+    /// Demo scenario to visualize
+    #[arg(value_enum, default_value = "quick")]
+    scenario: DemoScenario,
+
+    /// Number of worker nodes
+    #[arg(short, long, default_value = "5")]
+    workers: u32,
+
+    /// Number of training rounds
+    #[arg(short, long, default_value = "10")]
+    rounds: u32,
+
+    /// Refresh rate in milliseconds
+    #[arg(long, default_value = "100")]
+    refresh_rate: u64,
+
+    /// Start visualization without running demo (attach to existing)
+    #[arg(long)]
+    attach: bool,
+}
+
+#[derive(Args)]
+struct HelpArgs {
+    /// Topic or command to get help for
+    #[arg(default_value = "")]
+    topic: String,
+
+    /// Show quick reference card
+    #[arg(long)]
+    quick: bool,
+}
+
 // ============================================================================
 // Main Entry Point
 // ============================================================================
@@ -430,6 +474,8 @@ async fn main() -> Result<()> {
         Commands::Benchmark(args) => cmd_benchmark(args, &cli).await,
         Commands::Logs(args) => cmd_logs(args, &cli, shutdown_tx.subscribe()).await,
         Commands::Watch(args) => cmd_watch(args, &cli, shutdown_tx.subscribe()).await,
+        Commands::Visualize(args) => cmd_visualize(args, &cli, shutdown_tx.subscribe()).await,
+        Commands::Help(args) => cmd_help(args, &cli).await,
     };
 
     if let Err(e) = result {
@@ -472,29 +518,25 @@ async fn cmd_init(args: &InitArgs, cli: &Cli) -> Result<()> {
         .join(".helix");
     std::fs::create_dir_all(&config_dir)?;
 
-    // Generate default config
-    let config = config::HelixConfig {
-        node: config::NodeConfig {
-            name: name.clone(),
-            network: args.network.clone(),
-            data_dir: config_dir.join("data"),
-            capabilities: if args.aggregator {
-                vec!["train".into(), "aggregate".into(), "prove".into()]
-            } else {
-                vec!["train".into(), "prove".into()]
-            },
-        },
-        network: config::NetworkConfig {
-            listen_addr: "0.0.0.0:9000".into(),
-            bootstrap_nodes: vec![],
-            enable_mdns: true,
-        },
-        training: config::TrainingConfig {
-            batch_size: 32,
-            learning_rate: 0.001,
-            max_rounds: 100,
-        },
+    // Determine profile from network argument
+    let profile = match args.network.as_str() {
+        "local" | "dev" => config::ConfigProfile::Local,
+        "anvil" => config::ConfigProfile::Anvil,
+        "sepolia" | "testnet" => config::ConfigProfile::Sepolia,
+        "mainnet" => config::ConfigProfile::Mainnet,
+        _ => config::ConfigProfile::Local,
     };
+
+    // Generate config from profile
+    let mut config = config::HelixConfig::from_profile(profile);
+
+    // Override with CLI arguments
+    config.node.name = name.clone();
+    config.node.data_dir = config_dir.join("data");
+    if args.aggregator {
+        config.node.capabilities = vec!["train".into(), "aggregate".into(), "prove".into()];
+        config.node.role = config::NodeRole::Aggregator;
+    }
 
     // Write config file
     let config_path = cli.config.clone();
@@ -506,7 +548,7 @@ async fn cmd_init(args: &InitArgs, cli: &Cli) -> Result<()> {
     println!("\n{}", "Configuration:".cyan().bold());
     println!("  Config file: {}", config_path.display());
     println!("  Data directory: {}", config_dir.join("data").display());
-    println!("  Network: {}", args.network);
+    println!("  Network: {} ({})", args.network, profile.name());
 
     if args.generate_wallet {
         progress.start_spinner("Generating wallet...");
@@ -703,92 +745,36 @@ async fn cmd_export(args: &ExportArgs, _cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_demo(args: &DemoArgs, _cli: &Cli, mut shutdown: broadcast::Receiver<()>) -> Result<()> {
-    println!("{}", "═".repeat(60).cyan());
-    println!("{}", " HELIX Demo - Trustless Distributed ML Training".cyan().bold());
-    println!("{}", "═".repeat(60).cyan());
+async fn cmd_demo(args: &DemoArgs, _cli: &Cli, shutdown: broadcast::Receiver<()>) -> Result<()> {
+    use demo::{DemoScenarioType, DemoBuilder};
 
-    let scenario_name = match args.scenario {
-        DemoScenario::Quick => "Quick Demo",
-        DemoScenario::FullTraining => "Full Training Demo",
-        DemoScenario::Slashing => "Slashing Demo",
-        DemoScenario::MultiModel => "Multi-Model Demo",
-        DemoScenario::FaultTolerance => "Fault Tolerance Demo",
+    // Map CLI scenario to demo module scenario type
+    let scenario = match args.scenario {
+        DemoScenario::Quick => DemoScenarioType::Quick,
+        DemoScenario::FullTraining => DemoScenarioType::FullTraining,
+        DemoScenario::Slashing => DemoScenarioType::Slashing,
+        DemoScenario::MultiModel => DemoScenarioType::MultiModel,
+        DemoScenario::FaultTolerance => DemoScenarioType::FaultTolerance,
     };
 
-    println!("\n{} {}", "Scenario:".yellow(), scenario_name);
-    println!("{} {} workers", "Workers:".yellow(), args.workers);
-    println!("{} {} rounds ({} seconds each)", "Rounds:".yellow(), args.rounds, args.round_duration);
+    // Build the demo runner with CLI arguments
+    let runner = DemoBuilder::new()
+        .scenario(scenario)
+        .workers(args.workers)
+        .rounds(args.rounds)
+        .round_duration(Duration::from_secs(args.round_duration))
+        .headless(args.headless)
+        .build();
 
-    let mut progress = ProgressDisplay::new();
+    // Run the demo
+    let results = runner.run(shutdown).await?;
 
-    // Phase 1: Setup
-    println!("\n{}", "Phase 1: Network Setup".green().bold());
-
-    if !args.skip_deploy {
-        progress.start_spinner("Deploying smart contracts...");
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        progress.finish_spinner("Contracts deployed");
-    }
-
-    progress.start_spinner("Registering model on-chain...");
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    progress.finish_spinner("Model registered (ID: 0)");
-
-    progress.start_spinner(&format!("Starting {} worker nodes...", args.workers));
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    progress.finish_spinner(&format!("{} workers started", args.workers));
-
-    progress.start_spinner("Waiting for peer discovery...");
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    progress.finish_spinner("All peers discovered");
-
-    // Phase 2: Staking
-    println!("\n{}", "Phase 2: Staking".green().bold());
-    for i in 0..args.workers {
-        progress.start_spinner(&format!("Worker {} staking 0.5 ETH...", i + 1));
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        progress.finish_spinner(&format!("Worker {} staked", i + 1));
-    }
-
-    // Phase 3: Training
-    println!("\n{}", "Phase 3: Training Rounds".green().bold());
-
-    let pb = indicatif::ProgressBar::new(args.rounds as u64);
-    pb.set_style(
-        indicatif::ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} rounds ({eta})")?
-            .progress_chars("#>-"),
-    );
-
-    for round in 0..args.rounds {
-        // Check for shutdown
-        if shutdown.try_recv().is_ok() {
-            pb.abandon_with_message("Demo interrupted");
-            return Ok(());
+    // Export results if verbose
+    if !args.headless {
+        if let Ok(json) = results.to_json() {
+            tracing::debug!("Demo results: {}", json);
         }
-
-        pb.set_message(format!("Round {}", round + 1));
-
-        // Simulate round phases
-        tokio::time::sleep(Duration::from_millis(500)).await; // Training
-        tokio::time::sleep(Duration::from_millis(300)).await; // Aggregation
-        tokio::time::sleep(Duration::from_millis(200)).await; // Proof
-
-        pb.inc(1);
     }
-
-    pb.finish_with_message("Training complete!");
-
-    // Phase 4: Results
-    println!("\n{}", "Phase 4: Results".green().bold());
-    println!("  Rounds Completed:    {}", args.rounds);
-    println!("  Proofs Verified:     {}", args.rounds * args.workers);
-    println!("  Final Error Bound:   23.5");
-    println!("  Total Time:          {}s", args.rounds as u64 * args.round_duration / 10);
-
-    println!("\n{}", "Demo completed successfully!".green().bold());
-    println!("View the dashboard at: http://localhost:3000");
 
     Ok(())
 }
@@ -1148,6 +1134,51 @@ async fn cmd_watch(args: &WatchArgs, _cli: &Cli, mut shutdown: broadcast::Receiv
             }
         }
     }
+
+    Ok(())
+}
+
+async fn cmd_help(args: &HelpArgs, _cli: &Cli) -> Result<()> {
+    let help_system = help::HelpSystem::new();
+
+    if args.quick {
+        help::print_quick_reference();
+    } else if args.topic.is_empty() {
+        help_system.print_general_help();
+    } else {
+        // Check if it's a command or a topic
+        let topic = args.topic.to_lowercase();
+        match topic.as_str() {
+            "init" | "join" | "status" | "query" | "export" | "demo" |
+            "orchestrate" | "health" | "visualize" | "dashboard" |
+            "benchmark" | "logs" | "watch" => {
+                help_system.print_command_help(&topic);
+            }
+            _ => {
+                help_system.print_topic_help(&topic);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn cmd_visualize(args: &VisualizeArgs, _cli: &Cli, shutdown: broadcast::Receiver<()>) -> Result<()> {
+    use visualization::VisualizationRunner;
+
+    // Create and configure visualization runner
+    let mut runner = VisualizationRunner::new()?;
+
+    // Configure based on args
+    {
+        let state = runner.state_mut();
+        state.total_rounds = args.rounds as u64;
+        state.total_workers = args.workers;
+        state.active_workers = args.workers;
+    }
+
+    // Run visualization
+    runner.run(shutdown).await?;
 
     Ok(())
 }
