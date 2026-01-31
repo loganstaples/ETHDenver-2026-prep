@@ -117,8 +117,16 @@ impl TensorShare {
     }
 
     /// Scalar multiplication by f64 (convenience method).
+    /// Uses fixed-point multiplication since scalar is converted to fixed-point representation.
     pub fn scale_f64(&self, scalar: f64) -> TensorShare {
-        self.scale(&Fr::from_f64(scalar))
+        let scalar_fr = Fr::from_f64(scalar);
+        // Use fixed_mul since both values are in fixed-point format
+        let data: Vec<Fr> = self.data.iter().map(|v| v.fixed_mul(&scalar_fr)).collect();
+        let scalar_f64 = scalar.abs();
+        let mut result = TensorShare::new(self.id.clone(), data, self.shape.clone());
+        result.sharing_error = self.sharing_error * scalar_f64;
+        result.original_error = self.original_error * scalar_f64;
+        result
     }
 
     /// Transposes a 2D tensor share.

@@ -9,29 +9,44 @@
 //! - **Polynomial evaluation**: Multilinear extension evaluation
 //! - **Sumcheck**: Parallel partial sum computation
 //! - **Matrix operations**: Optimized for neural network circuits
+//! - **MSM**: Multi-scalar multiplication using Pippenger's algorithm
+//! - **NTT**: Number-theoretic transform for polynomial operations
 //!
 //! ## Usage
 //!
 //! ```ignore
-//! use helix_prover::metal::{MetalDevice, MetalAccelerator};
+//! use helix_prover::metal::{MetalDevice, MsmEngine, NttEngine};
 //!
-//! let device = MetalDevice::new()?;
-//! let accelerator = MetalAccelerator::new(&device)?;
+//! // MSM computation
+//! let mut msm = MsmEngine::new();
+//! let result = msm.compute(&points, &scalars)?;
 //!
-//! let result = accelerator.batch_multiply(&a, &b)?;
+//! // NTT computation
+//! let mut ntt = NttEngine::new();
+//! ntt.forward(&mut coefficients)?;
+//! ntt.inverse(&mut coefficients)?;
 //! ```
 
 pub mod device;
 pub mod field_ops;
+pub mod msm;
+pub mod ntt;
 
 // Conditional compilation for Metal
 #[cfg(all(target_os = "macos", feature = "metal"))]
 pub mod shaders;
 
-pub use device::{MetalDevice, MetalDeviceInfo, MetalError, MetalResult};
+pub use device::{MetalDevice, MetalDeviceInfo, MetalError, MetalResult, BufferPool};
 pub use field_ops::{
     MetalFieldOps, MetalPolynomialOps, MetalSumcheckAccelerator,
     BatchFieldOperation, FieldOpType,
+};
+pub use msm::{
+    MetalMsm, MsmEngine, MsmConfig, MsmStats,
+    AffinePoint, ProjectivePoint, Scalar,
+};
+pub use ntt::{
+    MetalNtt, NttEngine, NttConfig, NttStats, TwiddleFactors,
 };
 
 use super::gkr::FieldElement;

@@ -393,7 +393,8 @@ impl ModelSharing {
                 });
             }
             for (w, g) in embed.data.iter_mut().zip(&grad.data) {
-                let scaled_grad = Fr::mul(&lr_fr, g);
+                // Use fixed_mul since both lr_fr and g are in fixed-point format
+                let scaled_grad = lr_fr.fixed_mul(g);
                 *w = Fr::sub(w, &scaled_grad);
             }
         }
@@ -409,7 +410,8 @@ impl ModelSharing {
                         });
                     }
                     for (w, g) in weight.data.iter_mut().zip(&grad.data) {
-                        let scaled_grad = Fr::mul(&lr_fr, g);
+                        // Use fixed_mul since both lr_fr and g are in fixed-point format
+                        let scaled_grad = lr_fr.fixed_mul(g);
                         *w = Fr::sub(w, &scaled_grad);
                     }
                 }
@@ -425,7 +427,8 @@ impl ModelSharing {
                 });
             }
             for (w, g) in lm.data.iter_mut().zip(&grad.data) {
-                let scaled_grad = Fr::mul(&lr_fr, g);
+                // Use fixed_mul since both lr_fr and g are in fixed-point format
+                let scaled_grad = lr_fr.fixed_mul(g);
                 *w = Fr::sub(w, &scaled_grad);
             }
         }

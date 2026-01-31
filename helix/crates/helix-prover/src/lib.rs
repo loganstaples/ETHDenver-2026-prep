@@ -13,13 +13,20 @@
 //! - **provers**: Specialized provers for different circuit types
 //! - **gkr**: Orion-style ZK-GKR prover for neural network circuits
 //! - **metal**: Metal GPU acceleration (macOS)
+//! - **cuda**: CUDA GPU acceleration (NVIDIA)
+//! - **gpu**: Unified GPU infrastructure (memory pools, async ops, multi-GPU)
 //! - **backends**: Unified prover backend abstraction
+//! - **benchmarks**: GPU vs CPU performance benchmarking
 
 pub mod aggregation;
 pub mod backends;
+pub mod benchmarks;
 pub mod cache;
 pub mod chunking;
+#[cfg(feature = "cuda")]
+pub mod cuda;
 pub mod gkr;
+pub mod gpu;
 pub mod ivc;
 pub mod keys;
 pub mod metal;
@@ -56,6 +63,26 @@ pub use backends::{
 
 // Re-export Metal types
 pub use metal::{MetalConfig, MetalStats, is_metal_available, get_device_info};
+
+// Re-export GPU infrastructure types
+pub use gpu::{
+    GpuBackendType, GpuConfig,
+    GpuMemoryPool, PooledBuffer, PoolConfig, PoolStats,
+    AsyncOpQueue, AsyncOp, OpHandle, OpStatus, SyncBarrier,
+    MultiGpuManager, DeviceSelector, WorkDistributor, LoadBalanceStrategy,
+};
+
+// Re-export GPU prover types
+pub use provers::gpu_prover::{GpuBackend, GpuProver, GpuError, ProfilingInfo, GpuStatsSnapshot};
+
+// Re-export benchmark types
+pub use benchmarks::{
+    Benchmark, BenchmarkConfig, BenchmarkResult, BenchmarkSuite,
+    MsmBenchmark, NttBenchmark, ProofGenBenchmark,
+    // Profiler types
+    GpuProfiler, ProfiledOp, ProfileReport, OpGuard, OpStats,
+    OpType, Backend as ProfilerBackend, global_profiler,
+};
 pub use chunking::{ChunkId, ChunkingConfig, ComputationChunk, ComputationChunker};
 pub use ivc::{IVCConfig, IVCProver, IVCState, IVCStep};
 pub use keys::{FileKeyStore, InMemoryKeyStore, KeyId, KeyMetadata};
@@ -81,5 +108,9 @@ pub mod prelude {
         GKRProver, GKRVerifier, GKRProof, GKRConfig, LayeredCircuit,
         // Backend types
         UnifiedProver, BackendType, ProofData,
+        // GPU types
+        GpuProver, GpuBackendType, GpuConfig,
+        // Benchmark and profiling types
+        BenchmarkSuite, BenchmarkResult, GpuProfiler, global_profiler,
     };
 }

@@ -29,6 +29,12 @@
 //! the values being processed. This prevents timing attacks that could leak
 //! information about secret shares.
 //!
+//! # Metal/GPU Acceleration
+//!
+//! The field implementation uses `halo2curves::bn256::Fr` internally, which
+//! allows compatibility with Metal-accelerated batch operations in helix-prover.
+//! The `batch` submodule provides operations that can be accelerated.
+//!
 //! # Example
 //!
 //! ```rust
@@ -47,12 +53,16 @@
 //! println!("product = {}", product.to_f64());
 //! ```
 
-pub mod bn254;
+// Legacy implementation kept for reference/fallback
+mod bn254;
 pub mod constant_time;
 pub mod ops;
+pub mod unified;
 
-// Re-export main types
-pub use bn254::Fr;
+// Re-export main types from unified (halo2curves-backed) implementation
+pub use unified::Fr;
+pub use unified::batch;
+pub use unified::{FIXED_POINT_SCALE, FIXED_POINT_SCALE_BITS, HALF_MODULUS, MODULUS};
 pub use constant_time::{
     ct_assign_array, ct_assign_u64, ct_eq_array, ct_eq_u64, ct_ge_array, ct_ge_u64, ct_gt_u64,
     ct_le_u64, ct_lt_array, ct_lt_u64, ct_swap_array, ct_swap_u64, CtChoice, SecureBuffer,
@@ -66,9 +76,6 @@ pub use ops::{
 
 /// Type alias for field element (for clarity in MPC code).
 pub type FieldElement = Fr;
-
-/// BN254 scalar field modulus.
-pub const MODULUS: [u64; 4] = bn254::MODULUS;
 
 /// Creates a field element from a u64.
 #[inline]

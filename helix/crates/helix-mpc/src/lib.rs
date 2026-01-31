@@ -16,6 +16,7 @@
 //! - `field`: Finite field arithmetic for proper MPC (replaces f64)
 //! - `verification`: Formal verification stubs and protocol invariants
 //! - `profiling`: Performance profiling and bottleneck identification
+//! - `proofs`: MPC-specific ZK proofs (share validity, aggregation, MAC verification)
 
 pub mod beaver;
 pub mod error;
@@ -23,6 +24,7 @@ pub mod field;
 pub mod integration;
 pub mod nn;
 pub mod profiling;
+pub mod proofs;
 pub mod protocols;
 pub mod security;
 pub mod session;

@@ -4,7 +4,7 @@
 //! commonly needed in MPC protocols, including batch operations, vector
 //! operations, and matrix operations.
 
-use super::bn254::Fr;
+use super::unified::Fr;
 use super::constant_time::CtChoice;
 use rand::RngCore;
 use zeroize::Zeroize;

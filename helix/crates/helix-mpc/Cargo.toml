@@ -4,8 +4,22 @@ version = "0.1.0"
 edition = "2021"
 description = "Multi-Party Computation engine for HELIX trustless AI training"
 
+[features]
+default = ["parallel"]
+parallel = ["rayon"]
+metal = ["helix-prover/metal"]
+
 [dependencies]
 helix-core = { path = "../helix-core" }
+helix-prover = { path = "../helix-prover" }
+helix-circuits = { path = "../helix-circuits" }
+
+# Halo2 for ZK proof types and unified Fr
+halo2_proofs = "0.3.0"
+halo2curves = "0.7.0"
+
+# Parallelism
+rayon = { version = "1.8", optional = true }
 
 crossbeam-channel = "0.5"
 zeroize = { version = "1.7", features = ["derive"] }
@@ -40,3 +54,8 @@ bytes = "1.5"
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3.10"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "mpc_zk_pipeline"
+harness = false
