@@ -2,10 +2,55 @@
 name = "helix-client"
 version = "0.1.0"
 edition = "2021"
+description = "HELIX CLI client for distributed ML training orchestration"
+
+[[bin]]
+name = "helix"
+path = "src/main.rs"
 
 [dependencies]
 helix-core = { path = "../helix-core" }
-clap = { version = "4.0", features = ["derive"] }
-tokio = { version = "1", features = ["full"] }
+
+# CLI framework
+clap = { version = "4.0", features = ["derive", "env"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full", "signal"] }
+
+# Error handling
 anyhow = "1.0"
+thiserror = "1.0"
+
+# Serialization
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Terminal UI
+indicatif = "0.17"
+console = "0.15"
+colored = "2.0"
+
+# HTTP client/server for health endpoints and dashboard
+reqwest = { version = "0.11", features = ["json"] }
+axum = "0.7"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Configuration
+config = "0.14"
+notify = "6.0"
+
+# Utilities
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.0", features = ["v4", "serde"] }
+futures = "0.3"
+async-trait = "0.1"
+dirs = "5.0"
+
+[dev-dependencies]
+tempfile = "3.0"

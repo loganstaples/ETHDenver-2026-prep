@@ -9,6 +9,8 @@
 //! - **Aggregation**: Byzantine-fault-tolerant gradient aggregation
 //! - **Metrics**: Training metrics and convergence detection
 //! - **Coordination**: Distributed training orchestration with leader election
+//! - **Verification**: Proof verification before gradient aggregation
+//! - **Orchestration**: Multi-node coordination with failure detection
 
 pub mod round;
 pub mod data_loader;
@@ -19,6 +21,8 @@ pub mod metrics;
 pub mod coordinator;
 pub mod session;
 pub mod mpc;
+pub mod orchestrator;
+pub mod verification;
 
 // Re-export key types
 pub use round::{
@@ -65,6 +69,17 @@ pub use mpc::{
     MPCTrainingConfig, MPCTrainingRound, MPCStepResult,
     WorkerComputation, AdversarialDetector, SlashingEvent, SlashingReason,
     model_to_flat, flat_to_model,
+};
+
+pub use orchestrator::{
+    CollectedGradient, OrchestratorConfig, OrchestratorError, OrchestratorEvent,
+    RoundPhase, RoundState as OrchestratorRoundState, TrainingOrchestrator,
+    WorkerState, WorkerStats, WorkerStatus,
+};
+
+pub use verification::{
+    GradientValidator, ProofType, ProofVerifier, ValidationResult,
+    VerificationConfig, VerificationResult, VerificationStats,
 };
 
 /// Convenience type alias for training results.

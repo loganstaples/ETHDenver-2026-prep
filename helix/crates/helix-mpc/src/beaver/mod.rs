@@ -14,12 +14,21 @@
 //!
 //! This works because:
 //!   x*y = (a+d)*(b+e) = ab + ae + db + de = c + ae + db + de
+//!
+//! # Triple Generation Methods
+//!
+//! - `TrustedDealer`: Centralized generation (for testing/demos)
+//! - `DistributedTripleGen`: Simulated distributed generation
+//! - `OTTripleGenerator`: OT-based distributed generation (no trusted party)
 
 pub mod dealer;
 pub mod distributed;
+pub mod ot;
 pub mod pool;
 pub mod triple;
 
 pub use dealer::TrustedDealer;
+pub use distributed::DistributedTripleGen;
+pub use ot::{OTTripleGenerator, OTSender, OTReceiver, OTExtension, CorrelatedOT};
 pub use pool::BeaverPool;
 pub use triple::{BeaverTriple, MatrixBeaverTriple, VectorBeaverTriple};

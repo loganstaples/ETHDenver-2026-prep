@@ -1,0 +1,35 @@
+# Prometheus configuration for HELIX monitoring
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []
+
+rule_files: []
+
+scrape_configs:
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # HELIX Aggregator
+  - job_name: 'helix-aggregator'
+    static_configs:
+      - targets: ['aggregator:9001']
+    metrics_path: /metrics
+    scrape_interval: 5s
+
+  # HELIX Workers
+  - job_name: 'helix-workers'
+    static_configs:
+      - targets:
+          - 'worker1:9001'
+          - 'worker2:9001'
+          - 'worker3:9001'
+    metrics_path: /metrics
+    scrape_interval: 5s

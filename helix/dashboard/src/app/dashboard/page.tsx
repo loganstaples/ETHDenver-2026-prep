@@ -135,7 +135,7 @@ export default function DashboardPage() {
                     <ModelInteraction modelName="helix-llm-7b" />
                 </div>
                 <div className="full-width">
-                    <OnChainExplorer contractAddress="0xHelix...Coordinator" />
+                    <OnChainExplorer />
                 </div>
             </div>
         </div>

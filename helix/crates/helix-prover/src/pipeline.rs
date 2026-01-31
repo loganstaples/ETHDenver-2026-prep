@@ -135,6 +135,89 @@ impl<C: Circuit<Fr> + Clone> ProverPipeline<C> {
     pub fn params(&self) -> &Params<G1Affine> {
         &self.params
     }
+
+    /// Returns the K parameter (circuit size = 2^k rows).
+    pub fn k(&self) -> u32 {
+        self.params.k()
+    }
+
+    /// Checks if the pipeline has been set up.
+    pub fn is_setup(&self) -> bool {
+        self.pk.is_some() && self.vk.is_some()
+    }
+
+    /// Proves multiple circuits in batch, returning individual proofs.
+    ///
+    /// This uses the same proving/verification key for all circuits.
+    /// All circuits must be of the same type and size.
+    pub fn prove_batch(&self, circuits: &[C], public_inputs: &[Vec<Fr>]) -> Vec<Vec<u8>> {
+        assert_eq!(circuits.len(), public_inputs.len(), "Circuit and public input count mismatch");
+
+        circuits.iter().zip(public_inputs.iter())
+            .map(|(circuit, pi)| {
+                let pi_refs: Vec<&[Fr]> = vec![pi.as_slice()];
+                self.prove(circuit, &pi_refs)
+            })
+            .collect()
+    }
+
+    /// Verifies multiple proofs in batch.
+    ///
+    /// Returns a vector of booleans indicating which proofs verified successfully.
+    pub fn verify_batch(&self, proofs: &[Vec<u8>], public_inputs: &[Vec<Fr>]) -> Vec<bool> {
+        assert_eq!(proofs.len(), public_inputs.len(), "Proof and public input count mismatch");
+
+        proofs.iter().zip(public_inputs.iter())
+            .map(|(proof, pi)| {
+                let pi_refs: Vec<&[Fr]> = vec![pi.as_slice()];
+                self.verify(proof, &pi_refs)
+            })
+            .collect()
+    }
+
+    /// Proves multiple circuits in parallel using threads.
+    ///
+    /// This provides better performance for large batches.
+    #[cfg(feature = "parallel")]
+    pub fn prove_batch_parallel(&self, circuits: &[C], public_inputs: &[Vec<Fr>]) -> Vec<Vec<u8>> {
+        use rayon::prelude::*;
+
+        circuits.par_iter().zip(public_inputs.par_iter())
+            .map(|(circuit, pi)| {
+                let pi_refs: Vec<&[Fr]> = vec![pi.as_slice()];
+                self.prove(circuit, &pi_refs)
+            })
+            .collect()
+    }
+}
+
+/// Statistics from a proving session.
+#[derive(Debug, Clone)]
+pub struct ProvingStats {
+    /// Number of proofs generated.
+    pub num_proofs: usize,
+    /// Total proof size in bytes.
+    pub total_proof_size: usize,
+    /// Average proof size in bytes.
+    pub avg_proof_size: usize,
+    /// Number of successful verifications.
+    pub successful_verifications: usize,
+    /// K parameter used.
+    pub k: u32,
+}
+
+impl ProvingStats {
+    /// Creates stats from a batch of proofs.
+    pub fn from_batch(proofs: &[Vec<u8>], k: u32) -> Self {
+        let total_size: usize = proofs.iter().map(|p| p.len()).sum();
+        Self {
+            num_proofs: proofs.len(),
+            total_proof_size: total_size,
+            avg_proof_size: if proofs.is_empty() { 0 } else { total_size / proofs.len() },
+            successful_verifications: 0,
+            k,
+        }
+    }
 }
 
 /// Converts a field element to a decimal string (for Solidity constants).

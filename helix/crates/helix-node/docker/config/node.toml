@@ -1,0 +1,76 @@
+# HELIX Node Configuration
+# This configuration is shared by all nodes
+
+[network]
+# Default listen address (override with HELIX_LISTEN_ADDR)
+listen_addr = "0.0.0.0:9000"
+# Maximum peers
+max_peers = 50
+# Connection timeout (seconds)
+connect_timeout = 10
+# Enable TCP nodelay
+tcp_nodelay = true
+
+[gossip]
+# Number of peers to forward messages to
+fanout = 6
+# Maximum message hops
+max_hops = 10
+# Message cache TTL (seconds)
+message_cache_ttl = 300
+# Gossip interval (ms)
+gossip_interval = 100
+
+[discovery]
+# Enable mDNS for local network discovery
+enable_mdns = true
+# Discovery interval (seconds)
+discovery_interval = 30
+# Peer timeout (seconds)
+peer_timeout = 120
+
+[training]
+# Default learning rate
+learning_rate = 0.001
+# Default batch size
+batch_size = 32
+# Local epochs per round
+local_epochs = 5
+# Maximum error bound
+max_error_bound = 0.1
+
+[verification]
+# Enable proof verification
+enabled = true
+# Verification timeout (seconds)
+timeout = 30
+# Cache verified proofs
+enable_cache = true
+# Cache TTL (seconds)
+cache_ttl = 3600
+
+[orchestrator]
+# Minimum workers for a round
+min_workers = 3
+# Maximum workers per round
+max_workers = 100
+# Collection timeout (seconds)
+collection_timeout = 300
+# Aggregation timeout (seconds)
+aggregation_timeout = 60
+# Heartbeat interval (seconds)
+heartbeat_interval = 10
+# Worker timeout (seconds)
+worker_timeout = 30
+# Maximum failures before exclusion
+max_failures = 3
+# Enable automatic recovery
+auto_recovery = true
+
+[api]
+# API listen address (override with HELIX_API_ADDR)
+listen_addr = "0.0.0.0:9001"
+# Enable metrics endpoint
+enable_metrics = true
+# Enable health endpoint
+enable_health = true

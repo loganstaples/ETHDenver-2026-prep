@@ -2,6 +2,7 @@
 
 pub mod arithmetic;
 pub mod bounds;
+pub mod circuit_bridge;
 pub mod gradient;
 pub mod nn;
 pub mod ops;

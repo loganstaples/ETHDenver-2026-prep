@@ -24,4 +24,11 @@ pub use error::{ArithmeticError, BoundsError, CircuitError, HelixError, HelixRes
 pub use traits::{ApproximateOp, BinarySerializable, Provable, Witness};
 pub use types::{BoundedTensor, BoundedValue, ErrorMargin, Precision, Shape};
 
+// Re-export benchmark types
+pub use benchmark::{
+    BenchmarkConfig, BenchmarkResult, BenchmarkRunner, CircuitBenchmarkResult,
+    GasCosts, MemorySnapshot, OverheadAnalysis, Statistics,
+    run_quick_suite, run_standard_suite,
+};
+
 

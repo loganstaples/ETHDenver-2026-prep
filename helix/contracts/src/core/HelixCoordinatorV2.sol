@@ -70,6 +70,13 @@ contract HelixCoordinatorV2 {
     /// @notice Slash percentage (100 = 1%)
     uint256 public slashPercentage = 5000; // 50%
 
+    /// @notice Maximum allowed error bound per step (in fixed-point units)
+    /// @dev If a proof has error bound higher than this, it's rejected
+    uint256 public maxErrorBound = 1e18; // 1.0 in 18-decimal fixed point
+
+    /// @notice Accumulated error bound per model
+    mapping(uint256 => uint256) public accumulatedErrorBound;
+
     /// @notice Treasury to receive slashed funds
     address public treasury;
 
@@ -267,6 +274,8 @@ contract HelixCoordinatorV2 {
         require(block.timestamp <= round.deadline, "Round expired");
 
         // Validate public inputs (7 inputs for MLTrainingStepCircuit)
+        // [0] = oldHashLo, [1] = oldHashHi, [2] = newHashLo, [3] = newHashHi
+        // [4] = loss, [5] = errorBound, [6] = stepNumber
         require(publicInputs.length == 7, "Invalid public inputs count");
 
         // Reconstruct old commitment from public inputs [0] and [1]
@@ -275,6 +284,10 @@ contract HelixCoordinatorV2 {
             oldCommitmentFromProof == round.modelCommitment,
             "Old commitment mismatch"
         );
+
+        // Validate error bound is within acceptable range
+        uint256 stepErrorBound = publicInputs[5];
+        require(stepErrorBound <= maxErrorBound, "Error bound exceeds maximum");
 
         // Verify the proof
         bool valid = verifier.verifyProof(proof, publicInputs);
@@ -302,6 +315,9 @@ contract HelixCoordinatorV2 {
         round.newCommitment = newCommitment;
         round.isCompleted = true;
         round.prover = msg.sender;
+
+        // Track accumulated error bound for the model
+        accumulatedErrorBound[modelId] += stepErrorBound;
 
         // Reset stake lock (reward for valid submission)
         stakes[msg.sender][modelId].lockedUntil = block.timestamp;
@@ -392,6 +408,22 @@ contract HelixCoordinatorV2 {
         return slashingRecords.length;
     }
 
+    /// @notice Gets the accumulated error bound for a model
+    /// @dev This represents the total numerical error accumulated across all training steps
+    function getAccumulatedErrorBound(uint256 modelId) external view returns (uint256) {
+        return accumulatedErrorBound[modelId];
+    }
+
+    /// @notice Checks if a model's accumulated error is within acceptable limits
+    /// @param modelId The model to check
+    /// @param maxAccumulated Maximum acceptable accumulated error
+    function isModelErrorAcceptable(
+        uint256 modelId,
+        uint256 maxAccumulated
+    ) external view returns (bool) {
+        return accumulatedErrorBound[modelId] <= maxAccumulated;
+    }
+
     // ============ Internal Helpers ============
 
     /// @notice Combines two 128-bit halves into a single commitment
@@ -420,6 +452,20 @@ contract HelixCoordinatorV2 {
     /// @notice Updates the default minimum stake
     function setDefaultMinStake(uint256 _minStake) external onlyOwner {
         defaultMinStake = _minStake;
+    }
+
+    /// @notice Updates the maximum allowed error bound per step
+    function setMaxErrorBound(uint256 _maxErrorBound) external onlyOwner {
+        maxErrorBound = _maxErrorBound;
+    }
+
+    /// @notice Resets accumulated error for a model (e.g., after re-training from scratch)
+    function resetAccumulatedError(uint256 modelId) external {
+        require(
+            msg.sender == models[modelId].owner || msg.sender == owner,
+            "Not authorized"
+        );
+        accumulatedErrorBound[modelId] = 0;
     }
 
     /// @notice Pauses a model

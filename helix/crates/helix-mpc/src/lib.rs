@@ -13,9 +13,11 @@
 //! - `session`: MPC session management and inter-party communication
 //! - `security`: Share commitments, verification, and audit trails
 //! - `integration`: Bridge to helix-node training coordinator
+//! - `field`: Finite field arithmetic for proper MPC (replaces f64)
 
 pub mod beaver;
 pub mod error;
+pub mod field;
 pub mod integration;
 pub mod nn;
 pub mod protocols;
@@ -25,4 +27,5 @@ pub mod sharing;
 pub mod types;
 
 pub use error::MPCError;
+pub use field::{FieldConfig, FieldElement, FieldShare, FieldSharing, FieldBeaverTriple, FieldSecureMultiply};
 pub use types::{MPCConfig, PartyId, ShareId};

@@ -36,6 +36,10 @@ pub use parallel::{BatchProofResult, ChunkProof, ParallelConfig, ParallelProver,
 pub use pipeline::{ExtractedVkData, ProverPipeline};
 pub use provers::step_prover::{MLTrainingStepProof, TrainingStepData, TrainingStepProver};
 pub use provers::training_prover::{MLTrainingProver, TrainingProofResult};
+pub use provers::training_prover_v2::{
+    MLTrainingProverV2, TrainingProofResultV2, BatchTrainingProverV2,
+    BatchProofResult as BatchProofResultV2, TrainingWeights, V2ProverConfig,
+};
 pub use serialization::{ProofFormat, ProofSerializer, SerializedProof};
 
 /// Prelude for convenient imports.
@@ -44,5 +48,7 @@ pub mod prelude {
         ChunkId, ComputationChunker, IVCProver, MLTrainingProver,
         ParallelProver, ProofAggregator, ProofSerializer, ProverPipeline,
         TrainingStepData, TrainingStepProver,
+        // V2 prover types
+        MLTrainingProverV2, BatchTrainingProverV2, TrainingWeights,
     };
 }

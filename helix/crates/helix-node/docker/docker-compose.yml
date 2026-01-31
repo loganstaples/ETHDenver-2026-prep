@@ -1,0 +1,208 @@
+# HELIX 3-Worker Demo Setup
+# This docker-compose configuration sets up a complete HELIX training network
+# with 3 workers, 1 aggregator, and supporting services.
+
+version: '3.8'
+
+services:
+  # Local Ethereum node (Anvil/Hardhat for development)
+  ethereum:
+    image: ghcr.io/foundry-rs/foundry:latest
+    container_name: helix-ethereum
+    command: ["anvil", "--host", "0.0.0.0", "--port", "8545", "--block-time", "2"]
+    ports:
+      - "8545:8545"
+    networks:
+      - helix-net
+    healthcheck:
+      test: ["CMD", "cast", "block-number", "--rpc-url", "http://localhost:8545"]
+      interval: 5s
+      timeout: 5s
+      retries: 3
+
+  # Aggregator node (coordinator)
+  aggregator:
+    build:
+      context: ../../../
+      dockerfile: crates/helix-node/docker/Dockerfile
+    container_name: helix-aggregator
+    environment:
+      - RUST_LOG=info,helix_node=debug
+      - HELIX_NODE_ROLE=aggregator
+      - HELIX_NODE_ID=aggregator-1
+      - HELIX_LISTEN_ADDR=0.0.0.0:9000
+      - HELIX_API_ADDR=0.0.0.0:9001
+      - HELIX_ETH_RPC=http://ethereum:8545
+      - HELIX_ENABLE_MDNS=true
+      - HELIX_MIN_WORKERS=3
+      - HELIX_COLLECTION_TIMEOUT=120
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - aggregator-data:/app/data
+      - aggregator-logs:/app/logs
+      - ./config:/app/config:ro
+    networks:
+      - helix-net
+    depends_on:
+      ethereum:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Worker 1
+  worker1:
+    build:
+      context: ../../../
+      dockerfile: crates/helix-node/docker/Dockerfile
+    container_name: helix-worker1
+    environment:
+      - RUST_LOG=info,helix_node=debug
+      - HELIX_NODE_ROLE=worker
+      - HELIX_NODE_ID=worker-1
+      - HELIX_LISTEN_ADDR=0.0.0.0:9000
+      - HELIX_API_ADDR=0.0.0.0:9001
+      - HELIX_ETH_RPC=http://ethereum:8545
+      - HELIX_AGGREGATOR_ADDR=aggregator:9000
+      - HELIX_ENABLE_MDNS=true
+      - HELIX_CAN_TRAIN=true
+      - HELIX_CAN_PROVE=true
+    volumes:
+      - worker1-data:/app/data
+      - worker1-logs:/app/logs
+      - ./config:/app/config:ro
+    networks:
+      - helix-net
+    depends_on:
+      aggregator:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Worker 2
+  worker2:
+    build:
+      context: ../../../
+      dockerfile: crates/helix-node/docker/Dockerfile
+    container_name: helix-worker2
+    environment:
+      - RUST_LOG=info,helix_node=debug
+      - HELIX_NODE_ROLE=worker
+      - HELIX_NODE_ID=worker-2
+      - HELIX_LISTEN_ADDR=0.0.0.0:9000
+      - HELIX_API_ADDR=0.0.0.0:9001
+      - HELIX_ETH_RPC=http://ethereum:8545
+      - HELIX_AGGREGATOR_ADDR=aggregator:9000
+      - HELIX_ENABLE_MDNS=true
+      - HELIX_CAN_TRAIN=true
+      - HELIX_CAN_PROVE=true
+    volumes:
+      - worker2-data:/app/data
+      - worker2-logs:/app/logs
+      - ./config:/app/config:ro
+    networks:
+      - helix-net
+    depends_on:
+      aggregator:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Worker 3
+  worker3:
+    build:
+      context: ../../../
+      dockerfile: crates/helix-node/docker/Dockerfile
+    container_name: helix-worker3
+    environment:
+      - RUST_LOG=info,helix_node=debug
+      - HELIX_NODE_ROLE=worker
+      - HELIX_NODE_ID=worker-3
+      - HELIX_LISTEN_ADDR=0.0.0.0:9000
+      - HELIX_API_ADDR=0.0.0.0:9001
+      - HELIX_ETH_RPC=http://ethereum:8545
+      - HELIX_AGGREGATOR_ADDR=aggregator:9000
+      - HELIX_ENABLE_MDNS=true
+      - HELIX_CAN_TRAIN=true
+      - HELIX_CAN_PROVE=true
+    volumes:
+      - worker3-data:/app/data
+      - worker3-logs:/app/logs
+      - ./config:/app/config:ro
+    networks:
+      - helix-net
+    depends_on:
+      aggregator:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Monitoring: Prometheus
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: helix-prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    ports:
+      - "9090:9090"
+    networks:
+      - helix-net
+    depends_on:
+      - aggregator
+      - worker1
+      - worker2
+      - worker3
+
+  # Monitoring: Grafana
+  grafana:
+    image: grafana/grafana:latest
+    container_name: helix-grafana
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    ports:
+      - "3000:3000"
+    networks:
+      - helix-net
+    depends_on:
+      - prometheus
+
+networks:
+  helix-net:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.28.0.0/16
+
+volumes:
+  aggregator-data:
+  aggregator-logs:
+  worker1-data:
+  worker1-logs:
+  worker2-data:
+  worker2-logs:
+  worker3-data:
+  worker3-logs:
+  prometheus-data:
+  grafana-data:
