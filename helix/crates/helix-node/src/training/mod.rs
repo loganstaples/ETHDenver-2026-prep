@@ -17,6 +17,8 @@ pub mod checkpoint;
 pub mod aggregation;
 pub mod metrics;
 pub mod coordinator;
+pub mod session;
+pub mod mpc;
 
 // Re-export key types
 pub use round::{
@@ -55,6 +57,16 @@ pub use coordinator::{
     CoordinatorEvent, TrainingCoordinator, PeerInfo, CoordinatorError,
 };
 
+pub use session::{
+    MlpDataset, SessionConfig, SessionResult, ProvedTrainingSession,
+};
+
+pub use mpc::{
+    MPCTrainingConfig, MPCTrainingRound, MPCStepResult,
+    WorkerComputation, AdversarialDetector, SlashingEvent, SlashingReason,
+    model_to_flat, flat_to_model,
+};
+
 /// Convenience type alias for training results.
 pub type TrainingResult<T> = Result<T, TrainingError>;
 
@@ -71,6 +83,8 @@ pub enum TrainingError {
     Aggregation(AggregationError),
     /// Coordinator-related error.
     Coordinator(CoordinatorError),
+    /// MPC-related error.
+    MPC(helix_mpc::MPCError),
     /// IO error.
     Io(std::io::Error),
     /// Custom error message.
@@ -85,6 +99,7 @@ impl std::fmt::Display for TrainingError {
             Self::Checkpoint(e) => write!(f, "Checkpoint error: {}", e),
             Self::Aggregation(e) => write!(f, "Aggregation error: {}", e),
             Self::Coordinator(e) => write!(f, "Coordinator error: {}", e),
+            Self::MPC(e) => write!(f, "MPC error: {}", e),
             Self::Io(e) => write!(f, "IO error: {}", e),
             Self::Custom(msg) => write!(f, "{}", msg),
         }
@@ -120,6 +135,12 @@ impl From<AggregationError> for TrainingError {
 impl From<CoordinatorError> for TrainingError {
     fn from(e: CoordinatorError) -> Self {
         Self::Coordinator(e)
+    }
+}
+
+impl From<helix_mpc::MPCError> for TrainingError {
+    fn from(e: helix_mpc::MPCError) -> Self {
+        Self::MPC(e)
     }
 }
 

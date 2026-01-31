@@ -128,9 +128,15 @@ impl TrainingStepProver {
     }
 
     /// Ensures the ML prover is initialised and returns a reference.
-    fn ensure_ml_prover(&mut self, k: u32) -> &MLTrainingProver {
+    fn ensure_ml_prover(
+        &mut self,
+        k: u32,
+        d_in: usize,
+        d_hid: usize,
+        d_out: usize,
+    ) -> &MLTrainingProver {
         if self.ml_prover.is_none() {
-            self.ml_prover = Some(MLTrainingProver::new(k));
+            self.ml_prover = Some(MLTrainingProver::new(k, d_in, d_hid, d_out));
         }
         self.ml_prover.as_ref().unwrap()
     }
@@ -227,7 +233,7 @@ impl TrainingStepProver {
         self.step_count += 1;
 
         // 1. Build witness and generate ML proof.
-        self.ensure_ml_prover(k);
+        self.ensure_ml_prover(k, data.d_in, data.d_hid, data.d_out);
         let ml_prover = self.ml_prover.as_ref().unwrap();
 
         let witness = MLTrainingProver::build_witness(
@@ -438,7 +444,8 @@ mod tests {
             .expect("prove failed");
 
         // Create a fresh verifier (separate from the prover) and verify.
-        let verifier = MLTrainingProver::new(14);
+        // Dimensions must match the data: 2×2×1
+        let verifier = MLTrainingProver::new(14, 2, 2, 1);
         assert!(verifier.verify_result(&result.ml_proof));
 
         // Tamper with proof and confirm rejection.

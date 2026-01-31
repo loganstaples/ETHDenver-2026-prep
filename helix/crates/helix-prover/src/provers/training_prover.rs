@@ -26,6 +26,7 @@ use helix_circuits::ml::training_step::{
     compute_state_hash, compute_witness, MLTrainingStepCircuit, MLTrainingStepWitness,
     NUM_PUBLIC_INPUTS,
 };
+use helix_circuits::verifier::{SolidityGenerator, VkData};
 
 /// Result of proving a training step.
 #[derive(Debug, Clone)]
@@ -50,34 +51,93 @@ pub struct TrainingProofResult {
 ///
 /// Generates real Halo2 KZG proofs for ML training steps using the
 /// `MLTrainingStepCircuit`.
+///
+/// IMPORTANT: The prover must be initialized with the same model dimensions
+/// that will be used for all subsequent proofs. The Halo2 circuit structure
+/// depends on the dimensions (number of constraints), so you cannot reuse a
+/// prover initialized for one dimension with a different dimension.
 pub struct MLTrainingProver {
     /// Halo2 proving pipeline (params, pk, vk).
     pipeline: ProverPipeline<MLTrainingStepCircuit>,
     /// ReLU lookup table half-range used in the circuit.
     relu_range: usize,
+    /// Model dimensions (d_in, d_hid, d_out).
+    dims: (usize, usize, usize),
 }
 
 impl MLTrainingProver {
-    /// Creates and initialises a new prover.
+    /// Creates and initialises a new prover for a specific model shape.
     ///
-    /// `k` controls the circuit size: 2^k rows.  A value of 14 (16 384 rows)
-    /// comfortably fits a 4×8×2 MLP training step.
-    pub fn new(k: u32) -> Self {
-        Self::with_relu_range(k, 128)
+    /// `k` controls the circuit size: 2^k rows. A value of 14 (16,384 rows)
+    /// comfortably fits models up to about 4×8×2.
+    ///
+    /// `d_in`, `d_hid`, `d_out` are the model dimensions. The prover will
+    /// only work for witnesses with these exact dimensions.
+    pub fn new(k: u32, d_in: usize, d_hid: usize, d_out: usize) -> Self {
+        Self::with_relu_range(k, d_in, d_hid, d_out, 128)
     }
 
     /// Creates a prover with a custom ReLU lookup range.
-    pub fn with_relu_range(k: u32, relu_range: usize) -> Self {
+    pub fn with_relu_range(
+        k: u32,
+        d_in: usize,
+        d_hid: usize,
+        d_out: usize,
+        relu_range: usize,
+    ) -> Self {
         let mut pipeline = ProverPipeline::new(k);
-        let empty = MLTrainingStepCircuit {
-            relu_range,
-            ..Default::default()
+
+        // Create a dummy witness with the correct dimensions for setup.
+        // The actual values don't matter; only the structure does.
+        let dummy_witness = MLTrainingStepWitness {
+            d_in,
+            d_hid,
+            d_out,
+            x: vec![Fr::ZERO; d_in],
+            target: vec![Fr::ZERO; d_out],
+            w1: vec![Fr::ZERO; d_hid * d_in],
+            b1: vec![Fr::ZERO; d_hid],
+            w2: vec![Fr::ZERO; d_out * d_hid],
+            b2: vec![Fr::ZERO; d_out],
+            h_pre: vec![Fr::ZERO; d_hid],
+            h: vec![Fr::ZERO; d_hid],
+            y: vec![Fr::ZERO; d_out],
+            loss: Fr::ZERO,
+            dy: vec![Fr::ZERO; d_out],
+            dw2: vec![Fr::ZERO; d_out * d_hid],
+            db2: vec![Fr::ZERO; d_out],
+            dh: vec![Fr::ZERO; d_hid],
+            relu_mask: vec![Fr::ZERO; d_hid],
+            dh_pre: vec![Fr::ZERO; d_hid],
+            dw1: vec![Fr::ZERO; d_hid * d_in],
+            db1: vec![Fr::ZERO; d_hid],
+            lr: Fr::ONE,
+            w1_new: vec![Fr::ZERO; d_hid * d_in],
+            b1_new: vec![Fr::ZERO; d_hid],
+            w2_new: vec![Fr::ZERO; d_out * d_hid],
+            b2_new: vec![Fr::ZERO; d_out],
+            total_error: Fr::ZERO,
+            old_state_hash: (Fr::ZERO, Fr::ZERO),
+            new_state_hash: (Fr::ZERO, Fr::ZERO),
+            step_number: 0,
         };
-        pipeline.setup(&empty);
+
+        let setup_circuit = MLTrainingStepCircuit {
+            witness: dummy_witness,
+            relu_range,
+        };
+        pipeline.setup(&setup_circuit);
+
         Self {
             pipeline,
             relu_range,
+            dims: (d_in, d_hid, d_out),
         }
+    }
+
+    /// Returns the model dimensions this prover was initialized for.
+    pub fn dims(&self) -> (usize, usize, usize) {
+        self.dims
     }
 
     /// Builds a witness from raw training data (all in `Fr`).
@@ -168,6 +228,28 @@ impl MLTrainingProver {
     pub fn verify_result(&self, result: &TrainingProofResult) -> bool {
         self.verify(&result.proof, &result.public_inputs)
     }
+
+    /// Generates a Solidity verifier contract for this prover's circuit.
+    ///
+    /// The generated contract can verify proofs from `MLTrainingStepCircuit`
+    /// using BN254 pairing precompiles.
+    pub fn generate_solidity_verifier(&self, contract_name: &str) -> String {
+        let vk_data = self.pipeline.extract_vk_data(NUM_PUBLIC_INPUTS)
+            .expect("VK not initialized");
+
+        let evm_vk = VkData {
+            g1: vk_data.g1,
+            s_g2: vk_data.s_g2,
+            neg_g2: vk_data.neg_g2,
+            num_advices: vk_data.num_advices,
+        };
+
+        SolidityGenerator::new(contract_name)
+            .with_instances(NUM_PUBLIC_INPUTS)
+            .with_vk_data(evm_vk)
+            .with_batch(true)
+            .generate()
+    }
 }
 
 #[cfg(test)]
@@ -192,12 +274,13 @@ mod tests {
 
     #[test]
     fn test_prover_init() {
-        let _prover = MLTrainingProver::new(14);
+        let _prover = MLTrainingProver::new(14, 2, 2, 1);
     }
 
     #[test]
     fn test_prove_and_verify() {
-        let prover = MLTrainingProver::new(14);
+        // small_model_witness has dims 2×2×1
+        let prover = MLTrainingProver::new(14, 2, 2, 1);
         let witness = small_model_witness();
         let result = prover.prove(&witness);
 
@@ -208,7 +291,7 @@ mod tests {
 
     #[test]
     fn test_wrong_public_inputs_rejected() {
-        let prover = MLTrainingProver::new(14);
+        let prover = MLTrainingProver::new(14, 2, 2, 1);
         let witness = small_model_witness();
         let result = prover.prove(&witness);
 
@@ -235,7 +318,7 @@ mod tests {
         let x: Vec<Fr> = (0..d_in).map(|i| Fr::from((i + 1) as u64)).collect();
         let target: Vec<Fr> = (0..d_out).map(|_| Fr::from(10u64)).collect();
 
-        let prover = MLTrainingProver::new(14);
+        let prover = MLTrainingProver::new(14, d_in, d_hid, d_out);
         let witness =
             MLTrainingProver::build_witness(d_in, d_hid, d_out, &x, &target, &w1, &b1, &w2, &b2, Fr::from(1), 1);
         let result = prover.prove(&witness);

@@ -33,7 +33,7 @@ pub use chunking::{ChunkId, ChunkingConfig, ComputationChunk, ComputationChunker
 pub use ivc::{IVCConfig, IVCProver, IVCState, IVCStep};
 pub use keys::{FileKeyStore, InMemoryKeyStore, KeyId, KeyMetadata};
 pub use parallel::{BatchProofResult, ChunkProof, ParallelConfig, ParallelProver, ProofStatus};
-pub use pipeline::ProverPipeline;
+pub use pipeline::{ExtractedVkData, ProverPipeline};
 pub use provers::step_prover::{MLTrainingStepProof, TrainingStepData, TrainingStepProver};
 pub use provers::training_prover::{MLTrainingProver, TrainingProofResult};
 pub use serialization::{ProofFormat, ProofSerializer, SerializedProof};
