@@ -9,3 +9,11 @@ halo2_proofs = { version = "0.3.0", features = ["dev-graph"] }
 halo2curves = { version = "0.1.0" }
 halo2_gadgets = "0.4.0"
 sha2 = "0.10"
+
+[dev-dependencies]
+rand = "0.8"
+criterion = "0.5"
+
+[[bench]]
+name = "circuit_benchmarks"
+harness = false

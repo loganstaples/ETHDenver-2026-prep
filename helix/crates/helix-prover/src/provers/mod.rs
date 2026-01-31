@@ -1,4 +1,9 @@
+pub mod batch_prover;
+pub mod gpu_prover;
+pub mod gradient_prover;
 pub mod ivc_circuit;
+pub mod layer_prover;
+pub mod matmul_prover;
 pub mod state_circuit;
 pub mod state_prover;
 pub mod step_prover;

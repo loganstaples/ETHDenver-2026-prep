@@ -412,6 +412,17 @@ impl<F: PrimeField, const RANGE: usize> Default for ErrorAccumulationCircuit<F, 
     }
 }
 
+impl<F: PrimeField, const RANGE: usize> ErrorAccumulationCircuit<F, RANGE> {
+    /// Creates a new error accumulation circuit.
+    pub fn new(operations: Vec<OperationData<F>>, max_allowed_error: F) -> Self {
+        Self {
+            operations,
+            max_allowed_error,
+            _marker: PhantomData,
+        }
+    }
+}
+
 impl<F: PrimeField, const RANGE: usize> Circuit<F> for ErrorAccumulationCircuit<F, RANGE> {
     type Config = ErrorAccumulationConfig<F, RANGE>;
     type FloorPlanner = SimpleFloorPlanner;

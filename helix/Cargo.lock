@@ -2256,10 +2256,12 @@ dependencies = [
 name = "helix-circuits"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "halo2_gadgets",
  "halo2_proofs",
  "halo2curves",
  "helix-core",
+ "rand 0.8.5",
  "sha2",
 ]
 
