@@ -6,3 +6,5 @@ pub mod roles;
 pub mod storage;
 pub mod trainer;
 pub mod training;
+pub mod sc_client;
+pub mod round_commit;

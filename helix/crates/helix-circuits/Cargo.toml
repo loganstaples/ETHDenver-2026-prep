@@ -14,6 +14,10 @@ sha2 = "0.10"
 rand = "0.8"
 criterion = "0.5"
 
+[features]
+default = []
+profiling = []  # Enable detailed profiling (slight performance overhead)
+
 [[bench]]
 name = "circuit_benchmarks"
 harness = false

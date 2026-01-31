@@ -6,6 +6,14 @@
 //! - Proper softmax verification using exp lookup tables
 //! - Configurable model dimensions
 //! - Benchmark instrumentation
+//! - Profiling hooks for performance analysis
+//!
+//! # Optimization Features
+//!
+//! - **Freivalds Verification**: O(n²) instead of O(n³) for matrix multiplication
+//! - **Lookup Tables**: ReLU via lookup instead of comparison
+//! - **Error Bound Tracking**: Approximate proofs reduce constraint count
+//! - **Profiling Support**: Hooks for constraint counting and timing
 //!
 //! Proves an entire training step for a 2-layer MLP:
 //!   Forward:  h = ReLU(W1 * x + b1),  y = W2 * h + b2
@@ -21,6 +29,12 @@
 //!   4: loss               (quantized loss value)
 //!   5: total_error_bound  (accumulated error across all operations)
 //!   6: step_number
+//!
+//! # Performance Targets
+//!
+//! - Proof generation: <500ms for demo model (500K-2M parameters)
+//! - Constraint reduction: 30%+ compared to direct verification
+//! - Error bound: <1% increase in training loss
 
 use halo2_proofs::{
     arithmetic::Field,
@@ -47,6 +61,104 @@ pub const MUL_ERROR_UNIT: u64 = 1;
 
 /// Error introduced per addition operation (in scaled units).
 pub const ADD_ERROR_UNIT: u64 = 0;
+
+// ---------------------------------------------------------------------------
+// Profiling Support
+// ---------------------------------------------------------------------------
+
+/// Profiling metrics for the circuit.
+#[derive(Debug, Clone, Default)]
+pub struct CircuitMetrics {
+    /// Number of multiplication constraints.
+    pub mul_constraints: usize,
+    /// Number of addition constraints.
+    pub add_constraints: usize,
+    /// Number of subtraction constraints.
+    pub sub_constraints: usize,
+    /// Number of equality constraints.
+    pub eq_constraints: usize,
+    /// Number of ReLU lookups.
+    pub relu_lookups: usize,
+    /// Number of Freivalds verifications.
+    pub freivalds_verifications: usize,
+    /// Number of error accumulation constraints.
+    pub error_acc_constraints: usize,
+    /// Total rows used.
+    pub total_rows: usize,
+    /// Estimated constraint count.
+    pub estimated_constraints: usize,
+}
+
+impl CircuitMetrics {
+    /// Creates a new empty metrics instance.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns the total constraint count.
+    pub fn total(&self) -> usize {
+        self.mul_constraints
+            + self.add_constraints
+            + self.sub_constraints
+            + self.eq_constraints
+            + self.relu_lookups * 2 // Lookups add ~2 constraints each
+            + self.freivalds_verifications
+            + self.error_acc_constraints
+    }
+
+    /// Estimates constraints saved by using Freivalds.
+    pub fn freivalds_savings(&self, d_in: usize, d_hid: usize, d_out: usize) -> usize {
+        // Direct verification would use O(n³) constraints
+        // Freivalds uses O(n²) constraints
+        let layer1_direct = d_hid * d_in * d_in;
+        let layer1_freivalds = d_hid + d_in * d_hid;
+        let layer2_direct = d_out * d_hid * d_hid;
+        let layer2_freivalds = d_out + d_hid * d_out;
+
+        (layer1_direct + layer2_direct).saturating_sub(layer1_freivalds + layer2_freivalds)
+    }
+
+    /// Returns a formatted summary.
+    pub fn summary(&self) -> String {
+        format!(
+            "Circuit Metrics:\n\
+             - Multiplications: {}\n\
+             - Additions: {}\n\
+             - Subtractions: {}\n\
+             - Equalities: {}\n\
+             - ReLU lookups: {}\n\
+             - Freivalds verifications: {}\n\
+             - Error accumulations: {}\n\
+             - Total rows: {}\n\
+             - Estimated total: {}",
+            self.mul_constraints,
+            self.add_constraints,
+            self.sub_constraints,
+            self.eq_constraints,
+            self.relu_lookups,
+            self.freivalds_verifications,
+            self.error_acc_constraints,
+            self.total_rows,
+            self.total()
+        )
+    }
+}
+
+/// Trait for profiling-aware circuit components.
+pub trait Profilable {
+    /// Returns the constraint count for this component.
+    fn constraint_count(&self) -> usize;
+
+    /// Returns the lookup count for this component.
+    fn lookup_count(&self) -> usize {
+        0
+    }
+
+    /// Returns the row count for this component.
+    fn row_count(&self) -> usize {
+        self.constraint_count()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Circuit Configuration
@@ -328,6 +440,120 @@ impl Default for MLTrainingStepV2Circuit {
 impl MLTrainingStepV2Circuit {
     pub fn public_inputs(&self) -> Vec<Fr> {
         self.witness.public_inputs()
+    }
+
+    /// Returns estimated circuit metrics for profiling.
+    pub fn estimate_metrics(&self) -> CircuitMetrics {
+        let w = &self.witness;
+        let d_in = w.d_in;
+        let d_hid = w.d_hid;
+        let d_out = w.d_out;
+
+        let mut metrics = CircuitMetrics::new();
+
+        // Forward pass layer 1
+        if self.use_freivalds && !w.freivalds_r1.is_empty() {
+            // Freivalds: d_hid equality checks
+            metrics.freivalds_verifications += d_hid;
+        } else {
+            // Direct: d_hid dot products, each with d_in muls + (d_in-1) adds
+            metrics.mul_constraints += d_hid * d_in;
+            metrics.add_constraints += d_hid * (d_in.saturating_sub(1));
+        }
+
+        // Bias addition and ReLU for layer 1
+        metrics.add_constraints += d_hid; // bias
+        metrics.relu_lookups += d_hid;
+
+        // Forward pass layer 2
+        if self.use_freivalds && !w.freivalds_r2.is_empty() {
+            metrics.freivalds_verifications += d_out;
+        } else {
+            metrics.mul_constraints += d_out * d_hid;
+            metrics.add_constraints += d_out * (d_hid.saturating_sub(1));
+        }
+
+        // Bias addition for layer 2
+        metrics.add_constraints += d_out;
+
+        // Loss computation: d_out subtractions, d_out multiplications, (d_out-1) additions
+        metrics.sub_constraints += d_out;
+        metrics.mul_constraints += d_out;
+        metrics.add_constraints += d_out.saturating_sub(1);
+        metrics.eq_constraints += 1; // loss check
+
+        // Backward pass - output gradient
+        metrics.mul_constraints += d_out;
+        metrics.eq_constraints += d_out;
+
+        // Backward pass - dW2, db2, dh
+        metrics.mul_constraints += d_out * d_hid;
+        metrics.eq_constraints += d_out * d_hid;
+        metrics.eq_constraints += d_out; // db2
+        metrics.mul_constraints += d_hid * d_out;
+        metrics.add_constraints += d_hid * (d_out.saturating_sub(1));
+
+        // ReLU mask
+        metrics.mul_constraints += d_hid;
+
+        // Backward pass - dW1, db1
+        metrics.mul_constraints += d_hid * d_in;
+        metrics.eq_constraints += d_hid * d_in;
+        metrics.eq_constraints += d_hid;
+
+        // Weight updates: 2 constraints per weight (mul + sub)
+        let total_weights = d_hid * d_in + d_hid + d_out * d_hid + d_out;
+        metrics.mul_constraints += total_weights;
+        metrics.sub_constraints += total_weights;
+
+        // Error bound verification
+        metrics.error_acc_constraints += 1;
+
+        // Estimate total rows
+        metrics.total_rows = metrics.total() + 2 * self.relu_range; // Include lookup table rows
+        metrics.estimated_constraints = metrics.total();
+
+        metrics
+    }
+
+    /// Returns the estimated constraint reduction from using Freivalds.
+    pub fn freivalds_savings(&self) -> usize {
+        if !self.use_freivalds {
+            return 0;
+        }
+
+        let w = &self.witness;
+        let metrics = CircuitMetrics::new();
+        metrics.freivalds_savings(w.d_in, w.d_hid, w.d_out)
+    }
+
+    /// Creates a circuit with profiling enabled.
+    pub fn with_profiling(witness: MLTrainingStepV2Witness) -> Self {
+        Self {
+            witness,
+            relu_range: 256,
+            exp_range: 128,
+            exp_scale: 64,
+            use_freivalds: true,
+        }
+    }
+
+    /// Returns a summary of circuit configuration.
+    pub fn config_summary(&self) -> String {
+        let w = &self.witness;
+        format!(
+            "MLTrainingStepV2Circuit Configuration:\n\
+             - Dimensions: {}x{}x{}\n\
+             - Freivalds: {}\n\
+             - ReLU range: {}\n\
+             - Exp range: {} (scale: {})\n\
+             - Total parameters: {}",
+            w.d_in, w.d_hid, w.d_out,
+            self.use_freivalds,
+            self.relu_range,
+            self.exp_range, self.exp_scale,
+            w.d_in * w.d_hid + w.d_hid + w.d_out * w.d_hid + w.d_out
+        )
     }
 }
 

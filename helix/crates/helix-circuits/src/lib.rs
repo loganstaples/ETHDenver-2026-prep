@@ -1,12 +1,15 @@
 pub mod approximate;
 pub mod benchmark;
+pub mod cache;
 pub mod commitment;
 pub mod gadgets;
 pub mod gkr_compat;
 pub mod ivc;
 pub mod lookup;
 pub mod ml;
+pub mod optimization;
 pub mod params;
+pub mod profiling;
 pub mod quantization;
 pub mod verifier;
 
@@ -115,6 +118,56 @@ pub use gkr_compat::{
 
     // Constants
     MAX_GKR_DEPTH, MAX_GATES_PER_LAYER, MIN_GATES_PER_LAYER,
+};
+
+// Re-export profiling module types
+pub use profiling::{
+    // Core profiling
+    CircuitProfiler, CircuitProfile, ProfilingConfig,
+    Bottleneck, BottleneckType, EstimatedSavings,
+    OperationProfile,
+
+    // Constraint counting
+    ConstraintCounter, ConstraintProfile, ConstraintBreakdown,
+    OperationCost, GateProfile, LookupProfile,
+
+    // Timing
+    TimingProfiler, TimingProfile, PhaseTimer, ProfilingPhase,
+
+    // Report generation
+    ReportGenerator, OptimizationReport, OptimizationRecommendation,
+    OptimizationPriority, ReportFormat, BottleneckAnalysis,
+};
+
+// Re-export optimization module types (with aliases to avoid conflicts with params module)
+pub use optimization::{
+    // Core optimization (aliased to avoid conflict with params::CircuitOptimizer)
+    CircuitOptimizer as ProfilingOptimizer,
+    OptimizationConfig,
+    OptimizationResult as ProfilingOptResult,
+    OptimizationSummary as ProfilingOptSummary,
+    PrecisionLevel,
+
+    // Constraint reduction
+    ConstraintReducer, ReductionStrategy, ReductionResult,
+    FreivaldsOptimizer, OperationBatcher, LazyEvaluator,
+
+    // Lookup compression
+    LookupCompressor, CompressionStrategy, CompressedTable,
+    RangeAnalyzer, TableOptimizer, CompressedLookupConfig,
+
+    // Parallel witness generation
+    ParallelWitnessGenerator, ParallelConfig, WitnessChunk,
+    MatrixParallelizer, BatchHasher,
+};
+
+// Re-export cache module types (KeyCache aliased to avoid conflict with params::KeyCache)
+pub use cache::{
+    CircuitCache, CircuitCacheConfig, CircuitCacheBuilder,
+    StructureCache, CachedStructure, StructureKey,
+    CacheStats, CacheConfig, EvictionPolicy,
+    WitnessCache, TableCache, KeyCache as WitnessKeyCache,
+    global_cache as circuit_cache,
 };
 
 #[cfg(test)]

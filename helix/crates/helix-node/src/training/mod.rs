@@ -6,16 +6,21 @@
 //! - **Data Loading**: Streaming data loader with tokenization and sharding
 //! - **Model Management**: Weight loading, saving, and gradient application
 //! - **Checkpointing**: Automatic checkpoints with verification
+//! - **Distributed Checkpointing**: Coordinated checkpoints across workers with resume
 //! - **Aggregation**: Byzantine-fault-tolerant gradient aggregation
 //! - **Metrics**: Training metrics and convergence detection
 //! - **Coordination**: Distributed training orchestration with leader election
 //! - **Verification**: Proof verification before gradient aggregation
 //! - **Orchestration**: Multi-node coordination with failure detection
+//! - **State Machine**: Distributed round state machine for training lifecycle
+//! - **Synchronization**: Barrier synchronization for worker coordination
+//! - **Fault Tolerance**: Failure detection, recovery, and worker replacement
 
 pub mod round;
 pub mod data_loader;
 pub mod model;
 pub mod checkpoint;
+pub mod distributed_checkpoint;
 pub mod aggregation;
 pub mod metrics;
 pub mod coordinator;
@@ -23,6 +28,10 @@ pub mod session;
 pub mod mpc;
 pub mod orchestrator;
 pub mod verification;
+pub mod state_machine;
+pub mod synchronization;
+pub mod fault_tolerance;
+pub mod distributed_coordinator;
 
 // Re-export key types
 pub use round::{
@@ -83,6 +92,38 @@ pub use verification::{
     VerificationConfig, VerificationResult, VerificationStats,
 };
 
+pub use state_machine::{
+    DistributedRoundId, DistributedRoundState, RoundFailureReason,
+    WorkerRoundState, RoundWorker, StateMachineConfig,
+    DistributedRound, DistributedTrainingStateMachine, StateMachineEvent,
+    RoundSummary as StateMachineRoundSummary,
+};
+
+pub use synchronization::{
+    SyncPhase, BarrierResult, SyncBarrier, BarrierConfig, BarrierId,
+    BarrierManager, SyncCoordinator, BarrierEvent,
+};
+
+pub use fault_tolerance::{
+    WorkerHealth, WorkerHealthInfo, FaultToleranceConfig,
+    FailureDetector, RecoveryCoordinator, RecoveryState, RecoveryAttempt,
+    FaultToleranceManager, FaultEvent, WorkerReplacement, ReplacementAction,
+};
+
+pub use distributed_checkpoint::{
+    DistributedCheckpointId, DistributedCheckpointStatus, WorkerCheckpointContribution,
+    DistributedCheckpoint, CheckpointProgress, ResumableTrainingState,
+    TrainingConfigSnapshot, ShareCheckpoint, DistributedCheckpointConfig,
+    CheckpointEvent, DistributedCheckpointCoordinator, ResumeCoordinator,
+    CheckpointSyncHelper, DistributedCheckpointError,
+};
+
+pub use distributed_coordinator::{
+    DistributedTrainingConfig, DistributedTrainingState, WorkerInfo as DistributedWorkerInfo,
+    DistributedTrainingEvent, GradientShare, GradientShareCollector,
+    DistributedTrainingCoordinator, DistributedCoordinatorError,
+};
+
 /// Convenience type alias for training results.
 pub type TrainingResult<T> = Result<T, TrainingError>;
 
@@ -95,10 +136,14 @@ pub enum TrainingError {
     Model(ModelError),
     /// Checkpoint-related error.
     Checkpoint(CheckpointError),
+    /// Distributed checkpoint-related error.
+    DistributedCheckpoint(DistributedCheckpointError),
     /// Aggregation-related error.
     Aggregation(AggregationError),
     /// Coordinator-related error.
     Coordinator(CoordinatorError),
+    /// Distributed coordinator-related error.
+    DistributedCoordinator(DistributedCoordinatorError),
     /// MPC-related error.
     MPC(helix_mpc::MPCError),
     /// IO error.
@@ -113,8 +158,10 @@ impl std::fmt::Display for TrainingError {
             Self::Round(e) => write!(f, "Round error: {}", e),
             Self::Model(e) => write!(f, "Model error: {}", e),
             Self::Checkpoint(e) => write!(f, "Checkpoint error: {}", e),
+            Self::DistributedCheckpoint(e) => write!(f, "Distributed checkpoint error: {}", e),
             Self::Aggregation(e) => write!(f, "Aggregation error: {}", e),
             Self::Coordinator(e) => write!(f, "Coordinator error: {}", e),
+            Self::DistributedCoordinator(e) => write!(f, "Distributed coordinator error: {}", e),
             Self::MPC(e) => write!(f, "MPC error: {}", e),
             Self::Io(e) => write!(f, "IO error: {}", e),
             Self::Custom(msg) => write!(f, "{}", msg),
@@ -163,6 +210,18 @@ impl From<helix_mpc::MPCError> for TrainingError {
 impl From<std::io::Error> for TrainingError {
     fn from(e: std::io::Error) -> Self {
         Self::Io(e)
+    }
+}
+
+impl From<DistributedCheckpointError> for TrainingError {
+    fn from(e: DistributedCheckpointError) -> Self {
+        Self::DistributedCheckpoint(e)
+    }
+}
+
+impl From<DistributedCoordinatorError> for TrainingError {
+    fn from(e: DistributedCoordinatorError) -> Self {
+        Self::DistributedCoordinator(e)
     }
 }
 

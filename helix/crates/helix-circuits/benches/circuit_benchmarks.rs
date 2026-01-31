@@ -5,10 +5,13 @@
 //! - Proof generation time (via MockProver approximation)
 //! - Verification time
 //! - Memory usage
+//! - Profiling overhead
+//! - Optimization effectiveness
 //!
 //! Target: 30x overhead compared to native computation.
+//! Target: <500ms proof generation for demo model.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
+use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
 use halo2_proofs::dev::MockProver;
 use halo2curves::bn256::Fr;
 use helix_circuits::{
@@ -27,6 +30,9 @@ use helix_circuits::{
     quantization::{
         Int8SymmetricParams, Int4WeightParams,
     },
+    MLTrainingStepV2Circuit,
+    compute_witness_v2,
+    compute_state_hash_v2,
 };
 use std::time::Duration;
 
@@ -435,6 +441,305 @@ fn bench_int4_packing(c: &mut Criterion) {
     group.finish();
 }
 
+/// Helper: Create benchmark witness for MLTrainingStepV2.
+fn create_training_witness(d_in: usize, d_hid: usize, d_out: usize) -> helix_circuits::MLTrainingStepV2Witness {
+    let w1: Vec<Fr> = (0..d_hid * d_in)
+        .map(|i| Fr::from((i % 10 + 1) as u64))
+        .collect();
+    let b1 = vec![Fr::zero(); d_hid];
+    let w2: Vec<Fr> = (0..d_out * d_hid)
+        .map(|i| Fr::from((i % 10 + 1) as u64))
+        .collect();
+    let b2 = vec![Fr::zero(); d_out];
+    let x: Vec<Fr> = (0..d_in).map(|i| Fr::from((i + 1) as u64)).collect();
+    let target: Vec<Fr> = (0..d_out).map(|_| Fr::from(10u64)).collect();
+    let lr = Fr::from(1);
+    let base_error = Fr::from(1);
+
+    let old_hash = compute_state_hash_v2(&w1, &b1, &w2, &b2);
+    let witness = compute_witness_v2(
+        d_in, d_hid, d_out, &x, &target, &w1, &b1, &w2, &b2,
+        lr, old_hash, (Fr::zero(), Fr::zero()), 1, base_error,
+    );
+    let new_hash = compute_state_hash_v2(
+        &witness.w1_new, &witness.b1_new, &witness.w2_new, &witness.b2_new,
+    );
+    compute_witness_v2(
+        d_in, d_hid, d_out, &x, &target, &w1, &b1, &w2, &b2,
+        lr, old_hash, new_hash, 1, base_error,
+    )
+}
+
+/// Benchmark MLTrainingStepV2 witness generation.
+fn bench_training_witness(c: &mut Criterion) {
+    let mut group = c.benchmark_group("Training Witness Generation");
+    group.sample_size(50);
+
+    for &(d_in, d_hid, d_out) in &[(2, 2, 1), (4, 4, 2), (8, 8, 4)] {
+        let id = format!("{}x{}x{}", d_in, d_hid, d_out);
+        let params = (d_in * d_hid + d_hid + d_out * d_hid + d_out) as u64;
+        group.throughput(Throughput::Elements(params));
+
+        let w1: Vec<Fr> = (0..d_hid * d_in).map(|i| Fr::from((i % 10 + 1) as u64)).collect();
+        let b1 = vec![Fr::zero(); d_hid];
+        let w2: Vec<Fr> = (0..d_out * d_hid).map(|i| Fr::from((i % 10 + 1) as u64)).collect();
+        let b2 = vec![Fr::zero(); d_out];
+        let x: Vec<Fr> = (0..d_in).map(|i| Fr::from((i + 1) as u64)).collect();
+        let target: Vec<Fr> = (0..d_out).map(|_| Fr::from(10u64)).collect();
+        let lr = Fr::from(1);
+        let base_error = Fr::from(1);
+        let old_hash = compute_state_hash_v2(&w1, &b1, &w2, &b2);
+
+        group.bench_function(BenchmarkId::new("witness", &id), |b| {
+            b.iter(|| {
+                compute_witness_v2(
+                    black_box(d_in), black_box(d_hid), black_box(d_out),
+                    black_box(&x), black_box(&target),
+                    black_box(&w1), black_box(&b1),
+                    black_box(&w2), black_box(&b2),
+                    black_box(lr), black_box(old_hash),
+                    black_box((Fr::zero(), Fr::zero())), black_box(1), black_box(base_error),
+                )
+            });
+        });
+    }
+
+    group.finish();
+}
+
+/// Benchmark MLTrainingStepV2 circuit with MockProver.
+fn bench_training_circuit(c: &mut Criterion) {
+    let mut group = c.benchmark_group("Training Circuit MockProver");
+    group.sample_size(20);
+    group.measurement_time(Duration::from_secs(30));
+
+    // Tiny model for quick iteration
+    let witness = create_training_witness(2, 2, 1);
+    let pi = witness.public_inputs();
+
+    // With Freivalds
+    let circuit_freivalds = MLTrainingStepV2Circuit {
+        witness: witness.clone(),
+        relu_range: 128,
+        exp_range: 64,
+        exp_scale: 32,
+        use_freivalds: true,
+    };
+
+    group.bench_function("2x2x1_freivalds", |b| {
+        b.iter(|| {
+            let prover = MockProver::run(14, black_box(&circuit_freivalds), vec![pi.clone()]).unwrap();
+            black_box(prover.verify())
+        });
+    });
+
+    // Without Freivalds
+    let circuit_direct = MLTrainingStepV2Circuit {
+        witness: witness.clone(),
+        relu_range: 128,
+        exp_range: 64,
+        exp_scale: 32,
+        use_freivalds: false,
+    };
+
+    group.bench_function("2x2x1_direct", |b| {
+        b.iter(|| {
+            let prover = MockProver::run(14, black_box(&circuit_direct), vec![pi.clone()]).unwrap();
+            black_box(prover.verify())
+        });
+    });
+
+    // Small model
+    let witness_sm = create_training_witness(4, 4, 2);
+    let pi_sm = witness_sm.public_inputs();
+
+    let circuit_sm = MLTrainingStepV2Circuit {
+        witness: witness_sm,
+        relu_range: 128,
+        exp_range: 64,
+        exp_scale: 32,
+        use_freivalds: true,
+    };
+
+    group.bench_function("4x4x2_freivalds", |b| {
+        b.iter(|| {
+            let prover = MockProver::run(14, black_box(&circuit_sm), vec![pi_sm.clone()]).unwrap();
+            black_box(prover.verify())
+        });
+    });
+
+    group.finish();
+}
+
+/// Benchmark state hash computation.
+fn bench_state_hash(c: &mut Criterion) {
+    let mut group = c.benchmark_group("State Hash Computation");
+    group.sample_size(100);
+
+    for &size in &[16, 64, 256] {
+        let w1: Vec<Fr> = (0..size).map(|i| Fr::from(i as u64)).collect();
+        let b1: Vec<Fr> = (0..size / 4).map(|i| Fr::from(i as u64)).collect();
+        let w2: Vec<Fr> = (0..size / 2).map(|i| Fr::from(i as u64)).collect();
+        let b2: Vec<Fr> = (0..size / 8).map(|i| Fr::from(i as u64)).collect();
+
+        group.throughput(Throughput::Elements(
+            (w1.len() + b1.len() + w2.len() + b2.len()) as u64
+        ));
+
+        group.bench_function(BenchmarkId::new("hash", size), |b| {
+            b.iter(|| {
+                compute_state_hash_v2(
+                    black_box(&w1), black_box(&b1),
+                    black_box(&w2), black_box(&b2),
+                )
+            });
+        });
+    }
+
+    group.finish();
+}
+
+/// Benchmark overhead comparison: ZK vs direct computation.
+fn bench_overhead_comparison(c: &mut Criterion) {
+    let mut group = c.benchmark_group("Overhead Comparison");
+    group.sample_size(100);
+
+    let d_in = 4;
+    let d_hid = 4;
+    let d_out = 2;
+
+    let w1: Vec<Fr> = (0..d_hid * d_in).map(|i| Fr::from((i % 10 + 1) as u64)).collect();
+    let b1 = vec![Fr::zero(); d_hid];
+    let w2: Vec<Fr> = (0..d_out * d_hid).map(|i| Fr::from((i % 10 + 1) as u64)).collect();
+    let b2 = vec![Fr::zero(); d_out];
+    let x: Vec<Fr> = (0..d_in).map(|i| Fr::from((i + 1) as u64)).collect();
+
+    // Baseline: Direct forward pass
+    group.bench_function("direct_forward_4x4x2", |b| {
+        b.iter(|| {
+            let mut h_pre = vec![Fr::zero(); d_hid];
+            for j in 0..d_hid {
+                for i in 0..d_in {
+                    h_pre[j] = h_pre[j] + w1[j * d_in + i] * x[i];
+                }
+                h_pre[j] = h_pre[j] + b1[j];
+            }
+            let h = h_pre.clone();
+
+            let mut y = vec![Fr::zero(); d_out];
+            for j in 0..d_out {
+                for k in 0..d_hid {
+                    y[j] = y[j] + w2[j * d_hid + k] * h[k];
+                }
+                y[j] = y[j] + b2[j];
+            }
+            black_box(y)
+        });
+    });
+
+    // ZK: Witness generation only
+    let target: Vec<Fr> = (0..d_out).map(|_| Fr::from(10u64)).collect();
+    let lr = Fr::from(1);
+    let base_error = Fr::from(1);
+    let old_hash = compute_state_hash_v2(&w1, &b1, &w2, &b2);
+
+    group.bench_function("zk_witness_4x4x2", |b| {
+        b.iter(|| {
+            compute_witness_v2(
+                black_box(d_in), black_box(d_hid), black_box(d_out),
+                black_box(&x), black_box(&target),
+                black_box(&w1), black_box(&b1),
+                black_box(&w2), black_box(&b2),
+                black_box(lr), black_box(old_hash),
+                black_box((Fr::zero(), Fr::zero())), black_box(1), black_box(base_error),
+            )
+        });
+    });
+
+    group.finish();
+}
+
+/// Benchmark Freivalds challenge generation.
+fn bench_freivalds_challenge(c: &mut Criterion) {
+    use helix_circuits::ml::training_step_v2::generate_freivalds_challenge;
+
+    let mut group = c.benchmark_group("Freivalds Challenge");
+    group.sample_size(100);
+
+    for &len in &[4, 8, 16, 32] {
+        group.throughput(Throughput::Elements(len as u64));
+        group.bench_function(BenchmarkId::new("generate", len), |b| {
+            b.iter(|| {
+                generate_freivalds_challenge(black_box(42), black_box(len))
+            });
+        });
+    }
+
+    group.finish();
+}
+
+/// Benchmark K parameter scaling.
+fn bench_k_scaling(c: &mut Criterion) {
+    let mut group = c.benchmark_group("K Parameter Scaling");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(60));
+
+    let witness = create_training_witness(2, 2, 1);
+    let pi = witness.public_inputs();
+
+    let circuit = MLTrainingStepV2Circuit {
+        witness: witness.clone(),
+        relu_range: 64,
+        exp_range: 32,
+        exp_scale: 16,
+        use_freivalds: true,
+    };
+
+    for k in [12, 13, 14] {
+        group.bench_function(BenchmarkId::new("mock_prover_k", k), |b| {
+            b.iter(|| {
+                let prover = MockProver::run(black_box(k), &circuit, vec![pi.clone()]).unwrap();
+                black_box(prover.verify())
+            });
+        });
+    }
+
+    group.finish();
+}
+
+/// Benchmark model scaling.
+fn bench_model_scaling(c: &mut Criterion) {
+    let mut group = c.benchmark_group("Model Scaling");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(60));
+
+    for &(d_in, d_hid, d_out, k) in &[(2, 2, 1, 14), (4, 4, 2, 14), (8, 8, 4, 15)] {
+        let witness = create_training_witness(d_in, d_hid, d_out);
+        let pi = witness.public_inputs();
+
+        let circuit = MLTrainingStepV2Circuit {
+            witness: witness.clone(),
+            relu_range: 128,
+            exp_range: 64,
+            exp_scale: 32,
+            use_freivalds: true,
+        };
+
+        let params = (d_in * d_hid + d_hid + d_out * d_hid + d_out) as u64;
+        group.throughput(Throughput::Elements(params));
+
+        let id = format!("{}x{}x{}", d_in, d_hid, d_out);
+        group.bench_function(BenchmarkId::new("full_circuit", &id), |b| {
+            b.iter(|| {
+                let prover = MockProver::run(k, black_box(&circuit), vec![pi.clone()]).unwrap();
+                black_box(prover.verify())
+            });
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_srs_generation,
@@ -449,6 +754,14 @@ criterion_group!(
     bench_lookup_vs_arithmetic,
     bench_quantization,
     bench_int4_packing,
+    // New profiling-focused benchmarks
+    bench_training_witness,
+    bench_training_circuit,
+    bench_state_hash,
+    bench_overhead_comparison,
+    bench_freivalds_challenge,
+    bench_k_scaling,
+    bench_model_scaling,
 );
 
 criterion_main!(benches);
