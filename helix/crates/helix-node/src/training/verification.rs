@@ -86,6 +86,16 @@ pub struct ProofVerifier {
     stats: Arc<RwLock<VerificationStats>>,
 }
 
+impl std::fmt::Debug for ProofVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProofVerifier")
+            .field("config", &self.config)
+            .field("cache_size", &self.cache.read().len())
+            .field("stats", &*self.stats.read())
+            .finish()
+    }
+}
+
 /// Verification statistics.
 #[derive(Debug, Clone, Default)]
 pub struct VerificationStats {
@@ -445,6 +455,16 @@ pub struct GradientValidator {
     max_gradient_norm: f64,
     /// Required participants for Byzantine tolerance.
     min_participants: usize,
+}
+
+impl std::fmt::Debug for GradientValidator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GradientValidator")
+            .field("verifier", &self.verifier)
+            .field("max_gradient_norm", &self.max_gradient_norm)
+            .field("min_participants", &self.min_participants)
+            .finish()
+    }
 }
 
 impl GradientValidator {

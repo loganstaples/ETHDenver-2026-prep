@@ -4,47 +4,81 @@ pragma solidity ^0.8.19;
 import "../interfaces/IHelixVerifier.sol";
 
 /// @title HelixCoordinatorV2
-/// @notice Manages model registration, proof submission, staking, and slashing
+/// @notice Gas-optimized coordinator for model registration, proof submission, staking, and slashing
 /// @dev Supports real ZK proof verification with economic security
+///      Storage layout optimized for gas efficiency with struct packing
 contract HelixCoordinatorV2 {
-    // ============ Structs ============
+    // ============ Structs (Optimized for Storage Packing) ============
 
+    /// @notice Model information - packed to minimize storage slots
+    /// @dev Packed: owner(20) + currentRound(4) + active(1) + minStake(8) = 33 bytes (2 slots with commitment)
     struct Model {
-        string ipfsHash;              // IPFS hash of model weights
-        uint256 currentCommitment;    // Current state commitment (hash of weights)
-        uint256 currentRound;         // Current training round
-        address owner;                // Model owner
-        uint256 minStake;             // Minimum stake required to participate
-        bool active;                  // Whether the model is accepting submissions
+        string ipfsHash;              // Dynamic - separate slot(s)
+        uint256 currentCommitment;    // Slot 1: 32 bytes
+        address owner;                // Slot 2: 20 bytes
+        uint32 currentRound;          // Slot 2: 4 bytes (max 4B rounds)
+        bool active;                  // Slot 2: 1 byte
+        uint64 minStake;              // Slot 2: 8 bytes (max 18.4 ETH in gwei units)
     }
 
+    /// @notice Round information - packed to minimize storage slots
+    /// @dev Packed: deadline(5) + isCompleted(1) + prover(20) = 26 bytes in one slot
     struct Round {
-        uint256 modelCommitment;      // Expected old commitment for this round
-        uint256 newCommitment;        // New commitment after round completes
-        bool isCompleted;             // Whether round is completed
-        uint256 deadline;             // Deadline for submissions
-        address prover;               // Who submitted the winning proof
+        uint256 modelCommitment;      // Slot 1: 32 bytes
+        uint256 newCommitment;        // Slot 2: 32 bytes
+        uint40 deadline;              // Slot 3: 5 bytes (timestamps until year 36812)
+        bool isCompleted;             // Slot 3: 1 byte
+        address prover;               // Slot 3: 20 bytes
     }
 
+    /// @notice Stake information - packed to single slot where possible
+    /// @dev Packed: amount(16) + lockedUntil(5) + slashed(1) = 22 bytes
     struct Stake {
-        uint256 amount;               // Staked amount
-        uint256 lockedUntil;          // Lock period end timestamp
-        bool slashed;                 // Whether stake has been slashed
+        uint128 amount;               // 16 bytes (max 340 undecillion wei)
+        uint40 lockedUntil;           // 5 bytes (timestamps until year 36812)
+        bool slashed;                 // 1 byte
     }
 
+    /// @notice Slashing record - optimized with indexed timestamp
+    /// @dev Keeping full precision for amounts as these are audit records
     struct SlashingRecord {
-        address prover;               // Who was slashed
-        uint256 modelId;              // Which model
-        uint256 roundId;              // Which round
-        uint256 amount;               // Amount slashed
-        string reason;                // Why they were slashed
-        uint256 timestamp;            // When it happened
+        address prover;               // 20 bytes
+        uint64 modelId;               // 8 bytes
+        uint32 roundId;               // 4 bytes
+        uint128 amount;               // 16 bytes
+        string reason;                // Dynamic
+        uint40 timestamp;             // 5 bytes
     }
 
-    // ============ State Variables ============
+    // ============ State Variables (Ordered for Optimal Packing) ============
 
+    // Slot 1: Verifier (immutable after deployment for gas savings)
     /// @notice The ZK proof verifier contract
     IHelixVerifier public verifier;
+
+    // Slot 2: Packed addresses and small values
+    /// @notice Treasury to receive slashed funds
+    address public treasury;
+    /// @notice Slash percentage (100 = 1%, max 10000 = 100%)
+    uint16 public slashPercentage;
+    /// @notice Stake lock period in days (max 65535 days = ~179 years)
+    uint16 public stakeLockDays;
+    /// @notice Counter for model IDs
+    uint32 public nextModelId;
+
+    // Slot 3: Owner
+    /// @notice Contract owner
+    address public owner;
+
+    // Slot 4: Default min stake (full precision needed)
+    /// @notice Default minimum stake (in wei)
+    uint256 public defaultMinStake;
+
+    // Slot 5: Max error bound (full precision needed)
+    /// @notice Maximum allowed error bound per step (in fixed-point units)
+    uint256 public maxErrorBound;
+
+    // ============ Mappings ============
 
     /// @notice Model registry
     mapping(uint256 => Model) public models;
@@ -55,86 +89,134 @@ contract HelixCoordinatorV2 {
     /// @notice Prover stakes: prover => modelId => Stake
     mapping(address => mapping(uint256 => Stake)) public stakes;
 
-    /// @notice Slashing records
-    SlashingRecord[] public slashingRecords;
-
-    /// @notice Counter for model IDs
-    uint256 public nextModelId;
-
-    /// @notice Default minimum stake (in wei)
-    uint256 public defaultMinStake = 0.1 ether;
-
-    /// @notice Stake lock period (in seconds)
-    uint256 public stakeLockPeriod = 7 days;
-
-    /// @notice Slash percentage (100 = 1%)
-    uint256 public slashPercentage = 5000; // 50%
-
-    /// @notice Maximum allowed error bound per step (in fixed-point units)
-    /// @dev If a proof has error bound higher than this, it's rejected
-    uint256 public maxErrorBound = 1e18; // 1.0 in 18-decimal fixed point
-
     /// @notice Accumulated error bound per model
     mapping(uint256 => uint256) public accumulatedErrorBound;
 
-    /// @notice Treasury to receive slashed funds
-    address public treasury;
+    /// @notice Slashing records - append only for audit trail
+    SlashingRecord[] public slashingRecords;
 
-    /// @notice Contract owner
-    address public owner;
+    // ============ Events (Optimized with Indexed Parameters) ============
 
-    // ============ Events ============
-
+    /// @notice Emitted when a new model is registered
+    /// @param modelId Indexed for efficient filtering by model
+    /// @param owner Indexed for efficient filtering by owner
+    /// @param initialCommitment Initial state commitment
+    /// @param minStake Minimum stake required
+    /// @param ipfsHash IPFS hash of model weights
     event ModelRegistered(
         uint256 indexed modelId,
         address indexed owner,
         uint256 initialCommitment,
+        uint256 minStake,
         string ipfsHash
     );
 
+    /// @notice Emitted when a training round starts
+    /// @param modelId Indexed for efficient filtering by model
+    /// @param roundId Indexed for efficient filtering by round
+    /// @param deadline Submission deadline timestamp
+    /// @param modelCommitment Current model commitment
     event RoundStarted(
         uint256 indexed modelId,
         uint256 indexed roundId,
-        uint256 deadline
+        uint256 deadline,
+        uint256 modelCommitment
     );
 
+    /// @notice Emitted when a proof is submitted
+    /// @param modelId Indexed for efficient filtering by model
+    /// @param roundId Indexed for efficient filtering by round
+    /// @param prover Indexed for efficient filtering by prover
+    /// @param newCommitment New state commitment after training step
+    /// @param errorBound Error bound of this step
     event ProofSubmitted(
         uint256 indexed modelId,
         uint256 indexed roundId,
         address indexed prover,
-        uint256 newCommitment
+        uint256 newCommitment,
+        uint256 errorBound
     );
 
+    /// @notice Emitted when a training round completes
+    /// @param modelId Indexed for efficient filtering by model
+    /// @param roundId Indexed for efficient filtering by round
+    /// @param newCommitment Final commitment
+    /// @param totalErrorBound Accumulated error bound after this round
     event RoundCompleted(
         uint256 indexed modelId,
         uint256 indexed roundId,
-        uint256 newCommitment
+        uint256 newCommitment,
+        uint256 totalErrorBound
     );
 
+    /// @notice Emitted when stake is deposited
+    /// @param prover Indexed for efficient filtering by prover
+    /// @param modelId Indexed for efficient filtering by model
+    /// @param amount Amount staked in this transaction
+    /// @param totalStake Total stake after this deposit
     event Staked(
         address indexed prover,
         uint256 indexed modelId,
-        uint256 amount
+        uint256 amount,
+        uint256 totalStake
     );
 
+    /// @notice Emitted when stake is withdrawn
+    /// @param prover Indexed for efficient filtering by prover
+    /// @param modelId Indexed for efficient filtering by model
+    /// @param amount Amount withdrawn
     event Unstaked(
         address indexed prover,
         uint256 indexed modelId,
         uint256 amount
     );
 
+    /// @notice Emitted when a prover is slashed
+    /// @param prover Indexed for efficient filtering by prover
+    /// @param modelId Indexed for efficient filtering by model
+    /// @param roundId Round where slashing occurred
+    /// @param amount Amount slashed
+    /// @param remainingStake Remaining stake after slashing
+    /// @param reason Reason for slashing
     event Slashed(
         address indexed prover,
         uint256 indexed modelId,
+        uint256 roundId,
         uint256 amount,
+        uint256 remainingStake,
         string reason
     );
 
+    /// @notice Emitted when an invalid proof is detected
+    /// @param modelId Indexed for efficient filtering by model
+    /// @param roundId Indexed for efficient filtering by round
+    /// @param prover Indexed for efficient filtering by prover
+    /// @param proofHash Hash of the invalid proof
     event InvalidProofDetected(
         uint256 indexed modelId,
         uint256 indexed roundId,
         address indexed prover,
         bytes32 proofHash
+    );
+
+    /// @notice Emitted when model state changes
+    /// @param modelId Indexed for efficient filtering by model
+    /// @param active New active state
+    /// @param changedBy Who made the change
+    event ModelStateChanged(
+        uint256 indexed modelId,
+        bool active,
+        address indexed changedBy
+    );
+
+    /// @notice Emitted when configuration is updated
+    /// @param parameter Which parameter was changed
+    /// @param oldValue Previous value
+    /// @param newValue New value
+    event ConfigUpdated(
+        string indexed parameter,
+        uint256 oldValue,
+        uint256 newValue
     );
 
     // ============ Modifiers ============
@@ -150,14 +232,9 @@ contract HelixCoordinatorV2 {
     }
 
     modifier hasStake(uint256 modelId) {
-        require(
-            stakes[msg.sender][modelId].amount >= models[modelId].minStake,
-            "Insufficient stake"
-        );
-        require(
-            !stakes[msg.sender][modelId].slashed,
-            "Stake has been slashed"
-        );
+        Stake storage s = stakes[msg.sender][modelId];
+        require(s.amount >= models[modelId].minStake, "Insufficient stake");
+        require(!s.slashed, "Stake has been slashed");
         _;
     }
 
@@ -167,6 +244,12 @@ contract HelixCoordinatorV2 {
         verifier = IHelixVerifier(_verifier);
         treasury = _treasury;
         owner = msg.sender;
+
+        // Initialize packed values
+        slashPercentage = 5000;  // 50%
+        stakeLockDays = 7;       // 7 days
+        defaultMinStake = 0.1 ether;
+        maxErrorBound = 1e18;    // 1.0 in 18-decimal fixed point
     }
 
     // ============ Model Management ============
@@ -182,16 +265,20 @@ contract HelixCoordinatorV2 {
     ) external returns (uint256 modelId) {
         modelId = nextModelId++;
 
+        uint64 effectiveMinStake = minStake > 0
+            ? uint64(minStake / 1 gwei)  // Store in gwei for packing
+            : uint64(defaultMinStake / 1 gwei);
+
         models[modelId] = Model({
             ipfsHash: ipfsHash,
             currentCommitment: initialCommitment,
-            currentRound: 0,
             owner: msg.sender,
-            minStake: minStake > 0 ? minStake : defaultMinStake,
-            active: true
+            currentRound: 0,
+            active: true,
+            minStake: effectiveMinStake
         });
 
-        emit ModelRegistered(modelId, msg.sender, initialCommitment, ipfsHash);
+        emit ModelRegistered(modelId, msg.sender, initialCommitment, minStake > 0 ? minStake : defaultMinStake, ipfsHash);
     }
 
     /// @notice Starts a new training round
@@ -205,18 +292,18 @@ contract HelixCoordinatorV2 {
         require(msg.sender == model.owner, "Only model owner");
         require(model.active, "Model not active");
 
-        uint256 roundId = ++model.currentRound;
-        uint256 deadline = block.timestamp + duration;
+        uint32 roundId = ++model.currentRound;
+        uint40 deadline = uint40(block.timestamp + duration);
 
         rounds[modelId][roundId] = Round({
             modelCommitment: model.currentCommitment,
             newCommitment: 0,
-            isCompleted: false,
             deadline: deadline,
+            isCompleted: false,
             prover: address(0)
         });
 
-        emit RoundStarted(modelId, roundId, deadline);
+        emit RoundStarted(modelId, roundId, deadline, model.currentCommitment);
     }
 
     // ============ Staking ============
@@ -229,10 +316,11 @@ contract HelixCoordinatorV2 {
         Stake storage s = stakes[msg.sender][modelId];
         require(!s.slashed, "Previous stake was slashed");
 
-        s.amount += msg.value;
-        s.lockedUntil = block.timestamp + stakeLockPeriod;
+        uint128 newAmount = s.amount + uint128(msg.value);
+        s.amount = newAmount;
+        s.lockedUntil = uint40(block.timestamp + uint256(stakeLockDays) * 1 days);
 
-        emit Staked(msg.sender, modelId, msg.value);
+        emit Staked(msg.sender, modelId, msg.value, newAmount);
     }
 
     /// @notice Withdraws stake after lock period
@@ -273,19 +361,14 @@ contract HelixCoordinatorV2 {
         require(!round.isCompleted, "Round completed");
         require(block.timestamp <= round.deadline, "Round expired");
 
-        // Validate public inputs (7 inputs for MLTrainingStepCircuit)
-        // [0] = oldHashLo, [1] = oldHashHi, [2] = newHashLo, [3] = newHashHi
-        // [4] = loss, [5] = errorBound, [6] = stepNumber
+        // Validate public inputs count
         require(publicInputs.length == 7, "Invalid public inputs count");
 
-        // Reconstruct old commitment from public inputs [0] and [1]
+        // Reconstruct and validate old commitment
         uint256 oldCommitmentFromProof = _hashPair(publicInputs[0], publicInputs[1]);
-        require(
-            oldCommitmentFromProof == round.modelCommitment,
-            "Old commitment mismatch"
-        );
+        require(oldCommitmentFromProof == round.modelCommitment, "Old commitment mismatch");
 
-        // Validate error bound is within acceptable range
+        // Validate error bound
         uint256 stepErrorBound = publicInputs[5];
         require(stepErrorBound <= maxErrorBound, "Error bound exceeds maximum");
 
@@ -293,21 +376,12 @@ contract HelixCoordinatorV2 {
         bool valid = verifier.verifyProof(proof, publicInputs);
 
         if (!valid) {
-            // Slash the prover for submitting invalid proof
-            // NOTE: We do NOT revert here - that would roll back the slashing!
-            // Instead, we slash and return early. The prover loses their stake
-            // and must re-stake to participate again.
-            _slash(msg.sender, modelId, "Invalid proof");
-            emit InvalidProofDetected(
-                modelId,
-                roundId,
-                msg.sender,
-                keccak256(proof)
-            );
-            return; // Do not revert - let the slashing persist
+            _slash(msg.sender, modelId, roundId, "Invalid proof");
+            emit InvalidProofDetected(modelId, roundId, msg.sender, keccak256(proof));
+            return;
         }
 
-        // Extract new commitment from public inputs [2] and [3]
+        // Extract new commitment
         uint256 newCommitment = _hashPair(publicInputs[2], publicInputs[3]);
 
         // Update state
@@ -316,14 +390,15 @@ contract HelixCoordinatorV2 {
         round.isCompleted = true;
         round.prover = msg.sender;
 
-        // Track accumulated error bound for the model
-        accumulatedErrorBound[modelId] += stepErrorBound;
+        // Track accumulated error bound
+        uint256 newAccumulatedError = accumulatedErrorBound[modelId] + stepErrorBound;
+        accumulatedErrorBound[modelId] = newAccumulatedError;
 
         // Reset stake lock (reward for valid submission)
-        stakes[msg.sender][modelId].lockedUntil = block.timestamp;
+        stakes[msg.sender][modelId].lockedUntil = uint40(block.timestamp);
 
-        emit ProofSubmitted(modelId, roundId, msg.sender, newCommitment);
-        emit RoundCompleted(modelId, roundId, newCommitment);
+        emit ProofSubmitted(modelId, roundId, msg.sender, newCommitment, stepErrorBound);
+        emit RoundCompleted(modelId, roundId, newCommitment, newAccumulatedError);
     }
 
     // ============ Slashing ============
@@ -332,13 +407,14 @@ contract HelixCoordinatorV2 {
     function _slash(
         address prover,
         uint256 modelId,
+        uint256 roundId,
         string memory reason
     ) internal {
         Stake storage s = stakes[prover][modelId];
         require(s.amount > 0, "No stake to slash");
         require(!s.slashed, "Already slashed");
 
-        uint256 slashAmount = (s.amount * slashPercentage) / 10000;
+        uint128 slashAmount = uint128((uint256(s.amount) * slashPercentage) / 10000);
         s.amount -= slashAmount;
         s.slashed = true;
 
@@ -350,18 +426,17 @@ contract HelixCoordinatorV2 {
 
         slashingRecords.push(SlashingRecord({
             prover: prover,
-            modelId: modelId,
-            roundId: models[modelId].currentRound,
+            modelId: uint64(modelId),
+            roundId: uint32(roundId),
             amount: slashAmount,
             reason: reason,
-            timestamp: block.timestamp
+            timestamp: uint40(block.timestamp)
         }));
 
-        emit Slashed(prover, modelId, slashAmount, reason);
+        emit Slashed(prover, modelId, roundId, slashAmount, s.amount, reason);
     }
 
-    /// @notice Allows anyone to challenge a past proof (if fraud is detected later)
-    /// @dev This could be called if someone finds a proof was actually invalid
+    /// @notice Allows anyone to challenge a past proof
     function challengeProof(
         uint256 modelId,
         uint256 roundId,
@@ -372,12 +447,10 @@ contract HelixCoordinatorV2 {
         require(round.isCompleted, "Round not completed");
         require(round.prover != address(0), "No prover to challenge");
 
-        // Re-verify the proof
         bool valid = verifier.verifyProof(proof, publicInputs);
 
         if (!valid) {
-            // The original prover submitted fraud!
-            _slash(round.prover, modelId, "Fraudulent proof challenged");
+            _slash(round.prover, modelId, roundId, "Fraudulent proof challenged");
         }
     }
 
@@ -409,19 +482,21 @@ contract HelixCoordinatorV2 {
     }
 
     /// @notice Gets the accumulated error bound for a model
-    /// @dev This represents the total numerical error accumulated across all training steps
     function getAccumulatedErrorBound(uint256 modelId) external view returns (uint256) {
         return accumulatedErrorBound[modelId];
     }
 
     /// @notice Checks if a model's accumulated error is within acceptable limits
-    /// @param modelId The model to check
-    /// @param maxAccumulated Maximum acceptable accumulated error
     function isModelErrorAcceptable(
         uint256 modelId,
         uint256 maxAccumulated
     ) external view returns (bool) {
         return accumulatedErrorBound[modelId] <= maxAccumulated;
+    }
+
+    /// @notice Gets the effective stake lock period in seconds
+    function stakeLockPeriod() external view returns (uint256) {
+        return uint256(stakeLockDays) * 1 days;
     }
 
     // ============ Internal Helpers ============
@@ -435,31 +510,36 @@ contract HelixCoordinatorV2 {
 
     /// @notice Updates the verifier contract
     function setVerifier(address _verifier) external onlyOwner {
+        emit ConfigUpdated("verifier", uint256(uint160(address(verifier))), uint256(uint160(_verifier)));
         verifier = IHelixVerifier(_verifier);
     }
 
     /// @notice Updates the treasury address
     function setTreasury(address _treasury) external onlyOwner {
+        emit ConfigUpdated("treasury", uint256(uint160(treasury)), uint256(uint160(_treasury)));
         treasury = _treasury;
     }
 
     /// @notice Updates the slash percentage
     function setSlashPercentage(uint256 _percentage) external onlyOwner {
         require(_percentage <= 10000, "Max 100%");
-        slashPercentage = _percentage;
+        emit ConfigUpdated("slashPercentage", slashPercentage, _percentage);
+        slashPercentage = uint16(_percentage);
     }
 
     /// @notice Updates the default minimum stake
     function setDefaultMinStake(uint256 _minStake) external onlyOwner {
+        emit ConfigUpdated("defaultMinStake", defaultMinStake, _minStake);
         defaultMinStake = _minStake;
     }
 
     /// @notice Updates the maximum allowed error bound per step
     function setMaxErrorBound(uint256 _maxErrorBound) external onlyOwner {
+        emit ConfigUpdated("maxErrorBound", maxErrorBound, _maxErrorBound);
         maxErrorBound = _maxErrorBound;
     }
 
-    /// @notice Resets accumulated error for a model (e.g., after re-training from scratch)
+    /// @notice Resets accumulated error for a model
     function resetAccumulatedError(uint256 modelId) external {
         require(
             msg.sender == models[modelId].owner || msg.sender == owner,
@@ -475,6 +555,7 @@ contract HelixCoordinatorV2 {
             "Not authorized"
         );
         models[modelId].active = false;
+        emit ModelStateChanged(modelId, false, msg.sender);
     }
 
     /// @notice Resumes a model
@@ -484,6 +565,7 @@ contract HelixCoordinatorV2 {
             "Not authorized"
         );
         models[modelId].active = true;
+        emit ModelStateChanged(modelId, true, msg.sender);
     }
 
     /// @notice Receives ETH

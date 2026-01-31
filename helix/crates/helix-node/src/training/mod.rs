@@ -59,6 +59,7 @@ pub use metrics::{
 pub use coordinator::{
     NodeId, NodeRole, CoordinatorConfig, CoordinatorState,
     CoordinatorEvent, TrainingCoordinator, PeerInfo, CoordinatorError,
+    ByzantineDetection, ErrorBoundTracker, GradientOutlierDetector, RecoveryState,
 };
 
 pub use session::{
