@@ -1,0 +1,165 @@
+# HELIX Demo Configuration
+# ==========================
+# Configuration for the 90-second live demo with real proof generation
+
+[demo]
+# Demo scenario type: "quick", "full", "slashing", "multi_model", "fault_tolerance"
+scenario = "full"
+
+# Target demo duration in seconds
+target_duration = 90
+
+# Number of training rounds (each generates a real ZK proof)
+rounds = 5
+
+# Number of worker nodes to simulate
+workers = 3
+
+# Enable real proof generation (requires prover binary)
+real_proofs = true
+
+# Enable real on-chain verification (requires Halo2Verifier deployment)
+real_verification = true
+
+# Enable adversarial worker demonstration
+adversarial_demo = true
+
+# Round at which adversarial worker submits invalid proof
+adversarial_round = 3
+
+# Recording mode settings
+recording_mode = false
+
+[model]
+# Model dimensions for the 2-layer MLP
+# Smaller dimensions for faster proof generation during demo
+d_in = 4
+d_hid = 8
+d_out = 2
+
+# Learning rate for SGD
+learning_rate = 0.01
+
+# Random seed for reproducibility
+seed = 42
+
+# Circuit K parameter (2^k rows, affects proof size/speed)
+# Lower K = faster proofs but smaller circuits
+# K=14 is good balance for demo model
+circuit_k = 14
+
+[prover]
+# Pre-warm the prover before demo starts
+prewarm = true
+
+# Number of warmup proofs to generate (discarded)
+warmup_proofs = 1
+
+# Target proof generation time (ms)
+# Demo will warn if proofs take longer
+target_proof_time_ms = 500
+
+# Use parallel proof generation
+parallel = true
+
+# Number of prover threads
+threads = 4
+
+# Cache proving keys for faster subsequent runs
+cache_keys = true
+
+# Key cache directory
+key_cache_dir = ".helix/key_cache"
+
+[blockchain]
+# RPC URL for Ethereum node
+rpc_url = "http://localhost:8545"
+
+# Anvil port for local blockchain
+anvil_port = 8545
+
+# Default private key (Anvil test key #0)
+private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+
+# Worker private keys (Anvil test keys #1-3)
+worker_keys = [
+    "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
+    "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a",
+    "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6"
+]
+
+# Stake amount per worker (in wei, 0.5 ETH)
+stake_amount = 500000000000000000
+
+# Deploy contracts fresh or use existing
+deploy_fresh = true
+
+# Use real Halo2Verifier (true) or MockVerifier (false)
+use_real_verifier = true
+
+[dashboard]
+# Enable dashboard data streaming
+enabled = true
+
+# Dashboard HTTP port
+port = 3000
+
+# Dashboard API port (for streaming data)
+api_port = 8080
+
+# WebSocket port for real-time updates
+ws_port = 8081
+
+# Auto-open browser
+auto_open = false
+
+[logging]
+# Log level: "error", "warn", "info", "debug", "trace"
+level = "info"
+
+# Log to file
+log_to_file = true
+
+# Log file path
+log_file = ".helix/demo.log"
+
+# Show timing information
+show_timing = true
+
+# Verbose contract interactions
+verbose_contracts = false
+
+[recovery]
+# Enable automatic recovery from errors
+auto_recovery = true
+
+# Maximum recovery attempts
+max_retries = 3
+
+# Retry delay in milliseconds
+retry_delay_ms = 1000
+
+# Checkpoint frequency (rounds between checkpoints)
+checkpoint_frequency = 1
+
+# Checkpoint directory
+checkpoint_dir = ".helix/checkpoints"
+
+[recording]
+# Video recording settings
+enabled = false
+
+# Output file path
+output_file = "demo_recording.mp4"
+
+# Terminal recording tool: "asciinema", "ttyrec", "script"
+terminal_recorder = "asciinema"
+
+# Include timestamp overlay
+show_timestamp = true
+
+# Auto-pause at key moments for emphasis
+auto_pause = true
+
+# Pause duration in seconds
+pause_duration = 2

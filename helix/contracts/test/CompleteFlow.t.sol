@@ -38,7 +38,15 @@ contract CompleteFlowTest is Test {
     event DataCommitmentSet(uint256 indexed modelId, bytes32 indexed dataRoot, address indexed setBy);
     event RoundDataCommitted(uint256 indexed modelId, uint256 indexed roundId, bytes32 dataRoot);
     event EmergencyPauseChanged(bool isPaused, address indexed changedBy);
-    event EvidenceSubmitted(uint256 indexed evidenceId, address indexed prover, uint64 indexed modelId, SlashingEvidence.ViolationType violationType, uint128 slashedAmount);
+    event EvidenceSubmitted(
+        uint256 indexed evidenceId,
+        address indexed prover,
+        uint64 indexed modelId,
+        SlashingEvidence.ViolationType violationType,
+        SlashingEvidence.ErrorCode errorCode,
+        SlashingEvidence.SeverityLevel severity,
+        uint128 slashedAmount
+    );
 
     function setUp() public {
         owner = address(this);
@@ -317,9 +325,11 @@ contract CompleteFlowTest is Test {
             0, // modelId
             1, // roundId
             SlashingEvidence.ViolationType.InvalidProof,
+            SlashingEvidence.ErrorCode.PROOF_VERIFICATION_FAILED,
             0.5 ether, // slashed
             0.5 ether, // remaining
             keccak256("proof"),
+            address(0), // challenger
             "Test slashing"
         );
 
@@ -347,14 +357,18 @@ contract CompleteFlowTest is Test {
             prover,
             0, 1,
             SlashingEvidence.ViolationType.InvalidProof,
+            SlashingEvidence.ErrorCode.PROOF_VERIFICATION_FAILED,
             0.5 ether, 0.5 ether,
             keccak256("proof"),
+            address(0), // challenger
             "Test"
         );
 
-        // File dispute
+        // File dispute (requires stake)
+        uint256 disputeStake = slashingEvidence.disputeStakeRequired();
+        vm.deal(prover, disputeStake);
         vm.prank(prover);
-        uint256 disputeId = slashingEvidence.fileDispute(
+        uint256 disputeId = slashingEvidence.fileDispute{value: disputeStake}(
             evidenceId,
             keccak256("counter-evidence"),
             "I believe the proof was valid"

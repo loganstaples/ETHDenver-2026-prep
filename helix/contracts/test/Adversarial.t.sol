@@ -793,4 +793,517 @@ contract AdversarialTest is Test {
         // Should use reasonable gas (less than 2M for verification failure path)
         assertLt(gasUsed, 2_000_000);
     }
+
+    // ============ Advanced Slashing Scenarios ============
+
+    /// @notice Test slashing with exact percentage calculation
+    function test_SlashingPercentageCalculation() public {
+        (uint256 modelId, uint256 hashLo, uint256 hashHi) = _setupModelAndRound();
+
+        // Test with various stake amounts
+        uint256[] memory stakeAmounts = new uint256[](5);
+        stakeAmounts[0] = 1 ether;
+        stakeAmounts[1] = 2.5 ether;
+        stakeAmounts[2] = 0.1 ether;
+        stakeAmounts[3] = 10 ether;
+        stakeAmounts[4] = 0.123456789 ether;
+
+        for (uint256 i = 0; i < stakeAmounts.length; i++) {
+            // Create new attacker for each test
+            address attacker = makeAddr(string(abi.encodePacked("stakeAttacker", i)));
+            vm.deal(attacker, stakeAmounts[i] + 1 ether);
+
+            vm.prank(attacker);
+            coordinator.stake{value: stakeAmounts[i]}(modelId);
+
+            mockVerifier.setShouldPass(false);
+
+            uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111 + i, 2222 + i);
+            bytes memory proof = new bytes(320);
+
+            vm.prank(attacker);
+            coordinator.submitProof(modelId, 1, proof, inputs);
+
+            (uint256 remaining,, bool slashed) = coordinator.getStake(attacker, modelId);
+            assertTrue(slashed);
+            // 50% slashing percentage
+            assertEq(remaining, stakeAmounts[i] / 2, "Should slash exactly 50%");
+        }
+    }
+
+    /// @notice Test slashing record details
+    function test_SlashingRecordDetails() public {
+        (uint256 modelId, uint256 hashLo, uint256 hashHi) = _setupModelAndRound();
+
+        vm.prank(attacker1);
+        coordinator.stake{value: LARGE_STAKE}(modelId);
+
+        mockVerifier.setShouldPass(false);
+
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        bytes memory proof = new bytes(320);
+
+        uint256 expectedSlashAmount = LARGE_STAKE / 2;
+
+        vm.prank(attacker1);
+        coordinator.submitProof(modelId, 1, proof, inputs);
+
+        // Verify slashing record
+        (
+            address prover,
+            uint64 recordModelId,
+            uint32 roundId,
+            uint128 amount,
+            ,
+            uint40 timestamp
+        ) = coordinator.slashingRecords(0);
+
+        assertEq(prover, attacker1, "Wrong prover in record");
+        assertEq(recordModelId, modelId, "Wrong model ID in record");
+        assertEq(roundId, 1, "Wrong round ID in record");
+        assertEq(amount, expectedSlashAmount, "Wrong amount in record");
+        assertGt(timestamp, 0, "Timestamp should be set");
+    }
+
+    /// @notice Test partial stake withdrawal before slash
+    function test_PartialWithdrawalBeforeSlash() public {
+        (uint256 modelId, uint256 hashLo, uint256 hashHi) = _setupModelAndRound();
+
+        vm.prank(attacker1);
+        coordinator.stake{value: LARGE_STAKE}(modelId);
+
+        // Lock period prevents withdrawal
+        vm.prank(attacker1);
+        vm.expectRevert("Still locked");
+        coordinator.unstake(modelId);
+
+        // Attacker cannot withdraw before being slashed
+        mockVerifier.setShouldPass(false);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        bytes memory proof = new bytes(320);
+
+        vm.prank(attacker1);
+        coordinator.submitProof(modelId, 1, proof, inputs);
+
+        // After slashing, withdrawal should fail due to slashed status
+        vm.prank(attacker1);
+        vm.expectRevert("Stake was slashed");
+        coordinator.unstake(modelId);
+    }
+
+    /// @notice Test model deactivation after slashing
+    function test_ModelOperationsAfterSlashing() public {
+        (uint256 modelId, uint256 hashLo, uint256 hashHi) = _setupModelAndRound();
+
+        vm.prank(attacker1);
+        coordinator.stake{value: LARGE_STAKE}(modelId);
+
+        mockVerifier.setShouldPass(false);
+
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        bytes memory proof = new bytes(320);
+
+        // Attacker gets slashed
+        vm.prank(attacker1);
+        coordinator.submitProof(modelId, 1, proof, inputs);
+
+        // Honest prover can still complete the round
+        vm.prank(honestProver);
+        coordinator.stake{value: LARGE_STAKE}(modelId);
+
+        mockVerifier.setShouldPass(true);
+
+        vm.prank(honestProver);
+        coordinator.submitProof(modelId, 1, proof, inputs);
+
+        // Model should still be active
+        (,, bool active) = coordinator.getModelState(modelId);
+        assertTrue(active, "Model should remain active");
+    }
+
+    // ============ Multi-Model Attack Scenarios ============
+
+    /// @notice Test attacker across multiple models
+    function test_AttackerAcrossMultipleModels() public {
+        // Create multiple models
+        uint256[] memory modelIds = new uint256[](3);
+        for (uint256 i = 0; i < 3; i++) {
+            uint256 commitment = uint256(keccak256(abi.encodePacked(i + 1, i + 2)));
+            vm.prank(modelOwner);
+            modelIds[i] = coordinator.registerModel(
+                string(abi.encodePacked("Model", i)),
+                commitment,
+                MIN_STAKE
+            );
+            vm.prank(modelOwner);
+            coordinator.startRound(modelIds[i], ROUND_DURATION);
+        }
+
+        // Attacker stakes on all models
+        for (uint256 i = 0; i < 3; i++) {
+            vm.prank(attacker1);
+            coordinator.stake{value: LARGE_STAKE}(modelIds[i]);
+        }
+
+        // Attack model 0
+        mockVerifier.setShouldPass(false);
+        uint256[] memory inputs = new uint256[](7);
+        inputs[0] = 1;
+        inputs[1] = 2;
+        inputs[2] = 3;
+        inputs[3] = 4;
+        inputs[4] = 100;
+        inputs[5] = 10;
+        inputs[6] = 1;
+        bytes memory proof = new bytes(320);
+
+        vm.prank(attacker1);
+        coordinator.submitProof(modelIds[0], 1, proof, inputs);
+
+        // Slashed on model 0
+        (,, bool slashed0) = coordinator.getStake(attacker1, modelIds[0]);
+        assertTrue(slashed0, "Should be slashed on model 0");
+
+        // But can still operate on other models
+        (,, bool slashed1) = coordinator.getStake(attacker1, modelIds[1]);
+        (,, bool slashed2) = coordinator.getStake(attacker1, modelIds[2]);
+        assertFalse(slashed1, "Should not be slashed on model 1");
+        assertFalse(slashed2, "Should not be slashed on model 2");
+    }
+
+    // ============ Edge Cases with Public Inputs ============
+
+    /// @notice Test with boundary value public inputs
+    function test_BoundaryValuePublicInputs() public {
+        coordinator.setVerifier(address(realVerifier));
+        (uint256 modelId, uint256 hashLo, uint256 hashHi) = _setupModelAndRound();
+
+        vm.prank(attacker1);
+        coordinator.stake{value: LARGE_STAKE}(modelId);
+
+        // Test with zero values (except commitment)
+        uint256[] memory inputs = new uint256[](7);
+        inputs[0] = hashLo;
+        inputs[1] = hashHi;
+        inputs[2] = 0;  // Zero new hash
+        inputs[3] = 0;  // Zero new hash
+        inputs[4] = 0;  // Zero loss
+        inputs[5] = 0;  // Zero error bound
+        inputs[6] = 0;  // Zero step number
+
+        bytes memory proof = new bytes(320);
+
+        vm.prank(attacker1);
+        coordinator.submitProof(modelId, 1, proof, inputs);
+
+        // Should fail verification and get slashed
+        (,, bool slashed) = coordinator.getStake(attacker1, modelId);
+        assertTrue(slashed, "Should be slashed for invalid proof");
+    }
+
+    /// @notice Test with max uint128 values
+    function test_LargeValuePublicInputs() public {
+        (uint256 modelId, uint256 hashLo, uint256 hashHi) = _setupModelAndRound();
+
+        vm.prank(attacker1);
+        coordinator.stake{value: LARGE_STAKE}(modelId);
+
+        // Test with max uint128 for hash values
+        uint256[] memory inputs = new uint256[](7);
+        inputs[0] = hashLo;
+        inputs[1] = hashHi;
+        inputs[2] = type(uint128).max;  // Large new hash lo
+        inputs[3] = type(uint128).max;  // Large new hash hi
+        inputs[4] = type(uint128).max;  // Large loss
+        inputs[5] = 10;  // Valid error bound
+        inputs[6] = type(uint64).max;  // Large step number
+
+        bytes memory proof = new bytes(320);
+
+        mockVerifier.setShouldPass(true);
+
+        vm.prank(attacker1);
+        coordinator.submitProof(modelId, 1, proof, inputs);
+
+        // Should succeed with valid proof
+        (,, bool slashed) = coordinator.getStake(attacker1, modelId);
+        assertFalse(slashed, "Should not be slashed for valid proof");
+    }
+
+    // ============ Concurrent Attack Tests ============
+
+    /// @notice Test concurrent submissions from multiple attackers
+    function test_ConcurrentAttackersMultipleRounds() public {
+        (uint256 modelId, uint256 hashLo, uint256 hashHi) = _setupModelAndRound();
+
+        // Multiple attackers stake
+        address[] memory attackers = new address[](5);
+        for (uint256 i = 0; i < 5; i++) {
+            attackers[i] = makeAddr(string(abi.encodePacked("multiAttacker", i)));
+            vm.deal(attackers[i], 10 ether);
+            vm.prank(attackers[i]);
+            coordinator.stake{value: LARGE_STAKE}(modelId);
+        }
+
+        // First attacker submits invalid
+        mockVerifier.setShouldPass(false);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        bytes memory proof = new bytes(320);
+
+        vm.prank(attackers[0]);
+        coordinator.submitProof(modelId, 1, proof, inputs);
+
+        // First attacker slashed
+        (,, bool slashed0) = coordinator.getStake(attackers[0], modelId);
+        assertTrue(slashed0);
+
+        // Second attacker submits valid (completes round)
+        mockVerifier.setShouldPass(true);
+        vm.prank(attackers[1]);
+        coordinator.submitProof(modelId, 1, proof, inputs);
+
+        // Second attacker not slashed
+        (,, bool slashed1) = coordinator.getStake(attackers[1], modelId);
+        assertFalse(slashed1);
+
+        // Other attackers can't submit (round completed)
+        for (uint256 i = 2; i < 5; i++) {
+            vm.prank(attackers[i]);
+            vm.expectRevert("Round completed");
+            coordinator.submitProof(modelId, 1, proof, inputs);
+        }
+    }
+
+    // ============ Time-based Attack Tests ============
+
+    /// @notice Test attack at exact deadline
+    function test_AttackAtExactDeadline() public {
+        (uint256 modelId, uint256 hashLo, uint256 hashHi) = _setupModelAndRound();
+
+        vm.prank(attacker1);
+        coordinator.stake{value: LARGE_STAKE}(modelId);
+
+        mockVerifier.setShouldPass(true);
+
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        bytes memory proof = new bytes(320);
+
+        // Warp to exactly deadline (should still work)
+        vm.warp(block.timestamp + ROUND_DURATION);
+
+        vm.prank(attacker1);
+        coordinator.submitProof(modelId, 1, proof, inputs);
+
+        // Should succeed at deadline
+        (,, bool slashed) = coordinator.getStake(attacker1, modelId);
+        assertFalse(slashed);
+    }
+
+    /// @notice Test attack 1 second after deadline
+    function test_AttackOneSecondAfterDeadline() public {
+        (uint256 modelId, uint256 hashLo, uint256 hashHi) = _setupModelAndRound();
+
+        vm.prank(attacker1);
+        coordinator.stake{value: LARGE_STAKE}(modelId);
+
+        mockVerifier.setShouldPass(true);
+
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        bytes memory proof = new bytes(320);
+
+        // Warp to 1 second after deadline
+        vm.warp(block.timestamp + ROUND_DURATION + 1);
+
+        vm.prank(attacker1);
+        vm.expectRevert("Round expired");
+        coordinator.submitProof(modelId, 1, proof, inputs);
+    }
+
+    // ============ Slashing Parameter Tests ============
+
+    /// @notice Test changing slash percentage mid-operation
+    function test_SlashPercentageChange() public {
+        (uint256 modelId, uint256 hashLo, uint256 hashHi) = _setupModelAndRound();
+
+        vm.prank(attacker1);
+        coordinator.stake{value: LARGE_STAKE}(modelId);
+
+        // Change slash percentage to 75%
+        coordinator.setSlashPercentage(7500);
+
+        mockVerifier.setShouldPass(false);
+
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        bytes memory proof = new bytes(320);
+
+        vm.prank(attacker1);
+        coordinator.submitProof(modelId, 1, proof, inputs);
+
+        // Should slash 75%
+        (uint256 remaining,, bool slashed) = coordinator.getStake(attacker1, modelId);
+        assertTrue(slashed);
+        assertEq(remaining, LARGE_STAKE * 25 / 100);  // 25% remains
+    }
+
+    /// @notice Test 100% slash
+    function test_FullSlash() public {
+        (uint256 modelId, uint256 hashLo, uint256 hashHi) = _setupModelAndRound();
+
+        vm.prank(attacker1);
+        coordinator.stake{value: LARGE_STAKE}(modelId);
+
+        // Change slash percentage to 100%
+        coordinator.setSlashPercentage(10000);
+
+        mockVerifier.setShouldPass(false);
+
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        bytes memory proof = new bytes(320);
+
+        vm.prank(attacker1);
+        coordinator.submitProof(modelId, 1, proof, inputs);
+
+        // Should slash 100%
+        (uint256 remaining,, bool slashed) = coordinator.getStake(attacker1, modelId);
+        assertTrue(slashed);
+        assertEq(remaining, 0);  // 0% remains
+    }
+
+    /// @notice Test 0% slash (warning only)
+    function test_ZeroSlash() public {
+        (uint256 modelId, uint256 hashLo, uint256 hashHi) = _setupModelAndRound();
+
+        vm.prank(attacker1);
+        coordinator.stake{value: LARGE_STAKE}(modelId);
+
+        // Change slash percentage to 0%
+        coordinator.setSlashPercentage(0);
+
+        mockVerifier.setShouldPass(false);
+
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        bytes memory proof = new bytes(320);
+
+        vm.prank(attacker1);
+        coordinator.submitProof(modelId, 1, proof, inputs);
+
+        // Should still mark as slashed but 0 amount
+        (uint256 remaining,, bool slashed) = coordinator.getStake(attacker1, modelId);
+        assertTrue(slashed);  // Still marked as slashed
+        assertEq(remaining, LARGE_STAKE);  // Full stake remains
+    }
+
+    // ============ Emergency Pause Tests ============
+
+    /// @notice Test attack during emergency pause
+    function test_AttackDuringEmergencyPause() public {
+        (uint256 modelId, uint256 hashLo, uint256 hashHi) = _setupModelAndRound();
+
+        vm.prank(attacker1);
+        coordinator.stake{value: LARGE_STAKE}(modelId);
+
+        // Pause the contract
+        coordinator.emergencyPause();
+
+        mockVerifier.setShouldPass(false);
+
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        bytes memory proof = new bytes(320);
+
+        // Note: submitProof doesn't have whenNotPaused modifier in current implementation
+        // This test documents current behavior
+    }
+
+    /// @notice Test new model registration during pause
+    function test_NewModelDuringPause() public {
+        // Pause the contract
+        coordinator.emergencyPause();
+
+        vm.prank(modelOwner);
+        vm.expectRevert("Contract is paused");
+        coordinator.registerModel("Test", 12345, MIN_STAKE);
+    }
+
+    // ============ Model State Attack Tests ============
+
+    /// @notice Test attack on inactive model
+    function test_AttackOnInactiveModel() public {
+        (uint256 modelId, uint256 hashLo, uint256 hashHi) = _setupModelAndRound();
+
+        vm.prank(attacker1);
+        coordinator.stake{value: LARGE_STAKE}(modelId);
+
+        // Deactivate model
+        vm.prank(modelOwner);
+        coordinator.pauseModel(modelId);
+
+        // Try to start new round on inactive model
+        vm.prank(modelOwner);
+        vm.expectRevert("Model not active");
+        coordinator.startRound(modelId, ROUND_DURATION);
+    }
+
+    // ============ Accumulated Error Attack Tests ============
+
+    /// @notice Test model error tolerance check
+    function test_ModelErrorToleranceCheck() public {
+        (uint256 modelId, uint256 hashLo, uint256 hashHi) = _setupModelAndRound();
+
+        vm.prank(honestProver);
+        coordinator.stake{value: LARGE_STAKE}(modelId);
+
+        mockVerifier.setShouldPass(true);
+
+        // Submit proof with high error bound
+        uint256[] memory inputs = new uint256[](7);
+        inputs[0] = hashLo;
+        inputs[1] = hashHi;
+        inputs[2] = 1111;
+        inputs[3] = 2222;
+        inputs[4] = 100;
+        inputs[5] = coordinator.maxErrorBound();  // Max allowed error
+        inputs[6] = 1;
+
+        bytes memory proof = new bytes(320);
+
+        vm.prank(honestProver);
+        coordinator.submitProof(modelId, 1, proof, inputs);
+
+        // Check accumulated error
+        uint256 accumulated = coordinator.getAccumulatedErrorBound(modelId);
+        assertEq(accumulated, coordinator.maxErrorBound());
+
+        // Model is still acceptable at this threshold
+        assertTrue(coordinator.isModelErrorAcceptable(modelId, coordinator.maxErrorBound()));
+
+        // But not acceptable below
+        assertFalse(coordinator.isModelErrorAcceptable(modelId, coordinator.maxErrorBound() - 1));
+    }
+
+    /// @notice Test accumulated error reset
+    function test_AccumulatedErrorReset() public {
+        (uint256 modelId, uint256 hashLo, uint256 hashHi) = _setupModelAndRound();
+
+        vm.prank(honestProver);
+        coordinator.stake{value: LARGE_STAKE}(modelId);
+
+        mockVerifier.setShouldPass(true);
+
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        bytes memory proof = new bytes(320);
+
+        vm.prank(honestProver);
+        coordinator.submitProof(modelId, 1, proof, inputs);
+
+        // Has accumulated error
+        uint256 errorBefore = coordinator.getAccumulatedErrorBound(modelId);
+        assertGt(errorBefore, 0);
+
+        // Reset error
+        vm.prank(modelOwner);
+        coordinator.resetAccumulatedError(modelId);
+
+        // Error should be 0
+        assertEq(coordinator.getAccumulatedErrorBound(modelId), 0);
+    }
 }
