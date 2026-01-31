@@ -93,3 +93,41 @@ path = "integration/cross_platform.rs"
 name = "performance_regression"
 harness = false
 path = "benches/performance_regression.rs"
+
+[[bench]]
+name = "comprehensive_benchmarks"
+harness = false
+path = "benches/comprehensive_benchmarks.rs"
+
+[[bench]]
+name = "overhead_report"
+harness = false
+path = "benches/overhead_report_bench.rs"
+
+[[bench]]
+name = "scaling_analysis"
+harness = false
+path = "benches/scaling_bench.rs"
+
+[[bench]]
+name = "metal_comparison"
+harness = false
+path = "benches/metal_bench.rs"
+
+[[bench]]
+name = "memory_benchmarks"
+harness = false
+path = "benches/memory_bench.rs"
+
+[[bin]]
+name = "ci_benchmarks"
+path = "benches/ci_benchmarks_main.rs"
+
+[features]
+default = []
+parallel = ["rayon"]
+metal = ["helix-prover/metal"]
+
+[dependencies.rayon]
+version = "1.10"
+optional = true

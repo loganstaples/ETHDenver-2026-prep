@@ -8,12 +8,18 @@
 //! - TCP/TLS transport layer
 //! - Wire format serialization
 //! - mDNS-based local discovery
+//! - Network security and hardening
 
 pub mod discovery;
+pub mod eclipse;
 pub mod gossip;
 pub mod mdns_discovery;
 pub mod messages;
+pub mod partition_detect;
+pub mod rate_limit;
+pub mod reputation;
 pub mod runner;
+pub mod sybil;
 pub mod sync;
 pub mod transport;
 pub mod wire;
@@ -35,4 +41,23 @@ pub use transport::{
 pub use wire::{
     BinaryGradient, FrameHeader, FrameReader, FrameWriter, MessageFlags, MessageTypeId,
     WireCodec, WireError, HEADER_SIZE, MAGIC, MAX_MESSAGE_SIZE, PROTOCOL_VERSION,
+};
+
+// Network security re-exports
+pub use eclipse::{
+    DiversityStats, EclipsePreventionConfig, EclipseResistantPeerManager, PeerNetworkInfo,
+};
+pub use partition_detect::{
+    PartitionAction, PartitionDetectionConfig, PartitionDetector, PartitionDetectorStats,
+    PartitionEvent, PartitionStatus, PeerConnectivity, PeerConnectivityInfo,
+};
+pub use rate_limit::{
+    BlacklistEntry, PeerRateLimit, RateLimitConfig, RateLimitStats, RateLimiter,
+};
+pub use reputation::{
+    BehaviorEvent, PeerReputation, ReputationConfig, ReputationDimension, ReputationManager,
+    ReputationStats,
+};
+pub use sybil::{
+    PeerStake, SelectionResult, SybilResistanceConfig, SybilResistantSelector,
 };

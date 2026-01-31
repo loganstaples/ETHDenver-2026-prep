@@ -8,6 +8,7 @@
 //! - Mock implementations for network simulation and adversarial testing
 //! - Performance metrics and regression tracking
 //! - Custom assertions for cryptographic verification
+//! - Comprehensive performance benchmark suite
 //!
 //! # Organization
 //!
@@ -29,6 +30,15 @@
 //!   - `cross_platform.rs` - Platform compatibility
 //!
 //! - `benches/` - Performance benchmarks
+//!   - `harness.rs` - Benchmark harness with standardized reporting
+//!   - `native_baseline.rs` - Native computation baselines
+//!   - `gkr_prover.rs` - GKR prover benchmarks
+//!   - `halo2_prover.rs` - Halo2 prover benchmarks
+//!   - `overhead_report.rs` - Automated overhead calculation
+//!   - `metal_vs_cpu.rs` - GPU vs CPU comparison
+//!   - `memory_profile.rs` - Memory usage profiling
+//!   - `scaling.rs` - Scaling analysis
 //!   - `performance_regression.rs` - CI/CD performance tracking
 
 pub mod common;
+pub mod benches;
