@@ -451,6 +451,7 @@ impl OTTripleGenerator {
         seed: u64,
     ) -> Vec<Vec<super::triple::BeaverTriple>> {
         use super::triple::BeaverTriple;
+        use crate::field::Fr;
 
         let mut per_party: Vec<Vec<BeaverTriple>> = (0..num_parties)
             .map(|_| Vec::with_capacity(count))
@@ -481,13 +482,21 @@ impl OTTripleGenerator {
 
             for i in 0..num_parties - 1 {
                 let c_i: f64 = rng.gen_range(-1000.0..1000.0);
-                per_party[i].push(BeaverTriple::new(all_a[i], all_b[i], c_i));
+                per_party[i].push(BeaverTriple::new(
+                    Fr::from_f64(all_a[i]),
+                    Fr::from_f64(all_b[i]),
+                    Fr::from_f64(c_i),
+                ));
                 c_sum += c_i;
             }
 
             // Last party gets the remainder
             let last = num_parties - 1;
-            per_party[last].push(BeaverTriple::new(all_a[last], all_b[last], total_c - c_sum));
+            per_party[last].push(BeaverTriple::new(
+                Fr::from_f64(all_a[last]),
+                Fr::from_f64(all_b[last]),
+                Fr::from_f64(total_c - c_sum),
+            ));
         }
 
         per_party
@@ -604,6 +613,9 @@ mod tests {
 
     #[test]
     fn test_ot_triple_generation() {
+        use crate::field::Fr;
+        use crate::field::ops::sum;
+
         let triples = OTTripleGenerator::simulate_full_generation(3, 10, 42);
 
         assert_eq!(triples.len(), 3);
@@ -611,14 +623,15 @@ mod tests {
 
         // Verify each triple
         for t in 0..10 {
-            let a: f64 = triples.iter().map(|p| p[t].a).sum();
-            let b: f64 = triples.iter().map(|p| p[t].b).sum();
-            let c: f64 = triples.iter().map(|p| p[t].c).sum();
+            let a = sum(&triples.iter().map(|p| p[t].a.clone()).collect::<Vec<_>>());
+            let b = sum(&triples.iter().map(|p| p[t].b.clone()).collect::<Vec<_>>());
+            let c = sum(&triples.iter().map(|p| p[t].c.clone()).collect::<Vec<_>>());
 
+            let expected = Fr::mul(&a, &b);
             assert!(
-                (c - a * b).abs() < 1e-6,
-                "Triple {} incorrect: c={}, a*b={}, diff={}",
-                t, c, a * b, (c - a * b).abs()
+                c.ct_eq(&expected).to_bool(),
+                "Triple {} incorrect",
+                t,
             );
         }
     }

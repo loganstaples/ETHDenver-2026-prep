@@ -6,44 +6,35 @@
 //! This is the simplest approach and is suitable for the demo. In production,
 //! the dealer role would be replaced by a distributed protocol (see `distributed.rs`).
 
-use rand::Rng;
-use rand_chacha::ChaCha20Rng;
 use rand::SeedableRng;
+use rand_chacha::ChaCha20Rng;
 
-use crate::error::{MPCError, MPCResult};
-use crate::types::PartyId;
+use crate::error::MPCResult;
+use crate::field::Fr;
 use super::triple::{BeaverTriple, MatrixBeaverTriple, VectorBeaverTriple};
 
 /// A trusted dealer that generates Beaver triples and distributes shares.
 #[derive(Debug)]
 pub struct TrustedDealer {
     rng: ChaCha20Rng,
-    /// Range for random triple values.
-    value_range: f64,
 }
 
 impl TrustedDealer {
     pub fn new() -> Self {
         Self {
             rng: ChaCha20Rng::from_entropy(),
-            value_range: 100.0,
         }
     }
 
     pub fn with_seed(seed: u64) -> Self {
         Self {
             rng: ChaCha20Rng::seed_from_u64(seed),
-            value_range: 100.0,
         }
     }
 
-    pub fn with_range(mut self, range: f64) -> Self {
-        self.value_range = range;
-        self
-    }
-
-    fn random_value(&mut self) -> f64 {
-        self.rng.gen_range(-self.value_range..self.value_range)
+    /// Generates a random field element.
+    fn random_value(&mut self) -> Fr {
+        Fr::random(&mut self.rng)
     }
 
     /// Generates shares of a single scalar Beaver triple for n parties.
@@ -57,9 +48,9 @@ impl TrustedDealer {
     ) -> Vec<BeaverTriple> {
         let a = self.random_value();
         let b = self.random_value();
-        let c = a * b;
+        let c = Fr::mul(&a, &b);
 
-        self.additive_share_triple(a, b, c, num_parties)
+        self.additive_share_triple(&a, &b, &c, num_parties)
     }
 
     /// Generates a batch of scalar Beaver triples.
@@ -89,9 +80,9 @@ impl TrustedDealer {
         dim: usize,
         num_parties: usize,
     ) -> Vec<VectorBeaverTriple> {
-        let a: Vec<f64> = (0..dim).map(|_| self.random_value()).collect();
-        let b: Vec<f64> = (0..dim).map(|_| self.random_value()).collect();
-        let c: Vec<f64> = a.iter().zip(&b).map(|(x, y)| x * y).collect();
+        let a: Vec<Fr> = (0..dim).map(|_| self.random_value()).collect();
+        let b: Vec<Fr> = (0..dim).map(|_| self.random_value()).collect();
+        let c: Vec<Fr> = a.iter().zip(&b).map(|(x, y)| Fr::mul(x, y)).collect();
 
         self.additive_share_vector_triple(&a, &b, &c, dim, num_parties)
     }
@@ -105,16 +96,16 @@ impl TrustedDealer {
         num_parties: usize,
     ) -> Vec<MatrixBeaverTriple> {
         // Generate random matrices A[m,k] and B[k,n].
-        let a: Vec<f64> = (0..m * k).map(|_| self.random_value()).collect();
-        let b: Vec<f64> = (0..k * n).map(|_| self.random_value()).collect();
+        let a: Vec<Fr> = (0..m * k).map(|_| self.random_value()).collect();
+        let b: Vec<Fr> = (0..k * n).map(|_| self.random_value()).collect();
 
         // Compute C = A @ B.
-        let mut c = vec![0.0; m * n];
+        let mut c = vec![Fr::ZERO; m * n];
         for i in 0..m {
             for j in 0..n {
-                let mut sum = 0.0;
+                let mut sum = Fr::ZERO;
                 for l in 0..k {
-                    sum += a[i * k + l] * b[l * n + j];
+                    sum = Fr::add(&sum, &Fr::mul(&a[i * k + l], &b[l * n + j]));
                 }
                 c[i * n + j] = sum;
             }
@@ -149,46 +140,54 @@ impl TrustedDealer {
     /// Creates additive shares of a scalar triple.
     fn additive_share_triple(
         &mut self,
-        a: f64,
-        b: f64,
-        c: f64,
+        a: &Fr,
+        b: &Fr,
+        c: &Fr,
         n: usize,
     ) -> Vec<BeaverTriple> {
         let mut shares = Vec::with_capacity(n);
-        let mut a_sum = 0.0;
-        let mut b_sum = 0.0;
-        let mut c_sum = 0.0;
+        let mut a_sum = Fr::ZERO;
+        let mut b_sum = Fr::ZERO;
+        let mut c_sum = Fr::ZERO;
 
-        for i in 0..n - 1 {
+        for _ in 0..n - 1 {
             let ai = self.random_value();
             let bi = self.random_value();
             let ci = self.random_value();
-            a_sum += ai;
-            b_sum += bi;
-            c_sum += ci;
+            a_sum = Fr::add(&a_sum, &ai);
+            b_sum = Fr::add(&b_sum, &bi);
+            c_sum = Fr::add(&c_sum, &ci);
             shares.push(BeaverTriple::new(ai, bi, ci));
         }
 
         // Last share ensures sums are correct.
-        shares.push(BeaverTriple::new(a - a_sum, b - b_sum, c - c_sum));
+        shares.push(BeaverTriple::new(
+            Fr::sub(a, &a_sum),
+            Fr::sub(b, &b_sum),
+            Fr::sub(c, &c_sum),
+        ));
         shares
     }
 
     /// Creates additive shares of a vector triple.
     fn additive_share_vector_triple(
         &mut self,
-        a: &[f64],
-        b: &[f64],
-        c: &[f64],
+        a: &[Fr],
+        b: &[Fr],
+        c: &[Fr],
         dim: usize,
         n: usize,
     ) -> Vec<VectorBeaverTriple> {
         let mut shares: Vec<VectorBeaverTriple> = (0..n)
-            .map(|_| VectorBeaverTriple::new(vec![0.0; dim], vec![0.0; dim], vec![0.0; dim]))
+            .map(|_| VectorBeaverTriple::new(
+                vec![Fr::ZERO; dim],
+                vec![Fr::ZERO; dim],
+                vec![Fr::ZERO; dim],
+            ))
             .collect();
 
         for d in 0..dim {
-            let scalar_shares = self.additive_share_triple(a[d], b[d], c[d], n);
+            let scalar_shares = self.additive_share_triple(&a[d], &b[d], &c[d], n);
             for (i, s) in scalar_shares.into_iter().enumerate() {
                 shares[i].a[d] = s.a;
                 shares[i].b[d] = s.b;
@@ -202,9 +201,9 @@ impl TrustedDealer {
     /// Creates additive shares of a matrix triple.
     fn additive_share_matrix_triple(
         &mut self,
-        a: &[f64],
-        b: &[f64],
-        c: &[f64],
+        a: &[Fr],
+        b: &[Fr],
+        c: &[Fr],
         m: usize,
         k: usize,
         n: usize,
@@ -213,9 +212,9 @@ impl TrustedDealer {
         let mut shares: Vec<MatrixBeaverTriple> = (0..num_parties)
             .map(|_| {
                 MatrixBeaverTriple::new(
-                    vec![0.0; m * k],
-                    vec![0.0; k * n],
-                    vec![0.0; m * n],
+                    vec![Fr::ZERO; m * k],
+                    vec![Fr::ZERO; k * n],
+                    vec![Fr::ZERO; m * n],
                     m,
                     k,
                     n,
@@ -225,7 +224,7 @@ impl TrustedDealer {
 
         // Share each element of A.
         for idx in 0..m * k {
-            let s = self.additive_share_scalar(a[idx], num_parties);
+            let s = self.additive_share_scalar(&a[idx], num_parties);
             for (i, val) in s.into_iter().enumerate() {
                 shares[i].a[idx] = val;
             }
@@ -233,7 +232,7 @@ impl TrustedDealer {
 
         // Share each element of B.
         for idx in 0..k * n {
-            let s = self.additive_share_scalar(b[idx], num_parties);
+            let s = self.additive_share_scalar(&b[idx], num_parties);
             for (i, val) in s.into_iter().enumerate() {
                 shares[i].b[idx] = val;
             }
@@ -241,7 +240,7 @@ impl TrustedDealer {
 
         // Share each element of C.
         for idx in 0..m * n {
-            let s = self.additive_share_scalar(c[idx], num_parties);
+            let s = self.additive_share_scalar(&c[idx], num_parties);
             for (i, val) in s.into_iter().enumerate() {
                 shares[i].c[idx] = val;
             }
@@ -251,15 +250,15 @@ impl TrustedDealer {
     }
 
     /// Simple additive share of a single scalar into n parts.
-    fn additive_share_scalar(&mut self, value: f64, n: usize) -> Vec<f64> {
+    fn additive_share_scalar(&mut self, value: &Fr, n: usize) -> Vec<Fr> {
         let mut shares = Vec::with_capacity(n);
-        let mut sum = 0.0;
+        let mut sum = Fr::ZERO;
         for _ in 0..n - 1 {
             let r = self.random_value();
-            shares.push(r);
-            sum += r;
+            shares.push(r.clone());
+            sum = Fr::add(&sum, &r);
         }
-        shares.push(value - sum);
+        shares.push(Fr::sub(value, &sum));
         shares
     }
 }
@@ -273,6 +272,7 @@ impl Default for TrustedDealer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::field::ops::sum;
 
     #[test]
     fn test_scalar_triple_correctness() {
@@ -280,15 +280,14 @@ mod tests {
         let shares = dealer.generate_scalar_triple(3);
 
         // Sum of a-shares, b-shares, c-shares should satisfy c = a*b.
-        let a: f64 = shares.iter().map(|s| s.a).sum();
-        let b: f64 = shares.iter().map(|s| s.b).sum();
-        let c: f64 = shares.iter().map(|s| s.c).sum();
+        let a = sum(&shares.iter().map(|s| s.a.clone()).collect::<Vec<_>>());
+        let b = sum(&shares.iter().map(|s| s.b.clone()).collect::<Vec<_>>());
+        let c = sum(&shares.iter().map(|s| s.c.clone()).collect::<Vec<_>>());
 
+        let expected_c = Fr::mul(&a, &b);
         assert!(
-            (c - a * b).abs() < 1e-6,
-            "Triple incorrect: c={}, a*b={}",
-            c,
-            a * b,
+            c.ct_eq(&expected_c).to_bool(),
+            "Triple incorrect: c != a*b",
         );
     }
 
@@ -302,15 +301,15 @@ mod tests {
 
         // Verify each triple.
         for idx in 0..100 {
-            let a: f64 = per_party.iter().map(|p| p[idx].a).sum();
-            let b: f64 = per_party.iter().map(|p| p[idx].b).sum();
-            let c: f64 = per_party.iter().map(|p| p[idx].c).sum();
+            let a = sum(&per_party.iter().map(|p| p[idx].a.clone()).collect::<Vec<_>>());
+            let b = sum(&per_party.iter().map(|p| p[idx].b.clone()).collect::<Vec<_>>());
+            let c = sum(&per_party.iter().map(|p| p[idx].c.clone()).collect::<Vec<_>>());
+
+            let expected_c = Fr::mul(&a, &b);
             assert!(
-                (c - a * b).abs() < 1e-4,
-                "Triple {} incorrect: c={}, a*b={}",
+                c.ct_eq(&expected_c).to_bool(),
+                "Triple {} incorrect",
                 idx,
-                c,
-                a * b,
             );
         }
     }
@@ -325,15 +324,15 @@ mod tests {
         assert_eq!(shares[0].dim, dim);
 
         for d in 0..dim {
-            let a: f64 = shares.iter().map(|s| s.a[d]).sum();
-            let b: f64 = shares.iter().map(|s| s.b[d]).sum();
-            let c: f64 = shares.iter().map(|s| s.c[d]).sum();
+            let a = sum(&shares.iter().map(|s| s.a[d].clone()).collect::<Vec<_>>());
+            let b = sum(&shares.iter().map(|s| s.b[d].clone()).collect::<Vec<_>>());
+            let c = sum(&shares.iter().map(|s| s.c[d].clone()).collect::<Vec<_>>());
+
+            let expected_c = Fr::mul(&a, &b);
             assert!(
-                (c - a * b).abs() < 1e-4,
-                "Vector triple[{}] incorrect: c={}, a*b={}",
+                c.ct_eq(&expected_c).to_bool(),
+                "Vector triple[{}] incorrect",
                 d,
-                c,
-                a * b,
             );
         }
     }
@@ -350,36 +349,34 @@ mod tests {
         assert_eq!(shares[0].n, n);
 
         // Reconstruct A, B, C.
-        let mut a = vec![0.0; m * k];
-        let mut b = vec![0.0; k * n];
-        let mut c = vec![0.0; m * n];
+        let mut a = vec![Fr::ZERO; m * k];
+        let mut b = vec![Fr::ZERO; k * n];
+        let mut c = vec![Fr::ZERO; m * n];
 
         for s in &shares {
             for i in 0..m * k {
-                a[i] += s.a[i];
+                a[i] = Fr::add(&a[i], &s.a[i]);
             }
             for i in 0..k * n {
-                b[i] += s.b[i];
+                b[i] = Fr::add(&b[i], &s.b[i]);
             }
             for i in 0..m * n {
-                c[i] += s.c[i];
+                c[i] = Fr::add(&c[i], &s.c[i]);
             }
         }
 
         // Verify C = A @ B.
         for i in 0..m {
             for j in 0..n {
-                let mut expected = 0.0;
+                let mut expected = Fr::ZERO;
                 for l in 0..k {
-                    expected += a[i * k + l] * b[l * n + j];
+                    expected = Fr::add(&expected, &Fr::mul(&a[i * k + l], &b[l * n + j]));
                 }
                 assert!(
-                    (c[i * n + j] - expected).abs() < 1e-4,
-                    "Matrix triple [{},{}] incorrect: {} vs {}",
+                    c[i * n + j].ct_eq(&expected).to_bool(),
+                    "Matrix triple [{},{}] incorrect",
                     i,
                     j,
-                    c[i * n + j],
-                    expected,
                 );
             }
         }
@@ -390,10 +387,11 @@ mod tests {
         let mut dealer = TrustedDealer::with_seed(42);
         let shares = dealer.generate_scalar_triple(2);
 
-        let a: f64 = shares.iter().map(|s| s.a).sum();
-        let b: f64 = shares.iter().map(|s| s.b).sum();
-        let c: f64 = shares.iter().map(|s| s.c).sum();
+        let a = Fr::add(&shares[0].a, &shares[1].a);
+        let b = Fr::add(&shares[0].b, &shares[1].b);
+        let c = Fr::add(&shares[0].c, &shares[1].c);
 
-        assert!((c - a * b).abs() < 1e-6);
+        let expected_c = Fr::mul(&a, &b);
+        assert!(c.ct_eq(&expected_c).to_bool());
     }
 }

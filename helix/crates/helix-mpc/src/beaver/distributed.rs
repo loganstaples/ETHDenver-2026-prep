@@ -14,13 +14,14 @@
 //! This implementation uses a simplified version suitable for the demo,
 //! simulating the cross-term computation locally.
 
-use rand::Rng;
-use rand_chacha::ChaCha20Rng;
 use rand::SeedableRng;
-use sha2::{Sha256, Digest};
+use rand_chacha::ChaCha20Rng;
+use sha2::{Digest, Sha256};
 
 use crate::error::{MPCError, MPCResult};
+use crate::field::Fr;
 use crate::types::PartyId;
+
 use super::triple::{BeaverTriple, MatrixBeaverTriple, VectorBeaverTriple};
 
 /// Messages exchanged during distributed triple generation.
@@ -31,9 +32,9 @@ pub enum TripleGenMessage {
         from: PartyId,
         to: PartyId,
         /// Masked value: a_i + r (where r is a random mask).
-        masked_a: f64,
+        masked_a: Fr,
         /// Masked value: b_i + s (where s is a random mask).
-        masked_b: f64,
+        masked_b: Fr,
         /// Hash commitment to the masks for verification.
         mask_commitment: [u8; 32],
     },
@@ -42,7 +43,7 @@ pub enum TripleGenMessage {
         from: PartyId,
         to: PartyId,
         /// The computed cross-term share.
-        value: f64,
+        value: Fr,
     },
 }
 
@@ -53,7 +54,6 @@ pub struct DistributedTripleGen {
     party_index: usize,
     num_parties: usize,
     rng: ChaCha20Rng,
-    value_range: f64,
 }
 
 impl DistributedTripleGen {
@@ -65,12 +65,11 @@ impl DistributedTripleGen {
             party_index,
             num_parties,
             rng: ChaCha20Rng::seed_from_u64(party_seed),
-            value_range: 100.0,
         }
     }
 
-    fn random_value(&mut self) -> f64 {
-        self.rng.gen_range(-self.value_range..self.value_range)
+    fn random_value(&mut self) -> Fr {
+        Fr::random(&mut self.rng)
     }
 
     /// Phase 1: Generate local randomness and produce messages for other parties.
@@ -79,7 +78,7 @@ impl DistributedTripleGen {
     pub fn phase1_generate(
         &mut self,
         other_parties: &[PartyId],
-    ) -> (f64, f64, Vec<TripleGenMessage>) {
+    ) -> (Fr, Fr, Vec<TripleGenMessage>) {
         let a_i = self.random_value();
         let b_i = self.random_value();
 
@@ -94,13 +93,13 @@ impl DistributedTripleGen {
             let mask_a = self.random_value();
             let mask_b = self.random_value();
 
-            let masked_a = a_i + mask_a;
-            let masked_b = b_i + mask_b;
+            let masked_a = Fr::add(&a_i, &mask_a);
+            let masked_b = Fr::add(&b_i, &mask_b);
 
             // Commit to the masks.
             let mut hasher = Sha256::new();
-            hasher.update(mask_a.to_le_bytes());
-            hasher.update(mask_b.to_le_bytes());
+            hasher.update(&mask_a.to_bytes_le());
+            hasher.update(&mask_b.to_bytes_le());
             let commitment: [u8; 32] = hasher.finalize().into();
 
             messages.push(TripleGenMessage::CrossTermContribution {
@@ -121,29 +120,23 @@ impl DistributedTripleGen {
     /// compute the local c_i share.
     pub fn phase2_compute(
         &mut self,
-        local_a: f64,
-        local_b: f64,
+        local_a: Fr,
+        local_b: Fr,
         received: &[TripleGenMessage],
     ) -> MPCResult<BeaverTriple> {
         // Start with the local product term.
-        let mut c_i = local_a * local_b;
+        let mut c_i = Fr::mul(&local_a, &local_b);
 
         // For each received contribution, compute our share of the cross-term.
         // In a real protocol, this would use OT. Here we use a simplified version:
         // Each party contributes a random share of the cross-term and the
         // parties' shares are coordinated to sum correctly.
         for msg in received {
-            if let TripleGenMessage::CrossTermContribution {
-                from,
-                masked_a,
-                masked_b,
-                ..
-            } = msg
-            {
+            if let TripleGenMessage::CrossTermContribution { .. } = msg {
                 // Simplified: add a deterministic share of the cross-term.
                 // In production this would be an OT-based protocol.
                 let cross_term_share = self.random_value();
-                c_i += cross_term_share;
+                c_i = Fr::add(&c_i, &cross_term_share);
             }
         }
 
@@ -154,10 +147,7 @@ impl DistributedTripleGen {
     ///
     /// This is a simulation that runs all parties locally for testing.
     /// In production, each party would run independently and communicate.
-    pub fn simulate_distributed_generation(
-        num_parties: usize,
-        seed: u64,
-    ) -> Vec<BeaverTriple> {
+    pub fn simulate_distributed_generation(num_parties: usize, seed: u64) -> Vec<BeaverTriple> {
         let parties: Vec<PartyId> = (0..num_parties).map(PartyId::from_index).collect();
 
         // Phase 1: Each party generates randomness.
@@ -165,33 +155,33 @@ impl DistributedTripleGen {
         let mut all_messages: Vec<Vec<TripleGenMessage>> = Vec::new();
 
         for i in 0..num_parties {
-            let mut gen = DistributedTripleGen::new(
-                parties[i].clone(),
-                i,
-                num_parties,
-                seed,
-            );
+            let mut gen =
+                DistributedTripleGen::new(parties[i].clone(), i, num_parties, seed);
             let (a, b, msgs) = gen.phase1_generate(&parties);
             local_values.push((a, b));
             all_messages.push(msgs);
         }
 
         // Compute the actual product from the global a and b.
-        let total_a: f64 = local_values.iter().map(|(a, _)| a).sum();
-        let total_b: f64 = local_values.iter().map(|(_, b)| b).sum();
-        let total_c = total_a * total_b;
+        let mut total_a = Fr::ZERO;
+        let mut total_b = Fr::ZERO;
+        for (a, b) in &local_values {
+            total_a = Fr::add(&total_a, a);
+            total_b = Fr::add(&total_b, b);
+        }
+        let total_c = Fr::mul(&total_a, &total_b);
 
         // Distribute c shares additively (simplified - real protocol uses OT).
         let mut c_shares = Vec::with_capacity(num_parties);
-        let mut c_sum = 0.0;
+        let mut c_sum = Fr::ZERO;
         let mut rng = ChaCha20Rng::seed_from_u64(seed.wrapping_add(999));
 
-        for i in 0..num_parties - 1 {
-            let ci: f64 = rng.gen_range(-1000.0..1000.0);
-            c_shares.push(ci);
-            c_sum += ci;
+        for _i in 0..num_parties - 1 {
+            let ci = Fr::random(&mut rng);
+            c_shares.push(ci.clone());
+            c_sum = Fr::add(&c_sum, &ci);
         }
-        c_shares.push(total_c - c_sum);
+        c_shares.push(Fr::sub(&total_c, &c_sum));
 
         // Assemble triples.
         local_values
@@ -226,21 +216,21 @@ impl DistributedTripleGen {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::field::ops::sum;
 
     #[test]
     fn test_distributed_triple_correctness() {
         let shares = DistributedTripleGen::simulate_distributed_generation(3, 42);
         assert_eq!(shares.len(), 3);
 
-        let a: f64 = shares.iter().map(|s| s.a).sum();
-        let b: f64 = shares.iter().map(|s| s.b).sum();
-        let c: f64 = shares.iter().map(|s| s.c).sum();
+        let a = sum(&shares.iter().map(|s| s.a.clone()).collect::<Vec<_>>());
+        let b = sum(&shares.iter().map(|s| s.b.clone()).collect::<Vec<_>>());
+        let c = sum(&shares.iter().map(|s| s.c.clone()).collect::<Vec<_>>());
 
+        let expected = Fr::mul(&a, &b);
         assert!(
-            (c - a * b).abs() < 1e-6,
-            "Distributed triple incorrect: c={}, a*b={}",
-            c,
-            a * b,
+            c.ct_eq(&expected).to_bool(),
+            "Distributed triple incorrect",
         );
     }
 
@@ -251,11 +241,12 @@ mod tests {
         assert_eq!(per_party[0].len(), 50);
 
         for idx in 0..50 {
-            let a: f64 = per_party.iter().map(|p| p[idx].a).sum();
-            let b: f64 = per_party.iter().map(|p| p[idx].b).sum();
-            let c: f64 = per_party.iter().map(|p| p[idx].c).sum();
+            let a = sum(&per_party.iter().map(|p| p[idx].a.clone()).collect::<Vec<_>>());
+            let b = sum(&per_party.iter().map(|p| p[idx].b.clone()).collect::<Vec<_>>());
+            let c = sum(&per_party.iter().map(|p| p[idx].c.clone()).collect::<Vec<_>>());
+            let expected = Fr::mul(&a, &b);
             assert!(
-                (c - a * b).abs() < 1e-4,
+                c.ct_eq(&expected).to_bool(),
                 "Distributed triple {} incorrect",
                 idx,
             );
@@ -265,9 +256,10 @@ mod tests {
     #[test]
     fn test_two_party_distributed() {
         let shares = DistributedTripleGen::simulate_distributed_generation(2, 42);
-        let a: f64 = shares.iter().map(|s| s.a).sum();
-        let b: f64 = shares.iter().map(|s| s.b).sum();
-        let c: f64 = shares.iter().map(|s| s.c).sum();
-        assert!((c - a * b).abs() < 1e-6);
+        let a = Fr::add(&shares[0].a, &shares[1].a);
+        let b = Fr::add(&shares[0].b, &shares[1].b);
+        let c = Fr::add(&shares[0].c, &shares[1].c);
+        let expected = Fr::mul(&a, &b);
+        assert!(c.ct_eq(&expected).to_bool());
     }
 }

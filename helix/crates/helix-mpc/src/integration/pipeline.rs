@@ -186,7 +186,7 @@ impl SecurePipeline {
                 .share_vector(&grad_data, "grad_embed", &parties)?;
 
             for (i, share) in shares.into_iter().enumerate() {
-                grad_shares[i].embeddings = Some(TensorShare::new(
+                grad_shares[i].embeddings = Some(TensorShare::from_f64(
                     share.id,
                     share.values,
                     embed.shape.clone(),
@@ -218,7 +218,7 @@ impl SecurePipeline {
                 for (i, share) in shares.into_iter().enumerate() {
                     layer_grads[i].gradients.insert(
                         name.clone(),
-                        TensorShare::new(share.id, share.values, tensor.shape.clone()),
+                        TensorShare::from_f64(share.id, share.values, tensor.shape.clone()),
                     );
                 }
             }
@@ -242,7 +242,7 @@ impl SecurePipeline {
                 .share_vector(&grad_data, "grad_lm", &parties)?;
 
             for (i, share) in shares.into_iter().enumerate() {
-                grad_shares[i].lm_head = Some(TensorShare::new(
+                grad_shares[i].lm_head = Some(TensorShare::from_f64(
                     share.id,
                     share.values,
                     lm.shape.clone(),

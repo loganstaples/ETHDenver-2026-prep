@@ -31,5 +31,5 @@ pub mod types;
 pub mod verification;
 
 pub use error::MPCError;
-pub use field::{FieldConfig, FieldElement, FieldShare, FieldSharing, FieldBeaverTriple, FieldSecureMultiply};
+pub use field::{Fr, FieldElement, CtChoice, SecureBuffer, SecureVec};
 pub use types::{MPCConfig, PartyId, ShareId};

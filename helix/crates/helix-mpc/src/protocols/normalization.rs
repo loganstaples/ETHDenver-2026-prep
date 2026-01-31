@@ -14,8 +14,8 @@
 //! can be applied as local operations on shares.
 
 use crate::beaver::pool::BeaverPool;
-use crate::error::{MPCError, MPCResult};
-use crate::protocols::arithmetic::SecureArithmetic;
+use crate::error::MPCResult;
+use crate::field::Fr;
 
 /// Secure normalization operations.
 pub struct SecureNormalization;
@@ -32,29 +32,32 @@ impl SecureNormalization {
     ///
     /// Returns new shares of the normalized vector.
     pub fn layer_norm(
-        shares: &[Vec<f64>],
+        shares: &[Vec<Fr>],
         gamma: &[f64],
         beta: &[f64],
         eps: f64,
-    ) -> Vec<Vec<f64>> {
+    ) -> Vec<Vec<Fr>> {
         let num_parties = shares.len();
         let dim = shares[0].len();
 
         // Step 1: Reconstruct the input.
-        let mut values = vec![0.0; dim];
+        let mut values = vec![Fr::ZERO; dim];
         for s in shares {
             for (i, v) in s.iter().enumerate() {
-                values[i] += v;
+                values[i] = Fr::add(&values[i], v);
             }
         }
 
+        // Convert to f64 for normalization computation
+        let values_f64: Vec<f64> = values.iter().map(|v| v.to_f64()).collect();
+
         // Step 2: Compute LayerNorm.
-        let mean: f64 = values.iter().sum::<f64>() / dim as f64;
+        let mean: f64 = values_f64.iter().sum::<f64>() / dim as f64;
         let variance: f64 =
-            values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / dim as f64;
+            values_f64.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / dim as f64;
         let inv_std = 1.0 / (variance + eps).sqrt();
 
-        let normalized: Vec<f64> = values
+        let normalized: Vec<f64> = values_f64
             .iter()
             .enumerate()
             .map(|(i, v)| gamma[i] * (v - mean) * inv_std + beta[i])
@@ -71,26 +74,29 @@ impl SecureNormalization {
     /// RMSNorm is simpler than LayerNorm (no mean subtraction) and is used
     /// in modern architectures like LLaMA.
     pub fn rms_norm(
-        shares: &[Vec<f64>],
+        shares: &[Vec<Fr>],
         gamma: &[f64],
         eps: f64,
-    ) -> Vec<Vec<f64>> {
+    ) -> Vec<Vec<Fr>> {
         let num_parties = shares.len();
         let dim = shares[0].len();
 
         // Reconstruct.
-        let mut values = vec![0.0; dim];
+        let mut values = vec![Fr::ZERO; dim];
         for s in shares {
             for (i, v) in s.iter().enumerate() {
-                values[i] += v;
+                values[i] = Fr::add(&values[i], v);
             }
         }
 
+        // Convert to f64
+        let values_f64: Vec<f64> = values.iter().map(|v| v.to_f64()).collect();
+
         // RMS.
-        let rms = (values.iter().map(|v| v * v).sum::<f64>() / dim as f64 + eps).sqrt();
+        let rms = (values_f64.iter().map(|v| v * v).sum::<f64>() / dim as f64 + eps).sqrt();
         let inv_rms = 1.0 / rms;
 
-        let normalized: Vec<f64> = values
+        let normalized: Vec<f64> = values_f64
             .iter()
             .enumerate()
             .map(|(i, v)| gamma[i] * v * inv_rms)
@@ -104,21 +110,24 @@ impl SecureNormalization {
     /// softmax(x)_i = exp(x_i) / sum(exp(x_j))
     ///
     /// Uses the numerically stable variant: subtract max before exp.
-    pub fn softmax(shares: &[Vec<f64>]) -> Vec<Vec<f64>> {
+    pub fn softmax(shares: &[Vec<Fr>]) -> Vec<Vec<Fr>> {
         let num_parties = shares.len();
         let dim = shares[0].len();
 
         // Reconstruct.
-        let mut values = vec![0.0; dim];
+        let mut values = vec![Fr::ZERO; dim];
         for s in shares {
             for (i, v) in s.iter().enumerate() {
-                values[i] += v;
+                values[i] = Fr::add(&values[i], v);
             }
         }
 
+        // Convert to f64
+        let values_f64: Vec<f64> = values.iter().map(|v| v.to_f64()).collect();
+
         // Numerically stable softmax.
-        let max_val = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        let exp_values: Vec<f64> = values.iter().map(|v| (v - max_val).exp()).collect();
+        let max_val = values_f64.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let exp_values: Vec<f64> = values_f64.iter().map(|v| (v - max_val).exp()).collect();
         let sum_exp: f64 = exp_values.iter().sum();
         let softmax_values: Vec<f64> = exp_values.iter().map(|e| e / sum_exp).collect();
 
@@ -128,14 +137,14 @@ impl SecureNormalization {
     /// Batch softmax: applies softmax independently to each row of a matrix.
     ///
     /// `shares[party][row][col]` → applies softmax across cols for each row.
-    pub fn batch_softmax(shares: &[Vec<Vec<f64>>]) -> Vec<Vec<Vec<f64>>> {
+    pub fn batch_softmax(shares: &[Vec<Vec<Fr>>]) -> Vec<Vec<Vec<Fr>>> {
         let num_parties = shares.len();
         let num_rows = shares[0].len();
 
-        let mut result: Vec<Vec<Vec<f64>>> = vec![Vec::with_capacity(num_rows); num_parties];
+        let mut result: Vec<Vec<Vec<Fr>>> = vec![Vec::with_capacity(num_rows); num_parties];
 
         for row in 0..num_rows {
-            let row_shares: Vec<Vec<f64>> = shares
+            let row_shares: Vec<Vec<Fr>> = shares
                 .iter()
                 .map(|p| p[row].clone())
                 .collect();
@@ -159,39 +168,42 @@ impl SecureNormalization {
     /// 3. Multiply [gamma] * normalized using Beaver triples
     /// 4. Add [beta]
     pub fn layer_norm_shared_params(
-        shares: &[Vec<f64>],
-        gamma_shares: &[Vec<f64>],
-        beta_shares: &[Vec<f64>],
+        shares: &[Vec<Fr>],
+        gamma_shares: &[Vec<Fr>],
+        beta_shares: &[Vec<Fr>],
         eps: f64,
-        pools: &mut [BeaverPool],
-    ) -> MPCResult<Vec<Vec<f64>>> {
+        _pools: &mut [BeaverPool],
+    ) -> MPCResult<Vec<Vec<Fr>>> {
         let num_parties = shares.len();
         let dim = shares[0].len();
 
         // Reconstruct input.
-        let mut values = vec![0.0; dim];
+        let mut values = vec![Fr::ZERO; dim];
         for s in shares {
             for (i, v) in s.iter().enumerate() {
-                values[i] += v;
+                values[i] = Fr::add(&values[i], v);
             }
         }
 
+        // Convert to f64
+        let values_f64: Vec<f64> = values.iter().map(|v| v.to_f64()).collect();
+
         // Compute normalization constants (public).
-        let mean: f64 = values.iter().sum::<f64>() / dim as f64;
+        let mean: f64 = values_f64.iter().sum::<f64>() / dim as f64;
         let variance: f64 =
-            values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / dim as f64;
+            values_f64.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / dim as f64;
         let inv_std = 1.0 / (variance + eps).sqrt();
 
         // normalized = (x - mean) * inv_std (public values)
-        let normalized: Vec<f64> = values.iter().map(|v| (v - mean) * inv_std).collect();
+        let normalized: Vec<f64> = values_f64.iter().map(|v| (v - mean) * inv_std).collect();
 
         // [result] = [gamma] * normalized + [beta]
         // gamma * normalized is a local operation (multiply share by public value)
-        let mut result: Vec<Vec<f64>> = vec![vec![0.0; dim]; num_parties];
+        let mut result: Vec<Vec<Fr>> = vec![vec![Fr::ZERO; dim]; num_parties];
         for i in 0..num_parties {
             for d in 0..dim {
-                result[i][d] =
-                    gamma_shares[i][d] * normalized[d] + beta_shares[i][d];
+                let gamma_scaled = Fr::mul(&gamma_shares[i][d], &Fr::from_f64(normalized[d]));
+                result[i][d] = Fr::add(&gamma_scaled, &beta_shares[i][d]);
             }
         }
 
@@ -200,23 +212,24 @@ impl SecureNormalization {
 }
 
 /// Creates additive shares of values.
-fn reshare_values(values: &[f64], num_parties: usize) -> Vec<Vec<f64>> {
+fn reshare_values(values: &[f64], num_parties: usize) -> Vec<Vec<Fr>> {
     use rand::SeedableRng;
     use rand::Rng;
     use rand_chacha::ChaCha20Rng;
 
     let dim = values.len();
     let mut rng = ChaCha20Rng::seed_from_u64(0xA0EDA112E);
-    let mut shares: Vec<Vec<f64>> = vec![vec![0.0; dim]; num_parties];
+    let mut shares: Vec<Vec<Fr>> = vec![vec![Fr::ZERO; dim]; num_parties];
 
     for d in 0..dim {
-        let mut sum = 0.0;
+        let target = Fr::from_f64(values[d]);
+        let mut sum = Fr::ZERO;
         for i in 0..num_parties - 1 {
-            let r: f64 = rng.gen_range(-100.0..100.0);
-            shares[i][d] = r;
-            sum += r;
+            let r = Fr::from_f64(rng.gen_range(-100.0..100.0));
+            shares[i][d] = r.clone();
+            sum = Fr::add(&sum, &r);
         }
-        shares[num_parties - 1][d] = values[d] - sum;
+        shares[num_parties - 1][d] = Fr::sub(&target, &sum);
     }
 
     shares
@@ -225,38 +238,37 @@ fn reshare_values(values: &[f64], num_parties: usize) -> Vec<Vec<f64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::beaver::dealer::TrustedDealer;
+    use crate::field::ops::sum;
+    use rand::{Rng, SeedableRng};
+    use rand_chacha::ChaCha20Rng;
 
-    fn split_vector(values: &[f64], n: usize, seed: u64) -> Vec<Vec<f64>> {
-        use rand::SeedableRng;
-        use rand::Rng;
-        use rand_chacha::ChaCha20Rng;
-
+    fn split_vector(values: &[f64], n: usize, seed: u64) -> Vec<Vec<Fr>> {
         let dim = values.len();
         let mut rng = ChaCha20Rng::seed_from_u64(seed);
-        let mut shares: Vec<Vec<f64>> = vec![vec![0.0; dim]; n];
+        let mut shares: Vec<Vec<Fr>> = vec![vec![Fr::ZERO; dim]; n];
 
         for d in 0..dim {
-            let mut sum = 0.0;
+            let target = Fr::from_f64(values[d]);
+            let mut s = Fr::ZERO;
             for i in 0..n - 1 {
-                let r: f64 = rng.gen_range(-100.0..100.0);
-                shares[i][d] = r;
-                sum += r;
+                let r = Fr::from_f64(rng.gen_range(-100.0..100.0));
+                shares[i][d] = r.clone();
+                s = Fr::add(&s, &r);
             }
-            shares[n - 1][d] = values[d] - sum;
+            shares[n - 1][d] = Fr::sub(&target, &s);
         }
         shares
     }
 
-    fn reconstruct(shares: &[Vec<f64>]) -> Vec<f64> {
+    fn reconstruct(shares: &[Vec<Fr>]) -> Vec<f64> {
         let dim = shares[0].len();
-        let mut result = vec![0.0; dim];
+        let mut result = vec![Fr::ZERO; dim];
         for s in shares {
             for (i, v) in s.iter().enumerate() {
-                result[i] += v;
+                result[i] = Fr::add(&result[i], v);
             }
         }
-        result
+        result.iter().map(|v| v.to_f64()).collect()
     }
 
     #[test]
@@ -309,11 +321,11 @@ mod tests {
         let result = reconstruct(&result_shares);
 
         // Softmax should sum to 1.
-        let sum: f64 = result.iter().sum();
+        let total: f64 = result.iter().sum();
         assert!(
-            (sum - 1.0).abs() < 1e-10,
+            (total - 1.0).abs() < 1e-10,
             "Softmax doesn't sum to 1: {}",
-            sum,
+            total,
         );
 
         // Values should be in [0, 1] and ordered.
@@ -345,7 +357,7 @@ mod tests {
         let row1 = vec![1.0, 2.0, 3.0];
         let row2 = vec![0.0, 0.0, 0.0];
 
-        let shares: Vec<Vec<Vec<f64>>> = {
+        let shares: Vec<Vec<Vec<Fr>>> = {
             let s1 = split_vector(&row1, 3, 42);
             let s2 = split_vector(&row2, 3, 99);
             (0..3)
@@ -358,13 +370,13 @@ mod tests {
         // Row 2 (uniform input) should give uniform softmax.
         let row2_result: Vec<f64> = {
             let dim = result_shares[0][1].len();
-            let mut r = vec![0.0; dim];
+            let mut r = vec![Fr::ZERO; dim];
             for p in &result_shares {
                 for (i, v) in p[1].iter().enumerate() {
-                    r[i] += v;
+                    r[i] = Fr::add(&r[i], v);
                 }
             }
-            r
+            r.iter().map(|v| v.to_f64()).collect()
         };
 
         for v in &row2_result {

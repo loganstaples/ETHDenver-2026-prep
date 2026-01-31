@@ -16,7 +16,8 @@
 //! be evaluated on shares using Beaver triples.
 
 use crate::beaver::pool::BeaverPool;
-use crate::error::{MPCError, MPCResult};
+use crate::error::MPCResult;
+use crate::field::Fr;
 use crate::protocols::arithmetic::SecureArithmetic;
 
 /// Supported activation functions.
@@ -39,28 +40,31 @@ impl SecureActivation {
 
     /// Applies an activation function using the reconstruct-compute-reshare approach.
     ///
-    /// `shares`: each party's share of the pre-activation vector.
+    /// `shares`: each party's share of the pre-activation vector (Fr).
     ///           shares[party_idx][element_idx]
     /// `activation`: which activation to apply.
     ///
     /// Returns new shares of the post-activation vector.
     pub fn apply_reconstruct_reshare(
-        shares: &[Vec<f64>],
+        shares: &[Vec<Fr>],
         activation: ActivationType,
-    ) -> Vec<Vec<f64>> {
+    ) -> Vec<Vec<Fr>> {
         let num_parties = shares.len();
         let dim = shares[0].len();
 
         // Step 1: Reconstruct (parties would send shares to each other).
-        let mut values = vec![0.0; dim];
+        let mut values = vec![Fr::ZERO; dim];
         for s in shares {
             for (i, v) in s.iter().enumerate() {
-                values[i] += v;
+                values[i] = Fr::add(&values[i], v);
             }
         }
 
+        // Convert to f64 for activation computation
+        let values_f64: Vec<f64> = values.iter().map(|v| v.to_f64()).collect();
+
         // Step 2: Apply activation to the reconstructed values.
-        let activated: Vec<f64> = values
+        let activated: Vec<f64> = values_f64
             .iter()
             .map(|v| apply_activation(*v, activation))
             .collect();
@@ -72,16 +76,16 @@ impl SecureActivation {
 
     /// Batch version: applies activation to multiple vectors at once.
     pub fn apply_batch_reconstruct_reshare(
-        batch_shares: &[Vec<Vec<f64>>],
+        batch_shares: &[Vec<Vec<Fr>>],
         activation: ActivationType,
-    ) -> Vec<Vec<Vec<f64>>> {
+    ) -> Vec<Vec<Vec<Fr>>> {
         let num_parties = batch_shares.len();
         let batch_size = batch_shares[0].len();
 
-        let mut results: Vec<Vec<Vec<f64>>> = vec![Vec::with_capacity(batch_size); num_parties];
+        let mut results: Vec<Vec<Vec<Fr>>> = vec![Vec::with_capacity(batch_size); num_parties];
 
         for b in 0..batch_size {
-            let item_shares: Vec<Vec<f64>> = batch_shares
+            let item_shares: Vec<Vec<Fr>> = batch_shares
                 .iter()
                 .map(|p| p[b].clone())
                 .collect();
@@ -104,9 +108,9 @@ impl SecureActivation {
     ///
     /// This keeps the computation entirely on shares but is less accurate.
     pub fn approximate_relu(
-        shares: &[Vec<f64>],
+        shares: &[Vec<Fr>],
         pools: &mut [BeaverPool],
-    ) -> MPCResult<Vec<Vec<f64>>> {
+    ) -> MPCResult<Vec<Vec<Fr>>> {
         let num_parties = shares.len();
         let dim = shares[0].len();
 
@@ -127,13 +131,17 @@ impl SecureActivation {
         //
         // Final approximation: relu(x) ≈ 0.5*x + 0.25*x (crude but private)
         // This is essentially a leaky linear activation.
-        let mut result: Vec<Vec<f64>> = vec![vec![0.0; dim]; num_parties];
+        let half = Fr::from_f64(0.5);
+        let quarter = Fr::from_f64(0.25);
+
+        let mut result: Vec<Vec<Fr>> = vec![vec![Fr::ZERO; dim]; num_parties];
         for i in 0..num_parties {
             for d in 0..dim {
-                // relu ≈ 0.5*x + 0.5*x²/(x² + 0.1)
-                // Simplified to: 0.5*x + 0.5*x for positive regime
-                // This is a placeholder; production would use garbled circuits.
-                result[i][d] = 0.5 * shares[i][d] + 0.5 * x_squared[i][d].signum() * x_squared[i][d].abs().sqrt() * 0.5;
+                // relu ≈ 0.5*x + 0.25*x² (simplified approximation)
+                // A crude approximation that preserves privacy
+                let term1 = Fr::mul(&half, &shares[i][d]);
+                let term2 = Fr::mul(&quarter, &x_squared[i][d]);
+                result[i][d] = Fr::add(&term1, &term2);
             }
         }
 
@@ -146,9 +154,9 @@ impl SecureActivation {
     /// This is a degree-3 polynomial that can be evaluated on shares
     /// using 2 Beaver multiplications per element.
     pub fn approximate_sigmoid(
-        shares: &[Vec<f64>],
+        shares: &[Vec<Fr>],
         pools: &mut [BeaverPool],
-    ) -> MPCResult<Vec<Vec<f64>>> {
+    ) -> MPCResult<Vec<Vec<Fr>>> {
         let num_parties = shares.len();
         let dim = shares[0].len();
 
@@ -157,13 +165,20 @@ impl SecureActivation {
         let x_cubed = SecureArithmetic::simulate_vector_multiply(shares, &x_squared, pools)?;
 
         // sigmoid(x) ≈ 0.5 + 0.25*x - 0.0208*x³
-        let mut result: Vec<Vec<f64>> = vec![vec![0.0; dim]; num_parties];
+        let c_half = Fr::from_f64(0.5);
+        let c_quarter = Fr::from_f64(0.25);
+        let c_cubic = Fr::from_f64(-0.0208);
+
+        let mut result: Vec<Vec<Fr>> = vec![vec![Fr::ZERO; dim]; num_parties];
         for i in 0..num_parties {
             for d in 0..dim {
-                let term1 = SecureArithmetic::add_public(0.0, 0.5, i);
-                let term2 = SecureArithmetic::scale_share(shares[i][d], 0.25);
-                let term3 = SecureArithmetic::scale_share(x_cubed[i][d], -0.0208);
-                result[i][d] = term1 + term2 + term3;
+                // term1: 0.5 (only party 0 adds the constant)
+                let term1 = SecureArithmetic::add_public(&Fr::ZERO, &c_half, i);
+                // term2: 0.25 * x
+                let term2 = SecureArithmetic::scale_share(&shares[i][d], &c_quarter);
+                // term3: -0.0208 * x³
+                let term3 = SecureArithmetic::scale_share(&x_cubed[i][d], &c_cubic);
+                result[i][d] = Fr::add(&Fr::add(&term1, &term2), &term3);
             }
         }
 
@@ -175,9 +190,9 @@ impl SecureActivation {
     /// Simplified to: gelu(x) ≈ 0.5*x + 0.5*x*sigmoid(1.702*x)
     /// Further simplified for MPC: gelu(x) ≈ 0.5*x*(1 + 0.851*x - 0.0354*x³)
     pub fn approximate_gelu(
-        shares: &[Vec<f64>],
+        shares: &[Vec<Fr>],
         pools: &mut [BeaverPool],
-    ) -> MPCResult<Vec<Vec<f64>>> {
+    ) -> MPCResult<Vec<Vec<Fr>>> {
         let num_parties = shares.len();
         let dim = shares[0].len();
 
@@ -186,23 +201,28 @@ impl SecureActivation {
         // x³
         let x_cu = SecureArithmetic::simulate_vector_multiply(shares, &x_sq, pools)?;
 
+        let c_one = Fr::from_f64(1.0);
+        let c_linear = Fr::from_f64(0.851);
+        let c_cubic = Fr::from_f64(-0.0354);
+        let c_half = Fr::from_f64(0.5);
+
         // inner = 1 + 0.851*x - 0.0354*x³
-        let mut inner: Vec<Vec<f64>> = vec![vec![0.0; dim]; num_parties];
+        let mut inner: Vec<Vec<Fr>> = vec![vec![Fr::ZERO; dim]; num_parties];
         for i in 0..num_parties {
             for d in 0..dim {
-                let one = SecureArithmetic::add_public(0.0, 1.0, i);
-                let lin = SecureArithmetic::scale_share(shares[i][d], 0.851);
-                let cub = SecureArithmetic::scale_share(x_cu[i][d], -0.0354);
-                inner[i][d] = one + lin + cub;
+                let one = SecureArithmetic::add_public(&Fr::ZERO, &c_one, i);
+                let lin = SecureArithmetic::scale_share(&shares[i][d], &c_linear);
+                let cub = SecureArithmetic::scale_share(&x_cu[i][d], &c_cubic);
+                inner[i][d] = Fr::add(&Fr::add(&one, &lin), &cub);
             }
         }
 
         // result = 0.5 * x * inner
         let x_inner = SecureArithmetic::simulate_vector_multiply(shares, &inner, pools)?;
-        let mut result: Vec<Vec<f64>> = vec![vec![0.0; dim]; num_parties];
+        let mut result: Vec<Vec<Fr>> = vec![vec![Fr::ZERO; dim]; num_parties];
         for i in 0..num_parties {
             for d in 0..dim {
-                result[i][d] = SecureArithmetic::scale_share(x_inner[i][d], 0.5);
+                result[i][d] = SecureArithmetic::scale_share(&x_inner[i][d], &c_half);
             }
         }
 
@@ -233,23 +253,23 @@ fn apply_activation(x: f64, activation: ActivationType) -> f64 {
 
 /// Creates additive shares of values using a deterministic split.
 /// Party 0 gets the value minus random offsets; others get random offsets.
-fn reshare_values(values: &[f64], num_parties: usize) -> Vec<Vec<f64>> {
-    use rand::SeedableRng;
+fn reshare_values(values: &[f64], num_parties: usize) -> Vec<Vec<Fr>> {
     use rand::Rng;
+    use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
 
     let dim = values.len();
     let mut rng = ChaCha20Rng::seed_from_u64(0xAC71A710);
-    let mut shares: Vec<Vec<f64>> = vec![vec![0.0; dim]; num_parties];
+    let mut shares: Vec<Vec<Fr>> = vec![vec![Fr::ZERO; dim]; num_parties];
 
     for d in 0..dim {
-        let mut sum = 0.0;
+        let mut sum = Fr::ZERO;
         for i in 0..num_parties - 1 {
-            let r: f64 = rng.gen_range(-100.0..100.0);
-            shares[i][d] = r;
-            sum += r;
+            let r = Fr::from_f64(rng.gen_range(-100.0..100.0));
+            shares[i][d] = r.clone();
+            sum = Fr::add(&sum, &r);
         }
-        shares[num_parties - 1][d] = values[d] - sum;
+        shares[num_parties - 1][d] = Fr::sub(&Fr::from_f64(values[d]), &sum);
     }
 
     shares
@@ -260,36 +280,36 @@ mod tests {
     use super::*;
     use crate::beaver::dealer::TrustedDealer;
 
-    fn split_vector(values: &[f64], n: usize, seed: u64) -> Vec<Vec<f64>> {
-        use rand::SeedableRng;
+    fn split_vector(values: &[f64], n: usize, seed: u64) -> Vec<Vec<Fr>> {
         use rand::Rng;
+        use rand::SeedableRng;
         use rand_chacha::ChaCha20Rng;
 
         let dim = values.len();
         let mut rng = ChaCha20Rng::seed_from_u64(seed);
-        let mut shares: Vec<Vec<f64>> = vec![vec![0.0; dim]; n];
+        let mut shares: Vec<Vec<Fr>> = vec![vec![Fr::ZERO; dim]; n];
 
         for d in 0..dim {
-            let mut sum = 0.0;
+            let mut sum = Fr::ZERO;
             for i in 0..n - 1 {
-                let r: f64 = rng.gen_range(-100.0..100.0);
-                shares[i][d] = r;
-                sum += r;
+                let r = Fr::from_f64(rng.gen_range(-100.0..100.0));
+                shares[i][d] = r.clone();
+                sum = Fr::add(&sum, &r);
             }
-            shares[n - 1][d] = values[d] - sum;
+            shares[n - 1][d] = Fr::sub(&Fr::from_f64(values[d]), &sum);
         }
         shares
     }
 
-    fn reconstruct(shares: &[Vec<f64>]) -> Vec<f64> {
+    fn reconstruct(shares: &[Vec<Fr>]) -> Vec<f64> {
         let dim = shares[0].len();
-        let mut result = vec![0.0; dim];
+        let mut result = vec![Fr::ZERO; dim];
         for s in shares {
             for (i, v) in s.iter().enumerate() {
-                result[i] += v;
+                result[i] = Fr::add(&result[i], v);
             }
         }
-        result
+        result.iter().map(|v| v.to_f64()).collect()
     }
 
     #[test]
@@ -305,7 +325,7 @@ mod tests {
 
         for (r, e) in result.iter().zip(expected.iter()) {
             assert!(
-                (r - e).abs() < 1e-10,
+                (r - e).abs() < 1e-6,
                 "ReLU failed: {} vs {}",
                 r,
                 e,
@@ -326,7 +346,7 @@ mod tests {
         for (i, r) in result.iter().enumerate() {
             let expected = apply_activation(values[i], ActivationType::Sigmoid);
             assert!(
-                (r - expected).abs() < 1e-10,
+                (r - expected).abs() < 1e-6,
                 "Sigmoid[{}] failed: {} vs {}",
                 i,
                 r,
@@ -347,7 +367,7 @@ mod tests {
 
         for (i, r) in result.iter().enumerate() {
             let expected = apply_activation(values[i], ActivationType::GELU);
-            assert!((r - expected).abs() < 1e-10);
+            assert!((r - expected).abs() < 1e-6);
         }
     }
 
@@ -399,7 +419,7 @@ mod tests {
         let expected = vec![-0.02, -0.01, 0.0, 1.0, 2.0];
 
         for (r, e) in result.iter().zip(expected.iter()) {
-            assert!((r - e).abs() < 1e-10);
+            assert!((r - e).abs() < 1e-6);
         }
     }
 

@@ -295,7 +295,7 @@ impl SecureTrainingCoordinator {
 
             if let Some(ref embed) = share.embeddings {
                 let blinding = self.blinding_gen.generate();
-                party_comms.push(ShareCommitment::commit_vector(
+                party_comms.push(ShareCommitment::commit_fr_vector(
                     &share.party,
                     &embed.data,
                     &blinding,
@@ -318,7 +318,7 @@ impl SecureTrainingCoordinator {
 
             if let Some(ref lm) = share.lm_head {
                 let blinding = self.blinding_gen.generate();
-                party_comms.push(ShareCommitment::commit_vector(
+                party_comms.push(ShareCommitment::commit_fr_vector(
                     &share.party,
                     &lm.data,
                     &blinding,
@@ -377,7 +377,7 @@ mod tests {
             .map(|i| GradientShare {
                 party: PartyId::from_index(i),
                 index: i,
-                embeddings: Some(TensorShare::new(
+                embeddings: Some(TensorShare::from_f64(
                     ShareId::new(PartyId::from_index(i), "grad_embed", i),
                     vec![0.01; 6],
                     vec![3, 2],
@@ -387,7 +387,7 @@ mod tests {
                     gradients: [
                         (
                             "q_proj".to_string(),
-                            TensorShare::new(
+                            TensorShare::from_f64(
                                 ShareId::new(PartyId::from_index(i), "grad_q", i),
                                 vec![0.01; 4],
                                 vec![2, 2],
@@ -395,7 +395,7 @@ mod tests {
                         ),
                         (
                             "v_proj".to_string(),
-                            TensorShare::new(
+                            TensorShare::from_f64(
                                 ShareId::new(PartyId::from_index(i), "grad_v", i),
                                 vec![0.01; 4],
                                 vec![2, 2],
@@ -405,7 +405,7 @@ mod tests {
                     .into_iter()
                     .collect(),
                 }],
-                lm_head: Some(TensorShare::new(
+                lm_head: Some(TensorShare::from_f64(
                     ShareId::new(PartyId::from_index(i), "grad_lm", i),
                     vec![0.01; 6],
                     vec![2, 3],

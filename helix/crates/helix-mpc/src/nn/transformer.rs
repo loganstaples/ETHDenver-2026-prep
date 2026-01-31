@@ -11,11 +11,11 @@
 //! All weight parameters are secret-shared across parties.
 
 use crate::beaver::pool::BeaverPool;
-use crate::error::{MPCError, MPCResult};
+use crate::error::MPCResult;
+use crate::field::Fr;
 use crate::nn::attention::{SecureAttention, SecureAttentionConfig};
 use crate::nn::linear::SecureLinear;
 use crate::protocols::activation::{ActivationType, SecureActivation};
-use crate::protocols::arithmetic::SecureArithmetic;
 use crate::protocols::normalization::SecureNormalization;
 
 /// Configuration for a secure transformer block.
@@ -44,21 +44,21 @@ impl SecureTransformerConfig {
 #[derive(Debug, Clone)]
 pub struct TransformerBlockShares {
     /// LayerNorm 1 gamma [d_model] per party.
-    pub ln1_gamma: Vec<Vec<f64>>,
+    pub ln1_gamma: Vec<Vec<Fr>>,
     /// Attention Q projection [d_model * d_model] per party.
-    pub wq: Vec<Vec<f64>>,
+    pub wq: Vec<Vec<Fr>>,
     /// Attention K projection.
-    pub wk: Vec<Vec<f64>>,
+    pub wk: Vec<Vec<Fr>>,
     /// Attention V projection.
-    pub wv: Vec<Vec<f64>>,
+    pub wv: Vec<Vec<Fr>>,
     /// Attention output projection.
-    pub wo: Vec<Vec<f64>>,
+    pub wo: Vec<Vec<Fr>>,
     /// LayerNorm 2 gamma [d_model] per party.
-    pub ln2_gamma: Vec<Vec<f64>>,
+    pub ln2_gamma: Vec<Vec<Fr>>,
     /// MLP up projection [d_model * d_ff] per party.
-    pub mlp_up: Vec<Vec<f64>>,
+    pub mlp_up: Vec<Vec<Fr>>,
     /// MLP down projection [d_ff * d_model] per party.
-    pub mlp_down: Vec<Vec<f64>>,
+    pub mlp_down: Vec<Vec<Fr>>,
 }
 
 /// Secure transformer block.
@@ -70,12 +70,12 @@ impl SecureTransformerBlock {
     /// `x_shares[party][seq_len * d_model]`: input activations
     /// Returns output activations with same shape.
     pub fn forward(
-        x_shares: &[Vec<f64>],
+        x_shares: &[Vec<Fr>],
         weights: &TransformerBlockShares,
         config: &SecureTransformerConfig,
         seq_len: usize,
         pools: &mut [BeaverPool],
-    ) -> MPCResult<Vec<Vec<f64>>> {
+    ) -> MPCResult<Vec<Vec<Fr>>> {
         let num_parties = x_shares.len();
         let d = config.d_model;
 
@@ -101,12 +101,12 @@ impl SecureTransformerBlock {
         )?;
 
         // Step 3: Residual connection: x + attn_out.
-        let residual1: Vec<Vec<f64>> = (0..num_parties)
+        let residual1: Vec<Vec<Fr>> = (0..num_parties)
             .map(|i| {
                 x_shares[i]
                     .iter()
                     .zip(&attn_out[i])
-                    .map(|(a, b)| a + b)
+                    .map(|(a, b)| Fr::add(a, b))
                     .collect()
             })
             .collect();
@@ -130,12 +130,12 @@ impl SecureTransformerBlock {
         )?;
 
         // Step 6: Residual connection.
-        let output: Vec<Vec<f64>> = (0..num_parties)
+        let output: Vec<Vec<Fr>> = (0..num_parties)
             .map(|i| {
                 residual1[i]
                     .iter()
                     .zip(&ffn_out[i])
-                    .map(|(a, b)| a + b)
+                    .map(|(a, b)| Fr::add(a, b))
                     .collect()
             })
             .collect();
@@ -145,44 +145,44 @@ impl SecureTransformerBlock {
 
     /// Applies normalization to each position in the sequence.
     fn apply_norm_batched(
-        x_shares: &[Vec<f64>],
-        gamma_shares: &[Vec<f64>],
+        x_shares: &[Vec<Fr>],
+        gamma_shares: &[Vec<Fr>],
         config: &SecureTransformerConfig,
         seq_len: usize,
-    ) -> Vec<Vec<f64>> {
+    ) -> Vec<Vec<Fr>> {
         let num_parties = x_shares.len();
         let d = config.d_model;
 
-        let mut result: Vec<Vec<f64>> = vec![vec![0.0; seq_len * d]; num_parties];
+        let mut result: Vec<Vec<Fr>> = vec![vec![Fr::ZERO; seq_len * d]; num_parties];
 
         for pos in 0..seq_len {
             // Extract this position's slice for each party.
-            let pos_shares: Vec<Vec<f64>> = x_shares
+            let pos_shares: Vec<Vec<Fr>> = x_shares
                 .iter()
                 .map(|s| s[pos * d..(pos + 1) * d].to_vec())
                 .collect();
 
             let normed = if config.use_rms_norm {
-                // For RMSNorm, gamma is public (or we use shared params).
+                // For RMSNorm, gamma is reconstructed to public.
                 let gamma_vals: Vec<f64> = {
-                    let mut g = vec![0.0; d];
+                    let mut g = vec![Fr::ZERO; d];
                     for s in gamma_shares {
                         for (i, v) in s.iter().enumerate() {
-                            g[i] += v;
+                            g[i] = Fr::add(&g[i], v);
                         }
                     }
-                    g
+                    g.iter().map(|v| v.to_f64()).collect()
                 };
                 SecureNormalization::rms_norm(&pos_shares, &gamma_vals, 1e-5)
             } else {
                 let gamma_vals: Vec<f64> = {
-                    let mut g = vec![0.0; d];
+                    let mut g = vec![Fr::ZERO; d];
                     for s in gamma_shares {
                         for (i, v) in s.iter().enumerate() {
-                            g[i] += v;
+                            g[i] = Fr::add(&g[i], v);
                         }
                     }
-                    g
+                    g.iter().map(|v| v.to_f64()).collect()
                 };
                 let beta = vec![0.0; d];
                 SecureNormalization::layer_norm(&pos_shares, &gamma_vals, &beta, 1e-5)
@@ -190,7 +190,9 @@ impl SecureTransformerBlock {
 
             // Write back.
             for i in 0..num_parties {
-                result[i][pos * d..(pos + 1) * d].copy_from_slice(&normed[i]);
+                for (j, v) in normed[i].iter().enumerate() {
+                    result[i][pos * d + j] = v.clone();
+                }
             }
         }
 
@@ -199,13 +201,13 @@ impl SecureTransformerBlock {
 
     /// Feed-forward network: MLP(x) = down(activation(up(x))).
     fn feed_forward(
-        x_shares: &[Vec<f64>],
-        up_shares: &[Vec<f64>],
-        down_shares: &[Vec<f64>],
+        x_shares: &[Vec<Fr>],
+        up_shares: &[Vec<Fr>],
+        down_shares: &[Vec<Fr>],
         config: &SecureTransformerConfig,
         seq_len: usize,
         pools: &mut [BeaverPool],
-    ) -> MPCResult<Vec<Vec<f64>>> {
+    ) -> MPCResult<Vec<Vec<Fr>>> {
         let d = config.d_model;
         let d_ff = config.d_ff;
 

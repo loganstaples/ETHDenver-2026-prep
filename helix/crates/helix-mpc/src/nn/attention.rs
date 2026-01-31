@@ -12,7 +12,8 @@
 //! but not weights), consistent with the MPC-ML security model.
 
 use crate::beaver::pool::BeaverPool;
-use crate::error::{MPCError, MPCResult};
+use crate::error::MPCResult;
+use crate::field::Fr;
 use crate::nn::linear::SecureLinear;
 use crate::protocols::matmul::SecureMatmul;
 use crate::protocols::normalization::SecureNormalization;
@@ -49,15 +50,15 @@ impl SecureAttention {
     ///
     /// Returns party shares of output [seq_len * d_model].
     pub fn forward(
-        x_shares: &[Vec<f64>],
-        wq_shares: &[Vec<f64>],
-        wk_shares: &[Vec<f64>],
-        wv_shares: &[Vec<f64>],
-        wo_shares: &[Vec<f64>],
+        x_shares: &[Vec<Fr>],
+        wq_shares: &[Vec<Fr>],
+        wk_shares: &[Vec<Fr>],
+        wv_shares: &[Vec<Fr>],
+        wo_shares: &[Vec<Fr>],
         config: &SecureAttentionConfig,
         seq_len: usize,
         pools: &mut [BeaverPool],
-    ) -> MPCResult<Vec<Vec<f64>>> {
+    ) -> MPCResult<Vec<Vec<Fr>>> {
         let num_parties = x_shares.len();
         let d = config.d_model;
         let h = config.num_heads;
@@ -77,8 +78,8 @@ impl SecureAttention {
 
         // Step 2: Split into heads and compute attention per head.
         // For simplicity, we process heads sequentially.
-        let mut head_outputs: Vec<Vec<Vec<f64>>> =
-            vec![vec![vec![0.0; seq_len * dk]; num_parties]; h];
+        let mut head_outputs: Vec<Vec<Vec<Fr>>> =
+            vec![vec![vec![Fr::ZERO; seq_len * dk]; num_parties]; h];
 
         for head in 0..h {
             // Extract head slices from Q, K, V.
@@ -116,19 +117,19 @@ impl SecureAttention {
     ///
     /// Q, K, V are each [seq_len x head_dim].
     fn scaled_dot_product_attention(
-        q_shares: &[Vec<f64>],
-        k_shares: &[Vec<f64>],
-        v_shares: &[Vec<f64>],
+        q_shares: &[Vec<Fr>],
+        k_shares: &[Vec<Fr>],
+        v_shares: &[Vec<Fr>],
         seq_len: usize,
         head_dim: usize,
         pools: &mut [BeaverPool],
-    ) -> MPCResult<Vec<Vec<f64>>> {
+    ) -> MPCResult<Vec<Vec<Fr>>> {
         let num_parties = q_shares.len();
-        let scale = 1.0 / (head_dim as f64).sqrt();
+        let scale = Fr::from_f64(1.0 / (head_dim as f64).sqrt());
 
         // Step A: Compute [Q @ K^T] — results in [seq_len x seq_len]
         // K^T is [head_dim x seq_len]
-        let kt_shares: Vec<Vec<f64>> = k_shares
+        let kt_shares: Vec<Vec<Fr>> = k_shares
             .iter()
             .map(|k| transpose_flat(k, seq_len, head_dim))
             .collect();
@@ -143,14 +144,14 @@ impl SecureAttention {
         )?;
 
         // Step B: Scale by 1/sqrt(d_k) — local operation
-        let scaled: Vec<Vec<f64>> = scores_shares
+        let scaled: Vec<Vec<Fr>> = scores_shares
             .iter()
-            .map(|s| s.iter().map(|v| v * scale).collect())
+            .map(|s| s.iter().map(|v| Fr::mul(v, &scale)).collect())
             .collect();
 
         // Step C: Softmax — reconstruct, compute, reshare
         // Apply softmax to each row (each query position).
-        let attn_rows: Vec<Vec<Vec<f64>>> = (0..num_parties)
+        let attn_rows: Vec<Vec<Vec<Fr>>> = (0..num_parties)
             .map(|i| {
                 (0..seq_len)
                     .map(|row| {
@@ -163,7 +164,7 @@ impl SecureAttention {
         let softmax_attn = SecureNormalization::batch_softmax(&attn_rows);
 
         // Flatten back to [seq_len x seq_len].
-        let attn_shares: Vec<Vec<f64>> = softmax_attn
+        let attn_shares: Vec<Vec<Fr>> = softmax_attn
             .iter()
             .map(|party_rows| {
                 let mut flat = Vec::with_capacity(seq_len * seq_len);
@@ -190,19 +191,21 @@ impl SecureAttention {
 
 /// Extracts one attention head's data from the concatenated representation.
 fn extract_head_shares(
-    shares: &[Vec<f64>],
+    shares: &[Vec<Fr>],
     seq_len: usize,
     d_model: usize,
     head_idx: usize,
     head_dim: usize,
-) -> Vec<Vec<f64>> {
+) -> Vec<Vec<Fr>> {
     shares
         .iter()
         .map(|s| {
             let mut head_data = Vec::with_capacity(seq_len * head_dim);
             for row in 0..seq_len {
                 let start = row * d_model + head_idx * head_dim;
-                head_data.extend_from_slice(&s[start..start + head_dim]);
+                for i in 0..head_dim {
+                    head_data.push(s[start + i].clone());
+                }
             }
             head_data
         })
@@ -211,22 +214,22 @@ fn extract_head_shares(
 
 /// Concatenates attention head outputs back into full d_model representation.
 fn concat_head_shares(
-    heads: &[Vec<Vec<f64>>],
+    heads: &[Vec<Vec<Fr>>],
     seq_len: usize,
     num_heads: usize,
     head_dim: usize,
-) -> Vec<Vec<f64>> {
+) -> Vec<Vec<Fr>> {
     let d_model = num_heads * head_dim;
     let num_parties = heads[0].len();
 
     (0..num_parties)
         .map(|party| {
-            let mut concat = vec![0.0; seq_len * d_model];
+            let mut concat = vec![Fr::ZERO; seq_len * d_model];
             for head in 0..num_heads {
                 for row in 0..seq_len {
                     for d in 0..head_dim {
                         concat[row * d_model + head * head_dim + d] =
-                            heads[head][party][row * head_dim + d];
+                            heads[head][party][row * head_dim + d].clone();
                     }
                 }
             }
@@ -236,11 +239,11 @@ fn concat_head_shares(
 }
 
 /// Transpose a flattened [rows x cols] matrix.
-fn transpose_flat(data: &[f64], rows: usize, cols: usize) -> Vec<f64> {
-    let mut result = vec![0.0; data.len()];
+fn transpose_flat(data: &[Fr], rows: usize, cols: usize) -> Vec<Fr> {
+    let mut result = vec![Fr::ZERO; data.len()];
     for i in 0..rows {
         for j in 0..cols {
-            result[j * rows + i] = data[i * cols + j];
+            result[j * rows + i] = data[i * cols + j].clone();
         }
     }
     result
@@ -256,22 +259,43 @@ mod tests {
         // data = [a0 a1 b0 b1 | c0 c1 d0 d1]
         // head 0 should be [a0 a1 | c0 c1]
         // head 1 should be [b0 b1 | d0 d1]
-        let data = vec![vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]];
+        let data = vec![
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+                .iter()
+                .map(|&v| Fr::from_f64(v))
+                .collect::<Vec<Fr>>()
+        ];
         let head0 = extract_head_shares(&data, 2, 4, 0, 2);
-        assert_eq!(head0[0], vec![1.0, 2.0, 5.0, 6.0]);
+        let expected0: Vec<Fr> = vec![1.0, 2.0, 5.0, 6.0].iter().map(|&v| Fr::from_f64(v)).collect();
+        for (a, b) in head0[0].iter().zip(expected0.iter()) {
+            assert!(a.ct_eq(b).to_bool());
+        }
 
         let head1 = extract_head_shares(&data, 2, 4, 1, 2);
-        assert_eq!(head1[0], vec![3.0, 4.0, 7.0, 8.0]);
+        let expected1: Vec<Fr> = vec![3.0, 4.0, 7.0, 8.0].iter().map(|&v| Fr::from_f64(v)).collect();
+        for (a, b) in head1[0].iter().zip(expected1.iter()) {
+            assert!(a.ct_eq(b).to_bool());
+        }
     }
 
     #[test]
     fn test_concat_heads() {
-        let head0 = vec![vec![1.0, 2.0, 5.0, 6.0]]; // party 0's head 0
-        let head1 = vec![vec![3.0, 4.0, 7.0, 8.0]]; // party 0's head 1
+        let head0 = vec![
+            vec![1.0, 2.0, 5.0, 6.0].iter().map(|&v| Fr::from_f64(v)).collect::<Vec<Fr>>()
+        ]; // party 0's head 0
+        let head1 = vec![
+            vec![3.0, 4.0, 7.0, 8.0].iter().map(|&v| Fr::from_f64(v)).collect::<Vec<Fr>>()
+        ]; // party 0's head 1
         let heads = vec![head0, head1];
 
         let concat = concat_head_shares(&heads, 2, 2, 2);
-        assert_eq!(concat[0], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        let expected: Vec<Fr> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+            .iter()
+            .map(|&v| Fr::from_f64(v))
+            .collect();
+        for (a, b) in concat[0].iter().zip(expected.iter()) {
+            assert!(a.ct_eq(b).to_bool());
+        }
     }
 
     #[test]

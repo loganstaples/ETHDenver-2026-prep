@@ -27,6 +27,7 @@ use sha2::{Digest, Sha256};
 
 use crate::types::PartyId;
 use crate::sharing::tensor::TensorShare;
+use crate::field::Fr;
 
 /// A commitment to a share value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,7 +82,26 @@ impl ShareCommitment {
         blinding: &[u8; 32],
         description: impl Into<String>,
     ) -> Self {
-        Self::commit_vector(party, &tensor.data, blinding, description)
+        Self::commit_fr_vector(party, &tensor.data, blinding, description)
+    }
+
+    /// Creates a commitment to a vector of Fr field elements.
+    pub fn commit_fr_vector(
+        party: &PartyId,
+        values: &[Fr],
+        blinding: &[u8; 32],
+        description: impl Into<String>,
+    ) -> Self {
+        let mut data = Vec::with_capacity(values.len() * 32);
+        for v in values {
+            data.extend_from_slice(&v.to_bytes_le());
+        }
+        let hash = Self::hash_with_blinding(&data, blinding);
+        Self {
+            party: party.clone(),
+            hash,
+            description: description.into(),
+        }
     }
 
     /// Verifies a commitment against a value.
@@ -102,7 +122,17 @@ impl ShareCommitment {
 
     /// Verifies a commitment against a tensor share.
     pub fn verify_tensor(&self, tensor: &TensorShare, blinding: &[u8; 32]) -> bool {
-        self.verify_vector(&tensor.data, blinding)
+        self.verify_fr_vector(&tensor.data, blinding)
+    }
+
+    /// Verifies a commitment against a vector of Fr field elements.
+    pub fn verify_fr_vector(&self, values: &[Fr], blinding: &[u8; 32]) -> bool {
+        let mut data = Vec::with_capacity(values.len() * 32);
+        for v in values {
+            data.extend_from_slice(&v.to_bytes_le());
+        }
+        let expected = Self::hash_with_blinding(&data, blinding);
+        self.hash == expected
     }
 
     /// Computes H(data || blinding).

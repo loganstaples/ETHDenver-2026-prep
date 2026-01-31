@@ -8,6 +8,10 @@
 //! - Data loading, sharding, and model serialization
 //! - Advanced error algebra and precision management
 //! - Comprehensive benchmarking with standardized models
+//! - Merkle tree commitments for training data verification
+//! - Batch membership proofs for verifiable training
+//! - Data provenance tracking and attestations
+//! - Multi-source data fetching (IPFS, Filecoin, S3)
 
 pub mod archive;
 pub mod benchmark;
@@ -22,7 +26,7 @@ pub mod types;
 
 // Re-export commonly used items at crate root
 pub use config::{HelixConfig, ProverConfig, TrainingConfig, VMConfig};
-pub use error::{ArithmeticError, BoundsError, CircuitError, HelixError, HelixResult};
+pub use error::{ArithmeticError, BoundsError, CircuitError, DataError, HelixError, HelixResult};
 pub use traits::{ApproximateOp, BinarySerializable, Provable, Witness};
 
 // Core types
@@ -96,4 +100,26 @@ pub use benchmark::{
     // Standard model benchmarks
     Architecture, BenchmarkComparison, ErrorStats, ModelBenchmarkResult,
     ModelConfig, ModelSize, StandardBenchmarkSuite, compare_results,
+};
+
+// Merkle tree and data verification types
+pub use data::{
+    // Merkle tree
+    Hash, MerkleError, MerkleHasher, MerkleProof, MerkleTree, MerkleTreeBuilder,
+    MerkleTreeConfig, MultiProof, ProofDirection, ProofStep, Sha256Hasher, TreePosition,
+    HASH_SIZE,
+    // Commitments
+    BatchCommitment, CommitmentError, CommitmentManager, DatasetCommitment, SampleCommitment,
+    // Membership proofs
+    AggregatedBatchProof, BatchMembershipProof, MembershipProofError, MembershipProofGenerator,
+    MembershipVerifier, SampleMembershipProof, VerificationStats,
+    // Provenance
+    Attestation, AttestationType, CustodyRecord, Custodian, CustodianType, DataOrigin,
+    DataTransformation, ProvenanceBuilder, ProvenanceChainSummary, ProvenanceError,
+    ProvenanceId, ProvenanceRecord, ProvenanceRegistry, TransformationType,
+    // Data sources
+    DataCache, DataChunk, DataSource, DataSourceError, DataSourceResult, DataStream,
+    FallbackBehavior, FetchOptions, MultiSourceFetcher, PoolConfig, ResourceMetadata,
+    UploadOptions, WritableDataSource, IpfsDataSource, IpfsSourceConfig,
+    FilecoinClient, FilecoinConfig, FilecoinDataSource, S3Config, S3DataSource,
 };

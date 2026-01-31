@@ -381,6 +381,9 @@ impl ModelSharing {
         gradient: &GradientShare,
         learning_rate: f64,
     ) -> MPCResult<()> {
+        use crate::field::Fr;
+        let lr_fr = Fr::from_f64(learning_rate);
+
         // Apply to embeddings.
         if let (Some(embed), Some(grad)) = (&mut model.embeddings, &gradient.embeddings) {
             if embed.shape != grad.shape {
@@ -390,7 +393,8 @@ impl ModelSharing {
                 });
             }
             for (w, g) in embed.data.iter_mut().zip(&grad.data) {
-                *w -= learning_rate * g;
+                let scaled_grad = Fr::mul(&lr_fr, g);
+                *w = Fr::sub(w, &scaled_grad);
             }
         }
 
@@ -405,7 +409,8 @@ impl ModelSharing {
                         });
                     }
                     for (w, g) in weight.data.iter_mut().zip(&grad.data) {
-                        *w -= learning_rate * g;
+                        let scaled_grad = Fr::mul(&lr_fr, g);
+                        *w = Fr::sub(w, &scaled_grad);
                     }
                 }
             }
@@ -420,7 +425,8 @@ impl ModelSharing {
                 });
             }
             for (w, g) in lm.data.iter_mut().zip(&grad.data) {
-                *w -= learning_rate * g;
+                let scaled_grad = Fr::mul(&lr_fr, g);
+                *w = Fr::sub(w, &scaled_grad);
             }
         }
 

@@ -15,11 +15,11 @@
 //! The sum of all new shares still equals x (since the r's sum to zero),
 //! but the new shares are independent of the old ones.
 
-use rand::Rng;
 use rand_chacha::ChaCha20Rng;
 use rand::SeedableRng;
 
-use crate::error::{MPCError, MPCResult};
+use crate::error::MPCResult;
+use crate::field::Fr;
 use crate::types::PartyId;
 use crate::sharing::tensor::TensorShare;
 use crate::sharing::model::ModelShare;
@@ -30,27 +30,28 @@ pub struct Resharing;
 impl Resharing {
     /// Generates zero-shares for one party.
     ///
-    /// Returns a vector of n values that sum to zero.
+    /// Returns a vector of n field elements that sum to zero.
     /// Party i will send value j to party j.
-    pub fn generate_zero_shares(n: usize, rng: &mut ChaCha20Rng) -> Vec<f64> {
+    pub fn generate_zero_shares(n: usize, rng: &mut ChaCha20Rng) -> Vec<Fr> {
         let mut shares = Vec::with_capacity(n);
-        let mut sum = 0.0;
+        let mut sum = Fr::ZERO;
 
         for _ in 0..n - 1 {
-            let r: f64 = rng.gen_range(-1e9..1e9);
-            shares.push(r);
-            sum += r;
+            let r = Fr::random(rng);
+            shares.push(r.clone());
+            sum = Fr::add(&sum, &r);
         }
-        shares.push(-sum);
+        // Last share is -sum so all shares sum to zero.
+        shares.push(Fr::neg(&sum));
         shares
     }
 
     /// Simulates the full re-sharing protocol for scalar shares.
     ///
     /// Takes all parties' current shares and produces new shares of the same value.
-    pub fn reshare_scalar(old_shares: &[f64], seed: u64) -> Vec<f64> {
+    pub fn reshare_scalar(old_shares: &[Fr], seed: u64) -> Vec<Fr> {
         let n = old_shares.len();
-        let mut new_shares = old_shares.to_vec();
+        let mut new_shares: Vec<Fr> = old_shares.to_vec();
 
         // Each party generates zero-shares and distributes.
         for i in 0..n {
@@ -59,7 +60,7 @@ impl Resharing {
             let zero_shares = Self::generate_zero_shares(n, &mut rng);
 
             for j in 0..n {
-                new_shares[j] += zero_shares[j];
+                new_shares[j] = Fr::add(&new_shares[j], &zero_shares[j]);
             }
         }
 
@@ -67,11 +68,11 @@ impl Resharing {
     }
 
     /// Simulates re-sharing for a vector.
-    pub fn reshare_vector(old_shares: &[Vec<f64>], seed: u64) -> Vec<Vec<f64>> {
+    pub fn reshare_vector(old_shares: &[Vec<Fr>], seed: u64) -> Vec<Vec<Fr>> {
         let n = old_shares.len();
         let dim = old_shares[0].len();
 
-        let mut new_shares: Vec<Vec<f64>> = old_shares.to_vec();
+        let mut new_shares: Vec<Vec<Fr>> = old_shares.to_vec();
 
         for i in 0..n {
             let party_seed = seed.wrapping_add((i as u64).wrapping_mul(0x9E3779B97F4A7C15));
@@ -80,7 +81,7 @@ impl Resharing {
             for d in 0..dim {
                 let zero_shares = Self::generate_zero_shares(n, &mut rng);
                 for j in 0..n {
-                    new_shares[j][d] += zero_shares[j];
+                    new_shares[j][d] = Fr::add(&new_shares[j][d], &zero_shares[j]);
                 }
             }
         }
@@ -93,7 +94,7 @@ impl Resharing {
         let n = old_shares.len();
         let dim = old_shares[0].data.len();
 
-        let mut new_data: Vec<Vec<f64>> = old_shares.iter().map(|s| s.data.clone()).collect();
+        let mut new_data: Vec<Vec<Fr>> = old_shares.iter().map(|s| s.data.clone()).collect();
 
         for i in 0..n {
             let party_seed = seed.wrapping_add((i as u64).wrapping_mul(0x9E3779B97F4A7C15));
@@ -102,7 +103,7 @@ impl Resharing {
             for d in 0..dim {
                 let zero_shares = Self::generate_zero_shares(n, &mut rng);
                 for j in 0..n {
-                    new_data[j][d] += zero_shares[j];
+                    new_data[j][d] = Fr::add(&new_data[j][d], &zero_shares[j]);
                 }
             }
         }
@@ -199,7 +200,7 @@ impl Resharing {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sharing::{AdditiveSharing, SecretSharingScheme};
+    use crate::field::ops::sum;
 
     fn test_parties(n: usize) -> Vec<PartyId> {
         (0..n).map(PartyId::from_index).collect()
@@ -209,55 +210,60 @@ mod tests {
     fn test_zero_shares_sum_to_zero() {
         let mut rng = ChaCha20Rng::seed_from_u64(42);
         let shares = Resharing::generate_zero_shares(5, &mut rng);
-        let sum: f64 = shares.iter().sum();
-        assert!(sum.abs() < 1e-10, "Zero shares don't sum to zero: {}", sum);
+        let total = sum(&shares);
+        assert!(
+            total.ct_eq(&Fr::ZERO).to_bool(),
+            "Zero shares don't sum to zero",
+        );
     }
 
     #[test]
     fn test_reshare_preserves_secret() {
-        let secret = 42.0;
-        let old_shares = vec![10.0, 15.0, 17.0]; // sum = 42
+        // Create shares that sum to a known value.
+        let secret = Fr::from_f64(42.0);
+        let share1 = Fr::from_f64(10.0);
+        let share2 = Fr::from_f64(15.0);
+        let share3 = Fr::sub(&secret, &Fr::add(&share1, &share2)); // Makes sum = 42
+        let old_shares = vec![share1.clone(), share2.clone(), share3.clone()];
 
         let new_shares = Resharing::reshare_scalar(&old_shares, 99);
-        let sum: f64 = new_shares.iter().sum();
+        let new_sum = sum(&new_shares);
 
         assert!(
-            (sum - secret).abs() < 1e-10,
-            "Reshare changed secret: {} vs {}",
-            sum,
-            secret,
+            new_sum.ct_eq(&secret).to_bool(),
+            "Reshare changed secret",
         );
 
         // New shares should be different from old shares.
         let changed = new_shares
             .iter()
             .zip(&old_shares)
-            .any(|(n, o)| (n - o).abs() > 1.0);
+            .any(|(n, o)| !n.ct_eq(o).to_bool());
         assert!(changed, "Reshare didn't change shares");
     }
 
     #[test]
     fn test_reshare_vector_preserves_secret() {
-        let secret = vec![1.0, 2.0, 3.0];
-        let sharing = AdditiveSharing::with_seed(42);
-        let parties = test_parties(3);
+        // Create a simple 3-element vector shared among 3 parties.
+        let secrets = vec![Fr::from_f64(1.0), Fr::from_f64(2.0), Fr::from_f64(3.0)];
 
-        let shares = sharing.share_vector(&secret, "test", &parties).unwrap();
-        let old_vecs: Vec<Vec<f64>> = shares.iter().map(|s| s.values.clone()).collect();
+        // Party 0 holds all values, others hold zeros (simple additive sharing).
+        let old_shares = vec![
+            secrets.clone(),
+            vec![Fr::ZERO, Fr::ZERO, Fr::ZERO],
+            vec![Fr::ZERO, Fr::ZERO, Fr::ZERO],
+        ];
 
-        let new_vecs = Resharing::reshare_vector(&old_vecs, 99);
+        let new_shares = Resharing::reshare_vector(&old_shares, 99);
 
-        // Reconstruct and verify.
-        let dim = secret.len();
-        let mut recon = vec![0.0; dim];
-        for s in &new_vecs {
-            for (i, v) in s.iter().enumerate() {
-                recon[i] += v;
-            }
-        }
-
-        for (a, b) in recon.iter().zip(secret.iter()) {
-            assert!((a - b).abs() < 1e-6, "Reshare vector: {} vs {}", a, b);
+        // Reconstruct and verify each element.
+        for d in 0..3 {
+            let recon = sum(&new_shares.iter().map(|s| s[d].clone()).collect::<Vec<_>>());
+            assert!(
+                recon.ct_eq(&secrets[d]).to_bool(),
+                "Reshare vector element {} incorrect",
+                d,
+            );
         }
     }
 

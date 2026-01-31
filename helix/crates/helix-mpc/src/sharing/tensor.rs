@@ -6,8 +6,10 @@
 use helix_core::types::{BoundedTensor, BoundedValue, ErrorMargin};
 
 use crate::error::{MPCError, MPCResult};
+use crate::field::Fr;
 use crate::types::PartyId;
-use super::{AdditiveSharing, ScalarShare, SecretSharingScheme, ShamirSharing, ShareId, VectorShare};
+
+use super::{AdditiveSharing, ScalarShare, SecretSharingScheme, ShareId, ShamirSharing, VectorShare};
 
 use serde::{Deserialize, Serialize};
 
@@ -17,7 +19,7 @@ pub struct TensorShare {
     /// Identifies this share.
     pub id: ShareId,
     /// The share data (flattened, same layout as the original tensor).
-    pub data: Vec<f64>,
+    pub data: Vec<Fr>,
     /// Shape of the original tensor.
     pub shape: Vec<usize>,
     /// Error bound from the sharing process.
@@ -27,10 +29,21 @@ pub struct TensorShare {
 }
 
 impl TensorShare {
-    pub fn new(id: ShareId, data: Vec<f64>, shape: Vec<usize>) -> Self {
+    pub fn new(id: ShareId, data: Vec<Fr>, shape: Vec<usize>) -> Self {
         Self {
             id,
             data,
+            shape,
+            sharing_error: 0.0,
+            original_error: 0.0,
+        }
+    }
+
+    /// Creates a TensorShare from f64 data (convenience method).
+    pub fn from_f64(id: ShareId, data: Vec<f64>, shape: Vec<usize>) -> Self {
+        Self {
+            id,
+            data: data.into_iter().map(Fr::from_f64).collect(),
             shape,
             sharing_error: 0.0,
             original_error: 0.0,
@@ -45,7 +58,8 @@ impl TensorShare {
     /// Converts this share to a BoundedTensor (for use in local computation).
     pub fn to_bounded_tensor(&self) -> BoundedTensor {
         let total_error = self.sharing_error + self.original_error;
-        BoundedTensor::from_approximate(self.data.clone(), self.shape.clone(), total_error)
+        let data_f64: Vec<f64> = self.data.iter().map(|v| v.to_f64()).collect();
+        BoundedTensor::from_approximate(data_f64, self.shape.clone(), total_error)
     }
 
     /// Element-wise addition of two tensor shares (linear homomorphism).
@@ -57,11 +71,11 @@ impl TensorShare {
             });
         }
 
-        let data: Vec<f64> = self
+        let data: Vec<Fr> = self
             .data
             .iter()
             .zip(&other.data)
-            .map(|(a, b)| a + b)
+            .map(|(a, b)| Fr::add(a, b))
             .collect();
 
         let mut result = TensorShare::new(self.id.clone(), data, self.shape.clone());
@@ -79,11 +93,11 @@ impl TensorShare {
             });
         }
 
-        let data: Vec<f64> = self
+        let data: Vec<Fr> = self
             .data
             .iter()
             .zip(&other.data)
-            .map(|(a, b)| a - b)
+            .map(|(a, b)| Fr::sub(a, b))
             .collect();
 
         let mut result = TensorShare::new(self.id.clone(), data, self.shape.clone());
@@ -93,12 +107,18 @@ impl TensorShare {
     }
 
     /// Scalar multiplication of a tensor share by a public constant.
-    pub fn scale(&self, scalar: f64) -> TensorShare {
-        let data: Vec<f64> = self.data.iter().map(|v| v * scalar).collect();
+    pub fn scale(&self, scalar: &Fr) -> TensorShare {
+        let data: Vec<Fr> = self.data.iter().map(|v| Fr::mul(v, scalar)).collect();
+        let scalar_f64 = scalar.to_f64().abs();
         let mut result = TensorShare::new(self.id.clone(), data, self.shape.clone());
-        result.sharing_error = self.sharing_error * scalar.abs();
-        result.original_error = self.original_error * scalar.abs();
+        result.sharing_error = self.sharing_error * scalar_f64;
+        result.original_error = self.original_error * scalar_f64;
         result
+    }
+
+    /// Scalar multiplication by f64 (convenience method).
+    pub fn scale_f64(&self, scalar: f64) -> TensorShare {
+        self.scale(&Fr::from_f64(scalar))
     }
 
     /// Transposes a 2D tensor share.
@@ -111,19 +131,15 @@ impl TensorShare {
         }
 
         let (rows, cols) = (self.shape[0], self.shape[1]);
-        let mut data = vec![0.0; self.data.len()];
+        let mut data = vec![Fr::ZERO; self.data.len()];
 
         for i in 0..rows {
             for j in 0..cols {
-                data[j * rows + i] = self.data[i * cols + j];
+                data[j * rows + i] = self.data[i * cols + j].clone();
             }
         }
 
-        let mut result = TensorShare::new(
-            self.id.clone(),
-            data,
-            vec![cols, rows],
-        );
+        let mut result = TensorShare::new(self.id.clone(), data, vec![cols, rows]);
         result.sharing_error = self.sharing_error;
         result.original_error = self.original_error;
         Ok(result)
@@ -150,7 +166,7 @@ impl TensorSharing {
         let tensor_shares = vector_shares
             .into_iter()
             .map(|vs| {
-                let mut ts = TensorShare::new(vs.id, vs.values, shape.clone());
+                let mut ts = TensorShare::from_f64(vs.id, vs.values, shape.clone());
                 ts.original_error = original_error;
                 ts
             })
@@ -175,7 +191,7 @@ impl TensorSharing {
         let tensor_shares = vector_shares
             .into_iter()
             .map(|vs| {
-                let mut ts = TensorShare::new(vs.id, vs.values, shape.clone());
+                let mut ts = TensorShare::from_f64(vs.id, vs.values, shape.clone());
                 ts.original_error = original_error;
                 // Shamir has quantization error from field mapping.
                 ts.sharing_error = 1e-6;
@@ -187,9 +203,7 @@ impl TensorSharing {
     }
 
     /// Reconstructs a BoundedTensor from additive tensor shares.
-    pub fn reconstruct_additive(
-        shares: &[TensorShare],
-    ) -> MPCResult<BoundedTensor> {
+    pub fn reconstruct_additive(shares: &[TensorShare]) -> MPCResult<BoundedTensor> {
         if shares.is_empty() {
             return Err(MPCError::InsufficientShares {
                 required: 2,
@@ -209,12 +223,14 @@ impl TensorSharing {
             }
         }
 
-        let mut values = vec![0.0; dim];
+        let mut values = vec![Fr::ZERO; dim];
         for s in shares {
             for (i, v) in s.data.iter().enumerate() {
-                values[i] += v;
+                values[i] = Fr::add(&values[i], v);
             }
         }
+
+        let values_f64: Vec<f64> = values.iter().map(|v| v.to_f64()).collect();
 
         let max_sharing_error: f64 = shares.iter().map(|s| s.sharing_error).sum();
         let max_original_error: f64 = shares
@@ -223,7 +239,11 @@ impl TensorSharing {
             .fold(0.0, f64::max);
         let total_error = max_sharing_error + max_original_error;
 
-        Ok(BoundedTensor::from_approximate(values, shape, total_error))
+        Ok(BoundedTensor::from_approximate(
+            values_f64,
+            shape,
+            total_error,
+        ))
     }
 
     /// Reconstructs a BoundedTensor from Shamir tensor shares.
@@ -241,9 +261,13 @@ impl TensorSharing {
         let shape = shares[0].shape.clone();
 
         // Convert TensorShares to VectorShares for the Shamir reconstruction.
+        // Convert Fr back to f64 for the VectorShare API.
         let vector_shares: Vec<VectorShare> = shares
             .iter()
-            .map(|ts| VectorShare::new(ts.id.clone(), ts.data.clone()))
+            .map(|ts| {
+                let values: Vec<f64> = ts.data.iter().map(|v| v.to_f64()).collect();
+                VectorShare::new(ts.id.clone(), values)
+            })
             .collect();
 
         let values = sharing.reconstruct_vector(&vector_shares)?;
@@ -272,7 +296,7 @@ impl TensorSharing {
         let tensor_shares = vector_shares
             .into_iter()
             .map(|vs| {
-                let mut ts = TensorShare::new(vs.id, vs.values, shape.to_vec());
+                let mut ts = TensorShare::from_f64(vs.id, vs.values, shape.to_vec());
                 ts.original_error = error_bound;
                 ts
             })
@@ -282,9 +306,7 @@ impl TensorSharing {
     }
 
     /// Reconstructs raw weight data from additive tensor shares.
-    pub fn reconstruct_weight_data_additive(
-        shares: &[TensorShare],
-    ) -> MPCResult<(Vec<f32>, f64)> {
+    pub fn reconstruct_weight_data_additive(shares: &[TensorShare]) -> MPCResult<(Vec<f32>, f64)> {
         let tensor = Self::reconstruct_additive(shares)?;
         let data: Vec<f32> = tensor.data().iter().map(|bv| bv.value() as f32).collect();
         let error = tensor.max_error();
@@ -318,7 +340,7 @@ mod tests {
         let recon_vals = recon.values();
         for (a, b) in orig_vals.iter().zip(recon_vals.iter()) {
             assert!(
-                (a - b).abs() < 1e-10,
+                (a - b).abs() < 1e-6,
                 "Tensor recon failed: {} vs {}",
                 a,
                 b,
@@ -336,8 +358,7 @@ mod tests {
         assert_eq!(shares.len(), 3);
 
         // Reconstruct with just 2 shares (2-of-3 threshold).
-        let recon =
-            TensorSharing::reconstruct_shamir(&shares[..2], &sharing).unwrap();
+        let recon = TensorSharing::reconstruct_shamir(&shares[..2], &sharing).unwrap();
         let orig_vals = tensor.values();
         let recon_vals = recon.values();
 
@@ -375,7 +396,7 @@ mod tests {
 
         for (a, b) in result.values().iter().zip(expected.iter()) {
             assert!(
-                (a - b).abs() < 1e-10,
+                (a - b).abs() < 1e-6,
                 "Homomorphic add failed: {} vs {}",
                 a,
                 b,
@@ -392,13 +413,13 @@ mod tests {
         let shares = TensorSharing::share_additive(&tensor, "t", &parties, &sharing).unwrap();
 
         // Scale each share by 3.
-        let scaled: Vec<TensorShare> = shares.iter().map(|s| s.scale(3.0)).collect();
+        let scaled: Vec<TensorShare> = shares.iter().map(|s| s.scale_f64(3.0)).collect();
 
         let result = TensorSharing::reconstruct_additive(&scaled).unwrap();
         let expected = vec![6.0, 12.0, 18.0];
 
         for (a, b) in result.values().iter().zip(expected.iter()) {
-            assert!((a - b).abs() < 1e-10);
+            assert!((a - b).abs() < 1e-6);
         }
     }
 
@@ -410,10 +431,7 @@ mod tests {
         let tensor = BoundedTensor::from_exact(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);
         let shares = TensorSharing::share_additive(&tensor, "t", &parties, &sharing).unwrap();
 
-        let transposed: Vec<TensorShare> = shares
-            .iter()
-            .map(|s| s.transpose().unwrap())
-            .collect();
+        let transposed: Vec<TensorShare> = shares.iter().map(|s| s.transpose().unwrap()).collect();
 
         let result = TensorSharing::reconstruct_additive(&transposed).unwrap();
         assert_eq!(result.shape(), &vec![3, 2]);
@@ -421,7 +439,7 @@ mod tests {
         // Original [1,2,3; 4,5,6] transposed = [1,4; 2,5; 3,6]
         let expected = vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0];
         for (a, b) in result.values().iter().zip(expected.iter()) {
-            assert!((a - b).abs() < 1e-10);
+            assert!((a - b).abs() < 1e-6);
         }
     }
 
@@ -443,7 +461,7 @@ mod tests {
 
         for (a, b) in recon_data.iter().zip(data.iter()) {
             assert!(
-                (a - b).abs() < 1e-6,
+                (a - b).abs() < 1e-4,
                 "Weight data recon failed: {} vs {}",
                 a,
                 b,

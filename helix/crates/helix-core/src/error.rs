@@ -25,6 +25,10 @@ pub enum HelixError {
     #[error("Network error: {0}")]
     Network(#[from] NetworkError),
 
+    /// Data verification error.
+    #[error("Data error: {0}")]
+    Data(#[from] DataError),
+
     /// Configuration error.
     #[error("Config error: {0}")]
     Config(String),
@@ -139,6 +143,50 @@ pub enum NetworkError {
     /// Protocol error.
     #[error("Protocol error: {0}")]
     ProtocolError(String),
+}
+
+/// Errors related to data verification and provenance.
+#[derive(Error, Debug)]
+pub enum DataError {
+    /// Merkle tree error.
+    #[error("Merkle tree error: {0}")]
+    MerkleError(String),
+
+    /// Commitment verification failed.
+    #[error("Commitment verification failed: {0}")]
+    CommitmentVerificationFailed(String),
+
+    /// Membership proof invalid.
+    #[error("Membership proof invalid: {0}")]
+    MembershipProofInvalid(String),
+
+    /// Data integrity violation.
+    #[error("Data integrity error: expected hash {expected}, got {actual}")]
+    IntegrityError { expected: String, actual: String },
+
+    /// Provenance chain broken.
+    #[error("Provenance chain broken at step {step}: {reason}")]
+    ProvenanceChainBroken { step: usize, reason: String },
+
+    /// Data source error.
+    #[error("Data source error: {0}")]
+    SourceError(String),
+
+    /// Sample not found.
+    #[error("Sample not found: index {0}")]
+    SampleNotFound(usize),
+
+    /// Batch not found.
+    #[error("Batch not found: index {0}")]
+    BatchNotFound(usize),
+
+    /// Invalid data format.
+    #[error("Invalid data format: {0}")]
+    InvalidFormat(String),
+
+    /// Data too large.
+    #[error("Data too large: {size} bytes (max: {max})")]
+    DataTooLarge { size: usize, max: usize },
 }
 
 /// Result type alias for HELIX operations.
