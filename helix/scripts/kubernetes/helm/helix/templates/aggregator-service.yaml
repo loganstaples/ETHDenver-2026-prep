@@ -1,0 +1,26 @@
+{{- if .Values.aggregator.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "helix.fullname" . }}-aggregator
+  namespace: {{ .Values.namespace.name | default "helix" }}
+  labels:
+    {{- include "helix.aggregator.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.aggregator.service.type }}
+  ports:
+    - port: {{ .Values.aggregator.service.ports.p2p }}
+      targetPort: p2p
+      protocol: TCP
+      name: p2p
+    - port: {{ .Values.aggregator.service.ports.api }}
+      targetPort: api
+      protocol: TCP
+      name: api
+    - port: {{ .Values.aggregator.service.ports.metrics }}
+      targetPort: metrics
+      protocol: TCP
+      name: metrics
+  selector:
+    {{- include "helix.aggregator.selectorLabels" . | nindent 4 }}
+{{- end }}

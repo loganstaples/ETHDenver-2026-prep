@@ -85,7 +85,7 @@ contract HelixVerifier is IHelixVerifier {
         uint256 _omega,
         uint256 _maxErrorBound
     ) external onlyOwner {
-        require(!initialized || msg.sender == owner, "Already initialized");
+        require(!initialized, "Already initialized");
         
         vk.selectorCommitments = _selectorCommitments;
         vk.permutationCommitments = _permutationCommitments;
@@ -105,9 +105,12 @@ contract HelixVerifier is IHelixVerifier {
         bytes memory proof,
         uint256[] memory publicInputs
     ) external view override returns (bool isValid) {
+        // Require initialization
+        require(initialized, "Not initialized");
+
         // For hackathon demo, we implement a simplified verification
         // Full implementation would include complete Halo2 verfication
-        
+
         // Decode the proof
         if (proof.length < 256) {
             return false;

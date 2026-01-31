@@ -1,0 +1,60 @@
+{{- if .Values.dashboard.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "helix.fullname" . }}-dashboard
+  namespace: {{ .Values.namespace.name | default "helix" }}
+  labels:
+    {{- include "helix.dashboard.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.dashboard.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "helix.dashboard.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.dashboard.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "helix.dashboard.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- include "helix.imagePullSecrets" . | nindent 6 }}
+      serviceAccountName: {{ include "helix.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.dashboard.podSecurityContext | nindent 8 }}
+      containers:
+        - name: dashboard
+          securityContext:
+            {{- toYaml .Values.dashboard.securityContext | nindent 12 }}
+          image: "{{ .Values.images.dashboard.repository }}:{{ .Values.images.dashboard.tag }}"
+          imagePullPolicy: {{ .Values.images.dashboard.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+          env:
+            {{- range $key, $value := .Values.dashboard.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+            - name: NEXT_PUBLIC_RPC_URL
+              value: {{ include "helix.ethereumRpcUrl" . | quote }}
+            - name: NEXT_PUBLIC_AGGREGATOR_URL
+              value: {{ include "helix.aggregatorUrl" . | quote }}
+          livenessProbe:
+            {{- toYaml .Values.dashboard.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.dashboard.readinessProbe | nindent 12 }}
+          resources:
+            {{- toYaml .Values.dashboard.resources | nindent 12 }}
+      {{- with .Values.global.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.global.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

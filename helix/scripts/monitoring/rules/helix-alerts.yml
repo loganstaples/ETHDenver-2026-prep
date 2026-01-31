@@ -1,0 +1,236 @@
+# HELIX Prometheus Alert Rules
+# =============================
+# Production alerting rules for HELIX distributed ML training.
+
+groups:
+  # ==============================================================================
+  # Training Health Alerts
+  # ==============================================================================
+  - name: helix-training
+    interval: 30s
+    rules:
+      - alert: TrainingRoundStalled
+        expr: |
+          increase(helix_training_rounds_completed_total[10m]) == 0
+          and helix_training_active == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Training round has stalled"
+          description: "No training rounds completed in the last 10 minutes while training is active."
+
+      - alert: TrainingRoundTimeout
+        expr: |
+          helix_training_round_duration_seconds > 300
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Training round taking too long"
+          description: "Training round {{ $labels.round_id }} has been running for {{ $value }}s (threshold: 300s)."
+
+      - alert: HighErrorBound
+        expr: |
+          helix_training_accumulated_error > 0.5
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Accumulated error bound is high"
+          description: "Training accumulated error is {{ $value }} (threshold: 0.5)."
+
+      - alert: ErrorBoundExceeded
+        expr: |
+          helix_training_accumulated_error >= 1.0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Error bound exceeded"
+          description: "Training accumulated error {{ $value }} has exceeded maximum (1.0). Training quality compromised."
+
+  # ==============================================================================
+  # Worker Health Alerts
+  # ==============================================================================
+  - name: helix-workers
+    interval: 30s
+    rules:
+      - alert: WorkerDown
+        expr: |
+          up{job="helix-workers"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "HELIX worker is down"
+          description: "Worker {{ $labels.instance }} has been unreachable for more than 1 minute."
+
+      - alert: InsufficientWorkers
+        expr: |
+          count(up{job="helix-workers"} == 1) < 3
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Insufficient active workers"
+          description: "Only {{ $value }} workers are active (minimum: 3). Training cannot proceed."
+
+      - alert: WorkerHighLatency
+        expr: |
+          histogram_quantile(0.95, rate(helix_worker_gradient_compute_seconds_bucket[5m])) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Worker gradient computation is slow"
+          description: "Worker {{ $labels.instance }} P95 gradient computation latency is {{ $value }}s."
+
+      - alert: WorkerProofGenerationSlow
+        expr: |
+          histogram_quantile(0.95, rate(helix_prover_proof_generation_seconds_bucket[5m])) > 60
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Proof generation is slow"
+          description: "Worker {{ $labels.instance }} P95 proof generation time is {{ $value }}s."
+
+      - alert: WorkerHighMemory
+        expr: |
+          (container_memory_usage_bytes{container_label_helix_role="worker"}
+          / container_spec_memory_limit_bytes{container_label_helix_role="worker"}) > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Worker memory usage is high"
+          description: "Worker {{ $labels.instance }} is using {{ $value | humanizePercentage }} of its memory limit."
+
+      - alert: WorkerHighCPU
+        expr: |
+          rate(container_cpu_usage_seconds_total{container_label_helix_role="worker"}[5m]) > 1.8
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Worker CPU usage is high"
+          description: "Worker {{ $labels.instance }} is using {{ $value }} CPU cores."
+
+  # ==============================================================================
+  # Aggregator Health Alerts
+  # ==============================================================================
+  - name: helix-aggregator
+    interval: 30s
+    rules:
+      - alert: AggregatorDown
+        expr: |
+          up{job="helix-aggregator"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "HELIX aggregator is down"
+          description: "The aggregator node is unreachable. Training cannot proceed."
+
+      - alert: AggregatorGradientQueueFull
+        expr: |
+          helix_aggregator_pending_gradients > 100
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Aggregator gradient queue is backing up"
+          description: "{{ $value }} gradients pending aggregation."
+
+      - alert: ProofVerificationFailures
+        expr: |
+          rate(helix_aggregator_proof_verification_failures_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High proof verification failure rate"
+          description: "{{ $value | humanizePercentage }} proof verification failures in the last 5 minutes."
+
+      - alert: SlashingEvent
+        expr: |
+          increase(helix_aggregator_slashing_events_total[1m]) > 0
+        for: 0s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Worker slashing event detected"
+          description: "A worker has been slashed for submitting an invalid proof."
+
+  # ==============================================================================
+  # Network Health Alerts
+  # ==============================================================================
+  - name: helix-network
+    interval: 30s
+    rules:
+      - alert: PeerCountLow
+        expr: |
+          helix_network_connected_peers < 3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Low peer count"
+          description: "Node {{ $labels.instance }} has only {{ $value }} connected peers."
+
+      - alert: NetworkPartition
+        expr: |
+          helix_network_partition_detected == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Network partition detected"
+          description: "A network partition has been detected. Some nodes may be unreachable."
+
+      - alert: HighNetworkLatency
+        expr: |
+          histogram_quantile(0.95, rate(helix_network_message_latency_seconds_bucket[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High network latency"
+          description: "P95 network message latency is {{ $value }}s."
+
+  # ==============================================================================
+  # Ethereum/Blockchain Alerts
+  # ==============================================================================
+  - name: helix-blockchain
+    interval: 60s
+    rules:
+      - alert: EthereumRPCUnreachable
+        expr: |
+          helix_ethereum_rpc_available == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Ethereum RPC is unreachable"
+          description: "Cannot connect to Ethereum RPC endpoint. On-chain operations will fail."
+
+      - alert: TransactionFailures
+        expr: |
+          rate(helix_ethereum_transaction_failures_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High transaction failure rate"
+          description: "{{ $value | humanizePercentage }} of transactions are failing."
+
+      - alert: HighGasPrice
+        expr: |
+          helix_ethereum_gas_price_gwei > 100
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High gas price"
+          description: "Ethereum gas price is {{ $value }} gwei. Operations may be expensive."

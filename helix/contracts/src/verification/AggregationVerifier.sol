@@ -538,14 +538,19 @@ contract AggregationVerifier {
 
         if (n == 0) return bytes32(0);
 
-        // Compute stake-weighted combination of commitments
+        // Compute stake-weighted combination of commitments using XOR aggregation
+        // We use XOR because it's commutative and doesn't overflow
         bytes32 aggregated = bytes32(0);
         uint256 totalWeight = aggregationRounds[modelId][roundId].totalStakeWeight;
 
         for (uint256 i = 0; i < n; i++) {
-            // Weight each commitment by stake proportion
-            uint256 weight = (contribs[i].stakeWeight * 1e18) / totalWeight;
-            bytes32 weighted = bytes32(uint256(contribs[i].gradientCommitment) * weight / 1e18);
+            // Instead of multiplying large hash values (which overflows), we use
+            // a hash-based weighted combination that's overflow-safe
+            bytes32 weighted = keccak256(abi.encodePacked(
+                contribs[i].gradientCommitment,
+                contribs[i].stakeWeight,
+                totalWeight
+            ));
             aggregated = bytes32(uint256(aggregated) ^ uint256(weighted));
         }
 

@@ -1,16 +1,18 @@
 //! Quantization Module.
 //!
 //! Provides comprehensive quantization support for neural network operations,
-//! enabling efficient inference while tracking error bounds.
+//! enabling efficient inference and training while tracking error bounds.
 //!
 //! # Overview
 //!
 //! This module implements:
+//! - **Tensor Types**: Dedicated INT8 and INT4 tensor representations
+//! - **Operations**: Specialized quantized operations (matmul, activations, normalization)
 //! - **Schemes**: Different quantization formats (INT8, INT4, FP8)
 //! - **Static Quantization**: Pre-calibrated quantization with fixed parameters
 //! - **Dynamic Quantization**: Runtime quantization with adaptive parameters
 //! - **Calibration**: Statistical analysis for optimal quantization parameters
-//! - **Quantized Operations**: Efficient integer arithmetic for neural networks
+//! - **Mixed Precision**: Support for running different parts at different precisions
 //!
 //! # Error Tracking
 //!
@@ -21,7 +23,10 @@
 //! # Example
 //!
 //! ```ignore
-//! use helix_avm::quantization::{StaticQuantizer, QuantConfig};
+//! use helix_avm::quantization::{StaticQuantizer, QuantConfig, Int8Tensor};
+//!
+//! // Create INT8 tensor from float data
+//! let tensor = Int8Tensor::from_float_data(&data, shape, QuantScheme::SymmetricInt8);
 //!
 //! // Create a quantizer
 //! let mut quantizer = StaticQuantizer::new(QuantConfig::int8_static());
@@ -37,6 +42,11 @@
 pub mod calibration;
 pub mod dequantize;
 pub mod dynamic;
+pub mod int4_ops;
+pub mod int4_tensor;
+pub mod int8_ops;
+pub mod int8_tensor;
+pub mod mixed_precision;
 pub mod ops;
 pub mod quantize;
 pub mod schemes;
@@ -46,6 +56,23 @@ pub mod static_quant;
 pub use calibration::{CalibrationData, Calibrator, Observer};
 pub use dequantize::{dequantize_scalar, dequantize_tensor};
 pub use dynamic::{DynamicQuantizer, DynamicQuantizedLinear, PerTokenDynamicQuantizer};
+pub use int4_ops::{
+    compute_int4_quantization_error, int4_add, int4_gelu, int4_int8_matmul, int4_linear,
+    int4_matmul, int4_mul, int4_relu, int4_requantize, int4_scale, Int4QuantConfig,
+    Int4QuantizationErrorMetrics,
+};
+pub use int4_tensor::{Int4Tensor, Int4TensorBuilder, Int4TensorStats};
+pub use int8_ops::{
+    compute_quantization_error, int8_add, int8_batched_matmul, int8_concat, int8_gelu,
+    int8_layer_norm, int8_leaky_relu, int8_linear, int8_matmul, int8_matvec, int8_mean,
+    int8_mul, int8_relu, int8_requantize, int8_rms_norm, int8_scale, int8_sigmoid, int8_silu,
+    int8_softmax, int8_sub, int8_sum, int8_tanh, QuantizationErrorMetrics,
+};
+pub use int8_tensor::{Int8Tensor, Int8TensorBuilder, Int8TensorStats};
+pub use mixed_precision::{
+    ActivationType, ExecutionStats, LayerPrecisionConfig, MemoryFootprint,
+    MixedPrecisionConfig, MixedPrecisionExecutor, MixedPrecisionTensor, PrecisionLevel,
+};
 pub use ops::{
     quantized_add, quantized_gelu, quantized_layer_norm, quantized_linear, quantized_matmul,
     quantized_relu, quantized_sigmoid, quantized_softmax,
@@ -66,8 +93,10 @@ pub use static_quant::{
 /// Prelude module for convenient imports.
 pub mod prelude {
     pub use super::{
-        CalibrationData, Calibrator, DynamicQuantizer, Observer, QuantConfig, QuantScheme,
-        QuantizedTensor, StaticQuantizer, TensorQuantParams,
+        CalibrationData, Calibrator, DynamicQuantizer, Int4Tensor, Int8Tensor,
+        MixedPrecisionConfig, MixedPrecisionExecutor, MixedPrecisionTensor, Observer,
+        PrecisionLevel, QuantConfig, QuantScheme, QuantizedTensor, StaticQuantizer,
+        TensorQuantParams,
     };
 }
 

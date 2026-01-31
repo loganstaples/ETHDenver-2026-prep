@@ -19,10 +19,10 @@ contract HelixCoordinatorV2Test is Test {
     uint256 constant MIN_STAKE = 0.1 ether;
     uint256 constant ROUND_DURATION = 1 hours;
 
-    event ModelRegistered(uint256 indexed modelId, address indexed owner, uint256 initialCommitment, string ipfsHash);
-    event RoundStarted(uint256 indexed modelId, uint256 indexed roundId, uint256 deadline);
-    event Staked(address indexed prover, uint256 indexed modelId, uint256 amount);
-    event Slashed(address indexed prover, uint256 indexed modelId, uint256 amount, string reason);
+    event ModelRegistered(uint256 indexed modelId, address indexed owner, uint256 initialCommitment, uint256 minStake, string ipfsHash);
+    event RoundStarted(uint256 indexed modelId, uint256 indexed roundId, uint256 deadline, uint256 modelCommitment);
+    event Staked(address indexed prover, uint256 indexed modelId, uint256 amount, uint256 totalStake);
+    event Slashed(address indexed prover, uint256 indexed modelId, uint256 roundId, uint256 amount, uint256 remainingStake, string reason);
 
     function setUp() public {
         owner = address(this);
@@ -46,7 +46,7 @@ contract HelixCoordinatorV2Test is Test {
         uint256 initialCommitment = 12345;
 
         vm.expectEmit(true, true, false, true);
-        emit ModelRegistered(0, owner, initialCommitment, ipfsHash);
+        emit ModelRegistered(0, owner, initialCommitment, MIN_STAKE, ipfsHash);
 
         uint256 modelId = coordinator.registerModel(ipfsHash, initialCommitment, MIN_STAKE);
 
@@ -75,7 +75,7 @@ contract HelixCoordinatorV2Test is Test {
 
         vm.prank(prover1);
         vm.expectEmit(true, true, false, true);
-        emit Staked(prover1, modelId, 0.5 ether);
+        emit Staked(prover1, modelId, 0.5 ether, 0.5 ether);
         coordinator.stake{value: 0.5 ether}(modelId);
 
         (uint256 amount, uint256 lockedUntil, bool slashed) = coordinator.getStake(prover1, modelId);
@@ -131,7 +131,7 @@ contract HelixCoordinatorV2Test is Test {
         uint256 modelId = coordinator.registerModel("hash", 100, MIN_STAKE);
 
         vm.expectEmit(true, true, false, true);
-        emit RoundStarted(modelId, 1, block.timestamp + ROUND_DURATION);
+        emit RoundStarted(modelId, 1, block.timestamp + ROUND_DURATION, 100);
         coordinator.startRound(modelId, ROUND_DURATION);
 
         (uint256 round,,) = coordinator.getModelState(modelId);

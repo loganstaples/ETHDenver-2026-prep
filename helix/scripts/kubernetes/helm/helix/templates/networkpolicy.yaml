@@ -1,0 +1,129 @@
+{{- if .Values.networkPolicies.enabled }}
+# Aggregator network policy
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "helix.fullname" . }}-aggregator
+  namespace: {{ .Values.namespace.name | default "helix" }}
+  labels:
+    {{- include "helix.aggregator.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "helix.aggregator.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow from workers
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: worker
+      ports:
+        - protocol: TCP
+          port: 9000
+        - protocol: TCP
+          port: 9001
+    # Allow from dashboard
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: dashboard
+      ports:
+        - protocol: TCP
+          port: 9001
+    {{- if .Values.networkPolicies.allowMonitoring }}
+    # Allow from Prometheus
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: monitoring
+      ports:
+        - protocol: TCP
+          port: 9002
+    {{- end }}
+  egress:
+    # Allow to Ethereum RPC
+    - to: []
+      ports:
+        - protocol: TCP
+          port: 8545
+    # Allow DNS
+    - to: []
+      ports:
+        - protocol: UDP
+          port: 53
+---
+# Worker network policy
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "helix.fullname" . }}-worker
+  namespace: {{ .Values.namespace.name | default "helix" }}
+  labels:
+    {{- include "helix.worker.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "helix.worker.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow from aggregator
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: aggregator
+      ports:
+        - protocol: TCP
+          port: 9000
+        - protocol: TCP
+          port: 9001
+    # Allow from other workers (P2P mesh)
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: worker
+      ports:
+        - protocol: TCP
+          port: 9000
+    {{- if .Values.networkPolicies.allowMonitoring }}
+    # Allow from Prometheus
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: monitoring
+      ports:
+        - protocol: TCP
+          port: 9002
+    {{- end }}
+  egress:
+    # Allow to aggregator
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: aggregator
+      ports:
+        - protocol: TCP
+          port: 9000
+    # Allow to other workers
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: worker
+      ports:
+        - protocol: TCP
+          port: 9000
+    # Allow to Ethereum RPC
+    - to: []
+      ports:
+        - protocol: TCP
+          port: 8545
+    # Allow DNS
+    - to: []
+      ports:
+        - protocol: UDP
+          port: 53
+{{- end }}

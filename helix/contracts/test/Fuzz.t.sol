@@ -403,6 +403,7 @@ contract FuzzTest is Test {
 
     /// @notice Invariant: Treasury balance should only increase
     function testFuzz_TreasuryOnlyIncreases(uint96[3] memory stakeAmounts) public {
+        // Use consistent commitment values since invalid proofs don't update model state
         uint256 hashLo = 100;
         uint256 hashHi = 200;
         uint256 commitment = uint256(keccak256(abi.encodePacked(hashLo, hashHi)));
@@ -423,19 +424,16 @@ contract FuzzTest is Test {
             vm.prank(prover);
             coordinator.stake{value: stakeAmount}(modelId);
 
-            // New commitment for each round
-            hashLo = hashLo + i + 1;
-            hashHi = hashHi + i + 1;
-            commitment = uint256(keccak256(abi.encodePacked(hashLo, hashHi)));
-
             vm.prank(modelOwner);
             coordinator.startRound(modelId, ROUND_DURATION);
 
+            // Since proofs fail, the model commitment stays the same
+            // So we always use the same old commitment
             uint256[] memory inputs = new uint256[](7);
-            inputs[0] = hashLo - i - 1;
-            inputs[1] = hashHi - i - 1;
-            inputs[2] = hashLo;
-            inputs[3] = hashHi;
+            inputs[0] = hashLo;
+            inputs[1] = hashHi;
+            inputs[2] = hashLo + 1;  // New commitment values (won't be stored since proof fails)
+            inputs[3] = hashHi + 1;
             inputs[4] = 100;
             inputs[5] = 10;
             inputs[6] = i + 1;

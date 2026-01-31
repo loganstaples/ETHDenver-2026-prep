@@ -1,0 +1,115 @@
+{{- if .Values.workers.enabled }}
+{{- if eq .Values.workers.kind "StatefulSet" }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "helix.fullname" . }}-worker
+  namespace: {{ .Values.namespace.name | default "helix" }}
+  labels:
+    {{- include "helix.worker.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "helix.fullname" . }}-worker-headless
+  replicas: {{ .Values.workers.replicaCount }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "helix.worker.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.workers.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "helix.worker.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- include "helix.imagePullSecrets" . | nindent 6 }}
+      serviceAccountName: {{ include "helix.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.workers.podSecurityContext | nindent 8 }}
+      containers:
+        - name: worker
+          securityContext:
+            {{- toYaml .Values.workers.securityContext | nindent 12 }}
+          image: "{{ .Values.images.node.repository }}:{{ .Values.images.node.tag }}"
+          imagePullPolicy: {{ .Values.images.node.pullPolicy }}
+          ports:
+            - name: p2p
+              containerPort: 9000
+              protocol: TCP
+            - name: api
+              containerPort: 9001
+              protocol: TCP
+            - name: metrics
+              containerPort: 9002
+              protocol: TCP
+          env:
+            {{- include "helix.commonEnv" . | nindent 12 }}
+            {{- range $key, $value := .Values.workers.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+            - name: HELIX_AGGREGATOR_ADDR
+              value: {{ include "helix.aggregatorP2pAddr" . | quote }}
+            - name: HELIX_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            {{- if .Values.workers.config.enabled }}
+            - name: config
+              mountPath: /app/config
+              readOnly: true
+            {{- end }}
+            - name: data
+              mountPath: /app/data
+            - name: tmp
+              mountPath: /tmp
+          livenessProbe:
+            {{- toYaml .Values.workers.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.workers.readinessProbe | nindent 12 }}
+          resources:
+            {{- toYaml .Values.workers.resources | nindent 12 }}
+            {{- if .Values.workers.gpu.enabled }}
+            {{- if eq .Values.workers.gpu.type "nvidia" }}
+            nvidia.com/gpu: {{ .Values.workers.gpu.count }}
+            {{- end }}
+            {{- end }}
+      volumes:
+        {{- if .Values.workers.config.enabled }}
+        - name: config
+          configMap:
+            name: {{ include "helix.fullname" . }}-worker-config
+        {{- end }}
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.workers.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.workers.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.workers.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- if .Values.workers.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - {{ .Values.workers.persistence.accessMode }}
+        {{- if .Values.workers.persistence.storageClass }}
+        storageClassName: {{ .Values.workers.persistence.storageClass }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.workers.persistence.size }}
+  {{- end }}
+{{- end }}
+{{- end }}

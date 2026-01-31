@@ -1,0 +1,25 @@
+{{- if .Values.aggregator.config.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "helix.fullname" . }}-aggregator-config
+  namespace: {{ .Values.namespace.name | default "helix" }}
+  labels:
+    {{- include "helix.aggregator.labels" . | nindent 4 }}
+data:
+  aggregator.toml: |
+    {{- .Values.aggregator.config.content | nindent 4 }}
+{{- end }}
+---
+{{- if .Values.workers.config.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "helix.fullname" . }}-worker-config
+  namespace: {{ .Values.namespace.name | default "helix" }}
+  labels:
+    {{- include "helix.worker.labels" . | nindent 4 }}
+data:
+  worker.toml: |
+    {{- .Values.workers.config.content | nindent 4 }}
+{{- end }}

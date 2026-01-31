@@ -1,0 +1,71 @@
+# HELIX Client Default Configuration
+# ====================================
+# Configuration for the HELIX CLI client.
+
+[client]
+# Default output format: "json", "table", or "pretty"
+output_format = "pretty"
+# Enable colored output
+color = true
+# Verbosity level: 0-3
+verbosity = 1
+# Request timeout in seconds
+timeout = 60
+
+[network]
+# Default aggregator address
+aggregator_addr = "http://localhost:9001"
+# Connection timeout in seconds
+connect_timeout = 30
+# Enable TLS
+tls_enabled = false
+# TLS CA certificate path
+tls_ca = ""
+
+[ethereum]
+# Default RPC endpoint
+rpc_url = "http://localhost:8545"
+# Default chain ID
+chain_id = 31337
+# Private key file path (or set via env HELIX_PRIVATE_KEY)
+keyfile = ""
+# Coordinator contract address
+coordinator_address = ""
+
+[training]
+# Default model path
+model_path = ""
+# Default dataset path
+dataset_path = ""
+# Default number of workers
+workers = 3
+# Default number of rounds
+rounds = 100
+# Default batch size
+batch_size = 32
+# Default learning rate
+learning_rate = 0.001
+# Enable checkpointing
+checkpointing = true
+# Checkpoint interval (rounds)
+checkpoint_interval = 10
+
+[monitoring]
+# Enable real-time monitoring
+enabled = true
+# Refresh interval in seconds
+refresh_interval = 5
+# Show detailed metrics
+detailed = false
+# Log file path
+log_file = ""
+
+[output]
+# Output directory
+dir = "/app/output"
+# Save trained model
+save_model = true
+# Save training history
+save_history = true
+# Save proofs
+save_proofs = false

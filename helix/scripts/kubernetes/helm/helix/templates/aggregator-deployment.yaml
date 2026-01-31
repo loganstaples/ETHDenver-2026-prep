@@ -1,0 +1,95 @@
+{{- if .Values.aggregator.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "helix.fullname" . }}-aggregator
+  namespace: {{ .Values.namespace.name | default "helix" }}
+  labels:
+    {{- include "helix.aggregator.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.aggregator.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "helix.aggregator.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.aggregator.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "helix.aggregator.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- include "helix.imagePullSecrets" . | nindent 6 }}
+      serviceAccountName: {{ include "helix.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.aggregator.podSecurityContext | nindent 8 }}
+      containers:
+        - name: aggregator
+          securityContext:
+            {{- toYaml .Values.aggregator.securityContext | nindent 12 }}
+          image: "{{ .Values.images.aggregator.repository }}:{{ .Values.images.aggregator.tag }}"
+          imagePullPolicy: {{ .Values.images.aggregator.pullPolicy }}
+          ports:
+            - name: p2p
+              containerPort: 9000
+              protocol: TCP
+            - name: api
+              containerPort: 9001
+              protocol: TCP
+            - name: metrics
+              containerPort: 9002
+              protocol: TCP
+          env:
+            {{- include "helix.commonEnv" . | nindent 12 }}
+            {{- range $key, $value := .Values.aggregator.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+            - name: HELIX_AGGREGATOR_ADDR
+              value: {{ include "helix.aggregatorP2pAddr" . | quote }}
+          {{- if .Values.aggregator.config.enabled }}
+          volumeMounts:
+            - name: config
+              mountPath: /app/config
+              readOnly: true
+            - name: data
+              mountPath: /app/data
+            - name: tmp
+              mountPath: /tmp
+          {{- end }}
+          livenessProbe:
+            {{- toYaml .Values.aggregator.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.aggregator.readinessProbe | nindent 12 }}
+          resources:
+            {{- toYaml .Values.aggregator.resources | nindent 12 }}
+      volumes:
+        {{- if .Values.aggregator.config.enabled }}
+        - name: config
+          configMap:
+            name: {{ include "helix.fullname" . }}-aggregator-config
+        {{- end }}
+        - name: data
+          {{- if .Values.aggregator.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "helix.fullname" . }}-aggregator-data
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.aggregator.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.aggregator.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.aggregator.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

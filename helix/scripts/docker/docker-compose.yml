@@ -1,0 +1,534 @@
+# HELIX Production Docker Compose
+# ================================
+# Complete local development and demo setup for HELIX distributed ML training.
+#
+# This configuration includes:
+#   - Local Ethereum node (Anvil)
+#   - Contract deployer service
+#   - 1 Aggregator node
+#   - 3 Worker nodes (configurable)
+#   - Prometheus metrics collection
+#   - Grafana visualization
+#   - Loki log aggregation
+#   - Next.js Dashboard
+#
+# Usage:
+#   docker-compose up -d                    # Start all services
+#   docker-compose up -d --scale worker=5   # Start with 5 workers
+#   docker-compose logs -f aggregator       # Follow aggregator logs
+#   docker-compose down -v                  # Stop and remove volumes
+#
+# Profiles:
+#   docker-compose --profile monitoring up -d   # Include monitoring stack
+#   docker-compose --profile demo up -d         # Demo mode with dashboard
+
+version: '3.9'
+
+# ==============================================================================
+# Networks
+# ==============================================================================
+networks:
+  helix-network:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.30.0.0/16
+          gateway: 172.30.0.1
+    driver_opts:
+      com.docker.network.bridge.name: helix0
+      com.docker.network.bridge.enable_icc: "true"
+      com.docker.network.bridge.enable_ip_masquerade: "true"
+
+# ==============================================================================
+# Volumes
+# ==============================================================================
+volumes:
+  # Ethereum data
+  ethereum-data:
+
+  # Aggregator volumes
+  aggregator-data:
+  aggregator-logs:
+  aggregator-gradients:
+  aggregator-proofs:
+
+  # Worker volumes (using named pattern)
+  worker1-data:
+  worker1-logs:
+  worker2-data:
+  worker2-logs:
+  worker3-data:
+  worker3-logs:
+
+  # Monitoring volumes
+  prometheus-data:
+  grafana-data:
+  loki-data:
+
+  # Dashboard volume
+  dashboard-node-modules:
+
+# ==============================================================================
+# Service Configurations (YAML Anchors)
+# ==============================================================================
+x-worker-common: &worker-common
+  build:
+    context: ../..
+    dockerfile: scripts/docker/Dockerfile.node
+  networks:
+    - helix-network
+  restart: unless-stopped
+  deploy:
+    resources:
+      limits:
+        cpus: '2.0'
+        memory: 4G
+      reservations:
+        cpus: '0.5'
+        memory: 1G
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "100m"
+      max-file: "5"
+      labels: "service,role"
+
+x-worker-env: &worker-env
+  RUST_LOG: info,helix_node=debug,helix_prover=debug
+  RUST_BACKTRACE: 1
+  HELIX_NODE_ROLE: worker
+  HELIX_ETH_RPC: http://ethereum:8545
+  HELIX_AGGREGATOR_ADDR: aggregator:9000
+  HELIX_ENABLE_MDNS: "true"
+  HELIX_CAN_TRAIN: "true"
+  HELIX_CAN_PROVE: "true"
+
+# ==============================================================================
+# Services
+# ==============================================================================
+services:
+  # ============================================================================
+  # Ethereum Local Node (Anvil)
+  # ============================================================================
+  ethereum:
+    image: ghcr.io/foundry-rs/foundry:latest
+    container_name: helix-ethereum
+    command:
+      - anvil
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8545"
+      - --block-time
+      - "2"
+      - --accounts
+      - "20"
+      - --balance
+      - "10000"
+      - --gas-limit
+      - "30000000"
+      - --code-size-limit
+      - "100000"
+      - --chain-id
+      - "31337"
+    ports:
+      - "8545:8545"
+    networks:
+      helix-network:
+        ipv4_address: 172.30.0.10
+    volumes:
+      - ethereum-data:/root/.anvil
+    healthcheck:
+      test: ["CMD", "cast", "block-number", "--rpc-url", "http://localhost:8545"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    labels:
+      - "helix.service=ethereum"
+      - "helix.role=blockchain"
+
+  # ============================================================================
+  # Contract Deployer
+  # ============================================================================
+  deployer:
+    image: ghcr.io/foundry-rs/foundry:latest
+    container_name: helix-deployer
+    working_dir: /contracts
+    volumes:
+      - ../../contracts:/contracts:ro
+      - ./scripts:/scripts:ro
+    environment:
+      RPC_URL: http://ethereum:8545
+      PRIVATE_KEY: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+    networks:
+      - helix-network
+    depends_on:
+      ethereum:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "Waiting for Ethereum node..."
+        sleep 5
+
+        echo "Building contracts..."
+        forge build
+
+        echo "Deploying MockVerifier..."
+        VERIFIER=$$(forge create src/mocks/MockVerifier.sol:MockVerifier \
+          --rpc-url $$RPC_URL \
+          --private-key $$PRIVATE_KEY 2>&1 | grep "Deployed to:" | awk '{print $$3}')
+        echo "MockVerifier: $$VERIFIER"
+
+        echo "Deploying HelixCoordinator..."
+        COORDINATOR=$$(forge create src/core/HelixCoordinator.sol:HelixCoordinator \
+          --rpc-url $$RPC_URL \
+          --private-key $$PRIVATE_KEY \
+          --constructor-args $$VERIFIER 2>&1 | grep "Deployed to:" | awk '{print $$3}')
+        echo "HelixCoordinator: $$COORDINATOR"
+
+        # Write addresses to shared volume
+        cat > /contracts/deployed.json << EOF
+        {
+          "network": "local",
+          "chainId": 31337,
+          "verifier": "$$VERIFIER",
+          "coordinator": "$$COORDINATOR"
+        }
+        EOF
+
+        echo "Contracts deployed successfully!"
+        echo "Coordinator: $$COORDINATOR"
+
+        # Keep container running for inspection
+        tail -f /dev/null
+    labels:
+      - "helix.service=deployer"
+      - "helix.role=deployment"
+
+  # ============================================================================
+  # HELIX Aggregator Node
+  # ============================================================================
+  aggregator:
+    build:
+      context: ../..
+      dockerfile: scripts/docker/Dockerfile.aggregator
+    container_name: helix-aggregator
+    hostname: aggregator
+    environment:
+      RUST_LOG: info,helix_node=debug,helix_aggregator=debug
+      RUST_BACKTRACE: 1
+      HELIX_NODE_ROLE: aggregator
+      HELIX_NODE_ID: aggregator-primary
+      HELIX_LISTEN_ADDR: 0.0.0.0:9000
+      HELIX_API_ADDR: 0.0.0.0:9001
+      HELIX_METRICS_ADDR: 0.0.0.0:9002
+      HELIX_ETH_RPC: http://ethereum:8545
+      HELIX_ETH_CHAIN_ID: "31337"
+      HELIX_ENABLE_MDNS: "true"
+      HELIX_MIN_WORKERS: "3"
+      HELIX_COLLECTION_TIMEOUT: "120"
+      HELIX_VERIFICATION_PARALLELISM: "4"
+    ports:
+      - "9000:9000"   # P2P
+      - "9001:9001"   # API
+      - "9002:9002"   # Metrics
+    volumes:
+      - aggregator-data:/app/data
+      - aggregator-logs:/app/logs
+      - aggregator-gradients:/app/gradients
+      - aggregator-proofs:/app/proofs
+      - ./config:/app/config:ro
+    networks:
+      helix-network:
+        ipv4_address: 172.30.0.20
+    depends_on:
+      ethereum:
+        condition: service_healthy
+      deployer:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 8G
+        reservations:
+          cpus: '1.0'
+          memory: 2G
+    restart: unless-stopped
+    labels:
+      - "helix.service=aggregator"
+      - "helix.role=aggregator"
+      - "prometheus.scrape=true"
+      - "prometheus.port=9002"
+
+  # ============================================================================
+  # HELIX Worker Nodes
+  # ============================================================================
+  worker1:
+    <<: *worker-common
+    container_name: helix-worker1
+    hostname: worker1
+    environment:
+      <<: *worker-env
+      HELIX_NODE_ID: worker-1
+      HELIX_LISTEN_ADDR: 0.0.0.0:9000
+      HELIX_API_ADDR: 0.0.0.0:9001
+      HELIX_METRICS_ADDR: 0.0.0.0:9002
+    ports:
+      - "9010:9000"
+      - "9011:9001"
+      - "9012:9002"
+    volumes:
+      - worker1-data:/app/data
+      - worker1-logs:/app/logs
+      - ./config:/app/config:ro
+    networks:
+      helix-network:
+        ipv4_address: 172.30.0.31
+    depends_on:
+      aggregator:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9001/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    labels:
+      - "helix.service=worker"
+      - "helix.role=worker"
+      - "helix.worker.id=1"
+      - "prometheus.scrape=true"
+      - "prometheus.port=9002"
+
+  worker2:
+    <<: *worker-common
+    container_name: helix-worker2
+    hostname: worker2
+    environment:
+      <<: *worker-env
+      HELIX_NODE_ID: worker-2
+      HELIX_LISTEN_ADDR: 0.0.0.0:9000
+      HELIX_API_ADDR: 0.0.0.0:9001
+      HELIX_METRICS_ADDR: 0.0.0.0:9002
+    ports:
+      - "9020:9000"
+      - "9021:9001"
+      - "9022:9002"
+    volumes:
+      - worker2-data:/app/data
+      - worker2-logs:/app/logs
+      - ./config:/app/config:ro
+    networks:
+      helix-network:
+        ipv4_address: 172.30.0.32
+    depends_on:
+      aggregator:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9001/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    labels:
+      - "helix.service=worker"
+      - "helix.role=worker"
+      - "helix.worker.id=2"
+      - "prometheus.scrape=true"
+      - "prometheus.port=9002"
+
+  worker3:
+    <<: *worker-common
+    container_name: helix-worker3
+    hostname: worker3
+    environment:
+      <<: *worker-env
+      HELIX_NODE_ID: worker-3
+      HELIX_LISTEN_ADDR: 0.0.0.0:9000
+      HELIX_API_ADDR: 0.0.0.0:9001
+      HELIX_METRICS_ADDR: 0.0.0.0:9002
+    ports:
+      - "9030:9000"
+      - "9031:9001"
+      - "9032:9002"
+    volumes:
+      - worker3-data:/app/data
+      - worker3-logs:/app/logs
+      - ./config:/app/config:ro
+    networks:
+      helix-network:
+        ipv4_address: 172.30.0.33
+    depends_on:
+      aggregator:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9001/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    labels:
+      - "helix.service=worker"
+      - "helix.role=worker"
+      - "helix.worker.id=3"
+      - "prometheus.scrape=true"
+      - "prometheus.port=9002"
+
+  # ============================================================================
+  # Prometheus Metrics Collection
+  # ============================================================================
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: helix-prometheus
+    profiles: ["monitoring", "full"]
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--web.enable-lifecycle'
+      - '--web.enable-admin-api'
+    ports:
+      - "9090:9090"
+    volumes:
+      - ../monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../monitoring/rules:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    networks:
+      - helix-network
+    depends_on:
+      - aggregator
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    labels:
+      - "helix.service=prometheus"
+      - "helix.role=monitoring"
+
+  # ============================================================================
+  # Grafana Visualization
+  # ============================================================================
+  grafana:
+    image: grafana/grafana:10.2.2
+    container_name: helix-grafana
+    profiles: ["monitoring", "full"]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: helix
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_ROOT_URL: "http://localhost:3001"
+      GF_INSTALL_PLUGINS: grafana-clock-panel,grafana-simple-json-datasource
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/helix-overview.json
+    ports:
+      - "3001:3000"
+    volumes:
+      - ../monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    networks:
+      - helix-network
+    depends_on:
+      - prometheus
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    labels:
+      - "helix.service=grafana"
+      - "helix.role=monitoring"
+
+  # ============================================================================
+  # Loki Log Aggregation
+  # ============================================================================
+  loki:
+    image: grafana/loki:2.9.2
+    container_name: helix-loki
+    profiles: ["monitoring", "full"]
+    command: -config.file=/etc/loki/local-config.yaml
+    ports:
+      - "3100:3100"
+    volumes:
+      - ../monitoring/loki-config.yaml:/etc/loki/local-config.yaml:ro
+      - loki-data:/loki
+    networks:
+      - helix-network
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3100/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    labels:
+      - "helix.service=loki"
+      - "helix.role=logging"
+
+  # ============================================================================
+  # Promtail Log Shipper
+  # ============================================================================
+  promtail:
+    image: grafana/promtail:2.9.2
+    container_name: helix-promtail
+    profiles: ["monitoring", "full"]
+    volumes:
+      - ../monitoring/promtail-config.yaml:/etc/promtail/config.yml:ro
+      - aggregator-logs:/var/log/helix/aggregator:ro
+      - worker1-logs:/var/log/helix/worker1:ro
+      - worker2-logs:/var/log/helix/worker2:ro
+      - worker3-logs:/var/log/helix/worker3:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - helix-network
+    depends_on:
+      - loki
+    restart: unless-stopped
+    labels:
+      - "helix.service=promtail"
+      - "helix.role=logging"
+
+  # ============================================================================
+  # HELIX Dashboard (Next.js)
+  # ============================================================================
+  dashboard:
+    build:
+      context: ../../dashboard
+      dockerfile: ../scripts/docker/Dockerfile.dashboard
+    container_name: helix-dashboard
+    profiles: ["demo", "full"]
+    environment:
+      NODE_ENV: production
+      NEXT_PUBLIC_RPC_URL: http://localhost:8545
+      NEXT_PUBLIC_AGGREGATOR_URL: http://localhost:9001
+      NEXT_PUBLIC_CHAIN_ID: "31337"
+    ports:
+      - "3000:3000"
+    volumes:
+      - dashboard-node-modules:/app/node_modules
+    networks:
+      - helix-network
+    depends_on:
+      - aggregator
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    labels:
+      - "helix.service=dashboard"
+      - "helix.role=frontend"

@@ -1,0 +1,445 @@
+# HELIX Helm Chart Values
+# ========================
+# Production-grade configuration for HELIX distributed ML training infrastructure.
+
+# Global settings
+global:
+  # Image pull policy
+  imagePullPolicy: IfNotPresent
+  # Image pull secrets (for private registries)
+  imagePullSecrets: []
+  # Storage class for persistent volumes
+  storageClass: ""
+  # Node selector for all pods
+  nodeSelector: {}
+  # Tolerations for all pods
+  tolerations: []
+  # Pod affinity rules
+  affinity: {}
+
+# Namespace configuration
+namespace:
+  create: true
+  name: helix
+
+# HELIX images
+images:
+  node:
+    repository: helix-protocol/helix-node
+    tag: "0.1.0"
+    pullPolicy: IfNotPresent
+  aggregator:
+    repository: helix-protocol/helix-aggregator
+    tag: "0.1.0"
+    pullPolicy: IfNotPresent
+  client:
+    repository: helix-protocol/helix-client
+    tag: "0.1.0"
+    pullPolicy: IfNotPresent
+  dashboard:
+    repository: helix-protocol/helix-dashboard
+    tag: "0.1.0"
+    pullPolicy: IfNotPresent
+
+# ==============================================================================
+# Aggregator Configuration
+# ==============================================================================
+aggregator:
+  enabled: true
+  replicaCount: 1
+
+  # Pod configuration
+  podAnnotations: {}
+  podSecurityContext:
+    fsGroup: 1000
+    runAsNonRoot: true
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+
+  # Resource limits
+  resources:
+    requests:
+      cpu: "1000m"
+      memory: "2Gi"
+    limits:
+      cpu: "4000m"
+      memory: "8Gi"
+
+  # Service configuration
+  service:
+    type: ClusterIP
+    ports:
+      p2p: 9000
+      api: 9001
+      metrics: 9002
+
+  # Ingress (optional)
+  ingress:
+    enabled: false
+    className: nginx
+    annotations: {}
+    hosts:
+      - host: aggregator.helix.local
+        paths:
+          - path: /
+            pathType: Prefix
+    tls: []
+
+  # Environment variables
+  env:
+    RUST_LOG: "info,helix_node=debug,helix_aggregator=debug"
+    HELIX_NODE_ROLE: "aggregator"
+    HELIX_MIN_WORKERS: "3"
+    HELIX_COLLECTION_TIMEOUT: "120"
+    HELIX_VERIFICATION_PARALLELISM: "4"
+
+  # Config from ConfigMap
+  config:
+    enabled: true
+    # Override aggregator config here
+    content: |
+      [node]
+      role = "aggregator"
+
+      [aggregation]
+      min_workers = 3
+      max_workers = 100
+      collection_timeout = 120
+      verification_parallelism = 4
+
+      [proving]
+      enabled = true
+      parallelism = 8
+
+  # Persistent storage
+  persistence:
+    enabled: true
+    accessMode: ReadWriteOnce
+    size: 50Gi
+    storageClass: ""
+
+  # Health checks
+  livenessProbe:
+    httpGet:
+      path: /health
+      port: api
+    initialDelaySeconds: 30
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 5
+
+  readinessProbe:
+    httpGet:
+      path: /health
+      port: api
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+  # Node affinity
+  nodeSelector: {}
+  tolerations: []
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchExpressions:
+                - key: app.kubernetes.io/component
+                  operator: In
+                  values:
+                    - aggregator
+            topologyKey: kubernetes.io/hostname
+
+# ==============================================================================
+# Worker Configuration
+# ==============================================================================
+workers:
+  enabled: true
+  replicaCount: 3
+
+  # StatefulSet or Deployment
+  kind: StatefulSet
+
+  # Pod configuration
+  podAnnotations: {}
+  podSecurityContext:
+    fsGroup: 1000
+    runAsNonRoot: true
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+
+  # Resource limits
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "1Gi"
+    limits:
+      cpu: "2000m"
+      memory: "4Gi"
+
+  # GPU support
+  gpu:
+    enabled: false
+    type: nvidia
+    count: 1
+
+  # Service configuration
+  service:
+    type: ClusterIP
+    ports:
+      p2p: 9000
+      api: 9001
+      metrics: 9002
+
+  # Headless service for StatefulSet
+  headlessService:
+    enabled: true
+
+  # Environment variables
+  env:
+    RUST_LOG: "info,helix_node=debug,helix_prover=debug"
+    HELIX_NODE_ROLE: "worker"
+    HELIX_CAN_TRAIN: "true"
+    HELIX_CAN_PROVE: "true"
+
+  # Config from ConfigMap
+  config:
+    enabled: true
+    content: |
+      [node]
+      role = "worker"
+
+      [training]
+      batch_size = 32
+      local_epochs = 5
+
+      [proving]
+      enabled = true
+      parallelism = 4
+
+  # Persistent storage
+  persistence:
+    enabled: true
+    accessMode: ReadWriteOnce
+    size: 20Gi
+    storageClass: ""
+
+  # Health checks
+  livenessProbe:
+    httpGet:
+      path: /health
+      port: api
+    initialDelaySeconds: 30
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 5
+
+  readinessProbe:
+    httpGet:
+      path: /health
+      port: api
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+  # Pod disruption budget
+  pdb:
+    enabled: true
+    minAvailable: 2
+
+  # Horizontal Pod Autoscaler
+  autoscaling:
+    enabled: false
+    minReplicas: 3
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: 80
+
+  # Node affinity
+  nodeSelector: {}
+  tolerations: []
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchExpressions:
+                - key: app.kubernetes.io/component
+                  operator: In
+                  values:
+                    - worker
+            topologyKey: kubernetes.io/hostname
+
+# ==============================================================================
+# Dashboard Configuration
+# ==============================================================================
+dashboard:
+  enabled: true
+  replicaCount: 1
+
+  podAnnotations: {}
+  podSecurityContext: {}
+  securityContext: {}
+
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "256Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+
+  service:
+    type: ClusterIP
+    port: 3000
+
+  ingress:
+    enabled: false
+    className: nginx
+    annotations:
+      nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+      nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    hosts:
+      - host: dashboard.helix.local
+        paths:
+          - path: /
+            pathType: Prefix
+    tls: []
+
+  env:
+    NODE_ENV: "production"
+    NEXT_PUBLIC_CHAIN_ID: "31337"
+
+  livenessProbe:
+    httpGet:
+      path: /
+      port: http
+    initialDelaySeconds: 10
+    periodSeconds: 30
+
+  readinessProbe:
+    httpGet:
+      path: /
+      port: http
+    initialDelaySeconds: 5
+    periodSeconds: 10
+
+# ==============================================================================
+# Ethereum Configuration
+# ==============================================================================
+ethereum:
+  # Use external RPC or deploy local node
+  external:
+    enabled: true
+    rpcUrl: "https://eth-mainnet.alchemyapi.io/v2/your-api-key"
+    chainId: 1
+
+  # Local Anvil node (for development)
+  local:
+    enabled: false
+    replicaCount: 1
+    image:
+      repository: ghcr.io/foundry-rs/foundry
+      tag: latest
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+    persistence:
+      enabled: true
+      size: 10Gi
+
+# ==============================================================================
+# Contract Configuration
+# ==============================================================================
+contracts:
+  # Coordinator contract address (must be set)
+  coordinatorAddress: ""
+  # Verifier contract address
+  verifierAddress: ""
+  # Token contract address
+  tokenAddress: ""
+
+  # Deploy contracts on startup (development only)
+  deploy:
+    enabled: false
+    image:
+      repository: ghcr.io/foundry-rs/foundry
+      tag: latest
+
+# ==============================================================================
+# Monitoring Configuration
+# ==============================================================================
+monitoring:
+  # Prometheus
+  prometheus:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+      interval: 15s
+      scrapeTimeout: 10s
+    rules:
+      enabled: true
+
+  # Grafana
+  grafana:
+    enabled: true
+    adminPassword: "helix-admin"
+    dashboards:
+      enabled: true
+
+  # Loki
+  loki:
+    enabled: true
+    persistence:
+      enabled: true
+      size: 50Gi
+
+# ==============================================================================
+# Service Account
+# ==============================================================================
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+# ==============================================================================
+# RBAC
+# ==============================================================================
+rbac:
+  create: true
+
+# ==============================================================================
+# Network Policies
+# ==============================================================================
+networkPolicies:
+  enabled: true
+  # Allow ingress from monitoring namespace
+  allowMonitoring: true
+  # Allow ingress from ingress controller
+  allowIngress: true
+
+# ==============================================================================
+# Pod Security Policies (deprecated in k8s 1.25+)
+# ==============================================================================
+podSecurityPolicy:
+  enabled: false

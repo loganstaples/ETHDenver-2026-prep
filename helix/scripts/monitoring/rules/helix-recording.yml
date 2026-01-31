@@ -1,0 +1,117 @@
+# HELIX Prometheus Recording Rules
+# ==================================
+# Pre-computed metrics for dashboard efficiency.
+
+groups:
+  - name: helix-recording
+    interval: 30s
+    rules:
+      # ==============================================================================
+      # Training Metrics
+      # ==============================================================================
+      - record: helix:training:rounds_per_minute
+        expr: |
+          rate(helix_training_rounds_completed_total[5m]) * 60
+
+      - record: helix:training:loss_delta
+        expr: |
+          helix_training_current_loss - helix_training_current_loss offset 5m
+
+      - record: helix:training:convergence_rate
+        expr: |
+          1 - (helix_training_current_loss / helix_training_initial_loss)
+
+      - record: helix:training:overhead_ratio
+        expr: |
+          helix_training_total_time_seconds / helix_training_compute_time_seconds
+
+      # ==============================================================================
+      # Worker Metrics
+      # ==============================================================================
+      - record: helix:workers:active_count
+        expr: |
+          count(up{job="helix-workers"} == 1)
+
+      - record: helix:workers:avg_gradient_latency
+        expr: |
+          avg(rate(helix_worker_gradient_compute_seconds_sum[5m])
+          / rate(helix_worker_gradient_compute_seconds_count[5m]))
+
+      - record: helix:workers:avg_proof_latency
+        expr: |
+          avg(rate(helix_prover_proof_generation_seconds_sum[5m])
+          / rate(helix_prover_proof_generation_seconds_count[5m]))
+
+      - record: helix:workers:total_gradients_submitted
+        expr: |
+          sum(helix_worker_gradients_submitted_total)
+
+      - record: helix:workers:success_rate
+        expr: |
+          1 - (sum(rate(helix_worker_gradient_failures_total[5m]))
+          / sum(rate(helix_worker_gradients_submitted_total[5m])))
+
+      # ==============================================================================
+      # Aggregator Metrics
+      # ==============================================================================
+      - record: helix:aggregator:verifications_per_minute
+        expr: |
+          rate(helix_aggregator_proofs_verified_total[5m]) * 60
+
+      - record: helix:aggregator:avg_verification_latency
+        expr: |
+          rate(helix_aggregator_verification_seconds_sum[5m])
+          / rate(helix_aggregator_verification_seconds_count[5m])
+
+      - record: helix:aggregator:queue_depth
+        expr: |
+          helix_aggregator_pending_gradients
+
+      # ==============================================================================
+      # Network Metrics
+      # ==============================================================================
+      - record: helix:network:messages_per_second
+        expr: |
+          sum(rate(helix_network_messages_total[5m]))
+
+      - record: helix:network:bandwidth_bytes
+        expr: |
+          sum(rate(helix_network_bytes_sent_total[5m]))
+          + sum(rate(helix_network_bytes_received_total[5m]))
+
+      - record: helix:network:avg_peer_count
+        expr: |
+          avg(helix_network_connected_peers)
+
+      # ==============================================================================
+      # Resource Usage
+      # ==============================================================================
+      - record: helix:resources:total_memory_bytes
+        expr: |
+          sum(container_memory_usage_bytes{container_label_helix_service=~".+"})
+
+      - record: helix:resources:total_cpu_cores
+        expr: |
+          sum(rate(container_cpu_usage_seconds_total{container_label_helix_service=~".+"}[5m]))
+
+      # ==============================================================================
+      # SLA Metrics
+      # ==============================================================================
+      - record: helix:sla:proof_latency_p95
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(helix_prover_proof_generation_seconds_bucket[5m])) by (le))
+
+      - record: helix:sla:proof_latency_p99
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(helix_prover_proof_generation_seconds_bucket[5m])) by (le))
+
+      - record: helix:sla:round_latency_p95
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(helix_training_round_duration_seconds_bucket[5m])) by (le))
+
+      - record: helix:sla:availability
+        expr: |
+          avg_over_time(up{job=~"helix-.*"}[1h])

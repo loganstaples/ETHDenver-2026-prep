@@ -1,0 +1,53 @@
+apiVersion: v2
+name: helix
+description: |
+  HELIX - Trustless Distributed ML Training Infrastructure
+
+  Deploy verifiable, private machine learning training across untrusted compute.
+  Features MPC for weight privacy and ZK proofs for computation verification.
+
+type: application
+
+version: 0.1.0
+appVersion: "0.1.0"
+
+keywords:
+  - machine-learning
+  - distributed-training
+  - zero-knowledge
+  - mpc
+  - blockchain
+  - ethereum
+
+home: https://helix-protocol.io
+icon: https://helix-protocol.io/icon.png
+sources:
+  - https://github.com/helix-protocol/helix
+
+maintainers:
+  - name: HELIX Team
+    email: team@helix-protocol.io
+
+annotations:
+  category: Machine Learning
+  licenses: MIT
+
+dependencies:
+  - name: prometheus
+    version: "25.8.0"
+    repository: https://prometheus-community.github.io/helm-charts
+    condition: monitoring.prometheus.enabled
+    tags:
+      - monitoring
+  - name: grafana
+    version: "7.0.17"
+    repository: https://grafana.github.io/helm-charts
+    condition: monitoring.grafana.enabled
+    tags:
+      - monitoring
+  - name: loki-stack
+    version: "2.9.11"
+    repository: https://grafana.github.io/helm-charts
+    condition: monitoring.loki.enabled
+    tags:
+      - logging

@@ -6,12 +6,14 @@
 //! - Multi-head attention
 //! - MLP blocks (standard and gated)
 //! - Full transformer blocks and stacks
+//! - Quantized layers with INT8/INT4 support
 
 pub mod attention;
 pub mod embedding;
 pub mod layer;
 pub mod linear;
 pub mod mlp;
+pub mod quantized;
 pub mod transformer;
 
 // Re-export commonly used types
@@ -23,4 +25,12 @@ pub use mlp::{ActivationType, GatedMLP, MLP, MLPConfig, MLPError};
 pub use transformer::{
     NormPosition, NormType, TransformerBlock, TransformerConfig, TransformerError,
     TransformerModel, TransformerStack,
+};
+
+// Re-export quantized layer types
+pub use quantized::{
+    AccuracyMetrics, GradientStats, QATConfig, QuantizedActivation, QuantizedActivationConfig,
+    QuantizedActivationType, QuantizedGELU, QuantizedLayer, QuantizedLayerError,
+    QuantizedLinear, QuantizedLinearConfig, QuantizedLinearGradients, QuantizedReLU,
+    QuantizedSequential, QuantizedSiLU, Trainable, TrainingState,
 };

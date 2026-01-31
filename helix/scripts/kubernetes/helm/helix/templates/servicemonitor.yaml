@@ -1,0 +1,35 @@
+{{- if and .Values.monitoring.prometheus.enabled .Values.monitoring.prometheus.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "helix.fullname" . }}-aggregator
+  namespace: {{ .Values.namespace.name | default "helix" }}
+  labels:
+    {{- include "helix.aggregator.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "helix.aggregator.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: metrics
+      interval: {{ .Values.monitoring.prometheus.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.monitoring.prometheus.serviceMonitor.scrapeTimeout }}
+      path: /metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "helix.fullname" . }}-worker
+  namespace: {{ .Values.namespace.name | default "helix" }}
+  labels:
+    {{- include "helix.worker.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "helix.worker.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: metrics
+      interval: {{ .Values.monitoring.prometheus.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.monitoring.prometheus.serviceMonitor.scrapeTimeout }}
+      path: /metrics
+{{- end }}

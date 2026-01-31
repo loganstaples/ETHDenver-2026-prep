@@ -1,0 +1,170 @@
+# HELIX Node Default Configuration
+# ==================================
+# This is the default configuration for HELIX worker nodes.
+# Override these settings via environment variables or a custom config file.
+
+[node]
+# Unique node identifier (auto-generated if not set)
+id = ""
+# Node role: "worker", "aggregator", or "verifier"
+role = "worker"
+# Human-readable node name
+name = "helix-worker"
+
+[network]
+# P2P listen address
+listen_addr = "0.0.0.0:9000"
+# Maximum peer connections
+max_peers = 50
+# Enable TCP_NODELAY for low latency
+tcp_nodelay = true
+# Connection timeout in seconds
+connect_timeout = 30
+# Idle connection timeout
+idle_timeout = 300
+# Enable TLS for peer connections
+tls_enabled = false
+# TLS certificate path (if enabled)
+tls_cert = ""
+# TLS key path (if enabled)
+tls_key = ""
+
+[api]
+# HTTP API listen address
+listen_addr = "0.0.0.0:9001"
+# Enable CORS for dashboard access
+cors_enabled = true
+# CORS allowed origins (comma-separated)
+cors_origins = "*"
+# Request body size limit (bytes)
+max_body_size = 104857600  # 100MB
+# Request timeout in seconds
+timeout = 60
+# Enable API key authentication
+auth_enabled = false
+# API key (if auth enabled)
+api_key = ""
+
+[metrics]
+# Prometheus metrics endpoint
+listen_addr = "0.0.0.0:9002"
+# Metrics collection interval in seconds
+interval = 15
+# Enable detailed per-operation metrics
+detailed = true
+# Histogram buckets for latency metrics
+latency_buckets = [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
+
+[gossip]
+# Gossip protocol fanout (peers to forward to)
+fanout = 6
+# Maximum message hops
+max_hops = 10
+# Message cache TTL in seconds
+message_cache_ttl = 300
+# Heartbeat interval in seconds
+heartbeat_interval = 5
+# Peer reputation decay rate
+reputation_decay = 0.95
+
+[discovery]
+# Enable mDNS for local network discovery
+enable_mdns = true
+# Discovery refresh interval in seconds
+discovery_interval = 30
+# Bootstrap nodes (comma-separated addresses)
+bootstrap_nodes = []
+# Kademlia DHT enabled
+enable_dht = true
+# DHT replication factor
+dht_replication = 3
+
+[training]
+# Default learning rate
+learning_rate = 0.001
+# Default batch size
+batch_size = 32
+# Local epochs per round
+local_epochs = 5
+# Maximum accumulated error bound
+max_error_bound = 0.1
+# Gradient clipping threshold
+gradient_clip = 1.0
+# Enable gradient compression
+gradient_compression = true
+# Compression ratio (if enabled)
+compression_ratio = 0.1
+
+[proving]
+# Enable proof generation
+enabled = true
+# Proof system: "halo2" or "groth16"
+system = "halo2"
+# Parallelism for proof generation
+parallelism = 4
+# Proof cache size
+cache_size = 100
+# Maximum proof generation time (seconds)
+timeout = 300
+# Enable proof batching
+batch_proofs = true
+# Batch size for proof aggregation
+batch_size = 8
+
+[mpc]
+# Enable MPC for weight privacy
+enabled = true
+# Secret sharing threshold (t of n)
+threshold = 2
+# Number of MPC parties
+parties = 3
+# Re-sharing interval (rounds)
+reshare_interval = 10
+# MPC protocol: "shamir", "additive", or "replicated"
+protocol = "additive"
+
+[ethereum]
+# Ethereum RPC endpoint
+rpc_url = "http://localhost:8545"
+# Chain ID
+chain_id = 31337
+# Coordinator contract address
+coordinator_address = ""
+# Gas limit for transactions
+gas_limit = 500000
+# Gas price strategy: "legacy", "eip1559", or "auto"
+gas_strategy = "auto"
+# Transaction confirmation blocks
+confirmations = 1
+# Retry attempts for failed transactions
+retry_attempts = 3
+# Retry delay in seconds
+retry_delay = 5
+
+[storage]
+# Data directory
+data_dir = "/app/data"
+# Log directory
+log_dir = "/app/logs"
+# Maximum log file size (bytes)
+max_log_size = 104857600  # 100MB
+# Log rotation count
+log_rotation = 5
+# Enable persistence
+persistence_enabled = true
+# Database type: "rocksdb" or "sqlite"
+database = "rocksdb"
+
+[limits]
+# Maximum concurrent training jobs
+max_jobs = 10
+# Maximum gradient size (bytes)
+max_gradient_size = 1073741824  # 1GB
+# Maximum model size (bytes)
+max_model_size = 10737418240  # 10GB
+# Rate limit (requests per second)
+rate_limit = 100
+# Memory limit (bytes, 0 for unlimited)
+memory_limit = 0
+# CPU limit (cores, 0 for unlimited)
+cpu_limit = 0

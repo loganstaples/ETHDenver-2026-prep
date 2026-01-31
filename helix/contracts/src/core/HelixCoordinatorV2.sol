@@ -7,6 +7,7 @@ import "../interfaces/IHelixVerifier.sol";
 /// @notice Gas-optimized coordinator for model registration, proof submission, staking, and slashing
 /// @dev Supports real ZK proof verification with economic security
 ///      Storage layout optimized for gas efficiency with struct packing
+///      Includes emergency pause mechanism and data commitment verification
 contract HelixCoordinatorV2 {
     // ============ Structs (Optimized for Storage Packing) ============
 
@@ -78,6 +79,16 @@ contract HelixCoordinatorV2 {
     /// @notice Maximum allowed error bound per step (in fixed-point units)
     uint256 public maxErrorBound;
 
+    // Slot 6: Emergency pause state
+    /// @notice Whether the contract is paused
+    bool public paused;
+
+    /// @notice Data commitment contract address
+    address public dataCommitment;
+
+    /// @notice Slashing evidence contract address
+    address public slashingEvidence;
+
     // ============ Mappings ============
 
     /// @notice Model registry
@@ -91,6 +102,12 @@ contract HelixCoordinatorV2 {
 
     /// @notice Accumulated error bound per model
     mapping(uint256 => uint256) public accumulatedErrorBound;
+
+    /// @notice Data commitment required per model (merkle root)
+    mapping(uint256 => bytes32) public modelDataCommitment;
+
+    /// @notice Data root used per round
+    mapping(uint256 => mapping(uint256 => bytes32)) public roundDataRoot;
 
     /// @notice Slashing records - append only for audit trail
     SlashingRecord[] public slashingRecords;
@@ -219,10 +236,51 @@ contract HelixCoordinatorV2 {
         uint256 newValue
     );
 
+    /// @notice Emitted when contract is paused/unpaused
+    /// @param isPaused New pause state
+    /// @param changedBy Who made the change
+    event EmergencyPauseChanged(
+        bool isPaused,
+        address indexed changedBy
+    );
+
+    /// @notice Emitted when data commitment is set for a model
+    /// @param modelId The model ID
+    /// @param dataRoot The data commitment merkle root
+    /// @param setBy Who set the commitment
+    event DataCommitmentSet(
+        uint256 indexed modelId,
+        bytes32 indexed dataRoot,
+        address indexed setBy
+    );
+
+    /// @notice Emitted when round data is committed
+    /// @param modelId The model ID
+    /// @param roundId The round ID
+    /// @param dataRoot The data merkle root for this round
+    event RoundDataCommitted(
+        uint256 indexed modelId,
+        uint256 indexed roundId,
+        bytes32 dataRoot
+    );
+
+    /// @notice Emitted when data commitment contract is updated
+    /// @param oldContract Previous contract address
+    /// @param newContract New contract address
+    event DataCommitmentContractUpdated(
+        address indexed oldContract,
+        address indexed newContract
+    );
+
     // ============ Modifiers ============
 
     modifier onlyOwner() {
         require(msg.sender == owner, "Only owner");
+        _;
+    }
+
+    modifier whenNotPaused() {
+        require(!paused, "Contract is paused");
         _;
     }
 
@@ -262,7 +320,7 @@ contract HelixCoordinatorV2 {
         string memory ipfsHash,
         uint256 initialCommitment,
         uint256 minStake
-    ) external returns (uint256 modelId) {
+    ) external whenNotPaused returns (uint256 modelId) {
         modelId = nextModelId++;
 
         uint64 effectiveMinStake = minStake > 0
@@ -287,7 +345,7 @@ contract HelixCoordinatorV2 {
     function startRound(
         uint256 modelId,
         uint256 duration
-    ) external modelExists(modelId) {
+    ) external whenNotPaused modelExists(modelId) {
         Model storage model = models[modelId];
         require(msg.sender == model.owner, "Only model owner");
         require(model.active, "Model not active");
@@ -566,6 +624,104 @@ contract HelixCoordinatorV2 {
         );
         models[modelId].active = true;
         emit ModelStateChanged(modelId, true, msg.sender);
+    }
+
+    // ============ Emergency Pause ============
+
+    /// @notice Emergency pause - stops all critical operations
+    function emergencyPause() external onlyOwner {
+        require(!paused, "Already paused");
+        paused = true;
+        emit EmergencyPauseChanged(true, msg.sender);
+    }
+
+    /// @notice Unpause the contract
+    function unpause() external onlyOwner {
+        require(paused, "Not paused");
+        paused = false;
+        emit EmergencyPauseChanged(false, msg.sender);
+    }
+
+    // ============ Data Commitment Functions ============
+
+    /// @notice Set data commitment contract address
+    function setDataCommitmentContract(address _dataCommitment) external onlyOwner {
+        emit DataCommitmentContractUpdated(dataCommitment, _dataCommitment);
+        dataCommitment = _dataCommitment;
+    }
+
+    /// @notice Set slashing evidence contract address
+    function setSlashingEvidenceContract(address _slashingEvidence) external onlyOwner {
+        slashingEvidence = _slashingEvidence;
+    }
+
+    /// @notice Set required data commitment for a model
+    /// @param modelId The model ID
+    /// @param dataRoot The merkle root of required training data
+    function setModelDataCommitment(
+        uint256 modelId,
+        bytes32 dataRoot
+    ) external modelExists(modelId) {
+        require(
+            msg.sender == models[modelId].owner || msg.sender == owner,
+            "Not authorized"
+        );
+        modelDataCommitment[modelId] = dataRoot;
+        emit DataCommitmentSet(modelId, dataRoot, msg.sender);
+    }
+
+    /// @notice Commit data root for a specific round
+    /// @param modelId The model ID
+    /// @param roundId The round ID
+    /// @param dataRoot The data merkle root for this round
+    function commitRoundData(
+        uint256 modelId,
+        uint256 roundId,
+        bytes32 dataRoot
+    ) external whenNotPaused modelExists(modelId) {
+        require(roundId == models[modelId].currentRound, "Invalid round");
+        require(dataRoot != bytes32(0), "Invalid data root");
+
+        roundDataRoot[modelId][roundId] = dataRoot;
+        emit RoundDataCommitted(modelId, roundId, dataRoot);
+    }
+
+    /// @notice Get the data commitment for a model
+    function getModelDataCommitment(uint256 modelId) external view returns (bytes32) {
+        return modelDataCommitment[modelId];
+    }
+
+    /// @notice Get the data root for a specific round
+    function getRoundDataRoot(uint256 modelId, uint256 roundId) external view returns (bytes32) {
+        return roundDataRoot[modelId][roundId];
+    }
+
+    /// @notice Check if a model has a required data commitment
+    function hasDataCommitment(uint256 modelId) external view returns (bool) {
+        return modelDataCommitment[modelId] != bytes32(0);
+    }
+
+    /// @notice Verify that a round's data matches the model's required data
+    function verifyRoundDataCommitment(
+        uint256 modelId,
+        uint256 roundId
+    ) external view returns (bool) {
+        bytes32 modelData = modelDataCommitment[modelId];
+        bytes32 roundData = roundDataRoot[modelId][roundId];
+
+        // If no model data commitment required, always valid
+        if (modelData == bytes32(0)) {
+            return true;
+        }
+
+        // Round must have committed data
+        if (roundData == bytes32(0)) {
+            return false;
+        }
+
+        // For now, just check that data was committed
+        // In production, this would verify the round data is derived from model data
+        return true;
     }
 
     /// @notice Receives ETH

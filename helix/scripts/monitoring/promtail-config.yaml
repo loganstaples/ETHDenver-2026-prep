@@ -1,0 +1,119 @@
+# Promtail Configuration for HELIX Log Shipping
+# ===============================================
+
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+    tenant_id: helix
+    batchwait: 1s
+    batchsize: 1048576
+    timeout: 10s
+
+scrape_configs:
+  # ==============================================================================
+  # Docker Container Logs
+  # ==============================================================================
+  - job_name: docker
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+    relabel_configs:
+      # Only keep HELIX containers
+      - source_labels: ['__meta_docker_container_label_helix_service']
+        regex: .+
+        action: keep
+      # Extract container name
+      - source_labels: ['__meta_docker_container_name']
+        regex: '/(.+)'
+        target_label: container
+      # Extract service name
+      - source_labels: ['__meta_docker_container_label_helix_service']
+        target_label: service
+      # Extract role
+      - source_labels: ['__meta_docker_container_label_helix_role']
+        target_label: role
+      # Extract worker ID if present
+      - source_labels: ['__meta_docker_container_label_helix_worker_id']
+        target_label: worker_id
+    pipeline_stages:
+      # Parse JSON logs
+      - json:
+          expressions:
+            level: level
+            message: message
+            target: target
+            timestamp: timestamp
+      # Extract level
+      - labels:
+          level:
+      # Parse HELIX-specific fields
+      - regex:
+          expression: 'round_id=(?P<round_id>\d+)'
+      - labels:
+          round_id:
+      # Timestamp parsing
+      - timestamp:
+          source: timestamp
+          format: RFC3339Nano
+
+  # ==============================================================================
+  # Aggregator Logs (Direct File)
+  # ==============================================================================
+  - job_name: aggregator-logs
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: helix-aggregator
+          service: aggregator
+          role: aggregator
+          __path__: /var/log/helix/aggregator/*.log
+    pipeline_stages:
+      - multiline:
+          firstline: '^\d{4}-\d{2}-\d{2}'
+          max_wait_time: 3s
+      - regex:
+          expression: '^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z?)\s+(?P<level>\w+)\s+\[(?P<target>[^\]]+)\]\s+(?P<message>.*)$'
+      - labels:
+          level:
+          target:
+      - timestamp:
+          source: timestamp
+          format: RFC3339Nano
+
+  # ==============================================================================
+  # Worker Logs (Direct File)
+  # ==============================================================================
+  - job_name: worker-logs
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: helix-workers
+          service: worker
+          role: worker
+          __path__: /var/log/helix/worker*/*.log
+    pipeline_stages:
+      - multiline:
+          firstline: '^\d{4}-\d{2}-\d{2}'
+          max_wait_time: 3s
+      - regex:
+          expression: '^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z?)\s+(?P<level>\w+)\s+\[(?P<target>[^\]]+)\]\s+(?P<message>.*)$'
+      - labels:
+          level:
+          target:
+      # Extract worker ID from path
+      - regex:
+          source: filename
+          expression: 'worker(?P<worker_id>\d+)'
+      - labels:
+          worker_id:
+      - timestamp:
+          source: timestamp
+          format: RFC3339Nano

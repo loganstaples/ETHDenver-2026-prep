@@ -1,0 +1,134 @@
+# HELIX Aggregator Default Configuration
+# ========================================
+# Configuration for HELIX gradient aggregation nodes.
+
+[node]
+id = ""
+role = "aggregator"
+name = "helix-aggregator"
+
+[network]
+listen_addr = "0.0.0.0:9000"
+max_peers = 100
+tcp_nodelay = true
+connect_timeout = 30
+idle_timeout = 300
+tls_enabled = false
+
+[api]
+listen_addr = "0.0.0.0:9001"
+cors_enabled = true
+cors_origins = "*"
+max_body_size = 1073741824  # 1GB for gradient collection
+timeout = 120
+auth_enabled = false
+
+[metrics]
+listen_addr = "0.0.0.0:9002"
+interval = 10
+detailed = true
+# Aggregator-specific metrics buckets
+latency_buckets = [0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0]
+
+[gossip]
+fanout = 8
+max_hops = 10
+message_cache_ttl = 600
+heartbeat_interval = 3
+reputation_decay = 0.95
+
+[discovery]
+enable_mdns = true
+discovery_interval = 15
+bootstrap_nodes = []
+enable_dht = true
+dht_replication = 3
+
+[aggregation]
+# Minimum workers required to start aggregation
+min_workers = 3
+# Maximum workers in a training round
+max_workers = 100
+# Collection timeout in seconds
+collection_timeout = 120
+# Aggregation timeout in seconds
+aggregation_timeout = 60
+# Byzantine fault tolerance threshold
+byzantine_threshold = 0.33
+# Enable gradient validation
+validate_gradients = true
+# Enable proof verification before aggregation
+verify_proofs = true
+# Parallelism for proof verification
+verification_parallelism = 8
+# Aggregation strategy: "fedavg", "weighted", or "secure"
+strategy = "fedavg"
+# Enable gradient clipping during aggregation
+clip_gradients = true
+# Clipping threshold
+clip_threshold = 1.0
+
+[proving]
+enabled = true
+system = "halo2"
+parallelism = 8
+cache_size = 500
+timeout = 600
+batch_proofs = true
+batch_size = 16
+
+[ethereum]
+rpc_url = "http://localhost:8545"
+chain_id = 31337
+coordinator_address = ""
+gas_limit = 1000000
+gas_strategy = "auto"
+confirmations = 1
+retry_attempts = 5
+retry_delay = 10
+# Enable batch transaction submission
+batch_transactions = true
+# Maximum batch size
+max_batch_size = 10
+
+[storage]
+data_dir = "/app/data"
+log_dir = "/app/logs"
+# Gradient storage directory
+gradients_dir = "/app/gradients"
+# Proof storage directory
+proofs_dir = "/app/proofs"
+max_log_size = 209715200  # 200MB
+log_rotation = 10
+persistence_enabled = true
+database = "rocksdb"
+# Gradient retention period (hours)
+gradient_retention = 24
+# Proof retention period (hours)
+proof_retention = 168  # 7 days
+
+[limits]
+max_jobs = 50
+max_gradient_size = 10737418240  # 10GB
+max_model_size = 107374182400  # 100GB
+rate_limit = 1000
+memory_limit = 0
+cpu_limit = 0
+# Maximum concurrent verifications
+max_concurrent_verifications = 16
+# Maximum pending gradients queue
+max_pending_gradients = 1000
+
+[orchestrator]
+# Enable round orchestration
+enabled = true
+# Round duration in seconds
+round_duration = 120
+# Grace period for late submissions (seconds)
+grace_period = 30
+# Automatic round advancement
+auto_advance = true
+# Minimum participation rate to advance
+min_participation = 0.67
+# Enable slashing for invalid proofs
+slashing_enabled = true

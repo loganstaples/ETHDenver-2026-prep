@@ -1,0 +1,114 @@
+# HELIX Client Docker Image
+# ==========================
+# CLI client for orchestrating and monitoring HELIX training jobs.
+# Provides model registration, job submission, and real-time monitoring.
+#
+# Usage:
+#   docker build -t helix-client -f Dockerfile.client ../..
+#   docker run -it helix-client train --model model.json --workers 3
+#   docker run -it helix-client status --job-id abc123
+
+# ==============================================================================
+# Stage 1: Build dependencies cache
+# ==============================================================================
+FROM rust:1.75-bookworm AS chef
+
+RUN cargo install cargo-chef --locked
+WORKDIR /helix
+
+# ==============================================================================
+# Stage 2: Recipe creation
+# ==============================================================================
+FROM chef AS planner
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates/helix-core/Cargo.toml crates/helix-core/
+COPY crates/helix-avm/Cargo.toml crates/helix-avm/
+COPY crates/helix-circuits/Cargo.toml crates/helix-circuits/
+COPY crates/helix-prover/Cargo.toml crates/helix-prover/
+COPY crates/helix-mpc/Cargo.toml crates/helix-mpc/
+COPY crates/helix-node/Cargo.toml crates/helix-node/
+COPY crates/helix-client/Cargo.toml crates/helix-client/
+
+RUN mkdir -p crates/helix-core/src && echo "pub fn _dummy() {}" > crates/helix-core/src/lib.rs \
+    && mkdir -p crates/helix-avm/src && echo "pub fn _dummy() {}" > crates/helix-avm/src/lib.rs \
+    && mkdir -p crates/helix-circuits/src && echo "pub fn _dummy() {}" > crates/helix-circuits/src/lib.rs \
+    && mkdir -p crates/helix-prover/src && echo "pub fn _dummy() {}" > crates/helix-prover/src/lib.rs \
+    && mkdir -p crates/helix-mpc/src && echo "pub fn _dummy() {}" > crates/helix-mpc/src/lib.rs \
+    && mkdir -p crates/helix-node/src && echo "fn main() {}" > crates/helix-node/src/main.rs \
+    && mkdir -p crates/helix-client/src && echo "fn main() {}" > crates/helix-client/src/main.rs
+
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ==============================================================================
+# Stage 3: Dependency compilation
+# ==============================================================================
+FROM chef AS builder
+
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    libclang-dev \
+    clang \
+    cmake \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=planner /helix/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json -p helix-client
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+COPY proto/ proto/
+
+RUN rm -rf target/release/.fingerprint/helix-* \
+    && rm -rf target/release/deps/helix* \
+    && rm -rf target/release/deps/libhelix*
+
+RUN cargo build --release -p helix-client
+
+RUN cp target/release/helix /helix-client
+
+# ==============================================================================
+# Stage 4: Client runtime image
+# ==============================================================================
+FROM debian:bookworm-slim AS runtime
+
+LABEL org.opencontainers.image.title="HELIX Client"
+LABEL org.opencontainers.image.description="HELIX CLI client for training orchestration"
+LABEL org.opencontainers.image.version="0.1.0"
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    curl \
+    jq \
+    dumb-init \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+RUN mkdir -p /app/config /app/models /app/output
+
+RUN groupadd -r helix -g 1000 \
+    && useradd -r -u 1000 -g helix -d /app -s /bin/bash helix \
+    && chown -R helix:helix /app
+
+COPY --from=builder /helix-client /app/helix
+COPY scripts/docker/config/client-default.toml /app/config/client.toml
+
+RUN chmod +x /app/helix && chown -R helix:helix /app
+
+USER helix
+
+ENV RUST_LOG=info,helix_client=debug
+ENV HELIX_CONFIG=/app/config/client.toml
+ENV HELIX_OUTPUT_DIR=/app/output
+
+# Client doesn't need exposed ports (connects to aggregator)
+# But optionally expose for local API mode
+EXPOSE 8080/tcp
+
+VOLUME ["/app/config", "/app/models", "/app/output"]
+
+ENTRYPOINT ["/usr/bin/dumb-init", "--", "/app/helix"]
+CMD ["--help"]

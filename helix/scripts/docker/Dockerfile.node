@@ -1,0 +1,167 @@
+# HELIX Node Docker Image
+# ========================
+# Production-grade multi-stage build for HELIX compute nodes.
+# Supports both worker and verifier roles with GPU passthrough.
+#
+# Build args:
+#   RUST_VERSION: Rust toolchain version (default: 1.75)
+#   PROFILE: Build profile - release or debug (default: release)
+#   FEATURES: Cargo feature flags (default: empty)
+#
+# Usage:
+#   docker build -t helix-node -f Dockerfile.node ../..
+#   docker build -t helix-node --build-arg FEATURES="gpu,metal" -f Dockerfile.node ../..
+
+# ==============================================================================
+# Stage 1: Build dependencies cache layer
+# ==============================================================================
+FROM rust:1.75-bookworm AS chef
+
+RUN cargo install cargo-chef --locked
+WORKDIR /helix
+
+# ==============================================================================
+# Stage 2: Recipe creation (dependency graph analysis)
+# ==============================================================================
+FROM chef AS planner
+
+# Copy workspace manifests
+COPY Cargo.toml Cargo.lock ./
+COPY crates/helix-core/Cargo.toml crates/helix-core/
+COPY crates/helix-avm/Cargo.toml crates/helix-avm/
+COPY crates/helix-circuits/Cargo.toml crates/helix-circuits/
+COPY crates/helix-prover/Cargo.toml crates/helix-prover/
+COPY crates/helix-mpc/Cargo.toml crates/helix-mpc/
+COPY crates/helix-node/Cargo.toml crates/helix-node/
+COPY crates/helix-client/Cargo.toml crates/helix-client/
+
+# Create minimal source files for dependency resolution
+RUN mkdir -p crates/helix-core/src && echo "pub fn _dummy() {}" > crates/helix-core/src/lib.rs \
+    && mkdir -p crates/helix-avm/src && echo "pub fn _dummy() {}" > crates/helix-avm/src/lib.rs \
+    && mkdir -p crates/helix-circuits/src && echo "pub fn _dummy() {}" > crates/helix-circuits/src/lib.rs \
+    && mkdir -p crates/helix-prover/src && echo "pub fn _dummy() {}" > crates/helix-prover/src/lib.rs \
+    && mkdir -p crates/helix-mpc/src && echo "pub fn _dummy() {}" > crates/helix-mpc/src/lib.rs \
+    && mkdir -p crates/helix-node/src && echo "fn main() {}" > crates/helix-node/src/main.rs \
+    && mkdir -p crates/helix-client/src && echo "fn main() {}" > crates/helix-client/src/main.rs
+
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ==============================================================================
+# Stage 3: Dependency compilation (cached layer)
+# ==============================================================================
+FROM chef AS builder
+
+ARG RUST_VERSION=1.75
+ARG PROFILE=release
+ARG FEATURES=""
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    libclang-dev \
+    clang \
+    cmake \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy and build dependencies only (this layer is heavily cached)
+COPY --from=planner /helix/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json -p helix-node
+
+# Copy full source code
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+COPY proto/ proto/
+
+# Remove dummy fingerprints and rebuild with actual source
+RUN rm -rf target/release/.fingerprint/helix-* \
+    && rm -rf target/release/deps/helix* \
+    && rm -rf target/release/deps/libhelix*
+
+# Build the node binary
+RUN if [ -n "$FEATURES" ]; then \
+        cargo build --profile ${PROFILE} -p helix-node --features "${FEATURES}"; \
+    else \
+        cargo build --profile ${PROFILE} -p helix-node; \
+    fi
+
+# Copy binary to a consistent location
+RUN cp target/${PROFILE}/helix-node /helix-node
+
+# ==============================================================================
+# Stage 4: Runtime image (minimal footprint)
+# ==============================================================================
+FROM debian:bookworm-slim AS runtime
+
+# Metadata labels
+LABEL org.opencontainers.image.title="HELIX Node"
+LABEL org.opencontainers.image.description="HELIX distributed ML training node"
+LABEL org.opencontainers.image.version="0.1.0"
+LABEL org.opencontainers.image.vendor="HELIX Protocol"
+LABEL org.opencontainers.image.source="https://github.com/helix-protocol/helix"
+LABEL org.opencontainers.image.licenses="MIT"
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    curl \
+    jq \
+    dumb-init \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create application directories
+WORKDIR /app
+RUN mkdir -p /app/data /app/logs /app/config /app/keys
+
+# Create non-root user for security
+RUN groupadd -r helix -g 1000 \
+    && useradd -r -u 1000 -g helix -d /app -s /sbin/nologin helix \
+    && chown -R helix:helix /app
+
+# Copy binary from builder
+COPY --from=builder /helix-node /app/helix-node
+
+# Copy default configuration
+COPY scripts/docker/config/node-default.toml /app/config/node.toml
+
+# Set correct permissions
+RUN chmod +x /app/helix-node && chown -R helix:helix /app
+
+# Switch to non-root user
+USER helix
+
+# Environment configuration
+ENV RUST_LOG=info,helix_node=debug
+ENV RUST_BACKTRACE=1
+ENV HELIX_DATA_DIR=/app/data
+ENV HELIX_LOG_DIR=/app/logs
+ENV HELIX_CONFIG_DIR=/app/config
+ENV HELIX_KEYS_DIR=/app/keys
+
+# Network configuration defaults
+ENV HELIX_NODE_ROLE=worker
+ENV HELIX_LISTEN_ADDR=0.0.0.0:9000
+ENV HELIX_API_ADDR=0.0.0.0:9001
+ENV HELIX_METRICS_ADDR=0.0.0.0:9002
+
+# Expose ports
+# 9000: P2P gossip protocol (TCP)
+# 9001: HTTP API / JSON-RPC
+# 9002: Prometheus metrics
+# 5353: mDNS discovery (UDP)
+EXPOSE 9000/tcp 9001/tcp 9002/tcp 5353/udp
+
+# Health check configuration
+HEALTHCHECK --interval=15s --timeout=10s --start-period=30s --retries=5 \
+    CMD curl -f http://localhost:9001/health || exit 1
+
+# Volume mounts for persistence
+VOLUME ["/app/data", "/app/logs", "/app/config", "/app/keys"]
+
+# Use dumb-init as PID 1 for proper signal handling
+ENTRYPOINT ["/usr/bin/dumb-init", "--"]
+
+# Default command (can be overridden)
+CMD ["/app/helix-node", "--config", "/app/config/node.toml"]
