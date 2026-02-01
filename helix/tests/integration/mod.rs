@@ -29,3 +29,6 @@ pub mod checkpoint_resume;
 
 /// Cross-platform compatibility tests
 pub mod cross_platform;
+
+/// Full pipeline benchmark tests
+pub mod full_pipeline;

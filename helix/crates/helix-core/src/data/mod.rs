@@ -13,6 +13,7 @@
 
 pub mod commitment;
 pub mod dataset;
+pub mod dataset_registry;
 pub mod ipfs;
 pub mod membership_proof;
 pub mod merkle;
@@ -20,7 +21,9 @@ pub mod model;
 pub mod provenance;
 pub mod registry;
 pub mod sharding;
+pub mod shuffling;
 pub mod sources;
+pub mod streaming;
 
 // Re-export dataset types
 pub use dataset::{
@@ -90,4 +93,25 @@ pub use sources::{
     FilecoinClient, FilecoinConfig, FilecoinDataSource,
     // S3 source
     S3Config, S3DataSource,
+};
+
+// Re-export streaming verification types
+pub use streaming::{
+    BatchBuilder, BatchVerificationResult, StreamingBatchVerifier,
+    StreamingVerificationConfig, VerificationBatch, VerificationCheckpoint,
+    VerificationStats as StreamingVerificationStats,
+};
+
+// Re-export deterministic shuffling types
+pub use shuffling::{
+    DeterministicShuffler, SeedCommitment, ShuffleConfig, ShuffleResult,
+    ShuffleSeed, ShuffleSchedule, ShuffleVerifier,
+};
+
+// Re-export dataset commitment registry types
+pub use dataset_registry::{
+    AttestationType as DatasetAttestationType, AttesterType, DatasetAttestation,
+    DatasetCommitment as DatasetCommitmentEntry, DatasetCommitmentRegistry,
+    DatasetEntry, DatasetId, DatasetMetadata as DatasetRegistryMetadata,
+    DatasetStatus, RegistryConfig, RegistryError, RegistryResult, RegistryStats,
 };

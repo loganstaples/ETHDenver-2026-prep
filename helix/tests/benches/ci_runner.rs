@@ -273,9 +273,9 @@ fn run_overhead_check(
     quick: bool,
 ) -> (
     bool,
-    Option<helix_integration_tests::benches::overhead_report::OverheadReport>,
+    Option<crate::benches::overhead_report::OverheadReport>,
 ) {
-    use helix_integration_tests::benches::overhead_report::{quick_overhead_check, OverheadReport};
+    use crate::benches::overhead_report::{quick_overhead_check, OverheadReport};
 
     let report = if quick {
         quick_overhead_check()
@@ -311,12 +311,12 @@ fn run_overhead_check(
 
 fn run_scaling_check(
     result: &mut CIResult,
-    quick: bool,
+    _quick: bool,
 ) -> (
     bool,
-    Option<helix_integration_tests::benches::scaling::ScalingAnalysis>,
+    Option<crate::benches::scaling::ScalingAnalysis>,
 ) {
-    use helix_integration_tests::benches::scaling::analyze_model_size_scaling;
+    use crate::benches::scaling::analyze_model_size_scaling;
 
     let analysis = analyze_model_size_scaling();
 

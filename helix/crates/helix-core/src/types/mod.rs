@@ -32,6 +32,9 @@ pub use error_composition::{
     ActivationFunction, AttentionErrorPropagation, CompositionRule,
     ComputationGraphError, ErrorContext, MatrixErrorPropagation,
     NormalizationErrorPropagation, ReductionErrorPropagation, ReductionType,
+    // Adaptive precision system
+    AdaptivePrecision, AdaptivePrecisionConfig, AdaptivePrecisionController,
+    AdaptivePrecisionStats, PrecisionDecision, PrecisionChangeReason,
 };
 
 // Re-export precision selection types

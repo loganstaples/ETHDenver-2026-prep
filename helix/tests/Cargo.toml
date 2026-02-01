@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "Comprehensive end-to-end integration tests for HELIX trustless AI training"
 
+[lib]
+name = "helix_integration_tests"
+path = "lib.rs"
+
 [dependencies]
 # HELIX crates
 helix-core = { path = "../crates/helix-core" }
@@ -122,6 +126,14 @@ path = "benches/memory_bench.rs"
 [[bin]]
 name = "ci_benchmarks"
 path = "benches/ci_benchmarks_main.rs"
+
+[[bin]]
+name = "full_benchmarks"
+path = "benches/full_benchmark_runner.rs"
+
+[[test]]
+name = "full_pipeline"
+path = "integration/full_pipeline.rs"
 
 [features]
 default = []

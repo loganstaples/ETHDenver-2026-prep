@@ -48,6 +48,8 @@ pub mod memory_profile;
 pub mod metal_vs_cpu;
 pub mod native_baseline;
 pub mod overhead_report;
+pub mod prover_comparison;
+pub mod regression;
 pub mod scaling;
 
 // Re-exports for convenience
@@ -58,6 +60,8 @@ pub use harness::{
 };
 pub use native_baseline::{ComputationType, NativeBaseline};
 pub use overhead_report::{OverheadMetrics, OverheadReport};
+pub use prover_comparison::{ComparisonReport, ProverComparisonBenchmarks, ProverResult};
+pub use regression::{RegressionDetector, RegressionReport, RegressionSeverity};
 pub use scaling::{ScalingAnalysis, ScalingPoint};
 
 use std::time::Duration;

@@ -290,9 +290,9 @@ impl TestHarness {
     pub fn generate_report(&self, result: &TestResult) -> String {
         let mut report = String::new();
 
-        report.push_str(&format!("\n{'='*60}\n"));
+        report.push_str(&format!("\n{}\n", "=".repeat(60)));
         report.push_str(&format!("Test Report: {}\n", result.test_name));
-        report.push_str(&format!("{'='*60}\n\n"));
+        report.push_str(&format!("{}\n\n", "=".repeat(60)));
 
         report.push_str(&format!("Status: {}\n", if result.success { "PASSED" } else { "FAILED" }));
         report.push_str(&format!("Total Duration: {:?}\n\n", result.total_duration));
@@ -320,7 +320,7 @@ impl TestHarness {
             }
         }
 
-        report.push_str(&format!("\n{'='*60}\n"));
+        report.push_str(&format!("\n{}\n", "=".repeat(60)));
         report.push_str(&format!("Summary: {}\n", result.summary));
 
         report
@@ -362,9 +362,9 @@ impl TestRunner {
     pub fn generate_summary(&self) -> String {
         let passed = self.results.iter().filter(|r| r.success).count();
         let total = self.results.len();
-        let mut summary = format!("\n{'='*60}\n");
+        let mut summary = format!("\n{}\n", "=".repeat(60));
         summary.push_str(&format!("TEST SUITE SUMMARY: {}/{} tests passed\n", passed, total));
-        summary.push_str(&format!("{'='*60}\n\n"));
+        summary.push_str(&format!("{}\n\n", "=".repeat(60)));
 
         for result in &self.results {
             let status = if result.success { "PASS" } else { "FAIL" };

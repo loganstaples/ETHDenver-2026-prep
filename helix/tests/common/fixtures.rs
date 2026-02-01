@@ -11,6 +11,7 @@ use rand_chacha::ChaCha20Rng;
 use std::collections::HashMap;
 
 /// Standard model dimensions for testing.
+#[derive(Debug, Clone, Copy)]
 pub struct ModelDimensions {
     pub d_in: usize,
     pub d_hid: usize,
