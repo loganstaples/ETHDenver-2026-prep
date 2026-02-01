@@ -86,12 +86,18 @@ fn create_share_validity_witness(
     let mut dealer_pk = [0u8; 32];
     rng.fill(&mut dealer_pk);
 
+    // Compute Poseidon commitment
+    let blinding_fr = Fr::from_bytes_le(&blinding);
+    let poseidon_commitment = helix_mpc::poseidon::share_commitment(&share_values, blinding_fr.clone());
+
     ShareValidityWitness {
         share_values,
         shape: vec![num_elements],
         party: PartyId::new("party_0"),
         blinding,
+        blinding_fr,
         commitment,
+        poseidon_commitment,
         min_value: Fr::from_f64(-1e10),
         max_value: Fr::from_f64(1e10),
         dealer_public_key: dealer_pk,
@@ -111,14 +117,13 @@ fn create_aggregation_witness(
         let values = random_field_elements(num_gradients, rng);
         let mut blinding = [0u8; 32];
         rng.fill(&mut blinding);
-        let commitment = compute_commitment(&values, &blinding);
 
-        let input = GradientShareInput {
-            party: PartyId::new(format!("party_{}", party_idx)),
+        // Use new constructor that computes both SHA256 and Poseidon commitments
+        let input = GradientShareInput::new(
+            PartyId::new(format!("party_{}", party_idx)),
             values,
-            commitment,
             blinding,
-        };
+        );
         witness.add_gradient_share(input).unwrap();
     }
 
@@ -619,6 +624,113 @@ fn bench_proof_size(c: &mut Criterion) {
 }
 
 // =============================================================================
+// Poseidon Hash Benchmarks
+// =============================================================================
+
+fn bench_poseidon_vs_sha256(c: &mut Criterion) {
+    let mut group = c.benchmark_group("commitment_comparison");
+    group.measurement_time(Duration::from_secs(10));
+    group.sample_size(100);
+
+    for &num_elements in &[32, 128, 512, 2048] {
+        group.throughput(Throughput::Elements(num_elements as u64));
+
+        // Benchmark SHA256 commitment
+        group.bench_with_input(
+            BenchmarkId::new("sha256", num_elements),
+            &num_elements,
+            |b, &num_elements| {
+                let mut rng = ChaCha20Rng::seed_from_u64(12345);
+                let values = random_field_elements(num_elements, &mut rng);
+                let mut blinding = [0u8; 32];
+                rng.fill(&mut blinding);
+
+                b.iter(|| {
+                    black_box(compute_commitment(&values, &blinding))
+                });
+            },
+        );
+
+        // Benchmark Poseidon commitment
+        group.bench_with_input(
+            BenchmarkId::new("poseidon", num_elements),
+            &num_elements,
+            |b, &num_elements| {
+                let mut rng = ChaCha20Rng::seed_from_u64(12345);
+                let values = random_field_elements(num_elements, &mut rng);
+                let blinding = Fr::random(&mut rng);
+
+                b.iter(|| {
+                    black_box(helix_mpc::poseidon::share_commitment(&values, blinding.clone()))
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_poseidon_hash_scaling(c: &mut Criterion) {
+    let mut group = c.benchmark_group("poseidon_scaling");
+    group.measurement_time(Duration::from_secs(10));
+    group.sample_size(50);
+
+    // Test scaling with input size
+    for &num_elements in &[4, 16, 64, 256, 1024] {
+        group.throughput(Throughput::Elements(num_elements as u64));
+        group.bench_with_input(
+            BenchmarkId::new("hash", num_elements),
+            &num_elements,
+            |b, &num_elements| {
+                let mut rng = ChaCha20Rng::seed_from_u64(12345);
+                let values = random_field_elements(num_elements, &mut rng);
+
+                b.iter(|| {
+                    black_box(helix_mpc::poseidon::poseidon_hash(&values))
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_integrated_proof_with_poseidon(c: &mut Criterion) {
+    let mut group = c.benchmark_group("integrated_poseidon_proofs");
+    group.measurement_time(Duration::from_secs(15));
+    group.sample_size(30);
+
+    // Compare proof generation with and without Poseidon commitments
+    let num_elements = 256;
+
+    // Share validity with Poseidon
+    group.bench_function("share_validity_with_poseidon", |b| {
+        let mut rng = ChaCha20Rng::seed_from_u64(12345);
+
+        b.iter(|| {
+            let witness = create_share_validity_witness(num_elements, &mut rng);
+            let mut prover = ShareValidityProver::with_seed(42);
+            let proof = prover.prove(&witness).unwrap();
+            black_box(proof)
+        });
+    });
+
+    // Aggregation with Poseidon
+    group.bench_function("aggregation_with_poseidon", |b| {
+        let mut rng = ChaCha20Rng::seed_from_u64(12345);
+
+        b.iter(|| {
+            let witness = create_aggregation_witness(5, num_elements, &mut rng);
+            let mut prover = AggregationProver::with_seed(42);
+            let proof = prover.prove(&witness).unwrap();
+            black_box(proof)
+        });
+    });
+
+    group.finish();
+}
+
+// =============================================================================
 // Memory Benchmarks
 // =============================================================================
 
@@ -668,6 +780,10 @@ criterion_group!(
     // Batch benchmarks
     bench_batch_verification,
     bench_batch_mixed_proofs,
+    // Poseidon hash benchmarks
+    bench_poseidon_vs_sha256,
+    bench_poseidon_hash_scaling,
+    bench_integrated_proof_with_poseidon,
     // Full pipeline benchmarks
     bench_full_training_step,
     bench_proof_size,

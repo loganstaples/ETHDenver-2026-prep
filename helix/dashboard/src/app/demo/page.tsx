@@ -32,6 +32,7 @@ import {
 import LiveLossCurve from '@/components/training/LiveLossCurve';
 import ProofStream from '@/components/proof/ProofStream';
 import LiveTopology from '@/components/network/LiveTopology';
+import ErrorBoundsViz from '@/components/training/ErrorBoundsViz';
 import { useTrainingStatus, type TrainingAlert } from '@/hooks/useTrainingStatus';
 import { useProofStream } from '@/hooks/useProofStream';
 import { useWorkerHealth } from '@/hooks/useWorkerHealth';
@@ -649,12 +650,24 @@ export default function DemoPage() {
                 <section id="training-section" className={`${
                     showTour && (currentStep?.target === 'training') ? 'ring-2 ring-emerald-500 ring-offset-4 ring-offset-neutral-950 rounded-xl' : ''
                 }`}>
-                    <LiveLossCurve
-                        modelId={BigInt(1)}
-                        height={350}
-                        showAccuracy={true}
-                        showErrorBound={true}
-                    />
+                    <div className="grid grid-cols-3 gap-6">
+                        <div className="col-span-2">
+                            <LiveLossCurve
+                                modelId={BigInt(1)}
+                                height={350}
+                                showAccuracy={true}
+                                showErrorBound={true}
+                            />
+                        </div>
+                        <div>
+                            <ErrorBoundsViz
+                                modelId={BigInt(1)}
+                                showDetails={false}
+                                showTimeline={true}
+                                compact={false}
+                            />
+                        </div>
+                    </div>
                 </section>
 
                 {/* Proofs and Network Grid */}

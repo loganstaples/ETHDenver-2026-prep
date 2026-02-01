@@ -582,12 +582,11 @@ impl ZKTrainingCoordinator {
             hasher.update(&blinding);
             let commitment: [u8; 32] = hasher.finalize().into();
 
-            witness.add_gradient_share(GradientShareInput {
+            witness.add_gradient_share(GradientShareInput::new(
                 party,
                 values,
-                commitment,
                 blinding,
-            })?;
+            ))?;
         }
 
         witness.compute_aggregation();

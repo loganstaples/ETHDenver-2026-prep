@@ -2615,47 +2615,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "halo2curves"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d380afeef3f1d4d3245b76895172018cfb087d9976a7cabcd5597775b2933e07"
-dependencies = [
- "blake2",
- "digest",
- "ff",
- "group",
- "halo2derive",
- "lazy_static",
- "num-bigint",
- "num-integer",
- "num-traits",
- "pairing",
- "pasta_curves",
- "paste",
- "rand 0.8.5",
- "rand_core 0.6.4",
- "rayon",
- "sha2",
- "static_assertions",
- "subtle",
- "unroll",
-]
-
-[[package]]
-name = "halo2derive"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bdb99e7492b4f5ff469d238db464131b86c2eaac814a78715acba369f64d2c76"
-dependencies = [
- "num-bigint",
- "num-integer",
- "num-traits",
- "proc-macro2",
- "quote",
- "syn 1.0.109",
-]
-
-[[package]]
 name = "hashbrown"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2732,7 +2691,7 @@ dependencies = [
  "criterion",
  "halo2_gadgets",
  "halo2_proofs",
- "halo2curves 0.1.0",
+ "halo2curves",
  "helix-core",
  "rand 0.8.5",
  "sha2",
@@ -2828,7 +2787,7 @@ dependencies = [
  "dashmap",
  "futures",
  "halo2_proofs",
- "halo2curves 0.1.0",
+ "halo2curves",
  "helix-avm",
  "helix-circuits",
  "helix-core",
@@ -2866,7 +2825,7 @@ dependencies = [
  "ed25519-dalek",
  "futures",
  "halo2_proofs",
- "halo2curves 0.7.0",
+ "halo2curves",
  "helix-circuits",
  "helix-core",
  "helix-prover",
@@ -4370,15 +4329,6 @@ checksum = "9aa2b01e1d916879f73a53d01d1d6cee68adbb31d6d9177a8cfce093cced1d50"
 dependencies = [
  "futures-core",
  "pin-project-lite",
-]
-
-[[package]]
-name = "pairing"
-version = "0.23.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81fec4625e73cf41ef4bb6846cafa6d44736525f442ba45e407c4a000a13996f"
-dependencies = [
- "group",
 ]
 
 [[package]]
@@ -6728,16 +6678,6 @@ checksum = "fc1de2c688dc15305988b563c3854064043356019f97a4b46276fe734c4f07ea"
 dependencies = [
  "crypto-common",
  "subtle",
-]
-
-[[package]]
-name = "unroll"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ad948c1cb799b1a70f836077721a92a35ac177d4daddf4c20a633786d4cf618"
-dependencies = [
- "quote",
- "syn 1.0.109",
 ]
 
 [[package]]

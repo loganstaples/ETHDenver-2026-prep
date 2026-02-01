@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use crate::error::{MPCError, MPCResult};
 use crate::field::Fr;
+use crate::integration::circuit_bridge::{CircuitBridge, CircuitBridgeConfig, Halo2ProofResult};
 use crate::integration::witness_format::{
     MPCTrainingWitness, ReconstructedWitness, ShareWitness, WitnessAggregator, WitnessBuilder,
 };
@@ -51,6 +52,9 @@ pub struct ZKPipelineConfig {
     pub compress_proofs: bool,
     /// Circuit size parameter (k for 2^k rows).
     pub circuit_k: u32,
+    /// Whether to use real Halo2 proofs (expensive).
+    /// If false, uses mock proofs for testing.
+    pub use_real_proofs: bool,
 }
 
 impl Default for ZKPipelineConfig {
@@ -65,6 +69,7 @@ impl Default for ZKPipelineConfig {
             use_freivalds: true,
             compress_proofs: true,
             circuit_k: 14,
+            use_real_proofs: false, // Default to mock proofs for testing
         }
     }
 }
@@ -216,17 +221,38 @@ pub struct ZKProofPipeline {
     commitments: HashMap<usize, ShareProofCommitment>,
     /// Current step number.
     current_step: u64,
+    /// Previous step's new_state_hash for chain continuity.
+    /// None for the first step.
+    previous_state_hash: Option<(Fr, Fr)>,
+    /// Circuit bridge for real Halo2 proofs (optional).
+    circuit_bridge: Option<CircuitBridge>,
 }
 
 impl ZKProofPipeline {
     /// Creates a new ZK proof pipeline.
     pub fn new(config: ZKPipelineConfig) -> Self {
+        // Create circuit bridge if real proofs are enabled
+        let circuit_bridge = if config.use_real_proofs {
+            let bridge_config = CircuitBridgeConfig::for_model(
+                config.d_in,
+                config.d_hid,
+                config.d_out,
+            )
+            .with_k(config.circuit_k)
+            .with_base_error(config.base_error);
+            Some(CircuitBridge::new(bridge_config))
+        } else {
+            None
+        };
+
         Self {
             config,
             blinding_gen: BlindingGenerator::new(),
             party_witnesses: HashMap::new(),
             commitments: HashMap::new(),
             current_step: 0,
+            previous_state_hash: None,
+            circuit_bridge,
         }
     }
 
@@ -336,13 +362,23 @@ impl ZKProofPipeline {
 
     /// Generates a ZK proof for the training step.
     ///
-    /// This simulates proof generation - in production, this would call
-    /// the actual helix-prover APIs.
-    pub fn generate_proof(&self) -> MPCResult<ProofResult> {
+    /// If `use_real_proofs` is enabled in config, generates actual Halo2
+    /// KZG proofs using the circuit bridge. Otherwise, uses mock proofs
+    /// for testing (faster).
+    ///
+    /// For state chain continuity, uses the previous step's new_state_hash
+    /// as this step's old_state_hash (if available).
+    pub fn generate_proof(&mut self) -> MPCResult<ProofResult> {
         let start = std::time::Instant::now();
 
         // Aggregate witnesses.
-        let reconstructed = self.aggregate_witnesses()?;
+        let mut reconstructed = self.aggregate_witnesses()?;
+
+        // For state chain continuity: if we have a previous state hash,
+        // use it as this step's old_state_hash
+        if let Some(prev_hash) = &self.previous_state_hash {
+            reconstructed.old_state_hash = prev_hash.clone();
+        }
 
         // Verify error bounds.
         let error_f64 = reconstructed.total_error.to_f64();
@@ -353,22 +389,45 @@ impl ZKProofPipeline {
             });
         }
 
-        // Generate the proof.
-        // In production, this would call helix_prover::MLTrainingProverV2.
-        let proof = self.simulate_proof_generation(&reconstructed)?;
+        // Generate the proof - use real Halo2 if circuit bridge is available
+        let result = if let Some(ref bridge) = self.circuit_bridge {
+            // Generate real Halo2 KZG proof
+            let halo2_result = bridge.prove(&reconstructed)?;
 
-        let elapsed = start.elapsed();
+            // Store this step's new_state_hash for the next step's continuity
+            self.previous_state_hash = Some(halo2_result.new_state_hash.clone());
 
-        Ok(ProofResult::new(
-            proof,
-            reconstructed.public_inputs(),
-            reconstructed.old_state_hash,
-            reconstructed.new_state_hash,
-            Fr::ZERO, // Loss computed during proof
-            reconstructed.total_error,
-            reconstructed.step_number,
-            elapsed.as_millis() as u64,
-        ))
+            ProofResult::new(
+                halo2_result.proof,
+                halo2_result.public_inputs,
+                halo2_result.old_state_hash,
+                halo2_result.new_state_hash,
+                halo2_result.loss,
+                halo2_result.total_error,
+                halo2_result.step_number,
+                halo2_result.generation_time_ms,
+            )
+        } else {
+            // Use mock proof for testing
+            let proof = self.simulate_proof_generation(&reconstructed)?;
+            let elapsed = start.elapsed();
+
+            // Store this step's new_state_hash for the next step's continuity
+            self.previous_state_hash = Some(reconstructed.new_state_hash.clone());
+
+            ProofResult::new(
+                proof,
+                reconstructed.public_inputs(),
+                reconstructed.old_state_hash,
+                reconstructed.new_state_hash,
+                Fr::ZERO, // Loss computed during proof
+                reconstructed.total_error,
+                reconstructed.step_number,
+                elapsed.as_millis() as u64,
+            )
+        };
+
+        Ok(result)
     }
 
     /// Simulates proof generation.
@@ -433,6 +492,9 @@ impl ZKProofPipeline {
 
     /// Verifies a proof against public inputs.
     ///
+    /// If real proofs are enabled, uses the Halo2 verifier.
+    /// Otherwise, does structural verification for mock proofs.
+    ///
     /// This checks that:
     /// 1. The proof structure is valid
     /// 2. Public inputs match the expected format
@@ -458,9 +520,24 @@ impl ZKProofPipeline {
             return Ok(false);
         }
 
-        // In production, this would call helix_prover::verify.
-        // For now, we do structural verification.
-        Ok(proof.proof.len() > 0)
+        // Use real Halo2 verification if circuit bridge is available
+        if let Some(ref bridge) = self.circuit_bridge {
+            // Convert ProofResult to Halo2ProofResult format for verification
+            let halo2_proof = Halo2ProofResult::new(
+                proof.proof.clone(),
+                proof.public_inputs.clone(),
+                proof.old_state_hash.clone(),
+                proof.new_state_hash.clone(),
+                proof.loss.clone(),
+                proof.total_error.clone(),
+                proof.step_number,
+                proof.generation_time_ms,
+            );
+            return bridge.verify(&halo2_proof);
+        }
+
+        // For mock proofs, do structural verification
+        Ok(!proof.proof.is_empty())
     }
 
     /// Verifies all party commitments are consistent.
@@ -495,6 +572,32 @@ impl ZKProofPipeline {
     /// Returns all party commitments.
     pub fn commitments(&self) -> &HashMap<usize, ShareProofCommitment> {
         &self.commitments
+    }
+
+    /// Returns whether real Halo2 proofs are enabled.
+    pub fn uses_real_proofs(&self) -> bool {
+        self.circuit_bridge.is_some()
+    }
+
+    /// Enables real Halo2 proofs by initializing the circuit bridge.
+    ///
+    /// Note: This is expensive as it creates the proving key.
+    pub fn enable_real_proofs(&mut self) {
+        if self.circuit_bridge.is_none() {
+            let bridge_config = CircuitBridgeConfig::for_model(
+                self.config.d_in,
+                self.config.d_hid,
+                self.config.d_out,
+            )
+            .with_k(self.config.circuit_k)
+            .with_base_error(self.config.base_error);
+            self.circuit_bridge = Some(CircuitBridge::new(bridge_config));
+        }
+    }
+
+    /// Returns a reference to the circuit bridge if available.
+    pub fn circuit_bridge(&self) -> Option<&CircuitBridge> {
+        self.circuit_bridge.as_ref()
     }
 }
 
@@ -1009,5 +1112,66 @@ mod tests {
             ShareProofCommitment::new(party, &share_data, &result_data, error, &blinding);
 
         assert!(commitment.verify_signature());
+    }
+
+    #[test]
+    fn test_enable_real_proofs() {
+        let config = ZKPipelineConfig::default();
+        let mut pipeline = ZKProofPipeline::new(config);
+
+        assert!(!pipeline.uses_real_proofs());
+
+        pipeline.enable_real_proofs();
+
+        assert!(pipeline.uses_real_proofs());
+        assert!(pipeline.circuit_bridge().is_some());
+    }
+
+    // Note: Real Halo2 proof generation test is expensive, so we mark it as ignored.
+    // Run with: cargo test --release -p helix-mpc -- --ignored
+    #[test]
+    #[ignore]
+    fn test_real_halo2_proof_generation() {
+        let d_in = 2;
+        let d_hid = 2;
+        let d_out = 1;
+
+        // Create pipeline with real proofs enabled
+        let config = ZKPipelineConfig {
+            num_parties: 3,
+            d_in,
+            d_hid,
+            d_out,
+            use_real_proofs: true,
+            ..Default::default()
+        };
+
+        let mut pipeline = ZKProofPipeline::new(config);
+        assert!(pipeline.uses_real_proofs());
+
+        // Generate witnesses for each party
+        for i in 0..3 {
+            let model = create_test_model_share(i, d_in, d_hid, d_out);
+            let gradient = create_test_gradient_share(i);
+
+            pipeline
+                .generate_party_witness(i, &model, &gradient, &[1.0, 1.0], &[1.0], 0.01)
+                .unwrap();
+        }
+
+        // Generate real Halo2 proof
+        let proof = pipeline.generate_proof().unwrap();
+
+        // Verify proof structure
+        assert!(!proof.proof.is_empty());
+        assert_eq!(proof.public_inputs.len(), 7);
+        assert_eq!(proof.step_number, 0);
+
+        // Verify with real Halo2 verifier
+        assert!(pipeline.verify_proof(&proof).unwrap());
+
+        // Log proof statistics
+        println!("Real Halo2 proof size: {} bytes", proof.proof_size_bytes);
+        println!("Proof generation time: {} ms", proof.generation_time_ms);
     }
 }
