@@ -32,6 +32,7 @@ interface ProofStreamProps {
     showStats?: boolean;
     showOnChain?: boolean;
     compact?: boolean;
+    enableSimulation?: boolean;
     className?: string;
 }
 
@@ -375,6 +376,7 @@ export default function ProofStream({
     showStats = true,
     showOnChain = true,
     compact = false,
+    enableSimulation = true,
     className = '',
 }: ProofStreamProps) {
     const [selectedProof, setSelectedProof] = useState<ProofStreamItem | null>(null);
@@ -391,7 +393,7 @@ export default function ProofStream({
         modelId,
         maxProofs: 100,
         enableWebSocket: true,
-        enableSimulation: false, // Only use real data from WebSocket/contract
+        enableSimulation,
     });
 
     const filteredProofs = useMemo(() => {

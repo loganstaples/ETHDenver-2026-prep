@@ -20,6 +20,7 @@ interface LiveLossCurveProps {
     showAccuracy?: boolean;
     showErrorBound?: boolean;
     showThroughput?: boolean;
+    enablePolling?: boolean;
     className?: string;
 }
 
@@ -76,6 +77,7 @@ export default function LiveLossCurve({
     showAccuracy = true,
     showErrorBound = true,
     showThroughput = false,
+    enablePolling = true,
     className = '',
 }: LiveLossCurveProps) {
     const svgRef = useRef<SVGSVGElement>(null);
@@ -94,7 +96,7 @@ export default function LiveLossCurve({
     } = useTrainingStatus({
         modelId: modelId || BigInt(1),
         enableWebSocket: true,
-        enablePolling: false, // Only use real data from WebSocket/contract
+        enablePolling,
     });
 
     // Update dimensions on resize

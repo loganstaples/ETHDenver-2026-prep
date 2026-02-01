@@ -31,6 +31,7 @@ interface LiveTopologyProps {
     height?: number;
     interactive?: boolean;
     showDetails?: boolean;
+    enablePolling?: boolean;
     className?: string;
 }
 
@@ -410,6 +411,7 @@ export default function LiveTopology({
     height = 500,
     interactive = true,
     showDetails = true,
+    enablePolling = true,
     className = '',
 }: LiveTopologyProps) {
     const containerRef = useRef<HTMLDivElement>(null);
@@ -429,7 +431,7 @@ export default function LiveTopology({
     } = useWorkerHealth({
         modelId,
         enableWebSocket: true,
-        enablePolling: false, // Only use real data from WebSocket/contract
+        enablePolling,
     });
 
     // Update dimensions
