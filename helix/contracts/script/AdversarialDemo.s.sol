@@ -5,6 +5,7 @@ import "forge-std/Script.sol";
 import "forge-std/console.sol";
 import "../src/core/HelixCoordinatorV2.sol";
 import "../src/verification/SlashingEvidence.sol";
+import "../src/verification/BatchVerifier.sol";
 import "../src/mocks/MockVerifier.sol";
 
 /// @title AdversarialDemo
@@ -17,6 +18,7 @@ contract AdversarialDemo is Script {
     // ============ Contracts ============
     HelixCoordinatorV2 public coordinator;
     SlashingEvidence public slashingEvidence;
+    BatchVerifier public batchVerifier;
     MockVerifier public mockVerifier;
 
     // ============ Actors ============
@@ -75,7 +77,13 @@ contract AdversarialDemo is Script {
         // Phase 8: Show challenger rewards
         _demonstrateChallengerRewards();
 
-        // Phase 9: Summary
+        // Phase 9: Batch verification and gas analysis
+        _demonstrateBatchVerification();
+
+        // Phase 10: Multi-sig emergency pause
+        _demonstrateMultiSigPause();
+
+        // Phase 11: Summary
         _printSummary();
 
         vm.stopBroadcast();
@@ -102,6 +110,10 @@ contract AdversarialDemo is Script {
         // Deploy slashing evidence
         slashingEvidence = new SlashingEvidence(address(coordinator));
         console.log("SlashingEvidence deployed at:", address(slashingEvidence));
+
+        // Deploy batch verifier
+        batchVerifier = new BatchVerifier(address(mockVerifier));
+        console.log("BatchVerifier deployed at:", address(batchVerifier));
 
         // Configure coordinator
         coordinator.setSlashingEvidenceContract(address(slashingEvidence));
@@ -390,6 +402,119 @@ contract AdversarialDemo is Script {
         console.log("");
     }
 
+    function _demonstrateBatchVerification() internal {
+        _printPhase("Phase 9: Batch Verification & Gas Analysis");
+
+        console.log("Testing batch proof verification for gas optimization...");
+        console.log("");
+
+        // Create test proofs
+        bytes[] memory proofs = new bytes[](5);
+        uint256[][] memory inputsArray = new uint256[][](5);
+
+        for (uint256 i = 0; i < 5; i++) {
+            proofs[i] = new bytes(320);
+            inputsArray[i] = new uint256[](7);
+            inputsArray[i][0] = 12345 + i;
+            inputsArray[i][1] = 67890;
+            inputsArray[i][2] = 1111;
+            inputsArray[i][3] = 2222;
+            inputsArray[i][4] = 100;
+            inputsArray[i][5] = 10;
+            inputsArray[i][6] = i + 1;
+        }
+
+        // Single verification gas
+        mockVerifier.setShouldPass(true);
+        uint256 singleGas = batchVerifier.estimateSingleVerifyGas(proofs[0], inputsArray[0]);
+        console.log("Single proof verification gas:", singleGas);
+
+        // Batch verification gas
+        (uint256 totalGas, uint256 perProofGas) = batchVerifier.estimateBatchVerifyGas(proofs, inputsArray);
+        console.log("Batch (5 proofs) total gas:", totalGas);
+        console.log("Batch per-proof gas:", perProofGas);
+
+        // Gas target check
+        uint256 gasTarget = 250000;
+        bool underTarget = perProofGas < gasTarget;
+        console.log("");
+        console.log("=== GAS TARGET CHECK ===");
+        console.log("Target: <", gasTarget);
+        console.log("Actual:", perProofGas);
+        console.log("Status:", underTarget ? "PASS" : "FAIL");
+
+        // Demonstrate error codes
+        console.log("");
+        console.log("Error code system:");
+        console.log("  0x0103:", batchVerifier.getErrorDescription(0x0103));
+        console.log("  0x0201:", batchVerifier.getErrorDescription(0x0201));
+        console.log("  0x0301:", batchVerifier.getErrorDescription(0x0301));
+        console.log("  0x0602:", batchVerifier.getErrorDescription(0x0602));
+
+        // Batch verification result
+        mockVerifier.setShouldPass(true);
+        BatchVerifier.BatchResult memory result = batchVerifier.batchVerify(proofs, inputsArray);
+        console.log("");
+        console.log("Batch verification results:");
+        console.log("  Total proofs:", result.totalProofs);
+        console.log("  Valid proofs:", result.validProofs);
+        console.log("  Invalid proofs:", result.invalidProofs);
+        console.log("  Average gas per proof:", result.averageGasPerProof);
+        console.log("");
+    }
+
+    function _demonstrateMultiSigPause() internal {
+        _printPhase("Phase 10: Multi-Sig Emergency Pause System");
+
+        console.log("Coordinator multi-sig pause configuration:");
+        console.log("");
+
+        // Show current guardian configuration
+        console.log("Guardian Management:");
+        console.log("  Owner is guardian:", coordinator.isGuardian(deployer));
+        console.log("  Guardian count:", coordinator.guardianCount());
+        console.log("  Required guardians:", coordinator.requiredGuardians());
+
+        // Add additional guardians for demo
+        address guardian2 = vm.addr(20);
+        address guardian3 = vm.addr(21);
+
+        coordinator.addGuardian(guardian2);
+        coordinator.addGuardian(guardian3);
+
+        console.log("");
+        console.log("Added 2 additional guardians:");
+        console.log("  Guardian 2:", guardian2);
+        console.log("  Guardian 3:", guardian3);
+        console.log("  New guardian count:", coordinator.guardianCount());
+
+        // Show pause approval status
+        (uint64 nonce, uint8 approvals, uint8 required) = coordinator.getPauseApprovalStatus();
+        console.log("");
+        console.log("Pause Approval Status:");
+        console.log("  Current nonce:", nonce);
+        console.log("  Current approvals:", approvals);
+        console.log("  Required approvals:", required);
+
+        // Show challenger reward config
+        (uint16 rewardPct, uint128 minReward, uint128 maxReward, bool enabled) = coordinator.getChallengerConfig();
+        console.log("");
+        console.log("Challenger Reward Configuration:");
+        console.log("  Reward percentage:", rewardPct / 100, "%");
+        console.log("  Min reward:", uint256(minReward) / 1e15, "finney");
+        console.log("  Max reward:", uint256(maxReward) / 1e18, "ETH");
+        console.log("  Enabled:", enabled);
+
+        // Recovery configuration
+        console.log("");
+        console.log("Recovery Configuration:");
+        console.log("  Time lock:", coordinator.recoveryTimeLock() / 3600, "hours");
+
+        (address pendingOwner, uint256 execTime, bool isPending) = coordinator.getPendingRecovery();
+        console.log("  Pending recovery:", isPending);
+        console.log("");
+    }
+
     function _printSummary() internal {
         _printPhase("Demo Summary");
 
@@ -402,10 +527,15 @@ contract AdversarialDemo is Script {
         console.log("  [x] Dispute filing and resolution");
         console.log("  [x] Challenger reward distribution");
         console.log("  [x] Protocol fee collection");
+        console.log("  [x] Batch proof verification (<250K gas target)");
+        console.log("  [x] Multi-sig emergency pause system");
+        console.log("  [x] Time-locked recovery mechanism");
+        console.log("  [x] Guardian management");
         console.log("");
         console.log("Contract addresses:");
         console.log("  Coordinator:", address(coordinator));
         console.log("  SlashingEvidence:", address(slashingEvidence));
+        console.log("  BatchVerifier:", address(batchVerifier));
         console.log("  MockVerifier:", address(mockVerifier));
         console.log("");
         console.log("Final state:");

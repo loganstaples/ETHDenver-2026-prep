@@ -6,6 +6,7 @@
 //! - Multi-head attention
 //! - MLP blocks (standard and gated)
 //! - Full transformer blocks and stacks
+//! - Layer normalization (LayerNorm and RMSNorm)
 //! - Quantized layers with INT8/INT4 support
 //! - Large model support with memory-efficient execution
 
@@ -13,6 +14,7 @@ pub mod attention;
 pub mod embedding;
 pub mod large_model;
 pub mod layer;
+pub mod layer_norm;
 pub mod linear;
 pub mod mlp;
 pub mod quantized;
@@ -45,4 +47,10 @@ pub use quantized::{
 pub use large_model::{
     LargeModelConfig, LargeModelError, LargeModelExecutor,
     chunked_attention, compute_optimal_batch_size, estimate_forward_memory,
+};
+
+// Re-export layer normalization types
+pub use layer_norm::{
+    LayerNorm, LayerNormConfig, LayerNormError, RMSNorm,
+    fused_layer_norm, fused_rms_norm,
 };
