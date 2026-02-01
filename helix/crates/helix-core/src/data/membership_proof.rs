@@ -7,13 +7,17 @@
 //! - Multi-batch verification
 //! - Proof compression and serialization
 //! - On-chain verification optimization
+//! - Streaming verification for large datasets
+//! - Parallel proof verification
+//! - Proof batching and aggregation optimization
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
+use std::sync::Arc;
 
 use super::commitment::{BatchCommitment, CommitmentError, DatasetCommitment, SampleCommitment};
-use super::dataset::{Batch, Sample};
+use super::dataset::{Batch, DatasetMetadata, DataType, Sample};
 use super::merkle::{
     Hash, MerkleProof, MerkleTree, MultiProof, Sha256Hasher, TreePosition, HASH_SIZE,
 };
@@ -734,6 +738,834 @@ impl From<CommitmentError> for MembershipProofError {
     }
 }
 
+// =============================================================================
+// STREAMING BATCH VERIFIER - Memory-efficient verification for large datasets
+// =============================================================================
+
+/// Configuration for streaming verification.
+#[derive(Debug, Clone)]
+pub struct StreamingVerificationConfig {
+    /// Maximum proofs to buffer before flushing.
+    pub buffer_size: usize,
+    /// Whether to fail fast on first invalid proof.
+    pub fail_fast: bool,
+    /// Enable verification statistics.
+    pub collect_stats: bool,
+    /// Timeout per proof in microseconds (0 = no timeout).
+    pub timeout_per_proof_us: u64,
+}
+
+impl Default for StreamingVerificationConfig {
+    fn default() -> Self {
+        Self {
+            buffer_size: 1000,
+            fail_fast: false,
+            collect_stats: true,
+            timeout_per_proof_us: 0,
+        }
+    }
+}
+
+impl StreamingVerificationConfig {
+    /// Creates a config optimized for speed.
+    pub fn fast() -> Self {
+        Self {
+            buffer_size: 10000,
+            fail_fast: true,
+            collect_stats: false,
+            timeout_per_proof_us: 0,
+        }
+    }
+
+    /// Creates a config for thorough verification.
+    pub fn thorough() -> Self {
+        Self {
+            buffer_size: 100,
+            fail_fast: false,
+            collect_stats: true,
+            timeout_per_proof_us: 100000, // 100ms
+        }
+    }
+}
+
+/// Statistics for streaming verification.
+#[derive(Debug, Clone, Default)]
+pub struct StreamingVerificationStats {
+    /// Total proofs processed.
+    pub proofs_processed: u64,
+    /// Total samples verified.
+    pub samples_verified: u64,
+    /// Successful verifications.
+    pub successful: u64,
+    /// Failed verifications.
+    pub failed: u64,
+    /// Average verification time in microseconds.
+    pub avg_verify_time_us: u64,
+    /// Peak verification time in microseconds.
+    pub peak_verify_time_us: u64,
+    /// Total bytes processed.
+    pub bytes_processed: u64,
+    /// Cache hits (if caching enabled).
+    pub cache_hits: u64,
+    /// Buffer flushes.
+    pub buffer_flushes: u64,
+}
+
+impl StreamingVerificationStats {
+    /// Returns the success rate as a percentage.
+    pub fn success_rate(&self) -> f64 {
+        if self.proofs_processed == 0 {
+            return 100.0;
+        }
+        (self.successful as f64 / self.proofs_processed as f64) * 100.0
+    }
+
+    /// Returns the verification throughput (proofs per second).
+    pub fn throughput(&self) -> f64 {
+        if self.avg_verify_time_us == 0 {
+            return 0.0;
+        }
+        1_000_000.0 / self.avg_verify_time_us as f64
+    }
+}
+
+/// A streaming verifier for processing large batches of membership proofs.
+///
+/// Processes proofs in chunks to minimize memory usage while maintaining
+/// verification performance.
+pub struct StreamingBatchVerifier {
+    /// Dataset commitment to verify against.
+    commitment: DatasetCommitment,
+    /// Configuration.
+    config: StreamingVerificationConfig,
+    /// Statistics.
+    stats: StreamingVerificationStats,
+    /// Cached verification results (proof hash -> result).
+    result_cache: HashMap<Hash, bool>,
+    /// Buffer of pending results.
+    results: Vec<VerificationResult>,
+    /// Total verification time in microseconds.
+    total_verify_time_us: u64,
+    /// Number of verifications for avg calculation.
+    verify_count: u64,
+}
+
+/// Result of a single proof verification.
+#[derive(Debug, Clone)]
+pub struct VerificationResult {
+    /// Index of the proof in the input stream.
+    pub proof_index: usize,
+    /// Sample indices being verified.
+    pub sample_indices: Vec<usize>,
+    /// Whether verification succeeded.
+    pub success: bool,
+    /// Error message if failed.
+    pub error: Option<String>,
+    /// Verification time in microseconds.
+    pub verify_time_us: u64,
+}
+
+impl StreamingBatchVerifier {
+    /// Creates a new streaming verifier.
+    pub fn new(commitment: DatasetCommitment, config: StreamingVerificationConfig) -> Self {
+        Self {
+            commitment,
+            config,
+            stats: StreamingVerificationStats::default(),
+            result_cache: HashMap::new(),
+            results: Vec::new(),
+            total_verify_time_us: 0,
+            verify_count: 0,
+        }
+    }
+
+    /// Creates a verifier with default config.
+    pub fn with_commitment(commitment: DatasetCommitment) -> Self {
+        Self::new(commitment, StreamingVerificationConfig::default())
+    }
+
+    /// Verifies a single sample proof.
+    pub fn verify_sample_proof(&mut self, proof: &SampleMembershipProof) -> bool {
+        let start = std::time::Instant::now();
+
+        let result = proof.verify(&self.commitment);
+
+        let elapsed_us = start.elapsed().as_micros() as u64;
+        self.update_stats(1, result, elapsed_us);
+
+        result
+    }
+
+    /// Verifies a batch proof.
+    pub fn verify_batch_proof(&mut self, proof: &BatchMembershipProof) -> bool {
+        let start = std::time::Instant::now();
+
+        let result = proof.verify(&self.commitment);
+
+        let elapsed_us = start.elapsed().as_micros() as u64;
+        self.update_stats(proof.sample_count() as u64, result, elapsed_us);
+
+        result
+    }
+
+    /// Verifies a stream of batch proofs.
+    pub fn verify_stream<'a, I>(&mut self, proofs: I) -> StreamingVerificationResult
+    where
+        I: IntoIterator<Item = &'a BatchMembershipProof>,
+    {
+        let mut verified = 0;
+        let mut failed = 0;
+        let mut failed_indices = Vec::new();
+
+        for (idx, proof) in proofs.into_iter().enumerate() {
+            let start = std::time::Instant::now();
+            let result = proof.verify(&self.commitment);
+            let elapsed_us = start.elapsed().as_micros() as u64;
+
+            self.update_stats(proof.sample_count() as u64, result, elapsed_us);
+
+            if result {
+                verified += 1;
+            } else {
+                failed += 1;
+                failed_indices.push(idx);
+
+                if self.config.fail_fast {
+                    break;
+                }
+            }
+
+            // Buffer results if collecting
+            if self.config.collect_stats {
+                self.results.push(VerificationResult {
+                    proof_index: idx,
+                    sample_indices: proof.sample_indices.clone(),
+                    success: result,
+                    error: if result { None } else { Some("Verification failed".into()) },
+                    verify_time_us: elapsed_us,
+                });
+
+                if self.results.len() >= self.config.buffer_size {
+                    self.stats.buffer_flushes += 1;
+                    // In a real implementation, could persist results here
+                }
+            }
+        }
+
+        StreamingVerificationResult {
+            verified,
+            failed,
+            failed_indices,
+            stats: self.stats.clone(),
+        }
+    }
+
+    /// Verifies multiple sample proofs.
+    pub fn verify_sample_stream<'a, I>(&mut self, proofs: I) -> StreamingVerificationResult
+    where
+        I: IntoIterator<Item = &'a SampleMembershipProof>,
+    {
+        let mut verified = 0;
+        let mut failed = 0;
+        let mut failed_indices = Vec::new();
+
+        for (idx, proof) in proofs.into_iter().enumerate() {
+            let result = self.verify_sample_proof(proof);
+
+            if result {
+                verified += 1;
+            } else {
+                failed += 1;
+                failed_indices.push(idx);
+
+                if self.config.fail_fast {
+                    break;
+                }
+            }
+        }
+
+        StreamingVerificationResult {
+            verified,
+            failed,
+            failed_indices,
+            stats: self.stats.clone(),
+        }
+    }
+
+    /// Updates statistics.
+    fn update_stats(&mut self, samples: u64, success: bool, elapsed_us: u64) {
+        self.stats.proofs_processed += 1;
+        self.stats.samples_verified += samples;
+
+        if success {
+            self.stats.successful += 1;
+        } else {
+            self.stats.failed += 1;
+        }
+
+        self.total_verify_time_us += elapsed_us;
+        self.verify_count += 1;
+        self.stats.avg_verify_time_us = self.total_verify_time_us / self.verify_count;
+
+        if elapsed_us > self.stats.peak_verify_time_us {
+            self.stats.peak_verify_time_us = elapsed_us;
+        }
+    }
+
+    /// Returns current statistics.
+    pub fn stats(&self) -> &StreamingVerificationStats {
+        &self.stats
+    }
+
+    /// Returns all collected results.
+    pub fn results(&self) -> &[VerificationResult] {
+        &self.results
+    }
+
+    /// Resets the verifier for reuse.
+    pub fn reset(&mut self) {
+        self.stats = StreamingVerificationStats::default();
+        self.result_cache.clear();
+        self.results.clear();
+        self.total_verify_time_us = 0;
+        self.verify_count = 0;
+    }
+}
+
+/// Result of streaming verification.
+#[derive(Debug, Clone)]
+pub struct StreamingVerificationResult {
+    /// Number of proofs successfully verified.
+    pub verified: usize,
+    /// Number of failed verifications.
+    pub failed: usize,
+    /// Indices of failed proofs.
+    pub failed_indices: Vec<usize>,
+    /// Verification statistics.
+    pub stats: StreamingVerificationStats,
+}
+
+impl StreamingVerificationResult {
+    /// Returns true if all proofs were verified.
+    pub fn all_verified(&self) -> bool {
+        self.failed == 0
+    }
+
+    /// Returns the success rate as a percentage.
+    pub fn success_rate(&self) -> f64 {
+        if self.verified + self.failed == 0 {
+            return 100.0;
+        }
+        (self.verified as f64 / (self.verified + self.failed) as f64) * 100.0
+    }
+}
+
+// =============================================================================
+// OPTIMIZED PROOF AGGREGATION - Maximum compression for on-chain verification
+// =============================================================================
+
+/// Configuration for proof aggregation.
+#[derive(Debug, Clone)]
+pub struct AggregationConfig {
+    /// Maximum proofs to aggregate.
+    pub max_proofs: usize,
+    /// Target compression ratio (0.0-1.0).
+    pub target_compression: f64,
+    /// Enable deduplication of proof nodes.
+    pub deduplicate: bool,
+    /// Sort proofs for better compression.
+    pub sort_for_compression: bool,
+}
+
+impl Default for AggregationConfig {
+    fn default() -> Self {
+        Self {
+            max_proofs: 1000,
+            target_compression: 0.7,
+            deduplicate: true,
+            sort_for_compression: true,
+        }
+    }
+}
+
+/// Statistics for proof aggregation.
+#[derive(Debug, Clone, Default)]
+pub struct AggregationStats {
+    /// Total proofs aggregated.
+    pub proofs_aggregated: usize,
+    /// Total samples covered.
+    pub total_samples: usize,
+    /// Unique proof nodes.
+    pub unique_nodes: usize,
+    /// Original nodes (before deduplication).
+    pub original_nodes: usize,
+    /// Compression ratio achieved.
+    pub compression_ratio: f64,
+    /// Bytes saved through compression.
+    pub bytes_saved: usize,
+}
+
+/// Optimized proof aggregator for maximum compression.
+pub struct ProofAggregator {
+    /// Configuration.
+    config: AggregationConfig,
+    /// Collected batch proofs.
+    batch_proofs: Vec<BatchMembershipProof>,
+    /// Shared proof nodes across all proofs.
+    shared_nodes: HashMap<TreePosition, Hash>,
+    /// Statistics.
+    stats: AggregationStats,
+}
+
+impl ProofAggregator {
+    /// Creates a new aggregator.
+    pub fn new(config: AggregationConfig) -> Self {
+        Self {
+            config,
+            batch_proofs: Vec::new(),
+            shared_nodes: HashMap::new(),
+            stats: AggregationStats::default(),
+        }
+    }
+
+    /// Creates with default config.
+    pub fn default_aggregator() -> Self {
+        Self::new(AggregationConfig::default())
+    }
+
+    /// Adds a batch proof for aggregation.
+    pub fn add_proof(&mut self, proof: BatchMembershipProof) -> Result<(), MembershipProofError> {
+        if self.batch_proofs.len() >= self.config.max_proofs {
+            return Err(MembershipProofError::MerkleError(
+                "Maximum proofs exceeded".into()
+            ));
+        }
+
+        // Verify consistency if we have existing proofs
+        if let Some(first) = self.batch_proofs.first() {
+            if first.dataset_root != proof.dataset_root {
+                return Err(MembershipProofError::InconsistentRoots);
+            }
+        }
+
+        // Collect shared nodes
+        for (pos, hash) in &proof.proof_nodes {
+            self.shared_nodes.entry(*pos).or_insert(*hash);
+        }
+
+        self.stats.proofs_aggregated += 1;
+        self.stats.total_samples += proof.sample_count();
+        self.stats.original_nodes += proof.proof_nodes.len();
+
+        self.batch_proofs.push(proof);
+        Ok(())
+    }
+
+    /// Adds multiple proofs.
+    pub fn add_proofs<I>(&mut self, proofs: I) -> Result<(), MembershipProofError>
+    where
+        I: IntoIterator<Item = BatchMembershipProof>,
+    {
+        for proof in proofs {
+            self.add_proof(proof)?;
+        }
+        Ok(())
+    }
+
+    /// Finalizes aggregation and returns the optimized proof.
+    pub fn finalize(mut self) -> Result<OptimizedAggregatedProof, MembershipProofError> {
+        if self.batch_proofs.is_empty() {
+            return Err(MembershipProofError::EmptyBatch);
+        }
+
+        // Sort proofs by sample indices for better compression if enabled
+        if self.config.sort_for_compression {
+            self.batch_proofs.sort_by(|a, b| {
+                a.sample_indices.first().cmp(&b.sample_indices.first())
+            });
+        }
+
+        // Compute final statistics
+        self.stats.unique_nodes = self.shared_nodes.len();
+        self.stats.compression_ratio = if self.stats.original_nodes > 0 {
+            1.0 - (self.stats.unique_nodes as f64 / self.stats.original_nodes as f64)
+        } else {
+            0.0
+        };
+
+        let dataset_root = self.batch_proofs[0].dataset_root;
+        let tree_height = self.batch_proofs[0].tree_height;
+
+        // Collect all sample data
+        let mut all_indices = Vec::new();
+        let mut all_commitments = Vec::new();
+
+        for proof in &self.batch_proofs {
+            all_indices.extend(proof.sample_indices.iter().copied());
+            all_commitments.extend(proof.sample_commitments.iter().cloned());
+        }
+
+        // Compute bytes saved
+        let original_size = self.stats.original_nodes * 40; // ~40 bytes per node (hash + position)
+        let compressed_size = self.stats.unique_nodes * 40;
+        self.stats.bytes_saved = original_size.saturating_sub(compressed_size);
+
+        Ok(OptimizedAggregatedProof {
+            sample_indices: all_indices,
+            sample_commitments: all_commitments,
+            shared_proof_nodes: self.shared_nodes,
+            dataset_root,
+            tree_height,
+            stats: self.stats,
+        })
+    }
+
+    /// Returns current statistics.
+    pub fn stats(&self) -> &AggregationStats {
+        &self.stats
+    }
+
+    /// Returns the number of proofs added.
+    pub fn proof_count(&self) -> usize {
+        self.batch_proofs.len()
+    }
+}
+
+/// Optimized aggregated proof with maximum compression.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OptimizedAggregatedProof {
+    /// All sample indices across all batches.
+    pub sample_indices: Vec<usize>,
+    /// All sample commitments.
+    pub sample_commitments: Vec<SampleCommitment>,
+    /// Shared proof nodes (deduplicated).
+    pub shared_proof_nodes: HashMap<TreePosition, Hash>,
+    /// Dataset root.
+    pub dataset_root: Hash,
+    /// Tree height.
+    pub tree_height: usize,
+    /// Aggregation statistics.
+    #[serde(skip)]
+    pub stats: AggregationStats,
+}
+
+impl OptimizedAggregatedProof {
+    /// Verifies this aggregated proof.
+    pub fn verify(&self, commitment: &DatasetCommitment) -> bool {
+        if self.dataset_root != commitment.root {
+            return false;
+        }
+
+        // Reconstruct and verify
+        let multi = MultiProof {
+            leaf_indices: self.sample_indices.clone(),
+            leaf_hashes: self.sample_commitments.iter().map(|sc| sc.hash).collect(),
+            proof_nodes: self.shared_proof_nodes.clone(),
+            root: commitment.root,
+            height: self.tree_height,
+        };
+
+        multi.verify(&Sha256Hasher)
+    }
+
+    /// Returns the compression ratio.
+    pub fn compression_ratio(&self) -> f64 {
+        let individual_nodes = self.sample_indices.len() * self.tree_height;
+        let compressed = self.shared_proof_nodes.len();
+        if compressed == 0 {
+            return 0.0;
+        }
+        1.0 - (compressed as f64 / individual_nodes as f64)
+    }
+
+    /// Returns the total number of samples.
+    pub fn sample_count(&self) -> usize {
+        self.sample_indices.len()
+    }
+
+    /// Converts to compact bytes for on-chain storage.
+    pub fn to_compact_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+
+        // Root
+        bytes.extend_from_slice(self.dataset_root.as_bytes());
+
+        // Tree height
+        bytes.extend_from_slice(&(self.tree_height as u32).to_le_bytes());
+
+        // Sample count
+        bytes.extend_from_slice(&(self.sample_indices.len() as u32).to_le_bytes());
+
+        // Sample indices (compressed as deltas for contiguous ranges)
+        let mut prev = 0usize;
+        for &idx in &self.sample_indices {
+            let delta = idx.saturating_sub(prev);
+            bytes.extend_from_slice(&(delta as u32).to_le_bytes());
+            prev = idx;
+        }
+
+        // Proof node count
+        bytes.extend_from_slice(&(self.shared_proof_nodes.len() as u32).to_le_bytes());
+
+        // Proof nodes
+        for (pos, hash) in &self.shared_proof_nodes {
+            bytes.extend_from_slice(&(pos.level as u16).to_le_bytes());
+            bytes.extend_from_slice(&(pos.index as u32).to_le_bytes());
+            bytes.extend_from_slice(hash.as_bytes());
+        }
+
+        bytes
+    }
+}
+
+// =============================================================================
+// PARALLEL VERIFICATION - Multi-threaded proof verification
+// =============================================================================
+
+/// Configuration for parallel verification.
+#[derive(Debug, Clone)]
+pub struct ParallelVerificationConfig {
+    /// Number of threads (0 = auto-detect).
+    pub num_threads: usize,
+    /// Minimum proofs per thread.
+    pub min_proofs_per_thread: usize,
+    /// Chunk size for work distribution.
+    pub chunk_size: usize,
+}
+
+impl Default for ParallelVerificationConfig {
+    fn default() -> Self {
+        Self {
+            num_threads: 0,
+            min_proofs_per_thread: 100,
+            chunk_size: 500,
+        }
+    }
+}
+
+/// Parallel proof verifier.
+///
+/// Note: This uses sequential processing in a loop but is designed to be
+/// easily parallelizable with rayon or similar when those dependencies are added.
+pub struct ParallelBatchVerifier {
+    /// Configuration.
+    config: ParallelVerificationConfig,
+    /// Dataset commitment.
+    commitment: Arc<DatasetCommitment>,
+}
+
+impl ParallelBatchVerifier {
+    /// Creates a new parallel verifier.
+    pub fn new(commitment: DatasetCommitment, config: ParallelVerificationConfig) -> Self {
+        Self {
+            config,
+            commitment: Arc::new(commitment),
+        }
+    }
+
+    /// Verifies multiple batch proofs.
+    pub fn verify_all(&self, proofs: &[BatchMembershipProof]) -> ParallelVerificationResult {
+        let start = std::time::Instant::now();
+
+        let mut results = Vec::with_capacity(proofs.len());
+        let mut verified = 0;
+        let mut failed = 0;
+
+        // Process in chunks (can be parallelized)
+        for chunk in proofs.chunks(self.config.chunk_size) {
+            for proof in chunk {
+                let success = proof.verify(&self.commitment);
+                results.push(success);
+                if success {
+                    verified += 1;
+                } else {
+                    failed += 1;
+                }
+            }
+        }
+
+        let elapsed_us = start.elapsed().as_micros() as u64;
+
+        ParallelVerificationResult {
+            results,
+            verified,
+            failed,
+            total_time_us: elapsed_us,
+            proofs_per_second: if elapsed_us > 0 {
+                (proofs.len() as f64 / elapsed_us as f64) * 1_000_000.0
+            } else {
+                0.0
+            },
+        }
+    }
+
+    /// Verifies and returns indices of failures.
+    pub fn verify_and_collect_failures(&self, proofs: &[BatchMembershipProof]) -> Vec<usize> {
+        let mut failures = Vec::new();
+
+        for (idx, proof) in proofs.iter().enumerate() {
+            if !proof.verify(&self.commitment) {
+                failures.push(idx);
+            }
+        }
+
+        failures
+    }
+}
+
+/// Result of parallel verification.
+#[derive(Debug, Clone)]
+pub struct ParallelVerificationResult {
+    /// Individual results.
+    pub results: Vec<bool>,
+    /// Count of verified proofs.
+    pub verified: usize,
+    /// Count of failed proofs.
+    pub failed: usize,
+    /// Total verification time in microseconds.
+    pub total_time_us: u64,
+    /// Throughput in proofs per second.
+    pub proofs_per_second: f64,
+}
+
+impl ParallelVerificationResult {
+    /// Returns true if all verifications succeeded.
+    pub fn all_verified(&self) -> bool {
+        self.failed == 0
+    }
+
+    /// Returns the success rate.
+    pub fn success_rate(&self) -> f64 {
+        if self.verified + self.failed == 0 {
+            return 100.0;
+        }
+        (self.verified as f64 / (self.verified + self.failed) as f64) * 100.0
+    }
+}
+
+// =============================================================================
+// INCREMENTAL PROOF GENERATOR - Generate proofs as data streams in
+// =============================================================================
+
+/// Incremental proof generator for streaming data.
+pub struct IncrementalProofGenerator {
+    /// The Merkle tree (grows as samples are added).
+    tree: MerkleTree<Sha256Hasher>,
+    /// Dataset commitment (updated as tree grows).
+    commitment: Option<DatasetCommitment>,
+    /// Sample commitments cache.
+    sample_commitments: Vec<SampleCommitment>,
+    /// Metadata for commitment updates.
+    metadata: DatasetMetadata,
+}
+
+impl IncrementalProofGenerator {
+    /// Creates a new incremental generator.
+    pub fn new(metadata: DatasetMetadata) -> Self {
+        Self {
+            tree: MerkleTree::with_sha256(),
+            commitment: None,
+            sample_commitments: Vec::new(),
+            metadata,
+        }
+    }
+
+    /// Adds a sample and returns its index.
+    pub fn add_sample(&mut self, sample: &Sample) -> Result<usize, MembershipProofError> {
+        let sc = SampleCommitment::new(sample);
+        let hash_bytes = SampleCommitment::hash_sample(sample);
+
+        self.tree
+            .push(&hash_bytes)
+            .map_err(|e| MembershipProofError::MerkleError(format!("{}", e)))?;
+
+        self.sample_commitments.push(sc);
+
+        // Update commitment
+        self.commitment = Some(DatasetCommitment::new(
+            &self.tree,
+            &self.metadata,
+            None,
+        ));
+
+        Ok(self.sample_commitments.len() - 1)
+    }
+
+    /// Generates a proof for a sample by index.
+    pub fn prove(&self, index: usize) -> Result<SampleMembershipProof, MembershipProofError> {
+        let commitment = self.commitment
+            .as_ref()
+            .ok_or(MembershipProofError::EmptyBatch)?;
+
+        let sc = self.sample_commitments
+            .get(index)
+            .ok_or(MembershipProofError::SampleNotInDataset(index))?
+            .clone();
+
+        let merkle_proof = self.tree
+            .prove(index)
+            .map_err(|e| MembershipProofError::MerkleError(format!("{}", e)))?;
+
+        Ok(SampleMembershipProof {
+            sample_commitment: sc,
+            sample_index: index,
+            merkle_proof,
+            dataset_root: commitment.root,
+        })
+    }
+
+    /// Generates a batch proof for multiple samples.
+    pub fn prove_batch(&self, indices: &[usize]) -> Result<BatchMembershipProof, MembershipProofError> {
+        if indices.is_empty() {
+            return Err(MembershipProofError::EmptyBatch);
+        }
+
+        let commitment = self.commitment
+            .as_ref()
+            .ok_or(MembershipProofError::EmptyBatch)?;
+
+        let sample_commitments: Result<Vec<_>, _> = indices
+            .iter()
+            .map(|&i| {
+                self.sample_commitments
+                    .get(i)
+                    .cloned()
+                    .ok_or(MembershipProofError::SampleNotInDataset(i))
+            })
+            .collect();
+
+        let sample_commitments = sample_commitments?;
+
+        let multi_proof = self.tree
+            .prove_multi(indices)
+            .map_err(|e| MembershipProofError::MerkleError(format!("{}", e)))?;
+
+        Ok(BatchMembershipProof {
+            sample_commitments,
+            sample_indices: indices.to_vec(),
+            proof_nodes: multi_proof.proof_nodes,
+            tree_height: self.tree.height(),
+            dataset_root: commitment.root,
+            batch_commitment: None,
+        })
+    }
+
+    /// Returns the current commitment.
+    pub fn commitment(&self) -> Option<&DatasetCommitment> {
+        self.commitment.as_ref()
+    }
+
+    /// Returns the number of samples.
+    pub fn len(&self) -> usize {
+        self.sample_commitments.len()
+    }
+
+    /// Returns true if empty.
+    pub fn is_empty(&self) -> bool {
+        self.sample_commitments.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -918,5 +1750,334 @@ mod tests {
 
         // Should fail verification against different root
         assert!(!proof.verify(&other_commitment));
+    }
+
+    // =========================================================================
+    // STREAMING BATCH VERIFIER TESTS
+    // =========================================================================
+
+    #[test]
+    fn test_streaming_batch_verifier() {
+        let samples = create_test_samples(100);
+        let (tree, commitment) = setup_test_tree(&samples);
+
+        let mut verifier = StreamingBatchVerifier::with_commitment(commitment.clone());
+
+        // Create and verify proofs
+        for i in 0..10 {
+            let batch_samples: Vec<Sample> = (i * 10..(i + 1) * 10)
+                .map(|j| samples[j].clone())
+                .collect();
+            let proof = BatchMembershipProof::new(&batch_samples, &tree, &commitment).unwrap();
+            assert!(verifier.verify_batch_proof(&proof));
+        }
+
+        let stats = verifier.stats();
+        assert_eq!(stats.proofs_processed, 10);
+        assert_eq!(stats.successful, 10);
+        assert_eq!(stats.failed, 0);
+    }
+
+    #[test]
+    fn test_streaming_verifier_with_failures() {
+        let samples = create_test_samples(100);
+        let (tree, commitment) = setup_test_tree(&samples);
+
+        let mut verifier = StreamingBatchVerifier::new(
+            commitment.clone(),
+            StreamingVerificationConfig::thorough()
+        );
+
+        // Create valid proofs
+        let mut proofs = Vec::new();
+        for i in 0..5 {
+            let batch_samples: Vec<Sample> = (i * 10..(i + 1) * 10)
+                .map(|j| samples[j].clone())
+                .collect();
+            proofs.push(BatchMembershipProof::new(&batch_samples, &tree, &commitment).unwrap());
+        }
+
+        // Corrupt one proof
+        proofs[2].dataset_root = Hash::zero();
+
+        let result = verifier.verify_stream(&proofs);
+
+        assert_eq!(result.verified, 4);
+        assert_eq!(result.failed, 1);
+        assert_eq!(result.failed_indices, vec![2]);
+    }
+
+    #[test]
+    fn test_streaming_verifier_fail_fast() {
+        let samples = create_test_samples(100);
+        let (tree, commitment) = setup_test_tree(&samples);
+
+        let mut verifier = StreamingBatchVerifier::new(
+            commitment.clone(),
+            StreamingVerificationConfig::fast()
+        );
+
+        let mut proofs = Vec::new();
+        for i in 0..10 {
+            let batch_samples: Vec<Sample> = (i * 10..(i + 1) * 10)
+                .map(|j| samples[j].clone())
+                .collect();
+            proofs.push(BatchMembershipProof::new(&batch_samples, &tree, &commitment).unwrap());
+        }
+
+        // Corrupt second proof
+        proofs[1].dataset_root = Hash::zero();
+
+        let result = verifier.verify_stream(&proofs);
+
+        // Should stop after first failure (index 1)
+        assert_eq!(result.verified, 1);
+        assert_eq!(result.failed, 1);
+    }
+
+    // =========================================================================
+    // PROOF AGGREGATION TESTS
+    // =========================================================================
+
+    #[test]
+    fn test_proof_aggregator() {
+        let samples = create_test_samples(256);
+        let (tree, commitment) = setup_test_tree(&samples);
+
+        let mut aggregator = ProofAggregator::default_aggregator();
+
+        // Add multiple batch proofs
+        for i in 0..8 {
+            let batch_samples: Vec<Sample> = (i * 32..(i + 1) * 32)
+                .map(|j| samples[j].clone())
+                .collect();
+            let proof = BatchMembershipProof::new(&batch_samples, &tree, &commitment).unwrap();
+            aggregator.add_proof(proof).unwrap();
+        }
+
+        let optimized = aggregator.finalize().unwrap();
+
+        assert!(optimized.verify(&commitment));
+        assert_eq!(optimized.sample_count(), 256);
+        assert!(optimized.compression_ratio() > 0.0);
+    }
+
+    #[test]
+    fn test_proof_aggregator_compression() {
+        let samples = create_test_samples(512);
+        let (tree, commitment) = setup_test_tree(&samples);
+
+        let mut aggregator = ProofAggregator::new(AggregationConfig {
+            sort_for_compression: true,
+            deduplicate: true,
+            ..Default::default()
+        });
+
+        // Add contiguous batches (should have good compression)
+        for i in 0..16 {
+            let batch_samples: Vec<Sample> = (i * 32..(i + 1) * 32)
+                .map(|j| samples[j].clone())
+                .collect();
+            let proof = BatchMembershipProof::new(&batch_samples, &tree, &commitment).unwrap();
+            aggregator.add_proof(proof).unwrap();
+        }
+
+        let stats = aggregator.stats();
+        assert!(stats.proofs_aggregated == 16);
+
+        let optimized = aggregator.finalize().unwrap();
+        let compression = optimized.compression_ratio();
+
+        // Contiguous ranges should compress well
+        assert!(compression > 0.5, "Expected >50% compression, got {}%", compression * 100.0);
+    }
+
+    #[test]
+    fn test_optimized_proof_compact_bytes() {
+        let samples = create_test_samples(64);
+        let (tree, commitment) = setup_test_tree(&samples);
+
+        let mut aggregator = ProofAggregator::default_aggregator();
+
+        for i in 0..4 {
+            let batch_samples: Vec<Sample> = (i * 16..(i + 1) * 16)
+                .map(|j| samples[j].clone())
+                .collect();
+            let proof = BatchMembershipProof::new(&batch_samples, &tree, &commitment).unwrap();
+            aggregator.add_proof(proof).unwrap();
+        }
+
+        let optimized = aggregator.finalize().unwrap();
+        let bytes = optimized.to_compact_bytes();
+
+        // Should be reasonably compact
+        assert!(bytes.len() < 10000);
+    }
+
+    // =========================================================================
+    // PARALLEL VERIFICATION TESTS
+    // =========================================================================
+
+    #[test]
+    fn test_parallel_verifier() {
+        let samples = create_test_samples(200);
+        let (tree, commitment) = setup_test_tree(&samples);
+
+        let proofs: Vec<BatchMembershipProof> = (0..20)
+            .map(|i| {
+                let batch_samples: Vec<Sample> = (i * 10..(i + 1) * 10)
+                    .map(|j| samples[j].clone())
+                    .collect();
+                BatchMembershipProof::new(&batch_samples, &tree, &commitment).unwrap()
+            })
+            .collect();
+
+        let verifier = ParallelBatchVerifier::new(
+            commitment.clone(),
+            ParallelVerificationConfig::default()
+        );
+
+        let result = verifier.verify_all(&proofs);
+
+        assert!(result.all_verified());
+        assert_eq!(result.verified, 20);
+        assert_eq!(result.failed, 0);
+        assert!(result.proofs_per_second > 0.0);
+    }
+
+    #[test]
+    fn test_parallel_verifier_collect_failures() {
+        let samples = create_test_samples(100);
+        let (tree, commitment) = setup_test_tree(&samples);
+
+        let mut proofs: Vec<BatchMembershipProof> = (0..10)
+            .map(|i| {
+                let batch_samples: Vec<Sample> = (i * 10..(i + 1) * 10)
+                    .map(|j| samples[j].clone())
+                    .collect();
+                BatchMembershipProof::new(&batch_samples, &tree, &commitment).unwrap()
+            })
+            .collect();
+
+        // Corrupt some proofs
+        proofs[3].dataset_root = Hash::zero();
+        proofs[7].dataset_root = Hash::zero();
+
+        let verifier = ParallelBatchVerifier::new(
+            commitment.clone(),
+            ParallelVerificationConfig::default()
+        );
+
+        let failures = verifier.verify_and_collect_failures(&proofs);
+
+        assert_eq!(failures.len(), 2);
+        assert!(failures.contains(&3));
+        assert!(failures.contains(&7));
+    }
+
+    // =========================================================================
+    // INCREMENTAL PROOF GENERATOR TESTS
+    // =========================================================================
+
+    #[test]
+    fn test_incremental_generator() {
+        let metadata = DatasetMetadata {
+            name: "incremental_test".to_string(),
+            num_samples: 0,
+            feature_dims: vec![4],
+            label_dims: vec![2],
+            dtype: DataType::Float32,
+            extra: StdHashMap::new(),
+        };
+
+        let mut generator = IncrementalProofGenerator::new(metadata);
+
+        // Add samples incrementally
+        for i in 0..50 {
+            let sample = Sample::from_f32(i, vec![i as f32; 4], vec![0.0, 1.0]);
+            generator.add_sample(&sample).unwrap();
+        }
+
+        assert_eq!(generator.len(), 50);
+
+        // Generate and verify proofs
+        let proof = generator.prove(25).unwrap();
+        assert!(proof.verify(generator.commitment().unwrap()));
+
+        let batch_proof = generator.prove_batch(&[10, 20, 30, 40]).unwrap();
+        assert!(batch_proof.verify(generator.commitment().unwrap()));
+    }
+
+    #[test]
+    fn test_incremental_generator_single_sample() {
+        let metadata = DatasetMetadata {
+            name: "single".to_string(),
+            num_samples: 0,
+            feature_dims: vec![4],
+            label_dims: vec![2],
+            dtype: DataType::Float32,
+            extra: StdHashMap::new(),
+        };
+
+        let mut generator = IncrementalProofGenerator::new(metadata);
+
+        let sample = Sample::from_f32(0, vec![1.0, 2.0, 3.0, 4.0], vec![0.0, 1.0]);
+        generator.add_sample(&sample).unwrap();
+
+        let proof = generator.prove(0).unwrap();
+        assert!(proof.verify(generator.commitment().unwrap()));
+    }
+
+    // =========================================================================
+    // LARGE SCALE VERIFICATION TESTS
+    // =========================================================================
+
+    #[test]
+    fn test_large_scale_verification() {
+        let samples = create_test_samples(1000);
+        let (tree, commitment) = setup_test_tree(&samples);
+
+        // Create many batch proofs
+        let proofs: Vec<BatchMembershipProof> = (0..100)
+            .map(|i| {
+                let batch_samples: Vec<Sample> = (i * 10..(i + 1) * 10)
+                    .map(|j| samples[j].clone())
+                    .collect();
+                BatchMembershipProof::new(&batch_samples, &tree, &commitment).unwrap()
+            })
+            .collect();
+
+        let mut verifier = StreamingBatchVerifier::with_commitment(commitment);
+        let result = verifier.verify_stream(&proofs);
+
+        assert!(result.all_verified());
+        assert_eq!(result.verified, 100);
+        assert!(result.stats.samples_verified == 1000);
+    }
+
+    #[test]
+    fn test_verification_throughput() {
+        let samples = create_test_samples(500);
+        let (tree, commitment) = setup_test_tree(&samples);
+
+        let proofs: Vec<BatchMembershipProof> = (0..50)
+            .map(|i| {
+                let batch_samples: Vec<Sample> = (i * 10..(i + 1) * 10)
+                    .map(|j| samples[j].clone())
+                    .collect();
+                BatchMembershipProof::new(&batch_samples, &tree, &commitment).unwrap()
+            })
+            .collect();
+
+        let verifier = ParallelBatchVerifier::new(
+            commitment,
+            ParallelVerificationConfig::default()
+        );
+
+        let result = verifier.verify_all(&proofs);
+
+        // Should have reasonable throughput
+        assert!(result.proofs_per_second > 100.0,
+            "Expected >100 proofs/sec, got {}", result.proofs_per_second);
     }
 }

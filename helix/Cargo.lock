@@ -2800,6 +2800,7 @@ dependencies = [
 name = "helix-core"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "proptest",
  "rand 0.8.5",
  "rand_distr",

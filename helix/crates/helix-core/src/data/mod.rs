@@ -41,13 +41,24 @@ pub use model::{
 pub use registry::{ModelEntry, ModelId, ModelRegistry, ModelStatus, ModelVersion};
 
 // Re-export sharding types
-pub use sharding::{DataShard, DataSharder, ShardAssignment, ShardId, ShardingConfig, ShardingStrategy};
+pub use sharding::{
+    DataShard, DataSharder, ShardAssignment, ShardId, ShardingConfig, ShardingStrategy,
+    // Worker types for distributed training
+    WorkerId, WorkerInfo, WorkerStatus, ShardStats, ShardRegistry, ShardRegistryConfig,
+    LocalityAwareAssigner, ShardStreamer, ShardStreamConfig, ShardChunk, ShardProgress,
+    OverallProgress, ShardMetadata, ShardVerification,
+};
 
 // Re-export Merkle tree types
 pub use merkle::{
     Hash, MerkleError, MerkleHasher, MerkleProof, MerkleTree, MerkleTreeBuilder,
     MerkleTreeConfig, MultiProof, ProofDirection, ProofStep, Sha256Hasher, TreePosition,
     HASH_SIZE,
+    // Streaming and memory-efficient builders
+    StreamingMerkleBuilder, StreamingConfig, StreamingStats,
+    ChunkedMerkleBuilder, IncrementalRootComputer,
+    ParallelMerkleBuilder, ParallelConfig,
+    SparseMerkleTree, ProofBatchVerifier,
 };
 
 // Re-export commitment types

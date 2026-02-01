@@ -108,6 +108,11 @@ pub use data::{
     Hash, MerkleError, MerkleHasher, MerkleProof, MerkleTree, MerkleTreeBuilder,
     MerkleTreeConfig, MultiProof, ProofDirection, ProofStep, Sha256Hasher, TreePosition,
     HASH_SIZE,
+    // Streaming and memory-efficient builders
+    StreamingMerkleBuilder, StreamingConfig, StreamingStats,
+    ChunkedMerkleBuilder, IncrementalRootComputer,
+    ParallelMerkleBuilder, ParallelConfig,
+    SparseMerkleTree, ProofBatchVerifier,
     // Commitments
     BatchCommitment, CommitmentError, CommitmentManager, DatasetCommitment, SampleCommitment,
     // Membership proofs
@@ -122,4 +127,8 @@ pub use data::{
     FallbackBehavior, FetchOptions, MultiSourceFetcher, PoolConfig, ResourceMetadata,
     UploadOptions, WritableDataSource, IpfsDataSource, IpfsSourceConfig,
     FilecoinClient, FilecoinConfig, FilecoinDataSource, S3Config, S3DataSource,
+    // Sharding types
+    WorkerId, WorkerInfo, WorkerStatus, ShardStats, ShardRegistry, LocalityAwareAssigner,
+    ShardStreamer, ShardStreamConfig, DataShard, DataSharder, ShardId, ShardingConfig,
+    ShardingStrategy, ShardAssignment,
 };

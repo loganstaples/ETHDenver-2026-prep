@@ -14,4 +14,8 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 [dev-dependencies]
 proptest = "1.4"
 tempfile = "3.10"
+criterion = { version = "0.5", features = ["html_reports"] }
 
+[[bench]]
+name = "data_pipeline_benchmarks"
+harness = false
