@@ -10,6 +10,12 @@ path = "src/main.rs"
 
 [dependencies]
 helix-core = { path = "../helix-core" }
+helix-avm = { path = "../helix-avm" }
+helix-prover = { path = "../helix-prover" }
+helix-circuits = { path = "../helix-circuits" }
+
+# Field arithmetic (for ZK proof integration)
+ff = "0.13"
 
 # CLI framework
 clap = { version = "4.0", features = ["derive", "env"] }

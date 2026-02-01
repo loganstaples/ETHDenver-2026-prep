@@ -241,7 +241,7 @@ constant uint64_t MONT_R[4] = {
 };
 
 // Montgomery reduction parameter: -p^(-1) mod 2^64
-constant uint64_t INV = 0xc2e1f593effffffULL;
+constant uint64_t INV = 0xc2e1f593efffffffULL;
 
 // 64x64 -> 128 bit multiplication
 inline void mul64(uint64_t a, uint64_t b, thread uint64_t& hi, thread uint64_t& lo) {
@@ -1193,9 +1193,8 @@ impl MsmEngine {
         result
     }
 
-    /// Add two projective points (simplified).
+    /// Add two projective points using complete Jacobian formulas.
     fn add_projective(&self, p: &ProjectivePoint, q: &ProjectivePoint) -> ProjectivePoint {
-        // Simplified addition - in production would use full formulas
         let p_is_id = p.z.iter().all(|&l| l == 0);
         let q_is_id = q.z.iter().all(|&l| l == 0);
 
@@ -1206,18 +1205,90 @@ impl MsmEngine {
             return *p;
         }
 
-        // Full addition would be implemented here
-        *p
+        // Full Jacobian addition formula
+        let z1_sq = field_mul_limbs(&p.z, &p.z);
+        let z2_sq = field_mul_limbs(&q.z, &q.z);
+        let z1_cu = field_mul_limbs(&z1_sq, &p.z);
+        let z2_cu = field_mul_limbs(&z2_sq, &q.z);
+
+        let u1 = field_mul_limbs(&p.x, &z2_sq);
+        let u2 = field_mul_limbs(&q.x, &z1_sq);
+        let s1 = field_mul_limbs(&p.y, &z2_cu);
+        let s2 = field_mul_limbs(&q.y, &z1_cu);
+
+        let h = field_sub_limbs(&u2, &u1);
+        let r = field_sub_limbs(&s2, &s1);
+
+        let h_is_zero = h.iter().all(|&l| l == 0);
+        let r_is_zero = r.iter().all(|&l| l == 0);
+
+        if h_is_zero && r_is_zero {
+            return self.double_projective(p);
+        }
+
+        if h_is_zero {
+            return ProjectivePoint::identity();
+        }
+
+        let hh = field_mul_limbs(&h, &h);
+        let hhh = field_mul_limbs(&hh, &h);
+        let v = field_mul_limbs(&u1, &hh);
+
+        let r_sq = field_mul_limbs(&r, &r);
+        let two_v = field_add_limbs(&v, &v);
+
+        let x3 = field_sub_limbs(&field_sub_limbs(&r_sq, &hhh), &two_v);
+
+        let v_minus_x3 = field_sub_limbs(&v, &x3);
+        let s1_hhh = field_mul_limbs(&s1, &hhh);
+        let y3 = field_sub_limbs(&field_mul_limbs(&r, &v_minus_x3), &s1_hhh);
+
+        let z1_z2 = field_mul_limbs(&p.z, &q.z);
+        let z3 = field_mul_limbs(&z1_z2, &h);
+
+        ProjectivePoint { x: x3, y: y3, z: z3 }
     }
 
-    /// Double a projective point (simplified).
+    /// Double a projective point using complete Jacobian doubling formula.
     fn double_projective(&self, p: &ProjectivePoint) -> ProjectivePoint {
         if p.z.iter().all(|&l| l == 0) {
             return *p;
         }
 
-        // Full doubling would be implemented here
-        *p
+        // Jacobian doubling: BN254 has a=0
+        // A = Y^2
+        // B = 4*X*A
+        // C = 8*A^2
+        // D = 3*X^2
+        // X3 = D^2 - 2*B
+        // Y3 = D*(B - X3) - C
+        // Z3 = 2*Y*Z
+
+        let a = field_mul_limbs(&p.y, &p.y);
+        let b = field_mul_limbs(&p.x, &a);
+        let two_b = field_add_limbs(&b, &b);
+        let four_b = field_add_limbs(&two_b, &two_b);
+
+        let a_sq = field_mul_limbs(&a, &a);
+        let two_a_sq = field_add_limbs(&a_sq, &a_sq);
+        let four_a_sq = field_add_limbs(&two_a_sq, &two_a_sq);
+        let c = field_add_limbs(&four_a_sq, &four_a_sq); // 8*A^2
+
+        let x_sq = field_mul_limbs(&p.x, &p.x);
+        let two_x_sq = field_add_limbs(&x_sq, &x_sq);
+        let d = field_add_limbs(&two_x_sq, &x_sq); // 3*X^2
+
+        let d_sq = field_mul_limbs(&d, &d);
+        let two_four_b = field_add_limbs(&four_b, &four_b);
+        let x3 = field_sub_limbs(&d_sq, &two_four_b);
+
+        let b_minus_x3 = field_sub_limbs(&four_b, &x3);
+        let y3 = field_sub_limbs(&field_mul_limbs(&d, &b_minus_x3), &c);
+
+        let y1_z1 = field_mul_limbs(&p.y, &p.z);
+        let z3 = field_add_limbs(&y1_z1, &y1_z1);
+
+        ProjectivePoint { x: x3, y: y3, z: z3 }
     }
 }
 
@@ -1256,7 +1327,7 @@ const MONT_R2: [u64; 4] = [
 ];
 
 /// -p^{-1} mod 2^64.
-const INV: u64 = 0xc2e1f593effffff;
+const INV: u64 = 0xc2e1f593efffffff;
 
 /// Compare two limb arrays.
 fn cmp_limbs(a: &[u64; 4], b: &[u64; 4]) -> i32 {

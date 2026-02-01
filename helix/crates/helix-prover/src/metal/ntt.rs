@@ -167,7 +167,7 @@ constant uint64_t MONT_R[4] = {
 };
 
 // Montgomery reduction parameter
-constant uint64_t INV = 0xc2e1f593effffffULL;
+constant uint64_t INV = 0xc2e1f593efffffffULL;
 
 // 64x64 -> 128 bit multiplication
 inline void mul64(uint64_t a, uint64_t b, thread uint64_t& hi, thread uint64_t& lo) {
@@ -1151,7 +1151,7 @@ const MONT_R2: [u64; 4] = [
 ];
 
 /// -p^{-1} mod 2^64.
-const INV: u64 = 0xc2e1f593effffff;
+const INV: u64 = 0xc2e1f593efffffff;
 
 /// Bit-reverse a number.
 fn bit_reverse(x: usize, log_n: usize) -> usize {

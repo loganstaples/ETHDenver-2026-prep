@@ -259,6 +259,7 @@ impl PoolInner {
             self.bytes_in_use += actual_size;
             self.stats.cache_hits += 1;
             self.stats.num_allocations += 1;
+            self.stats.bytes_in_use = self.bytes_in_use;
 
             return Some(PooledBuffer {
                 id: handle.id,
@@ -291,6 +292,7 @@ impl PoolInner {
         self.stats.cache_misses += 1;
         self.stats.num_allocations += 1;
         self.stats.total_allocated = self.total_allocated;
+        self.stats.bytes_in_use = self.bytes_in_use;
 
         if self.bytes_in_use > self.stats.peak_usage {
             self.stats.peak_usage = self.bytes_in_use;
