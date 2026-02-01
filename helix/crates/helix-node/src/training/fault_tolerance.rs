@@ -393,15 +393,16 @@ impl FailureDetector {
 
             // Try to get replacement
             let replacement_peer = self.get_replacement_worker();
+            let action = if replacement_peer.is_some() {
+                ReplacementAction::AssignReplacement
+            } else {
+                ReplacementAction::ContinueDegraded
+            };
             return Some(WorkerReplacement {
                 failed_peer: peer_id.clone(),
                 replacement_peer,
                 shard_index: 0, // Would be set by caller
-                action: if replacement_peer.is_some() {
-                    ReplacementAction::AssignReplacement
-                } else {
-                    ReplacementAction::ContinueDegraded
-                },
+                action,
             });
         }
 
@@ -775,9 +776,20 @@ impl FaultToleranceManager {
         self.detector.unregister_worker(peer_id);
     }
 
-    /// Records a heartbeat.
+    /// Records a heartbeat with latency.
     pub fn record_heartbeat(&self, peer_id: &PeerId, latency_ms: f64) {
         self.detector.record_heartbeat(peer_id, latency_ms);
+    }
+
+    /// Records a heartbeat with default latency (convenience method).
+    pub fn record_heartbeat_simple(&self, peer_id: PeerId) {
+        self.detector.record_heartbeat(&peer_id, 10.0); // Assume healthy latency
+    }
+
+    /// Detects failed workers (returns list of failed peer IDs).
+    pub fn detect_failures(&self) -> Vec<PeerId> {
+        let replacements = self.detector.check_failures();
+        replacements.into_iter().map(|r| r.failed_peer).collect()
     }
 
     /// Checks for failures and handles them.

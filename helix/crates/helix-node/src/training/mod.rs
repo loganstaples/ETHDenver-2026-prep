@@ -106,7 +106,7 @@ pub use synchronization::{
 
 pub use fault_tolerance::{
     WorkerHealth, WorkerHealthInfo, FaultToleranceConfig,
-    FailureDetector, RecoveryCoordinator, RecoveryState, RecoveryAttempt,
+    FailureDetector, RecoveryCoordinator, RecoveryState as FaultRecoveryState, RecoveryAttempt,
     FaultToleranceManager, FaultEvent, WorkerReplacement, ReplacementAction,
 };
 

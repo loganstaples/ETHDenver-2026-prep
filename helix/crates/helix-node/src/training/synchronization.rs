@@ -46,6 +46,8 @@ pub enum SyncPhase {
     GradientsComputed,
     /// Gradients submitted.
     GradientsSubmitted,
+    /// Ready for aggregation.
+    AggregationReady,
     /// Aggregation complete.
     AggregationComplete,
     /// Round committed on-chain.
@@ -62,6 +64,7 @@ impl std::fmt::Display for SyncPhase {
             Self::ComputationStarted => write!(f, "ComputationStarted"),
             Self::GradientsComputed => write!(f, "GradientsComputed"),
             Self::GradientsSubmitted => write!(f, "GradientsSubmitted"),
+            Self::AggregationReady => write!(f, "AggregationReady"),
             Self::AggregationComplete => write!(f, "AggregationComplete"),
             Self::RoundCommitted => write!(f, "RoundCommitted"),
             Self::Custom(id) => write!(f, "Custom({})", id),
@@ -717,6 +720,45 @@ impl SyncCoordinator {
     /// Returns the worker count.
     pub fn worker_count(&self) -> usize {
         self.workers.read().len()
+    }
+
+    /// Creates a barrier with the specified workers and timeout (convenience method).
+    pub fn create_barrier(
+        &self,
+        phase: SyncPhase,
+        workers: Vec<PeerId>,
+        timeout: Duration,
+    ) -> Arc<SyncBarrier> {
+        let config = BarrierConfig {
+            timeout,
+            ..Default::default()
+        };
+        let workers_set: HashSet<PeerId> = workers.into_iter().collect();
+        self.barrier_manager.create_barrier(phase, workers_set, Some(config))
+    }
+
+    /// Arrives at a barrier and waits for all participants.
+    pub async fn arrive_and_wait(
+        &self,
+        phase: SyncPhase,
+        peer_id: PeerId,
+        timeout: Duration,
+    ) -> BarrierResult {
+        // Arrive at the barrier
+        let _ = self.barrier_manager.arrive_at_phase(phase, &peer_id, None);
+
+        // Wait for the barrier with timeout
+        match tokio::time::timeout(timeout, self.barrier_manager.wait_for_phase(phase)).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => BarrierResult::Cancelled {
+                reason: "Phase barrier not found".to_string(),
+            },
+            Err(_) => BarrierResult::Timeout {
+                arrived: Vec::new(),
+                missing: Vec::new(),
+                duration: timeout,
+            },
+        }
     }
 }
 

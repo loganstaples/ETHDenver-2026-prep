@@ -584,9 +584,13 @@ pub fn simulate_gkr_proof<F: PrimeField>(
             };
             challenge_idx += 1;
 
-            // Simplified: create a linear polynomial
+            // Simplified: create a linear polynomial p(x) = c0 + c1*x
+            // p(0) = c0, p(1) = c0 + c1
+            // claimed_sum = p(0) + p(1)
             let coefficients = vec![F::from(1u64), F::from(1u64)];
-            let claimed_sum = coefficients[0] + coefficients[1];
+            let p0 = coefficients[0];  // p(0) = c0 = 1
+            let p1: F = coefficients.iter().copied().fold(F::ZERO, |a, b| a + b);  // p(1) = c0 + c1 = 2
+            let claimed_sum = p0 + p1;  // 1 + 2 = 3
 
             sumcheck_rounds.push(SumcheckRound::new(coefficients, claimed_sum, challenge));
         }

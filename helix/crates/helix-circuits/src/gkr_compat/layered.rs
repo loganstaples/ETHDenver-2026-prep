@@ -419,17 +419,18 @@ impl<F: PrimeField> LayeredCircuit<F> {
             return vec![];
         }
 
-        // Start from the input layer (last layer)
+        // Start with input values
         let mut current_values = inputs.to_vec();
 
-        // Pad to layer size if needed
-        let input_layer = &self.layers[self.layers.len() - 1];
+        // Pad to input layer size if needed (layer 0 is input layer)
+        let input_layer = &self.layers[0];
         while current_values.len() < input_layer.size() {
             current_values.push(F::ZERO);
         }
 
-        // Evaluate layer by layer from input to output
-        for layer in self.layers.iter().rev().skip(1) {
+        // Evaluate layer by layer from input (layer 0) to output (last layer)
+        // Skip the input layer (layer 0) and evaluate subsequent layers
+        for layer in self.layers.iter().skip(1) {
             current_values = layer.evaluate(&current_values);
         }
 
@@ -444,9 +445,9 @@ impl<F: PrimeField> LayeredCircuit<F> {
 
         let mut all_values = Vec::with_capacity(self.layers.len());
 
-        // Start from the input layer
+        // Start with input values (layer 0 is input layer)
         let mut current_values = inputs.to_vec();
-        let input_layer = &self.layers[self.layers.len() - 1];
+        let input_layer = &self.layers[0];
         while current_values.len() < input_layer.size() {
             current_values.push(F::ZERO);
         }
@@ -454,13 +455,13 @@ impl<F: PrimeField> LayeredCircuit<F> {
         // Store input layer values
         all_values.push(current_values.clone());
 
-        // Evaluate and store each layer
-        for layer in self.layers.iter().rev().skip(1) {
+        // Evaluate and store each subsequent layer
+        for layer in self.layers.iter().skip(1) {
             current_values = layer.evaluate(&current_values);
             all_values.push(current_values.clone());
         }
 
-        // Reverse so index 0 is output layer
+        // Reverse so index 0 is output layer (last computed layer)
         all_values.reverse();
         all_values
     }

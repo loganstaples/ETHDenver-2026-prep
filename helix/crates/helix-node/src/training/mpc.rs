@@ -28,6 +28,7 @@ use helix_mpc::sharing::model::{
 use helix_mpc::sharing::tensor::TensorShare;
 use helix_mpc::sharing::AdditiveSharing;
 use helix_mpc::types::{MPCConfig, PartyId, ShareId};
+use helix_mpc::Fr;
 
 use crate::trainer::{backward, forward, Gradients, MlpModel};
 
@@ -132,11 +133,11 @@ fn gradients_to_share(
     d_hid: usize,
     d_out: usize,
 ) -> GradientShare {
-    // Convert f64 gradients to f64 for shares.
-    let dw1: Vec<f64> = grads.dw1.clone();
-    let db1: Vec<f64> = grads.db1.clone();
-    let dw2: Vec<f64> = grads.dw2.clone();
-    let db2: Vec<f64> = grads.db2.clone();
+    // Convert f64 gradients to Fr field elements for shares.
+    let dw1: Vec<Fr> = grads.dw1.iter().map(|&v| Fr::from_f64(v)).collect();
+    let db1: Vec<Fr> = grads.db1.iter().map(|&v| Fr::from_f64(v)).collect();
+    let dw2: Vec<Fr> = grads.dw2.iter().map(|&v| Fr::from_f64(v)).collect();
+    let db2: Vec<Fr> = grads.db2.iter().map(|&v| Fr::from_f64(v)).collect();
 
     // Layer 0 gradients.
     let mut layer0_grads = HashMap::new();
@@ -422,7 +423,7 @@ impl MPCTrainingRound {
             for (name, tensor) in &layer.gradients {
                 hasher.update(name.as_bytes());
                 for v in &tensor.data {
-                    hasher.update(v.to_le_bytes());
+                    hasher.update(&v.to_bytes_le());
                 }
             }
         }
@@ -433,11 +434,12 @@ impl MPCTrainingRound {
     /// Verifies a worker's computation for adversarial behavior.
     fn verify_worker_computation(&self, comp: &WorkerComputation) -> Result<(), SlashingReason> {
         // Check gradient norm bounds.
-        let mut total_norm_sq = 0.0;
+        let mut total_norm_sq: f64 = 0.0;
         for layer in &comp.gradient_share.layers {
             for (_, tensor) in &layer.gradients {
                 for v in &tensor.data {
-                    total_norm_sq += v * v;
+                    let val = v.to_f64();
+                    total_norm_sq += val * val;
                 }
             }
         }
@@ -596,11 +598,12 @@ impl AdversarialDetector {
 
     /// Computes the L2 norm of a gradient share.
     pub fn compute_gradient_norm(grad: &GradientShare) -> f64 {
-        let mut norm_sq = 0.0;
+        let mut norm_sq: f64 = 0.0;
         for layer in &grad.layers {
             for (_, tensor) in &layer.gradients {
                 for v in &tensor.data {
-                    norm_sq += v * v;
+                    let val = v.to_f64();
+                    norm_sq += val * val;
                 }
             }
         }
@@ -654,7 +657,9 @@ impl AdversarialDetector {
         commitment: &ShareCommitment,
         blinding: &[u8; 32],
     ) -> bool {
-        commitment.verify_vector(&share.data, blinding)
+        // Convert Fr field elements back to f64 for verification
+        let data_f64: Vec<f64> = share.data.iter().map(|v| v.to_f64()).collect();
+        commitment.verify_vector(&data_f64, blinding)
     }
 }
 
@@ -810,7 +815,7 @@ mod tests {
             "w".to_string(),
             TensorShare::new(
                 ShareId::new(party.clone(), "grad", 0),
-                vec![0.1; 10],
+                (0..10).map(|_| Fr::from_f64(0.1)).collect(),
                 vec![2, 5],
             ),
         );
@@ -835,7 +840,7 @@ mod tests {
             "w".to_string(),
             TensorShare::new(
                 ShareId::new(party.clone(), "grad", 0),
-                vec![100.0; 10], // Very large values
+                (0..10).map(|_| Fr::from_f64(100.0)).collect(), // Very large values
                 vec![2, 5],
             ),
         );
@@ -897,10 +902,11 @@ mod tests {
 
             // Make party 1's gradient maliciously large.
             if i == 1 {
+                let amplify = Fr::from_u64(1000);
                 for layer in &mut comp.gradient_share.layers {
                     for (_, tensor) in &mut layer.gradients {
                         for v in &mut tensor.data {
-                            *v *= 1000.0; // Amplify gradients
+                            *v = *v * amplify; // Amplify gradients
                         }
                     }
                 }

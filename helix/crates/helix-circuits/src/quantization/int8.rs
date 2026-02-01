@@ -643,15 +643,25 @@ impl<F: PrimeField> Circuit<F> for Int8MatMulCircuit<F> {
                         }
 
                         // Verify requantization
+                        // Constraint: accumulator = output * output_scale + error
+                        // Since output = round(accumulator * requant_scale),
+                        // we need output_scale = 1 / requant_scale
                         let output = self.c[i][j];
-                        let requant_scale_fp = (self.requant_scale * 1000.0).round() as u64;
-                        let error = acc as i64 - (output as i64 * 1000 / requant_scale_fp as i64);
+                        // Use fixed-point representation for output_scale
+                        let fp_scale = 1000u64;
+                        let output_scale_fp = if self.requant_scale.abs() > 1e-10 {
+                            (fp_scale as f64 / self.requant_scale).round() as u64
+                        } else {
+                            fp_scale
+                        };
+                        // error = accumulator - output * output_scale
+                        let error = (acc as i64) * (fp_scale as i64) - (output as i64) * (output_scale_fp as i64);
 
                         chip.verify_requantization(
                             &mut region,
                             row,
-                            Value::known(Self::i32_to_field(acc)),
-                            Value::known(F::from(requant_scale_fp)),
+                            Value::known(Self::i32_to_field(acc) * F::from(fp_scale)),
+                            Value::known(F::from(output_scale_fp)),
                             Value::known(Self::i8_to_field(output)),
                             Value::known(Self::i64_to_field(error)),
                         )?;

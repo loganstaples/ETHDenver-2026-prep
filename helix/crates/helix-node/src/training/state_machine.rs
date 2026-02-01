@@ -19,21 +19,31 @@ use crate::network::messages::PeerId;
 
 /// Unique identifier for a distributed training round.
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, Serialize, Deserialize)]
-pub struct DistributedRoundId(pub u64);
+pub struct DistributedRoundId {
+    /// Session ID.
+    pub session_id: u64,
+    /// Round number within the session.
+    pub round_number: u64,
+}
 
 impl DistributedRoundId {
-    pub fn new(id: u64) -> Self {
-        Self(id)
+    pub fn new(session_id: u64, round_number: u64) -> Self {
+        Self { session_id, round_number }
+    }
+
+    /// Creates from a single ID (for backwards compatibility).
+    pub fn from_round(round_number: u64) -> Self {
+        Self { session_id: 0, round_number }
     }
 
     pub fn next(&self) -> Self {
-        Self(self.0 + 1)
+        Self { session_id: self.session_id, round_number: self.round_number + 1 }
     }
 }
 
 impl std::fmt::Display for DistributedRoundId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "DRound({})", self.0)
+        write!(f, "DRound(s{}-r{})", self.session_id, self.round_number)
     }
 }
 
@@ -196,7 +206,17 @@ impl RoundWorker {
 /// Event emitted by the state machine.
 #[derive(Debug, Clone)]
 pub enum StateMachineEvent {
-    /// State changed.
+    /// Round created.
+    RoundCreated {
+        round_id: DistributedRoundId,
+    },
+    /// State transition occurred.
+    StateTransition {
+        round_id: DistributedRoundId,
+        from: DistributedRoundState,
+        to: DistributedRoundState,
+    },
+    /// State changed (alias for StateTransition).
     StateChanged {
         round_id: DistributedRoundId,
         from: DistributedRoundState,
@@ -669,7 +689,7 @@ impl DistributedTrainingStateMachine {
         }
 
         self.round_counter += 1;
-        let round_id = DistributedRoundId::new(self.round_counter);
+        let round_id = DistributedRoundId::from_round(self.round_counter);
         let config = config.unwrap_or_else(|| self.default_config.clone());
 
         let mut round = DistributedRound::new(round_id, config, initial_commitment);
@@ -690,13 +710,15 @@ impl DistributedTrainingStateMachine {
 
     /// Adds a worker to the current round.
     pub fn add_worker(&mut self, peer_id: PeerId, stake: u64) -> Result<u32, String> {
-        let round = self.current_round.as_mut().ok_or("No active round")?;
-
-        let shard_index = round.add_worker(peer_id.clone(), stake)?;
-        let worker_count = round.active_worker_count();
+        let (round_id, shard_index, worker_count) = {
+            let round = self.current_round.as_mut().ok_or("No active round")?;
+            let shard_index = round.add_worker(peer_id.clone(), stake)?;
+            let worker_count = round.active_worker_count();
+            (round.id, shard_index, worker_count)
+        };
 
         self.emit(StateMachineEvent::WorkerJoined {
-            round_id: round.id,
+            round_id,
             peer_id,
             worker_count,
         });
@@ -722,23 +744,26 @@ impl DistributedTrainingStateMachine {
 
     /// Attempts to advance to Distributing state.
     pub fn try_start_distribution(&mut self) -> Result<bool, String> {
-        let round = self.current_round.as_mut().ok_or("No active round")?;
+        let state_change = {
+            let round = self.current_round.as_mut().ok_or("No active round")?;
 
-        if round.state != DistributedRoundState::WaitingForWorkers {
-            return Ok(false);
-        }
+            if round.state != DistributedRoundState::WaitingForWorkers {
+                return Ok(false);
+            }
 
-        if !round.has_min_workers() {
-            return Ok(false);
-        }
+            if !round.has_min_workers() {
+                return Ok(false);
+            }
 
-        let old_state = round.state;
-        round.transition_to(DistributedRoundState::Distributing);
+            let old_state = round.state;
+            round.transition_to(DistributedRoundState::Distributing);
+            (round.id, old_state, round.state)
+        };
 
         self.emit(StateMachineEvent::StateChanged {
-            round_id: round.id,
-            from: old_state,
-            to: round.state,
+            round_id: state_change.0,
+            from: state_change.1,
+            to: state_change.2,
         });
 
         Ok(true)
@@ -746,28 +771,31 @@ impl DistributedTrainingStateMachine {
 
     /// Marks that shares have been distributed to all workers.
     pub fn mark_distribution_complete(&mut self) -> Result<(), String> {
-        let round = self.current_round.as_mut().ok_or("No active round")?;
+        let (round_id, worker_count, old_state, new_state) = {
+            let round = self.current_round.as_mut().ok_or("No active round")?;
 
-        if round.state != DistributedRoundState::Distributing {
-            return Err(format!(
-                "Not in Distributing state: {:?}",
-                round.state
-            ));
-        }
+            if round.state != DistributedRoundState::Distributing {
+                return Err(format!(
+                    "Not in Distributing state: {:?}",
+                    round.state
+                ));
+            }
 
-        let worker_count = round.active_worker_count();
-        let old_state = round.state;
-        round.transition_to(DistributedRoundState::Computing);
+            let worker_count = round.active_worker_count();
+            let old_state = round.state;
+            round.transition_to(DistributedRoundState::Computing);
+            (round.id, worker_count, old_state, round.state)
+        };
 
         self.emit(StateMachineEvent::SharesDistributed {
-            round_id: round.id,
+            round_id,
             worker_count,
         });
 
         self.emit(StateMachineEvent::StateChanged {
-            round_id: round.id,
+            round_id,
             from: old_state,
-            to: round.state,
+            to: new_state,
         });
 
         Ok(())
@@ -800,25 +828,31 @@ impl DistributedTrainingStateMachine {
 
     /// Attempts to advance to Collecting state.
     pub fn try_start_collection(&mut self) -> Result<bool, String> {
-        let round = self.current_round.as_mut().ok_or("No active round")?;
+        let state_change = {
+            let round = self.current_round.as_mut().ok_or("No active round")?;
 
-        if round.state != DistributedRoundState::Computing {
-            return Ok(false);
-        }
+            if round.state != DistributedRoundState::Computing {
+                return Ok(false);
+            }
 
-        // Check if we have submissions or timeout
-        if round.submitted_count() > 0
-            && (round.has_min_submissions() || round.is_timed_out())
-        {
-            let old_state = round.state;
-            round.transition_to(DistributedRoundState::Collecting);
+            // Check if we have submissions or timeout
+            if round.submitted_count() > 0
+                && (round.has_min_submissions() || round.is_timed_out())
+            {
+                let old_state = round.state;
+                round.transition_to(DistributedRoundState::Collecting);
+                Some((round.id, old_state, round.state))
+            } else {
+                None
+            }
+        };
 
+        if let Some((round_id, from, to)) = state_change {
             self.emit(StateMachineEvent::StateChanged {
-                round_id: round.id,
-                from: old_state,
-                to: round.state,
+                round_id,
+                from,
+                to,
             });
-
             return Ok(true);
         }
 
@@ -827,22 +861,28 @@ impl DistributedTrainingStateMachine {
 
     /// Attempts to advance to Aggregating state.
     pub fn try_start_aggregation(&mut self) -> Result<bool, String> {
-        let round = self.current_round.as_mut().ok_or("No active round")?;
+        let state_change = {
+            let round = self.current_round.as_mut().ok_or("No active round")?;
 
-        if round.state != DistributedRoundState::Collecting {
-            return Ok(false);
-        }
+            if round.state != DistributedRoundState::Collecting {
+                return Ok(false);
+            }
 
-        if round.has_min_submissions() || round.is_timed_out() {
-            let old_state = round.state;
-            round.transition_to(DistributedRoundState::Aggregating);
+            if round.has_min_submissions() || round.is_timed_out() {
+                let old_state = round.state;
+                round.transition_to(DistributedRoundState::Aggregating);
+                Some((round.id, old_state, round.state))
+            } else {
+                None
+            }
+        };
 
+        if let Some((round_id, from, to)) = state_change {
             self.emit(StateMachineEvent::StateChanged {
-                round_id: round.id,
-                from: old_state,
-                to: round.state,
+                round_id,
+                from,
+                to,
             });
-
             return Ok(true);
         }
 
@@ -857,24 +897,25 @@ impl DistributedTrainingStateMachine {
         included_count: usize,
         excluded_count: usize,
     ) -> Result<(), String> {
-        let round = self.current_round.as_mut().ok_or("No active round")?;
-
-        round.set_aggregation_result(aggregated_commitment, new_model_commitment)?;
-
-        let old_state = round.state;
-        round.transition_to(DistributedRoundState::Committing);
+        let (round_id, old_state, new_state) = {
+            let round = self.current_round.as_mut().ok_or("No active round")?;
+            round.set_aggregation_result(aggregated_commitment, new_model_commitment)?;
+            let old_state = round.state;
+            round.transition_to(DistributedRoundState::Committing);
+            (round.id, old_state, round.state)
+        };
 
         self.emit(StateMachineEvent::AggregationCompleted {
-            round_id: round.id,
+            round_id,
             included_count,
             excluded_count,
             aggregated_commitment,
         });
 
         self.emit(StateMachineEvent::StateChanged {
-            round_id: round.id,
+            round_id,
             from: old_state,
-            to: round.state,
+            to: new_state,
         });
 
         Ok(())
@@ -882,31 +923,31 @@ impl DistributedTrainingStateMachine {
 
     /// Records successful on-chain commit.
     pub fn record_commit(&mut self, tx_hash: [u8; 32]) -> Result<(), String> {
-        let round = self.current_round.as_mut().ok_or("No active round")?;
-
-        round.set_tx_hash(tx_hash)?;
-
-        let new_commitment = round.new_commitment.unwrap_or([0u8; 32]);
-        let old_state = round.state;
-        let duration = round.duration();
-        let workers_participated = round.submitted_count();
-
-        round.transition_to(DistributedRoundState::Completed);
+        let (round_id, new_commitment, old_state, new_state, duration, workers_participated) = {
+            let round = self.current_round.as_mut().ok_or("No active round")?;
+            round.set_tx_hash(tx_hash)?;
+            let new_commitment = round.new_commitment.unwrap_or([0u8; 32]);
+            let old_state = round.state;
+            let duration = round.duration();
+            let workers_participated = round.submitted_count();
+            round.transition_to(DistributedRoundState::Completed);
+            (round.id, new_commitment, old_state, round.state, duration, workers_participated)
+        };
 
         self.emit(StateMachineEvent::Committed {
-            round_id: round.id,
+            round_id,
             tx_hash,
             new_model_commitment: new_commitment,
         });
 
         self.emit(StateMachineEvent::StateChanged {
-            round_id: round.id,
+            round_id,
             from: old_state,
-            to: round.state,
+            to: new_state,
         });
 
         self.emit(StateMachineEvent::RoundCompleted {
-            round_id: round.id,
+            round_id,
             duration,
             workers_participated,
         });
@@ -916,25 +957,28 @@ impl DistributedTrainingStateMachine {
 
     /// Marks the round as failed.
     pub fn fail_round(&mut self, reason: RoundFailureReason, message: &str) -> Result<(), String> {
-        let round = self.current_round.as_mut().ok_or("No active round")?;
+        let (round_id, old_state, new_state) = {
+            let round = self.current_round.as_mut().ok_or("No active round")?;
 
-        if round.state.is_terminal() {
-            return Err("Round already in terminal state".to_string());
-        }
+            if round.state.is_terminal() {
+                return Err("Round already in terminal state".to_string());
+            }
 
-        let old_state = round.state;
-        round.transition_to(DistributedRoundState::Failed(reason));
+            let old_state = round.state;
+            round.transition_to(DistributedRoundState::Failed(reason));
+            (round.id, old_state, round.state)
+        };
 
         self.emit(StateMachineEvent::RoundFailed {
-            round_id: round.id,
+            round_id,
             reason,
             message: message.to_string(),
         });
 
         self.emit(StateMachineEvent::StateChanged {
-            round_id: round.id,
+            round_id,
             from: old_state,
-            to: round.state,
+            to: new_state,
         });
 
         Ok(())
@@ -942,24 +986,28 @@ impl DistributedTrainingStateMachine {
 
     /// Checks for timeouts and handles them.
     pub fn check_timeouts(&mut self) -> Option<RoundFailureReason> {
-        let round = match self.current_round.as_mut() {
-            Some(r) if !r.state.is_terminal() => r,
-            _ => return None,
+        // First check if we have an active round that's timed out and gather info
+        let timeout_info = {
+            let round = match self.current_round.as_ref() {
+                Some(r) if !r.state.is_terminal() => r,
+                _ => return None,
+            };
+
+            if !round.is_timed_out() {
+                return None;
+            }
+
+            (round.id, round.state, round.can_proceed_degraded(), round.submitted_count())
         };
 
-        if !round.is_timed_out() {
-            return None;
-        }
-
-        let round_id = round.id;
-        let state = round.state;
+        let (round_id, state, can_degrade, submitted) = timeout_info;
 
         self.emit(StateMachineEvent::Timeout { round_id, state });
 
         // Determine failure reason based on state
         let reason = match state {
             DistributedRoundState::WaitingForWorkers => {
-                if round.can_proceed_degraded() {
+                if can_degrade {
                     // Try to proceed in degraded mode
                     if let Ok(true) = self.try_start_distribution() {
                         return None;
@@ -969,7 +1017,7 @@ impl DistributedTrainingStateMachine {
             }
             DistributedRoundState::Distributing => RoundFailureReason::DistributionFailed,
             DistributedRoundState::Computing => {
-                if round.submitted_count() > 0 && round.can_proceed_degraded() {
+                if submitted > 0 && can_degrade {
                     // Try to collect what we have
                     if let Ok(true) = self.try_start_collection() {
                         return None;
@@ -978,7 +1026,7 @@ impl DistributedTrainingStateMachine {
                 RoundFailureReason::ComputationTimeout
             }
             DistributedRoundState::Collecting => {
-                if round.submitted_count() > 0 {
+                if submitted > 0 {
                     // Try to aggregate what we have
                     if let Ok(true) = self.try_start_aggregation() {
                         return None;
@@ -997,16 +1045,23 @@ impl DistributedTrainingStateMachine {
 
     /// Checks for inactive workers and marks them as failed.
     pub fn check_inactive_workers(&mut self) -> Vec<PeerId> {
-        let round = match self.current_round.as_mut() {
-            Some(r) if !r.state.is_terminal() => r,
-            _ => return Vec::new(),
+        let (round_id, inactive) = {
+            let round = match self.current_round.as_mut() {
+                Some(r) if !r.state.is_terminal() => r,
+                _ => return Vec::new(),
+            };
+
+            let inactive = round.check_inactive_workers();
+            let round_id = round.id;
+
+            for peer_id in &inactive {
+                round.mark_worker_failed(peer_id, "Inactivity timeout");
+            }
+
+            (round_id, inactive)
         };
 
-        let inactive = round.check_inactive_workers();
-        let round_id = round.id;
-
         for peer_id in &inactive {
-            round.mark_worker_failed(peer_id, "Inactivity timeout");
             self.emit(StateMachineEvent::WorkerLeft {
                 round_id,
                 peer_id: peer_id.clone(),
@@ -1030,6 +1085,149 @@ impl DistributedTrainingStateMachine {
     /// Returns the completed rounds.
     pub fn completed_rounds(&self) -> &[RoundSummary] {
         &self.completed_rounds
+    }
+
+    /// Creates a new round with a list of workers (alternative to start_round).
+    pub fn create_round(&mut self, workers: Vec<PeerId>) -> Result<DistributedRoundId, String> {
+        let round_id = self.start_round([0u8; 32], None)?;
+
+        // Add all workers
+        for (i, peer_id) in workers.into_iter().enumerate() {
+            self.add_worker(peer_id, 1000)?;
+        }
+
+        Ok(round_id)
+    }
+
+    /// Records that a worker has submitted their contribution.
+    pub fn worker_submitted(&mut self, round_id: DistributedRoundId, worker_id: PeerId) -> Result<(), String> {
+        let round = self.current_round.as_mut().ok_or("No active round")?;
+
+        if round.id != round_id {
+            return Err(format!("Round mismatch: expected {:?}, got {:?}", round.id, round_id));
+        }
+
+        // Update worker state
+        if let Some(worker) = round.workers.get_mut(&worker_id) {
+            if worker.state == WorkerRoundState::Computing || worker.state == WorkerRoundState::SharesReceived {
+                worker.state = WorkerRoundState::Submitted;
+                worker.touch();
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Transitions to aggregation phase.
+    pub fn start_aggregation(&mut self, round_id: DistributedRoundId) -> Result<(), String> {
+        let (old_state, new_state) = {
+            let round = self.current_round.as_mut().ok_or("No active round")?;
+
+            if round.id != round_id {
+                return Err(format!("Round mismatch: expected {:?}, got {:?}", round.id, round_id));
+            }
+
+            if !matches!(round.state, DistributedRoundState::Computing | DistributedRoundState::Collecting) {
+                return Err(format!("Cannot start aggregation in state {:?}", round.state));
+            }
+
+            let old_state = round.state;
+            round.transition_to(DistributedRoundState::Aggregating);
+            (old_state, round.state)
+        };
+
+        self.emit(StateMachineEvent::StateChanged {
+            round_id,
+            from: old_state,
+            to: new_state,
+        });
+
+        Ok(())
+    }
+
+    /// Completes the aggregation phase.
+    pub fn complete_aggregation(&mut self, round_id: DistributedRoundId) -> Result<(), String> {
+        let round = self.current_round.as_mut().ok_or("No active round")?;
+
+        if round.id != round_id {
+            return Err(format!("Round mismatch: expected {:?}, got {:?}", round.id, round_id));
+        }
+
+        if round.state != DistributedRoundState::Aggregating {
+            return Err(format!("Cannot complete aggregation in state {:?}", round.state));
+        }
+
+        // Aggregation is complete, ready for commit
+        Ok(())
+    }
+
+    /// Transitions to commit phase.
+    pub fn start_commit(&mut self, round_id: DistributedRoundId) -> Result<(), String> {
+        let (old_state, new_state) = {
+            let round = self.current_round.as_mut().ok_or("No active round")?;
+
+            if round.id != round_id {
+                return Err(format!("Round mismatch: expected {:?}, got {:?}", round.id, round_id));
+            }
+
+            if round.state != DistributedRoundState::Aggregating {
+                return Err(format!("Cannot start commit in state {:?}", round.state));
+            }
+
+            let old_state = round.state;
+            round.transition_to(DistributedRoundState::Committing);
+            (old_state, round.state)
+        };
+
+        self.emit(StateMachineEvent::StateChanged {
+            round_id,
+            from: old_state,
+            to: new_state,
+        });
+
+        Ok(())
+    }
+
+    /// Completes a training round.
+    pub fn complete_round(&mut self, round_id: DistributedRoundId) -> Result<(), String> {
+        let (old_state, new_state, duration, workers_participated) = {
+            let round = self.current_round.as_mut().ok_or("No active round")?;
+
+            if round.id != round_id {
+                return Err(format!("Round mismatch: expected {:?}, got {:?}", round.id, round_id));
+            }
+
+            if !matches!(round.state, DistributedRoundState::Committing | DistributedRoundState::Aggregating) {
+                return Err(format!("Cannot complete round in state {:?}", round.state));
+            }
+
+            let old_state = round.state;
+            let duration = round.duration();
+            let workers_participated = round.submitted_count();
+            round.transition_to(DistributedRoundState::Completed);
+            (old_state, round.state, duration, workers_participated)
+        };
+
+        self.emit(StateMachineEvent::StateChanged {
+            round_id,
+            from: old_state,
+            to: new_state,
+        });
+
+        self.emit(StateMachineEvent::RoundCompleted {
+            round_id,
+            duration,
+            workers_participated,
+        });
+
+        Ok(())
+    }
+
+    /// Drains all pending events (returns empty vec for compatibility).
+    pub fn drain_events(&mut self) -> Vec<StateMachineEvent> {
+        // Events are broadcast as they happen, so there's no buffer to drain
+        // This method exists for API compatibility
+        Vec::new()
     }
 
     /// Archives a completed round.
@@ -1076,7 +1274,7 @@ mod tests {
 
         // Start round
         let round_id = sm.start_round([1u8; 32], None).unwrap();
-        assert_eq!(round_id.0, 1);
+        assert_eq!(round_id.round_number, 1);
 
         // Add workers
         sm.add_worker(create_peer_id(0), 1000).unwrap();

@@ -282,7 +282,8 @@ impl ProofCollector {
             return Err(RoundCommitError::DuplicateProof(proof.worker_id));
         }
 
-        self.proofs.insert(proof.worker_id, proof);
+        let worker_id = proof.worker_id.clone();
+        self.proofs.insert(worker_id, proof);
         Ok(())
     }
 
@@ -507,7 +508,7 @@ impl RoundCommitManager {
         let collector = self.collectors.get_mut(&commit_id)
             .ok_or(RoundCommitError::CollectionNotFound(commit_id))?;
 
-        let worker_id = proof.worker_id;
+        let worker_id = proof.worker_id.clone();
         collector.add_proof(proof)?;
 
         let proofs_collected = collector.proofs().len();
@@ -730,7 +731,7 @@ impl RoundCommitCoordinator {
         gradient_commitment: [u8; 32],
     ) -> WorkerProof {
         WorkerProof {
-            worker_id: self.worker_id,
+            worker_id: self.worker_id.clone(),
             proof: proof_bytes,
             public_inputs: TrainingProofInputs {
                 old_hash_lo: U256::from_big_endian(&old_commitment[..16]),
@@ -868,9 +869,7 @@ mod tests {
     use super::*;
 
     fn create_test_peer_id(id: u8) -> PeerId {
-        let mut bytes = [0u8; 32];
-        bytes[0] = id;
-        PeerId(bytes)
+        PeerId::from_string(&format!("test-peer-{}", id))
     }
 
     fn create_test_config() -> RoundCommitConfig {
@@ -1074,7 +1073,7 @@ mod tests {
     fn test_round_commit_coordinator_create_proof() {
         let config = create_test_config();
         let worker_id = create_test_peer_id(1);
-        let coordinator = RoundCommitCoordinator::new(config, worker_id);
+        let coordinator = RoundCommitCoordinator::new(config, worker_id.clone());
 
         let proof = coordinator.create_proof(
             vec![1, 2, 3, 4],

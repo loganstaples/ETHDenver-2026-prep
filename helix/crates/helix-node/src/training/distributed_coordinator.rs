@@ -92,7 +92,7 @@ impl Default for DistributedTrainingConfig {
             sync_config: BarrierConfig::default(),
             fault_tolerance_config: FaultToleranceConfig::default(),
             checkpoint_config: DistributedCheckpointConfig::default(),
-            worker_id: PeerId([0u8; 32]),
+            worker_id: PeerId::from_string("default-worker"),
             min_workers: 2,
             max_workers: 100,
             auto_recovery: true,
@@ -161,9 +161,10 @@ pub struct WorkerInfo {
 impl WorkerInfo {
     /// Creates a new worker info.
     pub fn new(peer_id: PeerId, stake: u64) -> Self {
+        let node_id = NodeId::new(format!("{}", peer_id));
         Self {
             peer_id,
-            node_id: NodeId::new(format!("{}", peer_id)),
+            node_id,
             stake,
             health: WorkerHealth::Healthy,
             round_state: None,
@@ -353,7 +354,8 @@ impl GradientShareCollector {
             return Err(format!("Already have share from {}", share.worker_id));
         }
 
-        self.shares.insert(share.worker_id, share);
+        let worker_id = share.worker_id.clone();
+        self.shares.insert(worker_id, share);
         Ok(())
     }
 
@@ -515,12 +517,12 @@ impl DistributedTrainingCoordinator {
 
     /// Returns the current leader.
     pub fn current_leader(&self) -> Option<PeerId> {
-        self.current_leader
+        self.current_leader.clone()
     }
 
     /// Returns whether this node is the leader.
     pub fn is_leader(&self) -> bool {
-        self.current_leader == Some(self.config.worker_id)
+        self.current_leader == Some(self.config.worker_id.clone())
     }
 
     /// Returns rounds completed.
@@ -545,11 +547,11 @@ impl DistributedTrainingCoordinator {
             .map_err(|e| DistributedCoordinatorError::CoordinatorError(e))?;
 
         // Register self as a worker
-        let self_info = WorkerInfo::new(self.config.worker_id, self.config.coordinator_config.stake);
-        self.workers.insert(self.config.worker_id, self_info);
+        let self_info = WorkerInfo::new(self.config.worker_id.clone(), self.config.coordinator_config.stake);
+        self.workers.insert(self.config.worker_id.clone(), self_info);
 
         // Initialize fault manager with self
-        self.fault_manager.register_worker(self.config.worker_id);
+        self.fault_manager.register_worker(self.config.worker_id.clone());
 
         self.state = DistributedTrainingState::WaitingForWorkers;
 
@@ -579,11 +581,11 @@ impl DistributedTrainingCoordinator {
         );
 
         // Add to our workers
-        let info = WorkerInfo::new(worker_id, stake);
-        self.workers.insert(worker_id, info);
+        let info = WorkerInfo::new(worker_id.clone(), stake);
+        self.workers.insert(worker_id.clone(), info);
 
         // Register with fault manager
-        self.fault_manager.register_worker(worker_id);
+        self.fault_manager.register_worker(worker_id.clone());
 
         self.pending_events.push(DistributedTrainingEvent::WorkerJoined {
             worker_id,
@@ -707,7 +709,7 @@ impl DistributedTrainingCoordinator {
 
         self.pending_events.push(DistributedTrainingEvent::RoundStarted {
             round_id,
-            leader: self.current_leader.unwrap_or(self.config.worker_id),
+            leader: self.current_leader.clone().unwrap_or_else(|| self.config.worker_id.clone()),
         });
 
         Ok(round_id)
@@ -722,7 +724,7 @@ impl DistributedTrainingCoordinator {
             .ok_or(DistributedCoordinatorError::NoActiveRound)?;
 
         let round_id = collector.round_id;
-        let worker_id = share.worker_id;
+        let worker_id = share.worker_id.clone();
 
         // Add share to collector
         collector.add_share(share)
@@ -735,7 +737,7 @@ impl DistributedTrainingCoordinator {
         }
 
         // Record heartbeat
-        self.fault_manager.record_heartbeat(worker_id);
+        self.fault_manager.record_heartbeat(&worker_id, 10.0);
 
         // Emit event
         let shares_collected = collector.shares().len();
@@ -743,13 +745,13 @@ impl DistributedTrainingCoordinator {
 
         self.pending_events.push(DistributedTrainingEvent::GradientShareCollected {
             round_id,
-            worker_id,
+            worker_id: worker_id.clone(),
             shares_collected,
             shares_required,
         });
 
         // Transition state machine
-        self.state_machine.worker_submitted(round_id, worker_id)
+        self.state_machine.worker_submitted(round_id, worker_id.clone())
             .map_err(|e| DistributedCoordinatorError::StateMachineError(e))?;
 
         // Check if we can proceed to aggregation
@@ -909,8 +911,8 @@ impl DistributedTrainingCoordinator {
     /// Elects a leader from available workers.
     fn elect_leader(&mut self) {
         let leader = self.compute_leader(0);
-        let old_leader = self.current_leader;
-        self.current_leader = Some(leader);
+        let old_leader = self.current_leader.clone();
+        self.current_leader = Some(leader.clone());
 
         // Update worker info
         for (id, worker) in self.workers.iter_mut() {
@@ -928,8 +930,8 @@ impl DistributedTrainingCoordinator {
     /// Elects a leader for a specific round.
     fn elect_leader_for_round(&mut self, round_id: DistributedRoundId) {
         let leader = self.compute_leader(round_id.round_number);
-        let old_leader = self.current_leader;
-        self.current_leader = Some(leader);
+        let old_leader = self.current_leader.clone();
+        self.current_leader = Some(leader.clone());
 
         // Update worker info
         for (id, worker) in self.workers.iter_mut() {
@@ -947,14 +949,14 @@ impl DistributedTrainingCoordinator {
     /// Computes leader for a given round using deterministic rotation.
     fn compute_leader(&self, round: u64) -> PeerId {
         let mut worker_ids: Vec<PeerId> = self.workers.keys().cloned().collect();
-        worker_ids.sort_by_key(|id| id.0);
+        worker_ids.sort_by_key(|id| id.0.clone());
 
         if worker_ids.is_empty() {
-            return self.config.worker_id;
+            return self.config.worker_id.clone();
         }
 
         let leader_idx = (round as usize) % worker_ids.len();
-        worker_ids[leader_idx]
+        worker_ids[leader_idx].clone()
     }
 
     // ========================================================================
@@ -1007,7 +1009,7 @@ impl DistributedTrainingCoordinator {
 
     /// Processes heartbeat from a worker.
     pub fn process_heartbeat(&mut self, worker_id: PeerId) {
-        self.fault_manager.record_heartbeat(worker_id);
+        self.fault_manager.record_heartbeat(&worker_id, 10.0);
 
         if let Some(worker) = self.workers.get_mut(&worker_id) {
             worker.touch();
@@ -1025,7 +1027,7 @@ impl DistributedTrainingCoordinator {
             }
 
             self.pending_events.push(DistributedTrainingEvent::FaultDetected {
-                worker_id: *worker_id,
+                worker_id: worker_id.clone(),
                 fault_type: "Heartbeat timeout".to_string(),
             });
         }
@@ -1040,9 +1042,9 @@ impl DistributedTrainingCoordinator {
 
     /// Handles worker failures.
     async fn handle_worker_failures(&mut self, failed_workers: &[PeerId]) {
-        for &worker_id in failed_workers {
+        for worker_id in failed_workers {
             // Remove failed worker
-            let _ = self.remove_worker(worker_id, "Heartbeat timeout".to_string());
+            let _ = self.remove_worker(worker_id.clone(), "Heartbeat timeout".to_string());
 
             // Check if we need to pause training
             if self.workers.len() < self.config.min_workers {
@@ -1062,7 +1064,7 @@ impl DistributedTrainingCoordinator {
             }
 
             // Check if leader failed
-            if self.current_leader == Some(worker_id) {
+            if self.current_leader.as_ref() == Some(worker_id) {
                 self.elect_leader();
             }
         }
@@ -1116,10 +1118,10 @@ impl DistributedTrainingCoordinator {
         phase: SyncPhase,
     ) -> Result<BarrierResult, DistributedCoordinatorError> {
         let result = self.sync_coordinator
-            .arrive_and_wait(phase, self.config.worker_id, self.config.collection_timeout)
+            .arrive_and_wait(phase, self.config.worker_id.clone(), self.config.collection_timeout)
             .await;
 
-        if matches!(result, BarrierResult::AllArrived) {
+        if matches!(result, BarrierResult::AllArrived { .. }) {
             self.pending_events.push(DistributedTrainingEvent::BarrierSynchronized {
                 phase,
                 participants: self.workers.len(),
@@ -1151,12 +1153,12 @@ impl DistributedTrainingCoordinator {
 
         for event in events {
             match event {
-                StateMachineEvent::RoundCreated { round_id } => {
+                StateMachineEvent::RoundCreated { round_id: _ } => {
                     // Already handled in start_round
                 }
                 StateMachineEvent::StateTransition {
                     round_id,
-                    from,
+                    from: _,
                     to,
                 } => {
                     self.pending_events.push(DistributedTrainingEvent::RoundPhaseChanged {
@@ -1164,13 +1166,13 @@ impl DistributedTrainingCoordinator {
                         phase: to,
                     });
                 }
-                StateMachineEvent::WorkerJoined { round_id, worker_id } => {
+                StateMachineEvent::WorkerJoined { round_id: _, peer_id: _, worker_count: _ } => {
                     // Update worker state
                 }
-                StateMachineEvent::RoundCompleted { round_id, duration } => {
+                StateMachineEvent::RoundCompleted { round_id: _, duration: _, workers_participated: _ } => {
                     // Already handled in complete_round
                 }
-                StateMachineEvent::RoundFailed { round_id, reason } => {
+                StateMachineEvent::RoundFailed { round_id, reason, message: _ } => {
                     self.pending_events.push(DistributedTrainingEvent::RoundFailed {
                         round_id,
                         reason: format!("{:?}", reason),
@@ -1281,9 +1283,7 @@ mod tests {
     use super::*;
 
     fn create_test_peer_id(id: u8) -> PeerId {
-        let mut bytes = [0u8; 32];
-        bytes[0] = id;
-        PeerId(bytes)
+        PeerId::from_string(&format!("test-peer-{}", id))
     }
 
     fn create_test_config() -> DistributedTrainingConfig {
@@ -1457,23 +1457,28 @@ mod tests {
             create_test_peer_id(1),
             create_test_peer_id(2),
         ];
-        worker_ids.sort_by_key(|id| id.0);
+        worker_ids.sort_by_key(|id| id.0.clone());
+
+        // After sorting: test-peer-1, test-peer-2, test-peer-3
+        assert_eq!(worker_ids[0].0, "test-peer-1");
+        assert_eq!(worker_ids[1].0, "test-peer-2");
+        assert_eq!(worker_ids[2].0, "test-peer-3");
 
         // Round 0 -> worker 0
         let leader_idx = 0 % worker_ids.len();
-        assert_eq!(worker_ids[leader_idx].0[0], 1);
+        assert_eq!(worker_ids[leader_idx].0, "test-peer-1");
 
         // Round 1 -> worker 1
         let leader_idx = 1 % worker_ids.len();
-        assert_eq!(worker_ids[leader_idx].0[0], 2);
+        assert_eq!(worker_ids[leader_idx].0, "test-peer-2");
 
         // Round 2 -> worker 2
         let leader_idx = 2 % worker_ids.len();
-        assert_eq!(worker_ids[leader_idx].0[0], 3);
+        assert_eq!(worker_ids[leader_idx].0, "test-peer-3");
 
         // Round 3 -> back to worker 0
         let leader_idx = 3 % worker_ids.len();
-        assert_eq!(worker_ids[leader_idx].0[0], 1);
+        assert_eq!(worker_ids[leader_idx].0, "test-peer-1");
     }
 
     #[test]

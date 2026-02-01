@@ -168,7 +168,8 @@ impl DistributedCheckpoint {
 
     /// Adds a worker contribution.
     pub fn add_contribution(&mut self, contribution: WorkerCheckpointContribution) {
-        self.contributions.insert(contribution.worker_id, contribution);
+        let worker_id = contribution.worker_id.clone();
+        self.contributions.insert(worker_id, contribution);
         if self.is_complete() {
             self.status = DistributedCheckpointStatus::Verifying;
         } else {
@@ -607,15 +608,15 @@ impl DistributedCheckpointCoordinator {
 
         // Verify worker is required
         if !checkpoint.required_workers.contains(&contribution.worker_id) {
-            return Err(DistributedCheckpointError::UnexpectedWorker(contribution.worker_id));
+            return Err(DistributedCheckpointError::UnexpectedWorker(contribution.worker_id.clone()));
         }
 
         // Check for duplicate contribution
         if checkpoint.contributions.contains_key(&contribution.worker_id) {
-            return Err(DistributedCheckpointError::DuplicateContribution(contribution.worker_id));
+            return Err(DistributedCheckpointError::DuplicateContribution(contribution.worker_id.clone()));
         }
 
-        let worker_id = contribution.worker_id;
+        let worker_id = contribution.worker_id.clone();
         let remaining = checkpoint.missing_workers().len() - 1;
 
         checkpoint.add_contribution(contribution);
@@ -686,7 +687,7 @@ impl DistributedCheckpointCoordinator {
                     // Remove from active
                     self.active_checkpoints.write().remove(&checkpoint_id);
                 }
-                Err(e) => {
+                Err(ref e) => {
                     checkpoint.status = DistributedCheckpointStatus::Failed;
                     checkpoint.failure_reason = Some(e.to_string());
 
@@ -842,7 +843,7 @@ impl DistributedCheckpointCoordinator {
         }
 
         // Try disk
-        let filename = format!("shares-{}.json", worker_id);
+        let filename = format!("shares-{}.json", worker_id.clone());
         let path = self.config.distributed_dir.join(&filename);
 
         if path.exists() {
@@ -947,12 +948,12 @@ impl ResumeCoordinator {
     ) -> Result<ResumableTrainingState, DistributedCheckpointError> {
         let _ = self.event_tx.send(CheckpointEvent::ResumeStarted {
             checkpoint_id: checkpoint.id,
-            worker_id,
+            worker_id: worker_id.clone(),
         });
 
         // Get worker's contribution
         let contribution = checkpoint.contributions.get(&worker_id)
-            .ok_or(DistributedCheckpointError::WorkerNotInCheckpoint(worker_id))?;
+            .ok_or_else(|| DistributedCheckpointError::WorkerNotInCheckpoint(worker_id.clone()))?;
 
         // Load local checkpoint
         let local_checkpoint = self.checkpoint_coordinator
@@ -960,11 +961,11 @@ impl ResumeCoordinator {
             .ok_or(DistributedCheckpointError::NoLocalCheckpoint)?;
 
         // Load shares if available
-        let shares = self.checkpoint_coordinator.load_shares(worker_id);
+        let shares = self.checkpoint_coordinator.load_shares(worker_id.clone());
 
         let state = ResumableTrainingState {
             checkpoint_id: checkpoint.id,
-            worker_id,
+            worker_id: worker_id.clone(),
             worker_ids: checkpoint.required_workers.iter().cloned().collect(),
             progress: checkpoint.progress.clone(),
             round_state: contribution.round_state,
@@ -977,7 +978,7 @@ impl ResumeCoordinator {
             weights_path: local_checkpoint.metadata.weights_path,
             shares_path: shares.as_ref().map(|_| {
                 self.checkpoint_coordinator.config.distributed_dir
-                    .join(format!("shares-{}.json", worker_id))
+                    .join(format!("shares-{}.json", worker_id.clone()))
             }),
             pending_shares: None,
             leader_id: None,
@@ -986,7 +987,7 @@ impl ResumeCoordinator {
 
         let _ = self.event_tx.send(CheckpointEvent::ResumeCompleted {
             checkpoint_id: checkpoint.id,
-            worker_id,
+            worker_id: worker_id.clone(),
         });
 
         Ok(state)
@@ -1002,7 +1003,7 @@ impl ResumeCoordinator {
 
         for worker_id in workers {
             if checkpoint.contributions.contains_key(&worker_id) {
-                let state = self.create_resume_state(checkpoint, worker_id).await?;
+                let state = self.create_resume_state(checkpoint, worker_id.clone()).await?;
                 states.insert(worker_id, state);
             }
         }
@@ -1082,7 +1083,7 @@ impl CheckpointSyncHelper {
         };
 
         WorkerCheckpointContribution {
-            worker_id: self.worker_id,
+            worker_id: self.worker_id.clone(),
             local_checkpoint_id,
             share_commitment,
             iteration,
@@ -1229,9 +1230,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn create_test_peer_id(id: u8) -> PeerId {
-        let mut bytes = [0u8; 32];
-        bytes[0] = id;
-        PeerId(bytes)
+        PeerId(format!("peer-{}", id))
     }
 
     fn create_test_config(dir: &Path) -> DistributedCheckpointConfig {
@@ -1335,7 +1334,7 @@ mod tests {
             vec![4.0, 5.0, 6.0],
         ];
 
-        let share_ckpt = ShareCheckpoint::new(worker_id, 0, &shares, 2, 3);
+        let share_ckpt = ShareCheckpoint::new(worker_id.clone(), 0, &shares, 2, 3);
 
         assert_eq!(share_ckpt.worker_id, worker_id);
         assert_eq!(share_ckpt.share_index, 0);
@@ -1578,7 +1577,7 @@ mod tests {
         );
 
         let worker_id = create_test_peer_id(1);
-        let helper = CheckpointSyncHelper::new(coordinator, worker_id);
+        let helper = CheckpointSyncHelper::new(coordinator, worker_id.clone());
 
         let shares = vec![vec![1.0, 2.0], vec![3.0, 4.0]];
         let contribution = helper.create_contribution(
