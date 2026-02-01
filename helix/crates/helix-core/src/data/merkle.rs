@@ -893,6 +893,14 @@ impl<H: MerkleHasher> MerkleTree<H> {
         Ok(self.leaf_count - 1)
     }
 
+    /// Appends a pre-computed hash as a new leaf to the tree.
+    pub fn push_hash(&mut self, hash: Hash) -> Result<usize, MerkleError> {
+        self.leaves.push(hash);
+        self.leaf_count = self.leaves.len();
+        self.rebuild_internal()?;
+        Ok(self.leaf_count - 1)
+    }
+
     /// Updates a leaf at the given index.
     pub fn update(&mut self, index: usize, data: &[u8]) -> Result<(), MerkleError> {
         if index >= self.leaf_count {

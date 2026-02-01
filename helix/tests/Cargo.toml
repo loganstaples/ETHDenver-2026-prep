@@ -3,6 +3,7 @@ name = "helix-integration-tests"
 version = "0.1.0"
 edition = "2021"
 description = "Comprehensive end-to-end integration tests for HELIX trustless AI training"
+autobenches = false
 
 [lib]
 name = "helix_integration_tests"

@@ -1474,9 +1474,10 @@ impl IncrementalProofGenerator {
     pub fn add_sample(&mut self, sample: &Sample) -> Result<usize, MembershipProofError> {
         let sc = SampleCommitment::new(sample);
         let hash_bytes = SampleCommitment::hash_sample(sample);
+        let hash = Hash::from_bytes(hash_bytes);
 
         self.tree
-            .push(&hash_bytes)
+            .push_hash(hash)
             .map_err(|e| MembershipProofError::MerkleError(format!("{}", e)))?;
 
         self.sample_commitments.push(sc);

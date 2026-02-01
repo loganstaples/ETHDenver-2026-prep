@@ -84,11 +84,11 @@ fn test_full_pipeline_small_dataset() {
     let samples = create_realistic_samples(100, 32);
     let metadata = create_metadata("test_dataset", 100, 32);
 
-    // Create Merkle tree from samples - use add_leaf to match DatasetCommitment::from_samples behavior
+    // Create Merkle tree from samples - use add_hash to match DatasetCommitment::from_samples behavior
     let mut builder = MerkleTreeBuilder::with_sha256();
     for sample in &samples {
-        // from_samples uses add_leaf(&hash_sample(sample)), so we match that
-        builder = builder.add_leaf(&SampleCommitment::hash_sample(sample));
+        // from_samples uses add_hash(Hash::from_bytes(hash_sample(sample))), so we match that
+        builder = builder.add_hash(Hash::from_bytes(SampleCommitment::hash_sample(sample)));
     }
     let tree = builder.build().unwrap();
 
@@ -358,11 +358,10 @@ fn test_commitment_verification_chain() {
     // Create sample commitments
     let sample_commitments: Vec<SampleCommitment> = samples.iter().map(SampleCommitment::new).collect();
 
-    // Build tree matching from_samples behavior: add_leaf(&hash_sample(sample))
-    // This means the leaf hash is Hasher.hash_leaf(hash_sample(sample))
+    // Build tree matching from_samples behavior: add_hash(Hash::from_bytes(hash_sample(sample)))
     let mut builder = MerkleTreeBuilder::with_sha256();
     for sample in &samples {
-        builder = builder.add_leaf(&SampleCommitment::hash_sample(sample));
+        builder = builder.add_hash(Hash::from_bytes(SampleCommitment::hash_sample(sample)));
     }
     let tree = builder.build().unwrap();
 
@@ -372,7 +371,6 @@ fn test_commitment_verification_chain() {
     // Verify individual sample proofs
     for i in 0..sample_commitments.len() {
         let proof = tree.prove(i).unwrap();
-        // The leaf hash is the hashed sample hash (due to add_leaf behavior)
         assert!(proof.verify(&Sha256Hasher));
     }
 }
@@ -581,13 +579,13 @@ fn test_sharding_verification() {
     let sharder = DataSharder::new(config);
     let shards = sharder.shard(&samples);
 
-    // Create full dataset commitment (uses add_leaf internally)
+    // Create full dataset commitment (uses add_hash internally)
     let dataset_commitment = DatasetCommitment::from_samples(&samples, &metadata, None);
 
     // Build tree matching from_samples behavior
     let mut builder = MerkleTreeBuilder::with_sha256();
     for sample in &samples {
-        builder = builder.add_leaf(&SampleCommitment::hash_sample(sample));
+        builder = builder.add_hash(Hash::from_bytes(SampleCommitment::hash_sample(sample)));
     }
     let full_tree = builder.build().unwrap();
 
