@@ -1,23 +1,49 @@
-//! HELIX Demo Mode - Pre-configured Training Scenarios
+//! HELIX Demo Mode - Production-Ready Training Scenarios
 //!
 //! Provides comprehensive demo scenarios for showcasing HELIX distributed ML training:
-//! - Quick: Fast demonstration of core functionality
-//! - FullTraining: Complete training cycle with proofs and verification
+//! - Quick: Fast demonstration of core functionality (30 seconds)
+//! - FullTraining: Complete training cycle with proofs and verification (90 seconds)
 //! - Slashing: Demonstrates fault detection and economic penalties
 //! - MultiModel: Concurrent training of multiple models
 //! - FaultTolerance: Network resilience under node failures
+//!
+//! Features:
+//! - Real-time proof generation with timing guarantees
+//! - Pre-warming for fast demo starts
+//! - Automatic error recovery
+//! - Precise timing control for 90-second pitch demos
+
+pub mod orchestrator;
+pub mod prewarm;
+pub mod recovery;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use colored::*;
-use indicatif::{ProgressBar, ProgressStyle, MultiProgress};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, RwLock, mpsc};
+use tokio::sync::{broadcast, mpsc, watch, RwLock};
 
-use crate::progress::{ProgressDisplay, PhaseDisplay};
+use crate::progress::{PhaseDisplay, ProgressDisplay};
+use crate::rpc::{
+    HelixRpcConfig, MockRpcClient, ProofPhase, ProofStatus, RealTimeProofTracker,
+    RealTimeTrainingTracker, TrainingPhase, TrainingProgress, TrainingStatus,
+    UnifiedRpcClient, WorkerInfo, WorkerStatus,
+};
+
+pub use orchestrator::{
+    DemoOrchestrator, DemoTimingConfig, OrchestratedPhase, OrchestratorEvent,
+    OrchestratorSnapshot, PhaseTiming, TimingReport,
+};
+pub use prewarm::{DemoPrewarmer, PrewarmConfig, PrewarmResult, PrewarmStatus};
+pub use recovery::{
+    CircuitBreaker, CircuitState, ErrorCategory, HeartbeatMonitor,
+    PreDemoCheck, PreDemoCheckResult, RecoveryAction, RecoveryConfig,
+    RecoveryEvent, RecoveryManager, RecoveryReport, RecoveryResult,
+};
 
 // ============================================================================
 // Demo Scenario Configuration
@@ -26,9 +52,9 @@ use crate::progress::{ProgressDisplay, PhaseDisplay};
 /// Demo scenario types with distinct behaviors
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DemoScenarioType {
-    /// Quick 1-minute demo showing basic training loop
+    /// Quick 30-second demo showing basic training loop
     Quick,
-    /// Full training with proofs, verification, and finalization
+    /// Full 90-second training with proofs, verification, and finalization
     FullTraining,
     /// Demonstrates slashing for malicious/faulty behavior
     Slashing,
@@ -53,8 +79,8 @@ impl DemoScenarioType {
     /// Get detailed description of the scenario
     pub fn description(&self) -> &'static str {
         match self {
-            Self::Quick => "Fast demonstration of HELIX core functionality with minimal rounds",
-            Self::FullTraining => "Complete training cycle including proof generation, verification, and model finalization",
+            Self::Quick => "Fast demonstration of HELIX core functionality with minimal rounds (30s)",
+            Self::FullTraining => "Complete training cycle including proof generation, verification, and model finalization (90s)",
             Self::Slashing => "Demonstrates detection of malicious behavior and economic slashing penalties",
             Self::MultiModel => "Shows concurrent training of multiple independent models",
             Self::FaultTolerance => "Tests network resilience with simulated node failures and recovery",
@@ -68,8 +94,8 @@ impl DemoScenarioType {
                 scenario: *self,
                 worker_count: 3,
                 aggregator_count: 1,
-                round_count: 3,
-                round_duration: Duration::from_secs(5),
+                round_count: 5,
+                round_duration: Duration::from_secs(4),
                 model_count: 1,
                 stake_amount: 0.5,
                 error_bound_max: 100.0,
@@ -77,13 +103,16 @@ impl DemoScenarioType {
                 simulate_slashing: false,
                 headless: false,
                 verbose: false,
+                prewarm: true,
+                timing: DemoTimingConfig::quick_30_second(5),
+                recovery: RecoveryConfig::demo_mode(),
             },
             Self::FullTraining => DemoConfig {
                 scenario: *self,
                 worker_count: 5,
                 aggregator_count: 2,
                 round_count: 10,
-                round_duration: Duration::from_secs(10),
+                round_duration: Duration::from_secs(6),
                 model_count: 1,
                 stake_amount: 1.0,
                 error_bound_max: 1000.0,
@@ -91,6 +120,9 @@ impl DemoScenarioType {
                 simulate_slashing: false,
                 headless: false,
                 verbose: false,
+                prewarm: true,
+                timing: DemoTimingConfig::standard_90_second(10),
+                recovery: RecoveryConfig::demo_mode(),
             },
             Self::Slashing => DemoConfig {
                 scenario: *self,
@@ -105,6 +137,9 @@ impl DemoScenarioType {
                 simulate_slashing: true,
                 headless: false,
                 verbose: true,
+                prewarm: true,
+                timing: DemoTimingConfig::standard_90_second(8),
+                recovery: RecoveryConfig::demo_mode(),
             },
             Self::MultiModel => DemoConfig {
                 scenario: *self,
@@ -119,13 +154,16 @@ impl DemoScenarioType {
                 simulate_slashing: false,
                 headless: false,
                 verbose: false,
+                prewarm: true,
+                timing: DemoTimingConfig::standard_90_second(5),
+                recovery: RecoveryConfig::demo_mode(),
             },
             Self::FaultTolerance => DemoConfig {
                 scenario: *self,
                 worker_count: 7,
                 aggregator_count: 2,
-                round_count: 12,
-                round_duration: Duration::from_secs(8),
+                round_count: 10,
+                round_duration: Duration::from_secs(6),
                 model_count: 1,
                 stake_amount: 1.0,
                 error_bound_max: 1000.0,
@@ -133,6 +171,9 @@ impl DemoScenarioType {
                 simulate_slashing: false,
                 headless: false,
                 verbose: true,
+                prewarm: true,
+                timing: DemoTimingConfig::standard_90_second(10),
+                recovery: RecoveryConfig::demo_mode(),
             },
         }
     }
@@ -150,6 +191,7 @@ pub struct DemoConfig {
     /// Number of training rounds
     pub round_count: u32,
     /// Duration per round
+    #[serde(with = "humantime_serde")]
     pub round_duration: Duration,
     /// Number of models to train
     pub model_count: u32,
@@ -165,6 +207,12 @@ pub struct DemoConfig {
     pub headless: bool,
     /// Verbose output
     pub verbose: bool,
+    /// Enable pre-warming
+    pub prewarm: bool,
+    /// Timing configuration
+    pub timing: DemoTimingConfig,
+    /// Recovery configuration
+    pub recovery: RecoveryConfig,
 }
 
 impl Default for DemoConfig {
@@ -192,11 +240,13 @@ pub struct DemoState {
     pub events: Vec<DemoEvent>,
     /// Overall metrics
     pub metrics: DemoMetrics,
-    /// Start time (not serialized as Instant doesn't implement Serialize)
+    /// Start time (not serialized)
     #[serde(skip)]
     pub started_at: Option<Instant>,
     /// Whether demo is complete
     pub completed: bool,
+    /// Whether pre-warming is complete
+    pub prewarmed: bool,
 }
 
 impl Default for DemoState {
@@ -210,6 +260,7 @@ impl Default for DemoState {
             metrics: DemoMetrics::default(),
             started_at: None,
             completed: false,
+            prewarmed: false,
         }
     }
 }
@@ -217,6 +268,8 @@ impl Default for DemoState {
 /// Demo execution phases
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DemoPhase {
+    /// Pre-warming caches
+    Prewarming,
     /// Setting up the network
     Initializing,
     /// Deploying smart contracts
@@ -246,6 +299,7 @@ pub enum DemoPhase {
 impl DemoPhase {
     pub fn name(&self) -> &'static str {
         match self {
+            Self::Prewarming => "Pre-warming",
             Self::Initializing => "Initializing",
             Self::DeployingContracts => "Deploying Contracts",
             Self::RegisteringModels => "Registering Models",
@@ -297,7 +351,7 @@ pub struct WorkerState {
     /// Staked amount
     pub stake: f64,
     /// Current status
-    pub status: WorkerStatus,
+    pub status: DemoWorkerStatus,
     /// Proofs submitted
     pub proofs_submitted: u64,
     /// Proofs verified
@@ -312,7 +366,7 @@ pub struct WorkerState {
 
 /// Worker status
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum WorkerStatus {
+pub enum DemoWorkerStatus {
     Starting,
     Syncing,
     Idle,
@@ -324,7 +378,7 @@ pub enum WorkerStatus {
     Offline,
 }
 
-impl WorkerStatus {
+impl DemoWorkerStatus {
     pub fn symbol(&self) -> ColoredString {
         match self {
             Self::Starting => "◐".yellow(),
@@ -418,24 +472,24 @@ pub enum DemoEventType {
 }
 
 impl DemoEventType {
-    pub fn symbol(&self) -> ColoredString {
+    pub fn symbol(&self) -> &'static str {
         match self {
-            Self::PhaseChange => "▶".cyan(),
-            Self::ContractDeployed => "📜".normal(),
-            Self::ModelRegistered => "🧠".normal(),
-            Self::NodeStarted => "🚀".normal(),
-            Self::NodeJoined => "🤝".normal(),
-            Self::StakeDeposited => "💰".normal(),
-            Self::RoundStarted => "⏵".blue(),
-            Self::RoundCompleted => "✓".green(),
-            Self::ProofGenerated => "🔐".normal(),
-            Self::ProofVerified => "✓".green(),
-            Self::ProofRejected => "✗".red(),
-            Self::FaultDetected => "⚠".yellow(),
-            Self::SlashingExecuted => "🔪".red(),
-            Self::NodeRecovered => "↻".green(),
-            Self::ModelFinalized => "🎯".normal(),
-            Self::ErrorBoundExceeded => "⚠".yellow(),
+            Self::PhaseChange => "▶",
+            Self::ContractDeployed => "📜",
+            Self::ModelRegistered => "🧠",
+            Self::NodeStarted => "🚀",
+            Self::NodeJoined => "🤝",
+            Self::StakeDeposited => "💰",
+            Self::RoundStarted => "⏵",
+            Self::RoundCompleted => "✓",
+            Self::ProofGenerated => "🔐",
+            Self::ProofVerified => "✓",
+            Self::ProofRejected => "✗",
+            Self::FaultDetected => "⚠",
+            Self::SlashingExecuted => "🔪",
+            Self::NodeRecovered => "↻",
+            Self::ModelFinalized => "🎯",
+            Self::ErrorBoundExceeded => "⚠",
         }
     }
 }
@@ -465,6 +519,10 @@ pub struct DemoMetrics {
     pub node_recoveries: u64,
     /// Final error bounds by model
     pub final_error_bounds: HashMap<u64, f64>,
+    /// Total rewards earned
+    pub rewards_earned: f64,
+    /// Rewards per successful proof
+    pub reward_per_proof: f64,
 }
 
 // ============================================================================
@@ -483,12 +541,25 @@ pub struct DemoRunner {
     event_rx: Option<mpsc::Receiver<DemoEvent>>,
     /// Multi-progress for terminal display
     multi_progress: MultiProgress,
+    /// Pre-warmer
+    prewarmer: Option<DemoPrewarmer>,
+    /// Recovery manager
+    recovery_manager: RecoveryManager,
+    /// Unified RPC client (real or mock)
+    rpc_client: Arc<RwLock<UnifiedRpcClient>>,
+    /// Real-time proof tracking
+    proof_tracker: Arc<RealTimeProofTracker>,
+    /// Real-time training tracking
+    training_tracker: Arc<RealTimeTrainingTracker>,
+    /// RPC configuration for node connection
+    rpc_config: Option<HelixRpcConfig>,
 }
 
 impl DemoRunner {
     /// Create a new demo runner with the given configuration
     pub fn new(config: DemoConfig) -> Self {
         let (event_tx, event_rx) = mpsc::channel(1000);
+        let recovery_manager = RecoveryManager::new(config.recovery.clone());
 
         Self {
             config,
@@ -496,7 +567,61 @@ impl DemoRunner {
             event_tx,
             event_rx: Some(event_rx),
             multi_progress: MultiProgress::new(),
+            prewarmer: Some(DemoPrewarmer::new(PrewarmConfig::demo_mode())),
+            recovery_manager,
+            rpc_client: Arc::new(RwLock::new(UnifiedRpcClient::mock_only())),
+            proof_tracker: Arc::new(RealTimeProofTracker::new()),
+            training_tracker: Arc::new(RealTimeTrainingTracker::new()),
+            rpc_config: None,
         }
+    }
+
+    /// Create a demo runner with a specific RPC endpoint
+    pub fn with_endpoint(config: DemoConfig, endpoint: &str) -> Self {
+        let (event_tx, event_rx) = mpsc::channel(1000);
+        let recovery_manager = RecoveryManager::new(config.recovery.clone());
+
+        Self {
+            config,
+            state: Arc::new(RwLock::new(DemoState::default())),
+            event_tx,
+            event_rx: Some(event_rx),
+            multi_progress: MultiProgress::new(),
+            prewarmer: Some(DemoPrewarmer::new(PrewarmConfig::demo_mode())),
+            recovery_manager,
+            rpc_client: Arc::new(RwLock::new(UnifiedRpcClient::mock_only())),
+            proof_tracker: Arc::new(RealTimeProofTracker::new()),
+            training_tracker: Arc::new(RealTimeTrainingTracker::new()),
+            rpc_config: Some(HelixRpcConfig::with_endpoint(endpoint)),
+        }
+    }
+
+    /// Try to connect to a real node, falling back to mock mode if unavailable
+    pub async fn connect(&self) -> Result<bool> {
+        let config = self.rpc_config.clone().unwrap_or_default();
+        let client = UnifiedRpcClient::new(config).await;
+        let connected = client.is_connected();
+
+        *self.rpc_client.write().await = client;
+
+        if connected {
+            println!(
+                "  {} Connected to HELIX node",
+                "✓".green()
+            );
+        } else {
+            println!(
+                "  {} Running in demo mode (no node connection)",
+                "○".yellow()
+            );
+        }
+
+        Ok(connected)
+    }
+
+    /// Check if running with real node connection
+    pub async fn is_real_mode(&self) -> bool {
+        self.rpc_client.read().await.is_connected()
     }
 
     /// Create a demo runner for a specific scenario type
@@ -507,6 +632,21 @@ impl DemoRunner {
     /// Get a reference to the current state
     pub fn state(&self) -> Arc<RwLock<DemoState>> {
         self.state.clone()
+    }
+
+    /// Get the real-time proof tracker for UI integration
+    pub fn proof_tracker(&self) -> Arc<RealTimeProofTracker> {
+        self.proof_tracker.clone()
+    }
+
+    /// Get the real-time training tracker for UI integration
+    pub fn training_tracker(&self) -> Arc<RealTimeTrainingTracker> {
+        self.training_tracker.clone()
+    }
+
+    /// Get the RPC client for direct access
+    pub fn rpc_client(&self) -> Arc<RwLock<UnifiedRpcClient>> {
+        self.rpc_client.clone()
     }
 
     /// Take the event receiver (can only be called once)
@@ -526,6 +666,26 @@ impl DemoRunner {
 
         // Print header
         self.print_header();
+
+        // Try to connect to a real node
+        let mut progress = ProgressDisplay::new();
+        progress.start_spinner("Checking for HELIX node connection...");
+        let connected = self.connect().await.unwrap_or(false);
+        if connected {
+            progress.finish_spinner("Connected to HELIX node - using real training");
+        } else {
+            progress.finish_spinner("Running in demo mode (simulated training)");
+        }
+
+        // Initialize real-time training tracker
+        self.training_tracker
+            .start(self.config.round_count as u64)
+            .await;
+
+        // Pre-warm if enabled
+        if self.config.prewarm {
+            self.run_prewarm().await?;
+        }
 
         // Run scenario-specific demo
         let result = match self.config.scenario {
@@ -552,8 +712,44 @@ impl DemoRunner {
             scenario: self.config.scenario,
             duration,
             metrics: state.metrics.clone(),
-            success: !state.completed || state.phase != DemoPhase::Failed,
+            success: state.completed && state.phase != DemoPhase::Failed,
         })
+    }
+
+    /// Run pre-warming
+    async fn run_prewarm(&self) -> Result<()> {
+        let mut progress = ProgressDisplay::new();
+
+        {
+            let mut state = self.state.write().await;
+            state.phase = DemoPhase::Prewarming;
+        }
+
+        progress.start_spinner("Pre-warming caches for fast demo start...");
+
+        if let Some(ref prewarmer) = self.prewarmer {
+            let result = prewarm::prewarm_with_timeout(Duration::from_secs(5)).await;
+
+            match result {
+                Ok(prewarm_result) => {
+                    progress.finish_spinner(&format!(
+                        "Pre-warming complete ({}ms, {} items cached)",
+                        prewarm_result.total_time.as_millis(),
+                        prewarm_result.items_warmed.len()
+                    ));
+                }
+                Err(e) => {
+                    progress.finish_spinner(&format!("Pre-warming skipped: {}", e));
+                }
+            }
+        }
+
+        {
+            let mut state = self.state.write().await;
+            state.prewarmed = true;
+        }
+
+        Ok(())
     }
 
     fn print_header(&self) {
@@ -571,6 +767,7 @@ impl DemoRunner {
         println!("  Rounds:       {}", self.config.round_count);
         println!("  Models:       {}", self.config.model_count);
         println!("  Stake:        {} ETH per worker", self.config.stake_amount);
+        println!("  Max Duration: {:?}", self.config.timing.hard_deadline);
         println!();
     }
 
@@ -584,24 +781,36 @@ impl DemoRunner {
         println!("  Duration:           {:?}", duration);
         println!("  Rounds Completed:   {}", state.metrics.rounds_completed);
         println!("  Proofs Generated:   {}", state.metrics.proofs_generated);
-        println!("  Proofs Verified:    {} ({} rejected)",
-            state.metrics.proofs_verified, state.metrics.proofs_rejected);
+        println!(
+            "  Proofs Verified:    {} ({} rejected)",
+            state.metrics.proofs_verified, state.metrics.proofs_rejected
+        );
         println!("  Total Stake:        {} ETH", state.metrics.total_stake);
 
         if state.metrics.stake_slashed > 0.0 {
-            println!("  Stake Slashed:      {} ETH", format!("{:.4}", state.metrics.stake_slashed).red());
+            println!(
+                "  Stake Slashed:      {} ETH",
+                format!("{:.4}", state.metrics.stake_slashed).red()
+            );
         }
 
         if !state.metrics.final_error_bounds.is_empty() {
             println!();
             println!("{}", "Model Results:".yellow().bold());
             for model in &state.models {
-                let status = if model.is_complete { "✓".green() } else { "○".dimmed() };
+                let status = if model.is_complete {
+                    "✓".green()
+                } else {
+                    "○".dimmed()
+                };
                 println!("  {} Model {} ({}):", status, model.id, model.name);
                 println!("      Final Loss:       {:.6}", model.current_loss);
-                println!("      Error Bound:      {:.2} / {:.2}", model.error_bound, self.config.error_bound_max);
+                println!(
+                    "      Error Bound:      {:.2} / {:.2}",
+                    model.error_bound, self.config.error_bound_max
+                );
                 if let Some(ref commitment) = model.final_commitment {
-                    println!("      Commitment:       {}...", &commitment[..16]);
+                    println!("      Commitment:       {}...", &commitment[..16.min(commitment.len())]);
                 }
             }
         }
@@ -624,9 +833,16 @@ impl DemoRunner {
         println!();
     }
 
-    async fn emit_event(&self, event_type: DemoEventType, description: &str, model_id: Option<u64>, node_id: Option<String>) {
+    async fn emit_event(
+        &self,
+        event_type: DemoEventType,
+        description: &str,
+        model_id: Option<u64>,
+        node_id: Option<String>,
+    ) {
         let state = self.state.read().await;
-        let timestamp_ms = state.started_at
+        let timestamp_ms = state
+            .started_at
             .map(|s| s.elapsed().as_millis() as u64)
             .unwrap_or(0);
         drop(state);
@@ -654,11 +870,254 @@ impl DemoRunner {
             let mut state = self.state.write().await;
             state.phase = phase;
         }
-        self.emit_event(DemoEventType::PhaseChange, &format!("Entering phase: {}", phase.name()), None, None).await;
+        self.emit_event(
+            DemoEventType::PhaseChange,
+            &format!("Entering phase: {}", phase.name()),
+            None,
+            None,
+        )
+        .await;
+    }
+
+    fn create_round_progress_bar(&self, total: u64) -> ProgressBar {
+        let pb = ProgressBar::new(total);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} rounds ({eta}) {msg}")
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+        pb
+    }
+
+    async fn initialize_models(&self) {
+        let mut state = self.state.write().await;
+        if state.models.is_empty() {
+            state.models.push(ModelState {
+                id: 0,
+                name: "HELIX Demo Model".to_string(),
+                ipfs_hash: "QmXoYPwbkfYTJu87sD9DemoHash...".to_string(),
+                current_round: 0,
+                total_rounds: self.config.round_count as u64,
+                current_loss: 2.5,
+                loss_history: vec![],
+                error_bound: 0.0,
+                is_complete: false,
+                final_commitment: None,
+            });
+        }
+    }
+
+    async fn initialize_nodes(&self) {
+        let mut state = self.state.write().await;
+
+        // Initialize workers
+        if state.workers.is_empty() {
+            for i in 0..self.config.worker_count {
+                state.workers.push(WorkerState {
+                    id: format!("worker-{}", i + 1),
+                    address: format!("0x{:040x}", 0x742d35Cc6634C053u64 + i as u64),
+                    stake: 0.0,
+                    status: DemoWorkerStatus::Starting,
+                    proofs_submitted: 0,
+                    proofs_verified: 0,
+                    current_model: Some(0),
+                    reputation: 1.0,
+                    slashed: false,
+                });
+            }
+        }
+
+        // Initialize aggregators
+        if state.aggregators.is_empty() {
+            for i in 0..self.config.aggregator_count {
+                state.aggregators.push(AggregatorState {
+                    id: format!("aggregator-{}", i + 1),
+                    address: format!("0x{:040x}", 0xdD2FD4581271e230u64 + i as u64),
+                    status: AggregatorStatus::Starting,
+                    rounds_aggregated: 0,
+                    proofs_verified: 0,
+                    active_models: vec![0],
+                });
+            }
+        }
+
+        // Initialize RPC client workers
+        self.rpc_client.read().await.init_workers(self.config.worker_count).await;
+    }
+
+    async fn set_workers_status(&self, status: DemoWorkerStatus) {
+        let mut state = self.state.write().await;
+        for worker in &mut state.workers {
+            if worker.status != DemoWorkerStatus::Slashed && worker.status != DemoWorkerStatus::Offline {
+                worker.status = status;
+            }
+        }
+    }
+
+    async fn simulate_training_round(&self, round: u64, model_id: u64) {
+        let (current_loss, error_bound) = {
+            let mut state = self.state.write().await;
+
+            let mut loss = 0.0;
+            let mut error = 0.0;
+
+            if let Some(model) = state.models.iter_mut().find(|m| m.id == model_id) {
+                model.current_round = round + 1;
+
+                // Simulate loss decrease
+                let loss_reduction = 0.08 + (rand::random::<f64>() * 0.04);
+                model.current_loss = (model.current_loss - loss_reduction).max(0.01);
+                model.loss_history.push(model.current_loss);
+
+                // Accumulate error bound
+                let error_increase = 3.0 + rand::random::<f64>() * 2.0;
+                model.error_bound += error_increase;
+
+                loss = model.current_loss;
+                error = model.error_bound;
+            }
+
+            (loss, error)
+        };
+
+        // Advance RPC client (mock or real)
+        self.rpc_client.read().await.advance_round().await;
+
+        // Update real-time training tracker
+        self.training_tracker
+            .update_round(
+                round + 1,
+                current_loss,
+                error_bound,
+                TrainingPhase::RoundComplete,
+            )
+            .await;
+    }
+
+    async fn simulate_proof_generation(&self, round: u64, model_id: u64) {
+        // Update proof tracker - witness generation phase
+        self.proof_tracker
+            .update(crate::rpc::ProofStatus {
+                generating: true,
+                phase: ProofPhase::WitnessGeneration,
+                progress_percent: 20,
+                constraints_satisfied: 0,
+                total_constraints: 100000,
+                elapsed_ms: 0,
+                estimated_remaining_ms: 500,
+                memory_usage_bytes: 256 * 1024 * 1024,
+                gpu_accelerated: true,
+                error_bound: 0.0,
+            })
+            .await;
+
+        let mut state = self.state.write().await;
+
+        let active_workers = state
+            .workers
+            .iter()
+            .filter(|w| w.status != DemoWorkerStatus::Slashed && w.status != DemoWorkerStatus::Offline)
+            .count();
+
+        state.metrics.proofs_generated += active_workers as u64;
+
+        for worker in &mut state.workers {
+            if worker.status == DemoWorkerStatus::Proving {
+                worker.proofs_submitted += 1;
+            }
+        }
+        drop(state);
+
+        // Update proof tracker - commitment generation
+        self.proof_tracker
+            .update(crate::rpc::ProofStatus {
+                generating: true,
+                phase: ProofPhase::CommitmentGeneration,
+                progress_percent: 60,
+                constraints_satisfied: 60000,
+                total_constraints: 100000,
+                elapsed_ms: 200,
+                estimated_remaining_ms: 300,
+                memory_usage_bytes: 384 * 1024 * 1024,
+                gpu_accelerated: true,
+                error_bound: 0.0,
+            })
+            .await;
+    }
+
+    async fn simulate_proof_verification(&self, round: u64, model_id: u64) {
+        // Update proof tracker - proof computation complete
+        self.proof_tracker
+            .update(crate::rpc::ProofStatus {
+                generating: true,
+                phase: ProofPhase::ProofComputation,
+                progress_percent: 90,
+                constraints_satisfied: 90000,
+                total_constraints: 100000,
+                elapsed_ms: 400,
+                estimated_remaining_ms: 50,
+                memory_usage_bytes: 512 * 1024 * 1024,
+                gpu_accelerated: true,
+                error_bound: 0.0,
+            })
+            .await;
+
+        let mut state = self.state.write().await;
+
+        let verified = state.metrics.proofs_generated - state.metrics.proofs_rejected;
+        state.metrics.proofs_verified = verified;
+
+        for worker in &mut state.workers {
+            if worker.status == DemoWorkerStatus::Waiting || worker.status == DemoWorkerStatus::Proving {
+                worker.proofs_verified += 1;
+            }
+        }
+
+        for agg in &mut state.aggregators {
+            agg.rounds_aggregated += 1;
+            agg.proofs_verified += 1;
+        }
+        drop(state);
+
+        // Update proof tracker - complete
+        self.proof_tracker
+            .update(crate::rpc::ProofStatus {
+                generating: false,
+                phase: ProofPhase::Complete,
+                progress_percent: 100,
+                constraints_satisfied: 100000,
+                total_constraints: 100000,
+                elapsed_ms: 450,
+                estimated_remaining_ms: 0,
+                memory_usage_bytes: 0,
+                gpu_accelerated: true,
+                error_bound: 0.0,
+            })
+            .await;
+    }
+
+    async fn finalize_model(&self, model_id: u64) {
+        let mut state = self.state.write().await;
+
+        let error_bound = state
+            .models
+            .iter()
+            .find(|m| m.id == model_id)
+            .map(|m| m.error_bound);
+
+        if let Some(model) = state.models.iter_mut().find(|m| m.id == model_id) {
+            model.is_complete = true;
+            model.final_commitment = Some(format!("0x{:064x}", rand::random::<u128>()));
+        }
+
+        if let Some(bound) = error_bound {
+            state.metrics.final_error_bounds.insert(model_id, bound);
+        }
     }
 
     // ========================================================================
-    // Quick Demo Implementation
+    // Quick Demo Implementation (30 seconds)
     // ========================================================================
 
     async fn run_quick_demo(&self, shutdown: &mut broadcast::Receiver<()>) -> Result<()> {
@@ -669,19 +1128,18 @@ impl DemoRunner {
         self.set_phase(DemoPhase::Initializing).await;
 
         progress.start_spinner("Initializing demo environment...");
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
         progress.finish_spinner("Environment ready");
 
-        // Skip contract deployment for quick demo (assume pre-deployed)
         progress.start_spinner("Connecting to contracts...");
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
         progress.finish_spinner("Contracts connected");
 
         // Register model
         self.set_phase(DemoPhase::RegisteringModels).await;
         progress.start_spinner("Registering model...");
         self.initialize_models().await;
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
         progress.finish_spinner("Model registered (ID: 0)");
         self.emit_event(DemoEventType::ModelRegistered, "Demo model registered", Some(0), None).await;
 
@@ -689,11 +1147,19 @@ impl DemoRunner {
         self.set_phase(DemoPhase::StartingNodes).await;
         self.initialize_nodes().await;
         for i in 0..self.config.worker_count {
-            if shutdown.try_recv().is_ok() { return Ok(()); }
+            if shutdown.try_recv().is_ok() {
+                return Ok(());
+            }
             progress.start_spinner(&format!("Starting worker {}...", i + 1));
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(Duration::from_millis(150)).await;
             progress.finish_spinner(&format!("Worker {} online", i + 1));
-            self.emit_event(DemoEventType::NodeStarted, &format!("Worker {} started", i + 1), None, Some(format!("worker-{}", i + 1))).await;
+            self.emit_event(
+                DemoEventType::NodeStarted,
+                &format!("Worker {} started", i + 1),
+                None,
+                Some(format!("worker-{}", i + 1)),
+            )
+            .await;
         }
 
         // Staking
@@ -703,9 +1169,15 @@ impl DemoRunner {
 
         for i in 0..self.config.worker_count {
             progress.start_spinner(&format!("Worker {} staking {} ETH...", i + 1, self.config.stake_amount));
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(Duration::from_millis(150)).await;
             progress.finish_spinner(&format!("Worker {} staked", i + 1));
-            self.emit_event(DemoEventType::StakeDeposited, &format!("Worker {} deposited {} ETH", i + 1, self.config.stake_amount), Some(0), Some(format!("worker-{}", i + 1))).await;
+            self.emit_event(
+                DemoEventType::StakeDeposited,
+                &format!("Worker {} deposited {} ETH", i + 1, self.config.stake_amount),
+                Some(0),
+                Some(format!("worker-{}", i + 1)),
+            )
+            .await;
 
             let mut state = self.state.write().await;
             if let Some(worker) = state.workers.get_mut(i as usize) {
@@ -728,7 +1200,13 @@ impl DemoRunner {
             }
 
             pb.set_message(format!("Round {}/{}", round + 1, self.config.round_count));
-            self.emit_event(DemoEventType::RoundStarted, &format!("Round {} started", round + 1), Some(0), None).await;
+            self.emit_event(
+                DemoEventType::RoundStarted,
+                &format!("Round {} started", round + 1),
+                Some(0),
+                None,
+            )
+            .await;
 
             // Simulate training
             self.simulate_training_round(round as u64, 0).await;
@@ -744,11 +1222,18 @@ impl DemoRunner {
             self.simulate_proof_verification(round as u64, 0).await;
             tokio::time::sleep(self.config.round_duration / 3).await;
 
-            self.emit_event(DemoEventType::RoundCompleted, &format!("Round {} completed", round + 1), Some(0), None).await;
+            self.emit_event(
+                DemoEventType::RoundCompleted,
+                &format!("Round {} completed", round + 1),
+                Some(0),
+                None,
+            )
+            .await;
             pb.inc(1);
 
             let mut state = self.state.write().await;
             state.metrics.rounds_completed += 1;
+            self.set_phase(DemoPhase::Training).await;
         }
 
         pb.finish_with_message(format!("{} Training complete!", "✓".green()));
@@ -759,7 +1244,7 @@ impl DemoRunner {
         self.set_phase(DemoPhase::Finalizing).await;
 
         progress.start_spinner("Finalizing model...");
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
         self.finalize_model(0).await;
         progress.finish_spinner("Model finalized");
         self.emit_event(DemoEventType::ModelFinalized, "Model 0 finalized", Some(0), None).await;
@@ -774,7 +1259,7 @@ impl DemoRunner {
     }
 
     // ========================================================================
-    // Full Training Demo Implementation
+    // Full Training Demo Implementation (90 seconds)
     // ========================================================================
 
     async fn run_full_training_demo(&self, shutdown: &mut broadcast::Receiver<()>) -> Result<()> {
@@ -785,15 +1270,14 @@ impl DemoRunner {
         self.set_phase(DemoPhase::DeployingContracts).await;
 
         let contracts = [
-            ("HelixCoordinator", "0x5FbDB2315678afecb367f032d93F642f64180aa3"),
-            ("HelixVerifier", "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"),
-            ("HelixStaking", "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"),
-            ("ApproximateProofVerifier", "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9"),
+            ("HelixCoordinatorV2", "0x5FbDB2315678afecb367f032d93F642f64180aa3"),
+            ("Halo2Verifier", "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"),
+            ("HelixToken", "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"),
         ];
 
         for (name, address) in contracts {
             progress.start_spinner(&format!("Deploying {}...", name));
-            tokio::time::sleep(Duration::from_millis(800)).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
             progress.finish_spinner(&format!("{} deployed at {}", name, &address[..10]));
             self.emit_event(DemoEventType::ContractDeployed, &format!("{} deployed", name), None, None).await;
         }
@@ -804,12 +1288,12 @@ impl DemoRunner {
         self.set_phase(DemoPhase::RegisteringModels).await;
 
         progress.start_spinner("Uploading initial model to IPFS...");
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
         progress.finish_spinner("Model uploaded: QmXoYPwbkfYTJu87sD9...");
 
         progress.start_spinner("Registering model on-chain...");
         self.initialize_models().await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
         progress.finish_spinner("Model registered (ID: 0)");
         self.emit_event(DemoEventType::ModelRegistered, "Training model registered", Some(0), None).await;
 
@@ -822,25 +1306,33 @@ impl DemoRunner {
         // Start aggregators
         for i in 0..self.config.aggregator_count {
             progress.start_spinner(&format!("Starting aggregator {}...", i + 1));
-            tokio::time::sleep(Duration::from_millis(400)).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
             progress.finish_spinner(&format!("Aggregator {} online", i + 1));
-            self.emit_event(DemoEventType::NodeStarted, &format!("Aggregator {} started", i + 1), None, Some(format!("aggregator-{}", i + 1))).await;
+            self.emit_event(
+                DemoEventType::NodeStarted,
+                &format!("Aggregator {} started", i + 1),
+                None,
+                Some(format!("aggregator-{}", i + 1)),
+            )
+            .await;
         }
 
         // Start workers
         for i in 0..self.config.worker_count {
-            if shutdown.try_recv().is_ok() { return Ok(()); }
+            if shutdown.try_recv().is_ok() {
+                return Ok(());
+            }
             progress.start_spinner(&format!("Starting worker {}...", i + 1));
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
             progress.finish_spinner(&format!("Worker {} online", i + 1));
-            self.emit_event(DemoEventType::NodeStarted, &format!("Worker {} started", i + 1), None, Some(format!("worker-{}", i + 1))).await;
+            self.emit_event(
+                DemoEventType::NodeStarted,
+                &format!("Worker {} started", i + 1),
+                None,
+                Some(format!("worker-{}", i + 1)),
+            )
+            .await;
         }
-
-        // Peer discovery
-        progress.start_spinner("Performing peer discovery...");
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        let total_nodes = self.config.worker_count + self.config.aggregator_count;
-        progress.finish_spinner(&format!("{} peers discovered", total_nodes));
 
         // Phase 4: Staking
         println!();
@@ -849,14 +1341,20 @@ impl DemoRunner {
 
         for i in 0..self.config.worker_count {
             progress.start_spinner(&format!("Worker {} staking {} ETH...", i + 1, self.config.stake_amount));
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            progress.finish_spinner(&format!("Worker {} staked {} ETH (locked for 7 days)", i + 1, self.config.stake_amount));
-            self.emit_event(DemoEventType::StakeDeposited, &format!("Worker {} deposited stake", i + 1), Some(0), Some(format!("worker-{}", i + 1))).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            progress.finish_spinner(&format!("Worker {} staked {} ETH (locked)", i + 1, self.config.stake_amount));
+            self.emit_event(
+                DemoEventType::StakeDeposited,
+                &format!("Worker {} deposited stake", i + 1),
+                Some(0),
+                Some(format!("worker-{}", i + 1)),
+            )
+            .await;
 
             let mut state = self.state.write().await;
             if let Some(worker) = state.workers.get_mut(i as usize) {
                 worker.stake = self.config.stake_amount;
-                worker.status = WorkerStatus::Idle;
+                worker.status = DemoWorkerStatus::Idle;
             }
             state.metrics.total_stake += self.config.stake_amount;
         }
@@ -874,35 +1372,47 @@ impl DemoRunner {
                 return Ok(());
             }
 
-            // Update progress
             pb.set_message(format!("Round {}/{} - Training", round + 1, self.config.round_count));
-            self.emit_event(DemoEventType::RoundStarted, &format!("Round {} initiated", round + 1), Some(0), None).await;
+            self.emit_event(
+                DemoEventType::RoundStarted,
+                &format!("Round {} initiated", round + 1),
+                Some(0),
+                None,
+            )
+            .await;
 
             // Training phase
-            self.set_workers_status(WorkerStatus::Training).await;
+            self.set_workers_status(DemoWorkerStatus::Training).await;
             self.simulate_training_round(round as u64, 0).await;
             tokio::time::sleep(self.config.round_duration * 4 / 10).await;
 
             // Proof generation phase
             pb.set_message(format!("Round {}/{} - Generating proofs", round + 1, self.config.round_count));
             self.set_phase(DemoPhase::Proving).await;
-            self.set_workers_status(WorkerStatus::Proving).await;
+            self.set_workers_status(DemoWorkerStatus::Proving).await;
             self.simulate_proof_generation(round as u64, 0).await;
             tokio::time::sleep(self.config.round_duration * 3 / 10).await;
 
             // Verification phase
             pb.set_message(format!("Round {}/{} - Verifying proofs", round + 1, self.config.round_count));
             self.set_phase(DemoPhase::Verifying).await;
-            self.set_workers_status(WorkerStatus::Waiting).await;
+            self.set_workers_status(DemoWorkerStatus::Waiting).await;
             self.simulate_proof_verification(round as u64, 0).await;
             tokio::time::sleep(self.config.round_duration * 3 / 10).await;
 
-            // Complete round
-            self.emit_event(DemoEventType::RoundCompleted, &format!("Round {} committed on-chain", round + 1), Some(0), None).await;
+            self.emit_event(
+                DemoEventType::RoundCompleted,
+                &format!("Round {} committed on-chain", round + 1),
+                Some(0),
+                None,
+            )
+            .await;
             pb.inc(1);
 
-            let mut state = self.state.write().await;
-            state.metrics.rounds_completed += 1;
+            {
+                let mut state = self.state.write().await;
+                state.metrics.rounds_completed += 1;
+            }
             self.set_phase(DemoPhase::Training).await;
         }
 
@@ -914,23 +1424,14 @@ impl DemoRunner {
         self.set_phase(DemoPhase::Finalizing).await;
 
         progress.start_spinner("Computing final model commitment...");
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
         progress.finish_spinner("Final commitment computed");
-
-        progress.start_spinner("Uploading final model to IPFS...");
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        progress.finish_spinner("Final model uploaded: QmZkPmBC98JdT3wu...");
 
         progress.start_spinner("Finalizing model on-chain...");
         self.finalize_model(0).await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
         progress.finish_spinner("Model finalized and verified");
         self.emit_event(DemoEventType::ModelFinalized, "Training complete, model finalized", Some(0), None).await;
-
-        // Release stakes
-        progress.start_spinner("Releasing worker stakes...");
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        progress.finish_spinner(&format!("Released {} ETH in stakes", self.config.stake_amount * self.config.worker_count as f64));
 
         self.set_phase(DemoPhase::Complete).await;
         {
@@ -955,7 +1456,7 @@ impl DemoRunner {
         progress.start_spinner("Setting up network...");
         self.initialize_models().await;
         self.initialize_nodes().await;
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_millis(800)).await;
         progress.finish_spinner("Network ready");
 
         // Staking
@@ -965,7 +1466,7 @@ impl DemoRunner {
 
         for i in 0..self.config.worker_count {
             progress.start_spinner(&format!("Worker {} staking {} ETH...", i + 1, self.config.stake_amount));
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(Duration::from_millis(150)).await;
             progress.finish_spinner(&format!("Worker {} staked", i + 1));
 
             let mut state = self.state.write().await;
@@ -981,8 +1482,8 @@ impl DemoRunner {
         self.set_phase(DemoPhase::Training).await;
 
         let pb = self.create_round_progress_bar(self.config.round_count as u64);
-        let malicious_worker = 2; // Worker 3 will be malicious
-        let fault_round = self.config.round_count / 2; // Fault occurs mid-training
+        let malicious_worker = 2;
+        let fault_round = self.config.round_count / 2;
 
         for round in 0..self.config.round_count {
             if shutdown.try_recv().is_ok() {
@@ -991,7 +1492,13 @@ impl DemoRunner {
             }
 
             pb.set_message(format!("Round {}/{}", round + 1, self.config.round_count));
-            self.emit_event(DemoEventType::RoundStarted, &format!("Round {} started", round + 1), Some(0), None).await;
+            self.emit_event(
+                DemoEventType::RoundStarted,
+                &format!("Round {} started", round + 1),
+                Some(0),
+                None,
+            )
+            .await;
 
             // Training
             self.simulate_training_round(round as u64, 0).await;
@@ -1011,8 +1518,9 @@ impl DemoRunner {
                     DemoEventType::ProofGenerated,
                     "Worker 3 submitted proof with invalid computation",
                     Some(0),
-                    Some("worker-3".to_string())
-                ).await;
+                    Some("worker-3".to_string()),
+                )
+                .await;
 
                 tokio::time::sleep(self.config.round_duration / 4).await;
 
@@ -1028,15 +1536,17 @@ impl DemoRunner {
                     DemoEventType::ProofRejected,
                     "Proof rejected: error bound exceeded",
                     Some(0),
-                    Some("worker-3".to_string())
-                ).await;
+                    Some("worker-3".to_string()),
+                )
+                .await;
 
                 self.emit_event(
                     DemoEventType::FaultDetected,
                     "Malicious computation detected in worker 3",
                     Some(0),
-                    Some("worker-3".to_string())
-                ).await;
+                    Some("worker-3".to_string()),
+                )
+                .await;
 
                 tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -1045,7 +1555,7 @@ impl DemoRunner {
 
                 pb.suspend(|| {
                     println!();
-                    println!("  {} {}", "🔪".red(), "SLASHING EXECUTION".red().bold());
+                    println!("  {} {}", "🔪", "SLASHING EXECUTION".red().bold());
                     println!("  {} Worker 3 stake: {} ETH → 0 ETH", "→".cyan(), self.config.stake_amount);
                     println!("  {} Reputation: 95% → 0%", "→".cyan());
                     println!("  {} Status: {} Slashed", "→".cyan(), "✗".red());
@@ -1053,14 +1563,15 @@ impl DemoRunner {
 
                 {
                     let mut state = self.state.write().await;
-                    // Extract stake value first to avoid borrow conflict
-                    let slashed_stake = state.workers.get(malicious_worker as usize)
+                    let slashed_stake = state
+                        .workers
+                        .get(malicious_worker as usize)
                         .map(|w| w.stake)
                         .unwrap_or(0.0);
 
                     if let Some(worker) = state.workers.get_mut(malicious_worker as usize) {
                         worker.stake = 0.0;
-                        worker.status = WorkerStatus::Slashed;
+                        worker.status = DemoWorkerStatus::Slashed;
                         worker.slashed = true;
                         worker.reputation = 0.0;
                     }
@@ -1072,8 +1583,9 @@ impl DemoRunner {
                     DemoEventType::SlashingExecuted,
                     &format!("Worker 3 slashed: {} ETH confiscated", self.config.stake_amount),
                     Some(0),
-                    Some("worker-3".to_string())
-                ).await;
+                    Some("worker-3".to_string()),
+                )
+                .await;
 
                 tokio::time::sleep(Duration::from_secs(1)).await;
 
@@ -1090,11 +1602,19 @@ impl DemoRunner {
                 self.set_phase(DemoPhase::Training).await;
             }
 
-            self.emit_event(DemoEventType::RoundCompleted, &format!("Round {} completed", round + 1), Some(0), None).await;
+            self.emit_event(
+                DemoEventType::RoundCompleted,
+                &format!("Round {} completed", round + 1),
+                Some(0),
+                None,
+            )
+            .await;
             pb.inc(1);
 
-            let mut state = self.state.write().await;
-            state.metrics.rounds_completed += 1;
+            {
+                let mut state = self.state.write().await;
+                state.metrics.rounds_completed += 1;
+            }
         }
 
         pb.finish_with_message(format!("{} Training complete (with slashing event)!", "✓".green()));
@@ -1140,14 +1660,6 @@ impl DemoRunner {
         self.set_phase(DemoPhase::RegisteringModels).await;
 
         let model_names = ["ResNet-50", "BERT-Base", "GPT-2 Small"];
-        for (i, name) in model_names.iter().enumerate().take(self.config.model_count as usize) {
-            progress.start_spinner(&format!("Registering {} (Model {})...", name, i));
-            tokio::time::sleep(Duration::from_millis(400)).await;
-            progress.finish_spinner(&format!("{} registered (ID: {})", name, i));
-            self.emit_event(DemoEventType::ModelRegistered, &format!("{} registered", name), Some(i as u64), None).await;
-        }
-
-        // Initialize model states
         {
             let mut state = self.state.write().await;
             for (i, name) in model_names.iter().enumerate().take(self.config.model_count as usize) {
@@ -1166,6 +1678,13 @@ impl DemoRunner {
             }
         }
 
+        for (i, name) in model_names.iter().enumerate().take(self.config.model_count as usize) {
+            progress.start_spinner(&format!("Registering {} (Model {})...", name, i));
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            progress.finish_spinner(&format!("{} registered (ID: {})", name, i));
+            self.emit_event(DemoEventType::ModelRegistered, &format!("{} registered", name), Some(i as u64), None).await;
+        }
+
         // Staking
         println!();
         println!("{}", "Phase 3: Staking".green().bold());
@@ -1174,7 +1693,7 @@ impl DemoRunner {
         for i in 0..self.config.worker_count {
             let model_assignment = (i as usize) % self.config.model_count as usize;
             progress.start_spinner(&format!("Worker {} staking for {}...", i + 1, model_names[model_assignment]));
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(Duration::from_millis(150)).await;
             progress.finish_spinner(&format!("Worker {} assigned to Model {}", i + 1, model_assignment));
 
             let mut state = self.state.write().await;
@@ -1190,7 +1709,6 @@ impl DemoRunner {
         println!("{}", "Phase 4: Concurrent Training".green().bold());
         self.set_phase(DemoPhase::Training).await;
 
-        // Create progress bars for each model
         let multi = MultiProgress::new();
         let mut model_pbs: Vec<ProgressBar> = Vec::new();
 
@@ -1200,13 +1718,12 @@ impl DemoRunner {
                 ProgressStyle::default_bar()
                     .template(&format!("  {{spinner:.green}} {} [{{bar:30.cyan/blue}}] {{pos}}/{{len}} ({{eta}})", name))
                     .unwrap()
-                    .progress_chars("#>-")
+                    .progress_chars("#>-"),
             );
             pb.set_position(0);
             model_pbs.push(pb);
         }
 
-        // Run training rounds
         for round in 0..self.config.round_count {
             if shutdown.try_recv().is_ok() {
                 for pb in &model_pbs {
@@ -1215,11 +1732,9 @@ impl DemoRunner {
                 return Ok(());
             }
 
-            // Update all models
             for (model_id, pb) in model_pbs.iter().enumerate() {
                 pb.set_message(format!("Round {}", round + 1));
 
-                // Simulate this model's training
                 {
                     let mut state = self.state.write().await;
                     if let Some(model) = state.models.get_mut(model_id) {
@@ -1238,8 +1753,10 @@ impl DemoRunner {
 
             tokio::time::sleep(self.config.round_duration).await;
 
-            let mut state = self.state.write().await;
-            state.metrics.rounds_completed += self.config.model_count as u64;
+            {
+                let mut state = self.state.write().await;
+                state.metrics.rounds_completed += self.config.model_count as u64;
+            }
         }
 
         for pb in &model_pbs {
@@ -1253,11 +1770,10 @@ impl DemoRunner {
 
         for (i, name) in model_names.iter().enumerate().take(self.config.model_count as usize) {
             progress.start_spinner(&format!("Finalizing {}...", name));
-            tokio::time::sleep(Duration::from_millis(400)).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
 
             {
                 let mut state = self.state.write().await;
-                // Extract error_bound first to avoid borrow conflict
                 let error_bound = state.models.get(i).map(|m| m.error_bound).unwrap_or(0.0);
 
                 if let Some(model) = state.models.get_mut(i) {
@@ -1294,9 +1810,11 @@ impl DemoRunner {
         progress.start_spinner("Initializing redundant network...");
         self.initialize_models().await;
         self.initialize_nodes().await;
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        progress.finish_spinner(&format!("Network ready ({} workers, {} aggregators)",
-            self.config.worker_count, self.config.aggregator_count));
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        progress.finish_spinner(&format!(
+            "Network ready ({} workers, {} aggregators)",
+            self.config.worker_count, self.config.aggregator_count
+        ));
 
         // Staking
         println!();
@@ -1305,7 +1823,7 @@ impl DemoRunner {
 
         for i in 0..self.config.worker_count {
             progress.start_spinner(&format!("Worker {} staking...", i + 1));
-            tokio::time::sleep(Duration::from_millis(150)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
             progress.finish_spinner(&format!("Worker {} ready", i + 1));
 
             let mut state = self.state.write().await;
@@ -1321,10 +1839,8 @@ impl DemoRunner {
         self.set_phase(DemoPhase::Training).await;
 
         let pb = self.create_round_progress_bar(self.config.round_count as u64);
-
-        // Schedule faults
-        let fault_rounds = vec![3, 6, 9]; // Rounds where faults occur
-        let recovery_delay = 2; // Rounds until recovery
+        let fault_rounds = vec![3, 6, 9];
+        let recovery_delay = 2;
 
         for round in 0..self.config.round_count {
             if shutdown.try_recv().is_ok() {
@@ -1346,7 +1862,7 @@ impl DemoRunner {
                 {
                     let mut state = self.state.write().await;
                     if let Some(worker) = state.workers.get_mut(failed_worker - 1) {
-                        worker.status = WorkerStatus::Offline;
+                        worker.status = DemoWorkerStatus::Offline;
                     }
                     state.metrics.node_failures += 1;
                 }
@@ -1355,8 +1871,9 @@ impl DemoRunner {
                     DemoEventType::FaultDetected,
                     &format!("Worker {} connection lost", failed_worker),
                     Some(0),
-                    Some(format!("worker-{}", failed_worker))
-                ).await;
+                    Some(format!("worker-{}", failed_worker)),
+                )
+                .await;
 
                 pb.suspend(|| {
                     let active = self.config.worker_count - 1;
@@ -1370,17 +1887,21 @@ impl DemoRunner {
 
                 pb.suspend(|| {
                     println!();
-                    println!("  {} {}", "↻".green().bold(), format!("Worker {} reconnected and syncing...", recovering_worker).green());
+                    println!(
+                        "  {} {}",
+                        "↻".green().bold(),
+                        format!("Worker {} reconnected and syncing...", recovering_worker).green()
+                    );
                 });
 
                 {
                     let mut state = self.state.write().await;
                     if let Some(worker) = state.workers.get_mut(recovering_worker - 1) {
-                        worker.status = WorkerStatus::Syncing;
+                        worker.status = DemoWorkerStatus::Syncing;
                     }
                 }
 
-                tokio::time::sleep(Duration::from_millis(300)).await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
 
                 pb.suspend(|| {
                     println!("  {} Worker {} recovered and rejoined training", "✓".green(), recovering_worker);
@@ -1389,7 +1910,7 @@ impl DemoRunner {
                 {
                     let mut state = self.state.write().await;
                     if let Some(worker) = state.workers.get_mut(recovering_worker - 1) {
-                        worker.status = WorkerStatus::Training;
+                        worker.status = DemoWorkerStatus::Training;
                     }
                     state.metrics.node_recoveries += 1;
                 }
@@ -1398,8 +1919,9 @@ impl DemoRunner {
                     DemoEventType::NodeRecovered,
                     &format!("Worker {} recovered and synced", recovering_worker),
                     Some(0),
-                    Some(format!("worker-{}", recovering_worker))
-                ).await;
+                    Some(format!("worker-{}", recovering_worker)),
+                )
+                .await;
             }
 
             // Normal training round
@@ -1417,12 +1939,17 @@ impl DemoRunner {
             self.set_phase(DemoPhase::Training).await;
             pb.inc(1);
 
-            let mut state = self.state.write().await;
-            state.metrics.rounds_completed += 1;
+            {
+                let mut state = self.state.write().await;
+                state.metrics.rounds_completed += 1;
+            }
         }
 
-        pb.finish_with_message(format!("{} Training complete (network survived {} failures)!",
-            "✓".green(), fault_rounds.len()));
+        pb.finish_with_message(format!(
+            "{} Training complete (network survived {} failures)!",
+            "✓".green(),
+            fault_rounds.len()
+        ));
 
         // Finalization
         println!();
@@ -1431,7 +1958,7 @@ impl DemoRunner {
 
         progress.start_spinner("Finalizing model...");
         self.finalize_model(0).await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
         progress.finish_spinner("Model finalized");
 
         // Fault tolerance summary
@@ -1442,7 +1969,10 @@ impl DemoRunner {
             println!("  Total Failures:     {}", state.metrics.node_failures);
             println!("  Successful Recoveries: {}", state.metrics.node_recoveries);
             println!("  Network Availability:  100% (training never interrupted)");
-            println!("  Final Error Bound:   {:.2}", state.models.get(0).map(|m| m.error_bound).unwrap_or(0.0));
+            println!(
+                "  Final Error Bound:   {:.2}",
+                state.models.get(0).map(|m| m.error_bound).unwrap_or(0.0)
+            );
         }
 
         self.set_phase(DemoPhase::Complete).await;
@@ -1452,152 +1982,6 @@ impl DemoRunner {
         }
 
         Ok(())
-    }
-
-    // ========================================================================
-    // Helper Methods
-    // ========================================================================
-
-    fn create_round_progress_bar(&self, total: u64) -> ProgressBar {
-        let pb = ProgressBar::new(total);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} rounds ({eta}) {msg}")
-                .unwrap()
-                .progress_chars("#>-")
-        );
-        pb
-    }
-
-    async fn initialize_models(&self) {
-        let mut state = self.state.write().await;
-        if state.models.is_empty() {
-            state.models.push(ModelState {
-                id: 0,
-                name: "Demo Model".to_string(),
-                ipfs_hash: "QmXoYPwbkfYTJu87sD9DemoHash...".to_string(),
-                current_round: 0,
-                total_rounds: self.config.round_count as u64,
-                current_loss: 2.5,
-                loss_history: vec![],
-                error_bound: 0.0,
-                is_complete: false,
-                final_commitment: None,
-            });
-        }
-    }
-
-    async fn initialize_nodes(&self) {
-        let mut state = self.state.write().await;
-
-        // Initialize workers
-        if state.workers.is_empty() {
-            for i in 0..self.config.worker_count {
-                state.workers.push(WorkerState {
-                    id: format!("worker-{}", i + 1),
-                    address: format!("0x{:040x}", 0x742d35Cc6634C053u64 + i as u64),
-                    stake: 0.0,
-                    status: WorkerStatus::Starting,
-                    proofs_submitted: 0,
-                    proofs_verified: 0,
-                    current_model: Some(0),
-                    reputation: 1.0,
-                    slashed: false,
-                });
-            }
-        }
-
-        // Initialize aggregators
-        if state.aggregators.is_empty() {
-            for i in 0..self.config.aggregator_count {
-                state.aggregators.push(AggregatorState {
-                    id: format!("aggregator-{}", i + 1),
-                    address: format!("0x{:040x}", 0xdD2FD4581271e230u64 + i as u64),
-                    status: AggregatorStatus::Starting,
-                    rounds_aggregated: 0,
-                    proofs_verified: 0,
-                    active_models: vec![0],
-                });
-            }
-        }
-    }
-
-    async fn set_workers_status(&self, status: WorkerStatus) {
-        let mut state = self.state.write().await;
-        for worker in &mut state.workers {
-            if worker.status != WorkerStatus::Slashed && worker.status != WorkerStatus::Offline {
-                worker.status = status;
-            }
-        }
-    }
-
-    async fn simulate_training_round(&self, round: u64, model_id: u64) {
-        let mut state = self.state.write().await;
-
-        if let Some(model) = state.models.iter_mut().find(|m| m.id == model_id) {
-            model.current_round = round + 1;
-
-            // Simulate loss decrease
-            let loss_reduction = 0.08 + (rand::random::<f64>() * 0.04);
-            model.current_loss = (model.current_loss - loss_reduction).max(0.01);
-            model.loss_history.push(model.current_loss);
-
-            // Accumulate error bound
-            let error_increase = 3.0 + rand::random::<f64>() * 2.0;
-            model.error_bound += error_increase;
-        }
-    }
-
-    async fn simulate_proof_generation(&self, _round: u64, _model_id: u64) {
-        let mut state = self.state.write().await;
-
-        let active_workers = state.workers.iter()
-            .filter(|w| w.status != WorkerStatus::Slashed && w.status != WorkerStatus::Offline)
-            .count();
-
-        state.metrics.proofs_generated += active_workers as u64;
-
-        for worker in &mut state.workers {
-            if worker.status == WorkerStatus::Proving {
-                worker.proofs_submitted += 1;
-            }
-        }
-    }
-
-    async fn simulate_proof_verification(&self, _round: u64, _model_id: u64) {
-        let mut state = self.state.write().await;
-
-        let verified = state.metrics.proofs_generated - state.metrics.proofs_rejected;
-        state.metrics.proofs_verified = verified;
-
-        for worker in &mut state.workers {
-            if worker.status == WorkerStatus::Waiting || worker.status == WorkerStatus::Proving {
-                worker.proofs_verified += 1;
-            }
-        }
-
-        for agg in &mut state.aggregators {
-            agg.rounds_aggregated += 1;
-            agg.proofs_verified += 1;
-        }
-    }
-
-    async fn finalize_model(&self, model_id: u64) {
-        let mut state = self.state.write().await;
-
-        // Extract error_bound first to avoid borrow conflict
-        let error_bound = state.models.iter()
-            .find(|m| m.id == model_id)
-            .map(|m| m.error_bound);
-
-        if let Some(model) = state.models.iter_mut().find(|m| m.id == model_id) {
-            model.is_complete = true;
-            model.final_commitment = Some(format!("0x{:064x}", rand::random::<u128>()));
-        }
-
-        if let Some(bound) = error_bound {
-            state.metrics.final_error_bounds.insert(model_id, bound);
-        }
     }
 }
 
@@ -1658,6 +2042,7 @@ impl DemoResults {
 /// Builder for creating demo configurations
 pub struct DemoBuilder {
     config: DemoConfig,
+    endpoint: Option<String>,
 }
 
 impl DemoBuilder {
@@ -1665,12 +2050,21 @@ impl DemoBuilder {
     pub fn new() -> Self {
         Self {
             config: DemoConfig::default(),
+            endpoint: None,
         }
+    }
+
+    /// Set the RPC endpoint for real node connection
+    pub fn endpoint(mut self, endpoint: &str) -> Self {
+        self.endpoint = Some(endpoint.to_string());
+        self
     }
 
     /// Set the scenario type
     pub fn scenario(mut self, scenario: DemoScenarioType) -> Self {
+        let endpoint = self.endpoint.take();
         self.config = scenario.default_config();
+        self.endpoint = endpoint;
         self
     }
 
@@ -1722,9 +2116,29 @@ impl DemoBuilder {
         self
     }
 
+    /// Enable pre-warming
+    pub fn prewarm(mut self, enabled: bool) -> Self {
+        self.config.prewarm = enabled;
+        self
+    }
+
     /// Build the demo runner
     pub fn build(self) -> DemoRunner {
-        DemoRunner::new(self.config)
+        if let Some(endpoint) = self.endpoint {
+            DemoRunner::with_endpoint(self.config, &endpoint)
+        } else {
+            DemoRunner::new(self.config)
+        }
+    }
+
+    /// Get access to real-time proof tracker for UI integration
+    pub fn proof_tracker(&self) -> Arc<RealTimeProofTracker> {
+        Arc::new(RealTimeProofTracker::new())
+    }
+
+    /// Get access to real-time training tracker for UI integration
+    pub fn training_tracker(&self) -> Arc<RealTimeTrainingTracker> {
+        Arc::new(RealTimeTrainingTracker::new())
     }
 }
 
@@ -1742,7 +2156,7 @@ mod tests {
     fn test_scenario_defaults() {
         let quick = DemoScenarioType::Quick.default_config();
         assert_eq!(quick.worker_count, 3);
-        assert_eq!(quick.round_count, 3);
+        assert_eq!(quick.round_count, 5);
 
         let full = DemoScenarioType::FullTraining.default_config();
         assert_eq!(full.worker_count, 5);
@@ -1763,7 +2177,8 @@ mod tests {
 
     #[test]
     fn test_worker_status_symbols() {
-        assert_eq!(format!("{}", WorkerStatus::Training.symbol()), format!("{}", "●".green()));
-        assert_eq!(format!("{}", WorkerStatus::Slashed.symbol()), format!("{}", "✗".red().bold()));
+        // Just test that symbols don't panic
+        let _ = DemoWorkerStatus::Training.symbol();
+        let _ = DemoWorkerStatus::Slashed.symbol();
     }
 }

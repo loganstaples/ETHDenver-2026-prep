@@ -511,10 +511,8 @@ impl MetalNtt {
         // Create data buffer
         let data_buffer = self.device.create_buffer_with_data(data)?;
 
-        // Execute NTT stages
-        for stage in 0..log_n {
-            self.execute_butterfly_stage(&data_buffer, stage, log_n, false)?;
-        }
+        // Execute ALL NTT stages in a single command buffer (batch for efficiency)
+        self.execute_all_butterfly_stages(&data_buffer, log_n, false)?;
 
         // Copy result back
         unsafe {
@@ -554,12 +552,10 @@ impl MetalNtt {
         // Create data buffer
         let data_buffer = self.device.create_buffer_with_data(data)?;
 
-        // Execute INTT stages (using inverse twiddles)
-        for stage in 0..log_n {
-            self.execute_butterfly_stage(&data_buffer, stage, log_n, true)?;
-        }
+        // Execute ALL INTT stages in a single command buffer (batch for efficiency)
+        self.execute_all_butterfly_stages(&data_buffer, log_n, true)?;
 
-        // Scale by n^{-1}
+        // Scale by n^{-1} (separate command buffer since it's different kernel)
         self.execute_scale(&data_buffer, n)?;
 
         // Copy result back
@@ -575,23 +571,179 @@ impl MetalNtt {
         Ok(())
     }
 
-    /// Executes a single butterfly stage.
+    /// Executes a single butterfly stage on GPU.
+    /// Executes ALL butterfly stages in a single command buffer for maximum GPU efficiency.
     #[cfg(all(target_os = "macos", feature = "metal"))]
-    fn execute_butterfly_stage(
+    fn execute_all_butterfly_stages(
         &self,
-        _data: &Buffer,
-        _stage: usize,
-        _log_n: usize,
-        _inverse: bool,
+        data: &Buffer,
+        log_n: usize,
+        inverse: bool,
     ) -> MetalResult<()> {
-        // Would dispatch butterfly kernel
+        use metal_rs::MTLSize;
+
+        let n = 1 << log_n;
+        let half_n = n / 2;
+
+        // Select twiddle buffer
+        let twiddle_buffer = if inverse {
+            self.twiddle_inv_buffer.as_ref()
+        } else {
+            self.twiddle_buffer.as_ref()
+        };
+
+        let twiddle_buffer = twiddle_buffer.ok_or(MetalError::InvalidArgument(
+            "Twiddle factors not initialized".to_string()
+        ))?;
+
+        // Create a SINGLE command buffer for ALL stages
+        let command_buffer = self.device.new_command_buffer();
+
+        // Pre-create constant buffers for all stages
+        let log_n_val = log_n as u32;
+        let is_inverse = if inverse { 1u32 } else { 0u32 };
+        let log_n_buf = self.device.create_buffer_with_data(&[log_n_val])?;
+        let inverse_buf = self.device.create_buffer_with_data(&[is_inverse])?;
+
+        // Encode ALL butterfly stages into the same command buffer
+        for stage in 0..log_n {
+            let encoder = command_buffer.new_compute_command_encoder();
+
+            encoder.set_compute_pipeline_state(&self.butterfly_pipeline);
+            encoder.set_buffer(0, Some(data), 0);
+            encoder.set_buffer(1, Some(twiddle_buffer), 0);
+
+            // Create stage buffer
+            let stage_val = stage as u32;
+            let stage_buf = self.device.create_buffer_with_data(&[stage_val])?;
+
+            encoder.set_buffer(2, Some(&stage_buf), 0);
+            encoder.set_buffer(3, Some(&log_n_buf), 0);
+            encoder.set_buffer(4, Some(&inverse_buf), 0);
+
+            // Dispatch threads
+            let threadgroup_size = MTLSize::new(
+                self.config.threadgroup_size.min(half_n) as u64,
+                1,
+                1
+            );
+            let grid_size = MTLSize::new(half_n as u64, 1, 1);
+
+            encoder.dispatch_threads(grid_size, threadgroup_size);
+            encoder.end_encoding();
+        }
+
+        // Commit ONCE and wait ONCE for all stages
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
         Ok(())
     }
 
-    /// Executes scaling by n^{-1}.
+    /// Executes a single butterfly stage on GPU (legacy, use execute_all_butterfly_stages instead).
     #[cfg(all(target_os = "macos", feature = "metal"))]
-    fn execute_scale(&self, _data: &Buffer, _n: usize) -> MetalResult<()> {
-        // Would dispatch scale kernel
+    #[allow(dead_code)]
+    fn execute_butterfly_stage(
+        &self,
+        data: &Buffer,
+        stage: usize,
+        log_n: usize,
+        inverse: bool,
+    ) -> MetalResult<()> {
+        use metal_rs::MTLSize;
+
+        let n = 1 << log_n;
+        let half_n = n / 2;
+
+        // Select twiddle buffer
+        let twiddle_buffer = if inverse {
+            self.twiddle_inv_buffer.as_ref()
+        } else {
+            self.twiddle_buffer.as_ref()
+        };
+
+        let twiddle_buffer = twiddle_buffer.ok_or(MetalError::InvalidArgument(
+            "Twiddle factors not initialized".to_string()
+        ))?;
+
+        // Create parameter buffers
+        let stage_val = stage as u32;
+        let log_n_val = log_n as u32;
+        let is_inverse = if inverse { 1u32 } else { 0u32 };
+
+        // Create command buffer and encoder
+        let command_buffer = self.device.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+
+        encoder.set_compute_pipeline_state(&self.butterfly_pipeline);
+        encoder.set_buffer(0, Some(data), 0);
+        encoder.set_buffer(1, Some(twiddle_buffer), 0);
+
+        // Set stage constant
+        let stage_buf = self.device.create_buffer_with_data(&[stage_val])?;
+        let log_n_buf = self.device.create_buffer_with_data(&[log_n_val])?;
+        let inverse_buf = self.device.create_buffer_with_data(&[is_inverse])?;
+
+        encoder.set_buffer(2, Some(&stage_buf), 0);
+        encoder.set_buffer(3, Some(&log_n_buf), 0);
+        encoder.set_buffer(4, Some(&inverse_buf), 0);
+
+        // Dispatch threads
+        let threadgroup_size = MTLSize::new(
+            self.config.threadgroup_size.min(half_n) as u64,
+            1,
+            1
+        );
+        let grid_size = MTLSize::new(half_n as u64, 1, 1);
+
+        encoder.dispatch_threads(grid_size, threadgroup_size);
+        encoder.end_encoding();
+
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        Ok(())
+    }
+
+    /// Executes scaling by n^{-1} on GPU.
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    fn execute_scale(&self, data: &Buffer, n: usize) -> MetalResult<()> {
+        use metal_rs::MTLSize;
+
+        let twiddles = self.twiddles.as_ref().ok_or(MetalError::InvalidArgument(
+            "Twiddle factors not initialized".to_string()
+        ))?;
+
+        // Create scale factor buffer
+        let scale_buf = self.device.create_buffer_with_data(&twiddles.size_inv)?;
+
+        // Create n buffer
+        let n_val = n as u32;
+        let n_buf = self.device.create_buffer_with_data(&[n_val])?;
+
+        // Create command buffer and encoder
+        let command_buffer = self.device.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+
+        encoder.set_compute_pipeline_state(&self.scale_pipeline);
+        encoder.set_buffer(0, Some(data), 0);
+        encoder.set_buffer(1, Some(&scale_buf), 0);
+        encoder.set_buffer(2, Some(&n_buf), 0);
+
+        // Dispatch threads
+        let threadgroup_size = MTLSize::new(
+            self.config.threadgroup_size.min(n) as u64,
+            1,
+            1
+        );
+        let grid_size = MTLSize::new(n as u64, 1, 1);
+
+        encoder.dispatch_threads(grid_size, threadgroup_size);
+        encoder.end_encoding();
+
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
         Ok(())
     }
 

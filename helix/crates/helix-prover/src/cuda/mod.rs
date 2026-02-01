@@ -17,6 +17,8 @@
 //! - **Pairing**: BN254 pairing computations
 
 pub mod bindings;
+pub mod msm_cpu;
+pub mod ntt_cpu;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -398,11 +400,9 @@ impl CudaMsm {
         }
     }
 
-    /// CPU fallback for MSM.
-    fn compute_cpu(&self, _points: &[[u64; 8]], _scalars: &[[u64; 4]]) -> [u64; 12] {
-        // Would implement actual MSM here
-        // For now, return identity
-        [0u64; 12]
+    /// CPU fallback for MSM using Pippenger's algorithm.
+    fn compute_cpu(&self, points: &[[u64; 8]], scalars: &[[u64; 4]]) -> [u64; 12] {
+        msm_cpu::compute_msm(points, scalars, self.config.window_size)
     }
 
     /// Returns statistics.
@@ -501,13 +501,13 @@ impl CudaNtt {
     }
 
     /// CPU forward NTT fallback.
-    fn forward_cpu(&self, _data: &mut [[u64; 4]]) {
-        // Would implement actual NTT here
+    fn forward_cpu(&self, data: &mut [[u64; 4]]) {
+        ntt_cpu::forward_ntt(data);
     }
 
     /// CPU inverse NTT fallback.
-    fn inverse_cpu(&self, _data: &mut [[u64; 4]]) {
-        // Would implement actual INTT here
+    fn inverse_cpu(&self, data: &mut [[u64; 4]]) {
+        ntt_cpu::inverse_ntt(data);
     }
 
     /// Returns statistics.

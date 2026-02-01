@@ -2,12 +2,13 @@
 name = "helix-prover"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
 
 [features]
 default = ["parallel"]
 parallel = ["rayon"]
 metal = ["metal-rs", "objc"]
-cuda = []  # Future: CUDA backend
+cuda = []  # CUDA backend - requires NVCC and CUDA Toolkit
 
 [dependencies]
 helix-core = { path = "../helix-core" }
@@ -29,10 +30,17 @@ tracing = "0.1"
 metal-rs = { version = "0.29", package = "metal", optional = true }
 objc = { version = "0.2", optional = true }
 
+[build-dependencies]
+# No external build dependencies needed - using raw nvcc commands
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]
 name = "gkr_vs_halo2"
+harness = false
+
+[[bench]]
+name = "gpu_acceleration"
 harness = false
 

@@ -9,10 +9,12 @@
 pub mod pool;
 pub mod async_ops;
 pub mod multi_gpu;
+pub mod hybrid_executor;
 
 pub use pool::{GpuMemoryPool, PooledBuffer, PoolConfig, PoolStats};
 pub use async_ops::{AsyncOpQueue, AsyncOp, OpHandle, OpStatus, SyncBarrier};
 pub use multi_gpu::{MultiGpuManager, DeviceSelector, WorkDistributor, LoadBalanceStrategy};
+pub use hybrid_executor::{HybridExecutor, HybridConfig, HybridStats, WorkItem};
 
 use std::sync::Arc;
 

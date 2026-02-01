@@ -268,12 +268,110 @@ impl MetalFieldOps {
         results
     }
 
-    /// Executes on GPU.
+    /// Executes on GPU using Metal shaders.
     #[cfg(all(target_os = "macos", feature = "metal"))]
     fn execute_gpu(&mut self, op: &BatchFieldOperation) -> MetalResult<Vec<FieldElement>> {
-        // For now, fall back to CPU until Metal shaders are fully implemented
-        // This is a placeholder for future GPU implementation
-        Ok(self.execute_cpu(op))
+        use metal_rs::{MTLSize, MTLResourceOptions};
+
+        let device = match &self.device {
+            Some(d) => d,
+            None => return Ok(self.execute_cpu(op)),
+        };
+
+        let n = op.len();
+        let start_time = std::time::Instant::now();
+
+        // Convert FieldElements to raw bytes
+        let a_bytes: Vec<[u64; 4]> = op.operands_a.iter()
+            .map(|f| field_element_to_limbs(f))
+            .collect();
+
+        // Create input buffer A
+        let a_buffer = device.metal_device().new_buffer_with_data(
+            a_bytes.as_ptr() as *const _,
+            (n * 32) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        // Create output buffer
+        let c_buffer = device.metal_device().new_buffer(
+            (n * 32) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        // Compile the appropriate kernel
+        let shader_source = include_str!("shaders.metal");
+
+        let kernel_name = match op.op_type {
+            FieldOpType::Add => "field_add",
+            FieldOpType::Sub => "field_sub",
+            FieldOpType::Mul => "field_mul",
+            FieldOpType::Neg => "field_neg",
+            FieldOpType::Square => "field_square",
+            FieldOpType::Inv => {
+                // Batch inversion is special - use CPU (Montgomery's trick is better)
+                return Ok(self.batch_invert(&op.operands_a));
+            }
+        };
+
+        let pipeline = device.compile_shader(shader_source, kernel_name)?;
+
+        // Create command buffer and encoder
+        let command_buffer = device.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(&a_buffer), 0);
+
+        // Handle binary operations (need second operand)
+        match op.op_type {
+            FieldOpType::Add | FieldOpType::Sub | FieldOpType::Mul => {
+                if let Some(ref b_operands) = op.operands_b {
+                    let b_bytes: Vec<[u64; 4]> = b_operands.iter()
+                        .map(|f| field_element_to_limbs(f))
+                        .collect();
+                    let b_buffer = device.metal_device().new_buffer_with_data(
+                        b_bytes.as_ptr() as *const _,
+                        (n * 32) as u64,
+                        MTLResourceOptions::StorageModeShared,
+                    );
+                    encoder.set_buffer(1, Some(&b_buffer), 0);
+                    encoder.set_buffer(2, Some(&c_buffer), 0);
+                }
+            }
+            FieldOpType::Neg | FieldOpType::Square => {
+                encoder.set_buffer(1, Some(&c_buffer), 0);
+            }
+            FieldOpType::Inv => unreachable!(),
+        }
+
+        // Dispatch threads
+        let threadgroup_size = 256.min(n);
+        let grid_size = MTLSize::new(n as u64, 1, 1);
+        let tg_size = MTLSize::new(threadgroup_size as u64, 1, 1);
+
+        encoder.dispatch_threads(grid_size, tg_size);
+        encoder.end_encoding();
+
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        // Read results back
+        let result_ptr = c_buffer.contents() as *const [u64; 4];
+        let mut results = Vec::with_capacity(n);
+        unsafe {
+            for i in 0..n {
+                let limbs = *result_ptr.add(i);
+                results.push(limbs_to_field_element(&limbs));
+            }
+        }
+
+        // Update stats
+        self.stats.gpu_time_us += start_time.elapsed().as_micros() as u64;
+        self.stats.num_dispatches += 1;
+        self.stats.bytes_transferred += n * 64; // Input + output
+
+        Ok(results)
     }
 
     #[cfg(not(all(target_os = "macos", feature = "metal")))]
@@ -504,6 +602,43 @@ impl Default for MetalSumcheckAccelerator {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ============================================================================
+// Helper Functions for Field Element Conversion
+// ============================================================================
+
+/// Convert a FieldElement to raw u64 limbs (Montgomery form).
+fn field_element_to_limbs(f: &FieldElement) -> [u64; 4] {
+    use helix_circuits::halo2curves::ff::PrimeField;
+    let repr = f.to_repr();
+    let bytes = repr.as_ref();
+
+    // Convert from little-endian bytes to u64 limbs
+    let mut limbs = [0u64; 4];
+    for i in 0..4 {
+        let offset = i * 8;
+        limbs[i] = u64::from_le_bytes([
+            bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3],
+            bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7],
+        ]);
+    }
+    limbs
+}
+
+/// Convert raw u64 limbs back to FieldElement.
+fn limbs_to_field_element(limbs: &[u64; 4]) -> FieldElement {
+    use helix_circuits::halo2curves::ff::PrimeField;
+
+    // Convert limbs to little-endian bytes
+    let mut bytes = [0u8; 32];
+    for i in 0..4 {
+        let le_bytes = limbs[i].to_le_bytes();
+        bytes[i * 8..(i + 1) * 8].copy_from_slice(&le_bytes);
+    }
+
+    // Try to convert - this may fail for invalid values, so use from_repr
+    FieldElement::from_repr_vartime(bytes.into()).unwrap_or(FieldElement::zero())
 }
 
 #[cfg(test)]

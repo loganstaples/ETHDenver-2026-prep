@@ -21,6 +21,7 @@ mod orchestrator;
 mod progress;
 mod health;
 mod benchmark;
+mod rpc;
 mod visualization;
 mod wallet;
 
@@ -1175,6 +1176,15 @@ async fn cmd_visualize(args: &VisualizeArgs, _cli: &Cli, shutdown: broadcast::Re
         state.total_rounds = args.rounds as u64;
         state.total_workers = args.workers;
         state.active_workers = args.workers;
+
+        // Set demo wallet info for visualization
+        state.update_wallet_info(
+            Some("0xdEm0...1234".to_string()),
+            100.0,  // 100 HLX staked
+            0.0,    // No pending rewards yet
+            12.5,   // 12.5% APY
+        );
+        state.set_hardware_wallet(false, None);
     }
 
     // Run visualization

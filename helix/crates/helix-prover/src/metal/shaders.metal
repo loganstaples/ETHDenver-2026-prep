@@ -833,21 +833,21 @@ kernel void parallel_product(
 // ============================================================================
 
 // Polynomial evaluation step for multilinear extension
-// new[i] = old[i] + r * (old[i + half] - old[i])
+// new[i] = old[i] + r * (old[i + half_size] - old[i])
 kernel void poly_eval_step(
     const device FieldElement* old_evals [[buffer(0)]],
     constant FieldElement& r [[buffer(1)]],
     device FieldElement* new_evals [[buffer(2)]],
-    constant uint32_t& half [[buffer(3)]],
+    constant uint32_t& half_size [[buffer(3)]],
     uint id [[thread_position_in_grid]]
 ) {
-    if (id >= half) return;
+    if (id >= half_size) return;
 
     FieldElement f0, f1, local_r, diff, scaled, result;
 
     for (int i = 0; i < 4; i++) {
         f0.limbs[i] = old_evals[id].limbs[i];
-        f1.limbs[i] = old_evals[id + half].limbs[i];
+        f1.limbs[i] = old_evals[id + half_size].limbs[i];
         local_r.limbs[i] = r.limbs[i];
     }
 
@@ -929,7 +929,7 @@ kernel void matmul_field_tiled(
 ) {
     if (id >= rows) return;
 
-    constant uint32_t TILE_SIZE = 64;
+    const uint32_t TILE_SIZE = 64;
 
     FieldElement sum;
     set_zero(sum);

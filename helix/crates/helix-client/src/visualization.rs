@@ -10,6 +10,7 @@
 
 use std::collections::VecDeque;
 use std::io::{self, Stdout};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -31,6 +32,11 @@ use ratatui::{
     Frame, Terminal,
 };
 use tokio::sync::broadcast;
+
+use crate::rpc::{
+    ProofPhase, ProofStatus, RealTimeProofTracker, RealTimeTrainingTracker,
+    TrainingPhase, TrainingStatus,
+};
 
 // ============================================================================
 // Visualization State
@@ -74,6 +80,39 @@ pub struct VisualizationState {
     pub proofs_generated: u64,
     /// Proofs verified
     pub proofs_verified: u64,
+    /// Current proof generation phase
+    pub proof_phase: ProofPhase,
+    /// Proof generation progress (0-100)
+    pub proof_progress: u8,
+    /// Whether proof is being generated
+    pub proof_generating: bool,
+    /// Current training phase
+    pub training_phase: TrainingPhase,
+    /// Whether connected to real node
+    pub connected_to_node: bool,
+    /// GPU acceleration enabled
+    pub gpu_accelerated: bool,
+    /// Proof constraints satisfied
+    pub constraints_satisfied: u64,
+    /// Total proof constraints
+    pub total_constraints: u64,
+    /// Memory usage (bytes)
+    pub memory_usage: u64,
+    // Wallet/staking fields
+    /// Wallet address (truncated for display)
+    pub wallet_address: Option<String>,
+    /// Staked amount in HLX tokens
+    pub staked_amount: f64,
+    /// Pending rewards in HLX tokens
+    pub pending_rewards: f64,
+    /// Total rewards claimed
+    pub total_rewards_claimed: f64,
+    /// Staking APY percentage
+    pub staking_apy: f64,
+    /// Hardware wallet connected
+    pub hardware_wallet_connected: bool,
+    /// Hardware wallet model name
+    pub hardware_wallet_model: Option<String>,
 }
 
 /// Visualization event
@@ -111,7 +150,81 @@ impl VisualizationState {
             total_workers: 5,
             proofs_generated: 0,
             proofs_verified: 0,
+            proof_phase: ProofPhase::Idle,
+            proof_progress: 0,
+            proof_generating: false,
+            training_phase: TrainingPhase::Idle,
+            connected_to_node: false,
+            gpu_accelerated: false,
+            constraints_satisfied: 0,
+            total_constraints: 0,
+            memory_usage: 0,
+            // Wallet/staking defaults
+            wallet_address: None,
+            staked_amount: 0.0,
+            pending_rewards: 0.0,
+            total_rewards_claimed: 0.0,
+            staking_apy: 12.5, // Default APY
+            hardware_wallet_connected: false,
+            hardware_wallet_model: None,
         }
+    }
+
+    /// Update from real-time proof tracker
+    pub fn update_from_proof_status(&mut self, status: &ProofStatus) {
+        self.proof_phase = status.phase;
+        self.proof_progress = status.progress_percent;
+        self.proof_generating = status.generating;
+        self.constraints_satisfied = status.constraints_satisfied;
+        self.total_constraints = status.total_constraints;
+        self.gpu_accelerated = status.gpu_accelerated;
+        self.memory_usage = status.memory_usage_bytes;
+    }
+
+    /// Update from real-time training tracker
+    pub fn update_from_training_status(&mut self, status: &TrainingStatus) {
+        self.current_round = status.current_round;
+        self.total_rounds = status.total_rounds;
+        self.current_loss = status.current_loss;
+        self.current_error_bound = status.accumulated_error;
+        self.max_error_bound = status.max_error_bound;
+        self.training_phase = status.phase;
+    }
+
+    /// Set connection status
+    pub fn set_connected(&mut self, connected: bool) {
+        self.connected_to_node = connected;
+    }
+
+    /// Update wallet information
+    pub fn update_wallet_info(
+        &mut self,
+        address: Option<String>,
+        staked: f64,
+        rewards: f64,
+        apy: f64,
+    ) {
+        self.wallet_address = address;
+        self.staked_amount = staked;
+        self.pending_rewards = rewards;
+        self.staking_apy = apy;
+    }
+
+    /// Set hardware wallet connection status
+    pub fn set_hardware_wallet(&mut self, connected: bool, model: Option<String>) {
+        self.hardware_wallet_connected = connected;
+        self.hardware_wallet_model = model;
+    }
+
+    /// Add rewards (called when rewards are earned)
+    pub fn add_rewards(&mut self, amount: f64) {
+        self.pending_rewards += amount;
+    }
+
+    /// Claim rewards (move from pending to claimed)
+    pub fn claim_rewards(&mut self) {
+        self.total_rewards_claimed += self.pending_rewards;
+        self.pending_rewards = 0.0;
     }
 
     /// Add an event to the log
@@ -190,6 +303,10 @@ pub struct VisualizationRunner {
     state: VisualizationState,
     /// Tick rate for UI updates
     tick_rate: Duration,
+    /// Real-time proof tracker
+    proof_tracker: Option<Arc<RealTimeProofTracker>>,
+    /// Real-time training tracker
+    training_tracker: Option<Arc<RealTimeTrainingTracker>>,
 }
 
 impl VisualizationRunner {
@@ -206,12 +323,48 @@ impl VisualizationRunner {
             terminal,
             state: VisualizationState::new(),
             tick_rate: Duration::from_millis(100),
+            proof_tracker: None,
+            training_tracker: None,
         })
+    }
+
+    /// Create visualization with real-time trackers
+    pub fn with_trackers(
+        proof_tracker: Arc<RealTimeProofTracker>,
+        training_tracker: Arc<RealTimeTrainingTracker>,
+    ) -> Result<Self> {
+        let mut runner = Self::new()?;
+        runner.proof_tracker = Some(proof_tracker);
+        runner.training_tracker = Some(training_tracker);
+        Ok(runner)
+    }
+
+    /// Set proof tracker
+    pub fn set_proof_tracker(&mut self, tracker: Arc<RealTimeProofTracker>) {
+        self.proof_tracker = Some(tracker);
+    }
+
+    /// Set training tracker
+    pub fn set_training_tracker(&mut self, tracker: Arc<RealTimeTrainingTracker>) {
+        self.training_tracker = Some(tracker);
     }
 
     /// Get mutable state reference
     pub fn state_mut(&mut self) -> &mut VisualizationState {
         &mut self.state
+    }
+
+    /// Update state from trackers
+    async fn update_from_trackers(&mut self) {
+        if let Some(ref tracker) = self.proof_tracker {
+            let status = tracker.get_status().await;
+            self.state.update_from_proof_status(&status);
+        }
+
+        if let Some(ref tracker) = self.training_tracker {
+            let status = tracker.get_status().await;
+            self.state.update_from_training_status(&status);
+        }
     }
 
     /// Run the visualization loop
@@ -261,26 +414,49 @@ impl VisualizationRunner {
                 return Ok(());
             }
 
-            // Simulate demo progress
+            // Update from real-time trackers or simulate progress
             if last_tick.elapsed() >= tick_rate && !self.state.paused {
                 simulation_tick += 1;
 
-                // Every 10 ticks, advance a round
-                if simulation_tick % 50 == 0 && self.state.current_round < self.state.total_rounds {
-                    self.state.current_round += 1;
-                    let loss = self.state.current_loss * 0.92;
-                    let error = self.state.current_error_bound + 5.0 + (rand::random::<f64>() * 3.0);
-                    self.state.update_metrics(self.state.current_round, loss, error);
+                // If we have trackers, use them for updates
+                let has_trackers = self.proof_tracker.is_some() || self.training_tracker.is_some();
 
-                    self.state.proofs_generated += self.state.active_workers as u64;
-                    self.state.proofs_verified += self.state.active_workers as u64;
+                if has_trackers {
+                    // Update from real-time trackers
+                    self.update_from_trackers().await;
+                } else {
+                    // Simulate demo progress (fallback when no trackers)
+                    // Every 50 ticks, advance a round
+                    if simulation_tick % 50 == 0 && self.state.current_round < self.state.total_rounds {
+                        self.state.current_round += 1;
+                        let loss = self.state.current_loss * 0.92;
+                        let error = self.state.current_error_bound + 5.0 + (rand::random::<f64>() * 3.0);
+                        self.state.update_metrics(self.state.current_round, loss, error);
 
-                    self.state.add_event(VisualizationEvent {
-                        timestamp_ms: self.state.start_time.elapsed().as_millis() as u64,
-                        event_type: "RoundCompleted".to_string(),
-                        description: format!("Round {} completed", self.state.current_round),
-                        color: Color::Green,
-                    });
+                        self.state.proofs_generated += self.state.active_workers as u64;
+                        self.state.proofs_verified += self.state.active_workers as u64;
+
+                        self.state.add_event(VisualizationEvent {
+                            timestamp_ms: self.state.start_time.elapsed().as_millis() as u64,
+                            event_type: "RoundCompleted".to_string(),
+                            description: format!("Round {} completed", self.state.current_round),
+                            color: Color::Green,
+                        });
+                    }
+
+                    // Simulate proof generation phases
+                    if simulation_tick % 10 == 0 {
+                        let phase_idx = (simulation_tick / 10) % 5;
+                        self.state.proof_phase = match phase_idx {
+                            0 => ProofPhase::WitnessGeneration,
+                            1 => ProofPhase::CommitmentGeneration,
+                            2 => ProofPhase::ProofComputation,
+                            3 => ProofPhase::Complete,
+                            _ => ProofPhase::Idle,
+                        };
+                        self.state.proof_generating = phase_idx < 3;
+                        self.state.proof_progress = ((phase_idx + 1) * 25).min(100) as u8;
+                    }
                 }
 
                 last_tick = Instant::now();
@@ -389,7 +565,7 @@ fn draw_overview_tab(frame: &mut Frame, area: Rect, state: &VisualizationState) 
 
     let left_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .constraints([Constraint::Percentage(35), Constraint::Percentage(35), Constraint::Percentage(30)])
         .split(chunks[0]);
 
     let right_chunks = Layout::default()
@@ -403,6 +579,9 @@ fn draw_overview_tab(frame: &mut Frame, area: Rect, state: &VisualizationState) 
     // Metrics panel
     draw_metrics_panel(frame, left_chunks[1], state);
 
+    // Wallet/staking panel
+    draw_wallet_panel(frame, left_chunks[2], state);
+
     // Loss chart
     draw_loss_chart(frame, right_chunks[0], state);
 
@@ -413,26 +592,54 @@ fn draw_overview_tab(frame: &mut Frame, area: Rect, state: &VisualizationState) 
 fn draw_status_panel(frame: &mut Frame, area: Rect, state: &VisualizationState) {
     let phase = if state.current_round >= state.total_rounds {
         "Complete"
+    } else if state.proof_generating {
+        "Proving"
     } else {
-        "Training"
+        state.training_phase.name()
+    };
+
+    let phase_color = if state.current_round >= state.total_rounds {
+        Color::Green
+    } else if state.proof_generating {
+        Color::Cyan
+    } else {
+        Color::Yellow
+    };
+
+    let mode = if state.connected_to_node {
+        ("Real", Color::Green)
+    } else {
+        ("Demo", Color::Yellow)
     };
 
     let status_text = vec![
         Line::from(vec![
-            Span::styled(" Phase: ", Style::default().fg(Color::Gray)),
-            Span::styled(phase, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(" Mode:     ", Style::default().fg(Color::Gray)),
+            Span::styled(mode.0, Style::default().fg(mode.1).add_modifier(Modifier::BOLD)),
         ]),
         Line::from(vec![
-            Span::styled(" Model: ", Style::default().fg(Color::Gray)),
+            Span::styled(" Phase:    ", Style::default().fg(Color::Gray)),
+            Span::styled(phase, Style::default().fg(phase_color).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::styled(" Model:    ", Style::default().fg(Color::Gray)),
             Span::raw("Demo Model (ID: 0)"),
         ]),
         Line::from(vec![
-            Span::styled(" Round: ", Style::default().fg(Color::Gray)),
+            Span::styled(" Round:    ", Style::default().fg(Color::Gray)),
             Span::styled(format!("{}/{}", state.current_round, state.total_rounds), Style::default().fg(Color::Yellow)),
         ]),
         Line::from(vec![
             Span::styled(" Progress: ", Style::default().fg(Color::Gray)),
             Span::styled(format!("{}%", state.current_round * 100 / state.total_rounds.max(1)), Style::default().fg(Color::Cyan)),
+        ]),
+        Line::from(vec![
+            Span::styled(" GPU:      ", Style::default().fg(Color::Gray)),
+            if state.gpu_accelerated {
+                Span::styled("Enabled", Style::default().fg(Color::Green))
+            } else {
+                Span::styled("Disabled", Style::default().fg(Color::Red))
+            },
         ]),
     ];
 
@@ -454,6 +661,7 @@ fn draw_metrics_panel(frame: &mut Frame, area: Rect, state: &VisualizationState)
             Constraint::Length(2),
             Constraint::Length(2),
             Constraint::Length(2),
+            Constraint::Length(2),
             Constraint::Min(0),
         ])
         .split(area);
@@ -465,7 +673,19 @@ fn draw_metrics_panel(frame: &mut Frame, area: Rect, state: &VisualizationState)
         .ratio(progress.min(1.0))
         .label(format!("{}%", (progress * 100.0) as u32));
 
-    // Proofs gauge
+    // Proof generation gauge
+    let proof_label = if state.proof_generating {
+        format!("{} {}%", state.proof_phase.name(), state.proof_progress)
+    } else {
+        "Idle".to_string()
+    };
+    let proof_gauge = Gauge::default()
+        .block(Block::default().title("Proof Generation"))
+        .gauge_style(Style::default().fg(if state.proof_generating { Color::Cyan } else { Color::DarkGray }))
+        .ratio(state.proof_progress as f64 / 100.0)
+        .label(proof_label);
+
+    // Proofs verified gauge
     let proofs_ratio = if state.proofs_generated > 0 {
         state.proofs_verified as f64 / state.proofs_generated as f64
     } else {
@@ -473,7 +693,7 @@ fn draw_metrics_panel(frame: &mut Frame, area: Rect, state: &VisualizationState)
     };
     let proofs_gauge = Gauge::default()
         .block(Block::default().title("Proofs Verified"))
-        .gauge_style(Style::default().fg(Color::Cyan))
+        .gauge_style(Style::default().fg(Color::Blue))
         .ratio(proofs_ratio.min(1.0))
         .label(format!("{}/{}", state.proofs_verified, state.proofs_generated));
 
@@ -496,9 +716,72 @@ fn draw_metrics_panel(frame: &mut Frame, area: Rect, state: &VisualizationState)
     frame.render_widget(outer_block, area);
 
     frame.render_widget(training_gauge, inner_chunks[0]);
-    frame.render_widget(proofs_gauge, inner_chunks[1]);
-    frame.render_widget(error_gauge, inner_chunks[2]);
-    frame.render_widget(workers_gauge, inner_chunks[3]);
+    frame.render_widget(proof_gauge, inner_chunks[1]);
+    frame.render_widget(proofs_gauge, inner_chunks[2]);
+    frame.render_widget(error_gauge, inner_chunks[3]);
+    frame.render_widget(workers_gauge, inner_chunks[4]);
+}
+
+fn draw_wallet_panel(frame: &mut Frame, area: Rect, state: &VisualizationState) {
+    let wallet_display = state.wallet_address.as_ref()
+        .map(|addr| {
+            if addr.len() > 12 {
+                format!("{}...{}", &addr[..6], &addr[addr.len()-4..])
+            } else {
+                addr.clone()
+            }
+        })
+        .unwrap_or_else(|| "Not Connected".to_string());
+
+    let wallet_color = if state.wallet_address.is_some() {
+        Color::Green
+    } else {
+        Color::Red
+    };
+
+    let hw_status = if state.hardware_wallet_connected {
+        let model = state.hardware_wallet_model.as_deref().unwrap_or("Unknown");
+        (format!("{}", model), Color::Green)
+    } else {
+        ("Not Connected".to_string(), Color::DarkGray)
+    };
+
+    let wallet_text = vec![
+        Line::from(vec![
+            Span::styled(" Wallet:  ", Style::default().fg(Color::Gray)),
+            Span::styled(wallet_display, Style::default().fg(wallet_color)),
+        ]),
+        Line::from(vec![
+            Span::styled(" HW:      ", Style::default().fg(Color::Gray)),
+            Span::styled(hw_status.0, Style::default().fg(hw_status.1)),
+        ]),
+        Line::from(vec![
+            Span::styled(" Staked:  ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("{:.2} HLX", state.staked_amount),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(" Rewards: ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("{:.4} HLX", state.pending_rewards),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(" APY:     ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("{:.1}%", state.staking_apy),
+                Style::default().fg(Color::Green),
+            ),
+        ]),
+    ];
+
+    let wallet = Paragraph::new(wallet_text)
+        .block(Block::default().borders(Borders::ALL).title(" Wallet & Staking "));
+
+    frame.render_widget(wallet, area);
 }
 
 fn draw_loss_chart(frame: &mut Frame, area: Rect, state: &VisualizationState) {
