@@ -74,7 +74,9 @@ impl DatasetCommitment {
     ) -> Self {
         let mut builder = MerkleTreeBuilder::with_sha256();
         for sample in samples {
-            builder = builder.add_leaf(&SampleCommitment::hash_sample(sample));
+            // Use add_hash since hash_sample already returns a hash
+            let hash = Hash::from_bytes(SampleCommitment::hash_sample(sample));
+            builder = builder.add_hash(hash);
         }
 
         let tree = builder.build().expect("Failed to build Merkle tree");

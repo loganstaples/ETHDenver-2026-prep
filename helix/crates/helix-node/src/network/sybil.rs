@@ -579,11 +579,14 @@ mod tests {
         let config = SybilResistanceConfig {
             min_stake: 100,
             selection_cooldown: Duration::from_secs(0), // No cooldown for test
+            // Disable quadratic weighting so effective_stake equals stake
+            // (otherwise sqrt(1000)=31 < min_stake=100)
+            use_quadratic_weighting: false,
             ..Default::default()
         };
         let mut selector = SybilResistantSelector::new(config);
 
-        // Register several peers
+        // Register several peers with stakes above min_stake
         for i in 0..5 {
             let peer = PeerId::from_string(format!("peer{}", i));
             selector.register_stake(peer, 1000 + i * 100).unwrap();

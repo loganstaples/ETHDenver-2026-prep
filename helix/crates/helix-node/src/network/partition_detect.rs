@@ -887,12 +887,22 @@ mod tests {
         let detector = create_detector();
 
         // Add multiple healthy peers
-        for i in 0..5 {
-            let addr: SocketAddr = format!("127.0.0.1:800{}", i).parse().unwrap();
+        let addrs: Vec<SocketAddr> = (0..5)
+            .map(|i| format!("127.0.0.1:800{}", i).parse().unwrap())
+            .collect();
+
+        for &addr in &addrs {
             detector.register_peer(addr);
             for _ in 0..5 {
                 detector.record_heartbeat(&addr, Some(Duration::from_millis(50)));
             }
+        }
+
+        // Update peer views so each peer reports all other peers as connected
+        // This forms a fully connected network topology
+        for &addr in &addrs {
+            let other_peers: HashSet<_> = addrs.iter().copied().filter(|&a| a != addr).collect();
+            detector.update_peer_view(&addr, other_peers);
         }
 
         let status = detector.detect_partition().await.unwrap();

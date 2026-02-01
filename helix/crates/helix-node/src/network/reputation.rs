@@ -623,12 +623,15 @@ mod tests {
     #[test]
     fn test_automatic_ban() {
         let config = ReputationConfig {
-            ban_threshold: 30.0,
+            // With validity_weight=0.35, 10 InvalidProof events drop score to ~32.5
+            // Set threshold above that to trigger ban
+            ban_threshold: 35.0,
             ..Default::default()
         };
         let mut rep = PeerReputation::new(PeerId::from_string("peer1"), config);
 
-        // Record many negative events
+        // Record many negative events (each -10 to validity dimension)
+        // After 5 events: validity=0.0, score=32.5 which is < 35.0 threshold
         for _ in 0..10 {
             rep.record_event(BehaviorEvent::new(BehaviorEventType::InvalidProof));
         }
@@ -654,18 +657,20 @@ mod tests {
     #[test]
     fn test_good_peers_filter() {
         let config = ReputationConfig {
-            good_threshold: 60.0,
+            // Lower threshold - with validity_weight=0.35, 5 ValidProof events
+            // only raise score from 50 to ~55.25
+            good_threshold: 54.0,
             ..Default::default()
         };
         let mut manager = ReputationManager::new(config);
 
-        // Add a good peer
+        // Add a good peer (5 ValidProof events, +3 each to validity)
         let good_peer = PeerId::from_string("good");
         for _ in 0..5 {
             manager.record_valid_proof(&good_peer);
         }
 
-        // Add a bad peer
+        // Add a bad peer (5 InvalidProof events, -10 each to validity)
         let bad_peer = PeerId::from_string("bad");
         for _ in 0..5 {
             manager.record_invalid_proof(&bad_peer);

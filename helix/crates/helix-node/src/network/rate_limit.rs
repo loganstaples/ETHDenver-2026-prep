@@ -741,16 +741,19 @@ mod tests {
             auto_blacklist_threshold: 3,
             default_burst_size: 1,
             default_requests_per_second: 0.1,
+            // Zero cooldown so violations can accumulate immediately
+            cooldown_period: Duration::from_millis(0),
+            max_cooldown: Duration::from_millis(0),
             ..Default::default()
         };
         let mut limiter = RateLimiter::new(config);
 
         let peer = PeerId::from_string("peer1");
 
-        // Exhaust limit
+        // Exhaust limit (first request uses the 1 token)
         limiter.check_rate_limit(&peer, MessageType::Generic);
 
-        // Trigger violations
+        // Trigger violations - need 3 to hit auto_blacklist_threshold
         for _ in 0..5 {
             let result = limiter.check_rate_limit(&peer, MessageType::Generic);
             if matches!(result, RateLimitResult::AutoBlacklisted) {

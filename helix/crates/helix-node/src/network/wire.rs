@@ -466,27 +466,32 @@ pub struct BinaryGradient {
 }
 
 impl BinaryGradient {
-    /// Creates a new binary gradient from float values.
+    /// Creates a new binary gradient from float values using asymmetric quantization.
     pub fn from_floats(values: &[f64], dimensions: Vec<usize>, bits: u8) -> Self {
-        let max_val = (1 << (bits - 1)) - 1;
-        let min_val = -(1 << (bits - 1));
+        let max_val = (1i32 << bits) - 1; // For 8 bits: 255
+        let min_val = 0i32;
 
         // Find range
         let (vmin, vmax) = values.iter().fold((f64::MAX, f64::MIN), |(min, max), &v| {
             (min.min(v), max.max(v))
         });
 
-        let scale = if vmax - vmin > 0.0 {
+        let scale = if vmax - vmin > 1e-10 {
             (vmax - vmin) / (max_val - min_val) as f64
         } else {
             1.0
         };
 
-        let zero_point = ((vmin / scale) as i32).clamp(min_val, max_val);
+        // Zero point maps vmin to min_val (0)
+        let zero_point = if scale > 1e-10 {
+            (min_val as f64 - vmin / scale).round() as i32
+        } else {
+            0
+        };
 
         let quantized: Vec<i32> = values
             .iter()
-            .map(|&v| ((v / scale) as i32 - zero_point).clamp(min_val, max_val))
+            .map(|&v| ((v / scale).round() as i32 + zero_point).clamp(min_val, max_val))
             .collect();
 
         Self {
@@ -501,7 +506,7 @@ impl BinaryGradient {
     pub fn to_floats(&self) -> Vec<f64> {
         self.values
             .iter()
-            .map(|&v| (v + self.zero_point) as f64 * self.scale)
+            .map(|&v| (v - self.zero_point) as f64 * self.scale)
             .collect()
     }
 

@@ -781,6 +781,14 @@ impl DistributedTrainingStateMachine {
                 ));
             }
 
+            // Transition all joined workers to SharesReceived
+            for worker in round.workers.values_mut() {
+                if worker.state == crate::training::state_machine::WorkerRoundState::Joined {
+                    worker.state = crate::training::state_machine::WorkerRoundState::SharesReceived;
+                    worker.touch();
+                }
+            }
+
             let worker_count = round.active_worker_count();
             let old_state = round.state;
             round.transition_to(DistributedRoundState::Computing);
