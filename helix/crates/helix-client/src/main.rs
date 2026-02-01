@@ -105,7 +105,7 @@ enum Commands {
     Visualize(VisualizeArgs),
 
     /// Show detailed help for a topic or command
-    Help(HelpArgs),
+    Guide(HelpArgs),
 }
 
 // ============================================================================
@@ -476,7 +476,7 @@ async fn main() -> Result<()> {
         Commands::Logs(args) => cmd_logs(args, &cli, shutdown_tx.subscribe()).await,
         Commands::Watch(args) => cmd_watch(args, &cli, shutdown_tx.subscribe()).await,
         Commands::Visualize(args) => cmd_visualize(args, &cli, shutdown_tx.subscribe()).await,
-        Commands::Help(args) => cmd_help(args, &cli).await,
+        Commands::Guide(args) => cmd_help(args, &cli).await,
     };
 
     if let Err(e) = result {

@@ -340,6 +340,21 @@ pub unsafe fn cuda_memcpy_dtoh(_dst: *mut u8, _src: u64, _size: usize) -> CudaRe
     Err(CudaError::NotAvailable)
 }
 
+/// Copy device to device.
+#[cfg(feature = "cuda")]
+pub unsafe fn cuda_memcpy_dtod(dst: u64, src: u64, size: usize) -> CudaResult<()> {
+    let result = helix_cuda_memcpy_dtod(dst, src, size);
+    if result != 0 {
+        return Err(CudaError::TransferFailed(format!("D->D copy failed: {}", result)));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "cuda"))]
+pub unsafe fn cuda_memcpy_dtod(_dst: u64, _src: u64, _size: usize) -> CudaResult<()> {
+    Err(CudaError::NotAvailable)
+}
+
 /// MSM using Pippenger's algorithm.
 #[cfg(feature = "cuda")]
 pub unsafe fn cuda_msm_pippenger(

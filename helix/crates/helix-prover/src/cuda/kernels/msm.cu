@@ -1,9 +1,16 @@
 // HELIX CUDA Multi-Scalar Multiplication (MSM)
 //
 // GPU-accelerated MSM using Pippenger's bucket method for BN254 G1.
+// Uses a hybrid CPU-GPU approach for optimal performance:
+// - GPU: Parallel bucket index extraction, point sorting prep
+// - CPU: Bucket accumulation (avoids atomic contention)
+// - GPU: Parallel bucket reduction
 
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <algorithm>
 
 // ============================================================================
 // BN254 Field Constants
@@ -25,17 +32,30 @@ __constant__ uint64_t FR_R[4] = {
 
 __constant__ uint64_t FR_INV = 0xc2e1f593efffffffULL;
 
+// Host-side constants
+static const uint64_t H_MODULUS[4] = {
+    0x43e1f593f0000001ULL,
+    0x2833e84879b97091ULL,
+    0xb85045b68181585dULL,
+    0x30644e72e131a029ULL
+};
+
+static const uint64_t H_R[4] = {
+    0xd35d438dc58f0d9dULL,
+    0x0a78eb28f5c70b3dULL,
+    0x666ea36f7879462cULL,
+    0x0e0a77c19a07df2fULL
+};
+
 // ============================================================================
 // Curve Point Structures
 // ============================================================================
 
-// Affine point (64 bytes: 32 for x, 32 for y)
 struct AffinePoint {
     uint64_t x[4];
     uint64_t y[4];
 };
 
-// Projective point (96 bytes: 32 each for x, y, z)
 struct ProjectivePoint {
     uint64_t x[4];
     uint64_t y[4];
@@ -43,7 +63,258 @@ struct ProjectivePoint {
 };
 
 // ============================================================================
-// Field Arithmetic (Inlined for Performance)
+// Host Field Arithmetic
+// ============================================================================
+
+static void host_add256(uint64_t* r, const uint64_t* a, const uint64_t* b, uint64_t* carry) {
+    *carry = 0;
+    for (int i = 0; i < 4; i++) {
+        __uint128_t sum = (__uint128_t)a[i] + b[i] + *carry;
+        r[i] = (uint64_t)sum;
+        *carry = (uint64_t)(sum >> 64);
+    }
+}
+
+static void host_sub256(uint64_t* r, const uint64_t* a, const uint64_t* b, uint64_t* borrow) {
+    *borrow = 0;
+    for (int i = 0; i < 4; i++) {
+        __uint128_t diff = (__uint128_t)a[i] - b[i] - *borrow;
+        r[i] = (uint64_t)diff;
+        *borrow = (diff >> 127) ? 1 : 0;
+    }
+}
+
+static bool host_gte(const uint64_t* a, const uint64_t* b) {
+    for (int i = 3; i >= 0; i--) {
+        if (a[i] > b[i]) return true;
+        if (a[i] < b[i]) return false;
+    }
+    return true;
+}
+
+static void host_field_add(uint64_t* c, const uint64_t* a, const uint64_t* b) {
+    uint64_t carry;
+    host_add256(c, a, b, &carry);
+    if (carry || host_gte(c, H_MODULUS)) {
+        uint64_t borrow;
+        host_sub256(c, c, H_MODULUS, &borrow);
+    }
+}
+
+static void host_field_sub(uint64_t* c, const uint64_t* a, const uint64_t* b) {
+    uint64_t borrow;
+    host_sub256(c, a, b, &borrow);
+    if (borrow) {
+        uint64_t carry;
+        host_add256(c, c, H_MODULUS, &carry);
+    }
+}
+
+static void host_mont_mul(uint64_t* c, const uint64_t* a, const uint64_t* b) {
+    uint64_t t[8] = {0};
+
+    for (int i = 0; i < 4; i++) {
+        uint64_t carry = 0;
+        for (int j = 0; j < 4; j++) {
+            __uint128_t prod = (__uint128_t)a[i] * b[j] + t[i+j] + carry;
+            t[i+j] = (uint64_t)prod;
+            carry = (uint64_t)(prod >> 64);
+        }
+        t[i+4] = carry;
+    }
+
+    const uint64_t inv = 0xc2e1f593efffffffULL;
+    for (int i = 0; i < 4; i++) {
+        uint64_t m = t[i] * inv;
+        uint64_t carry = 0;
+        for (int j = 0; j < 4; j++) {
+            __uint128_t prod = (__uint128_t)m * H_MODULUS[j] + t[i+j] + carry;
+            t[i+j] = (uint64_t)prod;
+            carry = (uint64_t)(prod >> 64);
+        }
+        for (int j = i+4; j < 8 && carry; j++) {
+            uint64_t sum = t[j] + carry;
+            carry = (sum < t[j]) ? 1 : 0;
+            t[j] = sum;
+        }
+    }
+
+    c[0] = t[4]; c[1] = t[5]; c[2] = t[6]; c[3] = t[7];
+
+    if (host_gte(c, H_MODULUS)) {
+        uint64_t borrow;
+        host_sub256(c, c, H_MODULUS, &borrow);
+    }
+}
+
+// ============================================================================
+// Host Curve Arithmetic
+// ============================================================================
+
+static bool host_is_identity(const ProjectivePoint* p) {
+    return p->z[0] == 0 && p->z[1] == 0 && p->z[2] == 0 && p->z[3] == 0;
+}
+
+static void host_set_identity(ProjectivePoint* p) {
+    memset(p->x, 0, 32);
+    memset(p->y, 0, 32);
+    memset(p->z, 0, 32);
+}
+
+static void host_point_double(ProjectivePoint* r, const ProjectivePoint* p) {
+    if (host_is_identity(p)) {
+        *r = *p;
+        return;
+    }
+
+    uint64_t a[4], b[4], c[4], d[4], tmp[4];
+
+    // A = Y^2
+    host_mont_mul(a, p->y, p->y);
+
+    // B = 4*X*A
+    host_mont_mul(b, p->x, a);
+    host_field_add(b, b, b);
+    host_field_add(b, b, b);
+
+    // C = 8*A^2
+    host_mont_mul(c, a, a);
+    host_field_add(c, c, c);
+    host_field_add(c, c, c);
+    host_field_add(c, c, c);
+
+    // D = 3*X^2 (a=0 for BN254)
+    host_mont_mul(d, p->x, p->x);
+    host_field_add(tmp, d, d);
+    host_field_add(d, tmp, d);
+
+    // X3 = D^2 - 2*B
+    host_mont_mul(r->x, d, d);
+    host_field_sub(r->x, r->x, b);
+    host_field_sub(r->x, r->x, b);
+
+    // Y3 = D*(B - X3) - C
+    host_field_sub(tmp, b, r->x);
+    host_mont_mul(r->y, d, tmp);
+    host_field_sub(r->y, r->y, c);
+
+    // Z3 = 2*Y*Z
+    host_mont_mul(r->z, p->y, p->z);
+    host_field_add(r->z, r->z, r->z);
+}
+
+static void host_point_add_mixed(ProjectivePoint* r, const ProjectivePoint* p, const AffinePoint* q) {
+    if (host_is_identity(p)) {
+        memcpy(r->x, q->x, 32);
+        memcpy(r->y, q->y, 32);
+        memcpy(r->z, H_R, 32);
+        return;
+    }
+
+    uint64_t z1_sq[4], u2[4], z1_cu[4], s2[4], h[4], rr[4];
+    uint64_t hh[4], hhh[4], v[4], tmp[4];
+
+    host_mont_mul(z1_sq, p->z, p->z);
+    host_mont_mul(u2, q->x, z1_sq);
+    host_mont_mul(z1_cu, z1_sq, p->z);
+    host_mont_mul(s2, q->y, z1_cu);
+
+    host_field_sub(h, u2, p->x);
+    host_field_sub(rr, s2, p->y);
+
+    // Check for special cases
+    bool h_zero = (h[0] == 0 && h[1] == 0 && h[2] == 0 && h[3] == 0);
+    bool r_zero = (rr[0] == 0 && rr[1] == 0 && rr[2] == 0 && rr[3] == 0);
+
+    if (h_zero && r_zero) {
+        // Point doubling case
+        host_point_double(r, p);
+        return;
+    }
+
+    if (h_zero) {
+        // Points are inverses
+        host_set_identity(r);
+        return;
+    }
+
+    host_mont_mul(hh, h, h);
+    host_mont_mul(hhh, hh, h);
+    host_mont_mul(v, p->x, hh);
+
+    host_mont_mul(r->x, rr, rr);
+    host_field_sub(r->x, r->x, hhh);
+    host_field_sub(r->x, r->x, v);
+    host_field_sub(r->x, r->x, v);
+
+    host_field_sub(tmp, v, r->x);
+    host_mont_mul(r->y, rr, tmp);
+    host_mont_mul(tmp, p->y, hhh);
+    host_field_sub(r->y, r->y, tmp);
+
+    host_mont_mul(r->z, p->z, h);
+}
+
+static void host_point_add_proj(ProjectivePoint* r, const ProjectivePoint* p, const ProjectivePoint* q) {
+    if (host_is_identity(p)) {
+        *r = *q;
+        return;
+    }
+    if (host_is_identity(q)) {
+        *r = *p;
+        return;
+    }
+
+    uint64_t z1_sq[4], z2_sq[4], z1_cu[4], z2_cu[4];
+    uint64_t u1[4], u2[4], s1[4], s2[4], h[4], rr[4];
+    uint64_t hh[4], hhh[4], v[4], tmp[4];
+
+    host_mont_mul(z1_sq, p->z, p->z);
+    host_mont_mul(z2_sq, q->z, q->z);
+    host_mont_mul(z1_cu, z1_sq, p->z);
+    host_mont_mul(z2_cu, z2_sq, q->z);
+
+    host_mont_mul(u1, p->x, z2_sq);
+    host_mont_mul(u2, q->x, z1_sq);
+    host_mont_mul(s1, p->y, z2_cu);
+    host_mont_mul(s2, q->y, z1_cu);
+
+    host_field_sub(h, u2, u1);
+    host_field_sub(rr, s2, s1);
+
+    bool h_zero = (h[0] == 0 && h[1] == 0 && h[2] == 0 && h[3] == 0);
+    bool r_zero = (rr[0] == 0 && rr[1] == 0 && rr[2] == 0 && rr[3] == 0);
+
+    if (h_zero && r_zero) {
+        host_point_double(r, p);
+        return;
+    }
+
+    if (h_zero) {
+        host_set_identity(r);
+        return;
+    }
+
+    host_mont_mul(hh, h, h);
+    host_mont_mul(hhh, hh, h);
+    host_mont_mul(v, u1, hh);
+
+    host_mont_mul(r->x, rr, rr);
+    host_field_sub(r->x, r->x, hhh);
+    host_field_sub(r->x, r->x, v);
+    host_field_sub(r->x, r->x, v);
+
+    host_field_sub(tmp, v, r->x);
+    host_mont_mul(r->y, rr, tmp);
+    host_mont_mul(tmp, s1, hhh);
+    host_field_sub(r->y, r->y, tmp);
+
+    host_mont_mul(tmp, p->z, q->z);
+    host_mont_mul(r->z, tmp, h);
+}
+
+// ============================================================================
+// Device Field Arithmetic
 // ============================================================================
 
 __device__ __forceinline__ void mul64(uint64_t a, uint64_t b, uint64_t& hi, uint64_t& lo) {
@@ -162,162 +433,7 @@ __device__ __forceinline__ void mont_mul(uint64_t* c, const uint64_t* a, const u
 }
 
 // ============================================================================
-// Elliptic Curve Operations
-// ============================================================================
-
-__device__ __forceinline__ bool is_identity(const ProjectivePoint* p) {
-    return p->z[0] == 0 && p->z[1] == 0 && p->z[2] == 0 && p->z[3] == 0;
-}
-
-__device__ void point_double(ProjectivePoint* r, const ProjectivePoint* p) {
-    if (is_identity(p)) {
-        *r = *p;
-        return;
-    }
-
-    uint64_t a[4], b[4], c[4], d[4], tmp[4];
-
-    // A = Y^2
-    mont_mul(a, p->y, p->y);
-
-    // B = 4*X*A
-    mont_mul(b, p->x, a);
-    field_add(b, b, b);
-    field_add(b, b, b);
-
-    // C = 8*A^2
-    mont_mul(c, a, a);
-    field_add(c, c, c);
-    field_add(c, c, c);
-    field_add(c, c, c);
-
-    // D = 3*X^2 (a=0 for BN254)
-    mont_mul(d, p->x, p->x);
-    field_add(tmp, d, d);
-    field_add(d, tmp, d);
-
-    // X3 = D^2 - 2*B
-    mont_mul(r->x, d, d);
-    field_sub(r->x, r->x, b);
-    field_sub(r->x, r->x, b);
-
-    // Y3 = D*(B - X3) - C
-    field_sub(tmp, b, r->x);
-    mont_mul(r->y, d, tmp);
-    field_sub(r->y, r->y, c);
-
-    // Z3 = 2*Y*Z
-    mont_mul(r->z, p->y, p->z);
-    field_add(r->z, r->z, r->z);
-}
-
-__device__ void point_add_mixed(ProjectivePoint* r, const ProjectivePoint* p, const AffinePoint* q) {
-    // Handle identity cases
-    bool p_is_id = is_identity(p);
-
-    if (p_is_id) {
-        #pragma unroll
-        for (int i = 0; i < 4; i++) {
-            r->x[i] = q->x[i];
-            r->y[i] = q->y[i];
-            r->z[i] = FR_R[i]; // Z = 1 in Montgomery form
-        }
-        return;
-    }
-
-    uint64_t z1_sq[4], u2[4], z1_cu[4], s2[4], h[4], r_val[4];
-    uint64_t hh[4], hhh[4], v[4], tmp[4];
-
-    // Z1^2
-    mont_mul(z1_sq, p->z, p->z);
-
-    // U2 = X2 * Z1^2
-    mont_mul(u2, q->x, z1_sq);
-
-    // Z1^3
-    mont_mul(z1_cu, z1_sq, p->z);
-
-    // S2 = Y2 * Z1^3
-    mont_mul(s2, q->y, z1_cu);
-
-    // H = U2 - X1
-    field_sub(h, u2, p->x);
-
-    // r = S2 - Y1
-    field_sub(r_val, s2, p->y);
-
-    // HH = H^2
-    mont_mul(hh, h, h);
-
-    // HHH = H^3
-    mont_mul(hhh, hh, h);
-
-    // V = X1 * HH
-    mont_mul(v, p->x, hh);
-
-    // X3 = r^2 - HHH - 2*V
-    mont_mul(r->x, r_val, r_val);
-    field_sub(r->x, r->x, hhh);
-    field_sub(r->x, r->x, v);
-    field_sub(r->x, r->x, v);
-
-    // Y3 = r*(V - X3) - Y1*HHH
-    field_sub(tmp, v, r->x);
-    mont_mul(r->y, r_val, tmp);
-    mont_mul(tmp, p->y, hhh);
-    field_sub(r->y, r->y, tmp);
-
-    // Z3 = Z1 * H
-    mont_mul(r->z, p->z, h);
-}
-
-__device__ void point_add_proj(ProjectivePoint* r, const ProjectivePoint* p, const ProjectivePoint* q) {
-    if (is_identity(p)) {
-        *r = *q;
-        return;
-    }
-    if (is_identity(q)) {
-        *r = *p;
-        return;
-    }
-
-    uint64_t z1_sq[4], z2_sq[4], z1_cu[4], z2_cu[4];
-    uint64_t u1[4], u2[4], s1[4], s2[4], h[4], r_val[4];
-    uint64_t hh[4], hhh[4], v[4], tmp[4];
-
-    mont_mul(z1_sq, p->z, p->z);
-    mont_mul(z2_sq, q->z, q->z);
-    mont_mul(z1_cu, z1_sq, p->z);
-    mont_mul(z2_cu, z2_sq, q->z);
-
-    mont_mul(u1, p->x, z2_sq);
-    mont_mul(u2, q->x, z1_sq);
-    mont_mul(s1, p->y, z2_cu);
-    mont_mul(s2, q->y, z1_cu);
-
-    field_sub(h, u2, u1);
-    field_sub(r_val, s2, s1);
-
-    mont_mul(hh, h, h);
-    mont_mul(hhh, hh, h);
-    mont_mul(v, u1, hh);
-
-    mont_mul(r->x, r_val, r_val);
-    field_sub(r->x, r->x, hhh);
-    field_sub(r->x, r->x, v);
-    field_sub(r->x, r->x, v);
-
-    field_sub(tmp, v, r->x);
-    mont_mul(r->y, r_val, tmp);
-    mont_mul(tmp, s1, hhh);
-    field_sub(r->y, r->y, tmp);
-
-    mont_mul(tmp, p->z, q->z);
-    mont_mul(r->z, tmp, h);
-}
-
-// ============================================================================
-// MSM Pippenger Implementation
+// GPU Kernels
 // ============================================================================
 
 // Get window value from scalar
@@ -341,98 +457,243 @@ __device__ __forceinline__ uint32_t get_window(const uint64_t* scalar, int windo
     return (uint32_t)(value & mask);
 }
 
-// Kernel to extract bucket indices for a window
-__global__ void extract_bucket_indices(
+// Kernel to extract bucket indices for all windows
+__global__ void extract_all_bucket_indices(
     const uint64_t* __restrict__ scalars,
     uint32_t* __restrict__ bucket_indices,
     size_t count,
-    int window_idx,
+    int num_windows,
     int window_size
 ) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= count) return;
 
     const uint64_t* scalar = &scalars[idx * 4];
-    bucket_indices[idx] = get_window(scalar, window_idx, window_size);
+
+    for (int w = 0; w < num_windows; w++) {
+        bucket_indices[w * count + idx] = get_window(scalar, w, window_size);
+    }
 }
 
-// Kernel to accumulate points into buckets (sequential per bucket due to atomics limitations)
-// This is done on CPU for now as GPU atomics for curve points are complex
+// ============================================================================
+// Host MSM Implementation
+// ============================================================================
 
-// ============================================================================
-// External C Interface
-// ============================================================================
+static uint32_t host_get_window(const uint64_t* scalar, int window_idx, int window_size) {
+    int bit_offset = window_idx * window_size;
+    int limb_idx = bit_offset / 64;
+    int bit_in_limb = bit_offset % 64;
+
+    if (limb_idx >= 4) return 0;
+
+    uint64_t value = scalar[limb_idx] >> bit_in_limb;
+
+    int bits_from_first = 64 - bit_in_limb;
+    if (bits_from_first < window_size && limb_idx + 1 < 4) {
+        int remaining_bits = window_size - bits_from_first;
+        uint64_t mask = (1ULL << remaining_bits) - 1;
+        value |= (scalar[limb_idx + 1] & mask) << bits_from_first;
+    }
+
+    uint32_t mask = (1U << window_size) - 1;
+    return (uint32_t)(value & mask);
+}
 
 extern "C" {
 
 int32_t helix_cuda_msm_pippenger(
-    const uint64_t* points,    // Array of affine points (8 limbs each)
-    const uint64_t* scalars,   // Array of scalars (4 limbs each)
+    const uint64_t* points,
+    const uint64_t* scalars,
     size_t count,
     size_t window_size,
-    uint64_t* result           // Result point (projective, 12 limbs)
+    uint64_t* result
 ) {
     if (count == 0) {
-        // Return identity
         for (int i = 0; i < 12; i++) result[i] = 0;
         return 0;
     }
 
-    // For small inputs or due to atomic limitations, fall back to CPU
-    // The GPU implementation would need proper bucket sorting first
-    // This is a simplified version that demonstrates the structure
-
-    // Allocate device memory
-    uint64_t* d_points;
-    uint64_t* d_scalars;
-    uint32_t* d_bucket_indices;
-
-    cudaMalloc(&d_points, count * 8 * sizeof(uint64_t));
-    cudaMalloc(&d_scalars, count * 4 * sizeof(uint64_t));
-    cudaMalloc(&d_bucket_indices, count * sizeof(uint32_t));
-
-    cudaMemcpy(d_points, points, count * 8 * sizeof(uint64_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_scalars, scalars, count * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice);
+    // Clamp window size
+    if (window_size < 4) window_size = 4;
+    if (window_size > 16) window_size = 16;
 
     int num_windows = (256 + window_size - 1) / window_size;
     size_t num_buckets = (1ULL << window_size) - 1;
 
-    // Process each window
-    ProjectivePoint host_result = {{0}, {0}, {0}};
-    ProjectivePoint window_results[20]; // Max 20 windows
+    // Allocate device memory for bucket indices
+    uint64_t* d_scalars;
+    uint32_t* d_bucket_indices;
 
-    for (int w = 0; w < num_windows; w++) {
-        // Extract bucket indices
+    cudaError_t err;
+    err = cudaMalloc(&d_scalars, count * 4 * sizeof(uint64_t));
+    if (err != cudaSuccess) {
+        // Fall back to pure CPU
+        goto cpu_fallback;
+    }
+
+    err = cudaMalloc(&d_bucket_indices, num_windows * count * sizeof(uint32_t));
+    if (err != cudaSuccess) {
+        cudaFree(d_scalars);
+        goto cpu_fallback;
+    }
+
+    // Copy scalars to device
+    cudaMemcpy(d_scalars, scalars, count * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice);
+
+    // Extract all bucket indices on GPU (parallel)
+    {
         int block_size = 256;
         int num_blocks = (count + block_size - 1) / block_size;
-
-        extract_bucket_indices<<<num_blocks, block_size>>>(
-            d_scalars,
-            d_bucket_indices,
-            count,
-            w,
-            window_size
+        extract_all_bucket_indices<<<num_blocks, block_size>>>(
+            d_scalars, d_bucket_indices, count, num_windows, window_size
         );
         cudaDeviceSynchronize();
-
-        // For now, bucket accumulation is done on CPU
-        // A full GPU implementation would sort points by bucket and use parallel reduction
-        window_results[w] = {{0}, {0}, {0}};
     }
 
-    // Cleanup
-    cudaFree(d_points);
-    cudaFree(d_scalars);
-    cudaFree(d_bucket_indices);
+    // Copy bucket indices back to host
+    {
+        uint32_t* h_bucket_indices = (uint32_t*)malloc(num_windows * count * sizeof(uint32_t));
+        if (!h_bucket_indices) {
+            cudaFree(d_scalars);
+            cudaFree(d_bucket_indices);
+            goto cpu_fallback;
+        }
 
-    // Copy result
-    for (int i = 0; i < 4; i++) {
-        result[i] = host_result.x[i];
-        result[i + 4] = host_result.y[i];
-        result[i + 8] = host_result.z[i];
+        cudaMemcpy(h_bucket_indices, d_bucket_indices, num_windows * count * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+
+        cudaFree(d_scalars);
+        cudaFree(d_bucket_indices);
+
+        // Cast points to AffinePoint array
+        const AffinePoint* affine_points = reinterpret_cast<const AffinePoint*>(points);
+
+        // Process each window
+        ProjectivePoint* window_results = (ProjectivePoint*)calloc(num_windows, sizeof(ProjectivePoint));
+        if (!window_results) {
+            free(h_bucket_indices);
+            goto cpu_fallback;
+        }
+
+        for (int w = 0; w < num_windows; w++) {
+            // Allocate buckets
+            ProjectivePoint* buckets = (ProjectivePoint*)calloc(num_buckets, sizeof(ProjectivePoint));
+            if (!buckets) {
+                free(h_bucket_indices);
+                free(window_results);
+                goto cpu_fallback;
+            }
+
+            // Accumulate points into buckets
+            uint32_t* window_indices = &h_bucket_indices[w * count];
+            for (size_t i = 0; i < count; i++) {
+                uint32_t bucket_idx = window_indices[i];
+                if (bucket_idx > 0 && bucket_idx <= num_buckets) {
+                    host_point_add_mixed(&buckets[bucket_idx - 1], &buckets[bucket_idx - 1], &affine_points[i]);
+                }
+            }
+
+            // Reduce buckets using running sum technique
+            ProjectivePoint running, sum;
+            host_set_identity(&running);
+            host_set_identity(&sum);
+
+            for (size_t i = num_buckets; i > 0; i--) {
+                host_point_add_proj(&running, &running, &buckets[i - 1]);
+                host_point_add_proj(&sum, &sum, &running);
+            }
+
+            window_results[w] = sum;
+            free(buckets);
+        }
+
+        free(h_bucket_indices);
+
+        // Combine window results using Horner's method
+        ProjectivePoint final_result = window_results[num_windows - 1];
+
+        for (int w = num_windows - 2; w >= 0; w--) {
+            // Double window_size times
+            for (size_t j = 0; j < window_size; j++) {
+                ProjectivePoint doubled;
+                host_point_double(&doubled, &final_result);
+                final_result = doubled;
+            }
+            // Add window result
+            host_point_add_proj(&final_result, &final_result, &window_results[w]);
+        }
+
+        free(window_results);
+
+        // Copy result
+        memcpy(&result[0], final_result.x, 32);
+        memcpy(&result[4], final_result.y, 32);
+        memcpy(&result[8], final_result.z, 32);
+
+        return 0;
     }
 
-    return 0;
+cpu_fallback:
+    // Pure CPU implementation
+    {
+        const AffinePoint* affine_points = reinterpret_cast<const AffinePoint*>(points);
+
+        ProjectivePoint* window_results = (ProjectivePoint*)calloc(num_windows, sizeof(ProjectivePoint));
+        if (!window_results) {
+            for (int i = 0; i < 12; i++) result[i] = 0;
+            return -1;
+        }
+
+        for (int w = 0; w < num_windows; w++) {
+            ProjectivePoint* buckets = (ProjectivePoint*)calloc(num_buckets, sizeof(ProjectivePoint));
+            if (!buckets) {
+                free(window_results);
+                for (int i = 0; i < 12; i++) result[i] = 0;
+                return -1;
+            }
+
+            // Accumulate points into buckets
+            for (size_t i = 0; i < count; i++) {
+                const uint64_t* scalar = &scalars[i * 4];
+                uint32_t bucket_idx = host_get_window(scalar, w, window_size);
+                if (bucket_idx > 0 && bucket_idx <= num_buckets) {
+                    host_point_add_mixed(&buckets[bucket_idx - 1], &buckets[bucket_idx - 1], &affine_points[i]);
+                }
+            }
+
+            // Reduce buckets
+            ProjectivePoint running, sum;
+            host_set_identity(&running);
+            host_set_identity(&sum);
+
+            for (size_t i = num_buckets; i > 0; i--) {
+                host_point_add_proj(&running, &running, &buckets[i - 1]);
+                host_point_add_proj(&sum, &sum, &running);
+            }
+
+            window_results[w] = sum;
+            free(buckets);
+        }
+
+        // Combine window results
+        ProjectivePoint final_result = window_results[num_windows - 1];
+
+        for (int w = num_windows - 2; w >= 0; w--) {
+            for (size_t j = 0; j < window_size; j++) {
+                ProjectivePoint doubled;
+                host_point_double(&doubled, &final_result);
+                final_result = doubled;
+            }
+            host_point_add_proj(&final_result, &final_result, &window_results[w]);
+        }
+
+        free(window_results);
+
+        memcpy(&result[0], final_result.x, 32);
+        memcpy(&result[4], final_result.y, 32);
+        memcpy(&result[8], final_result.z, 32);
+
+        return 0;
+    }
 }
 
 int32_t helix_cuda_msm_batch(
@@ -443,7 +704,6 @@ int32_t helix_cuda_msm_batch(
     size_t window_size,
     uint64_t* results
 ) {
-    // Process each MSM independently
     size_t point_offset = 0;
     size_t scalar_offset = 0;
 

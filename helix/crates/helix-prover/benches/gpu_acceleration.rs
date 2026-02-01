@@ -7,6 +7,10 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use rand::Rng;
 use std::time::Duration;
 
+// Import the crate for GPU comparison benchmarks
+#[allow(unused_imports)]
+use helix_prover;
+
 // ============================================================================
 // BN254 Field Constants & Arithmetic (Self-contained for benchmarking)
 // ============================================================================
@@ -381,8 +385,181 @@ fn bench_ntt_field_ops(c: &mut Criterion) {
 }
 
 // ============================================================================
-// Comparison Benchmarks
+// GPU vs CPU Comparison Benchmarks (B2 Requirement)
 // ============================================================================
+
+/// MSM performance comparison: CPU vs GPU
+/// Target: GPU should be 10x+ faster for large operations
+fn bench_msm_gpu_vs_cpu(c: &mut Criterion) {
+    let mut group = c.benchmark_group("MSM GPU vs CPU");
+    group.measurement_time(Duration::from_secs(15));
+
+    // Test various sizes to show scaling
+    for log_n in [10, 12, 14].iter() {
+        let n = 1 << log_n;
+        group.throughput(Throughput::Elements(n as u64));
+
+        // Generate random points and scalars
+        let points: Vec<[u64; 8]> = (0..n)
+            .map(|_| {
+                let mut p = [0u64; 8];
+                for i in 0..8 {
+                    p[i] = random_field_element()[i % 4];
+                }
+                p
+            })
+            .collect();
+
+        let scalars: Vec<[u64; 4]> = (0..n)
+            .map(|_| random_field_element())
+            .collect();
+
+        // CPU MSM benchmark
+        group.bench_with_input(BenchmarkId::new("cpu", log_n), &n, |b, _| {
+            b.iter(|| {
+                // Use the CPU MSM implementation
+                let result = helix_prover::cuda::msm_cpu::compute_msm(&points, &scalars, 16);
+                black_box(result)
+            });
+        });
+
+        // GPU MSM benchmark (if CUDA available)
+        #[cfg(feature = "cuda")]
+        {
+            if helix_prover::cuda::is_cuda_available() {
+                group.bench_with_input(BenchmarkId::new("gpu_cuda", log_n), &n, |b, _| {
+                    b.iter(|| {
+                        let result = unsafe {
+                            helix_prover::cuda::bindings::cuda_msm_pippenger(
+                                points.as_ptr() as *const u64,
+                                scalars.as_ptr() as *const u64,
+                                n,
+                                16, // window size
+                            )
+                        };
+                        black_box(result)
+                    });
+                });
+            }
+        }
+    }
+
+    group.finish();
+}
+
+/// NTT performance comparison: CPU vs GPU
+/// Target: GPU should be 10x+ faster for large transforms
+fn bench_ntt_gpu_vs_cpu(c: &mut Criterion) {
+    let mut group = c.benchmark_group("NTT GPU vs CPU");
+    group.measurement_time(Duration::from_secs(15));
+
+    for log_n in [12, 14, 16].iter() {
+        let n = 1 << log_n;
+        group.throughput(Throughput::Elements(n as u64));
+
+        let data: Vec<[u64; 4]> = (0..n).map(|_| random_field_element()).collect();
+
+        // CPU NTT benchmark
+        group.bench_with_input(BenchmarkId::new("cpu_forward", log_n), &data, |b, data| {
+            b.iter_batched(
+                || data.clone(),
+                |mut working_data| {
+                    forward_ntt(&mut working_data);
+                    working_data
+                },
+                criterion::BatchSize::SmallInput,
+            );
+        });
+
+        group.bench_with_input(BenchmarkId::new("cpu_inverse", log_n), &data, |b, data| {
+            b.iter_batched(
+                || data.clone(),
+                |mut working_data| {
+                    inverse_ntt(&mut working_data);
+                    working_data
+                },
+                criterion::BatchSize::SmallInput,
+            );
+        });
+
+        // GPU NTT benchmark (if CUDA available)
+        #[cfg(feature = "cuda")]
+        {
+            if helix_prover::cuda::is_cuda_available() {
+                group.bench_with_input(BenchmarkId::new("gpu_cuda_forward", log_n), &data, |b, data| {
+                    b.iter_batched(
+                        || {
+                            let mut flat: Vec<u64> = Vec::with_capacity(n * 4);
+                            for elem in data.iter() {
+                                flat.extend_from_slice(elem);
+                            }
+                            flat
+                        },
+                        |mut flat_data| {
+                            unsafe {
+                                let _ = helix_prover::cuda::bindings::cuda_ntt_forward(
+                                    flat_data.as_mut_ptr(),
+                                    n,
+                                );
+                            }
+                            flat_data
+                        },
+                        criterion::BatchSize::SmallInput,
+                    );
+                });
+            }
+        }
+    }
+
+    group.finish();
+}
+
+/// Field operations batch comparison
+fn bench_field_ops_gpu_vs_cpu(c: &mut Criterion) {
+    let mut group = c.benchmark_group("Field Ops GPU vs CPU");
+    group.measurement_time(Duration::from_secs(10));
+
+    let batch_size = 100000;
+    let a_batch: Vec<[u64; 4]> = (0..batch_size).map(|_| random_field_element()).collect();
+    let b_batch: Vec<[u64; 4]> = (0..batch_size).map(|_| random_field_element()).collect();
+
+    group.throughput(Throughput::Elements(batch_size as u64));
+
+    // CPU batch multiplication
+    group.bench_function("cpu_batch_mul", |bench| {
+        bench.iter(|| {
+            let results: Vec<_> = a_batch
+                .iter()
+                .zip(b_batch.iter())
+                .map(|(a, b)| field_mul(a, b))
+                .collect();
+            black_box(results)
+        });
+    });
+
+    // GPU batch multiplication (if available)
+    #[cfg(feature = "cuda")]
+    {
+        if helix_prover::cuda::is_cuda_available() {
+            group.bench_function("gpu_batch_mul", |bench| {
+                bench.iter(|| {
+                    let mut result = vec![[0u64; 4]; batch_size];
+                    unsafe {
+                        let _ = helix_prover::cuda::bindings::cuda_field_mul(
+                            a_batch.as_ptr() as *const u64,
+                            b_batch.as_ptr() as *const u64,
+                            result.as_mut_ptr() as *mut u64,
+                            batch_size,
+                        );
+                    }
+                    black_box(result)
+                });
+            });
+        }
+    }
+
+    group.finish();
+}
 
 fn bench_cpu_vs_parallel(c: &mut Criterion) {
     let mut group = c.benchmark_group("CPU vs Parallel");
@@ -461,4 +638,11 @@ criterion_group!(
     targets = bench_cpu_vs_parallel, bench_field_throughput
 );
 
-criterion_main!(ntt_benches, throughput_benches);
+// GPU vs CPU comparison benchmarks (B2 requirement: 10x+ speedup target)
+criterion_group!(
+    name = gpu_comparison_benches;
+    config = Criterion::default().sample_size(30);
+    targets = bench_msm_gpu_vs_cpu, bench_ntt_gpu_vs_cpu, bench_field_ops_gpu_vs_cpu
+);
+
+criterion_main!(ntt_benches, throughput_benches, gpu_comparison_benches);
