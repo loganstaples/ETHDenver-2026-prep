@@ -884,5 +884,325 @@ export function generateMockAdversarialEvent(index: number): AdversarialEvent {
     };
 }
 
+// ============================================================================
+// Status Page Specific Types and Functions
+// ============================================================================
+
+export interface StatusOverview {
+    trainingSessions: TrainingSession[];
+    workers: NodeInfo[];
+    recentProofs: ProofInfo[];
+    currentMetrics: TrainingMetrics | null;
+    networkStats: NetworkStats;
+    errorLogs: StatusErrorLog[];
+    contractState: ContractStateSnapshot;
+}
+
+export interface StatusErrorLog {
+    id: string;
+    timestamp: number;
+    level: 'error' | 'warning' | 'info';
+    message: string;
+    source: string;
+    details?: Record<string, unknown>;
+}
+
+export interface ContractStateSnapshot {
+    nextModelId: string;
+    defaultMinStake: string;
+    stakeLockPeriod: string;
+    slashPercentage: string;
+    maxErrorBound: string;
+    slashingRecordCount: string;
+    activeModels: number;
+    totalStaked: string;
+}
+
+export interface WorkerHealthStatus {
+    workerId: string;
+    address: string;
+    type: NodeInfo['type'];
+    status: NodeInfo['status'];
+    lastHeartbeat: number;
+    uptime: number;
+    proofsSubmitted: number;
+    proofsVerified: number;
+    proofsFailed: number;
+    averageProofTime: number;
+    stake: {
+        amount: string;
+        slashed: boolean;
+    };
+}
+
+export interface RoundState {
+    modelId: string;
+    currentRound: string;
+    roundStatus: 'pending' | 'in_progress' | 'aggregating' | 'proving' | 'completed' | 'failed';
+    deadline: number | null;
+    participants: string[];
+    prover: string | null;
+    modelCommitment: string;
+    newCommitment: string | null;
+    errorBound: number;
+    proofSubmitted: boolean;
+}
+
+// Add status-specific methods to the API client
+export class StatusApiClient extends HelixApiClient {
+    // ========================================================================
+    // Status Page Endpoints
+    // ========================================================================
+
+    /**
+     * Get complete status overview for the dashboard
+     * Aggregates multiple data sources into a single response
+     */
+    async getStatusOverview(): Promise<StatusOverview> {
+        return this['fetch']<StatusOverview>('/status/overview');
+    }
+
+    /**
+     * Get worker health status for all connected workers
+     */
+    async getWorkerHealthStatus(): Promise<WorkerHealthStatus[]> {
+        return this['fetch']<WorkerHealthStatus[]>('/status/workers');
+    }
+
+    /**
+     * Get current round state for a specific model
+     */
+    async getRoundState(modelId: string | bigint): Promise<RoundState> {
+        return this['fetch']<RoundState>(`/status/round/${modelId.toString()}`);
+    }
+
+    /**
+     * Get error logs with filtering
+     */
+    async getErrorLogs(params?: {
+        level?: StatusErrorLog['level'];
+        source?: string;
+        since?: number;
+        limit?: number;
+    }): Promise<{ logs: StatusErrorLog[]; total: number }> {
+        const queryParams = new URLSearchParams();
+        if (params) {
+            Object.entries(params).forEach(([key, value]) => {
+                if (value !== undefined) queryParams.set(key, String(value));
+            });
+        }
+        return this['fetch'](`/status/logs?${queryParams}`);
+    }
+
+    /**
+     * Get contract state snapshot
+     */
+    async getContractStateSnapshot(): Promise<ContractStateSnapshot> {
+        return this['fetch']<ContractStateSnapshot>('/status/contract');
+    }
+
+    /**
+     * Get recent proof submissions with verification status
+     */
+    async getRecentProofStatus(params?: {
+        modelId?: string;
+        limit?: number;
+    }): Promise<{
+        proofs: Array<ProofInfo & { verificationLatency?: number }>;
+        stats: {
+            totalSubmitted: number;
+            verified: number;
+            pending: number;
+            failed: number;
+            averageVerificationTime: number;
+        };
+    }> {
+        const queryParams = new URLSearchParams();
+        if (params) {
+            Object.entries(params).forEach(([key, value]) => {
+                if (value !== undefined) queryParams.set(key, String(value));
+            });
+        }
+        return this['fetch'](`/status/proofs?${queryParams}`);
+    }
+
+    /**
+     * Get live training metrics for a session
+     */
+    async getLiveTrainingMetrics(sessionId: string): Promise<{
+        metrics: TrainingMetrics;
+        deltaFromLast: {
+            loss: number;
+            accuracy: number;
+            errorBound: number;
+        };
+        estimatedCompletion: number | null;
+    }> {
+        return this['fetch'](`/status/training/${sessionId}/live`);
+    }
+}
+
+// ============================================================================
+// Status Mock Data Generators
+// ============================================================================
+
+export function generateMockStatusOverview(): StatusOverview {
+    const workers = Array.from({ length: 8 }, (_, i) =>
+        generateMockNodeInfo(
+            `0x${Array(40).fill(0).map(() => Math.floor(Math.random() * 16).toString(16)).join('')}`,
+            i
+        )
+    );
+
+    const proofs = Array.from({ length: 10 }, (_, i) =>
+        generateMockProofInfo(BigInt(Math.floor(Math.random() * 50) + 1), i)
+    );
+
+    const metrics = generateMockTrainingMetrics(25);
+
+    return {
+        trainingSessions: generateMockTrainingSessions(),
+        workers,
+        recentProofs: proofs,
+        currentMetrics: metrics,
+        networkStats: generateMockNetworkStats(),
+        errorLogs: generateMockErrorLogs(),
+        contractState: generateMockContractState(),
+    };
+}
+
+export function generateMockTrainingSessions(): TrainingSession[] {
+    const statuses: TrainingSession['status'][] = ['training', 'initializing', 'completed', 'paused'];
+    return Array.from({ length: 3 }, (_, i) => ({
+        id: `session-${i + 1}`,
+        modelId: BigInt(i + 1),
+        modelName: ['GPT-Mini', 'Vision Classifier', 'Sentiment Model'][i] || `Model ${i + 1}`,
+        status: statuses[i % statuses.length],
+        startedAt: Date.now() - (i + 1) * 3600000,
+        updatedAt: Date.now() - Math.random() * 60000,
+        completedAt: i === 2 ? Date.now() - 1800000 : undefined,
+        config: {
+            totalEpochs: 100,
+            batchSize: 32,
+            learningRate: 0.001,
+            optimizer: 'AdamW',
+            lossFunction: 'CrossEntropy',
+            maxErrorBound: 0.01,
+            mpcThreshold: 3,
+            proofFrequency: 10,
+        },
+        metrics: generateMockTrainingMetrics(Math.floor(Math.random() * 50) + 10),
+        rounds: [],
+        workers: [`0x${Array(40).fill(0).map(() => Math.floor(Math.random() * 16).toString(16)).join('')}`],
+        errorBounds: [],
+    }));
+}
+
+export function generateMockNetworkStats(): NetworkStats {
+    return {
+        totalNodes: 12,
+        activeNodes: 9,
+        totalStaked: BigInt(150 * 1e18),
+        totalProofs: 1247,
+        totalRounds: 89,
+        totalSlashed: BigInt(2 * 1e18),
+        averageProofTime: 312,
+        networkUptime: 0.997,
+        throughput: 42.5,
+        activeTrainingSessions: 2,
+    };
+}
+
+export function generateMockErrorLogs(): StatusErrorLog[] {
+    const messages = [
+        { level: 'error' as const, message: 'Proof verification failed for round 45', source: 'verifier' },
+        { level: 'warning' as const, message: 'Worker node-abc123 high latency detected (>500ms)', source: 'network' },
+        { level: 'info' as const, message: 'Round 46 aggregation complete', source: 'aggregator' },
+        { level: 'warning' as const, message: 'Memory usage above 80% on node-def456', source: 'monitor' },
+        { level: 'error' as const, message: 'Invalid gradient detected, triggering slash', source: 'coordinator' },
+        { level: 'info' as const, message: 'New worker registered: 0x7a3b...9c2d', source: 'registry' },
+        { level: 'warning' as const, message: 'Proof generation time exceeded threshold', source: 'prover' },
+        { level: 'info' as const, message: 'Model checkpoint saved to IPFS', source: 'storage' },
+    ];
+
+    return messages.map((m, i) => ({
+        id: `log-${i}`,
+        timestamp: Date.now() - i * 45000,
+        ...m,
+    }));
+}
+
+export function generateMockContractState(): ContractStateSnapshot {
+    return {
+        nextModelId: '5',
+        defaultMinStake: '1000000000000000000', // 1 ETH
+        stakeLockPeriod: '604800', // 7 days in seconds
+        slashPercentage: '10',
+        maxErrorBound: '1000000000000000', // 0.001 in wei-like format
+        slashingRecordCount: '3',
+        activeModels: 4,
+        totalStaked: '150000000000000000000', // 150 ETH
+    };
+}
+
+export function generateMockWorkerHealth(address: string, index: number): WorkerHealthStatus {
+    const types: NodeInfo['type'][] = ['compute', 'aggregator', 'verifier'];
+    const statuses: NodeInfo['status'][] = ['online', 'online', 'syncing', 'proving', 'training'];
+
+    return {
+        workerId: `worker-${address.slice(2, 10)}`,
+        address,
+        type: types[index % 3],
+        status: statuses[Math.floor(Math.random() * statuses.length)],
+        lastHeartbeat: Date.now() - Math.random() * 30000,
+        uptime: 0.95 + Math.random() * 0.05,
+        proofsSubmitted: Math.floor(Math.random() * 100),
+        proofsVerified: Math.floor(Math.random() * 90),
+        proofsFailed: Math.floor(Math.random() * 5),
+        averageProofTime: 200 + Math.random() * 300,
+        stake: {
+            amount: (Math.floor(Math.random() * 10 + 1) * 1e18).toString(),
+            slashed: Math.random() < 0.1,
+        },
+    };
+}
+
+export function generateMockRoundState(modelId: string): RoundState {
+    const statuses: RoundState['roundStatus'][] = ['pending', 'in_progress', 'aggregating', 'proving', 'completed'];
+    const status = statuses[Math.floor(Math.random() * statuses.length)];
+
+    return {
+        modelId,
+        currentRound: Math.floor(Math.random() * 100).toString(),
+        roundStatus: status,
+        deadline: status !== 'completed' ? Date.now() + Math.random() * 300000 : null,
+        participants: Array.from({ length: Math.floor(Math.random() * 5) + 1 }, () =>
+            `0x${Array(40).fill(0).map(() => Math.floor(Math.random() * 16).toString(16)).join('')}`
+        ),
+        prover: status === 'completed' || status === 'proving'
+            ? `0x${Array(40).fill(0).map(() => Math.floor(Math.random() * 16).toString(16)).join('')}`
+            : null,
+        modelCommitment: `0x${Array(64).fill(0).map(() => Math.floor(Math.random() * 16).toString(16)).join('')}`,
+        newCommitment: status === 'completed'
+            ? `0x${Array(64).fill(0).map(() => Math.floor(Math.random() * 16).toString(16)).join('')}`
+            : null,
+        errorBound: Math.random() * 0.001,
+        proofSubmitted: status === 'completed' || status === 'proving',
+    };
+}
+
+// ============================================================================
+// Status API Client Singleton
+// ============================================================================
+
+let statusApiClientInstance: StatusApiClient | null = null;
+
+export function getStatusApiClient(config?: Partial<ApiConfig>): StatusApiClient {
+    if (!statusApiClientInstance) {
+        statusApiClientInstance = new StatusApiClient(config);
+    }
+    return statusApiClientInstance;
+}
+
 // Default export
 export const apiClient = getApiClient();

@@ -9,6 +9,7 @@
 //! - Layer normalization (LayerNorm and RMSNorm)
 //! - Quantized layers with INT8/INT4 support
 //! - Large model support with memory-efficient execution
+//! - Validation and reference testing infrastructure
 
 pub mod attention;
 pub mod embedding;
@@ -18,7 +19,9 @@ pub mod layer_norm;
 pub mod linear;
 pub mod mlp;
 pub mod quantized;
+pub mod reference;
 pub mod transformer;
+pub mod validation;
 
 // Re-export commonly used types
 pub use attention::{
@@ -53,4 +56,18 @@ pub use large_model::{
 pub use layer_norm::{
     LayerNorm, LayerNormConfig, LayerNormError, RMSNorm,
     fused_layer_norm, fused_rms_norm,
+};
+
+// Re-export validation types
+pub use validation::{
+    LayerValidator, OutputValidator, StabilityChecker, StabilityReport,
+    ValidationConfig, ValidationError, ValidationResult,
+    validate_attention_forward, validate_linear_forward,
+};
+
+// Re-export reference testing types
+pub use reference::{
+    PyTorchReference, ReferenceTestVector, ReferenceTestSuite,
+    generate_linear_reference, generate_attention_reference,
+    generate_softmax_reference, generate_layer_norm_reference,
 };
