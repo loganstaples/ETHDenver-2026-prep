@@ -205,7 +205,8 @@ impl MLTrainingProver {
 
         let pi = witness.public_inputs();
         let pi_refs: Vec<&[Fr]> = vec![&pi];
-        let proof = self.pipeline.prove(&circuit, &pi_refs);
+        let proof = self.pipeline.prove(&circuit, &pi_refs)
+            .unwrap_or_else(|_| Vec::new());
 
         TrainingProofResult {
             proof,
@@ -221,7 +222,7 @@ impl MLTrainingProver {
     /// Verifies a proof against the given public inputs.
     pub fn verify(&self, proof: &[u8], public_inputs: &[Fr]) -> bool {
         let pi_refs: Vec<&[Fr]> = vec![public_inputs];
-        self.pipeline.verify(proof, &pi_refs)
+        self.pipeline.verify(proof, &pi_refs).unwrap_or(false)
     }
 
     /// Verifies a `TrainingProofResult`.

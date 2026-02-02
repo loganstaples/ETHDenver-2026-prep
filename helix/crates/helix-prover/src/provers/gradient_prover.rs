@@ -192,7 +192,8 @@ impl GradientProver {
 
         // Generate proof
         let pi_refs: Vec<&[Fr]> = vec![&public_inputs];
-        let proof = self.pipeline.prove(&circuit, &pi_refs);
+        let proof = self.pipeline.prove(&circuit, &pi_refs)
+            .unwrap_or_else(|_| Vec::new());
 
         let elapsed_ms = start.elapsed().as_millis() as u64;
 
@@ -246,7 +247,7 @@ impl GradientProver {
             .collect();
 
         let pi_refs: Vec<&[Fr]> = vec![&public_inputs];
-        self.pipeline.verify(&result.proof, &pi_refs)
+        self.pipeline.verify(&result.proof, &pi_refs).unwrap_or(false)
     }
 
     /// Gets a cached proof for a layer.

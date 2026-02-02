@@ -438,6 +438,14 @@ pub struct DistributedTrainingCoordinator {
     rounds_completed: u64,
     /// Training started at.
     started_at: Option<Instant>,
+    /// Smart contract client for on-chain operations.
+    sc_client: Option<Arc<crate::sc_client::SCClient>>,
+    /// Model ID on the smart contract.
+    model_id: Option<u64>,
+    /// Current model commitment hash.
+    model_commitment: [u8; 32],
+    /// Accumulated error bound.
+    total_error_bound: f64,
 }
 
 impl DistributedTrainingCoordinator {
@@ -492,7 +500,41 @@ impl DistributedTrainingCoordinator {
             round_counter: 0,
             rounds_completed: 0,
             started_at: None,
+            sc_client: None,
+            model_id: None,
+            model_commitment: [0u8; 32],
+            total_error_bound: 0.0,
         })
+    }
+
+    /// Sets the smart contract client for on-chain operations.
+    pub fn set_sc_client(&mut self, client: Arc<crate::sc_client::SCClient>) {
+        self.sc_client = Some(client);
+    }
+
+    /// Sets the model ID for on-chain tracking.
+    pub fn set_model_id(&mut self, model_id: u64) {
+        self.model_id = Some(model_id);
+    }
+
+    /// Sets the initial model commitment.
+    pub fn set_model_commitment(&mut self, commitment: [u8; 32]) {
+        self.model_commitment = commitment;
+    }
+
+    /// Returns the current model commitment.
+    pub fn model_commitment(&self) -> [u8; 32] {
+        self.model_commitment
+    }
+
+    /// Returns the model ID.
+    pub fn model_id(&self) -> Option<u64> {
+        self.model_id
+    }
+
+    /// Returns the total accumulated error bound.
+    pub fn total_error_bound(&self) -> f64 {
+        self.total_error_bound
     }
 
     /// Subscribes to training events.
@@ -855,9 +897,144 @@ impl DistributedTrainingCoordinator {
         &self,
         round_id: DistributedRoundId,
     ) -> Result<Option<String>, DistributedCoordinatorError> {
-        // This would integrate with sc_client for on-chain submission
-        // For now, return None to indicate no on-chain submission
-        Ok(None)
+        // Check if we have the necessary components for on-chain submission
+        let client = match &self.sc_client {
+            Some(c) => c,
+            None => return Ok(None), // No client configured, skip on-chain submission
+        };
+
+        let model_id = match self.model_id {
+            Some(id) => id,
+            None => return Ok(None), // No model ID, skip on-chain submission
+        };
+
+        // Get the current round from state machine to extract proof data
+        let round = match self.state_machine.current_round() {
+            Some(r) => r,
+            None => return Err(DistributedCoordinatorError::NoActiveRound),
+        };
+
+        // Collect proofs from submitted workers
+        let submitted_workers: Vec<_> = round.workers.iter()
+            .filter(|(_, w)| w.state == crate::training::state_machine::WorkerRoundState::Submitted)
+            .collect();
+
+        if submitted_workers.is_empty() {
+            return Err(DistributedCoordinatorError::InvalidShare("No submitted proofs".to_string()));
+        }
+
+        // Compute public inputs for the combined proof
+        // Split the commitment hashes into lo/hi halves
+        let old_commitment = round.initial_commitment;
+        let new_commitment = round.new_commitment.unwrap_or(old_commitment);
+
+        let old_hash_lo = ethers::types::U256::from_big_endian(&old_commitment[..16]);
+        let old_hash_hi = ethers::types::U256::from_big_endian(&old_commitment[16..]);
+        let new_hash_lo = ethers::types::U256::from_big_endian(&new_commitment[..16]);
+        let new_hash_hi = ethers::types::U256::from_big_endian(&new_commitment[16..]);
+
+        // Compute aggregate error bound
+        let total_error: f64 = submitted_workers.iter()
+            .filter_map(|(_, w)| w.error_bound)
+            .sum();
+
+        let inputs = crate::sc_client::TrainingProofInputs {
+            old_hash_lo,
+            old_hash_hi,
+            new_hash_lo,
+            new_hash_hi,
+            loss: ethers::types::U256::zero(), // Would come from training metrics
+            error_bound: ethers::types::U256::from((total_error * 1e18) as u64),
+            step_number: ethers::types::U256::from(round_id.round_number),
+        };
+
+        // Create a combined proof (in production, this would be a proper aggregated proof)
+        // For now, we just use an empty proof placeholder that would be replaced with actual ZK proof
+        let combined_proof = vec![0u8; 32]; // Placeholder
+
+        // Submit to the smart contract
+        match client.submit_proof(model_id, round_id.round_number, combined_proof, &inputs).await {
+            Ok(receipt) => {
+                let tx_hash = format!("{:?}", receipt.transaction_hash);
+                Ok(Some(tx_hash))
+            }
+            Err(e) => {
+                // Log the error but don't fail the round for on-chain issues
+                // The training can continue locally even if on-chain submission fails
+                log::warn!("Failed to submit proof on-chain: {}", e);
+                Err(DistributedCoordinatorError::CheckpointError(format!("On-chain submission failed: {}", e)))
+            }
+        }
+    }
+
+    /// Registers a model on-chain and returns the model ID.
+    pub async fn register_model_onchain(
+        &mut self,
+        ipfs_hash: &str,
+        initial_commitment: [u8; 32],
+        min_stake: u64,
+    ) -> Result<u64, DistributedCoordinatorError> {
+        let client = self.sc_client.as_ref()
+            .ok_or(DistributedCoordinatorError::InitializationFailed("No SC client configured".to_string()))?;
+
+        let commitment = ethers::types::U256::from_big_endian(&initial_commitment);
+        let stake = ethers::types::U256::from(min_stake);
+
+        let (_, model_id) = client.register_model(ipfs_hash, commitment, stake).await
+            .map_err(|e| DistributedCoordinatorError::CheckpointError(format!("Failed to register model: {}", e)))?;
+
+        self.model_id = Some(model_id);
+        self.model_commitment = initial_commitment;
+
+        Ok(model_id)
+    }
+
+    /// Starts a round on-chain.
+    pub async fn start_round_onchain(
+        &self,
+        duration_secs: u64,
+    ) -> Result<(), DistributedCoordinatorError> {
+        let client = self.sc_client.as_ref()
+            .ok_or(DistributedCoordinatorError::InitializationFailed("No SC client configured".to_string()))?;
+
+        let model_id = self.model_id
+            .ok_or(DistributedCoordinatorError::InitializationFailed("No model ID set".to_string()))?;
+
+        client.start_round(model_id, duration_secs).await
+            .map_err(|e| DistributedCoordinatorError::CheckpointError(format!("Failed to start round: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Stakes on the model (for worker registration).
+    pub async fn stake_onchain(
+        &self,
+        amount: u64,
+    ) -> Result<(), DistributedCoordinatorError> {
+        let client = self.sc_client.as_ref()
+            .ok_or(DistributedCoordinatorError::InitializationFailed("No SC client configured".to_string()))?;
+
+        let model_id = self.model_id
+            .ok_or(DistributedCoordinatorError::InitializationFailed("No model ID set".to_string()))?;
+
+        let stake_amount = ethers::types::U256::from(amount);
+
+        client.stake(model_id, stake_amount).await
+            .map_err(|e| DistributedCoordinatorError::CheckpointError(format!("Failed to stake: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Gets the current model state from the smart contract.
+    pub async fn get_model_state_onchain(&self) -> Result<crate::sc_client::ModelState, DistributedCoordinatorError> {
+        let client = self.sc_client.as_ref()
+            .ok_or(DistributedCoordinatorError::InitializationFailed("No SC client configured".to_string()))?;
+
+        let model_id = self.model_id
+            .ok_or(DistributedCoordinatorError::InitializationFailed("No model ID set".to_string()))?;
+
+        client.get_model_state(model_id).await
+            .map_err(|e| DistributedCoordinatorError::CheckpointError(format!("Failed to get model state: {}", e)))
     }
 
     /// Completes a training round.

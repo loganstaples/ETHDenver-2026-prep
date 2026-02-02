@@ -788,7 +788,8 @@ impl ParallelProver {
         let mut pipeline = ProverPipeline::<IVCStepCircuit>::new(5);
         pipeline.setup(&IVCStepCircuit::default());
 
-        let proof = pipeline.prove(&circuit, &pi_refs);
+        let proof = pipeline.prove(&circuit, &pi_refs)
+            .map_err(|e| e.to_string())?;
         Ok(proof)
     }
 }

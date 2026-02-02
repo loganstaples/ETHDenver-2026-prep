@@ -25,6 +25,7 @@ pub mod aggregation;
 pub mod metrics;
 pub mod coordinator;
 pub mod session;
+pub mod session_manager;
 pub mod mpc;
 pub mod orchestrator;
 pub mod verification;
@@ -122,6 +123,11 @@ pub use distributed_coordinator::{
     DistributedTrainingConfig, DistributedTrainingState, WorkerInfo as DistributedWorkerInfo,
     DistributedTrainingEvent, GradientShare, GradientShareCollector,
     DistributedTrainingCoordinator, DistributedCoordinatorError,
+};
+
+pub use session_manager::{
+    TrainingSessionConfig, SessionState, SessionSummary, SessionEvent,
+    RegisteredWorker, TrainingSessionManager, SessionError,
 };
 
 /// Convenience type alias for training results.

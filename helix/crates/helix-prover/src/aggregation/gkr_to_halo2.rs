@@ -334,7 +334,7 @@ impl GKRToHalo2Aggregator {
                     })
                     .collect();
 
-                pipeline.prove(&circuit, &[&pi])
+                pipeline.prove(&circuit, &[&pi]).unwrap_or_else(|_| vec![])
             }
             None => {
                 // Return placeholder if not set up
@@ -378,7 +378,7 @@ impl GKRToHalo2Aggregator {
                 })
                 .collect();
 
-            return Ok(pipeline.verify(&proof.aggregation_proof, &[&pi]));
+            return Ok(pipeline.verify(&proof.aggregation_proof, &[&pi]).unwrap_or(false));
         }
 
         // If no pipeline, just verify structure

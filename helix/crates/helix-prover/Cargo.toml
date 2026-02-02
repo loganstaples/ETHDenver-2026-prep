@@ -14,6 +14,7 @@ cuda = []  # CUDA backend - requires NVCC and CUDA Toolkit
 helix-core = { path = "../helix-core" }
 helix-avm = { path = "../helix-avm" }
 helix-circuits = { path = "../helix-circuits" }
+halo2curves = "0.1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rand = "0.8"

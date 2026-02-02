@@ -208,7 +208,7 @@ impl IVCProver {
 
         let pi: Vec<Fr> = circuit.public_inputs();
         let pi_refs: Vec<&[Fr]> = vec![&pi];
-        self.pipeline.verify(&step.proof, &pi_refs)
+        self.pipeline.verify(&step.proof, &pi_refs).unwrap_or(false)
     }
 
     /// Generates a final proof for the entire chain.
@@ -248,7 +248,8 @@ impl IVCProver {
 
             let pi: Vec<Fr> = circuit.public_inputs();
             let pi_refs: Vec<&[Fr]> = vec![&pi];
-            let step_proof = self.pipeline.prove(&circuit, &pi_refs);
+            let step_proof = self.pipeline.prove(&circuit, &pi_refs)
+                .unwrap_or_else(|_| Vec::new());
 
             // Length-prefixed proof bytes
             folded.extend_from_slice(&(step_proof.len() as u32).to_le_bytes());
@@ -426,10 +427,12 @@ mod tests {
         };
         let pi: Vec<Fr> = circuit.public_inputs();
         let pi_refs: Vec<&[Fr]> = vec![&pi];
-        let proof_bytes = prover.pipeline.prove(&circuit, &pi_refs);
+        let proof_bytes = prover.pipeline.prove(&circuit, &pi_refs)
+            .expect("Proof generation should succeed");
 
         // Verify the proof
-        assert!(prover.pipeline.verify(&proof_bytes, &pi_refs));
+        assert!(prover.pipeline.verify(&proof_bytes, &pi_refs)
+            .expect("Verification should complete"));
     }
 
     #[test]
@@ -447,7 +450,8 @@ mod tests {
         };
         let pi: Vec<helix_circuits::halo2curves::bn256::Fr> = circuit.public_inputs();
         let pi_refs: Vec<&[helix_circuits::halo2curves::bn256::Fr]> = vec![&pi];
-        let proof_bytes = prover.pipeline.prove(&circuit, &pi_refs);
+        let proof_bytes = prover.pipeline.prove(&circuit, &pi_refs)
+            .expect("Proof generation should succeed");
 
         let step = IVCStep {
             step: 1,

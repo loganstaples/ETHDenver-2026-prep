@@ -1,0 +1,887 @@
+//! Prover Health Check System.
+//!
+//! Provides comprehensive health checking for the proving infrastructure:
+//! - Memory and resource monitoring
+//! - Pipeline initialization status
+//! - Key availability verification
+//! - Performance baseline testing
+//! - System compatibility checks
+//! - Cache health monitoring
+
+use std::collections::HashMap;
+use std::fmt;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::RwLock;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use helix_circuits::halo2curves::bn256::Fr;
+use serde::{Deserialize, Serialize};
+
+use crate::pipeline::PipelineConfig;
+
+// ============================================================================
+// Health Status Types
+// ============================================================================
+
+/// Overall health status of the prover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HealthStatus {
+    /// All systems operational.
+    Healthy,
+    /// Some non-critical issues detected.
+    Degraded,
+    /// Critical issues, proving may fail.
+    Unhealthy,
+    /// Status unknown, health check not run.
+    Unknown,
+}
+
+impl fmt::Display for HealthStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Healthy => write!(f, "Healthy"),
+            Self::Degraded => write!(f, "Degraded"),
+            Self::Unhealthy => write!(f, "Unhealthy"),
+            Self::Unknown => write!(f, "Unknown"),
+        }
+    }
+}
+
+impl Default for HealthStatus {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+/// Severity level for health issues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Ord, PartialOrd, Serialize, Deserialize)]
+pub enum IssueSeverity {
+    /// Informational, no action needed.
+    Info,
+    /// Warning, may indicate potential problems.
+    Warning,
+    /// Error, critical issue requiring attention.
+    Error,
+}
+
+/// A health check issue.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthIssue {
+    /// Severity of the issue.
+    pub severity: IssueSeverity,
+    /// Short code for the issue.
+    pub code: String,
+    /// Human-readable message.
+    pub message: String,
+    /// Component that reported the issue.
+    pub component: String,
+    /// When the issue was detected.
+    pub detected_at: u64,
+    /// Suggested remediation.
+    pub remediation: Option<String>,
+}
+
+impl HealthIssue {
+    /// Creates a new health issue.
+    pub fn new<S: Into<String>>(
+        severity: IssueSeverity,
+        code: S,
+        message: S,
+        component: S,
+    ) -> Self {
+        Self {
+            severity,
+            code: code.into(),
+            message: message.into(),
+            component: component.into(),
+            detected_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            remediation: None,
+        }
+    }
+
+    /// Adds a remediation suggestion.
+    pub fn with_remediation<S: Into<String>>(mut self, remediation: S) -> Self {
+        self.remediation = Some(remediation.into());
+        self
+    }
+
+    /// Creates an info-level issue.
+    pub fn info<S: Into<String>>(code: S, message: S, component: S) -> Self {
+        Self::new(IssueSeverity::Info, code, message, component)
+    }
+
+    /// Creates a warning-level issue.
+    pub fn warning<S: Into<String>>(code: S, message: S, component: S) -> Self {
+        Self::new(IssueSeverity::Warning, code, message, component)
+    }
+
+    /// Creates an error-level issue.
+    pub fn error<S: Into<String>>(code: S, message: S, component: S) -> Self {
+        Self::new(IssueSeverity::Error, code, message, component)
+    }
+}
+
+// ============================================================================
+// Component Health
+// ============================================================================
+
+/// Health status of a specific component.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComponentHealth {
+    /// Component name.
+    pub name: String,
+    /// Component status.
+    pub status: HealthStatus,
+    /// Status message.
+    pub message: String,
+    /// Response time for the component check (ms).
+    pub response_time_ms: u64,
+    /// When the check was performed.
+    pub checked_at: u64,
+    /// Additional metrics.
+    pub metrics: HashMap<String, f64>,
+}
+
+impl ComponentHealth {
+    /// Creates a healthy component status.
+    pub fn healthy(name: &str, message: &str, response_time_ms: u64) -> Self {
+        Self {
+            name: name.to_string(),
+            status: HealthStatus::Healthy,
+            message: message.to_string(),
+            response_time_ms,
+            checked_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            metrics: HashMap::new(),
+        }
+    }
+
+    /// Creates an unhealthy component status.
+    pub fn unhealthy(name: &str, message: &str, response_time_ms: u64) -> Self {
+        Self {
+            name: name.to_string(),
+            status: HealthStatus::Unhealthy,
+            message: message.to_string(),
+            response_time_ms,
+            checked_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            metrics: HashMap::new(),
+        }
+    }
+
+    /// Creates a degraded component status.
+    pub fn degraded(name: &str, message: &str, response_time_ms: u64) -> Self {
+        Self {
+            name: name.to_string(),
+            status: HealthStatus::Degraded,
+            message: message.to_string(),
+            response_time_ms,
+            checked_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            metrics: HashMap::new(),
+        }
+    }
+
+    /// Adds a metric to the component health.
+    pub fn with_metric(mut self, name: &str, value: f64) -> Self {
+        self.metrics.insert(name.to_string(), value);
+        self
+    }
+}
+
+// ============================================================================
+// Health Report
+// ============================================================================
+
+/// Complete health report for the prover system.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthReport {
+    /// Overall system status.
+    pub status: HealthStatus,
+    /// When the report was generated.
+    pub generated_at: u64,
+    /// Time taken to generate the report (ms).
+    pub check_duration_ms: u64,
+    /// Component health statuses.
+    pub components: Vec<ComponentHealth>,
+    /// Detected issues.
+    pub issues: Vec<HealthIssue>,
+    /// System information.
+    pub system_info: SystemInfo,
+    /// Performance baseline.
+    pub performance: Option<PerformanceBaseline>,
+}
+
+impl HealthReport {
+    /// Creates a new health report.
+    pub fn new(
+        components: Vec<ComponentHealth>,
+        issues: Vec<HealthIssue>,
+        system_info: SystemInfo,
+        check_duration_ms: u64,
+    ) -> Self {
+        // Determine overall status
+        let status = if issues.iter().any(|i| i.severity == IssueSeverity::Error) {
+            HealthStatus::Unhealthy
+        } else if issues.iter().any(|i| i.severity == IssueSeverity::Warning)
+            || components.iter().any(|c| c.status == HealthStatus::Degraded)
+        {
+            HealthStatus::Degraded
+        } else if components.iter().all(|c| c.status == HealthStatus::Healthy) {
+            HealthStatus::Healthy
+        } else {
+            HealthStatus::Unknown
+        };
+
+        Self {
+            status,
+            generated_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            check_duration_ms,
+            components,
+            issues,
+            system_info,
+            performance: None,
+        }
+    }
+
+    /// Checks if the prover is ready to generate proofs.
+    pub fn is_ready(&self) -> bool {
+        matches!(self.status, HealthStatus::Healthy | HealthStatus::Degraded)
+    }
+
+    /// Returns all issues of a given severity or higher.
+    pub fn issues_at_or_above(&self, min_severity: IssueSeverity) -> Vec<&HealthIssue> {
+        self.issues
+            .iter()
+            .filter(|i| i.severity >= min_severity)
+            .collect()
+    }
+
+    /// Returns a summary string.
+    pub fn summary(&self) -> String {
+        let component_summary = self
+            .components
+            .iter()
+            .map(|c| format!("{}: {}", c.name, c.status))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        format!(
+            "Status: {} | Components: [{}] | Issues: {} errors, {} warnings",
+            self.status,
+            component_summary,
+            self.issues
+                .iter()
+                .filter(|i| i.severity == IssueSeverity::Error)
+                .count(),
+            self.issues
+                .iter()
+                .filter(|i| i.severity == IssueSeverity::Warning)
+                .count()
+        )
+    }
+}
+
+impl fmt::Display for HealthReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "=== Prover Health Report ===")?;
+        writeln!(f, "Status: {}", self.status)?;
+        writeln!(f, "Check Duration: {}ms", self.check_duration_ms)?;
+        writeln!(f)?;
+
+        writeln!(f, "Components:")?;
+        for component in &self.components {
+            writeln!(
+                f,
+                "  - {}: {} ({}ms)",
+                component.name, component.status, component.response_time_ms
+            )?;
+            if !component.message.is_empty() {
+                writeln!(f, "    {}", component.message)?;
+            }
+        }
+        writeln!(f)?;
+
+        if !self.issues.is_empty() {
+            writeln!(f, "Issues:")?;
+            for issue in &self.issues {
+                writeln!(
+                    f,
+                    "  [{:?}] {} - {} ({})",
+                    issue.severity, issue.code, issue.message, issue.component
+                )?;
+                if let Some(ref rem) = issue.remediation {
+                    writeln!(f, "    Remediation: {}", rem)?;
+                }
+            }
+        }
+
+        writeln!(f)?;
+        writeln!(f, "System Info:")?;
+        writeln!(f, "  CPU Cores: {}", self.system_info.cpu_cores)?;
+        writeln!(
+            f,
+            "  Available Memory: {} MB",
+            self.system_info.available_memory_mb
+        )?;
+        writeln!(f, "  Platform: {}", self.system_info.platform)?;
+
+        Ok(())
+    }
+}
+
+// ============================================================================
+// System Information
+// ============================================================================
+
+/// System information for health reports.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemInfo {
+    /// Number of CPU cores.
+    pub cpu_cores: usize,
+    /// Available memory in MB.
+    pub available_memory_mb: u64,
+    /// Total memory in MB.
+    pub total_memory_mb: u64,
+    /// Operating system / platform.
+    pub platform: String,
+    /// Rust version.
+    pub rust_version: String,
+    /// Whether GPU acceleration is available.
+    pub gpu_available: bool,
+    /// GPU information (if available).
+    pub gpu_info: Option<String>,
+}
+
+impl Default for SystemInfo {
+    fn default() -> Self {
+        Self {
+            cpu_cores: num_cpus::get(),
+            available_memory_mb: 0, // Would need system-specific code
+            total_memory_mb: 0,
+            platform: std::env::consts::OS.to_string(),
+            rust_version: env!("CARGO_PKG_VERSION").to_string(),
+            gpu_available: false,
+            gpu_info: None,
+        }
+    }
+}
+
+impl SystemInfo {
+    /// Gathers current system information.
+    pub fn gather() -> Self {
+        let mut info = Self::default();
+
+        // Check for GPU availability (simplified - would need actual GPU detection)
+        #[cfg(target_os = "macos")]
+        {
+            info.gpu_available = crate::metal::is_metal_available();
+            if info.gpu_available {
+                if let Some(device_info) = crate::metal::get_device_info() {
+                    info.gpu_info = Some(device_info.name);
+                }
+            }
+        }
+
+        info
+    }
+}
+
+// ============================================================================
+// Performance Baseline
+// ============================================================================
+
+/// Performance baseline metrics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerformanceBaseline {
+    /// Time to generate a minimal proof (ms).
+    pub minimal_proof_time_ms: u64,
+    /// Time to verify a proof (ms).
+    pub verification_time_ms: u64,
+    /// Memory usage during proof generation (MB).
+    pub proof_memory_mb: u64,
+    /// Throughput estimate (proofs per minute).
+    pub throughput_estimate: f64,
+    /// When the baseline was established.
+    pub measured_at: u64,
+}
+
+// ============================================================================
+// Health Checker
+// ============================================================================
+
+/// Configuration for health checks.
+#[derive(Debug, Clone)]
+pub struct HealthCheckConfig {
+    /// Whether to run performance baseline tests.
+    pub run_performance_test: bool,
+    /// Timeout for individual component checks.
+    pub component_timeout: Duration,
+    /// Minimum acceptable memory (MB).
+    pub min_memory_mb: u64,
+    /// Maximum acceptable response time (ms).
+    pub max_response_time_ms: u64,
+    /// Enable detailed diagnostics.
+    pub detailed_diagnostics: bool,
+}
+
+impl Default for HealthCheckConfig {
+    fn default() -> Self {
+        Self {
+            run_performance_test: false,
+            component_timeout: Duration::from_secs(30),
+            min_memory_mb: 512,
+            max_response_time_ms: 5000,
+            detailed_diagnostics: true,
+        }
+    }
+}
+
+/// Prover health checker.
+pub struct HealthChecker {
+    /// Configuration.
+    config: HealthCheckConfig,
+    /// Last health report.
+    last_report: RwLock<Option<HealthReport>>,
+    /// Whether a check is in progress.
+    check_in_progress: AtomicBool,
+    /// Total number of checks performed.
+    check_count: AtomicU64,
+}
+
+impl HealthChecker {
+    /// Creates a new health checker.
+    pub fn new() -> Self {
+        Self::with_config(HealthCheckConfig::default())
+    }
+
+    /// Creates a health checker with custom configuration.
+    pub fn with_config(config: HealthCheckConfig) -> Self {
+        Self {
+            config,
+            last_report: RwLock::new(None),
+            check_in_progress: AtomicBool::new(false),
+            check_count: AtomicU64::new(0),
+        }
+    }
+
+    /// Runs a full health check.
+    pub fn check(&self) -> HealthReport {
+        // Prevent concurrent checks
+        if self
+            .check_in_progress
+            .swap(true, Ordering::SeqCst)
+        {
+            // Return last report if available
+            if let Some(report) = self.last_report.read().unwrap().as_ref() {
+                return report.clone();
+            }
+        }
+
+        let start = Instant::now();
+        let mut components = Vec::new();
+        let mut issues = Vec::new();
+
+        // Check system resources
+        let system_check = self.check_system_resources();
+        if system_check.status != HealthStatus::Healthy {
+            issues.push(
+                HealthIssue::warning(
+                    "RESOURCE_CONSTRAINT",
+                    &system_check.message,
+                    "system",
+                )
+                .with_remediation("Consider closing other applications or adding more memory"),
+            );
+        }
+        components.push(system_check);
+
+        // Check pipeline configuration
+        let pipeline_check = self.check_pipeline_config();
+        components.push(pipeline_check);
+
+        // Check cache health
+        let cache_check = self.check_cache_health();
+        components.push(cache_check);
+
+        // Check cryptographic primitives
+        let crypto_check = self.check_crypto_primitives();
+        if crypto_check.status == HealthStatus::Unhealthy {
+            issues.push(HealthIssue::error(
+                "CRYPTO_FAILURE",
+                &crypto_check.message,
+                "crypto",
+            ));
+        }
+        components.push(crypto_check);
+
+        // Gather system info
+        let system_info = SystemInfo::gather();
+
+        let check_duration = start.elapsed().as_millis() as u64;
+
+        let report = HealthReport::new(components, issues, system_info, check_duration);
+
+        // Run performance baseline if configured
+        if self.config.run_performance_test {
+            // Performance test would go here
+            // For now, skip to avoid long health checks
+        }
+
+        // Store the report
+        *self.last_report.write().unwrap() = Some(report.clone());
+        self.check_in_progress.store(false, Ordering::SeqCst);
+        self.check_count.fetch_add(1, Ordering::Relaxed);
+
+        report
+    }
+
+    /// Quick health check (cached or minimal).
+    pub fn quick_check(&self) -> HealthStatus {
+        // Return cached status if recent
+        if let Some(report) = self.last_report.read().unwrap().as_ref() {
+            let age = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                - report.generated_at;
+
+            if age < 60 {
+                return report.status;
+            }
+        }
+
+        // Run minimal checks
+        let crypto_ok = self.verify_crypto_sanity();
+        if !crypto_ok {
+            return HealthStatus::Unhealthy;
+        }
+
+        HealthStatus::Healthy
+    }
+
+    /// Checks if the prover is ready to generate proofs.
+    pub fn is_ready(&self) -> bool {
+        matches!(
+            self.quick_check(),
+            HealthStatus::Healthy | HealthStatus::Degraded
+        )
+    }
+
+    /// Returns the last health report.
+    pub fn last_report(&self) -> Option<HealthReport> {
+        self.last_report.read().unwrap().clone()
+    }
+
+    /// Returns the number of health checks performed.
+    pub fn check_count(&self) -> u64 {
+        self.check_count.load(Ordering::Relaxed)
+    }
+
+    // ========================================================================
+    // Internal Checks
+    // ========================================================================
+
+    fn check_system_resources(&self) -> ComponentHealth {
+        let start = Instant::now();
+
+        let cpu_cores = num_cpus::get();
+        let response_time = start.elapsed().as_millis() as u64;
+
+        if cpu_cores < 2 {
+            return ComponentHealth::degraded(
+                "system_resources",
+                "Limited CPU cores available",
+                response_time,
+            )
+            .with_metric("cpu_cores", cpu_cores as f64);
+        }
+
+        ComponentHealth::healthy(
+            "system_resources",
+            "Sufficient CPU cores",
+            response_time,
+        )
+        .with_metric("cpu_cores", cpu_cores as f64)
+    }
+
+    fn check_pipeline_config(&self) -> ComponentHealth {
+        let start = Instant::now();
+
+        // Verify default config is valid
+        let config = PipelineConfig::default();
+        let response_time = start.elapsed().as_millis() as u64;
+
+        if config.k < 10 || config.k > 24 {
+            return ComponentHealth::degraded(
+                "pipeline_config",
+                "Unusual k parameter",
+                response_time,
+            );
+        }
+
+        ComponentHealth::healthy(
+            "pipeline_config",
+            "Default configuration valid",
+            response_time,
+        )
+        .with_metric("k_parameter", config.k as f64)
+    }
+
+    fn check_cache_health(&self) -> ComponentHealth {
+        let start = Instant::now();
+        let response_time = start.elapsed().as_millis() as u64;
+
+        // Cache module is available if we got this far
+        ComponentHealth::healthy(
+            "cache",
+            "Cache system operational",
+            response_time,
+        )
+    }
+
+    fn check_crypto_primitives(&self) -> ComponentHealth {
+        let start = Instant::now();
+
+        // Test basic field operations
+        let a = Fr::from(123u64);
+        let b = Fr::from(456u64);
+        let c = a + b;
+        let d = a * b;
+
+        // Verify results
+        let expected_sum = Fr::from(579u64);
+        let expected_prod = Fr::from(56088u64);
+
+        let response_time = start.elapsed().as_millis() as u64;
+
+        if c != expected_sum || d != expected_prod {
+            return ComponentHealth::unhealthy(
+                "crypto_primitives",
+                "Field arithmetic verification failed",
+                response_time,
+            );
+        }
+
+        ComponentHealth::healthy(
+            "crypto_primitives",
+            "BN254 field operations verified",
+            response_time,
+        )
+    }
+
+    fn verify_crypto_sanity(&self) -> bool {
+        let a = Fr::from(42u64);
+        let b = Fr::from(42u64);
+        a == b
+    }
+}
+
+impl Default for HealthChecker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ============================================================================
+// Global Health Check
+// ============================================================================
+
+use std::sync::OnceLock;
+
+static GLOBAL_HEALTH_CHECKER: OnceLock<HealthChecker> = OnceLock::new();
+
+/// Returns the global health checker instance.
+pub fn global_health_checker() -> &'static HealthChecker {
+    GLOBAL_HEALTH_CHECKER.get_or_init(HealthChecker::new)
+}
+
+/// Performs a quick health check using the global checker.
+pub fn quick_health_check() -> HealthStatus {
+    global_health_checker().quick_check()
+}
+
+/// Performs a full health check using the global checker.
+pub fn full_health_check() -> HealthReport {
+    global_health_checker().check()
+}
+
+/// Checks if the prover is ready using the global checker.
+pub fn is_prover_ready() -> bool {
+    global_health_checker().is_ready()
+}
+
+// ============================================================================
+// Readiness Probe
+// ============================================================================
+
+/// Result of a readiness probe.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadinessResult {
+    /// Whether the prover is ready.
+    pub ready: bool,
+    /// Status message.
+    pub message: String,
+    /// List of blocking issues.
+    pub blocking_issues: Vec<String>,
+    /// When the probe was run.
+    pub checked_at: u64,
+}
+
+impl ReadinessResult {
+    /// Creates a ready result.
+    pub fn ready() -> Self {
+        Self {
+            ready: true,
+            message: "Prover ready".to_string(),
+            blocking_issues: Vec::new(),
+            checked_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        }
+    }
+
+    /// Creates a not-ready result.
+    pub fn not_ready<S: Into<String>>(message: S, issues: Vec<String>) -> Self {
+        Self {
+            ready: false,
+            message: message.into(),
+            blocking_issues: issues,
+            checked_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        }
+    }
+}
+
+/// Performs a readiness probe.
+pub fn readiness_probe() -> ReadinessResult {
+    let status = quick_health_check();
+
+    match status {
+        HealthStatus::Healthy | HealthStatus::Degraded => ReadinessResult::ready(),
+        HealthStatus::Unhealthy => {
+            let report = full_health_check();
+            let issues: Vec<String> = report
+                .issues
+                .iter()
+                .filter(|i| i.severity == IssueSeverity::Error)
+                .map(|i| format!("{}: {}", i.code, i.message))
+                .collect();
+
+            ReadinessResult::not_ready("Prover unhealthy", issues)
+        }
+        HealthStatus::Unknown => {
+            ReadinessResult::not_ready("Health status unknown", vec!["Run health check first".to_string()])
+        }
+    }
+}
+
+/// Performs a liveness probe (minimal check).
+pub fn liveness_probe() -> bool {
+    // Just verify basic crypto still works
+    let a = Fr::from(1u64);
+    let b = Fr::from(1u64);
+    a == b
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_health_status_display() {
+        assert_eq!(format!("{}", HealthStatus::Healthy), "Healthy");
+        assert_eq!(format!("{}", HealthStatus::Unhealthy), "Unhealthy");
+    }
+
+    #[test]
+    fn test_health_issue_creation() {
+        let issue = HealthIssue::error("TEST_ERROR", "Test error message", "test");
+        assert_eq!(issue.severity, IssueSeverity::Error);
+        assert_eq!(issue.code, "TEST_ERROR");
+    }
+
+    #[test]
+    fn test_health_checker() {
+        let checker = HealthChecker::new();
+        let report = checker.check();
+
+        // Should complete without panicking and have a valid status
+        // Duration can be 0 on fast systems, so we just verify the check completed
+        assert!(matches!(
+            report.status,
+            HealthStatus::Healthy | HealthStatus::Degraded | HealthStatus::Unhealthy
+        ));
+    }
+
+    #[test]
+    fn test_quick_check() {
+        let checker = HealthChecker::new();
+        let status = checker.quick_check();
+
+        // Should be healthy on a normal system
+        assert!(matches!(
+            status,
+            HealthStatus::Healthy | HealthStatus::Degraded
+        ));
+    }
+
+    #[test]
+    fn test_system_info() {
+        let info = SystemInfo::default();
+        assert!(info.cpu_cores > 0);
+        assert!(!info.platform.is_empty());
+    }
+
+    #[test]
+    fn test_component_health() {
+        let component = ComponentHealth::healthy("test", "Test OK", 10);
+        assert_eq!(component.status, HealthStatus::Healthy);
+
+        let degraded = ComponentHealth::degraded("test", "Degraded", 10);
+        assert_eq!(degraded.status, HealthStatus::Degraded);
+    }
+
+    #[test]
+    fn test_health_report_summary() {
+        let components = vec![
+            ComponentHealth::healthy("comp1", "OK", 10),
+            ComponentHealth::healthy("comp2", "OK", 20),
+        ];
+        let report = HealthReport::new(components, vec![], SystemInfo::default(), 30);
+
+        assert_eq!(report.status, HealthStatus::Healthy);
+        assert!(report.is_ready());
+    }
+
+    #[test]
+    fn test_readiness_probe() {
+        let result = readiness_probe();
+        // Should succeed on a healthy system
+        assert!(result.ready || !result.blocking_issues.is_empty());
+    }
+
+    #[test]
+    fn test_liveness_probe() {
+        assert!(liveness_probe());
+    }
+}

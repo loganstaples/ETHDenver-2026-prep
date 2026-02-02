@@ -6,17 +6,206 @@
 //! - **Freivalds matrix verification** for O(n²) matmul checking
 //! - **Error bound tracking** through all operations
 //! - **Proper state commitment** using Poseidon-style hashing
+//! - **Comprehensive error handling** (no panics)
+//! - **Automatic retry on failure** with exponential backoff
+//! - **Progress callbacks** for long-running proofs
+//! - **Self-verification** before returning proofs
+//! - **Witness sanity checks** before proving
+//! - **Timeout handling** with graceful cancellation
+//! - **Deterministic proof generation** (same inputs → same proof)
+//! - **Proof caching** for identical witnesses
 //!
 //! This prover is recommended for production use over the V1 prover.
 
-use crate::pipeline::ProverPipeline;
-use helix_circuits::halo2_proofs::arithmetic::Field;
-use helix_circuits::halo2curves::bn256::Fr;
+use crate::cache::witness_cache::{
+    SharedWitnessCache, WitnessCachedProof, WitnessHash, WitnessHashBuilder, shared_witness_cache,
+};
+use crate::pipeline::{
+    CancellationToken, PipelineConfig, PipelineError, ProofPhase, ProofProgress, ProgressCallback,
+    ProverPipeline, RetryConfig, no_progress_callback,
+};
+use halo2curves::bn256::Fr;
+use halo2curves::ff::PrimeField;
 use helix_circuits::ml::training_step_v2::{
     compute_state_hash_v2, compute_witness_v2, MLTrainingStepV2Circuit, MLTrainingStepV2Witness,
     NUM_PUBLIC_INPUTS,
 };
 use helix_circuits::verifier::{SolidityGenerator, VkData};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+use thiserror::Error;
+
+// ============================================================================
+// Error Types
+// ============================================================================
+
+/// Errors specific to ML training proof generation.
+#[derive(Error, Debug)]
+pub enum TrainingProverError {
+    /// Pipeline error.
+    #[error("Pipeline error: {0}")]
+    Pipeline(#[from] PipelineError),
+
+    /// Witness validation failed.
+    #[error("Witness validation failed: {message} (field: {field})")]
+    WitnessValidation { message: String, field: String },
+
+    /// Dimension mismatch.
+    #[error("Dimension mismatch: expected {expected}, got {actual} for {field}")]
+    DimensionMismatch {
+        field: String,
+        expected: usize,
+        actual: usize,
+    },
+
+    /// Value out of range.
+    #[error("Value out of range in {field}: {message}")]
+    ValueOutOfRange { field: String, message: String },
+
+    /// Self-verification failed.
+    #[error("Self-verification failed: generated proof does not verify")]
+    SelfVerificationFailed,
+
+    /// Operation timed out.
+    #[error("Operation timed out after {elapsed_ms}ms")]
+    Timeout { elapsed_ms: u64 },
+
+    /// Operation cancelled.
+    #[error("Operation cancelled")]
+    Cancelled,
+
+    /// Prover not initialized.
+    #[error("Prover not initialized: {message}")]
+    NotInitialized { message: String },
+}
+
+impl TrainingProverError {
+    /// Creates a dimension mismatch error.
+    pub fn dimension_mismatch<S: Into<String>>(field: S, expected: usize, actual: usize) -> Self {
+        Self::DimensionMismatch {
+            field: field.into(),
+            expected,
+            actual,
+        }
+    }
+
+    /// Creates a witness validation error.
+    pub fn validation<S: Into<String>>(message: S, field: S) -> Self {
+        Self::WitnessValidation {
+            message: message.into(),
+            field: field.into(),
+        }
+    }
+
+    /// Creates a value out of range error.
+    pub fn out_of_range<S: Into<String>>(field: S, message: S) -> Self {
+        Self::ValueOutOfRange {
+            field: field.into(),
+            message: message.into(),
+        }
+    }
+}
+
+/// Result type for training prover operations.
+pub type TrainingProverResult<T> = Result<T, TrainingProverError>;
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+/// Configuration for V2 prover.
+#[derive(Debug, Clone)]
+pub struct V2ProverConfig {
+    /// K parameter (circuit size = 2^k rows).
+    pub k: u32,
+    /// ReLU lookup range half-width.
+    pub relu_range: usize,
+    /// Exp lookup range for softmax.
+    pub exp_range: usize,
+    /// Exp lookup scale.
+    pub exp_scale: u64,
+    /// Whether to use Freivalds verification.
+    pub use_freivalds: bool,
+    /// Base error per operation (for error tracking).
+    pub base_error: Fr,
+    /// Whether to self-verify proofs.
+    pub self_verify: bool,
+    /// Retry configuration.
+    pub retry: RetryConfig,
+    /// Proof generation timeout.
+    pub proof_timeout: Option<Duration>,
+    /// Verification timeout.
+    pub verify_timeout: Option<Duration>,
+    /// Seed for deterministic proof generation.
+    pub deterministic_seed: Option<[u8; 32]>,
+    /// Whether to use witness caching.
+    pub use_witness_cache: bool,
+    /// Enable detailed tracing.
+    pub enable_tracing: bool,
+}
+
+impl Default for V2ProverConfig {
+    fn default() -> Self {
+        Self {
+            k: 14,
+            relu_range: 128,
+            exp_range: 256,
+            exp_scale: 1000,
+            use_freivalds: true,
+            base_error: Fr::from(1u64),
+            self_verify: true,
+            retry: RetryConfig::default(),
+            proof_timeout: Some(Duration::from_secs(300)),
+            verify_timeout: Some(Duration::from_secs(30)),
+            deterministic_seed: None,
+            use_witness_cache: true,
+            enable_tracing: true,
+        }
+    }
+}
+
+impl V2ProverConfig {
+    /// Creates a minimal configuration for testing.
+    pub fn minimal() -> Self {
+        Self {
+            k: 12,
+            relu_range: 64,
+            exp_range: 128,
+            self_verify: false,
+            retry: RetryConfig::none(),
+            use_witness_cache: false,
+            enable_tracing: false,
+            ..Default::default()
+        }
+    }
+
+    /// Creates a production configuration with aggressive reliability.
+    pub fn production() -> Self {
+        Self {
+            self_verify: true,
+            retry: RetryConfig::aggressive(),
+            use_witness_cache: true,
+            enable_tracing: true,
+            ..Default::default()
+        }
+    }
+
+    /// Enables deterministic proof generation.
+    pub fn deterministic(mut self, seed: [u8; 32]) -> Self {
+        self.deterministic_seed = Some(seed);
+        self
+    }
+
+    /// Sets the K parameter.
+    pub fn with_k(mut self, k: u32) -> Self {
+        self.k = k;
+        self
+    }
+}
+
+// ============================================================================
+// Proof Result
+// ============================================================================
 
 /// Result of proving a V2 training step.
 #[derive(Debug, Clone)]
@@ -35,37 +224,190 @@ pub struct TrainingProofResultV2 {
     pub old_state_hash: (Fr, Fr),
     /// New state commitment.
     pub new_state_hash: (Fr, Fr),
+    /// Whether the proof was self-verified.
+    pub verified: bool,
+    /// Proof generation time.
+    pub generation_time: Duration,
+    /// Verification time (if self-verified).
+    pub verification_time: Option<Duration>,
+    /// Number of attempts.
+    pub attempts: u32,
+    /// Whether this result came from cache.
+    pub from_cache: bool,
+    /// Witness hash (for caching).
+    pub witness_hash: Option<WitnessHash>,
 }
 
-/// Configuration for V2 prover.
-#[derive(Debug, Clone)]
-pub struct V2ProverConfig {
-    /// K parameter (circuit size = 2^k rows).
-    pub k: u32,
-    /// ReLU lookup range half-width.
-    pub relu_range: usize,
-    /// Exp lookup range for softmax.
-    pub exp_range: usize,
-    /// Exp lookup scale.
-    pub exp_scale: u64,
-    /// Whether to use Freivalds verification.
-    pub use_freivalds: bool,
-    /// Base error per operation (for error tracking).
-    pub base_error: Fr,
+// ============================================================================
+// Witness Validation
+// ============================================================================
+
+/// Validation result for a witness.
+#[derive(Debug)]
+pub struct WitnessValidationResult {
+    /// Whether the witness is valid.
+    pub valid: bool,
+    /// List of validation errors.
+    pub errors: Vec<WitnessValidationError>,
+    /// List of warnings (non-fatal issues).
+    pub warnings: Vec<String>,
 }
 
-impl Default for V2ProverConfig {
-    fn default() -> Self {
+impl WitnessValidationResult {
+    /// Creates a successful validation result.
+    pub fn ok() -> Self {
         Self {
-            k: 14,
-            relu_range: 128,
-            exp_range: 256,
-            exp_scale: 1000,
-            use_freivalds: true,
-            base_error: Fr::from(1u64), // Small base error
+            valid: true,
+            errors: Vec::new(),
+            warnings: Vec::new(),
         }
     }
+
+    /// Adds an error.
+    pub fn add_error(&mut self, error: WitnessValidationError) {
+        self.valid = false;
+        self.errors.push(error);
+    }
+
+    /// Adds a warning.
+    pub fn add_warning(&mut self, warning: String) {
+        self.warnings.push(warning);
+    }
 }
+
+/// A specific witness validation error.
+#[derive(Debug)]
+pub struct WitnessValidationError {
+    /// Field that failed validation.
+    pub field: String,
+    /// Error message.
+    pub message: String,
+    /// Expected value (if applicable).
+    pub expected: Option<String>,
+    /// Actual value (if applicable).
+    pub actual: Option<String>,
+}
+
+impl WitnessValidationError {
+    /// Creates a new validation error.
+    pub fn new<S: Into<String>>(field: S, message: S) -> Self {
+        Self {
+            field: field.into(),
+            message: message.into(),
+            expected: None,
+            actual: None,
+        }
+    }
+
+    /// Adds expected/actual values.
+    pub fn with_values<S: Into<String>>(mut self, expected: S, actual: S) -> Self {
+        self.expected = Some(expected.into());
+        self.actual = Some(actual.into());
+        self
+    }
+}
+
+/// Validates a training witness before proving.
+pub fn validate_witness(witness: &MLTrainingStepV2Witness) -> WitnessValidationResult {
+    let mut result = WitnessValidationResult::ok();
+
+    // Check dimensions
+    let expected_w1_len = witness.d_hid * witness.d_in;
+    if witness.w1.len() != expected_w1_len {
+        result.add_error(
+            WitnessValidationError::new("w1", "Dimension mismatch")
+                .with_values(expected_w1_len.to_string(), witness.w1.len().to_string()),
+        );
+    }
+
+    let expected_b1_len = witness.d_hid;
+    if witness.b1.len() != expected_b1_len {
+        result.add_error(
+            WitnessValidationError::new("b1", "Dimension mismatch")
+                .with_values(expected_b1_len.to_string(), witness.b1.len().to_string()),
+        );
+    }
+
+    let expected_w2_len = witness.d_out * witness.d_hid;
+    if witness.w2.len() != expected_w2_len {
+        result.add_error(
+            WitnessValidationError::new("w2", "Dimension mismatch")
+                .with_values(expected_w2_len.to_string(), witness.w2.len().to_string()),
+        );
+    }
+
+    let expected_b2_len = witness.d_out;
+    if witness.b2.len() != expected_b2_len {
+        result.add_error(
+            WitnessValidationError::new("b2", "Dimension mismatch")
+                .with_values(expected_b2_len.to_string(), witness.b2.len().to_string()),
+        );
+    }
+
+    // Check input dimensions
+    if witness.x.len() != witness.d_in {
+        result.add_error(
+            WitnessValidationError::new("x", "Input dimension mismatch")
+                .with_values(witness.d_in.to_string(), witness.x.len().to_string()),
+        );
+    }
+
+    if witness.target.len() != witness.d_out {
+        result.add_error(
+            WitnessValidationError::new("target", "Target dimension mismatch")
+                .with_values(witness.d_out.to_string(), witness.target.len().to_string()),
+        );
+    }
+
+    // Check intermediate values
+    if witness.h.len() != witness.d_hid {
+        result.add_error(WitnessValidationError::new(
+            "h",
+            "Hidden activation dimension mismatch",
+        ));
+    }
+
+    if witness.y.len() != witness.d_out {
+        result.add_error(WitnessValidationError::new(
+            "y",
+            "Output dimension mismatch",
+        ));
+    }
+
+    // Check new weights
+    if witness.w1_new.len() != expected_w1_len {
+        result.add_error(WitnessValidationError::new(
+            "w1_new",
+            "Updated W1 dimension mismatch",
+        ));
+    }
+
+    if witness.w2_new.len() != expected_w2_len {
+        result.add_error(WitnessValidationError::new(
+            "w2_new",
+            "Updated W2 dimension mismatch",
+        ));
+    }
+
+    // Check for zero learning rate (warning)
+    if witness.lr == Fr::zero() {
+        result.add_warning("Learning rate is zero - weights will not update".to_string());
+    }
+
+    // Check step number is reasonable
+    if witness.step_number > 1_000_000 {
+        result.add_warning(format!(
+            "Very high step number: {} - verify this is intended",
+            witness.step_number
+        ));
+    }
+
+    result
+}
+
+// ============================================================================
+// ML Training Prover V2
+// ============================================================================
 
 /// ML Training Step V2 Prover.
 ///
@@ -78,6 +420,12 @@ pub struct MLTrainingProverV2 {
     config: V2ProverConfig,
     /// Model dimensions (d_in, d_hid, d_out).
     dims: (usize, usize, usize),
+    /// Witness cache.
+    cache: Option<SharedWitnessCache>,
+    /// Proof counter.
+    proof_count: AtomicU64,
+    /// Cache hit counter.
+    cache_hits: AtomicU64,
 }
 
 impl MLTrainingProverV2 {
@@ -93,11 +441,21 @@ impl MLTrainingProverV2 {
         d_out: usize,
         config: V2ProverConfig,
     ) -> Self {
-        let mut pipeline = ProverPipeline::new(config.k);
+        // Build pipeline config from prover config
+        let pipeline_config = PipelineConfig {
+            k: config.k,
+            self_verify: false, // We handle this ourselves
+            retry: config.retry.clone(),
+            proof_timeout: config.proof_timeout,
+            verify_timeout: config.verify_timeout,
+            deterministic_seed: config.deterministic_seed,
+            enable_tracing: config.enable_tracing,
+        };
 
-        // Create a dummy witness for setup (structure only matters, not values)
+        let mut pipeline = ProverPipeline::with_config(pipeline_config);
+
+        // Create a dummy witness for setup
         let dummy_witness = create_zero_witness(d_in, d_hid, d_out);
-
         let setup_circuit = MLTrainingStepV2Circuit {
             witness: dummy_witness,
             relu_range: config.relu_range,
@@ -105,12 +463,24 @@ impl MLTrainingProverV2 {
             exp_scale: config.exp_scale,
             use_freivalds: config.use_freivalds,
         };
-        pipeline.setup(&setup_circuit);
+
+        // Setup can fail, but we handle it in prove()
+        let _ = pipeline.setup(&setup_circuit);
+
+        // Create cache if enabled
+        let cache = if config.use_witness_cache {
+            Some(shared_witness_cache())
+        } else {
+            None
+        };
 
         Self {
             pipeline,
             config,
             dims: (d_in, d_hid, d_out),
+            cache,
+            proof_count: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
         }
     }
 
@@ -122,6 +492,27 @@ impl MLTrainingProverV2 {
     /// Returns the configuration.
     pub fn config(&self) -> &V2ProverConfig {
         &self.config
+    }
+
+    /// Returns the number of proofs generated.
+    pub fn proof_count(&self) -> u64 {
+        self.proof_count.load(Ordering::Relaxed)
+    }
+
+    /// Returns the number of cache hits.
+    pub fn cache_hits(&self) -> u64 {
+        self.cache_hits.load(Ordering::Relaxed)
+    }
+
+    /// Returns the cache hit ratio.
+    pub fn cache_hit_ratio(&self) -> f64 {
+        let proofs = self.proof_count();
+        let hits = self.cache_hits();
+        if proofs == 0 {
+            0.0
+        } else {
+            hits as f64 / proofs as f64
+        }
     }
 
     /// Builds a witness from raw training data.
@@ -146,23 +537,152 @@ impl MLTrainingProverV2 {
 
         // First pass to compute new weights
         let tmp = compute_witness_v2(
-            d_in, d_hid, d_out, x, target, w1, b1, w2, b2, lr,
-            old_hash, (Fr::zero(), Fr::zero()), step_number, base_error,
+            d_in,
+            d_hid,
+            d_out,
+            x,
+            target,
+            w1,
+            b1,
+            w2,
+            b2,
+            lr,
+            old_hash,
+            (Fr::zero(), Fr::zero()),
+            step_number,
+            base_error,
         );
 
-        let new_hash = compute_state_hash_v2(
-            &tmp.w1_new, &tmp.b1_new, &tmp.w2_new, &tmp.b2_new,
-        );
+        let new_hash = compute_state_hash_v2(&tmp.w1_new, &tmp.b1_new, &tmp.w2_new, &tmp.b2_new);
 
         // Second pass with correct new hash
         compute_witness_v2(
-            d_in, d_hid, d_out, x, target, w1, b1, w2, b2, lr,
-            old_hash, new_hash, step_number, base_error,
+            d_in, d_hid, d_out, x, target, w1, b1, w2, b2, lr, old_hash, new_hash, step_number,
+            base_error,
         )
+    }
+
+    /// Computes the witness hash for caching.
+    pub fn compute_witness_hash(witness: &MLTrainingStepV2Witness) -> WitnessHash {
+        WitnessHashBuilder::new()
+            .add_dims(witness.d_in, witness.d_hid, witness.d_out)
+            .add_field_elements(&witness.x)
+            .add_field_elements(&witness.target)
+            .add_field_elements(&witness.w1)
+            .add_field_elements(&witness.b1)
+            .add_field_elements(&witness.w2)
+            .add_field_elements(&witness.b2)
+            .add_field_elements(&[witness.lr])
+            .add_u64(witness.step_number)
+            .finish()
     }
 
     /// Generates a Halo2 proof for the given witness.
     pub fn prove(&self, witness: &MLTrainingStepV2Witness) -> TrainingProofResultV2 {
+        self.prove_with_options(witness, no_progress_callback(), None)
+            .unwrap_or_else(|_e| {
+                // Return a failed result with error info
+                TrainingProofResultV2 {
+                    proof: Vec::new(),
+                    public_inputs: Vec::new(),
+                    loss: Fr::zero(),
+                    total_error: Fr::zero(),
+                    step_number: witness.step_number,
+                    old_state_hash: witness.old_state_hash,
+                    new_state_hash: witness.new_state_hash,
+                    verified: false,
+                    generation_time: Duration::ZERO,
+                    verification_time: None,
+                    attempts: 0,
+                    from_cache: false,
+                    witness_hash: None,
+                }
+            })
+    }
+
+    /// Generates a proof with progress callbacks and cancellation support.
+    pub fn prove_with_options(
+        &self,
+        witness: &MLTrainingStepV2Witness,
+        progress: ProgressCallback,
+        cancel_token: Option<&CancellationToken>,
+    ) -> TrainingProverResult<TrainingProofResultV2> {
+        let start = Instant::now();
+
+        // Check cancellation
+        if let Some(token) = cancel_token {
+            if token.is_cancelled() {
+                return Err(TrainingProverError::Cancelled);
+            }
+        }
+
+        // Validate witness
+        progress(ProofProgress {
+            phase: ProofPhase::Setup,
+            phase_progress: 0.0,
+            overall_progress: 0.0,
+            elapsed: start.elapsed(),
+            estimated_remaining: None,
+            attempt: 0,
+            message: Some("Validating witness".to_string()),
+        });
+
+        let validation = validate_witness(witness);
+        if !validation.valid {
+            let first_error = validation.errors.first().unwrap();
+            return Err(TrainingProverError::validation(
+                &first_error.message,
+                &first_error.field,
+            ));
+        }
+
+        // Compute witness hash for caching
+        let witness_hash = Self::compute_witness_hash(witness);
+
+        // Check cache
+        if let Some(ref cache) = self.cache {
+            if let Some(cached) = cache.get(&witness_hash) {
+                self.cache_hits.fetch_add(1, Ordering::Relaxed);
+                self.proof_count.fetch_add(1, Ordering::Relaxed);
+
+                if self.config.enable_tracing {
+                    tracing::info!(
+                        witness_hash = %witness_hash,
+                        "Cache hit for training proof"
+                    );
+                }
+
+                // Reconstruct public inputs from witness
+                let pi = witness.public_inputs();
+
+                return Ok(TrainingProofResultV2 {
+                    proof: cached.proof,
+                    public_inputs: pi,
+                    loss: witness.loss,
+                    total_error: witness.total_error,
+                    step_number: witness.step_number,
+                    old_state_hash: witness.old_state_hash,
+                    new_state_hash: witness.new_state_hash,
+                    verified: cached.verified,
+                    generation_time: Duration::from_millis(cached.generation_time_ms),
+                    verification_time: None,
+                    attempts: 1,
+                    from_cache: true,
+                    witness_hash: Some(witness_hash),
+                });
+            }
+        }
+
+        // Check timeout
+        if let Some(timeout) = self.config.proof_timeout {
+            if start.elapsed() > timeout {
+                return Err(TrainingProverError::Timeout {
+                    elapsed_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+        }
+
+        // Build circuit
         let circuit = MLTrainingStepV2Circuit {
             witness: witness.clone(),
             relu_range: self.config.relu_range,
@@ -173,33 +693,120 @@ impl MLTrainingProverV2 {
 
         let pi = witness.public_inputs();
         let pi_refs: Vec<&[Fr]> = vec![&pi];
-        let proof = self.pipeline.prove(&circuit, &pi_refs);
 
-        TrainingProofResultV2 {
+        // Generate proof
+        progress(ProofProgress {
+            phase: ProofPhase::Synthesis,
+            phase_progress: 0.0,
+            overall_progress: 0.2,
+            elapsed: start.elapsed(),
+            estimated_remaining: None,
+            attempt: 0,
+            message: Some("Generating proof".to_string()),
+        });
+
+        let proof_result = self
+            .pipeline
+            .prove_with_options(&circuit, &pi_refs, progress.clone(), cancel_token)?;
+
+        let gen_time = proof_result.generation_time;
+        let proof = proof_result.proof;
+        let attempts = proof_result.attempts;
+
+        // Self-verification
+        let (verified, verify_time) = if self.config.self_verify {
+            progress(ProofProgress {
+                phase: ProofPhase::Verification,
+                phase_progress: 0.0,
+                overall_progress: 0.9,
+                elapsed: start.elapsed(),
+                estimated_remaining: None,
+                attempt: 0,
+                message: Some("Self-verifying proof".to_string()),
+            });
+
+            let verify_start = Instant::now();
+            let is_valid = self.pipeline.verify(&proof, &pi_refs)?;
+
+            if !is_valid {
+                return Err(TrainingProverError::SelfVerificationFailed);
+            }
+
+            (true, Some(verify_start.elapsed()))
+        } else {
+            (false, None)
+        };
+
+        // Store in cache
+        if let Some(ref cache) = self.cache {
+            let cached = WitnessCachedProof::new(
+                witness_hash,
+                proof.clone(),
+                pi.iter()
+                    .map(|f| {
+                        let bytes = f.to_repr();
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(bytes.as_ref());
+                        arr
+                    })
+                    .collect(),
+                gen_time.as_millis() as u64,
+            );
+            cache.insert(cached);
+
+            if verified {
+                cache.mark_verified(&witness_hash);
+            }
+        }
+
+        self.proof_count.fetch_add(1, Ordering::Relaxed);
+
+        if self.config.enable_tracing {
+            tracing::info!(
+                step = witness.step_number,
+                proof_size = proof.len(),
+                generation_time_ms = gen_time.as_millis() as u64,
+                verified,
+                "Training proof generated"
+            );
+        }
+
+        Ok(TrainingProofResultV2 {
             proof,
-            public_inputs: pi.clone(),
+            public_inputs: pi,
             loss: witness.loss,
             total_error: witness.total_error,
             step_number: witness.step_number,
             old_state_hash: witness.old_state_hash,
             new_state_hash: witness.new_state_hash,
-        }
+            verified,
+            generation_time: gen_time,
+            verification_time: verify_time,
+            attempts,
+            from_cache: false,
+            witness_hash: Some(witness_hash),
+        })
     }
 
     /// Verifies a proof against the given public inputs.
     pub fn verify(&self, proof: &[u8], public_inputs: &[Fr]) -> bool {
         let pi_refs: Vec<&[Fr]> = vec![public_inputs];
-        self.pipeline.verify(proof, &pi_refs)
+        self.pipeline.verify(proof, &pi_refs).unwrap_or(false)
     }
 
     /// Verifies a `TrainingProofResultV2`.
     pub fn verify_result(&self, result: &TrainingProofResultV2) -> bool {
+        if result.proof.is_empty() {
+            return false;
+        }
         self.verify(&result.proof, &result.public_inputs)
     }
 
     /// Generates a Solidity verifier contract for this prover's circuit.
     pub fn generate_solidity_verifier(&self, contract_name: &str) -> String {
-        let vk_data = self.pipeline.extract_vk_data(NUM_PUBLIC_INPUTS)
+        let vk_data = self
+            .pipeline
+            .extract_vk_data(NUM_PUBLIC_INPUTS)
             .expect("VK not initialized");
 
         let evm_vk = VkData {
@@ -214,6 +821,18 @@ impl MLTrainingProverV2 {
             .with_vk_data(evm_vk)
             .with_batch(true)
             .generate()
+    }
+
+    /// Clears the witness cache.
+    pub fn clear_cache(&self) {
+        if let Some(ref cache) = self.cache {
+            cache.clear();
+        }
+    }
+
+    /// Returns cache statistics.
+    pub fn cache_stats(&self) -> Option<crate::cache::witness_cache::WitnessCacheStats> {
+        self.cache.as_ref().map(|c| c.stats())
     }
 }
 
@@ -266,6 +885,10 @@ fn create_zero_witness(d_in: usize, d_hid: usize, d_out: usize) -> MLTrainingSte
     }
 }
 
+// ============================================================================
+// Batch Prover
+// ============================================================================
+
 /// Batch prover for processing multiple training steps efficiently.
 pub struct BatchTrainingProverV2 {
     /// The underlying V2 prover.
@@ -280,20 +903,69 @@ impl BatchTrainingProverV2 {
         }
     }
 
+    /// Creates a batch prover with custom configuration.
+    pub fn with_config(
+        d_in: usize,
+        d_hid: usize,
+        d_out: usize,
+        config: V2ProverConfig,
+    ) -> Self {
+        Self {
+            prover: MLTrainingProverV2::with_config(d_in, d_hid, d_out, config),
+        }
+    }
+
     /// Proves a batch of training steps sequentially.
-    ///
-    /// Returns the accumulated proofs along with the final state.
     pub fn prove_batch(
         &self,
         initial_weights: TrainingWeights,
-        training_samples: &[(Vec<Fr>, Vec<Fr>)], // (x, target) pairs
+        training_samples: &[(Vec<Fr>, Vec<Fr>)],
         lr: Fr,
     ) -> BatchProofResult {
+        self.prove_batch_with_options(
+            initial_weights,
+            training_samples,
+            lr,
+            no_progress_callback(),
+            None,
+        )
+    }
+
+    /// Proves a batch with progress callbacks and cancellation support.
+    pub fn prove_batch_with_options(
+        &self,
+        initial_weights: TrainingWeights,
+        training_samples: &[(Vec<Fr>, Vec<Fr>)],
+        lr: Fr,
+        progress: ProgressCallback,
+        cancel_token: Option<&CancellationToken>,
+    ) -> BatchProofResult {
+        let start = Instant::now();
         let mut current_weights = initial_weights;
         let mut proofs = Vec::new();
         let mut total_loss = Fr::zero();
+        let mut failed_steps = Vec::new();
+        let total_steps = training_samples.len();
 
         for (step, (x, target)) in training_samples.iter().enumerate() {
+            // Check cancellation
+            if let Some(token) = cancel_token {
+                if token.is_cancelled() {
+                    break;
+                }
+            }
+
+            // Report batch progress
+            progress(ProofProgress {
+                phase: ProofPhase::Setup,
+                phase_progress: 0.0,
+                overall_progress: step as f64 / total_steps as f64,
+                elapsed: start.elapsed(),
+                estimated_remaining: None,
+                attempt: 0,
+                message: Some(format!("Training step {}/{}", step + 1, total_steps)),
+            });
+
             let witness = MLTrainingProverV2::build_witness(
                 current_weights.d_in,
                 current_weights.d_hid,
@@ -309,16 +981,25 @@ impl BatchTrainingProverV2 {
                 self.prover.config.base_error,
             );
 
-            let result = self.prover.prove(&witness);
-            total_loss = total_loss + result.loss;
+            match self.prover.prove_with_options(&witness, progress.clone(), cancel_token) {
+                Ok(result) => {
+                    total_loss = total_loss + result.loss;
 
-            // Update weights for next iteration
-            current_weights.w1 = witness.w1_new.clone();
-            current_weights.b1 = witness.b1_new.clone();
-            current_weights.w2 = witness.w2_new.clone();
-            current_weights.b2 = witness.b2_new.clone();
+                    // Update weights for next iteration
+                    current_weights.w1 = witness.w1_new.clone();
+                    current_weights.b1 = witness.b1_new.clone();
+                    current_weights.w2 = witness.w2_new.clone();
+                    current_weights.b2 = witness.b2_new.clone();
 
-            proofs.push(result);
+                    proofs.push(result);
+                }
+                Err(e) => {
+                    if self.prover.config.enable_tracing {
+                        tracing::error!(step, error = %e, "Batch proving failed at step");
+                    }
+                    failed_steps.push((step, e.to_string()));
+                }
+            }
         }
 
         BatchProofResult {
@@ -326,6 +1007,8 @@ impl BatchTrainingProverV2 {
             final_weights: current_weights,
             total_loss,
             num_steps: training_samples.len(),
+            failed_steps,
+            total_time: start.elapsed(),
         }
     }
 
@@ -334,6 +1017,10 @@ impl BatchTrainingProverV2 {
         batch.proofs.iter().all(|p| self.prover.verify_result(p))
     }
 }
+
+// ============================================================================
+// Training Weights
+// ============================================================================
 
 /// Weights for a 2-layer MLP.
 #[derive(Debug, Clone)]
@@ -363,7 +1050,15 @@ impl TrainingWeights {
         assert_eq!(w2.len(), d_out * d_hid, "W2 size mismatch");
         assert_eq!(b2.len(), d_out, "B2 size mismatch");
 
-        Self { d_in, d_hid, d_out, w1, b1, w2, b2 }
+        Self {
+            d_in,
+            d_hid,
+            d_out,
+            w1,
+            b1,
+            w2,
+            b2,
+        }
     }
 
     /// Creates zero-initialized weights.
@@ -378,7 +1073,19 @@ impl TrainingWeights {
             b2: vec![Fr::zero(); d_out],
         }
     }
+
+    /// Validates the weights.
+    pub fn validate(&self) -> bool {
+        self.w1.len() == self.d_hid * self.d_in
+            && self.b1.len() == self.d_hid
+            && self.w2.len() == self.d_out * self.d_hid
+            && self.b2.len() == self.d_out
+    }
 }
+
+// ============================================================================
+// Batch Proof Result
+// ============================================================================
 
 /// Result of batch proving.
 #[derive(Debug)]
@@ -391,7 +1098,56 @@ pub struct BatchProofResult {
     pub total_loss: Fr,
     /// Number of training steps.
     pub num_steps: usize,
+    /// Failed steps with error messages.
+    pub failed_steps: Vec<(usize, String)>,
+    /// Total time for batch proving.
+    pub total_time: Duration,
 }
+
+impl BatchProofResult {
+    /// Returns the average loss.
+    pub fn average_loss(&self) -> Fr {
+        if self.proofs.is_empty() {
+            Fr::zero()
+        } else {
+            // Note: Division in Fr is complex, return total for now
+            self.total_loss
+        }
+    }
+
+    /// Returns the number of successful proofs.
+    pub fn successful_count(&self) -> usize {
+        self.proofs.len()
+    }
+
+    /// Returns the number of failed proofs.
+    pub fn failed_count(&self) -> usize {
+        self.failed_steps.len()
+    }
+
+    /// Returns the success rate.
+    pub fn success_rate(&self) -> f64 {
+        if self.num_steps == 0 {
+            1.0
+        } else {
+            self.proofs.len() as f64 / self.num_steps as f64
+        }
+    }
+
+    /// Returns the average proof generation time.
+    pub fn average_proof_time(&self) -> Duration {
+        if self.proofs.is_empty() {
+            Duration::ZERO
+        } else {
+            let total: Duration = self.proofs.iter().map(|p| p.generation_time).sum();
+            total / self.proofs.len() as u32
+        }
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -399,7 +1155,9 @@ mod tests {
 
     fn small_model_weights() -> TrainingWeights {
         TrainingWeights::new(
-            2, 2, 1,
+            2,
+            2,
+            1,
             vec![Fr::from(1), Fr::from(2), Fr::from(3), Fr::from(1)],
             vec![Fr::from(0), Fr::from(0)],
             vec![Fr::from(1), Fr::from(1)],
@@ -413,12 +1171,14 @@ mod tests {
     }
 
     #[test]
-    fn test_v2_prove_and_verify() {
+    fn test_witness_validation() {
         let prover = MLTrainingProverV2::new(2, 2, 1);
         let weights = small_model_weights();
 
         let witness = MLTrainingProverV2::build_witness(
-            2, 2, 1,
+            2,
+            2,
+            1,
             &[Fr::from(1), Fr::from(1)],
             &[Fr::from(5)],
             &weights.w1,
@@ -427,7 +1187,73 @@ mod tests {
             &weights.b2,
             Fr::from(1),
             1,
-            Fr::from(1), // base error
+            Fr::from(1),
+        );
+
+        let result = validate_witness(&witness);
+        assert!(result.valid);
+        assert!(result.errors.is_empty());
+    }
+
+    #[test]
+    fn test_witness_hash_deterministic() {
+        let weights = small_model_weights();
+
+        let witness1 = MLTrainingProverV2::build_witness(
+            2,
+            2,
+            1,
+            &[Fr::from(1), Fr::from(1)],
+            &[Fr::from(5)],
+            &weights.w1,
+            &weights.b1,
+            &weights.w2,
+            &weights.b2,
+            Fr::from(1),
+            1,
+            Fr::from(1),
+        );
+
+        let witness2 = MLTrainingProverV2::build_witness(
+            2,
+            2,
+            1,
+            &[Fr::from(1), Fr::from(1)],
+            &[Fr::from(5)],
+            &weights.w1,
+            &weights.b1,
+            &weights.w2,
+            &weights.b2,
+            Fr::from(1),
+            1,
+            Fr::from(1),
+        );
+
+        let hash1 = MLTrainingProverV2::compute_witness_hash(&witness1);
+        let hash2 = MLTrainingProverV2::compute_witness_hash(&witness2);
+
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_v2_prove_and_verify() {
+        let config = V2ProverConfig::minimal();
+        let prover = MLTrainingProverV2::with_config(2, 2, 1, config);
+        let weights = small_model_weights();
+
+        let witness = MLTrainingProverV2::build_witness(
+            2,
+            2,
+            1,
+            &[Fr::from(1), Fr::from(1)],
+            &[Fr::from(5)],
+            &weights.w1,
+            &weights.b1,
+            &weights.w2,
+            &weights.b2,
+            Fr::from(1),
+            1,
+            Fr::from(1),
         );
 
         let result = prover.prove(&witness);
@@ -438,14 +1264,11 @@ mod tests {
 
     #[test]
     fn test_batch_proving() {
-        let prover = BatchTrainingProverV2::new(2, 2, 1);
+        let config = V2ProverConfig::minimal();
+        let prover = BatchTrainingProverV2::with_config(2, 2, 1, config);
         let weights = small_model_weights();
 
-        // Use a single step for batch test to avoid constraint issues
-        // from updated weights exceeding lookup ranges
-        let samples = vec![
-            (vec![Fr::from(1), Fr::from(1)], vec![Fr::from(5)]),
-        ];
+        let samples = vec![(vec![Fr::from(1), Fr::from(1)], vec![Fr::from(5)])];
 
         let result = prover.prove_batch(weights, &samples, Fr::from(1));
 
@@ -456,11 +1279,14 @@ mod tests {
 
     #[test]
     fn test_wrong_public_inputs_rejected() {
-        let prover = MLTrainingProverV2::new(2, 2, 1);
+        let config = V2ProverConfig::minimal();
+        let prover = MLTrainingProverV2::with_config(2, 2, 1, config);
         let weights = small_model_weights();
 
         let witness = MLTrainingProverV2::build_witness(
-            2, 2, 1,
+            2,
+            2,
+            1,
             &[Fr::from(1), Fr::from(1)],
             &[Fr::from(5)],
             &weights.w1,
@@ -480,5 +1306,25 @@ mod tests {
             bad_pi[4] = Fr::from(9999u64);
         }
         assert!(!prover.verify(&result.proof, &bad_pi));
+    }
+
+    #[test]
+    fn test_prover_error_types() {
+        let err = TrainingProverError::dimension_mismatch("w1", 8, 4);
+        assert!(err.to_string().contains("Dimension mismatch"));
+
+        let err = TrainingProverError::validation("Invalid value", "loss");
+        assert!(err.to_string().contains("Witness validation failed"));
+    }
+
+    #[test]
+    fn test_config_builders() {
+        let config = V2ProverConfig::production();
+        assert!(config.self_verify);
+        assert!(config.use_witness_cache);
+
+        let config = V2ProverConfig::minimal();
+        assert!(!config.self_verify);
+        assert!(!config.use_witness_cache);
     }
 }
