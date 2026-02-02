@@ -200,13 +200,14 @@ impl SecureMatmul {
 /// Plain matrix multiplication: C = A @ B.
 /// A is [m x k], B is [k x n], result C is [m x n].
 /// All in row-major flattened form.
+/// Uses fixed_mul for proper fixed-point arithmetic.
 fn matmul_plain(a: &[Fr], b: &[Fr], m: usize, k: usize, n: usize) -> Vec<Fr> {
     let mut c = vec![Fr::ZERO; m * n];
     for i in 0..m {
         for j in 0..n {
             let mut sum = Fr::ZERO;
             for l in 0..k {
-                sum = Fr::add(&sum, &Fr::mul(&a[i * k + l], &b[l * n + j]));
+                sum = Fr::add(&sum, &a[i * k + l].fixed_mul(&b[l * n + j]));
             }
             c[i * n + j] = sum;
         }

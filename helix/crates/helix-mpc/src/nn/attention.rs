@@ -144,9 +144,10 @@ impl SecureAttention {
         )?;
 
         // Step B: Scale by 1/sqrt(d_k) — local operation
+        // Use fixed_mul for proper fixed-point arithmetic
         let scaled: Vec<Vec<Fr>> = scores_shares
             .iter()
-            .map(|s| s.iter().map(|v| Fr::mul(v, &scale)).collect())
+            .map(|s| s.iter().map(|v| v.fixed_mul(&scale)).collect())
             .collect();
 
         // Step C: Softmax — reconstruct, compute, reshare

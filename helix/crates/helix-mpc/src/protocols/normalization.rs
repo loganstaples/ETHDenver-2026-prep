@@ -199,10 +199,11 @@ impl SecureNormalization {
 
         // [result] = [gamma] * normalized + [beta]
         // gamma * normalized is a local operation (multiply share by public value)
+        // Use fixed_mul for proper fixed-point arithmetic
         let mut result: Vec<Vec<Fr>> = vec![vec![Fr::ZERO; dim]; num_parties];
         for i in 0..num_parties {
             for d in 0..dim {
-                let gamma_scaled = Fr::mul(&gamma_shares[i][d], &Fr::from_f64(normalized[d]));
+                let gamma_scaled = gamma_shares[i][d].fixed_mul(&Fr::from_f64(normalized[d]));
                 result[i][d] = Fr::add(&gamma_scaled, &beta_shares[i][d]);
             }
         }

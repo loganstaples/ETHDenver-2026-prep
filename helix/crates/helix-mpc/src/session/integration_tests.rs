@@ -416,6 +416,9 @@ async fn test_network_channel_start_and_shutdown() {
 
 #[tokio::test]
 async fn test_network_channel_with_tls() {
+    // Install rustls crypto provider for TLS operations
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let parties = test_parties(2);
     let tls_config = TlsConfig::generate_self_signed(&parties[0].0).unwrap();
 

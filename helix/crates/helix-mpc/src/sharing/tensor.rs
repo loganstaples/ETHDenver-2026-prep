@@ -107,8 +107,9 @@ impl TensorShare {
     }
 
     /// Scalar multiplication of a tensor share by a public constant.
+    /// Uses fixed_mul for proper fixed-point arithmetic.
     pub fn scale(&self, scalar: &Fr) -> TensorShare {
-        let data: Vec<Fr> = self.data.iter().map(|v| Fr::mul(v, scalar)).collect();
+        let data: Vec<Fr> = self.data.iter().map(|v| v.fixed_mul(scalar)).collect();
         let scalar_f64 = scalar.to_f64().abs();
         let mut result = TensorShare::new(self.id.clone(), data, self.shape.clone());
         result.sharing_error = self.sharing_error * scalar_f64;

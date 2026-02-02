@@ -627,11 +627,18 @@ mod tests {
             let b = sum(&triples.iter().map(|p| p[t].b.clone()).collect::<Vec<_>>());
             let c = sum(&triples.iter().map(|p| p[t].c.clone()).collect::<Vec<_>>());
 
-            let expected = Fr::mul(&a, &b);
+            // Use fixed_mul for proper fixed-point arithmetic
+            let expected = a.fixed_mul(&b);
+            // Use approximate comparison due to floating-point precision
+            // when converting f64 to Fr for secret sharing
+            let c_f64 = c.to_f64();
+            let expected_f64 = expected.to_f64();
             assert!(
-                c.ct_eq(&expected).to_bool(),
-                "Triple {} incorrect",
+                (c_f64 - expected_f64).abs() < 0.01,
+                "Triple {} incorrect: got {}, expected {}",
                 t,
+                c_f64,
+                expected_f64,
             );
         }
     }

@@ -6,7 +6,7 @@
 //! This is the simplest approach and is suitable for the demo. In production,
 //! the dealer role would be replaced by a distributed protocol (see `distributed.rs`).
 
-use rand::SeedableRng;
+use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
 use crate::error::MPCResult;
@@ -32,9 +32,13 @@ impl TrustedDealer {
         }
     }
 
-    /// Generates a random field element.
+    /// Generates a random field element in fixed-point format.
+    /// This ensures Beaver triples are compatible with fixed-point MPC values.
     fn random_value(&mut self) -> Fr {
-        Fr::random(&mut self.rng)
+        // Generate a random value in a bounded range and convert to fixed-point
+        // This keeps the random values in a similar magnitude to typical ML values
+        let val: f64 = self.rng.gen_range(-1000.0..1000.0);
+        Fr::from_f64(val)
     }
 
     /// Generates shares of a single scalar Beaver triple for n parties.
@@ -48,7 +52,8 @@ impl TrustedDealer {
     ) -> Vec<BeaverTriple> {
         let a = self.random_value();
         let b = self.random_value();
-        let c = Fr::mul(&a, &b);
+        // Use fixed_mul for proper fixed-point arithmetic
+        let c = a.fixed_mul(&b);
 
         self.additive_share_triple(&a, &b, &c, num_parties)
     }
@@ -82,7 +87,8 @@ impl TrustedDealer {
     ) -> Vec<VectorBeaverTriple> {
         let a: Vec<Fr> = (0..dim).map(|_| self.random_value()).collect();
         let b: Vec<Fr> = (0..dim).map(|_| self.random_value()).collect();
-        let c: Vec<Fr> = a.iter().zip(&b).map(|(x, y)| Fr::mul(x, y)).collect();
+        // Use fixed_mul for proper fixed-point arithmetic
+        let c: Vec<Fr> = a.iter().zip(&b).map(|(x, y)| x.fixed_mul(y)).collect();
 
         self.additive_share_vector_triple(&a, &b, &c, dim, num_parties)
     }
@@ -99,13 +105,13 @@ impl TrustedDealer {
         let a: Vec<Fr> = (0..m * k).map(|_| self.random_value()).collect();
         let b: Vec<Fr> = (0..k * n).map(|_| self.random_value()).collect();
 
-        // Compute C = A @ B.
+        // Compute C = A @ B using fixed_mul for proper fixed-point arithmetic.
         let mut c = vec![Fr::ZERO; m * n];
         for i in 0..m {
             for j in 0..n {
                 let mut sum = Fr::ZERO;
                 for l in 0..k {
-                    sum = Fr::add(&sum, &Fr::mul(&a[i * k + l], &b[l * n + j]));
+                    sum = Fr::add(&sum, &a[i * k + l].fixed_mul(&b[l * n + j]));
                 }
                 c[i * n + j] = sum;
             }
@@ -284,7 +290,8 @@ mod tests {
         let b = sum(&shares.iter().map(|s| s.b.clone()).collect::<Vec<_>>());
         let c = sum(&shares.iter().map(|s| s.c.clone()).collect::<Vec<_>>());
 
-        let expected_c = Fr::mul(&a, &b);
+        // Use fixed_mul for consistent fixed-point arithmetic
+        let expected_c = a.fixed_mul(&b);
         assert!(
             c.ct_eq(&expected_c).to_bool(),
             "Triple incorrect: c != a*b",
@@ -305,7 +312,8 @@ mod tests {
             let b = sum(&per_party.iter().map(|p| p[idx].b.clone()).collect::<Vec<_>>());
             let c = sum(&per_party.iter().map(|p| p[idx].c.clone()).collect::<Vec<_>>());
 
-            let expected_c = Fr::mul(&a, &b);
+            // Use fixed_mul for consistent fixed-point arithmetic
+            let expected_c = a.fixed_mul(&b);
             assert!(
                 c.ct_eq(&expected_c).to_bool(),
                 "Triple {} incorrect",
@@ -328,7 +336,8 @@ mod tests {
             let b = sum(&shares.iter().map(|s| s.b[d].clone()).collect::<Vec<_>>());
             let c = sum(&shares.iter().map(|s| s.c[d].clone()).collect::<Vec<_>>());
 
-            let expected_c = Fr::mul(&a, &b);
+            // Use fixed_mul for consistent fixed-point arithmetic
+            let expected_c = a.fixed_mul(&b);
             assert!(
                 c.ct_eq(&expected_c).to_bool(),
                 "Vector triple[{}] incorrect",
@@ -365,12 +374,12 @@ mod tests {
             }
         }
 
-        // Verify C = A @ B.
+        // Verify C = A @ B using fixed_mul.
         for i in 0..m {
             for j in 0..n {
                 let mut expected = Fr::ZERO;
                 for l in 0..k {
-                    expected = Fr::add(&expected, &Fr::mul(&a[i * k + l], &b[l * n + j]));
+                    expected = Fr::add(&expected, &a[i * k + l].fixed_mul(&b[l * n + j]));
                 }
                 assert!(
                     c[i * n + j].ct_eq(&expected).to_bool(),
@@ -391,7 +400,8 @@ mod tests {
         let b = Fr::add(&shares[0].b, &shares[1].b);
         let c = Fr::add(&shares[0].c, &shares[1].c);
 
-        let expected_c = Fr::mul(&a, &b);
+        // Use fixed_mul for consistent fixed-point arithmetic
+        let expected_c = a.fixed_mul(&b);
         assert!(c.ct_eq(&expected_c).to_bool());
     }
 }

@@ -451,7 +451,11 @@ impl SessionEstablishment {
         for party_id in &party_ids {
             hasher.update(party_id.as_bytes());
             if *party_id == &self.party_id.0 {
-                hasher.update(&self.random_contribution);
+                // Use commitment (hash) of our own random contribution for consistency
+                let mut own_hasher = Sha256::new();
+                own_hasher.update(&self.random_contribution);
+                let own_commitment: [u8; 32] = own_hasher.finalize().into();
+                hasher.update(&own_commitment);
             } else if let Some(ke) = self.received_key_exchanges.get(*party_id) {
                 hasher.update(&ke.random_commitment);
             }
@@ -470,12 +474,21 @@ impl SessionEstablishment {
 
         let session_id = self.compute_session_id();
 
-        // Derive session key from all random values
+        // Derive session key from all random values in deterministic order
         let mut hasher = Sha256::new();
         hasher.update(&session_id);
-        hasher.update(&self.random_contribution);
-        for auth in self.received_authentications.values() {
-            hasher.update(&auth.random_value);
+
+        // Collect all random values with party IDs and sort for deterministic ordering
+        let mut all_randoms: Vec<(&str, &[u8; 32])> = self
+            .received_authentications
+            .iter()
+            .map(|(party_id, auth)| (party_id.as_str(), &auth.random_value))
+            .collect();
+        all_randoms.push((self.party_id.0.as_str(), &self.random_contribution));
+        all_randoms.sort_by_key(|(party_id, _)| *party_id);
+
+        for (_, random) in all_randoms {
+            hasher.update(random);
         }
         let session_key: [u8; 32] = hasher.finalize().into();
 

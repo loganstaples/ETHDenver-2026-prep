@@ -139,8 +139,9 @@ impl SecureActivation {
             for d in 0..dim {
                 // relu ≈ 0.5*x + 0.25*x² (simplified approximation)
                 // A crude approximation that preserves privacy
-                let term1 = Fr::mul(&half, &shares[i][d]);
-                let term2 = Fr::mul(&quarter, &x_squared[i][d]);
+                // Use fixed_mul for proper fixed-point arithmetic
+                let term1 = half.fixed_mul(&shares[i][d]);
+                let term2 = quarter.fixed_mul(&x_squared[i][d]);
                 result[i][d] = Fr::add(&term1, &term2);
             }
         }

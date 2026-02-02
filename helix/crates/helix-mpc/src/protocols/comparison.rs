@@ -199,7 +199,7 @@ impl SecureComparison {
 
         let scaled_sign: Vec<Fr> = sign_shares
             .iter()
-            .map(|s| Fr::mul(s, &one_minus_alpha))
+            .map(|s| s.fixed_mul(&one_minus_alpha))
             .collect();
 
         // Add alpha to get: alpha + sign * (1 - alpha)
@@ -256,7 +256,7 @@ impl SecureComparison {
         // Compute x / (|x| + ε)
         let result: Vec<Fr> = x_shares
             .iter()
-            .map(|xi| Fr::mul(xi, &inv_abs_x))
+            .map(|xi| xi.fixed_mul(&inv_abs_x))
             .collect();
 
         Ok(result)
@@ -478,7 +478,8 @@ impl BitDecomposition {
         for (i, bit_sh) in bit_shares.iter().enumerate() {
             let scale = Fr::from_f64((1u64 << i) as f64);
             for (j, bit) in bit_sh.iter().enumerate() {
-                result[j] = Fr::add(&result[j], &Fr::mul(bit, &scale));
+                // Use fixed_mul for proper fixed-point arithmetic
+                result[j] = Fr::add(&result[j], &bit.fixed_mul(&scale));
             }
         }
 
