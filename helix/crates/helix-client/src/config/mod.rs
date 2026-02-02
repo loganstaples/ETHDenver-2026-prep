@@ -8,11 +8,15 @@
 //! - Mainnet: Ethereum mainnet production
 //! - Custom: User-defined configuration
 
+pub mod training;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
+
+pub use training::TrainingJobConfig;
 
 // ============================================================================
 // Root Configuration

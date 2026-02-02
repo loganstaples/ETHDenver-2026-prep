@@ -326,6 +326,15 @@ impl InitCommand {
         let extended_json = serde_json::to_string_pretty(&extended_config)?;
         std::fs::write(&extended_path, extended_json)?;
 
+        // Generate example training configuration
+        self.progress.start_spinner("Creating example training config...");
+        let training_config_path = helix_home.join("model.toml");
+        if !training_config_path.exists() {
+            let training_example = crate::config::training::TrainingJobConfig::example_toml();
+            std::fs::write(&training_config_path, training_example)?;
+        }
+        self.progress.finish_spinner("Training config template created");
+
         Ok(InitResult {
             node_id,
             node_name,

@@ -223,6 +223,7 @@ impl RealTrainingExecutor {
             exp_scale: 1000,
             use_freivalds: self.config.use_freivalds,
             base_error: Fr::from(1u64),
+            ..V2ProverConfig::default()
         };
 
         self.prover = Some(MLTrainingProverV2::with_config(

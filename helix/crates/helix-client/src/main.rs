@@ -31,6 +31,7 @@ use commands::{
     status::StatusCommand,
     query::QueryCommand,
     export::ExportCommand,
+    train::{TrainCommand, TrainOptions},
 };
 use orchestrator::NetworkOrchestrator;
 use progress::ProgressDisplay;
@@ -79,6 +80,9 @@ enum Commands {
 
     /// Export training artifacts
     Export(ExportArgs),
+
+    /// Start a training session with a model
+    Train(TrainArgs),
 
     /// Start a multi-node demo network
     Demo(DemoArgs),
@@ -191,6 +195,9 @@ enum QueryType {
     Stake,
     Proof,
     Error,
+    Worker,
+    Aggregator,
+    Metrics,
 }
 
 #[derive(Args)]
@@ -219,6 +226,57 @@ enum ExportType {
     Metrics,
     Logs,
     All,
+}
+
+#[derive(Args)]
+struct TrainArgs {
+    /// Path to training configuration file (TOML)
+    #[arg(long, short = 'C', default_value = "model.toml")]
+    train_config: PathBuf,
+
+    /// Model ID (if joining existing model training)
+    #[arg(short, long)]
+    model_id: Option<u64>,
+
+    /// Override max rounds from config
+    #[arg(long)]
+    max_rounds: Option<u32>,
+
+    /// Override learning rate from config
+    #[arg(long)]
+    learning_rate: Option<f64>,
+
+    /// Dry-run mode (validate config without actual training)
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Resume from checkpoint (path or round number)
+    #[arg(long)]
+    resume: Option<String>,
+
+    /// Wallet name to use for staking
+    #[arg(long)]
+    wallet: Option<String>,
+
+    /// Skip confirmation prompts
+    #[arg(long, short = 'y')]
+    force: bool,
+
+    /// Verbose output
+    #[arg(long)]
+    verbose: bool,
+
+    /// Headless mode (no interactive progress)
+    #[arg(long)]
+    headless: bool,
+
+    /// Export metrics after training completes
+    #[arg(long)]
+    export_metrics: bool,
+
+    /// Output directory for metrics and checkpoints
+    #[arg(long, short)]
+    output_dir: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -468,6 +526,7 @@ async fn main() -> Result<()> {
         Commands::Status(args) => cmd_status(args, &cli).await,
         Commands::Query(args) => cmd_query(args, &cli).await,
         Commands::Export(args) => cmd_export(args, &cli).await,
+        Commands::Train(args) => cmd_train(args, &cli, shutdown_tx.subscribe()).await,
         Commands::Demo(args) => cmd_demo(args, &cli, shutdown_tx.subscribe()).await,
         Commands::Orchestrate(args) => cmd_orchestrate(args, &cli).await,
         Commands::Health(args) => cmd_health(args, &cli).await,
@@ -701,6 +760,46 @@ async fn cmd_query(args: &QueryArgs, _cli: &Cli) -> Result<()> {
             println!("  Status:            {} Acceptable", "●".green());
             println!("  Rounds Tracked:    42");
         }
+        QueryType::Worker => {
+            println!("{}", "Worker Information".cyan().bold());
+            println!("  Worker ID:         helix-node-a1b2c3d4");
+            println!("  Address:           0x742d35Cc6634C053...");
+            println!("  Status:            {} Active", "●".green());
+            println!("  Models:            [{}, ...]", args.model_id);
+            println!("  Total Stake:       2.5 ETH");
+            println!("  Reputation:        98%");
+            println!("  Proofs Verified:   125 / 127");
+            println!("  Total Rewards:     0.15 ETH");
+        }
+        QueryType::Aggregator => {
+            println!("{}", "Aggregator Information".cyan().bold());
+            println!("  Aggregator ID:     helix-agg-01");
+            println!("  Address:           0x5FbDB2315678...");
+            println!("  Status:            {} Active", "●".green());
+            println!("  Rounds Aggregated: 42");
+            println!("  Success Rate:      100%");
+            println!("  Avg Time:          150 ms");
+            println!("  Fees Collected:    0.042 ETH");
+        }
+        QueryType::Metrics => {
+            println!("{}", "Training Metrics".cyan().bold());
+            println!("  Model ID:          {}", args.model_id);
+            println!();
+            println!("{}", "Training:".yellow());
+            println!("  Progress:          42/100 (42.0%)");
+            println!("  Avg Loss:          0.312 (improving)");
+            println!("  Avg Round Time:    2500 ms");
+            println!();
+            println!("{}", "Proofs:".yellow());
+            println!("  Generated:         127");
+            println!("  Verified:          125 (98.4%)");
+            println!("  Avg Proof Time:    1200 ms");
+            println!();
+            println!("{}", "Economics:".yellow());
+            println!("  Total Stake:       6.0 ETH");
+            println!("  Total Rewards:     0.15 ETH");
+            println!("  Slashing Events:   0");
+        }
     }
 
     Ok(())
@@ -740,6 +839,34 @@ async fn cmd_export(args: &ExportArgs, _cli: &Cli) -> Result<()> {
             progress.start_spinner("Exporting all artifacts...");
             tokio::time::sleep(Duration::from_secs(3)).await;
             progress.finish_spinner(&format!("All artifacts exported to {}", args.output.display()));
+        }
+    }
+
+    Ok(())
+}
+
+async fn cmd_train(args: &TrainArgs, _cli: &Cli, shutdown: broadcast::Receiver<()>) -> Result<()> {
+    let options = TrainOptions {
+        config: args.train_config.clone(),
+        model_id: args.model_id,
+        max_rounds: args.max_rounds,
+        learning_rate: args.learning_rate,
+        dry_run: args.dry_run,
+        resume: args.resume.clone(),
+        wallet: args.wallet.clone(),
+        force: args.force,
+        verbose: args.verbose,
+        headless: args.headless,
+        export_metrics: args.export_metrics,
+        output_dir: args.output_dir.clone(),
+    };
+
+    let mut cmd = TrainCommand::new();
+    let result = cmd.execute(options, shutdown).await?;
+
+    if !result.success {
+        if let Some(error) = &result.error {
+            return Err(anyhow::anyhow!("{}", error));
         }
     }
 

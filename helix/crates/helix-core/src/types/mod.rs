@@ -17,10 +17,13 @@ pub mod error_checkpoint;
 pub mod error_budget;
 
 // Re-export core types
-pub use bounded_value::BoundedValue;
+pub use bounded_value::{
+    BoundedValue, BoundedValueResult, IntoBounded,
+    MAX_ERROR_BOUND, MIN_POSITIVE_VALUE, DIVISION_THRESHOLD,
+};
 pub use error_margin::ErrorMargin;
 pub use precision::Precision;
-pub use tensor::{BoundedTensor, Shape};
+pub use tensor::{BoundedTensor, Shape, TensorBuilder, MAX_TENSOR_ELEMENTS, MAX_TENSOR_DIMS};
 
 // Re-export probabilistic error types
 pub use probabilistic_error::{

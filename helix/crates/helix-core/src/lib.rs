@@ -23,14 +23,37 @@ pub mod error;
 pub mod integration;
 pub mod traits;
 pub mod types;
+pub mod validation;
+
+#[cfg(test)]
+mod fuzz_tests;
 
 // Re-export commonly used items at crate root
 pub use config::{HelixConfig, ProverConfig, TrainingConfig, VMConfig};
-pub use error::{ArithmeticError, BoundsError, CircuitError, DataError, HelixError, HelixResult};
+pub use error::{
+    ArithmeticError, BoundsError, CircuitError, DataError, ErrorContext, ErrorSeverity,
+    HelixError, HelixResult, LogContext, NetworkError, OverflowError, ResultExt,
+    SerializationError, ValidationError,
+};
 pub use traits::{ApproximateOp, BinarySerializable, Provable, Witness};
 
+// Validation utilities
+pub use validation::{
+    validate_config, validate_vm_config, validate_prover_config, validate_training_config,
+    validate_finite, validate_range, validate_positive, validate_non_negative,
+    validate_vector, validate_non_empty, validate_shape, validate_bounded_value,
+    sanitize_f64, sanitize_vector, clamp_to_range,
+    validate_serialization_roundtrip, validate_tensor_roundtrip,
+    InputSanitizer, RecoveryStrategy, RecoveryContext, RecoveryAction,
+    ValidationCollector,
+};
+
 // Core types
-pub use types::{BoundedTensor, BoundedValue, ErrorMargin, Precision, Shape};
+pub use types::{
+    BoundedTensor, BoundedValue, BoundedValueResult, ErrorMargin, IntoBounded, Precision, Shape,
+    TensorBuilder, MAX_ERROR_BOUND, MIN_POSITIVE_VALUE, DIVISION_THRESHOLD,
+    MAX_TENSOR_ELEMENTS, MAX_TENSOR_DIMS,
+};
 
 // Probabilistic error types
 pub use types::{
@@ -40,7 +63,7 @@ pub use types::{
 // Error composition types
 pub use types::{
     ActivationFunction, AttentionErrorPropagation, CompositionRule,
-    ComputationGraphError, ErrorContext, MatrixErrorPropagation,
+    ComputationGraphError, ErrorContext as CompositionErrorContext, MatrixErrorPropagation,
     NormalizationErrorPropagation, ReductionErrorPropagation, ReductionType,
 };
 

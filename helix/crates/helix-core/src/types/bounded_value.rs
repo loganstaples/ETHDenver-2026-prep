@@ -1,15 +1,33 @@
 //! Bounded value type for approximate computation.
 //!
 //! A `BoundedValue<T>` represents a computed value together with its error bounds.
+//! This module provides comprehensive bounds checking, NaN/Inf detection, and
+//! graceful overflow handling for robust numerical computations.
 
 use super::error_margin::ErrorMargin;
+use crate::error::{ArithmeticError, BoundsError, HelixResult};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
+/// Maximum allowed error bound to prevent overflow in subsequent computations.
+pub const MAX_ERROR_BOUND: f64 = 1e100;
+
+/// Minimum representable positive value for underflow detection.
+pub const MIN_POSITIVE_VALUE: f64 = 1e-300;
+
+/// Threshold for division-by-zero detection.
+pub const DIVISION_THRESHOLD: f64 = 1e-15;
+
 /// A value with tracked error bounds.
 ///
 /// The true value is guaranteed to be within `[value - error, value + error]`.
+///
+/// # Invariants
+///
+/// - Error margin is always non-negative
+/// - Neither value nor error bound should be NaN
+/// - Infinity in error bound indicates unbounded uncertainty
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct BoundedValue<T> {
     /// The computed/approximate value.
@@ -54,6 +72,24 @@ impl<T: Copy> BoundedValue<T> {
 }
 
 impl BoundedValue<f64> {
+    /// Creates a bounded value with absolute error, with validation.
+    ///
+    /// Returns an error if the value or epsilon is NaN/Inf or if epsilon is negative.
+    pub fn try_with_absolute_error(value: f64, epsilon: f64) -> HelixResult<Self> {
+        Self::validate_finite(value, "value")?;
+        Self::validate_non_negative(epsilon, "epsilon")?;
+        Ok(Self::new(value, ErrorMargin::absolute(epsilon.min(MAX_ERROR_BOUND))))
+    }
+
+    /// Creates a bounded value with relative error, with validation.
+    ///
+    /// Returns an error if the value or epsilon is NaN/Inf or if epsilon is negative.
+    pub fn try_with_relative_error(value: f64, epsilon: f64) -> HelixResult<Self> {
+        Self::validate_finite(value, "value")?;
+        Self::validate_non_negative(epsilon, "epsilon")?;
+        Ok(Self::new(value, ErrorMargin::relative(epsilon.min(1e10))))
+    }
+
     /// Creates a bounded value with absolute error.
     pub fn with_absolute_error(value: f64, epsilon: f64) -> Self {
         Self::new(value, ErrorMargin::absolute(epsilon))
@@ -93,6 +129,313 @@ impl BoundedValue<f64> {
     pub fn interval_width(&self) -> f64 {
         2.0 * self.absolute_error()
     }
+
+    /// Checks if the value is finite (not NaN or Inf).
+    pub fn is_finite(&self) -> bool {
+        self.value.is_finite()
+    }
+
+    /// Checks if the value is NaN.
+    pub fn is_nan(&self) -> bool {
+        self.value.is_nan()
+    }
+
+    /// Checks if the value is infinite.
+    pub fn is_infinite(&self) -> bool {
+        self.value.is_infinite()
+    }
+
+    /// Checks if the error bound is finite.
+    pub fn has_finite_error(&self) -> bool {
+        let abs_err = self.absolute_error();
+        abs_err.is_finite()
+    }
+
+    /// Checks if the value has valid bounds (error is finite and non-negative).
+    pub fn has_valid_bounds(&self) -> bool {
+        let abs_err = self.absolute_error();
+        abs_err.is_finite() && abs_err >= 0.0
+    }
+
+    /// Returns true if this bounded value is in a valid state.
+    pub fn is_valid(&self) -> bool {
+        self.is_finite() && self.has_valid_bounds()
+    }
+
+    /// Validates that a value is finite.
+    fn validate_finite(value: f64, name: &str) -> HelixResult<()> {
+        if value.is_nan() {
+            return Err(ArithmeticError::nan_detected(format!("{} creation", name)).into());
+        }
+        if value.is_infinite() {
+            return Err(ArithmeticError::infinity_detected(
+                format!("{} creation", name),
+                value,
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Validates that a value is non-negative.
+    fn validate_non_negative(value: f64, name: &str) -> HelixResult<()> {
+        if value.is_nan() {
+            return Err(ArithmeticError::nan_detected(format!("{} validation", name)).into());
+        }
+        if value < 0.0 {
+            return Err(BoundsError::NegativeMargin(value).into());
+        }
+        Ok(())
+    }
+
+    /// Clamps the error bound to prevent overflow.
+    pub fn clamp_error(&mut self) {
+        let abs_err = self.absolute_error();
+        if abs_err > MAX_ERROR_BOUND || abs_err.is_infinite() {
+            self.error = ErrorMargin::absolute(MAX_ERROR_BOUND);
+        }
+    }
+
+    /// Returns a version with clamped error bounds.
+    pub fn with_clamped_error(mut self) -> Self {
+        self.clamp_error();
+        self
+    }
+
+    /// Sanitizes the value by replacing NaN with zero and clamping infinities.
+    pub fn sanitize(&mut self) {
+        if self.value.is_nan() {
+            self.value = 0.0;
+            self.error = ErrorMargin::absolute(MAX_ERROR_BOUND);
+        } else if self.value.is_infinite() {
+            self.value = self.value.signum() * f64::MAX;
+            self.error = ErrorMargin::absolute(MAX_ERROR_BOUND);
+        }
+        self.clamp_error();
+    }
+
+    /// Returns a sanitized version of this value.
+    pub fn sanitized(mut self) -> Self {
+        self.sanitize();
+        self
+    }
+
+    // === Checked arithmetic operations ===
+
+    /// Checked addition that returns a Result.
+    pub fn checked_add(self, rhs: Self) -> HelixResult<Self> {
+        // Check for NaN/Inf in inputs
+        if self.is_nan() || rhs.is_nan() {
+            return Err(ArithmeticError::nan_detected("addition").into());
+        }
+
+        let value = self.value + rhs.value;
+
+        // Check for overflow in result
+        if value.is_nan() {
+            return Err(ArithmeticError::nan_detected("addition result").into());
+        }
+        if value.is_infinite() {
+            return Err(ArithmeticError::infinity_detected("addition", value).into());
+        }
+
+        // Compute error with overflow protection
+        let error = self.error.add(&rhs.error, self.value, rhs.value);
+        let abs_error = error.epsilon();
+
+        if abs_error.is_infinite() || abs_error > MAX_ERROR_BOUND {
+            return Err(BoundsError::overflow("addition", abs_error).into());
+        }
+
+        Ok(BoundedValue { value, error })
+    }
+
+    /// Checked subtraction that returns a Result.
+    pub fn checked_sub(self, rhs: Self) -> HelixResult<Self> {
+        if self.is_nan() || rhs.is_nan() {
+            return Err(ArithmeticError::nan_detected("subtraction").into());
+        }
+
+        let value = self.value - rhs.value;
+
+        if value.is_nan() {
+            return Err(ArithmeticError::nan_detected("subtraction result").into());
+        }
+        if value.is_infinite() {
+            return Err(ArithmeticError::infinity_detected("subtraction", value).into());
+        }
+
+        let error = self.error.add(&rhs.error, self.value, rhs.value);
+        let abs_error = error.epsilon();
+
+        if abs_error.is_infinite() || abs_error > MAX_ERROR_BOUND {
+            return Err(BoundsError::overflow("subtraction", abs_error).into());
+        }
+
+        Ok(BoundedValue { value, error })
+    }
+
+    /// Checked multiplication that returns a Result.
+    pub fn checked_mul(self, rhs: Self) -> HelixResult<Self> {
+        if self.is_nan() || rhs.is_nan() {
+            return Err(ArithmeticError::nan_detected("multiplication").into());
+        }
+
+        let value = self.value * rhs.value;
+
+        if value.is_nan() {
+            return Err(ArithmeticError::nan_detected("multiplication result").into());
+        }
+        if value.is_infinite() {
+            return Err(ArithmeticError::infinity_detected("multiplication", value).into());
+        }
+
+        let error = self.error.multiply(&rhs.error, self.value, rhs.value);
+        let abs_error = error.epsilon();
+
+        if abs_error.is_infinite() || abs_error > MAX_ERROR_BOUND {
+            return Err(BoundsError::overflow("multiplication", abs_error).into());
+        }
+
+        Ok(BoundedValue { value, error })
+    }
+
+    /// Checked division that returns a Result.
+    pub fn checked_div(self, rhs: Self) -> HelixResult<Self> {
+        if self.is_nan() || rhs.is_nan() {
+            return Err(ArithmeticError::nan_detected("division").into());
+        }
+
+        // Check for division by zero
+        let b_abs = rhs.value.abs();
+        if b_abs < DIVISION_THRESHOLD {
+            return Err(ArithmeticError::DivisionByZero.into());
+        }
+
+        let value = self.value / rhs.value;
+
+        if value.is_nan() {
+            return Err(ArithmeticError::nan_detected("division result").into());
+        }
+        if value.is_infinite() {
+            return Err(ArithmeticError::infinity_detected("division", value).into());
+        }
+
+        // Compute division error
+        let eps_a = self.error.to_absolute(self.value);
+        let eps_b = rhs.error.to_absolute(rhs.value);
+
+        let rel_error = eps_a / self.value.abs().max(DIVISION_THRESHOLD) + eps_b / b_abs;
+        let abs_error = value.abs() * rel_error + eps_a / b_abs;
+
+        if abs_error.is_infinite() || abs_error > MAX_ERROR_BOUND {
+            return Err(BoundsError::overflow("division", abs_error).into());
+        }
+
+        Ok(BoundedValue::new(value, ErrorMargin::absolute(abs_error)))
+    }
+
+    /// Saturating addition that clamps overflow instead of returning an error.
+    pub fn saturating_add(self, rhs: Self) -> Self {
+        let mut result = self + rhs;
+        result.sanitize();
+        result
+    }
+
+    /// Saturating subtraction that clamps overflow instead of returning an error.
+    pub fn saturating_sub(self, rhs: Self) -> Self {
+        let mut result = self - rhs;
+        result.sanitize();
+        result
+    }
+
+    /// Saturating multiplication that clamps overflow instead of returning an error.
+    pub fn saturating_mul(self, rhs: Self) -> Self {
+        let mut result = self * rhs;
+        result.sanitize();
+        result
+    }
+
+    /// Saturating division that clamps overflow instead of returning an error.
+    /// Returns a value with maximum error if dividing by near-zero.
+    pub fn saturating_div(self, rhs: Self) -> Self {
+        let mut result = self / rhs;
+        result.sanitize();
+        result
+    }
+
+    // === Error accumulation helpers ===
+
+    /// Accumulates error from this operation with graceful overflow handling.
+    ///
+    /// Returns the accumulated error if successful, or the clamped maximum if overflow.
+    pub fn accumulate_error(current: f64, additional: f64) -> Result<f64, f64> {
+        let sum = current + additional;
+        if sum.is_infinite() || sum > MAX_ERROR_BOUND {
+            Err(MAX_ERROR_BOUND)
+        } else {
+            Ok(sum)
+        }
+    }
+
+    /// Creates a value representing a failed computation with maximum uncertainty.
+    pub fn failed_computation() -> Self {
+        Self::new(0.0, ErrorMargin::absolute(MAX_ERROR_BOUND))
+    }
+
+    /// Creates a value representing positive infinity with maximum uncertainty.
+    pub fn positive_overflow() -> Self {
+        Self::new(f64::MAX, ErrorMargin::absolute(MAX_ERROR_BOUND))
+    }
+
+    /// Creates a value representing negative infinity with maximum uncertainty.
+    pub fn negative_overflow() -> Self {
+        Self::new(f64::MIN, ErrorMargin::absolute(MAX_ERROR_BOUND))
+    }
+
+    // === Validation helpers ===
+
+    /// Validates that this value can be used in subsequent computations.
+    pub fn validate(&self) -> HelixResult<()> {
+        if self.is_nan() {
+            return Err(ArithmeticError::nan_detected("bounded value").into());
+        }
+        if self.is_infinite() {
+            return Err(ArithmeticError::infinity_detected("bounded value", self.value).into());
+        }
+        let abs_err = self.absolute_error();
+        if abs_err.is_nan() {
+            return Err(BoundsError::invalid_propagation("error margin is NaN").into());
+        }
+        if abs_err < 0.0 {
+            return Err(BoundsError::NegativeMargin(abs_err).into());
+        }
+        Ok(())
+    }
+
+    /// Validates and returns self if valid.
+    pub fn validated(self) -> HelixResult<Self> {
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Checks if this value exceeds an error threshold.
+    pub fn exceeds_threshold(&self, threshold: f64) -> bool {
+        self.absolute_error() > threshold
+    }
+
+    /// Returns an error if this value exceeds the given threshold.
+    pub fn check_threshold(&self, threshold: f64) -> HelixResult<()> {
+        let abs_err = self.absolute_error();
+        if abs_err > threshold {
+            return Err(BoundsError::ExceedsMaximum {
+                computed: abs_err,
+                max_allowed: threshold,
+            }
+            .into());
+        }
+        Ok(())
+    }
 }
 
 impl BoundedValue<f32> {
@@ -114,6 +457,27 @@ impl BoundedValue<f32> {
     /// Returns the upper bound.
     pub fn upper_bound(&self) -> f32 {
         self.value + self.absolute_error()
+    }
+
+    /// Checks if the value is finite.
+    pub fn is_finite(&self) -> bool {
+        self.value.is_finite()
+    }
+
+    /// Checks if the value is NaN.
+    pub fn is_nan(&self) -> bool {
+        self.value.is_nan()
+    }
+
+    /// Sanitizes the value.
+    pub fn sanitize(&mut self) {
+        if self.value.is_nan() {
+            self.value = 0.0;
+            self.error = ErrorMargin::absolute(MAX_ERROR_BOUND);
+        } else if self.value.is_infinite() {
+            self.value = self.value.signum() * f32::MAX;
+            self.error = ErrorMargin::absolute(MAX_ERROR_BOUND);
+        }
     }
 }
 
@@ -158,16 +522,16 @@ impl Div for BoundedValue<f64> {
         // Division error: ε(a/b) ≈ |a/b| * (εa/|a| + εb/|b|) for small relative errors
         let eps_a = self.error.to_absolute(self.value);
         let eps_b = rhs.error.to_absolute(rhs.value);
-        
+
         // Guard against division by near-zero
         let b_abs = rhs.value.abs();
-        if b_abs < 1e-15 {
+        if b_abs < DIVISION_THRESHOLD {
             return BoundedValue::new(value, ErrorMargin::absolute(f64::INFINITY));
         }
-        
-        let rel_error = eps_a / self.value.abs().max(1e-15) + eps_b / b_abs;
+
+        let rel_error = eps_a / self.value.abs().max(DIVISION_THRESHOLD) + eps_b / b_abs;
         let abs_error = value.abs() * rel_error + eps_a / b_abs;
-        
+
         BoundedValue::new(value, ErrorMargin::absolute(abs_error))
     }
 }
@@ -201,6 +565,48 @@ impl<T: PartialEq + Copy> PartialEq for BoundedValue<T> {
     }
 }
 
+/// Result type for bounded value operations.
+pub type BoundedValueResult = HelixResult<BoundedValue<f64>>;
+
+/// Trait for types that can be converted to bounded values.
+pub trait IntoBounded {
+    /// Converts this value to a bounded value with zero error.
+    fn into_exact(self) -> BoundedValue<f64>;
+
+    /// Converts this value to a bounded value with the given absolute error.
+    fn with_error(self, error: f64) -> BoundedValue<f64>;
+}
+
+impl IntoBounded for f64 {
+    fn into_exact(self) -> BoundedValue<f64> {
+        BoundedValue::exact(self)
+    }
+
+    fn with_error(self, error: f64) -> BoundedValue<f64> {
+        BoundedValue::<f64>::with_absolute_error(self, error)
+    }
+}
+
+impl IntoBounded for f32 {
+    fn into_exact(self) -> BoundedValue<f64> {
+        BoundedValue::exact(self as f64)
+    }
+
+    fn with_error(self, error: f64) -> BoundedValue<f64> {
+        BoundedValue::<f64>::with_absolute_error(self as f64, error)
+    }
+}
+
+impl IntoBounded for i32 {
+    fn into_exact(self) -> BoundedValue<f64> {
+        BoundedValue::exact(self as f64)
+    }
+
+    fn with_error(self, error: f64) -> BoundedValue<f64> {
+        BoundedValue::<f64>::with_absolute_error(self as f64, error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,6 +616,7 @@ mod tests {
         let v: BoundedValue<f64> = BoundedValue::exact(5.0_f64);
         assert_eq!(v.value(), 5.0);
         assert_eq!(v.absolute_error(), 0.0);
+        assert!(v.is_valid());
     }
 
     #[test]
@@ -249,5 +656,144 @@ mod tests {
 
         let c = BoundedValue::<f64>::with_absolute_error(12.0, 0.5);
         assert!(!a.overlaps(&c));
+    }
+
+    #[test]
+    fn test_nan_detection() {
+        let nan_val = BoundedValue::exact(f64::NAN);
+        assert!(nan_val.is_nan());
+        assert!(!nan_val.is_finite());
+        assert!(!nan_val.is_valid());
+
+        // Checked operations should fail on NaN
+        let normal = BoundedValue::exact(1.0);
+        assert!(normal.checked_add(nan_val).is_err());
+        assert!(normal.checked_mul(nan_val).is_err());
+    }
+
+    #[test]
+    fn test_infinity_detection() {
+        let inf_val = BoundedValue::exact(f64::INFINITY);
+        assert!(inf_val.is_infinite());
+        assert!(!inf_val.is_finite());
+        assert!(!inf_val.is_valid());
+
+        let normal = BoundedValue::exact(1.0);
+        assert!(normal.checked_add(inf_val).is_err());
+    }
+
+    #[test]
+    fn test_division_by_zero() {
+        let a = BoundedValue::exact(10.0);
+        let b = BoundedValue::exact(0.0);
+        assert!(a.checked_div(b).is_err());
+
+        // Regular division returns infinity error
+        let result = a / b;
+        assert!(result.absolute_error().is_infinite());
+    }
+
+    #[test]
+    fn test_sanitize() {
+        let mut nan_val = BoundedValue::exact(f64::NAN);
+        nan_val.sanitize();
+        assert_eq!(nan_val.value(), 0.0);
+        assert!(nan_val.is_valid());
+
+        let mut inf_val = BoundedValue::exact(f64::INFINITY);
+        inf_val.sanitize();
+        assert!(inf_val.is_finite());
+        assert!(inf_val.is_valid());
+    }
+
+    #[test]
+    fn test_saturating_operations() {
+        let a = BoundedValue::exact(f64::MAX / 2.0);
+        let b = BoundedValue::exact(f64::MAX / 2.0);
+
+        // Saturating add should not panic or return NaN
+        let result = a.saturating_add(b);
+        assert!(result.is_finite());
+
+        // Saturating with NaN should sanitize
+        let nan = BoundedValue::exact(f64::NAN);
+        let result = a.saturating_add(nan);
+        assert!(result.is_finite());
+    }
+
+    #[test]
+    fn test_checked_operations() {
+        let a = BoundedValue::exact(10.0);
+        let b = BoundedValue::exact(5.0);
+
+        assert!(a.checked_add(b).is_ok());
+        assert!(a.checked_sub(b).is_ok());
+        assert!(a.checked_mul(b).is_ok());
+        assert!(a.checked_div(b).is_ok());
+
+        let zero = BoundedValue::exact(0.0);
+        assert!(a.checked_div(zero).is_err());
+    }
+
+    #[test]
+    fn test_error_accumulation() {
+        let result = BoundedValue::accumulate_error(0.5, 0.3);
+        assert_eq!(result, Ok(0.8));
+
+        // MAX_ERROR_BOUND + MAX_ERROR_BOUND exceeds MAX_ERROR_BOUND
+        let overflow = BoundedValue::accumulate_error(MAX_ERROR_BOUND, MAX_ERROR_BOUND);
+        assert_eq!(overflow, Err(MAX_ERROR_BOUND));
+
+        // Test infinity case
+        let inf_overflow = BoundedValue::accumulate_error(f64::MAX, f64::MAX);
+        assert_eq!(inf_overflow, Err(MAX_ERROR_BOUND));
+    }
+
+    #[test]
+    fn test_threshold_check() {
+        let v = BoundedValue::<f64>::with_absolute_error(10.0, 0.5);
+        assert!(v.check_threshold(1.0).is_ok());
+        assert!(v.check_threshold(0.1).is_err());
+    }
+
+    #[test]
+    fn test_validated() {
+        let valid = BoundedValue::exact(10.0);
+        assert!(valid.validated().is_ok());
+
+        let invalid = BoundedValue::exact(f64::NAN);
+        assert!(invalid.validated().is_err());
+    }
+
+    #[test]
+    fn test_try_with_error() {
+        assert!(BoundedValue::try_with_absolute_error(10.0, 0.1).is_ok());
+        assert!(BoundedValue::try_with_absolute_error(f64::NAN, 0.1).is_err());
+        assert!(BoundedValue::try_with_absolute_error(10.0, -0.1).is_err());
+    }
+
+    #[test]
+    fn test_into_bounded() {
+        let v: BoundedValue<f64> = 5.0_f64.into_exact();
+        assert_eq!(v.value(), 5.0);
+        assert_eq!(v.absolute_error(), 0.0);
+
+        let v: BoundedValue<f64> = 5.0_f64.with_error(0.1);
+        assert_eq!(v.value(), 5.0);
+        assert_eq!(v.absolute_error(), 0.1);
+    }
+
+    #[test]
+    fn test_error_bound_clamping() {
+        let mut v = BoundedValue::new(10.0, ErrorMargin::absolute(f64::INFINITY));
+        v.clamp_error();
+        assert_eq!(v.absolute_error(), MAX_ERROR_BOUND);
+    }
+
+    #[test]
+    fn test_failed_computation() {
+        let v = BoundedValue::failed_computation();
+        assert_eq!(v.value(), 0.0);
+        assert_eq!(v.absolute_error(), MAX_ERROR_BOUND);
     }
 }

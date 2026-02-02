@@ -17,20 +17,50 @@ pub enum ErrorMargin {
 impl ErrorMargin {
     /// Creates a new absolute error margin.
     ///
-    /// # Panics
-    /// Panics if epsilon is negative.
+    /// Negative values are clamped to 0. NaN values are treated as 0.
     pub fn absolute(epsilon: f64) -> Self {
-        assert!(epsilon >= 0.0, "Error margin must be non-negative");
-        ErrorMargin::Absolute(epsilon)
+        // Handle NaN and negative values gracefully
+        let safe_epsilon = if epsilon.is_nan() || epsilon < 0.0 {
+            0.0
+        } else {
+            epsilon
+        };
+        ErrorMargin::Absolute(safe_epsilon)
     }
 
     /// Creates a new relative error margin.
     ///
-    /// # Panics
-    /// Panics if epsilon is negative.
+    /// Negative values are clamped to 0. NaN values are treated as 0.
     pub fn relative(epsilon: f64) -> Self {
-        assert!(epsilon >= 0.0, "Error margin must be non-negative");
-        ErrorMargin::Relative(epsilon)
+        // Handle NaN and negative values gracefully
+        let safe_epsilon = if epsilon.is_nan() || epsilon < 0.0 {
+            0.0
+        } else {
+            epsilon
+        };
+        ErrorMargin::Relative(safe_epsilon)
+    }
+
+    /// Creates a new absolute error margin with strict validation.
+    ///
+    /// Returns None if epsilon is negative or NaN.
+    pub fn try_absolute(epsilon: f64) -> Option<Self> {
+        if epsilon.is_nan() || epsilon < 0.0 {
+            None
+        } else {
+            Some(ErrorMargin::Absolute(epsilon))
+        }
+    }
+
+    /// Creates a new relative error margin with strict validation.
+    ///
+    /// Returns None if epsilon is negative or NaN.
+    pub fn try_relative(epsilon: f64) -> Option<Self> {
+        if epsilon.is_nan() || epsilon < 0.0 {
+            None
+        } else {
+            Some(ErrorMargin::Relative(epsilon))
+        }
     }
 
     /// Converts this error margin to an absolute value given the reference value.

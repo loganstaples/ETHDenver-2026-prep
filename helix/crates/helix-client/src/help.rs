@@ -54,6 +54,7 @@ impl HelpSystem {
         println!();
         println!("{}", "COMMANDS:".yellow().bold());
         println!("    {}       Initialize a new HELIX node or network", "init".green());
+        println!("    {}      Start training with model config", "train".green());
         println!("    {}       Join an existing training network", "join".green());
         println!("    {}     Query node/network status", "status".green());
         println!("    {}      Query model or round data", "query".green());
@@ -69,8 +70,9 @@ impl HelpSystem {
         println!();
         println!("{}", "QUICK START:".yellow().bold());
         println!("    1. Initialize a node:     helix init --network local");
-        println!("    2. Run the demo:          helix demo --scenario quick");
-        println!("    3. View status:           helix status --watch");
+        println!("    2. Start training:        helix train --config model.toml");
+        println!("    3. Or run demo:           helix demo --scenario quick");
+        println!("    4. View status:           helix status --watch");
         println!();
         println!("{}", "HELP TOPICS:".yellow().bold());
         println!("    helix help getting-started    Quick start guide");
@@ -141,7 +143,65 @@ The init command supports multiple network profiles:
                     description: "Initialize as aggregator with new wallet".to_string(),
                 },
             ],
-            see_also: vec!["join".to_string(), "config".to_string()],
+            see_also: vec!["train".to_string(), "join".to_string(), "config".to_string()],
+        });
+
+        // Train command
+        self.commands.insert("train".to_string(), CommandHelp {
+            name: "train".to_string(),
+            short_desc: "Start training with model configuration".to_string(),
+            long_desc: r#"
+Start a distributed training session using a TOML configuration file. The train
+command loads model architecture, hyperparameters, data sources, and proof settings
+from the config file and begins the training process.
+
+Training modes:
+  - Normal:   Full training with proof generation and on-chain verification
+  - Dry-run:  Simulate training without compute or on-chain interaction
+
+The command provides real-time progress reporting including:
+  - Current round and total rounds
+  - Loss values and convergence metrics
+  - Proof generation status
+  - Worker participation statistics
+  - Error bound tracking
+
+Use --dry-run to validate configuration and test workflow before committing
+resources to actual training.
+"#.to_string(),
+            usage: "helix train [OPTIONS]".to_string(),
+            options: vec![
+                ("-C, --config <FILE>".to_string(), "Training configuration file [default: model.toml]".to_string()),
+                ("--model-id <ID>".to_string(), "Override model ID from config".to_string()),
+                ("--max-rounds <N>".to_string(), "Override maximum training rounds".to_string()),
+                ("--learning-rate <RATE>".to_string(), "Override learning rate".to_string()),
+                ("--dry-run".to_string(), "Simulate training without real compute".to_string()),
+                ("--resume <CHECKPOINT>".to_string(), "Resume from checkpoint".to_string()),
+                ("--workers <N>".to_string(), "Minimum workers required to start".to_string()),
+                ("--timeout <SECS>".to_string(), "Round timeout in seconds".to_string()),
+                ("--output-dir <PATH>".to_string(), "Output directory for artifacts".to_string()),
+                ("--no-progress".to_string(), "Disable progress bar output".to_string()),
+                ("--watch".to_string(), "Continue watching after training completes".to_string()),
+            ],
+            examples: vec![
+                Example {
+                    command: "helix train --config model.toml".to_string(),
+                    description: "Start training with configuration file".to_string(),
+                },
+                Example {
+                    command: "helix train --config model.toml --dry-run".to_string(),
+                    description: "Validate config with simulated training".to_string(),
+                },
+                Example {
+                    command: "helix train -C model.toml --max-rounds 50 --learning-rate 0.001".to_string(),
+                    description: "Start training with overridden hyperparameters".to_string(),
+                },
+                Example {
+                    command: "helix train --resume checkpoint_round_10.json".to_string(),
+                    description: "Resume training from checkpoint".to_string(),
+                },
+            ],
+            see_also: vec!["init".to_string(), "join".to_string(), "status".to_string(), "export".to_string()],
         });
 
         // Join command
@@ -735,6 +795,30 @@ HELIX enables trustless distributed ML training where:
 3. Each computation is verified with approximate ZK proofs
 4. Economic incentives ensure honest participation
 
+QUICK START
+-----------
+Start training with a configuration file:
+  helix train --config model.toml
+
+Test your config without real compute:
+  helix train --config model.toml --dry-run
+
+Resume from checkpoint:
+  helix train --resume checkpoint_round_10.json
+
+CONFIGURATION
+-------------
+Training is configured via TOML files. Generate an example:
+  helix init --network local
+  # Creates ~/.helix/model.toml with example config
+
+Key configuration sections:
+  [model]      - Architecture, layers, precision
+  [training]   - Learning rate, batch size, rounds
+  [data]       - Data paths and preprocessing
+  [proof]      - Proof system and error bounds
+  [network]    - Coordinator and worker settings
+
 WORKFLOW
 --------
 1. MODEL REGISTRATION
@@ -922,6 +1006,7 @@ pub fn print_quick_reference() {
     println!();
     println!("{}", "Essential Commands:".yellow().bold());
     println!("  helix init                Initialize node");
+    println!("  helix train -C model.toml Start training");
     println!("  helix demo quick          Run quick demo");
     println!("  helix status --watch      Monitor status");
     println!("  helix visualize           Interactive UI");
@@ -970,6 +1055,8 @@ mod tests {
     fn test_command_exists() {
         let system = HelpSystem::new();
         assert!(system.commands.contains_key("init"));
+        assert!(system.commands.contains_key("train"));
+        assert!(system.commands.contains_key("join"));
         assert!(system.commands.contains_key("demo"));
         assert!(system.commands.contains_key("visualize"));
     }
