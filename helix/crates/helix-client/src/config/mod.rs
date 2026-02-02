@@ -225,7 +225,11 @@ impl ConfigProfile {
             Self::Anvil => self.anvil_config(),
             Self::Sepolia => self.sepolia_config(),
             Self::Mainnet => self.mainnet_config(),
-            Self::Custom => HelixConfig::default(),
+            Self::Custom => {
+                let mut config = HelixConfig::default();
+                config.profile = ConfigProfile::Custom;
+                config
+            }
         }
     }
 
