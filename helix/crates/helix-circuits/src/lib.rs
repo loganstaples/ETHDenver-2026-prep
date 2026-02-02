@@ -21,7 +21,25 @@ pub use benchmark::{BenchmarkResult, BenchmarkSuite, OverheadAnalysis};
 pub use ivc::{IVCAccumulator, IVCChain, IVCStepCircuit, IVCStepWitness};
 pub use ml::training_step_v2::{
     MLTrainingStepV2Circuit, MLTrainingStepV2Witness, compute_witness_v2, compute_state_hash_v2,
-    ErrorTracker,
+    ErrorTracker, ToEvmProof, ToEvmPublicInputs,
+};
+
+// Re-export EVM format types for proof-to-contract compatibility
+pub use verifier::{
+    // Core EVM proof types
+    EvmProof, EvmProofBuilder, EvmPublicInputsArray,
+    // Format specification constants
+    MIN_PROOF_SIZE, NUM_ADVICE_COMMITS, G1_POINT_SIZE, SCALAR_SIZE,
+    NUM_PUBLIC_INPUTS as EVM_NUM_PUBLIC_INPUTS,
+    // Serialization functions
+    fr_to_evm_bytes, fq_to_evm_bytes, g1_to_evm_bytes,
+    evm_bytes_to_fr, evm_bytes_to_fq, evm_bytes_to_g1,
+    // Validation
+    validate_proof_format, validate_public_inputs, compute_hash_pair, verify_commitment,
+    // Errors and structures
+    ProofFormatError, ProofStructure, ProofSection, EvmPublicInputs,
+    // Test utilities
+    create_test_proof, create_test_public_inputs,
 };
 pub use ml::softmax::{SoftmaxChip, SoftmaxCircuit, SoftmaxWitness, compute_softmax};
 

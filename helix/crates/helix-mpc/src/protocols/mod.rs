@@ -10,6 +10,7 @@
 //! # Available Protocols
 //!
 //! - `arithmetic`: Basic operations (add, multiply via Beaver triples)
+//! - `proved_arithmetic`: Arithmetic operations with ZK witness capture
 //! - `matmul`: Secure matrix multiplication
 //! - `activation`: Activation functions (ReLU, GELU, etc.)
 //! - `comparison`: Secure comparison and sign computation
@@ -23,6 +24,7 @@ pub mod arithmetic;
 pub mod comparison;
 pub mod matmul;
 pub mod normalization;
+pub mod proved_arithmetic;
 pub mod reshare;
 
 pub use activation::SecureActivation;
@@ -37,4 +39,8 @@ pub use comparison::{
 };
 pub use matmul::SecureMatmul;
 pub use normalization::SecureNormalization;
+pub use proved_arithmetic::{
+    BeaverWitness, OperationWitness, ProvedArithmetic, SharedWitnessCapture, WitnessCapture,
+    WitnessSummary, WitnessedOperation, create_shared_capture,
+};
 pub use reshare::Resharing;

@@ -45,10 +45,17 @@ use halo2_proofs::{
     },
     poly::Rotation,
 };
-use halo2curves::bn256::Fr;
+use halo2curves::bn256::{Fr, G1Affine};
 use halo2curves::ff::PrimeField;
+use halo2curves::group::Curve;
 use sha2::{Digest, Sha256};
 use std::marker::PhantomData;
+
+use crate::verifier::{
+    EvmProof, EvmProofBuilder, EvmPublicInputsArray,
+    fr_to_evm_bytes, compute_hash_pair, NUM_PUBLIC_INPUTS as EVM_NUM_PUBLIC_INPUTS,
+    MIN_PROOF_SIZE, ProofFormatError,
+};
 
 /// Number of public inputs exposed by this circuit.
 pub const NUM_PUBLIC_INPUTS: usize = 7;
@@ -404,6 +411,71 @@ impl MLTrainingStepV2Witness {
             Fr::from(self.step_number),
         ]
     }
+
+    /// Converts public inputs to EVM-compatible format for Halo2Verifier.sol.
+    ///
+    /// This produces a properly formatted array that can be submitted to the
+    /// `verifyProof(bytes proof, uint256[] publicInputs)` function.
+    ///
+    /// # Returns
+    /// An `EvmPublicInputsArray` containing the 7 public inputs:
+    /// - [0]: old_state_hash_lo (lower 128 bits of old weights SHA256)
+    /// - [1]: old_state_hash_hi (upper 128 bits of old weights SHA256)
+    /// - [2]: new_state_hash_lo (lower 128 bits of new weights SHA256)
+    /// - [3]: new_state_hash_hi (upper 128 bits of new weights SHA256)
+    /// - [4]: loss (quantized training loss)
+    /// - [5]: error_bound (accumulated error for this step)
+    /// - [6]: step_number (training step counter)
+    pub fn to_evm_public_inputs(&self) -> EvmPublicInputsArray {
+        EvmPublicInputsArray::from_training_step(
+            self.old_state_hash.0,
+            self.old_state_hash.1,
+            self.new_state_hash.0,
+            self.new_state_hash.1,
+            self.loss,
+            self.total_error,
+            self.step_number,
+        )
+    }
+
+    /// Returns the public inputs as raw EVM bytes.
+    ///
+    /// Each public input is encoded as a 32-byte big-endian uint256.
+    /// Total size: 7 * 32 = 224 bytes.
+    pub fn to_evm_public_inputs_bytes(&self) -> Vec<u8> {
+        self.to_evm_public_inputs().to_evm_bytes()
+    }
+
+    /// Returns a debug dump of the public inputs in EVM format.
+    pub fn dump_evm_public_inputs(&self) -> String {
+        let inputs = self.to_evm_public_inputs();
+        let mut output = String::new();
+        output.push_str("=== EVM Public Inputs ===\n");
+        output.push_str(&format!("Total: {} elements ({} bytes)\n\n", EVM_NUM_PUBLIC_INPUTS, EVM_NUM_PUBLIC_INPUTS * 32));
+
+        let labels = [
+            "old_state_hash_lo",
+            "old_state_hash_hi",
+            "new_state_hash_lo",
+            "new_state_hash_hi",
+            "loss",
+            "error_bound",
+            "step_number",
+        ];
+
+        for (i, (label, hex)) in labels.iter().zip(inputs.to_hex_array().iter()).enumerate() {
+            output.push_str(&format!("[{}] {}: {}\n", i, label, hex));
+        }
+
+        // Compute and show the commitments as the contract would reconstruct them
+        output.push_str("\n=== Reconstructed Commitments ===\n");
+        let old_commit = compute_hash_pair(&self.old_state_hash.0, &self.old_state_hash.1);
+        let new_commit = compute_hash_pair(&self.new_state_hash.0, &self.new_state_hash.1);
+        output.push_str(&format!("Old commitment: 0x{}\n", hex::encode(old_commit)));
+        output.push_str(&format!("New commitment: 0x{}\n", hex::encode(new_commit)));
+
+        output
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -554,6 +626,108 @@ impl MLTrainingStepV2Circuit {
             self.exp_range, self.exp_scale,
             w.d_in * w.d_hid + w.d_hid + w.d_out * w.d_hid + w.d_out
         )
+    }
+
+    /// Returns the public inputs in EVM-compatible format.
+    ///
+    /// This is a convenience method that delegates to the witness.
+    pub fn to_evm_public_inputs(&self) -> EvmPublicInputsArray {
+        self.witness.to_evm_public_inputs()
+    }
+
+    /// Creates a mock EVM proof for testing purposes.
+    ///
+    /// This generates valid G1 points deterministically from the witness data
+    /// to create a proof that passes format validation but is not cryptographically
+    /// valid. Use this only for testing serialization and contract integration.
+    ///
+    /// For actual proof generation, use the prover module which generates real
+    /// Halo2 proofs that can be verified both natively and on-chain.
+    pub fn create_mock_evm_proof(&self) -> EvmProof {
+        let g1 = G1Affine::generator();
+
+        // Generate deterministic advice commitments based on witness data
+        // These are structurally valid but not cryptographically meaningful
+        let seed = self.witness.step_number;
+
+        let c0 = (g1 * Fr::from(seed * 1000 + 1)).to_affine();
+        let c1 = (g1 * Fr::from(seed * 1000 + 2)).to_affine();
+        let c2 = (g1 * Fr::from(seed * 1000 + 3)).to_affine();
+        let w = (g1 * Fr::from(seed * 1000 + 4)).to_affine();
+        let w_prime = (g1 * Fr::from(seed * 1000 + 5)).to_affine();
+
+        EvmProof::from_points([c0, c1, c2], w, w_prime)
+    }
+
+    /// Validates that a proof meets the minimum length requirement.
+    ///
+    /// This checks that `proof.len() >= 320` as required by Halo2Verifier.sol.
+    pub fn validate_proof_length(&self, proof: &[u8]) -> Result<(), ProofFormatError> {
+        if proof.len() < MIN_PROOF_SIZE {
+            return Err(ProofFormatError::TooShort {
+                got: proof.len(),
+                min: MIN_PROOF_SIZE,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Trait for converting Halo2 proofs to EVM-compatible format.
+///
+/// This trait is implemented by proof types in the prover crate to enable
+/// serialization to the format expected by Halo2Verifier.sol.
+pub trait ToEvmProof {
+    /// Converts the proof to EVM-compatible format.
+    ///
+    /// The returned bytes must be at least 320 bytes and structured as:
+    /// - Bytes 0-191: 3 advice commitment points (3 × 64 bytes)
+    /// - Bytes 192-319: 2 opening proof points (2 × 64 bytes)
+    ///
+    /// Each point is encoded as (x: u256, y: u256) in big-endian format.
+    fn to_evm_proof(&self) -> EvmProof;
+
+    /// Returns the raw bytes for contract submission.
+    fn to_evm_proof_bytes(&self) -> Vec<u8> {
+        self.to_evm_proof().into_bytes()
+    }
+
+    /// Returns the proof as a hex string with 0x prefix.
+    fn to_evm_proof_hex(&self) -> String {
+        self.to_evm_proof().to_hex()
+    }
+}
+
+/// Trait for converting public inputs to EVM-compatible format.
+pub trait ToEvmPublicInputs {
+    /// Converts the public inputs to EVM-compatible format.
+    ///
+    /// Returns an array of 7 Fr elements that can be submitted to
+    /// `verifyProof(bytes proof, uint256[] publicInputs)`.
+    fn to_evm_public_inputs(&self) -> EvmPublicInputsArray;
+
+    /// Returns the public inputs as raw bytes.
+    ///
+    /// Each element is encoded as a 32-byte big-endian uint256.
+    fn to_evm_public_inputs_bytes(&self) -> Vec<u8> {
+        self.to_evm_public_inputs().to_evm_bytes()
+    }
+
+    /// Returns the public inputs as a Solidity literal expression.
+    fn to_evm_public_inputs_literal(&self) -> String {
+        self.to_evm_public_inputs().to_solidity_literal()
+    }
+}
+
+impl ToEvmPublicInputs for MLTrainingStepV2Witness {
+    fn to_evm_public_inputs(&self) -> EvmPublicInputsArray {
+        MLTrainingStepV2Witness::to_evm_public_inputs(self)
+    }
+}
+
+impl ToEvmPublicInputs for MLTrainingStepV2Circuit {
+    fn to_evm_public_inputs(&self) -> EvmPublicInputsArray {
+        self.witness.to_evm_public_inputs()
     }
 }
 

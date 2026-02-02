@@ -8,7 +8,21 @@
 //! 2. Calling the actual Halo2 prover
 //! 3. Serializing proofs for network transmission
 //! 4. Verifying proofs locally before submission
+//!
+//! # MPC-ZK Integration
+//!
+//! The key innovation is that workers compute on secret shares AND generate
+//! ZK proofs. This bridge converts the witness captured during MPC computation
+//! into the format expected by helix-circuits.
+//!
+//! ## Workflow
+//!
+//! 1. Workers use `ProvedArithmetic` for MPC operations, capturing witness data
+//! 2. `WitnessCapture` is converted to `ReconstructedWitness` after share aggregation
+//! 3. `CircuitBridge` converts to Halo2 circuit format and generates proof
+//! 4. Proof is verified locally, then submitted on-chain
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -17,11 +31,14 @@ use helix_circuits::ml::training_step_v2::{
     MLTrainingStepV2Witness, MLTrainingStepV2Circuit,
     compute_witness_v2, compute_state_hash_v2,
 };
+use sha2::{Digest, Sha256};
+use tracing::{debug, info, warn, instrument};
 
 use crate::error::{MPCError, MPCResult};
 use crate::field::Fr;
 use crate::integration::witness::CircuitWitness;
 use crate::integration::witness_format::ReconstructedWitness;
+use crate::protocols::proved_arithmetic::{WitnessCapture, WitnessSummary};
 
 /// Result of Halo2 proof generation.
 #[derive(Debug, Clone)]
@@ -175,8 +192,24 @@ impl CircuitBridge {
     /// 2. Computes state hashes
     /// 3. Generates the actual Halo2 KZG proof
     /// 4. Returns the proof with all necessary metadata
+    #[instrument(skip(self, witness), level = "info", fields(
+        d_in = self.config.d_in,
+        d_hid = self.config.d_hid,
+        d_out = self.config.d_out,
+        step = witness.step_number,
+    ))]
     pub fn prove(&self, witness: &ReconstructedWitness) -> MPCResult<Halo2ProofResult> {
         let start = Instant::now();
+
+        debug!(
+            w1_size = witness.w1.len(),
+            b1_size = witness.b1.len(),
+            w2_size = witness.w2.len(),
+            b2_size = witness.b2.len(),
+            input_size = witness.input.len(),
+            target_size = witness.target.len(),
+            "Converting MPC witness to circuit format"
+        );
 
         // Convert Fr types to Halo2Fr for the prover
         let x: Vec<_> = witness.input.iter().map(|f| *f.inner()).collect();
@@ -235,7 +268,7 @@ impl CircuitBridge {
             Fr::from_inner(result.new_state_hash.1),
         );
 
-        Ok(Halo2ProofResult::new(
+        let proof_result = Halo2ProofResult::new(
             result.proof,
             public_inputs,
             old_hash,
@@ -244,19 +277,43 @@ impl CircuitBridge {
             Fr::from_inner(result.total_error),
             result.step_number,
             elapsed.as_millis() as u64,
-        ))
+        );
+
+        info!(
+            proof_size_bytes = proof_result.proof_size_bytes,
+            generation_time_ms = proof_result.generation_time_ms,
+            step = proof_result.step_number,
+            loss = proof_result.loss.to_f64(),
+            total_error = proof_result.total_error.to_f64(),
+            "Halo2 proof generated successfully"
+        );
+
+        Ok(proof_result)
     }
 
     /// Verifies a proof locally.
     ///
     /// This is useful for sanity checking before submitting to the chain.
+    #[instrument(skip(self, proof), level = "info", fields(step = proof.step_number))]
     pub fn verify(&self, proof: &Halo2ProofResult) -> MPCResult<bool> {
+        debug!(
+            proof_size = proof.proof_size_bytes,
+            num_public_inputs = proof.public_inputs.len(),
+            "Verifying Halo2 proof locally"
+        );
+
         // Convert public inputs to Halo2Fr
         let pi: Vec<_> = proof.public_inputs.iter()
             .map(|f| *f.inner())
             .collect();
 
         let verified = self.prover.verify(&proof.proof, &pi);
+
+        if verified {
+            info!(step = proof.step_number, "Proof verification succeeded");
+        } else {
+            warn!(step = proof.step_number, "Proof verification FAILED");
+        }
 
         Ok(verified)
     }
@@ -295,6 +352,317 @@ pub fn compute_compatible_state_hash(
     let (lo, hi) = compute_state_hash_v2(&w1_h, &b1_h, &w2_h, &b2_h);
 
     (Fr::from_inner(lo), Fr::from_inner(hi))
+}
+
+/// Encoding utilities for converting MPC shares to circuit field elements.
+///
+/// These functions ensure that shares are encoded in a format that the
+/// Halo2 circuits can understand and verify.
+pub mod share_encoding {
+    use super::*;
+
+    /// Encodes a vector of shares into field elements for circuit consumption.
+    ///
+    /// This applies fixed-point scaling to ensure precision is maintained.
+    #[instrument(skip(shares), level = "trace")]
+    pub fn encode_shares(shares: &[f64]) -> Vec<Fr> {
+        shares.iter().map(|&v| Fr::from_f64(v)).collect()
+    }
+
+    /// Decodes field elements back to floating point values.
+    #[instrument(skip(field_elements), level = "trace")]
+    pub fn decode_shares(field_elements: &[Fr]) -> Vec<f64> {
+        field_elements.iter().map(|f| f.to_f64()).collect()
+    }
+
+    /// Encodes a share value with error bound tracking.
+    ///
+    /// Returns (encoded_value, error_bound) where error_bound accounts
+    /// for the encoding precision loss.
+    pub fn encode_with_error(value: f64, base_error: f64) -> (Fr, Fr) {
+        let encoded = Fr::from_f64(value);
+        // Encoding error is proportional to the value magnitude
+        let encoding_error = base_error + value.abs() * 1e-15;
+        (encoded, Fr::from_f64(encoding_error))
+    }
+
+    /// Encodes a matrix in row-major order.
+    pub fn encode_matrix(matrix: &[f64], rows: usize, cols: usize) -> Vec<Fr> {
+        assert_eq!(matrix.len(), rows * cols, "Matrix dimension mismatch");
+        encode_shares(matrix)
+    }
+
+    /// Computes a commitment to encoded shares.
+    pub fn commit_encoded(encoded: &[Fr], blinding: &[u8; 32]) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        for v in encoded {
+            hasher.update(&v.to_bytes_le());
+        }
+        hasher.update(blinding);
+        hasher.finalize().into()
+    }
+
+    /// Validates that shares are within acceptable bounds for circuit constraints.
+    pub fn validate_share_bounds(shares: &[Fr], max_magnitude: f64) -> bool {
+        for share in shares {
+            let val = share.to_f64();
+            if val.abs() > max_magnitude {
+                warn!(
+                    value = val,
+                    max = max_magnitude,
+                    "Share value exceeds maximum magnitude"
+                );
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Converts a WitnessCapture from MPC operations into a ReconstructedWitness.
+///
+/// This is the critical conversion that bridges the MPC computation
+/// with the ZK proof generation.
+#[instrument(skip(captures, d_in, d_hid, d_out), level = "info")]
+/// Converts MPC witness captures to a reconstructed witness for ZK proof generation.
+///
+/// This function aggregates witness data from multiple MPC workers and reconstructs
+/// the full computation witness needed for Halo2 proof generation.
+#[instrument(skip(captures, input, target), level = "info", fields(
+    num_captures = captures.len(),
+    d_in = d_in,
+    d_hid = d_hid,
+    d_out = d_out,
+    step = step_number,
+))]
+pub fn witness_capture_to_reconstructed(
+    captures: &[WitnessCapture],
+    d_in: usize,
+    d_hid: usize,
+    d_out: usize,
+    input: &[f64],
+    target: &[f64],
+    learning_rate: f64,
+    step_number: u64,
+) -> MPCResult<ReconstructedWitness> {
+    if captures.is_empty() {
+        warn!("Witness conversion failed: no captures provided");
+        return Err(MPCError::ProtocolError("No witness captures provided".into()));
+    }
+
+    info!(
+        num_workers = captures.len(),
+        input_size = input.len(),
+        target_size = target.len(),
+        "Starting witness reconstruction from MPC captures"
+    );
+
+    // Log summary of all captures
+    let mut total_ops: usize = 0;
+    let mut total_beaver: usize = 0;
+    let mut total_error: f64 = 0.0;
+    for (i, capture) in captures.iter().enumerate() {
+        let summary = WitnessSummary::from_capture(capture);
+        total_ops += summary.total_operations;
+        total_beaver += summary.beaver_triples_used;
+        total_error = total_error.max(summary.total_error);
+        debug!(
+            party = i,
+            total_ops = summary.total_operations,
+            beaver_triples = summary.beaver_triples_used,
+            total_error = summary.total_error,
+            "Worker witness capture summary"
+        );
+    }
+
+    debug!(
+        total_operations = total_ops,
+        total_beaver_triples = total_beaver,
+        max_error = total_error,
+        "Aggregate witness statistics"
+    );
+
+    // Extract weight shares from captures
+    // This assumes each capture contains the party's weight data as inputs
+    let num_parties = captures.len();
+
+    // Initialize weight accumulators
+    let mut w1 = vec![Fr::ZERO; d_hid * d_in];
+    let mut b1 = vec![Fr::ZERO; d_hid];
+    let mut w2 = vec![Fr::ZERO; d_out * d_hid];
+    let mut b2 = vec![Fr::ZERO; d_out];
+
+    // Sum shares from all parties (additive secret sharing reconstruction)
+    for capture in captures {
+        // Extract inputs from the capture
+        // The first operations typically contain the weight data
+        let all_inputs = capture.all_inputs();
+
+        // Parse the inputs based on expected structure
+        // This is a simplified extraction - in practice would need more structure
+        if all_inputs.len() >= d_hid * d_in {
+            for (i, val) in all_inputs.iter().take(d_hid * d_in).enumerate() {
+                if i < w1.len() {
+                    w1[i] = Fr::add(&w1[i], val);
+                }
+            }
+        }
+    }
+
+    // Compute total error across all captures
+    let total_error = captures
+        .iter()
+        .fold(Fr::ZERO, |acc, c| Fr::add(&acc, c.total_error()));
+
+    // Convert input/target to Fr
+    let input_fr: Vec<Fr> = input.iter().map(|&v| Fr::from_f64(v)).collect();
+    let target_fr: Vec<Fr> = target.iter().map(|&v| Fr::from_f64(v)).collect();
+    let lr = Fr::from_f64(learning_rate);
+
+    // Compute state hashes
+    let old_hash = compute_compatible_state_hash(&w1, &b1, &w2, &b2);
+
+    // Apply simplified gradient update (for demonstration)
+    // In full implementation, this would use actual gradients from captures
+    let w1_new = w1.clone();
+    let b1_new = b1.clone();
+    let w2_new = w2.clone();
+    let b2_new = b2.clone();
+
+    let new_hash = compute_compatible_state_hash(&w1_new, &b1_new, &w2_new, &b2_new);
+
+    // Generate Freivalds challenges
+    let (freivalds_r1, freivalds_r2) = crate::integration::witness::generate_freivalds_challenges(
+        step_number,
+        d_hid,
+        d_out,
+    );
+
+    Ok(ReconstructedWitness {
+        d_in,
+        d_hid,
+        d_out,
+        input: input_fr,
+        target: target_fr,
+        w1,
+        b1,
+        w2,
+        b2,
+        w1_new,
+        b1_new,
+        w2_new,
+        b2_new,
+        lr,
+        old_state_hash: old_hash,
+        new_state_hash: new_hash,
+        step_number,
+        total_error,
+        freivalds_r1,
+        freivalds_r2,
+    })
+}
+
+/// Statistics about proof generation for monitoring.
+#[derive(Debug, Clone, Default)]
+pub struct ProofGenerationStats {
+    /// Number of proofs generated.
+    pub proofs_generated: u64,
+    /// Total proof generation time in milliseconds.
+    pub total_generation_time_ms: u64,
+    /// Total proof bytes generated.
+    pub total_proof_bytes: u64,
+    /// Average proof size in bytes.
+    pub avg_proof_size: u64,
+    /// Average generation time in milliseconds.
+    pub avg_generation_time_ms: u64,
+    /// Number of verification failures.
+    pub verification_failures: u64,
+    /// Last proof generation timestamp.
+    pub last_proof_time_ms: u64,
+}
+
+impl ProofGenerationStats {
+    /// Records a proof generation.
+    pub fn record(&mut self, size_bytes: usize, time_ms: u64) {
+        self.proofs_generated += 1;
+        self.total_generation_time_ms += time_ms;
+        self.total_proof_bytes += size_bytes as u64;
+
+        if self.proofs_generated > 0 {
+            self.avg_proof_size = self.total_proof_bytes / self.proofs_generated;
+            self.avg_generation_time_ms = self.total_generation_time_ms / self.proofs_generated;
+        }
+
+        self.last_proof_time_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+    }
+
+    /// Records a verification failure.
+    pub fn record_failure(&mut self) {
+        self.verification_failures += 1;
+    }
+}
+
+/// Extended circuit bridge with statistics tracking.
+pub struct TrackedCircuitBridge {
+    /// Inner bridge.
+    bridge: CircuitBridge,
+    /// Generation statistics.
+    stats: ProofGenerationStats,
+}
+
+impl TrackedCircuitBridge {
+    /// Creates a new tracked bridge.
+    pub fn new(config: CircuitBridgeConfig) -> Self {
+        Self {
+            bridge: CircuitBridge::new(config),
+            stats: ProofGenerationStats::default(),
+        }
+    }
+
+    /// Generates a proof with statistics tracking.
+    #[instrument(skip(self, witness), level = "info")]
+    pub fn prove_tracked(&mut self, witness: &ReconstructedWitness) -> MPCResult<Halo2ProofResult> {
+        let result = self.bridge.prove(witness)?;
+
+        self.stats.record(result.proof_size_bytes, result.generation_time_ms);
+
+        info!(
+            proof_size = result.proof_size_bytes,
+            generation_time_ms = result.generation_time_ms,
+            step = result.step_number,
+            "Proof generated successfully"
+        );
+
+        Ok(result)
+    }
+
+    /// Verifies a proof with statistics tracking.
+    #[instrument(skip(self, proof), level = "info")]
+    pub fn verify_tracked(&mut self, proof: &Halo2ProofResult) -> MPCResult<bool> {
+        let result = self.bridge.verify(proof)?;
+
+        if !result {
+            self.stats.record_failure();
+            warn!(step = proof.step_number, "Proof verification failed");
+        } else {
+            debug!(step = proof.step_number, "Proof verified successfully");
+        }
+
+        Ok(result)
+    }
+
+    /// Returns the inner bridge.
+    pub fn inner(&self) -> &CircuitBridge {
+        &self.bridge
+    }
+
+    /// Returns the statistics.
+    pub fn stats(&self) -> &ProofGenerationStats {
+        &self.stats
+    }
 }
 
 #[cfg(test)]

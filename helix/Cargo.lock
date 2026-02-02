@@ -2693,8 +2693,11 @@ dependencies = [
  "halo2_proofs",
  "halo2curves",
  "helix-core",
+ "hex",
  "rand 0.8.5",
  "sha2",
+ "sha3",
+ "subtle",
 ]
 
 [[package]]

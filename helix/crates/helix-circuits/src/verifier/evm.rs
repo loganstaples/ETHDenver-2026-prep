@@ -1,9 +1,24 @@
-//! EVM Verifier Generator.
+//! EVM Verifier Generator and Proof Serialization.
 //!
-//! Generates Solidity code for verifying Halo2 proofs on-chain using
-//! BN254 pairing precompiles.
+//! This module provides:
+//! - Solidity code generation for Halo2 proof verification
+//! - Proof serialization to EVM-compatible byte format
+//! - Public input encoding for on-chain verification
+//!
+//! The serialization format matches exactly what Halo2Verifier.sol expects,
+//! enabling seamless Rust proof → Solidity verification.
 
 use std::fmt::Write;
+use halo2curves::bn256::{Fr, G1Affine, Fq};
+use halo2curves::ff::PrimeField;
+use halo2curves::group::Curve;
+use halo2curves::group::prime::PrimeCurveAffine;
+
+use super::format_spec::{
+    MIN_PROOF_SIZE, NUM_ADVICE_COMMITS, G1_POINT_SIZE, SCALAR_SIZE, NUM_PUBLIC_INPUTS,
+    fr_to_evm_bytes, g1_to_evm_bytes, fq_to_evm_bytes, evm_bytes_to_g1, evm_bytes_to_fr,
+    validate_proof_format, ProofFormatError, ProofStructure, EvmPublicInputs,
+};
 
 /// Embedded verification key data for the Solidity contract.
 #[derive(Debug, Clone)]
@@ -494,5 +509,526 @@ mod tests {
         assert!(code.contains("valid = _isOnCurve(lhs_x, lhs_y)"));
         // Should NOT have VK constants
         assert!(!code.contains("VK_G1_X"));
+    }
+}
+
+// ============================================================================
+// EVM Proof Serialization
+// ============================================================================
+
+/// A proof serialized in EVM-compatible format for Halo2Verifier.sol
+#[derive(Debug, Clone)]
+pub struct EvmProof {
+    /// Raw proof bytes in contract-compatible format
+    bytes: Vec<u8>,
+}
+
+impl EvmProof {
+    /// Creates a new EVM proof from raw bytes.
+    ///
+    /// # Errors
+    /// Returns an error if the proof is too short or contains invalid points.
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, ProofFormatError> {
+        validate_proof_format(&bytes)?;
+        Ok(Self { bytes })
+    }
+
+    /// Creates a new EVM proof from commitment points.
+    ///
+    /// # Arguments
+    /// * `advice_commits` - Three advice commitment points (C0, C1, C2)
+    /// * `w` - Opening proof point W
+    /// * `w_prime` - Opening proof point W'
+    pub fn from_points(
+        advice_commits: [G1Affine; NUM_ADVICE_COMMITS],
+        w: G1Affine,
+        w_prime: G1Affine,
+    ) -> Self {
+        let mut bytes = Vec::with_capacity(MIN_PROOF_SIZE);
+
+        // Serialize advice commitments (3 × 64 bytes = 192 bytes)
+        for commit in &advice_commits {
+            bytes.extend_from_slice(&g1_to_evm_bytes(commit));
+        }
+
+        // Serialize opening proofs (2 × 64 bytes = 128 bytes)
+        bytes.extend_from_slice(&g1_to_evm_bytes(&w));
+        bytes.extend_from_slice(&g1_to_evm_bytes(&w_prime));
+
+        Self { bytes }
+    }
+
+    /// Returns the raw proof bytes for contract submission.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Consumes self and returns the raw proof bytes.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    /// Returns the proof length in bytes.
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Returns whether the proof is empty.
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    /// Validates that the proof meets minimum length requirements.
+    pub fn validate_length(&self) -> Result<(), ProofFormatError> {
+        if self.bytes.len() < MIN_PROOF_SIZE {
+            return Err(ProofFormatError::TooShort {
+                got: self.bytes.len(),
+                min: MIN_PROOF_SIZE,
+            });
+        }
+        Ok(())
+    }
+
+    /// Extracts the advice commitment points from the proof.
+    pub fn advice_commits(&self) -> Result<[G1Affine; NUM_ADVICE_COMMITS], ProofFormatError> {
+        self.validate_length()?;
+
+        let mut commits = [G1Affine::identity(); NUM_ADVICE_COMMITS];
+        for i in 0..NUM_ADVICE_COMMITS {
+            let offset = i * G1_POINT_SIZE;
+            let point_bytes: [u8; G1_POINT_SIZE] = self.bytes[offset..offset + G1_POINT_SIZE]
+                .try_into()
+                .expect("slice length correct");
+            commits[i] = evm_bytes_to_g1(&point_bytes).ok_or(ProofFormatError::PointNotOnCurve {
+                point_index: i,
+                x: point_bytes[..32].try_into().unwrap(),
+                y: point_bytes[32..].try_into().unwrap(),
+            })?;
+        }
+        Ok(commits)
+    }
+
+    /// Extracts the W opening proof point.
+    pub fn w(&self) -> Result<G1Affine, ProofFormatError> {
+        self.validate_length()?;
+
+        let offset = NUM_ADVICE_COMMITS * G1_POINT_SIZE;
+        let point_bytes: [u8; G1_POINT_SIZE] = self.bytes[offset..offset + G1_POINT_SIZE]
+            .try_into()
+            .expect("slice length correct");
+        evm_bytes_to_g1(&point_bytes).ok_or(ProofFormatError::PointNotOnCurve {
+            point_index: 3,
+            x: point_bytes[..32].try_into().unwrap(),
+            y: point_bytes[32..].try_into().unwrap(),
+        })
+    }
+
+    /// Extracts the W' opening proof point.
+    pub fn w_prime(&self) -> Result<G1Affine, ProofFormatError> {
+        self.validate_length()?;
+
+        let offset = (NUM_ADVICE_COMMITS + 1) * G1_POINT_SIZE;
+        let point_bytes: [u8; G1_POINT_SIZE] = self.bytes[offset..offset + G1_POINT_SIZE]
+            .try_into()
+            .expect("slice length correct");
+        evm_bytes_to_g1(&point_bytes).ok_or(ProofFormatError::PointNotOnCurve {
+            point_index: 4,
+            x: point_bytes[..32].try_into().unwrap(),
+            y: point_bytes[32..].try_into().unwrap(),
+        })
+    }
+
+    /// Returns a structural breakdown of the proof.
+    pub fn structure(&self) -> ProofStructure {
+        ProofStructure::parse(&self.bytes).unwrap_or_else(|_| ProofStructure {
+            total_size: self.bytes.len(),
+            advice_section: super::format_spec::ProofSection {
+                offset: 0,
+                length: 0,
+                description: "Invalid".to_string(),
+            },
+            opening_section: super::format_spec::ProofSection {
+                offset: 0,
+                length: 0,
+                description: "Invalid".to_string(),
+            },
+            extra_data: None,
+        })
+    }
+
+    /// Returns a debug dump of the proof structure.
+    pub fn dump(&self) -> String {
+        self.structure().dump()
+    }
+
+    /// Encodes proof as hex string (with 0x prefix) for Solidity.
+    pub fn to_hex(&self) -> String {
+        format!("0x{}", hex::encode(&self.bytes))
+    }
+}
+
+impl AsRef<[u8]> for EvmProof {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// Builder for creating EVM-compatible proofs from Halo2 proof data.
+#[derive(Debug, Default)]
+pub struct EvmProofBuilder {
+    advice_commits: Vec<G1Affine>,
+    w: Option<G1Affine>,
+    w_prime: Option<G1Affine>,
+    extra_data: Vec<u8>,
+}
+
+impl EvmProofBuilder {
+    /// Creates a new proof builder.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds an advice commitment point.
+    pub fn add_advice_commit(mut self, commit: G1Affine) -> Self {
+        self.advice_commits.push(commit);
+        self
+    }
+
+    /// Sets the W opening proof point.
+    pub fn with_w(mut self, w: G1Affine) -> Self {
+        self.w = Some(w);
+        self
+    }
+
+    /// Sets the W' opening proof point.
+    pub fn with_w_prime(mut self, w_prime: G1Affine) -> Self {
+        self.w_prime = Some(w_prime);
+        self
+    }
+
+    /// Adds extra data to the proof (appended after standard fields).
+    pub fn with_extra_data(mut self, data: Vec<u8>) -> Self {
+        self.extra_data = data;
+        self
+    }
+
+    /// Builds the EVM proof.
+    ///
+    /// # Panics
+    /// Panics if the required fields are not set.
+    pub fn build(self) -> EvmProof {
+        assert_eq!(
+            self.advice_commits.len(),
+            NUM_ADVICE_COMMITS,
+            "Expected {} advice commits, got {}",
+            NUM_ADVICE_COMMITS,
+            self.advice_commits.len()
+        );
+
+        let w = self.w.expect("W point not set");
+        let w_prime = self.w_prime.expect("W' point not set");
+
+        let mut bytes = Vec::with_capacity(MIN_PROOF_SIZE + self.extra_data.len());
+
+        // Serialize advice commitments
+        for commit in &self.advice_commits {
+            bytes.extend_from_slice(&g1_to_evm_bytes(commit));
+        }
+
+        // Serialize opening proofs
+        bytes.extend_from_slice(&g1_to_evm_bytes(&w));
+        bytes.extend_from_slice(&g1_to_evm_bytes(&w_prime));
+
+        // Append extra data
+        bytes.extend_from_slice(&self.extra_data);
+
+        EvmProof { bytes }
+    }
+}
+
+/// Public inputs serialized for EVM contract submission.
+#[derive(Debug, Clone)]
+pub struct EvmPublicInputsArray {
+    /// The 7 public input values as Fr elements
+    values: [Fr; NUM_PUBLIC_INPUTS],
+}
+
+impl EvmPublicInputsArray {
+    /// Creates new public inputs from an array of Fr values.
+    pub fn new(values: [Fr; NUM_PUBLIC_INPUTS]) -> Self {
+        Self { values }
+    }
+
+    /// Creates public inputs from the training step circuit format.
+    ///
+    /// # Arguments
+    /// * `old_hash_lo` - Lower 128 bits of old state hash
+    /// * `old_hash_hi` - Upper 128 bits of old state hash
+    /// * `new_hash_lo` - Lower 128 bits of new state hash
+    /// * `new_hash_hi` - Upper 128 bits of new state hash
+    /// * `loss` - Computed loss value
+    /// * `error_bound` - Accumulated error bound
+    /// * `step_number` - Training step number
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_training_step(
+        old_hash_lo: Fr,
+        old_hash_hi: Fr,
+        new_hash_lo: Fr,
+        new_hash_hi: Fr,
+        loss: Fr,
+        error_bound: Fr,
+        step_number: u64,
+    ) -> Self {
+        Self {
+            values: [
+                old_hash_lo,
+                old_hash_hi,
+                new_hash_lo,
+                new_hash_hi,
+                loss,
+                error_bound,
+                Fr::from(step_number),
+            ],
+        }
+    }
+
+    /// Creates public inputs from a Vec<Fr>.
+    pub fn from_vec(values: Vec<Fr>) -> Result<Self, ProofFormatError> {
+        if values.len() != NUM_PUBLIC_INPUTS {
+            return Err(ProofFormatError::InvalidPublicInputCount {
+                got: values.len(),
+                expected: NUM_PUBLIC_INPUTS,
+            });
+        }
+        let arr: [Fr; NUM_PUBLIC_INPUTS] = values.try_into().expect("length checked");
+        Ok(Self { values: arr })
+    }
+
+    /// Returns the underlying values.
+    pub fn values(&self) -> &[Fr; NUM_PUBLIC_INPUTS] {
+        &self.values
+    }
+
+    /// Returns the old state hash as (lo, hi).
+    pub fn old_state_hash(&self) -> (Fr, Fr) {
+        (self.values[0], self.values[1])
+    }
+
+    /// Returns the new state hash as (lo, hi).
+    pub fn new_state_hash(&self) -> (Fr, Fr) {
+        (self.values[2], self.values[3])
+    }
+
+    /// Returns the loss value.
+    pub fn loss(&self) -> Fr {
+        self.values[4]
+    }
+
+    /// Returns the error bound.
+    pub fn error_bound(&self) -> Fr {
+        self.values[5]
+    }
+
+    /// Returns the step number.
+    pub fn step_number(&self) -> Fr {
+        self.values[6]
+    }
+
+    /// Encodes to EVM-compatible format (array of 32-byte big-endian values).
+    pub fn to_evm_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(NUM_PUBLIC_INPUTS * SCALAR_SIZE);
+        for val in &self.values {
+            bytes.extend_from_slice(&fr_to_evm_bytes(val));
+        }
+        bytes
+    }
+
+    /// Encodes as a Solidity uint256[] representation.
+    ///
+    /// Returns a vector of 32-byte arrays, each representing a uint256.
+    pub fn to_uint256_array(&self) -> Vec<[u8; 32]> {
+        self.values.iter().map(fr_to_evm_bytes).collect()
+    }
+
+    /// Encodes as hex strings for Solidity (with 0x prefix).
+    pub fn to_hex_array(&self) -> Vec<String> {
+        self.values
+            .iter()
+            .map(|v| format!("0x{}", hex::encode(fr_to_evm_bytes(v))))
+            .collect()
+    }
+
+    /// Encodes as a Solidity literal array expression.
+    ///
+    /// Example output: `[0x123..., 0x456..., ...]`
+    pub fn to_solidity_literal(&self) -> String {
+        let hex_strs: Vec<String> = self.to_hex_array();
+        format!("[{}]", hex_strs.join(", "))
+    }
+}
+
+impl From<[Fr; NUM_PUBLIC_INPUTS]> for EvmPublicInputsArray {
+    fn from(values: [Fr; NUM_PUBLIC_INPUTS]) -> Self {
+        Self::new(values)
+    }
+}
+
+impl AsRef<[Fr]> for EvmPublicInputsArray {
+    fn as_ref(&self) -> &[Fr] {
+        &self.values
+    }
+}
+
+/// Creates test proof data for EVM format testing.
+///
+/// This generates valid G1 points that are on the BN254 curve.
+/// The points are deterministically generated from a seed for reproducibility.
+pub fn create_test_proof(seed: u64) -> EvmProof {
+    // Generate deterministic test points using scalar multiplication of generator
+    let g1 = G1Affine::generator();
+
+    let mut advice_commits = [G1Affine::identity(); NUM_ADVICE_COMMITS];
+    for (i, commit) in advice_commits.iter_mut().enumerate() {
+        let scalar = Fr::from(seed + (i as u64 * 1000));
+        *commit = (g1 * scalar).to_affine();
+    }
+
+    let w = (g1 * Fr::from(seed + 3000)).to_affine();
+    let w_prime = (g1 * Fr::from(seed + 4000)).to_affine();
+
+    EvmProof::from_points(advice_commits, w, w_prime)
+}
+
+/// Creates test public inputs for EVM format testing.
+pub fn create_test_public_inputs(step: u64) -> EvmPublicInputsArray {
+    EvmPublicInputsArray::from_training_step(
+        Fr::from(step * 1000),      // old_hash_lo
+        Fr::from(step * 1001),      // old_hash_hi
+        Fr::from(step * 2000),      // new_hash_lo
+        Fr::from(step * 2001),      // new_hash_hi
+        Fr::from(step * 100),       // loss
+        Fr::from(step * 10),        // error_bound
+        step,                        // step_number
+    )
+}
+
+#[cfg(test)]
+mod evm_proof_tests {
+    use super::*;
+
+    #[test]
+    fn test_evm_proof_from_points() {
+        let proof = create_test_proof(12345);
+
+        assert_eq!(proof.len(), MIN_PROOF_SIZE);
+        assert!(proof.validate_length().is_ok());
+    }
+
+    #[test]
+    fn test_evm_proof_roundtrip() {
+        let original = create_test_proof(67890);
+
+        // Extract points
+        let advice = original.advice_commits().unwrap();
+        let w = original.w().unwrap();
+        let w_prime = original.w_prime().unwrap();
+
+        // Recreate proof
+        let recreated = EvmProof::from_points(advice, w, w_prime);
+
+        assert_eq!(original.as_bytes(), recreated.as_bytes());
+    }
+
+    #[test]
+    fn test_evm_proof_builder() {
+        let g1 = G1Affine::generator();
+
+        let proof = EvmProofBuilder::new()
+            .add_advice_commit((g1 * Fr::from(1u64)).to_affine())
+            .add_advice_commit((g1 * Fr::from(2u64)).to_affine())
+            .add_advice_commit((g1 * Fr::from(3u64)).to_affine())
+            .with_w((g1 * Fr::from(4u64)).to_affine())
+            .with_w_prime((g1 * Fr::from(5u64)).to_affine())
+            .build();
+
+        assert_eq!(proof.len(), MIN_PROOF_SIZE);
+    }
+
+    #[test]
+    fn test_public_inputs_encoding() {
+        let inputs = create_test_public_inputs(42);
+
+        let bytes = inputs.to_evm_bytes();
+        assert_eq!(bytes.len(), NUM_PUBLIC_INPUTS * SCALAR_SIZE);
+
+        let uint256_arr = inputs.to_uint256_array();
+        assert_eq!(uint256_arr.len(), NUM_PUBLIC_INPUTS);
+    }
+
+    #[test]
+    fn test_public_inputs_solidity_literal() {
+        let inputs = EvmPublicInputsArray::from_training_step(
+            Fr::from(1u64),
+            Fr::from(2u64),
+            Fr::from(3u64),
+            Fr::from(4u64),
+            Fr::from(100u64),
+            Fr::from(10u64),
+            1,
+        );
+
+        let literal = inputs.to_solidity_literal();
+        assert!(literal.starts_with('['));
+        assert!(literal.ends_with(']'));
+        assert!(literal.contains("0x"));
+    }
+
+    #[test]
+    fn test_proof_hex_encoding() {
+        let proof = create_test_proof(11111);
+        let hex = proof.to_hex();
+
+        assert!(hex.starts_with("0x"));
+        assert_eq!(hex.len(), 2 + MIN_PROOF_SIZE * 2); // 0x + 2 chars per byte
+    }
+
+    #[test]
+    fn test_proof_structure_dump() {
+        let proof = create_test_proof(22222);
+        let dump = proof.dump();
+
+        assert!(dump.contains("Advice Commitments"));
+        assert!(dump.contains("Opening Proofs"));
+        assert!(dump.contains("320"));
+    }
+
+    #[test]
+    fn test_invalid_proof_length() {
+        let short_bytes = vec![0u8; 100];
+        let result = EvmProof::from_bytes(short_bytes);
+
+        assert!(matches!(
+            result,
+            Err(ProofFormatError::TooShort { got: 100, min: 320 })
+        ));
+    }
+
+    #[test]
+    fn test_public_inputs_from_vec() {
+        let values: Vec<Fr> = (0..7).map(|i| Fr::from(i as u64)).collect();
+        let inputs = EvmPublicInputsArray::from_vec(values).unwrap();
+
+        assert_eq!(inputs.step_number(), Fr::from(6u64));
+    }
+
+    #[test]
+    fn test_public_inputs_wrong_length() {
+        let short: Vec<Fr> = (0..5).map(|i| Fr::from(i as u64)).collect();
+        let result = EvmPublicInputsArray::from_vec(short);
+
+        assert!(matches!(
+            result,
+            Err(ProofFormatError::InvalidPublicInputCount { got: 5, expected: 7 })
+        ));
     }
 }
