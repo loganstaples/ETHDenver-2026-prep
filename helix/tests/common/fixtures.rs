@@ -285,9 +285,8 @@ impl ProverTestConfig {
             k: self.k,
             relu_range: self.relu_range,
             exp_range: self.exp_range,
-            exp_scale: 1000,
             use_freivalds: self.use_freivalds,
-            base_error: Fr::from(1u64),
+            ..V2ProverConfig::default()
         }
     }
 }
@@ -400,6 +399,303 @@ impl TestScenario {
     }
 }
 
+// ============================================================================
+// Extended Fixtures for Reusable Test Models
+// ============================================================================
+
+/// Pre-configured test model for XOR problem.
+pub struct XORTestModel {
+    pub dims: ModelDimensions,
+    pub weights: TestModelWeights,
+    pub dataset: TestDataset,
+}
+
+impl XORTestModel {
+    /// Creates an XOR test model with known-good configuration.
+    pub fn new() -> Self {
+        let dims = ModelDimensions::tiny();
+        let weights = TestModelWeights::known(dims);
+        let dataset = TestDataset::new(dims.d_in, dims.d_out, 4, 42);
+        Self { dims, weights, dataset }
+    }
+
+    /// Returns training samples as tuples.
+    pub fn samples(&self) -> Vec<(Vec<Fr>, Vec<Fr>)> {
+        self.dataset.to_tuples()
+    }
+}
+
+impl Default for XORTestModel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Pre-configured regression test model.
+pub struct RegressionTestModel {
+    pub dims: ModelDimensions,
+    pub weights: TestModelWeights,
+    pub dataset: TestDataset,
+}
+
+impl RegressionTestModel {
+    /// Creates a regression test model with small architecture.
+    pub fn new(num_samples: usize) -> Self {
+        let dims = ModelDimensions::small();
+        let weights = TestModelWeights::random(dims, 42);
+        let dataset = TestDataset::new(dims.d_in, dims.d_out, num_samples, 42);
+        Self { dims, weights, dataset }
+    }
+
+    /// Creates with specific seed for reproducibility.
+    pub fn with_seed(num_samples: usize, seed: u64) -> Self {
+        let dims = ModelDimensions::small();
+        let weights = TestModelWeights::random(dims, seed);
+        let dataset = TestDataset::new(dims.d_in, dims.d_out, num_samples, seed);
+        Self { dims, weights, dataset }
+    }
+}
+
+/// Pre-configured stress test model.
+pub struct StressTestModel {
+    pub dims: ModelDimensions,
+    pub weights: TestModelWeights,
+    pub dataset: TestDataset,
+}
+
+impl StressTestModel {
+    /// Creates a stress test model with medium architecture.
+    pub fn new(num_samples: usize) -> Self {
+        let dims = ModelDimensions::medium();
+        let weights = TestModelWeights::random(dims, 42);
+        let dataset = TestDataset::new(dims.d_in, dims.d_out, num_samples, 42);
+        Self { dims, weights, dataset }
+    }
+
+    /// Creates a large model for memory stress testing.
+    pub fn large(num_samples: usize) -> Self {
+        let dims = ModelDimensions::large();
+        let weights = TestModelWeights::random(dims, 42);
+        let dataset = TestDataset::new(dims.d_in, dims.d_out, num_samples, 42);
+        Self { dims, weights, dataset }
+    }
+}
+
+/// Builder for constructing custom test scenarios.
+pub struct TestScenarioBuilder {
+    dims: Option<ModelDimensions>,
+    weights_seed: u64,
+    dataset_seed: u64,
+    num_samples: usize,
+    mpc_config: Option<MPCTestConfig>,
+    prover_config: Option<ProverTestConfig>,
+}
+
+impl TestScenarioBuilder {
+    pub fn new() -> Self {
+        Self {
+            dims: None,
+            weights_seed: 42,
+            dataset_seed: 42,
+            num_samples: 10,
+            mpc_config: None,
+            prover_config: None,
+        }
+    }
+
+    pub fn with_dims(mut self, dims: ModelDimensions) -> Self {
+        self.dims = Some(dims);
+        self
+    }
+
+    pub fn tiny(self) -> Self {
+        self.with_dims(ModelDimensions::tiny())
+    }
+
+    pub fn small(self) -> Self {
+        self.with_dims(ModelDimensions::small())
+    }
+
+    pub fn medium(self) -> Self {
+        self.with_dims(ModelDimensions::medium())
+    }
+
+    pub fn large(self) -> Self {
+        self.with_dims(ModelDimensions::large())
+    }
+
+    pub fn with_weights_seed(mut self, seed: u64) -> Self {
+        self.weights_seed = seed;
+        self
+    }
+
+    pub fn with_dataset_seed(mut self, seed: u64) -> Self {
+        self.dataset_seed = seed;
+        self
+    }
+
+    pub fn with_samples(mut self, count: usize) -> Self {
+        self.num_samples = count;
+        self
+    }
+
+    pub fn with_mpc_config(mut self, config: MPCTestConfig) -> Self {
+        self.mpc_config = Some(config);
+        self
+    }
+
+    pub fn with_prover_config(mut self, config: ProverTestConfig) -> Self {
+        self.prover_config = Some(config);
+        self
+    }
+
+    pub fn build(self) -> TestScenario {
+        let dims = self.dims.unwrap_or(ModelDimensions::tiny());
+        TestScenario {
+            name: format!("custom_{}x{}x{}", dims.d_in, dims.d_hid, dims.d_out),
+            model: TestModelWeights::random(dims, self.weights_seed),
+            dataset: TestDataset::new(dims.d_in, dims.d_out, self.num_samples, self.dataset_seed),
+            mpc_config: self.mpc_config.unwrap_or(MPCTestConfig::three_party()),
+            prover_config: self.prover_config.unwrap_or(ProverTestConfig::standard()),
+            expected_result: KnownGoodResult::xor_tiny(),
+            dims,
+        }
+    }
+}
+
+impl Default for TestScenarioBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Collection of pre-built test fixtures for common scenarios.
+pub struct TestFixtures;
+
+impl TestFixtures {
+    /// Returns a tiny model suitable for quick unit tests.
+    pub fn tiny_model() -> (ModelDimensions, TestModelWeights, TestSample) {
+        let dims = ModelDimensions::tiny();
+        let weights = TestModelWeights::known(dims);
+        let sample = TestSample::known(dims.d_in, dims.d_out);
+        (dims, weights, sample)
+    }
+
+    /// Returns a small model suitable for integration tests.
+    pub fn small_model() -> (ModelDimensions, TestModelWeights, TestDataset) {
+        let dims = ModelDimensions::small();
+        let weights = TestModelWeights::random(dims, 42);
+        let dataset = TestDataset::new(dims.d_in, dims.d_out, 10, 42);
+        (dims, weights, dataset)
+    }
+
+    /// Returns a model and samples for chain testing.
+    pub fn chain_test_setup(num_steps: usize) -> (ModelDimensions, TestModelWeights, Vec<(Vec<Fr>, Vec<Fr>)>) {
+        let dims = ModelDimensions::tiny();
+        let weights = TestModelWeights::known(dims);
+        let dataset = TestDataset::new(dims.d_in, dims.d_out, num_steps, 42);
+        (dims, weights, dataset.to_tuples())
+    }
+
+    /// Returns fixtures for adversarial testing.
+    pub fn adversarial_setup() -> (ModelDimensions, TestModelWeights, MPCTestConfig) {
+        let dims = ModelDimensions::tiny();
+        let weights = TestModelWeights::known(dims);
+        let mpc_config = MPCTestConfig::three_party();
+        (dims, weights, mpc_config)
+    }
+
+    /// Returns fixtures for performance testing.
+    pub fn performance_setup() -> (ModelDimensions, TestModelWeights, ProverTestConfig) {
+        let dims = ModelDimensions::small();
+        let weights = TestModelWeights::random(dims, 42);
+        let prover_config = ProverTestConfig::standard();
+        (dims, weights, prover_config)
+    }
+}
+
+/// Validation helpers for test assertions.
+pub struct TestValidation;
+
+impl TestValidation {
+    /// Validates that a proof result has correct structure.
+    pub fn validate_proof_result(
+        proof: &helix_prover::TrainingProofResultV2,
+        expected_step: u64,
+    ) -> Result<(), String> {
+        use helix_circuits::ml::training_step_v2::NUM_PUBLIC_INPUTS;
+
+        if proof.proof.is_empty() {
+            return Err("Proof bytes are empty".to_string());
+        }
+
+        if proof.proof.len() < 64 {
+            return Err(format!(
+                "Proof too short: {} bytes, need at least 64",
+                proof.proof.len()
+            ));
+        }
+
+        if proof.public_inputs.len() != NUM_PUBLIC_INPUTS {
+            return Err(format!(
+                "Wrong public input count: {} != {}",
+                proof.public_inputs.len(),
+                NUM_PUBLIC_INPUTS
+            ));
+        }
+
+        if proof.step_number != expected_step {
+            return Err(format!(
+                "Step number mismatch: {} != {}",
+                proof.step_number, expected_step
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Validates chain continuity between two proofs.
+    pub fn validate_chain_link(
+        current: &helix_prover::TrainingProofResultV2,
+        next: &helix_prover::TrainingProofResultV2,
+    ) -> Result<(), String> {
+        if current.new_state_hash != next.old_state_hash {
+            return Err(format!(
+                "Chain broken: current.new_hash {:?} != next.old_hash {:?}",
+                current.new_state_hash, next.old_state_hash
+            ));
+        }
+
+        if next.step_number != current.step_number + 1 {
+            return Err(format!(
+                "Step number not sequential: {} + 1 != {}",
+                current.step_number, next.step_number
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Validates a complete proof chain.
+    pub fn validate_proof_chain(
+        proofs: &[helix_prover::TrainingProofResultV2],
+    ) -> Result<(), String> {
+        if proofs.is_empty() {
+            return Err("Empty proof chain".to_string());
+        }
+
+        for (i, proof) in proofs.iter().enumerate() {
+            Self::validate_proof_result(proof, (i + 1) as u64)?;
+        }
+
+        for i in 0..proofs.len() - 1 {
+            Self::validate_chain_link(&proofs[i], &proofs[i + 1])?;
+        }
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,5 +737,40 @@ mod tests {
         let config = MPCTestConfig::three_party();
         assert_eq!(config.party_ids.len(), 3);
         assert_eq!(config.threshold, 2);
+    }
+
+    #[test]
+    fn test_xor_test_model() {
+        let model = XORTestModel::new();
+        assert_eq!(model.dims.d_in, 2);
+        assert_eq!(model.dims.d_hid, 2);
+        assert_eq!(model.dims.d_out, 1);
+    }
+
+    #[test]
+    fn test_scenario_builder() {
+        let scenario = TestScenarioBuilder::new()
+            .tiny()
+            .with_samples(5)
+            .with_weights_seed(123)
+            .build();
+
+        assert_eq!(scenario.dims.d_in, 2);
+        assert_eq!(scenario.dataset.samples.len(), 5);
+    }
+
+    #[test]
+    fn test_fixtures_tiny() {
+        let (dims, weights, sample) = TestFixtures::tiny_model();
+        assert_eq!(dims.d_in, 2);
+        assert_eq!(weights.w1.len(), dims.d_hid * dims.d_in);
+        assert_eq!(sample.x.len(), dims.d_in);
+    }
+
+    #[test]
+    fn test_fixtures_chain_setup() {
+        let (dims, weights, samples) = TestFixtures::chain_test_setup(3);
+        assert_eq!(samples.len(), 3);
+        assert_eq!(weights.dims.d_in, dims.d_in);
     }
 }

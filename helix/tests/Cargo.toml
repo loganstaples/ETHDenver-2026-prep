@@ -136,6 +136,14 @@ path = "benches/full_benchmark_runner.rs"
 name = "full_pipeline"
 path = "integration/full_pipeline.rs"
 
+[[test]]
+name = "proof_chain"
+path = "integration/proof_chain.rs"
+
+[[test]]
+name = "ci_validation"
+path = "ci_validation.rs"
+
 [features]
 default = []
 parallel = ["rayon"]

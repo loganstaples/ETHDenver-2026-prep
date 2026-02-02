@@ -378,6 +378,9 @@ impl GKRProver {
         let layer_idx = state.current_layer - 1;
 
         // Get previous layer values
+        // layer_values[0] = inputs
+        // layer_values[i+1] = output of layers[i]
+        // So layer_values[layer_idx] = output of layers[layer_idx-1] (or inputs if layer_idx=0)
         let prev_values = if layer_idx > 0 {
             state.layer_values.get(layer_idx)
                 .cloned()
@@ -401,19 +404,29 @@ impl GKRProver {
             claimed_sum,
         )?;
 
-        // Update state for next layer
-        state.challenge_point = sumcheck_proof.final_point.clone();
-        state.current_claim = sumcheck_proof.final_eval;
-        state.current_layer = layer_idx;
-
         // Handle ZK masking
-        let mask_opening = if self.config.zero_knowledge {
+        // The mask must have the same dimension as the polynomial being proved (prev_poly).
+        // layer_sizes[i] corresponds to layers[i].padded_size()
+        // prev_poly has dimension of layer_values[layer_idx] which is:
+        //   - inputs (layer_idx = 0): not covered by layer_sizes
+        //   - output of layers[layer_idx-1] (layer_idx > 0): has size layer_sizes[layer_idx-1]
+        // So we use mask[layer_idx - 1] when layer_idx > 0
+        let mask_opening = if self.config.zero_knowledge && layer_idx > 0 {
             self.zk_layer.as_ref().and_then(|zk| {
-                zk.get_mask(layer_idx).map(|mask| mask.evaluate(&state.challenge_point))
+                // Use mask for the previous layer (layer_idx - 1) since prev_poly
+                // has the dimension of layers[layer_idx - 1]'s output
+                zk.get_mask(layer_idx - 1).map(|mask| {
+                    mask.evaluate(&sumcheck_proof.final_point)
+                })
             })
         } else {
             None
         };
+
+        // Update state for next layer
+        state.challenge_point = sumcheck_proof.final_point.clone();
+        state.current_claim = sumcheck_proof.final_eval;
+        state.current_layer = layer_idx;
 
         Ok(GKRLayerProof {
             layer_idx,

@@ -32,3 +32,6 @@ pub mod cross_platform;
 
 /// Full pipeline benchmark tests
 pub mod full_pipeline;
+
+/// Multi-step proof chain tests
+pub mod proof_chain;

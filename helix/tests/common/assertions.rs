@@ -298,6 +298,311 @@ pub fn soft_assert_verification(result: bool, expected: bool) -> AssertionResult
     }
 }
 
+// ============================================================================
+// Proof-Specific Assertions
+// ============================================================================
+
+/// Asserts that a proof chain is valid (continuous state transitions).
+pub fn assert_proof_chain_valid(
+    proofs: &[helix_prover::TrainingProofResultV2],
+    context: &str,
+) {
+    assert!(
+        !proofs.is_empty(),
+        "{}: proof chain cannot be empty",
+        context
+    );
+
+    for i in 0..proofs.len() - 1 {
+        assert_eq!(
+            proofs[i].new_state_hash,
+            proofs[i + 1].old_state_hash,
+            "{}: chain broken at step {}: new_hash {:?} != old_hash {:?}",
+            context,
+            i,
+            proofs[i].new_state_hash,
+            proofs[i + 1].old_state_hash
+        );
+    }
+}
+
+/// Asserts that step numbers in a proof chain are sequential.
+pub fn assert_step_numbers_sequential(
+    proofs: &[helix_prover::TrainingProofResultV2],
+    context: &str,
+) {
+    for (i, proof) in proofs.iter().enumerate() {
+        let expected = (i + 1) as u64;
+        assert_eq!(
+            proof.step_number, expected,
+            "{}: step {} has step_number {}, expected {}",
+            context, i, proof.step_number, expected
+        );
+    }
+}
+
+/// Asserts that a proof has valid structure for contract verification.
+pub fn assert_proof_contract_ready(
+    proof: &helix_prover::TrainingProofResultV2,
+    context: &str,
+) {
+    use helix_circuits::ml::training_step_v2::NUM_PUBLIC_INPUTS;
+
+    // Check proof bytes
+    assert!(
+        !proof.proof.is_empty(),
+        "{}: proof bytes are empty",
+        context
+    );
+    assert!(
+        proof.proof.len() >= 64,
+        "{}: proof too short ({} bytes)",
+        context,
+        proof.proof.len()
+    );
+
+    // Check public inputs
+    assert_eq!(
+        proof.public_inputs.len(),
+        NUM_PUBLIC_INPUTS,
+        "{}: wrong public input count",
+        context
+    );
+
+    // Verify public input encoding matches proof result fields
+    assert_eq!(
+        proof.public_inputs[0], proof.old_state_hash.0,
+        "{}: old_hash_lo mismatch",
+        context
+    );
+    assert_eq!(
+        proof.public_inputs[1], proof.old_state_hash.1,
+        "{}: old_hash_hi mismatch",
+        context
+    );
+    assert_eq!(
+        proof.public_inputs[2], proof.new_state_hash.0,
+        "{}: new_hash_lo mismatch",
+        context
+    );
+    assert_eq!(
+        proof.public_inputs[3], proof.new_state_hash.1,
+        "{}: new_hash_hi mismatch",
+        context
+    );
+}
+
+/// Asserts that a proof's public inputs can be serialized to 32-byte values.
+pub fn assert_public_inputs_serializable(
+    proof: &helix_prover::TrainingProofResultV2,
+    context: &str,
+) {
+    use helix_circuits::halo2curves::ff::PrimeField;
+
+    for (i, pi) in proof.public_inputs.iter().enumerate() {
+        let repr = pi.to_repr();
+        assert_eq!(
+            repr.as_ref().len(),
+            32,
+            "{}: public input {} should serialize to 32 bytes",
+            context,
+            i
+        );
+    }
+}
+
+/// Asserts that state hash changed after training step.
+pub fn assert_training_updated_state(
+    proof: &helix_prover::TrainingProofResultV2,
+    context: &str,
+) {
+    assert_ne!(
+        proof.old_state_hash, proof.new_state_hash,
+        "{}: state should change after training step",
+        context
+    );
+}
+
+/// Asserts that initial state hash matches expected.
+pub fn assert_initial_state_hash(
+    proof: &helix_prover::TrainingProofResultV2,
+    expected: (Fr, Fr),
+    context: &str,
+) {
+    assert_eq!(
+        proof.old_state_hash, expected,
+        "{}: initial state hash mismatch",
+        context
+    );
+}
+
+/// Asserts proof generation completed within time limit.
+pub fn assert_proof_time_acceptable(
+    duration: std::time::Duration,
+    max_duration: std::time::Duration,
+    context: &str,
+) {
+    assert!(
+        duration <= max_duration,
+        "{}: proof generation took {:?}, exceeds {:?} limit",
+        context,
+        duration,
+        max_duration
+    );
+}
+
+/// Asserts verification returns expected result.
+pub fn assert_verification_result(
+    actual: bool,
+    expected: bool,
+    context: &str,
+) {
+    assert_eq!(
+        actual, expected,
+        "{}: verification result mismatch (got {}, expected {})",
+        context, actual, expected
+    );
+}
+
+/// Asserts that a batch of proofs all verify.
+pub fn assert_batch_verifies(
+    prover: &helix_prover::BatchTrainingProverV2,
+    batch: &helix_prover::BatchProofResultV2,
+    context: &str,
+) {
+    assert!(
+        prover.verify_batch(batch),
+        "{}: batch verification failed",
+        context
+    );
+}
+
+/// Asserts proof bytes are valid Halo2 KZG format.
+pub fn assert_halo2_proof_format(proof_bytes: &[u8], context: &str) {
+    // Halo2 KZG proofs have specific structure:
+    // - At least one commitment (32 bytes each for BN254)
+    // - Evaluation values
+    assert!(
+        proof_bytes.len() >= 64,
+        "{}: Halo2 proof should be at least 64 bytes",
+        context
+    );
+
+    // Check it's not all zeros (unlikely but worth checking)
+    let non_zero = proof_bytes.iter().any(|&b| b != 0);
+    assert!(
+        non_zero,
+        "{}: proof bytes should not be all zeros",
+        context
+    );
+}
+
+/// Asserts that mock EVM verification passes.
+pub fn assert_mock_evm_verifies(
+    mock_evm: &super::mocks::MockEVMVerifier,
+    proof: &helix_prover::TrainingProofResultV2,
+    context: &str,
+) {
+    let result = mock_evm.verify(&proof.proof, &proof.public_inputs);
+    assert!(
+        result.valid,
+        "{}: mock EVM verification failed",
+        context
+    );
+}
+
+/// Soft assertion for proof chain validity.
+pub fn soft_assert_proof_chain(
+    proofs: &[helix_prover::TrainingProofResultV2],
+) -> AssertionResult {
+    if proofs.is_empty() {
+        return Err("proof chain is empty".to_string());
+    }
+
+    for i in 0..proofs.len() - 1 {
+        if proofs[i].new_state_hash != proofs[i + 1].old_state_hash {
+            return Err(format!("chain broken at step {}", i));
+        }
+    }
+
+    Ok(())
+}
+
+/// Soft assertion for proof structure.
+pub fn soft_assert_proof_structure(
+    proof: &helix_prover::TrainingProofResultV2,
+) -> AssertionResult {
+    use helix_circuits::ml::training_step_v2::NUM_PUBLIC_INPUTS;
+
+    if proof.proof.is_empty() {
+        return Err("proof bytes are empty".to_string());
+    }
+
+    if proof.proof.len() < 64 {
+        return Err(format!("proof too short: {} bytes", proof.proof.len()));
+    }
+
+    if proof.public_inputs.len() != NUM_PUBLIC_INPUTS {
+        return Err(format!(
+            "wrong public input count: {}",
+            proof.public_inputs.len()
+        ));
+    }
+
+    Ok(())
+}
+
+/// Collector for multiple soft assertions.
+pub struct AssertionCollector {
+    errors: Vec<String>,
+}
+
+impl AssertionCollector {
+    pub fn new() -> Self {
+        Self { errors: Vec::new() }
+    }
+
+    /// Adds a soft assertion result to the collector.
+    pub fn collect(&mut self, name: &str, result: AssertionResult) {
+        if let Err(e) = result {
+            self.errors.push(format!("{}: {}", name, e));
+        }
+    }
+
+    /// Returns true if all assertions passed.
+    pub fn all_passed(&self) -> bool {
+        self.errors.is_empty()
+    }
+
+    /// Returns the error count.
+    pub fn error_count(&self) -> usize {
+        self.errors.len()
+    }
+
+    /// Returns all errors as a string.
+    pub fn errors_string(&self) -> String {
+        self.errors.join("\n")
+    }
+
+    /// Panics if any assertion failed.
+    pub fn assert_all_passed(&self, context: &str) {
+        if !self.all_passed() {
+            panic!(
+                "{}: {} assertions failed:\n{}",
+                context,
+                self.error_count(),
+                self.errors_string()
+            );
+        }
+    }
+}
+
+impl Default for AssertionCollector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,5 +647,26 @@ mod tests {
     fn test_soft_assertion() {
         assert!(soft_assert_f64_approx(1.0, 1.0, 1e-6).is_ok());
         assert!(soft_assert_f64_approx(1.0, 2.0, 1e-6).is_err());
+    }
+
+    #[test]
+    fn test_assertion_collector() {
+        let mut collector = AssertionCollector::new();
+        collector.collect("test1", Ok(()));
+        collector.collect("test2", Err("failed".to_string()));
+        collector.collect("test3", Ok(()));
+
+        assert!(!collector.all_passed());
+        assert_eq!(collector.error_count(), 1);
+    }
+
+    #[test]
+    fn test_assertion_collector_all_pass() {
+        let mut collector = AssertionCollector::new();
+        collector.collect("test1", Ok(()));
+        collector.collect("test2", Ok(()));
+
+        assert!(collector.all_passed());
+        collector.assert_all_passed("should pass");
     }
 }
