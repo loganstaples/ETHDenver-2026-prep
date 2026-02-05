@@ -11,7 +11,14 @@ use std::fmt;
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
 /// Maximum allowed error bound to prevent overflow in subsequent computations.
+/// Note: This is a permissive upper limit for clamping. For practical error tracking,
+/// use `MAX_SAFE_ERROR` which triggers warnings/errors before reaching this ceiling.
 pub const MAX_ERROR_BOUND: f64 = 1e100;
+
+/// Maximum safe error bound for practical computations.
+/// If error exceeds this threshold, the computation is likely numerically unstable
+/// and should be flagged. This is much more conservative than MAX_ERROR_BOUND.
+pub const MAX_SAFE_ERROR: f64 = 1e6;
 
 /// Minimum representable positive value for underflow detection.
 pub const MIN_POSITIVE_VALUE: f64 = 1e-300;
@@ -28,6 +35,27 @@ pub const DIVISION_THRESHOLD: f64 = 1e-15;
 /// - Error margin is always non-negative
 /// - Neither value nor error bound should be NaN
 /// - Infinity in error bound indicates unbounded uncertainty
+///
+/// # Example
+///
+/// ```
+/// use helix_core::types::{BoundedValue, ErrorMargin};
+///
+/// // Create a bounded value with absolute error
+/// let x = BoundedValue::with_absolute_error(10.0, 0.1);
+/// assert_eq!(x.value(), 10.0);
+/// assert!((x.absolute_error() - 0.1).abs() < 1e-10);
+///
+/// // True value is in [9.9, 10.1]
+/// assert!((x.lower_bound() - 9.9).abs() < 1e-10);
+/// assert!((x.upper_bound() - 10.1).abs() < 1e-10);
+///
+/// // Arithmetic propagates errors
+/// let y = BoundedValue::with_absolute_error(5.0, 0.05);
+/// let sum = x + y;  // Error adds: 0.1 + 0.05 = 0.15
+/// assert_eq!(sum.value(), 15.0);
+/// assert!((sum.absolute_error() - 0.15).abs() < 1e-10);
+/// ```
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct BoundedValue<T> {
     /// The computed/approximate value.
@@ -435,6 +463,26 @@ impl BoundedValue<f64> {
             .into());
         }
         Ok(())
+    }
+
+    /// Checks if error has exceeded the safe threshold, indicating potential numerical instability.
+    /// This is more conservative than `MAX_ERROR_BOUND` and should be used to detect
+    /// error explosion early in training runs.
+    pub fn check_safe_error(&self) -> HelixResult<()> {
+        let abs_err = self.absolute_error();
+        if abs_err > MAX_SAFE_ERROR {
+            return Err(BoundsError::ErrorExplosion {
+                accumulated: abs_err,
+                safe_limit: MAX_SAFE_ERROR,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Returns true if the error has exceeded the safe threshold.
+    pub fn has_error_explosion(&self) -> bool {
+        self.absolute_error() > MAX_SAFE_ERROR
     }
 }
 

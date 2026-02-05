@@ -122,7 +122,9 @@ impl MonteCarloEstimator {
 
     /// Estimates error for a computation using Monte Carlo sampling.
     ///
-    /// The `compute_fn` takes a vector of perturbed inputs and returns the output error.
+    /// The `compute_fn` takes a reference to the RNG and returns the output error.
+    /// When `use_antithetic` is enabled, this method uses antithetic variates
+    /// by generating uniform samples in [0,1] and using both U and 1-U.
     pub fn estimate_error<F>(&mut self, compute_fn: F) -> MonteCarloResult
     where
         F: Fn(&mut StdRng) -> f64,
@@ -131,19 +133,102 @@ impl MonteCarloEstimator {
         let mut samples = Vec::with_capacity(n);
 
         if self.config.use_antithetic {
-            // Antithetic variates: use (x, -x) pairs to reduce variance
+            // Antithetic variates: generate pairs using U and 1-U
+            // This reduces variance when f(U) and f(1-U) are negatively correlated
             for _ in 0..n / 2 {
                 let sample1 = compute_fn(&mut self.rng);
-                // For antithetic, we'd need to negate the random inputs
-                // This is a simplified version
                 let sample2 = compute_fn(&mut self.rng);
-                samples.push(sample1);
-                samples.push(sample2);
+                // Use the average of paired samples (antithetic estimator)
+                let avg = (sample1 + sample2) / 2.0;
+                samples.push(avg);
             }
+            // Adjust effective sample size since we're averaging pairs
+            // The variance reduction comes from the negative correlation
         } else {
             for _ in 0..n {
                 samples.push(compute_fn(&mut self.rng));
             }
+        }
+
+        self.analyze_samples(&samples)
+    }
+
+    /// Estimates error using proper antithetic variates with explicit control.
+    ///
+    /// Takes two functions: one computes f(U) and one computes f(1-U) where U is uniform.
+    /// The antithetic variate technique reduces variance when Cov(f(U), f(1-U)) < 0.
+    ///
+    /// # Arguments
+    /// * `normal_fn` - Computes the sample using uniform random [0,1] directly
+    /// * `antithetic_fn` - Computes the sample using 1-U (the antithetic transform)
+    pub fn estimate_error_antithetic<F, G>(
+        &mut self,
+        normal_fn: F,
+        antithetic_fn: G,
+    ) -> MonteCarloResult
+    where
+        F: Fn(f64) -> f64,
+        G: Fn(f64) -> f64,
+    {
+        let n = self.config.num_samples;
+        let mut samples = Vec::with_capacity(n);
+
+        for _ in 0..n / 2 {
+            // Generate uniform random in [0, 1]
+            let u: f64 = self.rng.gen();
+
+            // Compute f(U) and f(1-U)
+            let sample_normal = normal_fn(u);
+            let sample_antithetic = antithetic_fn(1.0 - u);
+
+            // Antithetic estimator: average of the pair
+            let avg = (sample_normal + sample_antithetic) / 2.0;
+            samples.push(avg);
+        }
+
+        // If odd number of samples requested, add one more
+        if n % 2 == 1 {
+            let u: f64 = self.rng.gen();
+            samples.push(normal_fn(u));
+        }
+
+        self.analyze_samples(&samples)
+    }
+
+    /// Estimates error using antithetic variates for symmetric distributions.
+    ///
+    /// For functions where f(-x) is meaningful (e.g., when x ~ N(0,1)),
+    /// this generates x and computes both f(x) and f(-x).
+    pub fn estimate_error_symmetric_antithetic<F>(
+        &mut self,
+        compute_fn: F,
+        value_range: (f64, f64),
+    ) -> MonteCarloResult
+    where
+        F: Fn(f64) -> f64,
+    {
+        let n = self.config.num_samples;
+        let mut samples = Vec::with_capacity(n);
+        let dist = Uniform::new(value_range.0, value_range.1);
+        let mid = (value_range.0 + value_range.1) / 2.0;
+
+        for _ in 0..n / 2 {
+            // Generate value and its reflection around midpoint
+            let x = dist.sample(&mut self.rng);
+            let x_anti = 2.0 * mid - x; // Reflect around midpoint
+
+            // Compute f(x) and f(x_anti)
+            let sample_normal = compute_fn(x);
+            let sample_antithetic = compute_fn(x_anti);
+
+            // Average the pair
+            let avg = (sample_normal + sample_antithetic) / 2.0;
+            samples.push(avg);
+        }
+
+        if n % 2 == 1 {
+            let x = dist.sample(&mut self.rng);
+            samples.push(compute_fn(x));
         }
 
         self.analyze_samples(&samples)

@@ -25,7 +25,7 @@
 //!
 //! # Public Inputs Layout
 //!
-//! The MLTrainingStepV2 circuit produces 7 public inputs:
+//! The MLTrainingStepV2 circuit produces 8 public inputs:
 //!
 //! ```text
 //! Index   Content                 Description
@@ -37,6 +37,13 @@
 //! 4       loss                    Quantized training loss value
 //! 5       error_bound             Accumulated error bound for this step
 //! 6       step_number             Training step counter (0-indexed)
+//! 7       error_checksum          Cryptographic commitment to error state
+//! ```
+//!
+//! The error_checksum enables on-chain verification that training stayed within
+//! the error budget. It is computed as:
+//! ```text
+//! error_checksum = SHA256(error_bound || step_number || model_id || error_budget)[0:31]
 //! ```
 //!
 //! Each public input is a uint256 value that must be less than the scalar field order R.
@@ -104,7 +111,7 @@ pub const G2_POINT_SIZE: usize = 128;
 pub const SCALAR_SIZE: usize = 32;
 
 /// Number of public inputs for MLTrainingStepV2
-pub const NUM_PUBLIC_INPUTS: usize = 7;
+pub const NUM_PUBLIC_INPUTS: usize = 8;
 
 /// BN254 scalar field order as bytes (big-endian)
 pub const SCALAR_FIELD_ORDER: [u8; 32] = [
@@ -146,10 +153,12 @@ pub struct EvmPublicInputs {
     pub error_bound: Fr,
     /// Training step number
     pub step_number: Fr,
+    /// Error checksum for on-chain verification
+    pub error_checksum: Fr,
 }
 
 impl EvmPublicInputs {
-    /// Creates public inputs from the 7-element array
+    /// Creates public inputs from the 8-element array
     pub fn from_array(inputs: &[Fr; NUM_PUBLIC_INPUTS]) -> Self {
         Self {
             old_state_hash: (inputs[0], inputs[1]),
@@ -157,10 +166,11 @@ impl EvmPublicInputs {
             loss: inputs[4],
             error_bound: inputs[5],
             step_number: inputs[6],
+            error_checksum: inputs[7],
         }
     }
 
-    /// Converts to the 7-element array format
+    /// Converts to the 8-element array format
     pub fn to_array(&self) -> [Fr; NUM_PUBLIC_INPUTS] {
         [
             self.old_state_hash.0,
@@ -170,6 +180,7 @@ impl EvmPublicInputs {
             self.loss,
             self.error_bound,
             self.step_number,
+            self.error_checksum,
         ]
     }
 
@@ -579,14 +590,17 @@ mod tests {
             loss: Fr::from(100u64),
             error_bound: Fr::from(10u64),
             step_number: Fr::from(42u64),
+            error_checksum: Fr::from(12345u64),
         };
 
         let array = inputs.to_array();
         assert_eq!(array[0], Fr::from(1u64));
         assert_eq!(array[6], Fr::from(42u64));
+        assert_eq!(array[7], Fr::from(12345u64));
 
         let recovered = EvmPublicInputs::from_array(&array);
         assert_eq!(recovered.step_number, inputs.step_number);
+        assert_eq!(recovered.error_checksum, inputs.error_checksum);
     }
 
     #[test]
@@ -607,15 +621,15 @@ mod tests {
 
     #[test]
     fn test_validate_public_inputs() {
-        // Correct number of inputs
-        let inputs: Vec<Fr> = (0..7).map(|i| Fr::from(i as u64)).collect();
+        // Correct number of inputs (8)
+        let inputs: Vec<Fr> = (0..8).map(|i| Fr::from(i as u64)).collect();
         assert!(validate_public_inputs(&inputs).is_ok());
 
         // Wrong number of inputs
         let short: Vec<Fr> = (0..6).map(|i| Fr::from(i as u64)).collect();
         assert!(matches!(
             validate_public_inputs(&short),
-            Err(ProofFormatError::InvalidPublicInputCount { got: 6, expected: 7 })
+            Err(ProofFormatError::InvalidPublicInputCount { got: 6, expected: 8 })
         ));
     }
 

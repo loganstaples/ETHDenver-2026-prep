@@ -58,7 +58,8 @@ use crate::verifier::{
 };
 
 /// Number of public inputs exposed by this circuit.
-pub const NUM_PUBLIC_INPUTS: usize = 7;
+/// Inputs: [old_hash_lo, old_hash_hi, new_hash_lo, new_hash_hi, loss, error_bound, step_number, error_checksum]
+pub const NUM_PUBLIC_INPUTS: usize = 8;
 
 /// Scale factor for quantized values (fixed-point arithmetic).
 pub const QUANTIZATION_SCALE: u64 = 1000;
@@ -346,6 +347,14 @@ pub struct MLTrainingStepV2Witness {
     pub old_state_hash: (Fr, Fr),
     pub new_state_hash: (Fr, Fr),
     pub step_number: u64,
+
+    // --- Error commitment (for on-chain verification) ---
+    /// Model identifier (32 bytes, typically hash of model config)
+    pub model_id: [u8; 32],
+    /// Error budget limit for this training run
+    pub error_budget: Fr,
+    /// Computed error checksum = hash(total_error || step_number || model_id || error_budget)
+    pub error_checksum: Fr,
 }
 
 impl Default for MLTrainingStepV2Witness {
@@ -394,12 +403,25 @@ impl Default for MLTrainingStepV2Witness {
             old_state_hash: (Fr::ZERO, Fr::ZERO),
             new_state_hash: (Fr::ZERO, Fr::ZERO),
             step_number: 0,
+            model_id: [0u8; 32],
+            error_budget: Fr::ZERO,
+            error_checksum: Fr::ZERO,
         }
     }
 }
 
 impl MLTrainingStepV2Witness {
     /// Builds the public inputs vector.
+    ///
+    /// Returns 8 public inputs:
+    /// - [0]: old_state_hash_lo
+    /// - [1]: old_state_hash_hi
+    /// - [2]: new_state_hash_lo
+    /// - [3]: new_state_hash_hi
+    /// - [4]: loss
+    /// - [5]: total_error (error bound)
+    /// - [6]: step_number
+    /// - [7]: error_checksum (cryptographic commitment to error state)
     pub fn public_inputs(&self) -> Vec<Fr> {
         vec![
             self.old_state_hash.0,
@@ -409,7 +431,42 @@ impl MLTrainingStepV2Witness {
             self.loss,
             self.total_error,
             Fr::from(self.step_number),
+            self.error_checksum,
         ]
+    }
+
+    /// Computes the error checksum from the current witness state.
+    ///
+    /// The checksum is: SHA256(total_error_bytes || step_number || model_id || error_budget_bytes)
+    /// truncated to fit in Fr.
+    pub fn compute_error_checksum(&self) -> Fr {
+        let mut hasher = Sha256::new();
+
+        // Add total error (as 32-byte representation)
+        let error_bytes = self.total_error.to_repr();
+        hasher.update(error_bytes.as_ref());
+
+        // Add step number
+        hasher.update(self.step_number.to_le_bytes());
+
+        // Add model ID
+        hasher.update(self.model_id);
+
+        // Add error budget
+        let budget_bytes = self.error_budget.to_repr();
+        hasher.update(budget_bytes.as_ref());
+
+        let hash = hasher.finalize();
+
+        // Convert first 31 bytes to Fr (to ensure it's in the field)
+        let mut repr = [0u8; 32];
+        repr[1..32].copy_from_slice(&hash[0..31]);
+        Fr::from_repr_vartime(repr).unwrap_or(Fr::ZERO)
+    }
+
+    /// Sets the error checksum by computing it from current state.
+    pub fn finalize_error_checksum(&mut self) {
+        self.error_checksum = self.compute_error_checksum();
     }
 
     /// Converts public inputs to EVM-compatible format for Halo2Verifier.sol.
@@ -435,6 +492,7 @@ impl MLTrainingStepV2Witness {
             self.loss,
             self.total_error,
             self.step_number,
+            self.error_checksum,
         )
     }
 
@@ -1596,6 +1654,10 @@ pub fn compute_witness_v2(
         old_state_hash,
         new_state_hash,
         step_number,
+        // Error commitment fields (default for now, should be set by caller)
+        model_id: [0u8; 32],
+        error_budget: Fr::ZERO,
+        error_checksum: Fr::ZERO,
     }
 }
 

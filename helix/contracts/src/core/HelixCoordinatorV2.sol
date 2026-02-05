@@ -527,7 +527,7 @@ contract HelixCoordinatorV2 {
     /// @param modelId The model ID
     /// @param roundId The round ID
     /// @param proof The ZK proof bytes
-    /// @param publicInputs Public inputs: [oldHashLo, oldHashHi, newHashLo, newHashHi, loss, errorBound, stepNumber]
+    /// @param publicInputs Public inputs: [oldHashLo, oldHashHi, newHashLo, newHashHi, loss, errorBound, stepNumber, errorChecksum]
     function submitProof(
         uint256 modelId,
         uint256 roundId,
@@ -542,8 +542,8 @@ contract HelixCoordinatorV2 {
         require(!round.isCompleted, "Round completed");
         require(block.timestamp <= round.deadline, "Round expired");
 
-        // Validate public inputs count
-        require(publicInputs.length == 7, "Invalid public inputs count");
+        // Validate public inputs count (8 inputs including error checksum)
+        require(publicInputs.length == 8, "Invalid public inputs count");
 
         // Reconstruct and validate old commitment
         uint256 oldCommitmentFromProof = _hashPair(publicInputs[0], publicInputs[1]);
@@ -552,6 +552,17 @@ contract HelixCoordinatorV2 {
         // Validate error bound
         uint256 stepErrorBound = publicInputs[5];
         require(stepErrorBound <= maxErrorBound, "Error bound exceeds maximum");
+
+        // Validate error checksum (prevents tampering with error tracking)
+        // The checksum cryptographically commits to: error || step || model_id || budget
+        uint256 errorChecksum = publicInputs[7];
+        uint256 expectedChecksum = _computeErrorChecksum(
+            stepErrorBound,
+            publicInputs[6], // step_number
+            modelId,
+            maxErrorBound
+        );
+        require(errorChecksum == expectedChecksum, "Error checksum mismatch");
 
         // Verify the proof
         bool valid = verifier.verifyProof(proof, publicInputs);
@@ -580,6 +591,30 @@ contract HelixCoordinatorV2 {
 
         emit ProofSubmitted(modelId, roundId, msg.sender, newCommitment, stepErrorBound);
         emit RoundCompleted(modelId, roundId, newCommitment, newAccumulatedError);
+    }
+
+    /// @notice Computes the expected error checksum for verification
+    /// @dev Matches the Rust implementation in helix-core/types/error_commitment.rs
+    /// @param errorBound The step error bound (scaled)
+    /// @param stepNumber The training step number
+    /// @param modelId The model identifier
+    /// @param errorBudget The maximum error budget (scaled)
+    /// @return The first 8 bytes of keccak256 hash as uint64
+    function _computeErrorChecksum(
+        uint256 errorBound,
+        uint256 stepNumber,
+        uint256 modelId,
+        uint256 errorBudget
+    ) internal pure returns (uint256) {
+        // Compute keccak256 of packed data (matches Rust checksum_compact())
+        bytes32 hash = keccak256(abi.encodePacked(
+            errorBound,
+            stepNumber,
+            bytes32(modelId), // Pad modelId to 32 bytes
+            errorBudget
+        ));
+        // Return first 8 bytes as uint64 (compact checksum)
+        return uint256(uint64(bytes8(hash)));
     }
 
     // ============ Slashing ============

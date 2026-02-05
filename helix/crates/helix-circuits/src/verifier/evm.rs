@@ -778,6 +778,7 @@ impl EvmPublicInputsArray {
         loss: Fr,
         error_bound: Fr,
         step_number: u64,
+        error_checksum: Fr,
     ) -> Self {
         Self {
             values: [
@@ -788,6 +789,7 @@ impl EvmPublicInputsArray {
                 loss,
                 error_bound,
                 Fr::from(step_number),
+                error_checksum,
             ],
         }
     }
@@ -832,6 +834,11 @@ impl EvmPublicInputsArray {
     /// Returns the step number.
     pub fn step_number(&self) -> Fr {
         self.values[6]
+    }
+
+    /// Returns the error checksum.
+    pub fn error_checksum(&self) -> Fr {
+        self.values[7]
     }
 
     /// Encodes to EVM-compatible format (array of 32-byte big-endian values).
@@ -909,6 +916,7 @@ pub fn create_test_public_inputs(step: u64) -> EvmPublicInputsArray {
         Fr::from(step * 100),       // loss
         Fr::from(step * 10),        // error_bound
         step,                        // step_number
+        Fr::from(step * 12345),     // error_checksum (test value)
     )
 }
 
@@ -975,6 +983,7 @@ mod evm_proof_tests {
             Fr::from(100u64),
             Fr::from(10u64),
             1,
+            Fr::from(12345u64), // error_checksum
         );
 
         let literal = inputs.to_solidity_literal();
@@ -1015,10 +1024,11 @@ mod evm_proof_tests {
 
     #[test]
     fn test_public_inputs_from_vec() {
-        let values: Vec<Fr> = (0..7).map(|i| Fr::from(i as u64)).collect();
+        let values: Vec<Fr> = (0..8).map(|i| Fr::from(i as u64)).collect();
         let inputs = EvmPublicInputsArray::from_vec(values).unwrap();
 
         assert_eq!(inputs.step_number(), Fr::from(6u64));
+        assert_eq!(inputs.error_checksum(), Fr::from(7u64));
     }
 
     #[test]
@@ -1028,7 +1038,7 @@ mod evm_proof_tests {
 
         assert!(matches!(
             result,
-            Err(ProofFormatError::InvalidPublicInputCount { got: 5, expected: 7 })
+            Err(ProofFormatError::InvalidPublicInputCount { got: 5, expected: 8 })
         ));
     }
 }

@@ -41,8 +41,9 @@ contract Halo2Verifier is IHelixVerifier {
     /// @notice Number of advice commitments in proof
     uint256 internal constant NUM_ADVICES = 3;
 
-    /// @notice Number of public inputs (MLTrainingStepCircuit has 7)
-    uint256 internal constant NUM_INSTANCES = 7;
+    /// @notice Number of public inputs (MLTrainingStepCircuit has 8)
+    /// Inputs: [oldHashLo, oldHashHi, newHashLo, newHashHi, loss, errorBound, stepNumber, errorChecksum]
+    uint256 internal constant NUM_INSTANCES = 8;
 
     // ============ State ============
 

@@ -1088,6 +1088,307 @@ impl AdaptivePrecisionController {
     }
 }
 
+// =============================================================================
+// RUNTIME STATISTICS-BASED ERROR CALIBRATION
+// =============================================================================
+
+/// Operation type for error calibration tracking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CalibrationOperationType {
+    MatMul,
+    LayerNorm,
+    Softmax,
+    Attention,
+    ElementwiseAdd,
+    ElementwiseMul,
+    Reduction,
+    Activation,
+}
+
+/// Statistics for a single operation type.
+#[derive(Debug, Clone, Default)]
+pub struct OperationErrorStats {
+    /// Number of observations.
+    pub count: usize,
+    /// Sum of observed errors.
+    pub observed_sum: f64,
+    /// Sum of theoretical (worst-case) bounds.
+    pub theoretical_sum: f64,
+    /// Sum of squared observed errors (for variance).
+    pub observed_sq_sum: f64,
+    /// Maximum observed ratio (observed/theoretical).
+    pub max_ratio: f64,
+    /// Minimum observed ratio.
+    pub min_ratio: f64,
+}
+
+impl OperationErrorStats {
+    /// Records an observation.
+    pub fn record(&mut self, observed: f64, theoretical: f64) {
+        self.count += 1;
+        self.observed_sum += observed;
+        self.theoretical_sum += theoretical;
+        self.observed_sq_sum += observed * observed;
+
+        if theoretical > 1e-15 {
+            let ratio = observed / theoretical;
+            if self.count == 1 {
+                self.max_ratio = ratio;
+                self.min_ratio = ratio;
+            } else {
+                self.max_ratio = self.max_ratio.max(ratio);
+                self.min_ratio = self.min_ratio.min(ratio);
+            }
+        }
+    }
+
+    /// Returns the mean observed error.
+    pub fn mean_observed(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.observed_sum / self.count as f64
+        }
+    }
+
+    /// Returns the mean theoretical bound.
+    pub fn mean_theoretical(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.theoretical_sum / self.count as f64
+        }
+    }
+
+    /// Returns the calibration factor (observed/theoretical ratio).
+    /// A factor < 1 means theoretical bounds are conservative and can be tightened.
+    pub fn calibration_factor(&self) -> f64 {
+        if self.theoretical_sum < 1e-15 || self.count < 10 {
+            1.0 // Not enough data, use theoretical bounds
+        } else {
+            let ratio = self.observed_sum / self.theoretical_sum;
+            // Clamp to reasonable range [0.1, 1.5]
+            // - Below 0.1 might indicate measurement issues
+            // - Above 1.0 means bounds weren't conservative enough (keep at 1.0 for safety)
+            ratio.clamp(0.1, 1.0)
+        }
+    }
+
+    /// Returns the variance of observed errors.
+    pub fn variance(&self) -> f64 {
+        if self.count < 2 {
+            0.0
+        } else {
+            let mean = self.mean_observed();
+            self.observed_sq_sum / self.count as f64 - mean * mean
+        }
+    }
+}
+
+/// Runtime statistics-based error calibrator.
+///
+/// Tracks observed errors vs theoretical bounds across operation types and
+/// provides calibration factors to tighten bounds based on empirical data.
+///
+/// # Usage
+///
+/// ```ignore
+/// let mut calibrator = RuntimeStatisticsCalibrator::new();
+///
+/// // During training, record observed vs theoretical errors
+/// calibrator.record(CalibrationOperationType::MatMul, observed_error, theoretical_bound);
+///
+/// // Use calibration factor to tighten future bounds
+/// let factor = calibrator.calibration_factor(CalibrationOperationType::MatMul);
+/// let tighter_bound = theoretical_bound * factor;
+/// ```
+#[derive(Debug, Clone)]
+pub struct RuntimeStatisticsCalibrator {
+    /// Statistics per operation type.
+    stats: std::collections::HashMap<CalibrationOperationType, OperationErrorStats>,
+    /// Whether calibration is enabled.
+    enabled: bool,
+    /// Minimum observations before using calibration.
+    min_observations: usize,
+    /// Safety margin applied to calibration factors.
+    safety_margin: f64,
+}
+
+impl Default for RuntimeStatisticsCalibrator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RuntimeStatisticsCalibrator {
+    /// Creates a new calibrator with default settings.
+    pub fn new() -> Self {
+        Self {
+            stats: std::collections::HashMap::new(),
+            enabled: true,
+            min_observations: 100,
+            safety_margin: 1.1, // 10% safety margin
+        }
+    }
+
+    /// Creates a calibrator with custom settings.
+    pub fn with_config(min_observations: usize, safety_margin: f64) -> Self {
+        Self {
+            stats: std::collections::HashMap::new(),
+            enabled: true,
+            min_observations,
+            safety_margin: safety_margin.max(1.0), // Must be >= 1.0 for safety
+        }
+    }
+
+    /// Enables or disables calibration.
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+
+    /// Records an observed error vs theoretical bound.
+    pub fn record(&mut self, op_type: CalibrationOperationType, observed: f64, theoretical: f64) {
+        if !self.enabled {
+            return;
+        }
+
+        self.stats
+            .entry(op_type)
+            .or_default()
+            .record(observed, theoretical);
+    }
+
+    /// Returns the calibration factor for an operation type.
+    ///
+    /// The factor is in range [0.1, 1.0] where:
+    /// - 1.0 means use full theoretical bound (not enough data or bounds are accurate)
+    /// - < 1.0 means bounds can be tightened by this factor
+    pub fn calibration_factor(&self, op_type: CalibrationOperationType) -> f64 {
+        if !self.enabled {
+            return 1.0;
+        }
+
+        self.stats
+            .get(&op_type)
+            .filter(|s| s.count >= self.min_observations)
+            .map(|s| (s.calibration_factor() * self.safety_margin).min(1.0))
+            .unwrap_or(1.0)
+    }
+
+    /// Applies calibration to tighten a theoretical bound.
+    pub fn calibrate(&self, op_type: CalibrationOperationType, theoretical: f64) -> f64 {
+        theoretical * self.calibration_factor(op_type)
+    }
+
+    /// Returns statistics for an operation type.
+    pub fn get_stats(&self, op_type: CalibrationOperationType) -> Option<&OperationErrorStats> {
+        self.stats.get(&op_type)
+    }
+
+    /// Returns all collected statistics.
+    pub fn all_stats(&self) -> &std::collections::HashMap<CalibrationOperationType, OperationErrorStats> {
+        &self.stats
+    }
+
+    /// Resets all statistics.
+    pub fn reset(&mut self) {
+        self.stats.clear();
+    }
+
+    /// Generates a calibration report.
+    pub fn report(&self) -> String {
+        let mut report = String::from("Error Calibration Report\n");
+        report.push_str("========================\n\n");
+
+        for (op_type, stats) in &self.stats {
+            report.push_str(&format!("{:?}:\n", op_type));
+            report.push_str(&format!("  Observations: {}\n", stats.count));
+            report.push_str(&format!("  Mean observed: {:.6e}\n", stats.mean_observed()));
+            report.push_str(&format!("  Mean theoretical: {:.6e}\n", stats.mean_theoretical()));
+            report.push_str(&format!("  Calibration factor: {:.3}\n", stats.calibration_factor()));
+            report.push_str(&format!("  Ratio range: [{:.3}, {:.3}]\n", stats.min_ratio, stats.max_ratio));
+            report.push_str("\n");
+        }
+
+        report
+    }
+
+    /// Returns whether enough data has been collected for reliable calibration.
+    pub fn has_sufficient_data(&self, op_type: CalibrationOperationType) -> bool {
+        self.stats
+            .get(&op_type)
+            .map(|s| s.count >= self.min_observations)
+            .unwrap_or(false)
+    }
+}
+
+/// Calibrated error propagation for matrix multiplication.
+///
+/// Uses runtime statistics to provide tighter bounds than worst-case analysis.
+impl MatrixErrorPropagation {
+    /// Computes calibrated output error using runtime statistics.
+    pub fn calibrated_output_error(&self, calibrator: &RuntimeStatisticsCalibrator) -> ProbabilisticError {
+        let base_error = self.output_error();
+        let factor = calibrator.calibration_factor(CalibrationOperationType::MatMul);
+
+        ProbabilisticError {
+            mean: base_error.mean * factor,
+            std_dev: base_error.std_dev * factor,
+            worst_case: base_error.worst_case * factor,
+            sample_count: base_error.sample_count,
+            distribution: base_error.distribution,
+        }
+    }
+}
+
+/// Calibrated error propagation for normalization.
+impl NormalizationErrorPropagation {
+    /// Computes calibrated softmax error using runtime statistics.
+    pub fn calibrated_softmax_error(&self, calibrator: &RuntimeStatisticsCalibrator) -> ProbabilisticError {
+        let base_error = self.softmax_error();
+        let factor = calibrator.calibration_factor(CalibrationOperationType::Softmax);
+
+        ProbabilisticError {
+            mean: base_error.mean * factor,
+            std_dev: base_error.std_dev * factor,
+            worst_case: base_error.worst_case * factor,
+            sample_count: base_error.sample_count,
+            distribution: base_error.distribution,
+        }
+    }
+
+    /// Computes calibrated layer norm error using runtime statistics.
+    pub fn calibrated_output_error(&self, calibrator: &RuntimeStatisticsCalibrator) -> ProbabilisticError {
+        let base_error = self.output_error();
+        let factor = calibrator.calibration_factor(CalibrationOperationType::LayerNorm);
+
+        ProbabilisticError {
+            mean: base_error.mean * factor,
+            std_dev: base_error.std_dev * factor,
+            worst_case: base_error.worst_case * factor,
+            sample_count: base_error.sample_count,
+            distribution: base_error.distribution,
+        }
+    }
+}
+
+/// Calibrated error propagation for attention.
+impl AttentionErrorPropagation {
+    /// Computes calibrated attention error using runtime statistics.
+    pub fn calibrated_output_error(&self, calibrator: &RuntimeStatisticsCalibrator) -> ProbabilisticError {
+        let base_error = self.output_error();
+        let factor = calibrator.calibration_factor(CalibrationOperationType::Attention);
+
+        ProbabilisticError {
+            mean: base_error.mean * factor,
+            std_dev: base_error.std_dev * factor,
+            worst_case: base_error.worst_case * factor,
+            sample_count: base_error.sample_count,
+            distribution: base_error.distribution,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1164,5 +1465,145 @@ mod tests {
 
         assert_eq!(graph.nodes().len(), 3);
         assert!(graph.total().worst_case > 0.0);
+    }
+
+    // =========================================================================
+    // RUNTIME STATISTICS CALIBRATOR TESTS
+    // =========================================================================
+
+    #[test]
+    fn test_calibrator_basic() {
+        let mut calibrator = RuntimeStatisticsCalibrator::new();
+
+        // Without enough data, factor should be 1.0
+        assert_eq!(calibrator.calibration_factor(CalibrationOperationType::MatMul), 1.0);
+
+        // Record some observations where observed is half of theoretical
+        for _ in 0..200 {
+            calibrator.record(CalibrationOperationType::MatMul, 0.5, 1.0);
+        }
+
+        // Factor should be around 0.5 * safety_margin (1.1) = 0.55
+        let factor = calibrator.calibration_factor(CalibrationOperationType::MatMul);
+        assert!(factor < 1.0);
+        assert!(factor > 0.4);
+    }
+
+    #[test]
+    fn test_calibrator_insufficient_data() {
+        let mut calibrator = RuntimeStatisticsCalibrator::with_config(100, 1.1);
+
+        // Record fewer than min_observations
+        for _ in 0..50 {
+            calibrator.record(CalibrationOperationType::Softmax, 0.1, 1.0);
+        }
+
+        // Should return 1.0 due to insufficient data
+        assert_eq!(calibrator.calibration_factor(CalibrationOperationType::Softmax), 1.0);
+    }
+
+    #[test]
+    fn test_calibrator_disabled() {
+        let mut calibrator = RuntimeStatisticsCalibrator::new();
+        calibrator.set_enabled(false);
+
+        // Record many observations
+        for _ in 0..200 {
+            calibrator.record(CalibrationOperationType::MatMul, 0.1, 1.0);
+        }
+
+        // When disabled, factor is always 1.0
+        assert_eq!(calibrator.calibration_factor(CalibrationOperationType::MatMul), 1.0);
+    }
+
+    #[test]
+    fn test_calibrator_apply() {
+        let mut calibrator = RuntimeStatisticsCalibrator::with_config(50, 1.0);
+
+        // Observed errors are 30% of theoretical
+        for _ in 0..100 {
+            calibrator.record(CalibrationOperationType::LayerNorm, 0.3, 1.0);
+        }
+
+        let calibrated = calibrator.calibrate(CalibrationOperationType::LayerNorm, 2.0);
+        // Should be 2.0 * 0.3 = 0.6 (approximately)
+        assert!(calibrated < 2.0);
+        assert!(calibrated > 0.5);
+    }
+
+    #[test]
+    fn test_calibrator_multiple_ops() {
+        let mut calibrator = RuntimeStatisticsCalibrator::with_config(50, 1.0);
+
+        // Different ratios for different operations
+        for _ in 0..100 {
+            calibrator.record(CalibrationOperationType::MatMul, 0.2, 1.0);
+            calibrator.record(CalibrationOperationType::Softmax, 0.5, 1.0);
+            calibrator.record(CalibrationOperationType::Attention, 0.8, 1.0);
+        }
+
+        // Each should have its own calibration factor
+        let matmul_factor = calibrator.calibration_factor(CalibrationOperationType::MatMul);
+        let softmax_factor = calibrator.calibration_factor(CalibrationOperationType::Softmax);
+        let attention_factor = calibrator.calibration_factor(CalibrationOperationType::Attention);
+
+        assert!(matmul_factor < softmax_factor);
+        assert!(softmax_factor < attention_factor);
+    }
+
+    #[test]
+    fn test_calibrator_with_matrix_propagation() {
+        let mut calibrator = RuntimeStatisticsCalibrator::with_config(50, 1.0);
+
+        // Simulate observed errors being 40% of theoretical for matmul
+        for _ in 0..100 {
+            calibrator.record(CalibrationOperationType::MatMul, 0.4, 1.0);
+        }
+
+        let prop = MatrixErrorPropagation::new(
+            64,
+            1.0,
+            1.0,
+            ProbabilisticError::from_absolute(0.001),
+            ProbabilisticError::from_absolute(0.001),
+        );
+
+        let base_error = prop.output_error();
+        let calibrated_error = prop.calibrated_output_error(&calibrator);
+
+        // Calibrated error should be smaller
+        assert!(calibrated_error.worst_case < base_error.worst_case);
+        // And roughly 40% of the base
+        let ratio = calibrated_error.worst_case / base_error.worst_case;
+        assert!(ratio > 0.3 && ratio < 0.5);
+    }
+
+    #[test]
+    fn test_operation_error_stats() {
+        let mut stats = OperationErrorStats::default();
+
+        stats.record(0.1, 1.0);
+        stats.record(0.2, 1.0);
+        stats.record(0.3, 1.0);
+
+        assert_eq!(stats.count, 3);
+        assert!((stats.mean_observed() - 0.2).abs() < 1e-10);
+        assert!((stats.mean_theoretical() - 1.0).abs() < 1e-10);
+        assert!((stats.min_ratio - 0.1).abs() < 1e-10);
+        assert!((stats.max_ratio - 0.3).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_calibrator_report() {
+        let mut calibrator = RuntimeStatisticsCalibrator::new();
+
+        for _ in 0..150 {
+            calibrator.record(CalibrationOperationType::MatMul, 0.5, 1.0);
+        }
+
+        let report = calibrator.report();
+        assert!(report.contains("MatMul"));
+        assert!(report.contains("Observations"));
+        assert!(report.contains("Calibration factor"));
     }
 }

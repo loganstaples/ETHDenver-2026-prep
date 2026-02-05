@@ -15,6 +15,7 @@ pub mod error_visualization;
 pub mod monte_carlo_error;
 pub mod error_checkpoint;
 pub mod error_budget;
+pub mod error_commitment;
 
 // Re-export core types
 pub use bounded_value::{
@@ -38,6 +39,8 @@ pub use error_composition::{
     // Adaptive precision system
     AdaptivePrecision, AdaptivePrecisionConfig, AdaptivePrecisionController,
     AdaptivePrecisionStats, PrecisionDecision, PrecisionChangeReason,
+    // Runtime statistics-based error calibration
+    CalibrationOperationType, OperationErrorStats, RuntimeStatisticsCalibrator,
 };
 
 // Re-export precision selection types
@@ -94,3 +97,9 @@ pub use error_visualization::{
 };
 
 pub use error_checkpoint::recover_from_checkpoint;
+
+// Re-export error commitment types
+pub use error_commitment::{
+    ErrorCommitment, ErrorCommitmentBuilder, ErrorCommitmentPublicInputs,
+    ErrorCommitmentTracker,
+};

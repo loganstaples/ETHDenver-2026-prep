@@ -403,6 +403,11 @@ pub enum BoundsError {
     /// Error propagation resulted in invalid state.
     #[error("Invalid error propagation: {message}")]
     InvalidPropagation { message: String },
+
+    /// Error has exploded beyond safe limits, indicating numerical instability.
+    /// This is a critical error that should halt computation to prevent silent failures.
+    #[error("Error explosion detected: accumulated {accumulated:.6e} exceeds safe limit {safe_limit:.6e}")]
+    ErrorExplosion { accumulated: f64, safe_limit: f64 },
 }
 
 impl BoundsError {
@@ -421,6 +426,9 @@ impl BoundsError {
             BoundsError::InvalidPropagation { .. } => {
                 Some("Verify input values are within expected ranges")
             }
+            BoundsError::ErrorExplosion { .. } => {
+                Some("Increase precision, reduce batch size, or checkpoint more frequently to reset error accumulation")
+            }
             _ => None,
         }
     }
@@ -434,6 +442,7 @@ impl BoundsError {
             BoundsError::NegativeMargin(_) => false,
             BoundsError::InconsistentBounds { .. } => false,
             BoundsError::InvalidPropagation { .. } => false,
+            BoundsError::ErrorExplosion { .. } => true, // Can recover by checkpointing
         }
     }
 
@@ -446,6 +455,7 @@ impl BoundsError {
             BoundsError::NegativeMargin(_) => ErrorSeverity::Error,
             BoundsError::InconsistentBounds { .. } => ErrorSeverity::Error,
             BoundsError::InvalidPropagation { .. } => ErrorSeverity::Error,
+            BoundsError::ErrorExplosion { .. } => ErrorSeverity::Critical, // Critical - computation is unreliable
         }
     }
 
@@ -466,6 +476,10 @@ impl BoundsError {
             BoundsError::ErrorBoundOverflow { operation, value } => {
                 fields.insert("operation".to_string(), operation.clone());
                 fields.insert("value".to_string(), format!("{:.6e}", value));
+            }
+            BoundsError::ErrorExplosion { accumulated, safe_limit } => {
+                fields.insert("accumulated".to_string(), format!("{:.6e}", accumulated));
+                fields.insert("safe_limit".to_string(), format!("{:.6e}", safe_limit));
             }
             _ => {}
         }

@@ -19,6 +19,22 @@ contract HelixCoordinatorV2Test is Test {
     uint256 constant MIN_STAKE = 0.1 ether;
     uint256 constant ROUND_DURATION = 1 hours;
 
+    /// @notice Helper function to compute error checksum (matches contract implementation)
+    function _computeErrorChecksum(
+        uint256 errorBound,
+        uint256 stepNumber,
+        uint256 modelId,
+        uint256 errorBudget
+    ) internal pure returns (uint256) {
+        bytes32 hash = keccak256(abi.encodePacked(
+            errorBound,
+            stepNumber,
+            bytes32(modelId),
+            errorBudget
+        ));
+        return uint256(uint64(bytes8(hash)));
+    }
+
     event ModelRegistered(uint256 indexed modelId, address indexed owner, uint256 initialCommitment, uint256 minStake, string ipfsHash);
     event RoundStarted(uint256 indexed modelId, uint256 indexed roundId, uint256 deadline, uint256 modelCommitment);
     event Staked(address indexed prover, uint256 indexed modelId, uint256 amount, uint256 totalStake);
@@ -164,7 +180,7 @@ contract HelixCoordinatorV2Test is Test {
         // Create invalid proof (too short)
         bytes memory invalidProof = hex"deadbeef";
 
-        uint256[] memory publicInputs = new uint256[](7);
+        uint256[] memory publicInputs = new uint256[](8);
         publicInputs[0] = oldHashLo; // old_hash_lo
         publicInputs[1] = oldHashHi; // old_hash_hi
         publicInputs[2] = 3; // new_hash_lo
@@ -172,6 +188,7 @@ contract HelixCoordinatorV2Test is Test {
         publicInputs[4] = 100; // loss
         publicInputs[5] = 10; // error_bound
         publicInputs[6] = 1; // step
+        publicInputs[7] = _computeErrorChecksum(10, 1, modelId, coordinator.maxErrorBound()); // error_checksum
 
         uint256 treasuryBefore = treasury.balance;
 
@@ -195,7 +212,7 @@ contract HelixCoordinatorV2Test is Test {
 
         // No stake
         bytes memory proof = new bytes(320);
-        uint256[] memory publicInputs = new uint256[](7);
+        uint256[] memory publicInputs = new uint256[](8);
 
         vm.prank(prover1);
         vm.expectRevert("Insufficient stake");
@@ -210,7 +227,7 @@ contract HelixCoordinatorV2Test is Test {
         coordinator.stake{value: 1 ether}(modelId);
 
         bytes memory proof = new bytes(320);
-        uint256[] memory publicInputs = new uint256[](7);
+        uint256[] memory publicInputs = new uint256[](8);
 
         vm.prank(prover1);
         vm.expectRevert("Invalid round");
@@ -228,7 +245,7 @@ contract HelixCoordinatorV2Test is Test {
         vm.warp(block.timestamp + ROUND_DURATION + 1);
 
         bytes memory proof = new bytes(320);
-        uint256[] memory publicInputs = new uint256[](7);
+        uint256[] memory publicInputs = new uint256[](8);
 
         vm.prank(prover1);
         vm.expectRevert("Round expired");
@@ -258,7 +275,7 @@ contract HelixCoordinatorV2Test is Test {
 
         // Submit invalid proof to get slashed (no revert expected)
         bytes memory invalidProof = hex"deadbeef";
-        uint256[] memory publicInputs = new uint256[](7);
+        uint256[] memory publicInputs = new uint256[](8);
         publicInputs[0] = oldHashLo;
         publicInputs[1] = oldHashHi;
         publicInputs[2] = 3;
@@ -266,6 +283,7 @@ contract HelixCoordinatorV2Test is Test {
         publicInputs[4] = 100;
         publicInputs[5] = 10;
         publicInputs[6] = 1;
+        publicInputs[7] = _computeErrorChecksum(10, 1, modelId, coordinator.maxErrorBound());
 
         vm.prank(prover1);
         coordinator.submitProof(modelId, 1, invalidProof, publicInputs);
@@ -324,7 +342,7 @@ contract HelixCoordinatorV2Test is Test {
 
         // Trigger slashing with matching commitment (no revert expected)
         bytes memory invalidProof = hex"deadbeef";
-        uint256[] memory publicInputs = new uint256[](7);
+        uint256[] memory publicInputs = new uint256[](8);
         publicInputs[0] = oldHashLo;
         publicInputs[1] = oldHashHi;
         publicInputs[2] = 3;
@@ -332,6 +350,7 @@ contract HelixCoordinatorV2Test is Test {
         publicInputs[4] = 100;
         publicInputs[5] = 10;
         publicInputs[6] = 1;
+        publicInputs[7] = _computeErrorChecksum(10, 1, modelId, coordinator.maxErrorBound());
 
         vm.prank(prover1);
         coordinator.submitProof(modelId, 1, invalidProof, publicInputs);
