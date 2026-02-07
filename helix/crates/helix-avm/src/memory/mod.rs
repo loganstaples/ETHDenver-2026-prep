@@ -39,12 +39,14 @@
 //! let checkpointer = GradientCheckpointer::new(CheckpointStrategy::SqrtN);
 //! ```
 
+pub mod arena;
 pub mod budget;
 pub mod chunked_loading;
 pub mod gradient_checkpoint;
 pub mod profiler;
 
 // Re-export commonly used types
+pub use arena::{ArenaSlice, TensorArena, with_arena};
 pub use budget::{AllocationError, MemoryBudget, MemoryRegion, MemoryTracker};
 pub use chunked_loading::{
     ChunkConfig, ChunkIterator, ChunkedTensor, ChunkedWeightLoader, WeightChunk,

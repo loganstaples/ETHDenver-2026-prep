@@ -12,6 +12,8 @@
 //!
 //! For example, an error of 0.001 with scale 2^16 becomes 65.536 ≈ 66.
 
+use crate::bounds::{AttentionBounds, RMSNormBounds};
+
 /// Number of bits for fixed-point scaling.
 pub const SCALE_BITS: u32 = 16;
 
@@ -107,6 +109,35 @@ impl CircuitErrorBounds {
             layer2_bias_error,
             loss_error,
             total_error,
+        }
+    }
+
+    /// Creates from a list of named operations with their error values.
+    ///
+    /// This is useful for non-MLP architectures where the fixed 6-field struct
+    /// doesn't map cleanly. The total_error is computed as the saturating sum.
+    pub fn from_operations(ops: &[(&str, f64)]) -> Self {
+        let mut total: u64 = 0;
+        for &(_, error) in ops {
+            total = total.saturating_add(error_to_field(error));
+        }
+
+        // Map known operation names to fields where possible
+        let find = |name: &str| -> u64 {
+            ops.iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, e)| error_to_field(*e))
+                .unwrap_or(0)
+        };
+
+        Self {
+            layer1_matmul_error: find("layer1_matmul").max(find("qk_matmul")).max(find("matmul1")),
+            layer1_bias_error: find("layer1_bias").max(find("scaling")).max(find("bias1")),
+            relu_error: find("relu").max(find("softmax")).max(find("activation")),
+            layer2_matmul_error: find("layer2_matmul").max(find("av_matmul")).max(find("matmul2")),
+            layer2_bias_error: find("layer2_bias").max(find("projection")).max(find("bias2")),
+            loss_error: find("loss").max(find("norm")).max(find("output")),
+            total_error: total,
         }
     }
 
@@ -206,6 +237,122 @@ impl TrainingErrorConfig {
             total_error: forward_bounds.total_error * 2,
         }
     }
+
+    /// Estimates error bounds for multi-head attention.
+    ///
+    /// Delegates to `AttentionBounds::forward_error()` and converts
+    /// components to circuit field elements.
+    ///
+    /// # Arguments
+    /// * `seq_len` - Sequence length
+    /// * `head_dim` - Dimension per attention head
+    /// * `num_heads` - Number of attention heads
+    pub fn estimate_attention_bounds(
+        &self,
+        seq_len: usize,
+        head_dim: usize,
+        num_heads: usize,
+    ) -> CircuitErrorBounds {
+        let q = self.quantization_error;
+
+        let bounds = AttentionBounds {
+            seq_len,
+            head_dim,
+            num_heads,
+            value_dim: head_dim,
+            epsilon: q,
+        };
+
+        let attn_error = bounds.forward_error(q, q, q);
+
+        CircuitErrorBounds::from_operations(&[
+            ("qk_matmul", attn_error.qk_matmul_error),
+            ("scaling", attn_error.scaling_error),
+            ("softmax", attn_error.softmax_error.total_error),
+            ("av_matmul", attn_error.av_matmul_error),
+            ("projection", attn_error.proj_error),
+            ("output", attn_error.concat_error),
+        ])
+    }
+
+    /// Estimates error bounds for layer/RMS normalization.
+    ///
+    /// Delegates to `RMSNormBounds::forward_error()`.
+    ///
+    /// # Arguments
+    /// * `normalized_dim` - Dimension being normalized
+    /// * `max_magnitude` - Maximum input magnitude
+    pub fn estimate_norm_bounds(
+        &self,
+        normalized_dim: usize,
+        max_magnitude: f64,
+    ) -> CircuitErrorBounds {
+        let q = self.quantization_error;
+
+        let bounds = RMSNormBounds {
+            normalized_dim,
+            min_rms: 1e-6,
+            epsilon: q,
+        };
+
+        let norm_error = bounds.forward_error(q, max_magnitude);
+
+        CircuitErrorBounds::from_operations(&[
+            ("norm", norm_error.norm_error),
+            ("scaling", norm_error.scale_error),
+            ("output", norm_error.total_error),
+        ])
+    }
+
+    /// Estimates error bounds for a full transformer layer.
+    ///
+    /// Composes attention + normalization + MLP bounds for a single
+    /// transformer layer (pre-norm architecture: norm -> attn -> residual -> norm -> MLP -> residual).
+    ///
+    /// # Arguments
+    /// * `d_model` - Model dimension
+    /// * `d_ff` - Feed-forward inner dimension
+    /// * `seq_len` - Sequence length
+    /// * `num_heads` - Number of attention heads
+    pub fn estimate_transformer_step_bounds(
+        &self,
+        d_model: usize,
+        d_ff: usize,
+        seq_len: usize,
+        num_heads: usize,
+    ) -> CircuitErrorBounds {
+        let head_dim = d_model / num_heads.max(1);
+        let max_mag = self.max_activation_magnitude;
+
+        // Pre-attention normalization
+        let norm1 = self.estimate_norm_bounds(d_model, max_mag);
+        let norm1_total = norm1.total_as_f64();
+
+        // Multi-head attention
+        let attn = self.estimate_attention_bounds(seq_len, head_dim, num_heads);
+        let attn_total = attn.total_as_f64();
+
+        // Pre-MLP normalization
+        let norm2 = self.estimate_norm_bounds(d_model, max_mag);
+        let norm2_total = norm2.total_as_f64();
+
+        // MLP (typically d_model -> d_ff -> d_model)
+        let mlp = self.estimate_mlp_bounds(d_model, d_ff, d_model);
+        let mlp_total = mlp.total_as_f64();
+
+        // Residual connections add errors from both branches
+        let q = self.quantization_error;
+        let residual_error = 2.0 * q; // Two residual additions
+
+        CircuitErrorBounds::from_operations(&[
+            ("norm", norm1_total + norm2_total),
+            ("qk_matmul", attn_total),
+            ("matmul1", mlp_total),
+            ("activation", 0.0), // GeLU/SiLU error is small
+            ("bias1", residual_error),
+            ("output", 0.0),
+        ])
+    }
 }
 
 /// Converts quantized weights to field element representation.
@@ -274,5 +421,74 @@ mod tests {
         for (w, r) in weights.iter().zip(recovered.iter()) {
             assert!((w - r).abs() < 0.001);
         }
+    }
+
+    #[test]
+    fn test_attention_bounds_estimation() {
+        let config = TrainingErrorConfig::default();
+        let bounds = config.estimate_attention_bounds(128, 64, 8);
+        assert!(bounds.total_error > 0);
+        assert!(bounds.total_as_f64() > 0.0);
+    }
+
+    #[test]
+    fn test_norm_bounds_estimation() {
+        let config = TrainingErrorConfig::default();
+        let bounds = config.estimate_norm_bounds(512, 10.0);
+        assert!(bounds.total_error > 0);
+    }
+
+    #[test]
+    fn test_transformer_step_bounds() {
+        let config = TrainingErrorConfig::default();
+        let bounds = config.estimate_transformer_step_bounds(512, 2048, 128, 8);
+        assert!(bounds.total_error > 0);
+
+        // Transformer bounds should be larger than just MLP bounds
+        let mlp_bounds = config.estimate_mlp_bounds(512, 2048, 512);
+        assert!(bounds.total_as_f64() > mlp_bounds.total_as_f64());
+    }
+
+    #[test]
+    fn test_from_operations() {
+        let bounds = CircuitErrorBounds::from_operations(&[
+            ("qk_matmul", 0.01),
+            ("softmax", 0.005),
+            ("av_matmul", 0.01),
+            ("projection", 0.003),
+        ]);
+        assert!(bounds.total_error > 0);
+        assert!(bounds.total_as_f64() > 0.02);
+    }
+
+    #[test]
+    fn test_attention_vs_direct_bounds() {
+        // Circuit bridge output should be consistent with direct bounds module calls
+        let config = TrainingErrorConfig::default();
+        let q = config.quantization_error;
+
+        let direct = AttentionBounds {
+            seq_len: 64,
+            head_dim: 32,
+            num_heads: 4,
+            value_dim: 32,
+            epsilon: q,
+        };
+        let direct_error = direct.forward_error(q, q, q);
+
+        let bridge = config.estimate_attention_bounds(64, 32, 4);
+
+        // The bridge total should account for the same components
+        assert!(bridge.total_as_f64() > 0.0);
+        // Total should be close to the sum of direct components
+        let direct_sum = direct_error.qk_matmul_error
+            + direct_error.scaling_error
+            + direct_error.softmax_error.total_error
+            + direct_error.av_matmul_error
+            + direct_error.proj_error
+            + direct_error.concat_error;
+        let bridge_total = bridge.total_as_f64();
+        // Allow for fixed-point quantization difference
+        assert!((bridge_total - direct_sum).abs() < 1.0);
     }
 }

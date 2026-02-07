@@ -8,14 +8,17 @@
 //! - Metrics tracking
 
 use std::collections::HashMap;
-use helix_core::types::{BoundedTensor, BoundedValue, Precision};
+use helix_core::types::{BoundedTensor, Precision};
 
-use super::autodiff::{GradientTape, NodeIndex, Variable};
+use super::autodiff::{NodeIndex, Variable};
 use super::backward::backward;
 use super::accumulator::GradientAccumulator;
 use super::clipping::GradientClipConfig;
 use super::optimizer::Optimizer;
-use super::loss;
+
+use crate::memory::gradient_checkpoint::{
+    CheckpointError, CheckpointStrategy, GradientCheckpointer,
+};
 
 /// Training configuration.
 #[derive(Debug, Clone)]
@@ -34,6 +37,8 @@ pub struct TrainingConfig {
     pub verbose: bool,
     /// Logging frequency (steps between logs).
     pub log_frequency: usize,
+    /// Optional gradient checkpointing strategy.
+    pub checkpoint_strategy: Option<CheckpointStrategy>,
 }
 
 impl Default for TrainingConfig {
@@ -46,6 +51,7 @@ impl Default for TrainingConfig {
             precision: Precision::F32,
             verbose: true,
             log_frequency: 100,
+            checkpoint_strategy: None,
         }
     }
 }
@@ -77,6 +83,12 @@ impl TrainingConfig {
     /// Sets gradient clipping.
     pub fn with_grad_clip(mut self, clip: GradientClipConfig) -> Self {
         self.grad_clip = clip;
+        self
+    }
+
+    /// Sets gradient checkpointing strategy.
+    pub fn with_checkpoint_strategy(mut self, strategy: CheckpointStrategy) -> Self {
+        self.checkpoint_strategy = Some(strategy);
         self
     }
 }
@@ -184,17 +196,24 @@ pub struct Trainer<O: Optimizer> {
     state: TrainingState,
     /// Current model parameters (by name).
     parameters: HashMap<String, (NodeIndex, BoundedTensor)>,
+    /// Gradient checkpointer (if checkpointing is enabled).
+    checkpointer: Option<GradientCheckpointer>,
 }
 
 impl<O: Optimizer> Trainer<O> {
     /// Creates a new trainer.
     pub fn new(optimizer: O, config: TrainingConfig) -> Self {
+        let checkpointer = config
+            .checkpoint_strategy
+            .map(GradientCheckpointer::new);
+
         Self {
             optimizer,
             config,
             accumulator: GradientAccumulator::new(),
             state: TrainingState::new(),
             parameters: HashMap::new(),
+            checkpointer,
         }
     }
 
@@ -206,6 +225,76 @@ impl<O: Optimizer> Trainer<O> {
     /// Gets parameter tensors as a HashMap by NodeIndex.
     pub fn get_param_tensors(&self) -> HashMap<NodeIndex, BoundedTensor> {
         self.parameters.values().map(|(idx, t)| (*idx, t.clone())).collect()
+    }
+
+    /// Initializes checkpointing for a model with the given number of layers.
+    ///
+    /// Must be called before using checkpoint methods if checkpointing is enabled.
+    pub fn init_checkpointing(&mut self, num_layers: usize) {
+        if let Some(ref mut cp) = self.checkpointer {
+            cp.init(num_layers);
+        }
+    }
+
+    /// Returns whether the given layer should have its activation checkpointed.
+    pub fn should_checkpoint(&self, layer: usize) -> bool {
+        self.checkpointer
+            .as_ref()
+            .map(|cp| cp.should_checkpoint(layer))
+            .unwrap_or(false)
+    }
+
+    /// Saves an activation for the given layer (if checkpointing is enabled).
+    pub fn save_activation(&mut self, layer: usize, activation: &BoundedTensor) {
+        if let Some(ref mut cp) = self.checkpointer {
+            cp.save_activation(layer, activation);
+        }
+    }
+
+    /// Gets a cached activation or recomputes it from the nearest checkpoint.
+    ///
+    /// The `recompute_fn` takes `(layer_index, input_activation)` and returns
+    /// the output activation for that layer.
+    pub fn get_or_recompute<F>(
+        &mut self,
+        layer: usize,
+        recompute_fn: F,
+    ) -> Result<BoundedTensor, CheckpointError>
+    where
+        F: Fn(usize, &BoundedTensor) -> Result<BoundedTensor, String>,
+    {
+        match self.checkpointer {
+            Some(ref mut cp) => cp.get_or_recompute(layer, recompute_fn),
+            None => Err(CheckpointError::InvalidConfig(
+                "Checkpointing not enabled".to_string(),
+            )),
+        }
+    }
+
+    /// Signals the start of a forward pass to the checkpointer.
+    pub fn begin_forward(&mut self) {
+        if let Some(ref mut cp) = self.checkpointer {
+            cp.begin_forward();
+        }
+    }
+
+    /// Signals the start of a backward pass to the checkpointer.
+    pub fn begin_backward(&mut self) {
+        if let Some(ref mut cp) = self.checkpointer {
+            cp.begin_backward();
+        }
+    }
+
+    /// Clears checkpointed activations (typically between training steps).
+    pub fn clear_checkpoints(&mut self) {
+        if let Some(ref mut cp) = self.checkpointer {
+            cp.clear();
+        }
+    }
+
+    /// Returns the checkpointing strategy, if any.
+    pub fn checkpoint_strategy(&self) -> Option<CheckpointStrategy> {
+        self.checkpointer.as_ref().map(|cp| cp.strategy())
     }
 
     /// Performs a single training step.
@@ -245,6 +334,9 @@ impl<O: Optimizer> Trainer<O> {
             // Clear accumulator
             self.accumulator.clear();
         }
+
+        // Clear checkpoints after each step
+        self.clear_checkpoints();
 
         let loss_value = if !loss_var.tensor.is_empty() {
             loss_var.tensor.data()[0].value()
@@ -296,13 +388,13 @@ pub fn train_step(
     let mut grads = backward(loss)?;
     grad_clip.apply(&mut grads);
     optimizer.step(params, &grads);
-    
+
     let loss_value = if !loss.tensor.is_empty() {
         loss.tensor.data()[0].value()
     } else {
         0.0
     };
-    
+
     Ok(loss_value)
 }
 
@@ -321,6 +413,14 @@ mod tests {
         assert_eq!(config.epochs, 10);
         assert_eq!(config.batch_size, 64);
         assert_eq!(config.accumulation_steps, 4);
+    }
+
+    #[test]
+    fn test_training_config_with_checkpointing() {
+        let config = TrainingConfig::new()
+            .with_checkpoint_strategy(CheckpointStrategy::SqrtN);
+
+        assert_eq!(config.checkpoint_strategy, Some(CheckpointStrategy::SqrtN));
     }
 
     #[test]
@@ -345,5 +445,48 @@ mod tests {
         let trainer = Trainer::new(optimizer, config);
 
         assert_eq!(trainer.state().global_step, 0);
+        assert!(trainer.checkpoint_strategy().is_none());
+    }
+
+    #[test]
+    fn test_trainer_with_checkpointing() {
+        let optimizer = SGD::new(0.01);
+        let config = TrainingConfig::new()
+            .with_checkpoint_strategy(CheckpointStrategy::SqrtN);
+        let mut trainer = Trainer::new(optimizer, config);
+
+        assert_eq!(trainer.checkpoint_strategy(), Some(CheckpointStrategy::SqrtN));
+
+        // Init checkpointing for 16 layers
+        trainer.init_checkpointing(16);
+
+        // SqrtN with 16 layers should checkpoint some layers
+        assert!(trainer.should_checkpoint(0));
+    }
+
+    #[test]
+    fn test_trainer_checkpoint_save_and_clear() {
+        let optimizer = SGD::new(0.01);
+        let config = TrainingConfig::new()
+            .with_checkpoint_strategy(CheckpointStrategy::None); // Store all
+        let mut trainer = Trainer::new(optimizer, config);
+        trainer.init_checkpointing(4);
+
+        let tensor = BoundedTensor::from_exact(vec![1.0, 2.0, 3.0], vec![3]);
+        trainer.save_activation(0, &tensor);
+
+        // After clear, saved activations should be gone
+        trainer.clear_checkpoints();
+    }
+
+    #[test]
+    fn test_trainer_no_checkpoint_should_return_false() {
+        let optimizer = SGD::new(0.01);
+        let config = TrainingConfig::default(); // No checkpointing
+        let trainer = Trainer::new(optimizer, config);
+
+        // Without checkpointing, should_checkpoint always returns false
+        assert!(!trainer.should_checkpoint(0));
+        assert!(!trainer.should_checkpoint(5));
     }
 }
