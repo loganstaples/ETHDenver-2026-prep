@@ -1232,12 +1232,17 @@ impl S3DataSource {
     // ========================================================================
 
     /// Internal fetch implementation.
+    ///
+    /// Checks mock storage first. When the `s3-fetch` feature is enabled and
+    /// credentials are configured, falls back to real HTTP GET via presigned URL
+    /// with retry and SHA-256 verification.
     async fn fetch_internal(
         &self,
         id: &str,
         range: Option<(u64, u64)>,
         verify_hash: Option<Hash>,
     ) -> DataSourceResult<Vec<u8>> {
+        // Check mock/local storage first
         if let Some(mock) = self.mock_storage.get(id) {
             let data = if let Some((start, end)) = range {
                 let start = start as usize;
@@ -1260,10 +1265,194 @@ impl S3DataSource {
             return Ok(data);
         }
 
+        // Real HTTP fetch when s3-fetch feature is enabled
+        #[cfg(feature = "s3-fetch")]
+        {
+            if self.config.access_key_id.is_some() && self.config.secret_access_key.is_some() {
+                return self.fetch_real_http(id, range, verify_hash).await;
+            }
+        }
+
         Err(DataSourceError::NotFound(format!(
             "s3://{}/{}",
             self.config.bucket, id
         )))
+    }
+
+    /// Real HTTP fetch via presigned URL with retry and integrity verification.
+    #[cfg(feature = "s3-fetch")]
+    async fn fetch_real_http(
+        &self,
+        id: &str,
+        range: Option<(u64, u64)>,
+        verify_hash: Option<Hash>,
+    ) -> DataSourceResult<Vec<u8>> {
+        let presigned = self.presigned_url_with_config(
+            id,
+            &PresignedUrlConfig::for_download(300),
+        );
+
+        let max_retries = self.config.max_retries;
+        let timeout_secs = self.config.timeout_secs;
+        let mut last_error = None;
+
+        for attempt in 0..=max_retries {
+            match Self::do_http_get(&presigned.url, range, timeout_secs).await {
+                Ok(data) => {
+                    // SHA-256 content verification
+                    if let Some(expected) = verify_hash {
+                        let actual = Sha256Hasher.hash_leaf(&data);
+                        if actual != expected {
+                            return Err(DataSourceError::IntegrityError {
+                                expected,
+                                actual,
+                            });
+                        }
+                    }
+                    return Ok(data);
+                }
+                Err(e) => {
+                    last_error = Some(e);
+                    if attempt < max_retries {
+                        // Exponential backoff: 100ms, 200ms, 400ms, ...
+                        let delay_ms = 100u64 * (1u64 << attempt);
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            DataSourceError::NotFound(format!("s3://{}/{}", self.config.bucket, id))
+        }))
+    }
+
+    /// Performs a single HTTP GET request via reqwest.
+    #[cfg(feature = "s3-fetch")]
+    async fn do_http_get(
+        url: &str,
+        range: Option<(u64, u64)>,
+        timeout_secs: u64,
+    ) -> DataSourceResult<Vec<u8>> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .build()
+            .map_err(|e| DataSourceError::ConnectionFailed(format!("HTTP client error: {}", e)))?;
+
+        let mut request = client.get(url);
+
+        if let Some((start, end)) = range {
+            request = request.header("Range", format!("bytes={}-{}", start, end - 1));
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    DataSourceError::Timeout {
+                        operation: "S3 GET".to_string(),
+                        seconds: timeout_secs,
+                    }
+                } else {
+                    DataSourceError::ConnectionFailed(format!("S3 GET failed: {}", e))
+                }
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(DataSourceError::ConnectionFailed(format!(
+                "S3 returned HTTP {}",
+                status.as_u16()
+            )));
+        }
+
+        response
+            .bytes()
+            .await
+            .map(|b| b.to_vec())
+            .map_err(|e| DataSourceError::ConnectionFailed(format!("Failed to read body: {}", e)))
+    }
+
+    /// Real HTTP upload via presigned PUT URL with retry.
+    #[cfg(feature = "s3-fetch")]
+    async fn upload_real_http(
+        &self,
+        key: &str,
+        data: &[u8],
+        content_type: Option<&str>,
+    ) -> DataSourceResult<String> {
+        let presigned = self.presigned_upload_url(
+            key,
+            300,
+            content_type,
+            Some(data.len() as u64),
+        );
+
+        let max_retries = self.config.max_retries;
+        let timeout_secs = self.config.timeout_secs;
+        let mut last_error = None;
+
+        for attempt in 0..=max_retries {
+            match Self::do_http_put(&presigned.url, data, &presigned.headers, timeout_secs).await {
+                Ok(()) => return Ok(key.to_string()),
+                Err(e) => {
+                    last_error = Some(e);
+                    if attempt < max_retries {
+                        let delay_ms = 100u64 * (1u64 << attempt);
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            DataSourceError::ConnectionFailed("S3 PUT failed after retries".to_string())
+        }))
+    }
+
+    /// Performs a single HTTP PUT request via reqwest.
+    #[cfg(feature = "s3-fetch")]
+    async fn do_http_put(
+        url: &str,
+        data: &[u8],
+        headers: &HashMap<String, String>,
+        timeout_secs: u64,
+    ) -> DataSourceResult<()> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .build()
+            .map_err(|e| DataSourceError::ConnectionFailed(format!("HTTP client error: {}", e)))?;
+
+        let mut request = client.put(url).body(data.to_vec());
+
+        for (k, v) in headers {
+            request = request.header(k.as_str(), v.as_str());
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    DataSourceError::Timeout {
+                        operation: "S3 PUT".to_string(),
+                        seconds: timeout_secs,
+                    }
+                } else {
+                    DataSourceError::ConnectionFailed(format!("S3 PUT failed: {}", e))
+                }
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(DataSourceError::ConnectionFailed(format!(
+                "S3 PUT returned HTTP {}",
+                status.as_u16()
+            )));
+        }
+
+        Ok(())
     }
 }
 
@@ -1399,6 +1588,17 @@ impl WritableDataSource for S3DataSource {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let key = format!("upload/{}/{}", timestamp, &hash.to_hex()[..16]);
+
+        #[cfg(feature = "s3-fetch")]
+        {
+            if self.config.access_key_id.is_some() && self.config.secret_access_key.is_some() {
+                let data = data.to_vec();
+                let key_clone = key.clone();
+                return Box::pin(async move {
+                    self.upload_real_http(&key_clone, &data, None).await
+                });
+            }
+        }
 
         Box::pin(async move { Ok(key) })
     }
@@ -2143,5 +2343,92 @@ mod tests {
             .build();
 
         assert_eq!(source.config().multipart_threshold, 50 * 1024 * 1024);
+    }
+
+    // ========== S3 Real Fetch Tests (feature-gated) ==========
+
+    #[test]
+    fn test_presigned_url_generation_for_real_fetch() {
+        // Validates that presigned URLs are correctly constructed for real HTTP
+        let source = S3DataSource::with_credentials(
+            "ml-training-data",
+            "us-west-2",
+            "AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        );
+
+        let presigned = source.presigned_url_with_config(
+            "datasets/cifar10/batch_001.bin",
+            &PresignedUrlConfig::for_download(300),
+        );
+
+        // Verify URL contains all required SigV4 components
+        assert!(presigned.url.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"));
+        assert!(presigned.url.contains("X-Amz-Credential"));
+        assert!(presigned.url.contains("X-Amz-Signature"));
+        assert!(presigned.url.contains("X-Amz-Expires=300"));
+        assert_eq!(presigned.method, "GET");
+        assert!(presigned.expires_at > 0);
+    }
+
+    #[test]
+    fn test_presigned_upload_url_construction() {
+        let source = S3DataSource::with_credentials(
+            "ml-models",
+            "us-east-1",
+            "AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        );
+
+        let presigned = source.presigned_upload_url(
+            "checkpoints/model_v2.bin",
+            300,
+            Some("application/octet-stream"),
+            Some(1024 * 1024),
+        );
+
+        assert_eq!(presigned.method, "PUT");
+        assert!(presigned.url.contains("X-Amz-Signature"));
+        assert!(presigned.headers.contains_key("Content-Type"));
+        assert_eq!(
+            presigned.headers.get("Content-Length"),
+            Some(&"1048576".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_internal_falls_back_to_mock() {
+        // Without s3-fetch feature or without credentials, fetch uses mock storage
+        let mut source = S3DataSource::new(S3Config::aws("test-bucket", "us-east-1"));
+        source.store_mock("data/file.bin", b"test data".to_vec());
+
+        let result = source.fetch_internal("data/file.bin", None, None).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), b"test data");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_internal_not_found_without_feature() {
+        // Without credentials, non-mock keys return NotFound
+        let source = S3DataSource::new(S3Config::aws("test-bucket", "us-east-1"));
+        let result = source.fetch_internal("nonexistent", None, None).await;
+        assert!(matches!(result, Err(DataSourceError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_internal_integrity_check() {
+        let mut source = S3DataSource::new(S3Config::aws("test-bucket", "us-east-1"));
+        let data = b"integrity test data".to_vec();
+        let hash = Sha256Hasher.hash_leaf(&data);
+        source.store_mock("verified.bin", data.clone());
+
+        // Correct hash passes
+        let result = source.fetch_internal("verified.bin", None, Some(hash)).await;
+        assert!(result.is_ok());
+
+        // Wrong hash fails
+        let wrong_hash = Sha256Hasher.hash_leaf(b"wrong");
+        let result = source.fetch_internal("verified.bin", None, Some(wrong_hash)).await;
+        assert!(matches!(result, Err(DataSourceError::IntegrityError { .. })));
     }
 }

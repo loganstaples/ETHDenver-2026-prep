@@ -20,6 +20,7 @@ ed25519-dalek = { version = "2.1", optional = true }
 [features]
 default = []
 ipfs-fetch = ["reqwest"]
+s3-fetch = ["reqwest"]
 crypto-verify = ["ed25519-dalek"]
 
 [dev-dependencies]

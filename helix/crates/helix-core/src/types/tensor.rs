@@ -1788,12 +1788,17 @@ impl BoundedTensor {
         let output_size = batch * out_channels * out_height * out_width;
         let mut output_data = Vec::with_capacity(output_size);
 
-        // Perform convolution
+        // Perform convolution with statistical error scaling.
+        // Each output position accumulates k independent product errors. Under
+        // a statistical independence assumption (same as MatrixErrorPropagation),
+        // the combined error scales as sqrt(k) rather than k, giving much
+        // tighter bounds for large kernels.
         for b in 0..batch {
             for oc in 0..out_channels {
                 for oh in 0..out_height {
                     for ow in 0..out_width {
                         let mut sum = BoundedValue::exact(0.0);
+                        let mut product_count: usize = 0;
 
                         for ic in 0..in_channels {
                             for kh_idx in 0..kh {
@@ -1828,8 +1833,17 @@ impl BoundedTensor {
 
                                     // Multiply and accumulate
                                     sum = sum.saturating_add(input_val.saturating_mul(kernel_val));
+                                    product_count += 1;
                                 }
                             }
+                        }
+
+                        // Apply sqrt(k) statistical error scaling.
+                        // Value is exact (sum of products), only error is rescaled.
+                        if product_count > 1 {
+                            let k = product_count as f64;
+                            let scaled_error = sum.absolute_error() / k.sqrt();
+                            sum = BoundedValue::new(sum.value(), ErrorMargin::absolute(scaled_error));
                         }
 
                         output_data.push(sum);
@@ -2027,7 +2041,7 @@ impl PartialEq for BoundedTensor {
 // PROVABLE TRAIT IMPLEMENTATION
 // =============================================================================
 
-use crate::traits::{Provable, Witness};
+use crate::traits::{BatchError, BatchProvable, BatchWitness, Provable, Witness};
 
 /// Witness for a BoundedTensor, containing quantized values and error bounds.
 #[derive(Debug, Clone)]
@@ -2165,6 +2179,67 @@ impl BoundedTensor {
             prime_power = prime_power.wrapping_mul(PRIME);
         }
         hash
+    }
+}
+
+impl BatchProvable for BoundedTensor {
+    /// Generates a batch witness from multiple tensors of the same shape.
+    ///
+    /// The common section contains the shared shape (written once). Each item
+    /// section contains that tensor's quantized values and error bounds.
+    fn generate_batch_witness(items: &[Self]) -> Result<BatchWitness, BatchError> {
+        if items.is_empty() {
+            return Err(BatchError::EmptyBatch);
+        }
+
+        let reference_shape: Vec<u64> = items[0].shape().iter().map(|&s| s as u64).collect();
+
+        // Validate all tensors have the same shape
+        for (i, item) in items.iter().enumerate().skip(1) {
+            let item_shape: Vec<u64> = item.shape().iter().map(|&s| s as u64).collect();
+            if item_shape != reference_shape {
+                return Err(BatchError::ShapeMismatch {
+                    expected: reference_shape,
+                    actual: item_shape,
+                    index: i,
+                });
+            }
+        }
+
+        // Common: ndims + shape dimensions
+        let mut common = Vec::with_capacity(1 + reference_shape.len());
+        common.push(reference_shape.len() as u64);
+        common.extend(&reference_shape);
+
+        // Per-item: quantized values + error bounds
+        let batch_items: Vec<Vec<u64>> = items
+            .iter()
+            .map(|tensor| {
+                let witness = TensorWitness::from_tensor(tensor);
+                let mut item_data = Vec::with_capacity(witness.values.len() * 2);
+                item_data.extend(&witness.values);
+                item_data.extend(&witness.error_bounds);
+                item_data
+            })
+            .collect();
+
+        Ok(BatchWitness::new(common, batch_items))
+    }
+
+    /// Returns combined public inputs for a batch.
+    ///
+    /// Format: [batch_size, shape_hash, item_0_num_elements, item_0_max_error, ...]
+    fn batch_public_inputs(items: &[Self]) -> Vec<u64> {
+        let mut inputs = Vec::with_capacity(2 + items.len() * 2);
+        inputs.push(items.len() as u64);
+        if let Some(first) = items.first() {
+            inputs.push(Self::shape_hash(first.shape()));
+        }
+        for item in items {
+            inputs.push(item.len() as u64);
+            inputs.push(TensorWitness::quantize(item.max_error()));
+        }
+        inputs
     }
 }
 
@@ -2742,6 +2817,98 @@ mod tests {
     }
 
     // =========================================================================
+    // BATCH WITNESS TESTS
+    // =========================================================================
+
+    #[test]
+    fn test_batch_witness_common_matches_single() {
+        use crate::traits::{BatchProvable, Provable, Witness};
+
+        let t1 = BoundedTensor::from_approximate(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], 0.01);
+        let t2 = BoundedTensor::from_approximate(vec![5.0, 6.0, 7.0, 8.0], vec![2, 2], 0.02);
+
+        let batch = BoundedTensor::generate_batch_witness(&[t1.clone(), t2]).unwrap();
+
+        // Common section should have ndims(=2) + shape [2, 2]
+        assert_eq!(batch.common[0], 2); // ndims
+        assert_eq!(batch.common[1], 2); // dim 0
+        assert_eq!(batch.common[2], 2); // dim 1
+
+        // Should match single witness shape section
+        let single_witness = t1.generate_witness();
+        let single_elements = single_witness.to_field_elements();
+        assert_eq!(single_elements[0], batch.common[0]); // ndims
+        assert_eq!(single_elements[1], batch.common[1]); // shape dim 0
+    }
+
+    #[test]
+    fn test_batch_witness_smaller_than_individual() {
+        use crate::traits::{BatchProvable, Provable, Witness};
+
+        let tensors: Vec<BoundedTensor> = (0..32)
+            .map(|i| {
+                BoundedTensor::from_approximate(
+                    vec![i as f64; 100],
+                    vec![10, 10],
+                    0.01,
+                )
+            })
+            .collect();
+
+        // Individual witnesses total size
+        let individual_total: usize = tensors
+            .iter()
+            .map(|t| t.generate_witness().to_field_elements().len())
+            .sum();
+
+        // Batch witness total size
+        let batch = BoundedTensor::generate_batch_witness(&tensors).unwrap();
+        let batch_total = batch.to_field_elements().len();
+
+        // Batch should be smaller: eliminates 31 redundant shape sections
+        assert!(
+            batch_total < individual_total,
+            "Batch ({}) should be smaller than individual ({})",
+            batch_total,
+            individual_total
+        );
+    }
+
+    #[test]
+    fn test_batch_witness_shape_mismatch() {
+        use crate::traits::BatchProvable;
+
+        let t1 = BoundedTensor::from_approximate(vec![1.0, 2.0], vec![2], 0.01);
+        let t2 = BoundedTensor::from_approximate(vec![1.0, 2.0, 3.0], vec![3], 0.01);
+
+        let result = BoundedTensor::generate_batch_witness(&[t1, t2]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_batch_witness_empty() {
+        use crate::traits::BatchProvable;
+
+        let result = BoundedTensor::generate_batch_witness(&[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_batch_public_inputs() {
+        use crate::traits::BatchProvable;
+
+        let t1 = BoundedTensor::from_approximate(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], 0.01);
+        let t2 = BoundedTensor::from_approximate(vec![5.0, 6.0, 7.0, 8.0], vec![2, 2], 0.02);
+
+        let inputs = BoundedTensor::batch_public_inputs(&[t1, t2]);
+
+        // Format: [batch_size, shape_hash, elem_count_0, max_error_0, elem_count_1, max_error_1]
+        assert_eq!(inputs[0], 2); // batch size
+        assert_eq!(inputs[2], 4); // t1 num elements
+        assert_eq!(inputs[4], 4); // t2 num elements
+    }
+
+    // =========================================================================
     // ACTIVATION FUNCTION TESTS
     // =========================================================================
 
@@ -3006,6 +3173,71 @@ mod tests {
 
         // Error should accumulate through the convolution
         assert!(output.max_error() > input.max_error());
+    }
+
+    #[test]
+    fn test_conv2d_statistical_error_scaling() {
+        // With sqrt(k) scaling, a 7x7 kernel (k=49) should produce tighter
+        // error bounds than linear accumulation would predict.
+        // Linear: error ~ 49 * per_product_error
+        // Statistical: error ~ sqrt(49) * per_product_error = 7 * per_product_error
+        let base_error = 0.01;
+        let input = BoundedTensor::from_approximate(
+            vec![1.0; 81], // 9x9 input
+            vec![1, 1, 9, 9],
+            base_error,
+        );
+
+        // 3x3 kernel: k = 9 products per output
+        let kernel_3x3 = BoundedTensor::from_approximate(
+            vec![0.5; 9],
+            vec![1, 1, 3, 3],
+            base_error,
+        );
+        let out_3x3 = input.conv2d(&kernel_3x3, 1, 0).unwrap();
+
+        // 7x7 kernel: k = 49 products per output
+        let kernel_7x7 = BoundedTensor::from_approximate(
+            vec![0.5; 49],
+            vec![1, 1, 7, 7],
+            base_error,
+        );
+        let out_7x7 = input.conv2d(&kernel_7x7, 1, 0).unwrap();
+
+        // With sqrt(k) scaling, 7x7 error ratio vs 3x3 should be ~sqrt(49)/sqrt(9) = 7/3 ≈ 2.33
+        // Without sqrt scaling, it would be 49/9 ≈ 5.44
+        let ratio = out_7x7.max_error() / out_3x3.max_error();
+        assert!(
+            ratio < 4.0,
+            "Error ratio 7x7/3x3 should be ~2.3 (statistical), not ~5.4 (linear). Got: {:.2}",
+            ratio
+        );
+    }
+
+    #[test]
+    fn test_conv2d_error_scaling_single_product() {
+        // With k=1 (1x1 kernel), no scaling should be applied
+        let input = BoundedTensor::from_approximate(
+            vec![2.0; 4],
+            vec![1, 1, 2, 2],
+            0.01,
+        );
+        let kernel = BoundedTensor::from_approximate(
+            vec![3.0],
+            vec![1, 1, 1, 1],
+            0.01,
+        );
+
+        let output = input.conv2d(&kernel, 1, 0).unwrap();
+        // Error for single product: |a|*εb + |b|*εa + εa*εb = 2*0.01 + 3*0.01 + 0.01*0.01
+        let expected_error = 2.0 * 0.01 + 3.0 * 0.01 + 0.01 * 0.01;
+        let actual_error = output.get(&[0, 0, 0, 0]).unwrap().absolute_error();
+        assert!(
+            (actual_error - expected_error).abs() < 1e-10,
+            "Single-product error should match exact formula: expected {}, got {}",
+            expected_error,
+            actual_error
+        );
     }
 
     #[test]

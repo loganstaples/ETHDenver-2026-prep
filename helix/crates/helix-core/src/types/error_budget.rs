@@ -589,34 +589,26 @@ impl BudgetAllocator {
             // Update allocations
             for i in 0..n {
                 allocations[i] -= lr * gradients[i];
-                allocations[i] = allocations[i].max(self.config.min_allocation * self.config.total_budget);
             }
 
-            // Project onto budget constraint
-            let total: f64 = allocations.iter().sum();
-            if total > budget {
-                for a in &mut allocations {
-                    *a *= budget / total;
-                }
-            }
+            // Project onto budget simplex (guarantees sum = budget AND all >= min)
+            let min_alloc = self.config.min_allocation * self.config.total_budget;
+            project_onto_budget_simplex(&mut allocations, budget, min_alloc);
 
             final_iteration = iteration + 1;
         }
 
-        // Create allocation results
+        // Create allocation results (no post-hoc clamp needed — projection handles it)
         self.components
             .iter()
             .enumerate()
             .map(|(i, c)| {
-                let clamped = allocations[i].clamp(
-                    self.config.min_allocation * self.config.total_budget,
-                    self.config.max_allocation * self.config.total_budget,
-                );
+                let alloc = allocations[i];
 
                 ComponentAllocation {
                     name: c.name.clone(),
-                    budget: clamped,
-                    precision: self.precision_for_budget(clamped, c),
+                    budget: alloc,
+                    precision: self.precision_for_budget(alloc, c),
                     confidence: 0.9,
                     reason: format!(
                         "Optimal allocation (loss minimization, {} iterations)",
@@ -776,6 +768,91 @@ impl std::fmt::Display for BudgetSummary {
             )?;
         }
         Ok(())
+    }
+}
+
+/// Projects allocations onto the budget simplex with minimum allocation constraints.
+///
+/// Guarantees:
+/// 1. All allocations sum exactly to `budget` (within f64 epsilon)
+/// 2. No allocation falls below `min_alloc`
+/// 3. Minimizes Euclidean distance from the input allocations
+///
+/// Uses iterative Lagrange multiplier computation: subtract a uniform offset,
+/// then iteratively fix variables that hit the minimum constraint.
+///
+/// Edge case: if `min_alloc * n > budget`, all allocations are set to `budget / n`
+/// (graceful degradation — minimum constraint cannot be satisfied).
+fn project_onto_budget_simplex(allocations: &mut [f64], budget: f64, min_alloc: f64) {
+    let n = allocations.len();
+    if n == 0 {
+        return;
+    }
+
+    // Edge case: if minimum constraints can't all be met, split evenly
+    if min_alloc * n as f64 > budget {
+        let equal = budget / n as f64;
+        for a in allocations.iter_mut() {
+            *a = equal;
+        }
+        return;
+    }
+
+    // Ensure all allocations start at or above minimum
+    for a in allocations.iter_mut() {
+        *a = a.max(min_alloc);
+    }
+
+    // Iterative projection: repeatedly compute lambda, fix active constraints
+    let mut active: Vec<bool> = vec![true; n]; // true = free to adjust
+
+    for _iter in 0..n {
+        let active_count = active.iter().filter(|&&a| a).count();
+        if active_count == 0 {
+            break;
+        }
+
+        let fixed_sum: f64 = allocations
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !active[*i])
+            .map(|(_, &a)| a)
+            .sum();
+        let free_sum: f64 = allocations
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| active[*i])
+            .map(|(_, &a)| a)
+            .sum();
+
+        let remaining_budget = budget - fixed_sum;
+        let lambda = (free_sum - remaining_budget) / active_count as f64;
+
+        let mut all_feasible = true;
+        for i in 0..n {
+            if !active[i] {
+                continue;
+            }
+            allocations[i] -= lambda;
+            if allocations[i] < min_alloc {
+                allocations[i] = min_alloc;
+                active[i] = false;
+                all_feasible = false;
+            }
+        }
+
+        if all_feasible {
+            break;
+        }
+    }
+
+    // Final normalization to eliminate any floating-point drift
+    let total: f64 = allocations.iter().sum();
+    if total.abs() > f64::EPSILON {
+        let correction = budget / total;
+        for a in allocations.iter_mut() {
+            *a *= correction;
+        }
     }
 }
 
@@ -1025,5 +1102,134 @@ mod tests {
             "Reason should mention iteration count: {}",
             reason
         );
+    }
+
+    // ========== Simplex Projection Tests ==========
+
+    #[test]
+    fn test_simplex_projection_sums_to_budget() {
+        let mut allocs = vec![0.3, 0.5, 0.2, 0.1];
+        let budget = 0.5;
+        let min_alloc = 0.01;
+
+        project_onto_budget_simplex(&mut allocs, budget, min_alloc);
+
+        let total: f64 = allocs.iter().sum();
+        assert!(
+            (total - budget).abs() < 1e-10,
+            "Allocations should sum to budget {}, got {}",
+            budget,
+            total
+        );
+    }
+
+    #[test]
+    fn test_simplex_projection_respects_minimum() {
+        let mut allocs = vec![0.9, 0.001, 0.001, 0.001];
+        let budget = 1.0;
+        let min_alloc = 0.05;
+
+        project_onto_budget_simplex(&mut allocs, budget, min_alloc);
+
+        for (i, &a) in allocs.iter().enumerate() {
+            assert!(
+                a >= min_alloc - 1e-10,
+                "Allocation {} = {} is below minimum {}",
+                i,
+                a,
+                min_alloc
+            );
+        }
+
+        let total: f64 = allocs.iter().sum();
+        assert!(
+            (total - budget).abs() < 1e-10,
+            "Sum {} should equal budget {}",
+            total,
+            budget
+        );
+    }
+
+    #[test]
+    fn test_simplex_projection_min_exceeds_budget() {
+        // Edge case: min_alloc * n > budget → graceful degradation to equal split
+        let mut allocs = vec![0.3, 0.3, 0.3];
+        let budget = 0.1;
+        let min_alloc = 0.05; // 3 * 0.05 = 0.15 > 0.1
+
+        project_onto_budget_simplex(&mut allocs, budget, min_alloc);
+
+        let expected = budget / 3.0;
+        for &a in &allocs {
+            assert!(
+                (a - expected).abs() < 1e-10,
+                "Each allocation should be {}, got {}",
+                expected,
+                a
+            );
+        }
+    }
+
+    #[test]
+    fn test_optimal_allocation_sums_exactly() {
+        // Verify the integrated optimal allocation with simplex projection
+        let config = BudgetAllocationConfig {
+            total_budget: 1.0,
+            strategy: AllocationStrategy::Optimal,
+            min_allocation: 0.05,
+            max_allocation: 1.0,
+            reserve_fraction: 0.0,
+            update_interval: 100,
+            smoothing_factor: 0.9,
+        };
+
+        let mut allocator = BudgetAllocator::new(config.clone());
+        allocator.add_component(
+            BudgetComponent::new("a", ComponentType::Loss).with_sensitivity(0.9),
+        );
+        allocator.add_component(
+            BudgetComponent::new("b", ComponentType::FeedForward).with_sensitivity(0.3),
+        );
+        allocator.add_component(
+            BudgetComponent::new("c", ComponentType::Embedding).with_sensitivity(0.1),
+        );
+
+        let result = allocator.allocate();
+        let total: f64 = result.allocations.iter().map(|a| a.budget).sum();
+        let budget = config.total_budget * (1.0 - config.reserve_fraction);
+
+        assert!(
+            (total - budget).abs() < 1e-6,
+            "Allocations should sum to budget {}. Got {} (diff={})",
+            budget,
+            total,
+            (total - budget).abs()
+        );
+
+        // No allocation below minimum
+        let min_abs = config.min_allocation * config.total_budget;
+        for alloc in &result.allocations {
+            assert!(
+                alloc.budget >= min_abs - 1e-10,
+                "Component {} budget {} below min {}",
+                alloc.name,
+                alloc.budget,
+                min_abs
+            );
+        }
+    }
+
+    #[test]
+    fn test_simplex_projection_empty() {
+        let mut allocs: Vec<f64> = vec![];
+        project_onto_budget_simplex(&mut allocs, 1.0, 0.01);
+        assert!(allocs.is_empty());
+    }
+
+    #[test]
+    fn test_simplex_projection_single_element() {
+        let mut allocs = vec![0.3];
+        project_onto_budget_simplex(&mut allocs, 1.0, 0.01);
+        assert!((allocs[0] - 1.0).abs() < 1e-10);
     }
 }

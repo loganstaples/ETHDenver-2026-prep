@@ -41,6 +41,22 @@ pub enum ErrorDistribution {
     BoundedUniform { min_bound: i64, max_bound: i64 },
 }
 
+impl ErrorDistribution {
+    /// Returns the minimum sample count for CLT to apply to this distribution.
+    ///
+    /// - Gaussian: always valid (n >= 1)
+    /// - Uniform: converges faster due to bounded support (n >= 12)
+    /// - BoundedUniform: same as Uniform (n >= 12)
+    /// - Unknown: standard textbook threshold (n >= 30)
+    pub fn clt_threshold(&self) -> usize {
+        match self {
+            ErrorDistribution::Gaussian => 1,
+            ErrorDistribution::Uniform | ErrorDistribution::BoundedUniform { .. } => 12,
+            ErrorDistribution::Unknown => 30,
+        }
+    }
+}
+
 impl Default for ErrorDistribution {
     fn default() -> Self {
         ErrorDistribution::Unknown
@@ -219,9 +235,53 @@ impl ProbabilisticError {
     }
 
     /// Computes a confidence interval at the specified confidence level.
+    ///
+    /// Uses the Gaussian (normal) distribution when the distribution is known
+    /// to be Gaussian, or when the sample count exceeds the CLT threshold.
+    /// Falls back to Chebyshev's inequality for Unknown distributions with
+    /// small sample counts, providing distribution-free (wider) bounds.
     pub fn confidence_interval(&self, value: f64, level: ConfidenceLevel) -> ConfidenceInterval {
+        let use_chebyshev = self.distribution == ErrorDistribution::Unknown
+            && self.sample_count < self.distribution.clt_threshold();
+
+        if use_chebyshev {
+            return self.chebyshev_confidence_interval(value, level);
+        }
+
         let z = level.z_score();
         let half_width = z * self.std_dev;
+
+        ConfidenceInterval::new(
+            value + self.mean,
+            value + self.mean - half_width,
+            value + self.mean + half_width,
+            level.probability(),
+        )
+    }
+
+    /// Computes a distribution-free confidence interval using Chebyshev's inequality.
+    ///
+    /// Chebyshev: P(|X - μ| >= kσ) <= 1/k², so for confidence p:
+    /// k = 1/sqrt(1 - p), giving half_width = k * std_dev.
+    ///
+    /// This produces wider intervals than the Gaussian assumption but is valid
+    /// for any distribution with finite variance.
+    pub fn chebyshev_confidence_interval(
+        &self,
+        value: f64,
+        level: ConfidenceLevel,
+    ) -> ConfidenceInterval {
+        let p = level.probability();
+        // From Chebyshev: P(|X - μ| < kσ) >= 1 - 1/k²
+        // We want P >= p, so 1 - 1/k² >= p => k² >= 1/(1-p) => k = 1/sqrt(1-p)
+        let k = if p < 1.0 {
+            1.0 / (1.0 - p).sqrt()
+        } else {
+            // For p = 1.0, use worst-case bound
+            self.worst_case / self.std_dev.max(f64::EPSILON)
+        };
+
+        let half_width = k * self.std_dev;
 
         ConfidenceInterval::new(
             value + self.mean,
@@ -268,15 +328,20 @@ impl ProbabilisticError {
         let std_dev = variance.sqrt();
         let worst_case = self.worst_case + other.worst_case;
 
-        // Result distribution: if both Gaussian, result is Gaussian
-        // Otherwise, by CLT with enough samples, tends toward Gaussian
+        // Result distribution: if both Gaussian, result is Gaussian.
+        // Otherwise, apply CLT only when sample count exceeds the
+        // distribution-aware threshold (n>=30 for Unknown, n>=12 for
+        // Uniform, n>=1 for Gaussian).
+        let combined_count = self.sample_count + other.sample_count;
         let distribution = match (&self.distribution, &other.distribution) {
             (ErrorDistribution::Gaussian, ErrorDistribution::Gaussian) => {
                 ErrorDistribution::Gaussian
             }
             _ => {
-                if self.sample_count + other.sample_count > 10 {
-                    // CLT approximation
+                // Use the more conservative (larger) threshold of the two
+                let threshold = self.distribution.clt_threshold()
+                    .max(other.distribution.clt_threshold());
+                if combined_count >= threshold {
                     ErrorDistribution::Gaussian
                 } else {
                     ErrorDistribution::Unknown
@@ -405,13 +470,14 @@ impl ProbabilisticError {
         }
 
         let n_f = n as f64;
+        let total_samples = self.sample_count * n;
         ProbabilisticError {
             mean: self.mean * n_f,
             // Std dev of sum = sqrt(n) * std_dev
             std_dev: self.std_dev * n_f.sqrt(),
             worst_case: self.worst_case * n_f,
-            sample_count: self.sample_count * n,
-            distribution: if n > 10 {
+            sample_count: total_samples,
+            distribution: if total_samples >= self.distribution.clt_threshold() {
                 ErrorDistribution::Gaussian // CLT kicks in
             } else {
                 self.distribution
@@ -448,12 +514,13 @@ impl ProbabilisticError {
         }
 
         let n_f = n as f64;
+        let total_samples = base_error.sample_count * n;
         ProbabilisticError {
             mean: base_error.mean,
             std_dev: base_error.std_dev / n_f.sqrt(),
             worst_case: base_error.worst_case, // Worst case doesn't improve for average
-            sample_count: base_error.sample_count * n,
-            distribution: if n > 10 {
+            sample_count: total_samples,
+            distribution: if total_samples >= base_error.distribution.clt_threshold() {
                 ErrorDistribution::Gaussian
             } else {
                 base_error.distribution
@@ -669,5 +736,130 @@ mod tests {
         assert!((erf(5.0) - 1.0).abs() < 1e-5);
         // erf(-x) = -erf(x)
         assert!((erf(1.0) + erf(-1.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_clt_thresholds() {
+        assert_eq!(ErrorDistribution::Gaussian.clt_threshold(), 1);
+        assert_eq!(ErrorDistribution::Uniform.clt_threshold(), 12);
+        assert_eq!(ErrorDistribution::Unknown.clt_threshold(), 30);
+        assert_eq!(
+            ErrorDistribution::BoundedUniform {
+                min_bound: 0,
+                max_bound: 100
+            }
+            .clt_threshold(),
+            12
+        );
+    }
+
+    #[test]
+    fn test_unknown_n15_uses_chebyshev() {
+        // n=15 with Unknown distribution: below CLT threshold (30), should use Chebyshev
+        let mut err = ProbabilisticError::new(0.0, 0.1, 0.3, ErrorDistribution::Unknown);
+        err.sample_count = 15;
+
+        let ci = err.confidence_interval(10.0, ConfidenceLevel::NinetyFive);
+        let chebyshev_ci = err.chebyshev_confidence_interval(10.0, ConfidenceLevel::NinetyFive);
+
+        // Should match Chebyshev (not Gaussian)
+        assert!((ci.width() - chebyshev_ci.width()).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_unknown_n40_uses_clt() {
+        // n=40 with Unknown distribution: above CLT threshold (30), should use Gaussian
+        let mut err = ProbabilisticError::new(0.0, 0.1, 0.3, ErrorDistribution::Unknown);
+        err.sample_count = 40;
+
+        let ci = err.confidence_interval(10.0, ConfidenceLevel::NinetyFive);
+
+        // Gaussian 95% CI half-width = 1.96 * 0.1 = 0.196
+        let expected_half_width = 1.96 * 0.1;
+        assert!(
+            (ci.half_width() - expected_half_width).abs() < 0.01,
+            "n=40 Unknown should use CLT/Gaussian. Got half_width={}, expected ~{}",
+            ci.half_width(),
+            expected_half_width
+        );
+    }
+
+    #[test]
+    fn test_chebyshev_wider_than_gaussian() {
+        let err = ProbabilisticError::new(0.0, 0.1, 0.3, ErrorDistribution::Gaussian);
+
+        let gaussian_ci = err.confidence_interval(10.0, ConfidenceLevel::NinetyFive);
+        let chebyshev_ci = err.chebyshev_confidence_interval(10.0, ConfidenceLevel::NinetyFive);
+
+        // Chebyshev intervals are always wider than Gaussian at same confidence
+        assert!(
+            chebyshev_ci.width() > gaussian_ci.width(),
+            "Chebyshev ({:.4}) should be wider than Gaussian ({:.4})",
+            chebyshev_ci.width(),
+            gaussian_ci.width()
+        );
+
+        // Specifically: Chebyshev k for 95% = 1/sqrt(0.05) ≈ 4.47 vs Gaussian z = 1.96
+        let chebyshev_k = 1.0 / (1.0 - 0.95_f64).sqrt();
+        assert!(chebyshev_k > 4.0);
+    }
+
+    #[test]
+    fn test_add_unknown_below_threshold_stays_unknown() {
+        // Two Unknown errors with small sample counts should remain Unknown
+        let e1 = ProbabilisticError {
+            mean: 0.0,
+            std_dev: 0.1,
+            worst_case: 0.3,
+            sample_count: 5,
+            distribution: ErrorDistribution::Unknown,
+        };
+        let e2 = ProbabilisticError {
+            mean: 0.0,
+            std_dev: 0.1,
+            worst_case: 0.3,
+            sample_count: 5,
+            distribution: ErrorDistribution::Unknown,
+        };
+
+        let sum = e1.add(&e2);
+        // Combined count = 10, threshold for Unknown = 30
+        assert_eq!(sum.distribution, ErrorDistribution::Unknown);
+    }
+
+    #[test]
+    fn test_add_unknown_above_threshold_becomes_gaussian() {
+        let e1 = ProbabilisticError {
+            mean: 0.0,
+            std_dev: 0.1,
+            worst_case: 0.3,
+            sample_count: 16,
+            distribution: ErrorDistribution::Unknown,
+        };
+        let e2 = ProbabilisticError {
+            mean: 0.0,
+            std_dev: 0.1,
+            worst_case: 0.3,
+            sample_count: 16,
+            distribution: ErrorDistribution::Unknown,
+        };
+
+        let sum = e1.add(&e2);
+        // Combined count = 32, threshold for Unknown = 30
+        assert_eq!(sum.distribution, ErrorDistribution::Gaussian);
+    }
+
+    #[test]
+    fn test_uniform_clt_at_n12() {
+        // Uniform errors converge faster: CLT at n >= 12
+        let err = ProbabilisticError::from_quantization(0.001);
+        assert_eq!(err.distribution, ErrorDistribution::Uniform);
+
+        let acc = err.accumulate(12);
+        assert_eq!(acc.distribution, ErrorDistribution::Gaussian);
+
+        // But n=5 stays Uniform
+        let acc_small = err.accumulate(5);
+        assert_eq!(acc_small.distribution, ErrorDistribution::Uniform);
     }
 }

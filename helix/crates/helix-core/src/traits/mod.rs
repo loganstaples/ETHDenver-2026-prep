@@ -5,5 +5,5 @@ pub mod provable;
 pub mod serializable;
 
 pub use approximate::{ApproximateBinaryOp, ApproximateOp, ApproximateScalarOp, ApproximateTensorOp};
-pub use provable::{Provable, SimpleWitness, Witness};
+pub use provable::{BatchError, BatchProvable, BatchWitness, Provable, SimpleWitness, Witness};
 pub use serializable::{BinarySerializable, SerializeError};
