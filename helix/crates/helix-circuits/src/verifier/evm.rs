@@ -9,10 +9,11 @@
 //! enabling seamless Rust proof → Solidity verification.
 
 use std::fmt::Write;
-use halo2curves::bn256::{Fr, G1Affine, Fq};
+use halo2curves::bn256::{Fr, G1Affine, G2Affine, Fq};
 use halo2curves::ff::PrimeField;
 use halo2curves::group::Curve;
 use halo2curves::group::prime::PrimeCurveAffine;
+use std::ops::Neg;
 
 use super::format_spec::{
     MIN_PROOF_SIZE, NUM_ADVICE_COMMITS, G1_POINT_SIZE, SCALAR_SIZE, NUM_PUBLIC_INPUTS,
@@ -58,6 +59,112 @@ impl Default for VkData {
     }
 }
 
+/// Converts a BN254 base field element (Fq) to a decimal string.
+///
+/// The Fq element is 256-bit; we convert its little-endian byte repr
+/// to a big-endian decimal string suitable for embedding in Solidity.
+fn fq_to_decimal_string(fq: &Fq) -> String {
+    let repr = fq.to_repr();
+    let bytes: &[u8] = repr.as_ref();
+    // Convert 32 little-endian bytes to a big integer via u64 limbs
+    let mut limbs = [0u64; 4];
+    for i in 0..4 {
+        let offset = i * 8;
+        limbs[i] = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+    }
+    // Convert limbs to decimal string via repeated division by 10^18
+    if limbs == [0u64; 4] {
+        return "0".to_string();
+    }
+    // Use 128-bit arithmetic to convert 256-bit number to decimal
+    let mut digits = Vec::new();
+    let mut tmp = limbs;
+    while tmp != [0u64; 4] {
+        let mut remainder: u128 = 0;
+        // Divide from most-significant limb down
+        for i in (0..4).rev() {
+            let val = (remainder << 64) | tmp[i] as u128;
+            tmp[i] = (val / 10) as u64;
+            remainder = val % 10;
+        }
+        digits.push((remainder as u8) + b'0');
+    }
+    digits.reverse();
+    String::from_utf8(digits).unwrap()
+}
+
+/// KZG Structured Reference String (SRS) data.
+///
+/// Holds the `s·G2` point from a trusted setup ceremony. In a real deployment,
+/// this would come from `ParamsKZG::s_g2()` of a PSE/halo2 KZG setup.
+/// We define this wrapper because the crates.io `halo2_proofs` is IPA-only;
+/// real KZG SRS data is injected at a higher layer (helix-prover).
+#[derive(Debug, Clone)]
+pub struct KzgSrs {
+    /// The s·G2 point from the trusted setup.
+    /// For a degree-k SRS generated with secret `s`, this is `[s]₂`.
+    pub s_g2: G2Affine,
+}
+
+impl KzgSrs {
+    /// Creates KZG SRS from the s·G2 point.
+    pub fn new(s_g2: G2Affine) -> Self {
+        Self { s_g2 }
+    }
+
+    /// Creates a trivial SRS where s=1 (the G2 generator itself).
+    /// WARNING: This is insecure and only for testing.
+    pub fn trivial() -> Self {
+        Self { s_g2: G2Affine::generator() }
+    }
+}
+
+/// Converts a G2Affine point's coordinates to the EIP-197 pairing precompile
+/// format: (x_imaginary, x_real, y_imaginary, y_real) as decimal strings.
+fn g2_to_evm_decimal_tuple(point: &G2Affine) -> (String, String, String, String) {
+    // EVM pairing precompile (EIP-197) encodes G2 points as:
+    //   x_imaginary || x_real || y_imaginary || y_real
+    // In halo2curves, Fq2 = c0 + c1*u, so c1 is imaginary, c0 is real.
+    (
+        fq_to_decimal_string(&point.x.c1), // x_imaginary
+        fq_to_decimal_string(&point.x.c0), // x_real
+        fq_to_decimal_string(&point.y.c1), // y_imaginary
+        fq_to_decimal_string(&point.y.c0), // y_real
+    )
+}
+
+impl VkData {
+    /// Extracts real verification key data from KZG SRS params.
+    ///
+    /// This uses the actual `s·G2` point from the trusted setup, which is
+    /// essential for on-chain proof verification. Using `VkData::default()`
+    /// embeds the BN254 G2 *generator* as `s·G2`, which only works if s=1
+    /// (i.e., a trivial/insecure setup).
+    ///
+    /// # Arguments
+    /// * `params` - KZG SRS containing the s·G2 point
+    pub fn from_params(params: &KzgSrs) -> Self {
+        // G1 generator (always the standard generator)
+        let g1 = G1Affine::generator();
+        let g1_x = fq_to_decimal_string(&g1.x);
+        let g1_y = fq_to_decimal_string(&g1.y);
+
+        // Extract the real s·G2 from the SRS
+        let s_g2 = g2_to_evm_decimal_tuple(&params.s_g2);
+
+        // Compute -G2 generator (negate y coordinate)
+        let neg_g2_point = G2Affine::generator().neg();
+        let neg_g2 = g2_to_evm_decimal_tuple(&neg_g2_point);
+
+        Self {
+            g1: (g1_x, g1_y),
+            s_g2,
+            neg_g2,
+            num_advices: 3, // MLTrainingStepV2 uses 3 advice commitments
+        }
+    }
+}
+
 /// Solidity verifier generator for Halo2 proofs.
 #[derive(Debug)]
 pub struct SolidityGenerator {
@@ -73,6 +180,8 @@ pub struct SolidityGenerator {
     include_batch: bool,
     /// Verification key data for KZG pairing.
     vk_data: Option<VkData>,
+    /// If true, VK is injected via constructor instead of hardcoded constants.
+    constructor_vk: bool,
 }
 
 impl Default for SolidityGenerator {
@@ -84,6 +193,7 @@ impl Default for SolidityGenerator {
             num_instances: 2,
             include_batch: true,
             vk_data: None,
+            constructor_vk: false,
         }
     }
 }
@@ -115,6 +225,17 @@ impl SolidityGenerator {
         self
     }
 
+    /// Enables constructor-injected VK mode.
+    ///
+    /// Instead of embedding VK constants directly in the contract bytecode,
+    /// the generated contract accepts VK coordinates via its constructor.
+    /// This allows deploying the same verifier contract with different
+    /// trusted setups without recompiling.
+    pub fn with_constructor_vk(mut self) -> Self {
+        self.constructor_vk = true;
+        self
+    }
+
     /// Generates the complete Solidity verifier contract.
     pub fn generate(&self) -> String {
         let mut code = String::new();
@@ -130,22 +251,27 @@ impl SolidityGenerator {
 
         // Constants
         self.generate_constants(&mut code);
-        
+
+        // Constructor-injected VK storage + constructor
+        if self.constructor_vk {
+            self.generate_constructor_vk_storage(&mut code);
+        }
+
         // Events
         self.generate_events(&mut code);
-        
+
         // Errors
         self.generate_errors(&mut code);
-        
+
         // Main verify function
         self.generate_verify_function(&mut code);
-        
+
         // Pairing helpers
         self.generate_pairing_helpers(&mut code);
-        
+
         // Transcript helpers
         self.generate_transcript_helpers(&mut code);
-        
+
         if self.include_batch {
             self.generate_batch_verify(&mut code);
         }
@@ -168,27 +294,66 @@ impl SolidityGenerator {
         writeln!(code, "    uint256 constant NUM_INSTANCES = {};", self.num_instances).unwrap();
         writeln!(code).unwrap();
 
-        // Embedded VK data
-        if let Some(ref vk) = self.vk_data {
-            writeln!(code, "    // Verification key points").unwrap();
-            writeln!(code, "    uint256 constant VK_G1_X = {};", vk.g1.0).unwrap();
-            writeln!(code, "    uint256 constant VK_G1_Y = {};", vk.g1.1).unwrap();
-            writeln!(code).unwrap();
-            writeln!(code, "    // SRS [s]₂ point (G2 coordinates, Fp2 tower)").unwrap();
-            writeln!(code, "    uint256 constant VK_S_G2_X0 = {};", vk.s_g2.0).unwrap();
-            writeln!(code, "    uint256 constant VK_S_G2_X1 = {};", vk.s_g2.1).unwrap();
-            writeln!(code, "    uint256 constant VK_S_G2_Y0 = {};", vk.s_g2.2).unwrap();
-            writeln!(code, "    uint256 constant VK_S_G2_Y1 = {};", vk.s_g2.3).unwrap();
-            writeln!(code).unwrap();
-            writeln!(code, "    // Negative G2 generator -[1]₂").unwrap();
-            writeln!(code, "    uint256 constant VK_NEG_G2_X0 = {};", vk.neg_g2.0).unwrap();
-            writeln!(code, "    uint256 constant VK_NEG_G2_X1 = {};", vk.neg_g2.1).unwrap();
-            writeln!(code, "    uint256 constant VK_NEG_G2_Y0 = {};", vk.neg_g2.2).unwrap();
-            writeln!(code, "    uint256 constant VK_NEG_G2_Y1 = {};", vk.neg_g2.3).unwrap();
-            writeln!(code).unwrap();
-            writeln!(code, "    uint256 constant NUM_ADVICES = {};", vk.num_advices).unwrap();
-            writeln!(code).unwrap();
+        // Embedded VK data (only when not using constructor-injected VK)
+        if !self.constructor_vk {
+            if let Some(ref vk) = self.vk_data {
+                writeln!(code, "    // Verification key points").unwrap();
+                writeln!(code, "    uint256 constant VK_G1_X = {};", vk.g1.0).unwrap();
+                writeln!(code, "    uint256 constant VK_G1_Y = {};", vk.g1.1).unwrap();
+                writeln!(code).unwrap();
+                writeln!(code, "    // SRS [s]₂ point (G2 coordinates, Fp2 tower)").unwrap();
+                writeln!(code, "    uint256 constant VK_S_G2_X0 = {};", vk.s_g2.0).unwrap();
+                writeln!(code, "    uint256 constant VK_S_G2_X1 = {};", vk.s_g2.1).unwrap();
+                writeln!(code, "    uint256 constant VK_S_G2_Y0 = {};", vk.s_g2.2).unwrap();
+                writeln!(code, "    uint256 constant VK_S_G2_Y1 = {};", vk.s_g2.3).unwrap();
+                writeln!(code).unwrap();
+                writeln!(code, "    // Negative G2 generator -[1]₂").unwrap();
+                writeln!(code, "    uint256 constant VK_NEG_G2_X0 = {};", vk.neg_g2.0).unwrap();
+                writeln!(code, "    uint256 constant VK_NEG_G2_X1 = {};", vk.neg_g2.1).unwrap();
+                writeln!(code, "    uint256 constant VK_NEG_G2_Y0 = {};", vk.neg_g2.2).unwrap();
+                writeln!(code, "    uint256 constant VK_NEG_G2_Y1 = {};", vk.neg_g2.3).unwrap();
+                writeln!(code).unwrap();
+                writeln!(code, "    uint256 constant NUM_ADVICES = {};", vk.num_advices).unwrap();
+                writeln!(code).unwrap();
+            }
         }
+    }
+
+    fn generate_constructor_vk_storage(&self, code: &mut String) {
+        writeln!(code, "    // === Constructor-injected Verification Key ===").unwrap();
+        writeln!(code, "    // VK is set once at deployment and stored as immutable.").unwrap();
+        writeln!(code, "    uint256 public immutable VK_G1_X;").unwrap();
+        writeln!(code, "    uint256 public immutable VK_G1_Y;").unwrap();
+        writeln!(code, "    uint256 public immutable VK_S_G2_X0;").unwrap();
+        writeln!(code, "    uint256 public immutable VK_S_G2_X1;").unwrap();
+        writeln!(code, "    uint256 public immutable VK_S_G2_Y0;").unwrap();
+        writeln!(code, "    uint256 public immutable VK_S_G2_Y1;").unwrap();
+        writeln!(code, "    uint256 public immutable VK_NEG_G2_X0;").unwrap();
+        writeln!(code, "    uint256 public immutable VK_NEG_G2_X1;").unwrap();
+        writeln!(code, "    uint256 public immutable VK_NEG_G2_Y0;").unwrap();
+        writeln!(code, "    uint256 public immutable VK_NEG_G2_Y1;").unwrap();
+        writeln!(code, "    uint256 public immutable NUM_ADVICES;").unwrap();
+        writeln!(code).unwrap();
+
+        writeln!(code, "    constructor(").unwrap();
+        writeln!(code, "        uint256 _g1x, uint256 _g1y,").unwrap();
+        writeln!(code, "        uint256 _sG2x0, uint256 _sG2x1, uint256 _sG2y0, uint256 _sG2y1,").unwrap();
+        writeln!(code, "        uint256 _negG2x0, uint256 _negG2x1, uint256 _negG2y0, uint256 _negG2y1,").unwrap();
+        writeln!(code, "        uint256 _numAdvices").unwrap();
+        writeln!(code, "    ) {{").unwrap();
+        writeln!(code, "        VK_G1_X = _g1x;").unwrap();
+        writeln!(code, "        VK_G1_Y = _g1y;").unwrap();
+        writeln!(code, "        VK_S_G2_X0 = _sG2x0;").unwrap();
+        writeln!(code, "        VK_S_G2_X1 = _sG2x1;").unwrap();
+        writeln!(code, "        VK_S_G2_Y0 = _sG2y0;").unwrap();
+        writeln!(code, "        VK_S_G2_Y1 = _sG2y1;").unwrap();
+        writeln!(code, "        VK_NEG_G2_X0 = _negG2x0;").unwrap();
+        writeln!(code, "        VK_NEG_G2_X1 = _negG2x1;").unwrap();
+        writeln!(code, "        VK_NEG_G2_Y0 = _negG2y0;").unwrap();
+        writeln!(code, "        VK_NEG_G2_Y1 = _negG2y1;").unwrap();
+        writeln!(code, "        NUM_ADVICES = _numAdvices;").unwrap();
+        writeln!(code, "    }}").unwrap();
+        writeln!(code).unwrap();
     }
 
     fn generate_events(&self, code: &mut String) {
@@ -219,8 +384,8 @@ impl SolidityGenerator {
         writeln!(code, "        }}").unwrap();
         writeln!(code).unwrap();
 
-        if self.vk_data.is_some() {
-            // Full KZG pairing verification
+        if self.vk_data.is_some() || self.constructor_vk {
+            // Full KZG pairing verification (VK from constants or constructor)
             self.generate_full_verify_body(code);
         } else {
             // Simplified verification (no VK embedded)
@@ -509,6 +674,79 @@ mod tests {
         assert!(code.contains("valid = _isOnCurve(lhs_x, lhs_y)"));
         // Should NOT have VK constants
         assert!(!code.contains("VK_G1_X"));
+    }
+
+    #[test]
+    fn test_fq_to_decimal_string() {
+        // Test zero
+        assert_eq!(fq_to_decimal_string(&Fq::zero()), "0");
+
+        // Test small value via known G1 generator: G1 = (1, 2)
+        let g1 = G1Affine::generator();
+        assert_eq!(fq_to_decimal_string(&g1.x), "1");
+        assert_eq!(fq_to_decimal_string(&g1.y), "2");
+    }
+
+    #[test]
+    fn test_vk_data_from_params_trivial() {
+        // Trivial SRS (s=1) should give G2 generator as s·G2
+        let srs = KzgSrs::trivial();
+        let vk = VkData::from_params(&srs);
+
+        // G1 should be (1, 2)
+        assert_eq!(vk.g1.0, "1");
+        assert_eq!(vk.g1.1, "2");
+
+        // s·G2 should equal G2 generator when s=1
+        let g2 = G2Affine::generator();
+        let expected = g2_to_evm_decimal_tuple(&g2);
+        assert_eq!(vk.s_g2, expected);
+
+        // neg_g2 y coordinates should differ from g2 y coordinates
+        assert_eq!(vk.neg_g2.0, vk.s_g2.0); // same x
+        assert_eq!(vk.neg_g2.1, vk.s_g2.1); // same x
+        assert_ne!(vk.neg_g2.2, vk.s_g2.2); // different y
+        assert_ne!(vk.neg_g2.3, vk.s_g2.3); // different y
+    }
+
+    #[test]
+    fn test_vk_data_from_params_generates_valid_solidity() {
+        let srs = KzgSrs::trivial();
+        let vk = VkData::from_params(&srs);
+
+        let gen = SolidityGenerator::new("RealVKVerifier")
+            .with_instances(8)
+            .with_vk_data(vk)
+            .with_batch(false);
+        let code = gen.generate();
+
+        assert!(code.contains("VK_S_G2_X0"));
+        assert!(code.contains("VK_NEG_G2_Y0"));
+        assert!(code.contains("NUM_ADVICES = 3"));
+    }
+
+    #[test]
+    fn test_constructor_vk_mode() {
+        let gen = SolidityGenerator::new("ConstructorVKVerifier")
+            .with_instances(8)
+            .with_constructor_vk()
+            .with_batch(false);
+        let code = gen.generate();
+
+        // Should have immutable storage variables
+        assert!(code.contains("immutable VK_G1_X"));
+        assert!(code.contains("immutable VK_S_G2_X0"));
+        assert!(code.contains("immutable NUM_ADVICES"));
+
+        // Should have constructor
+        assert!(code.contains("constructor("));
+        assert!(code.contains("VK_G1_X = _g1x"));
+
+        // Should NOT have constant VK declarations
+        assert!(!code.contains("uint256 constant VK_G1_X"));
+
+        // Should have full pairing verification (not simplified)
+        assert!(code.contains("_ecPairing(pairingInput)"));
     }
 }
 
@@ -1040,5 +1278,221 @@ mod evm_proof_tests {
             result,
             Err(ProofFormatError::InvalidPublicInputCount { got: 5, expected: 8 })
         ));
+    }
+}
+
+// ============================================================================
+// End-to-End Pipeline Tests
+// ============================================================================
+
+#[cfg(test)]
+mod pipeline_tests {
+    use super::*;
+    use super::super::format_spec::{
+        serialize_proof_for_evm, validate_proof_format, ProofStructure,
+    };
+    use super::super::transcript::Keccak256Write;
+
+    /// Full pipeline test: generate proof with Keccak256 transcript →
+    /// serialize to EVM format → verify structure matches Halo2Verifier.sol.
+    #[test]
+    fn test_e2e_proof_pipeline() {
+        let g1 = G1Affine::generator();
+
+        // === Step 1: Simulate proof generation with Keccak256 transcript ===
+        // In a real system, `create_proof()` would use this transcript.
+        // Here we simulate the transcript output structure.
+        let mut transcript = Keccak256Write::init(Vec::new());
+
+        // Write 3 advice commitments (mimicking Halo2 prover)
+        let advice_scalars = [Fr::from(111u64), Fr::from(222u64), Fr::from(333u64)];
+        let advice_points: Vec<G1Affine> = advice_scalars
+            .iter()
+            .map(|s| (g1 * s).to_affine())
+            .collect();
+
+        for point in &advice_points {
+            transcript.write_point(point).unwrap();
+        }
+
+        // Squeeze Fiat-Shamir challenges (alpha, beta, gamma)
+        let alpha = transcript.squeeze_challenge();
+        let beta = transcript.squeeze_challenge();
+        let gamma = transcript.squeeze_challenge();
+        assert_ne!(alpha, Fr::zero());
+        assert_ne!(beta, Fr::zero());
+        assert_ne!(gamma, Fr::zero());
+
+        // Write some evaluation scalars (intermediate transcript data)
+        transcript.write_scalar(&Fr::from(999u64)).unwrap();
+        transcript.write_scalar(&Fr::from(888u64)).unwrap();
+
+        // Write opening proof points W and W'
+        let w = (g1 * Fr::from(444u64)).to_affine();
+        let w_prime = (g1 * Fr::from(555u64)).to_affine();
+        transcript.write_point(&w).unwrap();
+        transcript.write_point(&w_prime).unwrap();
+
+        let transcript_bytes = transcript.finalize();
+
+        // === Step 2: Serialize to EVM format ===
+        let evm_proof_bytes = serialize_proof_for_evm(&transcript_bytes, 3).unwrap();
+        assert_eq!(evm_proof_bytes.len(), MIN_PROOF_SIZE);
+
+        // === Step 3: Validate format matches Halo2Verifier.sol expectations ===
+        validate_proof_format(&evm_proof_bytes).unwrap();
+
+        // Parse into structured format
+        let structure = ProofStructure::parse(&evm_proof_bytes).unwrap();
+        assert_eq!(structure.total_size, 320);
+        assert_eq!(structure.advice_section.offset, 0);
+        assert_eq!(structure.advice_section.length, 192); // 3 * 64
+        assert_eq!(structure.opening_section.offset, 192);
+        assert_eq!(structure.opening_section.length, 128); // 2 * 64
+
+        // Verify via EvmProof wrapper
+        let evm_proof = EvmProof::from_bytes(evm_proof_bytes.clone()).unwrap();
+        let extracted_advice = evm_proof.advice_commits().unwrap();
+        let extracted_w = evm_proof.w().unwrap();
+        let extracted_wp = evm_proof.w_prime().unwrap();
+
+        // Advice commits should match original points
+        for (i, (original, extracted)) in advice_points.iter().zip(extracted_advice.iter()).enumerate() {
+            assert_eq!(
+                original, extracted,
+                "Advice commit {} mismatch after EVM serialization",
+                i
+            );
+        }
+
+        // Opening proofs should match
+        assert_eq!(extracted_w, w, "W point mismatch");
+        assert_eq!(extracted_wp, w_prime, "W' point mismatch");
+
+        // === Step 4: Verify public inputs format ===
+        let public_inputs = create_test_public_inputs(1);
+        let pi_bytes = public_inputs.to_evm_bytes();
+        assert_eq!(pi_bytes.len(), NUM_PUBLIC_INPUTS * SCALAR_SIZE);
+
+        // Verify each public input is within the field
+        for (i, val) in public_inputs.values().iter().enumerate() {
+            let bytes = fr_to_evm_bytes(val);
+            let recovered = evm_bytes_to_fr(&bytes).unwrap();
+            assert_eq!(*val, recovered, "Public input {} round-trip failed", i);
+        }
+    }
+
+    /// Test that VkData from real params produces a valid Solidity contract
+    /// that references all the proof structure elements.
+    #[test]
+    fn test_e2e_vk_to_solidity_to_proof_structure() {
+        // Generate VK from trivial SRS
+        let srs = KzgSrs::trivial();
+        let vk = VkData::from_params(&srs);
+
+        // Generate verifier contract
+        let gen = SolidityGenerator::new("HelixTrainingVerifier")
+            .with_instances(NUM_PUBLIC_INPUTS)
+            .with_vk_data(vk)
+            .with_batch(true);
+        let solidity = gen.generate();
+
+        // Verify the generated Solidity references all critical elements
+        assert!(solidity.contains("NUM_INSTANCES = 8"), "Should have 8 public inputs");
+        assert!(solidity.contains("NUM_ADVICES = 3"), "Should expect 3 advice commits");
+        assert!(solidity.contains("_readPoint"), "Should parse proof points");
+        assert!(solidity.contains("_computeChallenges"), "Should compute Fiat-Shamir challenges");
+        assert!(solidity.contains("_ecPairing"), "Should do pairing check");
+        assert!(solidity.contains("batchVerify"), "Should support batch verification");
+        assert!(solidity.contains("VK_S_G2_X0"), "Should embed SRS s·G2");
+        assert!(solidity.contains("VK_NEG_G2_Y0"), "Should embed -G2");
+
+        // Verify the proof can be formatted for this contract
+        let proof = create_test_proof(42);
+        let hex_proof = proof.to_hex();
+        assert!(hex_proof.starts_with("0x"), "Hex proof should start with 0x");
+        assert_eq!(
+            hex_proof.len(),
+            2 + 320 * 2,
+            "Hex proof should encode 320 bytes"
+        );
+    }
+
+    /// Test that constructor-injected VK contract works with the pipeline.
+    #[test]
+    fn test_e2e_constructor_vk_pipeline() {
+        let srs = KzgSrs::trivial();
+        let vk = VkData::from_params(&srs);
+
+        // Generate constructor-injected verifier
+        let gen = SolidityGenerator::new("FlexibleVerifier")
+            .with_instances(NUM_PUBLIC_INPUTS)
+            .with_constructor_vk()
+            .with_batch(false);
+        let solidity = gen.generate();
+
+        // Should have constructor but no hardcoded constants
+        assert!(solidity.contains("constructor("));
+        assert!(solidity.contains("immutable VK_S_G2_X0"));
+        assert!(!solidity.contains("uint256 constant VK_S_G2_X0"));
+
+        // The VK data provides the constructor arguments
+        let constructor_args = format!(
+            "{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}",
+            vk.g1.0, vk.g1.1,
+            vk.s_g2.0, vk.s_g2.1, vk.s_g2.2, vk.s_g2.3,
+            vk.neg_g2.0, vk.neg_g2.1, vk.neg_g2.2, vk.neg_g2.3,
+            vk.num_advices,
+        );
+        // Just verify the args are well-formed decimal strings
+        for arg in constructor_args.split(", ") {
+            assert!(
+                arg.chars().all(|c| c.is_ascii_digit()),
+                "Constructor arg '{}' should be a decimal number",
+                arg
+            );
+        }
+    }
+
+    /// Test the complete Keccak256 transcript → challenge → Solidity alignment.
+    #[test]
+    fn test_e2e_transcript_challenge_alignment() {
+        use sha3::{Digest, Keccak256};
+        use super::super::format_spec::fq_to_evm_bytes;
+        use super::super::transcript::hash_to_fr;
+
+        let g1 = G1Affine::generator();
+        let p = (g1 * Fr::from(42u64)).to_affine();
+
+        // Prover derives challenges via Keccak256Write
+        let mut transcript = Keccak256Write::init(Vec::new());
+        transcript.common_point(&g1).unwrap();
+        transcript.common_point(&p).unwrap();
+
+        let alpha = transcript.squeeze_challenge();
+        let beta = transcript.squeeze_challenge();
+
+        // Manually compute what the Solidity verifier would do:
+        //   seed = keccak256(g1.x || g1.y || p.x || p.y)   (all big-endian)
+        //   alpha = uint256(seed) % R
+        //   beta = uint256(keccak256(seed || uint256(1))) % R
+        let mut data = Vec::new();
+        data.extend_from_slice(&fq_to_evm_bytes(&g1.x));
+        data.extend_from_slice(&fq_to_evm_bytes(&g1.y));
+        data.extend_from_slice(&fq_to_evm_bytes(&p.x));
+        data.extend_from_slice(&fq_to_evm_bytes(&p.y));
+
+        let seed = Keccak256::digest(&data);
+        let alpha_sol = hash_to_fr(&seed);
+        assert_eq!(alpha, alpha_sol, "Alpha challenge must match Solidity derivation");
+
+        let mut input2 = Vec::new();
+        input2.extend_from_slice(&seed);
+        let mut counter = [0u8; 32];
+        counter[24..].copy_from_slice(&1u64.to_be_bytes());
+        input2.extend_from_slice(&counter);
+        let hash2 = Keccak256::digest(&input2);
+        let beta_sol = hash_to_fr(&hash2);
+        assert_eq!(beta, beta_sol, "Beta challenge must match Solidity derivation");
     }
 }
