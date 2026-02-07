@@ -653,6 +653,17 @@ impl BudgetAllocator {
         self.current_allocation.as_ref()
     }
 
+    /// Exports per-component budget allocations as a map from name to budget value.
+    ///
+    /// This is intended for feeding into `AdaptivePrecisionController::update_budget()`
+    /// so the precision controller uses allocator-managed budgets instead of its own.
+    pub fn export_budgets(&self) -> HashMap<String, f64> {
+        self.components
+            .iter()
+            .map(|c| (c.name.clone(), c.allocated_budget))
+            .collect()
+    }
+
     /// Generates a summary report.
     pub fn summary(&self) -> BudgetSummary {
         let component_summaries: Vec<_> = self
@@ -866,6 +877,66 @@ mod tests {
 
         assert!(loss.budget >= attention.budget);
         assert!(attention.budget >= embedding.budget);
+    }
+
+    #[test]
+    fn test_export_budgets() {
+        let config = BudgetAllocationConfig {
+            total_budget: 0.1,
+            strategy: AllocationStrategy::Equal,
+            ..Default::default()
+        };
+
+        let mut allocator = BudgetAllocator::new(config);
+        allocator.add_component(BudgetComponent::new("attention", ComponentType::Attention));
+        allocator.add_component(BudgetComponent::new("ffn", ComponentType::FeedForward));
+        allocator.allocate();
+
+        let budgets = allocator.export_budgets();
+        assert_eq!(budgets.len(), 2);
+        assert!(budgets.contains_key("attention"));
+        assert!(budgets.contains_key("ffn"));
+        assert!(budgets["attention"] > 0.0);
+    }
+
+    #[test]
+    fn test_budget_drives_precision_controller() {
+        use crate::types::error_composition::{AdaptivePrecisionController, AdaptivePrecisionConfig};
+
+        let config = BudgetAllocationConfig {
+            total_budget: 0.1,
+            strategy: AllocationStrategy::Weighted,
+            min_allocation: 0.0,
+            max_allocation: 1.0,
+            ..Default::default()
+        };
+
+        let mut allocator = BudgetAllocator::new(config);
+        allocator.add_component(
+            BudgetComponent::new("attention", ComponentType::Attention).with_sensitivity(0.8),
+        );
+        allocator.allocate();
+
+        let budgets = allocator.export_budgets();
+        let attention_budget = budgets["attention"];
+
+        // Create a precision controller and update it with the allocator's budget
+        let mut controller = AdaptivePrecisionController::new(AdaptivePrecisionConfig {
+            total_error_budget: 999.0, // intentionally wrong
+            ..Default::default()
+        });
+
+        // After update_budget, controller should use the allocator's budget
+        controller.update_budget(attention_budget);
+        assert!((controller.total_error_budget() - attention_budget).abs() < 1e-15);
+        assert!(!controller.budget_exceeded());
+
+        // Accumulate error and verify budget tracking works with the new budget
+        let _ = controller.record_operation(attention_budget * 0.5);
+        assert!(!controller.budget_exceeded());
+
+        let _ = controller.record_operation(attention_budget * 0.6);
+        assert!(controller.budget_exceeded());
     }
 
     #[test]

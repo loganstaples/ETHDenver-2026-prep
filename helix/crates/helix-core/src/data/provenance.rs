@@ -702,6 +702,26 @@ impl ProvenanceRegistry {
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
+
+    /// Saves the registry to a JSON file.
+    pub fn save_to_file(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let records: Vec<&ProvenanceRecord> = self.records.values().collect();
+        let json = serde_json::to_string_pretty(&records)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(path, json)
+    }
+
+    /// Loads the registry from a JSON file, rebuilding indices.
+    pub fn load_from_file(path: &std::path::Path) -> std::io::Result<Self> {
+        let json = std::fs::read_to_string(path)?;
+        let records: Vec<ProvenanceRecord> = serde_json::from_str(&json)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let mut registry = Self::new();
+        for record in records {
+            registry.register(record);
+        }
+        Ok(registry)
+    }
 }
 
 impl Default for ProvenanceRegistry {
@@ -1029,5 +1049,42 @@ mod tests {
         assert_eq!(record.original_hash, original);
         assert_eq!(record.current_hash, transformed);
         assert_eq!(record.transformations.len(), 1);
+    }
+
+    #[test]
+    fn test_registry_save_and_load_roundtrip() {
+        let mut registry = ProvenanceRegistry::new();
+
+        let hash1 = Sha256Hasher.hash_leaf(b"data1");
+        let hash2 = Sha256Hasher.hash_leaf(b"data2");
+
+        let record = ProvenanceBuilder::new(
+            DataOrigin::Synthetic {
+                generator: "test".to_string(),
+                seed: Some(42),
+                parameters: HashMap::new(),
+            },
+            hash1,
+        )
+        .add_transformation(DataTransformation::new(
+            TransformationType::Normalization { method: "z-score".to_string() },
+            hash1,
+            hash2,
+            HashMap::new(),
+        ))
+        .build();
+
+        let record_id = record.id;
+        registry.register(record);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provenance.json");
+
+        registry.save_to_file(&path).unwrap();
+        let loaded = ProvenanceRegistry::load_from_file(&path).unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded.get(&record_id).is_some());
+        assert_eq!(loaded.find_by_original(&hash1).len(), 1);
     }
 }

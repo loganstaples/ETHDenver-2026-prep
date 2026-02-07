@@ -1985,8 +1985,10 @@ pub struct TensorWitness {
 }
 
 impl TensorWitness {
-    /// Scale factor for fixed-point quantization (10^9 = 9 decimal places)
-    const SCALE: f64 = 1e9;
+    /// Scale factor for fixed-point quantization (10^12 = 12 decimal places).
+    /// Matches ERROR_SCALE in error_commitment.rs for consistent precision across
+    /// tensor witnesses and error commitments.
+    const SCALE: f64 = 1e12;
 
     /// Creates a new tensor witness from a BoundedTensor.
     pub fn from_tensor(tensor: &BoundedTensor) -> Self {
@@ -2050,7 +2052,7 @@ impl Provable for BoundedTensor {
     ///
     /// The witness contains:
     /// - Shape information for reconstruction
-    /// - Quantized values (fixed-point at 10^9 scale)
+    /// - Quantized values (fixed-point at 10^12 scale)
     /// - Quantized error bounds
     ///
     /// # Example
@@ -2082,14 +2084,31 @@ impl Provable for BoundedTensor {
         vec![
             self.len() as u64,
             TensorWitness::quantize(self.max_error()),
-            // Simple shape hash: product of dimensions
-            self.shape().iter().product::<usize>() as u64,
+            Self::shape_hash(self.shape()),
         ]
     }
 
     /// Returns the circuit identifier for this tensor type.
     fn circuit_id(&self) -> &'static str {
         "bounded_tensor_v1"
+    }
+}
+
+impl BoundedTensor {
+    /// Computes a collision-resistant hash of tensor shape dimensions.
+    ///
+    /// Uses a polynomial hash `sum(dim_i * PRIME^i) mod u64` which is
+    /// order-dependent — `[2,3]` and `[3,2]` produce different hashes,
+    /// unlike the previous product-based approach.
+    pub(crate) fn shape_hash(shape: &[usize]) -> u64 {
+        const PRIME: u64 = 1_000_000_007;
+        let mut hash: u64 = 0;
+        let mut prime_power: u64 = 1;
+        for &dim in shape {
+            hash = hash.wrapping_add((dim as u64).wrapping_mul(prime_power));
+            prime_power = prime_power.wrapping_mul(PRIME);
+        }
+        hash
     }
 }
 
@@ -2619,7 +2638,22 @@ mod tests {
         assert_eq!(public_inputs.len(), 3);
         assert_eq!(public_inputs[0], 6); // num elements
         assert!(public_inputs[1] > 0); // quantized error
-        assert_eq!(public_inputs[2], 6); // shape product
+        // Shape hash is now a polynomial hash, not a simple product.
+        // For shape [2,3]: hash = 2 * 1 + 3 * PRIME = 2 + 3_000_000_021
+        assert_eq!(public_inputs[2], BoundedTensor::shape_hash(&[2, 3]));
+    }
+
+    #[test]
+    fn test_shape_hash_collision_resistance() {
+        // Permuted dimensions must produce different hashes
+        assert_ne!(BoundedTensor::shape_hash(&[2, 3]), BoundedTensor::shape_hash(&[3, 2]));
+        // Different rank with same product must produce different hashes
+        assert_ne!(BoundedTensor::shape_hash(&[6]), BoundedTensor::shape_hash(&[2, 3]));
+        assert_ne!(BoundedTensor::shape_hash(&[6]), BoundedTensor::shape_hash(&[3, 2]));
+        // Same shape must produce same hash
+        assert_eq!(BoundedTensor::shape_hash(&[2, 3]), BoundedTensor::shape_hash(&[2, 3]));
+        // Empty shape
+        assert_eq!(BoundedTensor::shape_hash(&[]), 0);
     }
 
     #[test]
@@ -2644,11 +2678,11 @@ mod tests {
         let witness = tensor.generate_witness();
         let elements = witness.to_field_elements();
 
-        // Values should be quantized (multiplied by 10^9)
-        // 0.000001 * 10^9 = 1000
+        // Values should be quantized (multiplied by 10^12)
+        // 0.000001 * 10^12 = 1_000_000
         let value_start = 1 + 1 + 1; // ndim + shape + count
-        assert_eq!(elements[value_start], 1000);
-        assert_eq!(elements[value_start + 1], 2000);
+        assert_eq!(elements[value_start], 1_000_000);
+        assert_eq!(elements[value_start + 1], 2_000_000);
     }
 
     // =========================================================================

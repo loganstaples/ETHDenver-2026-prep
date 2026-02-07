@@ -203,14 +203,14 @@ data/
 **Weaknesses:**
 - Signatures in attestations are `Vec<u8>` -- not cryptographically verified (placeholder implementation)
 - No integration with on-chain attestation contracts
-- ProvenanceRegistry is in-memory only
+- ~~ProvenanceRegistry is in-memory only~~ **RESOLVED:** `save_to_file()` / `load_from_file()` added with roundtrip tests
 
 ### 6. `dataset_registry.rs` -- ~1500+ lines
 
 **What it does:** Manages dataset lifecycle -- registration, versioning, lookup, and metadata.
 
 **Strengths:** Clean CRUD operations with version tracking.
-**Weakness:** In-memory storage only.
+**Weakness:** ~~In-memory storage only.~~ **RESOLVED:** `save_to_file()` / `load_from_file()` added with snapshot serialization.
 
 ### 7. `streaming.rs` -- ~1200+ lines
 
@@ -298,13 +298,13 @@ data/
 
 1. **Data sources are mock-only.** All three source implementations (S3, IPFS, Filecoin) operate on in-memory mock storage. No actual HTTP/network requests are made. For a demo, this means data must be pre-loaded rather than fetched from decentralized storage.
 
-2. **All registries and state are in-memory.** ShardRegistry, ProvenanceRegistry, DatasetRegistry -- none persist to disk. Process restart means losing all state.
+2. ~~**All registries and state are in-memory.**~~ **RESOLVED:** Added `save_to_file()` / `load_from_file()` JSON persistence to `ShardRegistry`, `ProvenanceRegistry`, and `DatasetCommitmentRegistry`. All three use snapshot-based serialization with index rebuilding on load. Roundtrip tests verify correctness.
 
-3. **No content verification on fetch.** When data is fetched from a source, there's no automatic hash verification against the expected commitment. A malicious or corrupted source could return wrong data.
+3. ~~**No content verification on fetch.**~~ **RESOLVED:** Added `verify_fetched_data()` utility and integrated hash verification into `MultiSourceFetcher::fetch()`. When `FetchOptions.verify_hash` is set, fetched data is checked against the expected SHA-256 hash, returning `IntegrityError` on mismatch.
 
 4. **Attestation signatures are placeholders.** The provenance system accepts `Vec<u8>` signatures without verification. For a real audit trail, these need cryptographic verification (ed25519, ECDSA, etc.).
 
-5. **No parallel proof verification.** Batch verification processes proofs sequentially. For large batches (1000+ proofs), parallelizing with rayon would significantly reduce verification time.
+5. ~~**No parallel proof verification.**~~ **RESOLVED:** `ParallelBatchVerifier::verify_all()` and `verify_and_collect_failures()` now use `rayon::par_iter()` for batches >= 50 proofs, with sequential fallback for small batches.
 
 6. **Sparse Merkle tree is not space-optimized.** Empty subtrees store full zero-hashes rather than using a sentinel/lazy approach that avoids materializing empty paths.
 
@@ -314,15 +314,15 @@ data/
 
 ### Critical (Before Demo)
 
-1. **Add hash verification on data fetch.** When a `DataSource` returns data, compare its SHA256 hash against the expected commitment hash. This closes a significant integrity gap.
+1. ~~**Add hash verification on data fetch.**~~ **DONE:** Added `Hash::compute()` for plain SHA-256, `verify_fetched_data()` utility, and integrated verification into `MultiSourceFetcher::fetch()`. Tests cover matching, mismatched, and no-verification cases.
 
 2. **Pre-load demo data into mock storage.** Since the data sources are mock-only, ensure the demo script populates the mock storage with realistic training data before the demo begins.
 
 ### Important (Quality Improvements)
 
-3. **Parallelize batch proof verification.** Use rayon to verify proofs in parallel within `ProofBatchVerifier`. The proofs are independent, so this is embarrassingly parallel.
+3. ~~**Parallelize batch proof verification.**~~ **DONE:** `ParallelBatchVerifier` now uses rayon with a 50-proof threshold.
 
-4. **Add disk persistence for ShardRegistry.** Even a simple JSON dump on shard assignment changes would survive process restarts during multi-round demos.
+4. ~~**Add disk persistence for ShardRegistry.**~~ **DONE:** Added JSON persistence (`save_to_file()` / `load_from_file()`) to ShardRegistry, ProvenanceRegistry, and DatasetCommitmentRegistry. All include roundtrip tests.
 
 5. **Implement real IPFS fetch.** An HTTP gateway fetch (`https://ipfs.io/ipfs/{cid}`) would demonstrate decentralized data sourcing for the demo. This requires only a simple HTTP GET with hash verification.
 
@@ -389,7 +389,7 @@ data/
 ### Needs Attention
 - Data must be pre-loaded into mock storage (no real fetch)
 - Provenance display requires UI integration (data structures exist but no rendering)
-- ShardRegistry state lost on restart
+- ~~ShardRegistry state lost on restart~~ **RESOLVED:** Persistence added
 
 ### Demo Scenario Support
 - **"Show me the data is committed"**: DatasetCommitment -> root hash -> on-chain -> verified
@@ -404,12 +404,12 @@ data/
 | Aspect | Score | Notes |
 |--------|-------|-------|
 | Architecture | 8/10 | Clean layering from primitives to pipeline |
-| Security | 8/10 | Domain separation correct; content verification missing |
-| Completeness | 8/10 | Full lifecycle covered; real I/O missing |
+| Security | 8.5/10 | Domain separation correct; content verification added |
+| Completeness | 8.5/10 | Full lifecycle covered; disk persistence added; real I/O missing |
 | Scalability | 9/10 | Tested at 1M elements with streaming/incremental builders |
 | Testing | 8/10 | Strong integration and benchmark coverage |
 | Demo Readiness | 7/10 | Core flows work; data sourcing requires pre-loading |
 
-### Health Score: 8/10
+### Health Score: 8.5/10
 
-The data/ module provides a thorough, well-tested data infrastructure that covers the complete lifecycle from sourcing through commitment through distribution through verification. The Merkle tree implementation with 5 construction methods is production-grade, and the benchmark coverage at 1M elements validates real-world scalability. The main gaps are the mock-only data sources (no real IPFS/S3 fetching) and the lack of content verification on fetch. For the ETHDenver demo, the commitment and proof verification paths are solid -- data just needs to be pre-loaded into mock storage rather than fetched from decentralized sources.
+The data/ module provides a thorough, well-tested data infrastructure that covers the complete lifecycle from sourcing through commitment through distribution through verification. The Merkle tree implementation with 5 construction methods is production-grade, and the benchmark coverage at 1M elements validates real-world scalability. Recent improvements have addressed the original weaknesses: content verification on fetch is implemented, batch proof verification is parallelized, and disk persistence is available for all registries (ShardRegistry, ProvenanceRegistry, DatasetCommitmentRegistry). The main remaining gap is mock-only data sources (no real IPFS/S3/Filecoin network I/O). For the ETHDenver demo, the commitment and proof verification paths are solid -- data just needs to be pre-loaded into mock storage rather than fetched from decentralized sources.

@@ -319,6 +319,23 @@ impl Default for PoolConfig {
     }
 }
 
+/// Verifies that fetched data matches an expected hash.
+///
+/// Returns `Ok(data)` if the hash matches or no verification was requested,
+/// or `Err(IntegrityError)` if there's a mismatch.
+pub fn verify_fetched_data(data: Vec<u8>, options: &FetchOptions) -> DataSourceResult<Vec<u8>> {
+    if let Some(expected_hash) = &options.verify_hash {
+        let actual_hash = Hash::compute(&data);
+        if actual_hash != *expected_hash {
+            return Err(DataSourceError::IntegrityError {
+                expected: *expected_hash,
+                actual: actual_hash,
+            });
+        }
+    }
+    Ok(data)
+}
+
 /// A multi-source data fetcher that can fetch from multiple sources.
 pub struct MultiSourceFetcher {
     /// Available sources.
@@ -364,17 +381,22 @@ impl MultiSourceFetcher {
     }
 
     /// Fetches data, trying sources in priority order.
+    ///
+    /// If `options.verify_hash` is set, the fetched data is verified against
+    /// the expected hash before returning. Returns `IntegrityError` on mismatch.
     pub async fn fetch(&self, id: &str, options: &FetchOptions) -> DataSourceResult<Vec<u8>> {
-        match self.fallback {
-            FallbackBehavior::TryNext => self.fetch_sequential(id, options).await,
-            FallbackBehavior::ParallelRace => self.fetch_parallel(id, options).await,
+        let data = match self.fallback {
+            FallbackBehavior::TryNext => self.fetch_sequential(id, options).await?,
+            FallbackBehavior::ParallelRace => self.fetch_parallel(id, options).await?,
             FallbackBehavior::FailFast => {
                 if self.sources.is_empty() {
                     return Err(DataSourceError::Custom("No sources configured".into()));
                 }
-                self.sources[self.priority[0]].fetch(id, options).await
+                self.sources[self.priority[0]].fetch(id, options).await?
             }
-        }
+        };
+
+        verify_fetched_data(data, options)
     }
 
     async fn fetch_sequential(
@@ -601,5 +623,43 @@ mod tests {
         let mut cache = DataCache::new(1000);
         assert!(cache.get("nonexistent").is_none());
         assert_eq!(cache.stats().misses, 1);
+    }
+
+    #[test]
+    fn test_verify_fetched_data_matching_hash() {
+        let data = b"hello world".to_vec();
+        let hash = Hash::compute(&data);
+        let options = FetchOptions::with_verification(hash);
+
+        let result = verify_fetched_data(data.clone(), &options);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), data);
+    }
+
+    #[test]
+    fn test_verify_fetched_data_mismatched_hash() {
+        let data = b"hello world".to_vec();
+        let wrong_hash = Hash::compute(b"different data");
+        let options = FetchOptions::with_verification(wrong_hash);
+
+        let result = verify_fetched_data(data, &options);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            DataSourceError::IntegrityError { expected, actual } => {
+                assert_eq!(expected, wrong_hash);
+                assert_eq!(actual, Hash::compute(b"hello world"));
+            }
+            other => panic!("Expected IntegrityError, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_verify_fetched_data_no_verification() {
+        let data = b"hello world".to_vec();
+        let options = FetchOptions::default(); // no verify_hash set
+
+        let result = verify_fetched_data(data.clone(), &options);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), data);
     }
 }

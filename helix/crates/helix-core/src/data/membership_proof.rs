@@ -11,6 +11,7 @@
 //! - Parallel proof verification
 //! - Proof batching and aggregation optimization
 
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
@@ -1343,16 +1344,19 @@ impl Default for ParallelVerificationConfig {
     }
 }
 
-/// Parallel proof verifier.
+/// Parallel proof verifier using rayon for concurrent verification.
 ///
-/// Note: This uses sequential processing in a loop but is designed to be
-/// easily parallelizable with rayon or similar when those dependencies are added.
+/// Proofs are independent and verified in parallel when the batch size
+/// exceeds `min_proofs_per_thread`.
 pub struct ParallelBatchVerifier {
     /// Configuration.
     config: ParallelVerificationConfig,
     /// Dataset commitment.
     commitment: Arc<DatasetCommitment>,
 }
+
+/// Threshold below which sequential verification is used (avoids rayon overhead).
+const PARALLEL_VERIFICATION_THRESHOLD: usize = 50;
 
 impl ParallelBatchVerifier {
     /// Creates a new parallel verifier.
@@ -1363,27 +1367,27 @@ impl ParallelBatchVerifier {
         }
     }
 
-    /// Verifies multiple batch proofs.
+    /// Verifies multiple batch proofs in parallel using rayon.
+    ///
+    /// Falls back to sequential verification for small batches (< 50 proofs)
+    /// to avoid thread pool overhead.
     pub fn verify_all(&self, proofs: &[BatchMembershipProof]) -> ParallelVerificationResult {
         let start = std::time::Instant::now();
 
-        let mut results = Vec::with_capacity(proofs.len());
-        let mut verified = 0;
-        let mut failed = 0;
+        let results: Vec<bool> = if proofs.len() >= PARALLEL_VERIFICATION_THRESHOLD {
+            proofs
+                .par_iter()
+                .map(|proof| proof.verify(&self.commitment))
+                .collect()
+        } else {
+            proofs
+                .iter()
+                .map(|proof| proof.verify(&self.commitment))
+                .collect()
+        };
 
-        // Process in chunks (can be parallelized)
-        for chunk in proofs.chunks(self.config.chunk_size) {
-            for proof in chunk {
-                let success = proof.verify(&self.commitment);
-                results.push(success);
-                if success {
-                    verified += 1;
-                } else {
-                    failed += 1;
-                }
-            }
-        }
-
+        let verified = results.iter().filter(|&&r| r).count();
+        let failed = results.len() - verified;
         let elapsed_us = start.elapsed().as_micros() as u64;
 
         ParallelVerificationResult {
@@ -1399,17 +1403,33 @@ impl ParallelBatchVerifier {
         }
     }
 
-    /// Verifies and returns indices of failures.
+    /// Verifies and returns indices of failures, using parallel verification.
     pub fn verify_and_collect_failures(&self, proofs: &[BatchMembershipProof]) -> Vec<usize> {
-        let mut failures = Vec::new();
-
-        for (idx, proof) in proofs.iter().enumerate() {
-            if !proof.verify(&self.commitment) {
-                failures.push(idx);
-            }
+        if proofs.len() >= PARALLEL_VERIFICATION_THRESHOLD {
+            proofs
+                .par_iter()
+                .enumerate()
+                .filter_map(|(idx, proof)| {
+                    if !proof.verify(&self.commitment) {
+                        Some(idx)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            proofs
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, proof)| {
+                    if !proof.verify(&self.commitment) {
+                        Some(idx)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
         }
-
-        failures
     }
 }
 

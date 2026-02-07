@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 
 /// Proof metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,6 +162,26 @@ impl ProofArchive {
             .map_err(|e| format!("Serialization error: {}", e))
     }
 
+    /// Saves the archive to a JSON file.
+    pub fn save_to_file(&self, path: &Path) -> std::io::Result<()> {
+        let proofs: Vec<&ArchivedProof> = self.proofs.values().collect();
+        let json = serde_json::to_string_pretty(&proofs)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(path, json)
+    }
+
+    /// Loads the archive from a JSON file, rebuilding indices.
+    pub fn load_from_file(path: &Path) -> std::io::Result<Self> {
+        let json = std::fs::read_to_string(path)?;
+        let proofs: Vec<ArchivedProof> = serde_json::from_str(&json)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let mut archive = Self::new();
+        for proof in proofs {
+            archive.archive(proof);
+        }
+        Ok(archive)
+    }
+
     /// Prunes old proofs, keeping only the most recent N per round.
     pub fn prune(&mut self, keep_per_round: usize) {
         for (_, ids) in self.index_by_round.iter_mut() {
@@ -256,12 +277,33 @@ mod tests {
     #[test]
     fn test_stats() {
         let mut archive = ProofArchive::new();
-        
+
         archive.archive(create_test_proof("p1", 1, ProofType::Training));
         archive.archive(create_test_proof("p2", 1, ProofType::Aggregation));
-        
+
         let stats = archive.stats();
         assert_eq!(stats.total_count, 2);
         assert_eq!(stats.total_size, 2048);
+    }
+
+    #[test]
+    fn test_save_and_load_roundtrip() {
+        let mut archive = ProofArchive::new();
+        archive.archive(create_test_proof("p1", 1, ProofType::Training));
+        archive.archive(create_test_proof("p2", 1, ProofType::Aggregation));
+        archive.archive(create_test_proof("p3", 2, ProofType::Gradient));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archive.json");
+
+        archive.save_to_file(&path).unwrap();
+        let loaded = ProofArchive::load_from_file(&path).unwrap();
+
+        assert_eq!(loaded.count(), 3);
+        assert!(loaded.get("p1").is_some());
+        assert!(loaded.get("p2").is_some());
+        assert!(loaded.get("p3").is_some());
+        assert_eq!(loaded.get_by_round(1).len(), 2);
+        assert_eq!(loaded.get_by_type(ProofType::Gradient).len(), 1);
     }
 }

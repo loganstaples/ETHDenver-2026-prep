@@ -56,6 +56,7 @@ pub const DIVISION_THRESHOLD: f64 = 1e-15;
 /// assert_eq!(sum.value(), 15.0);
 /// assert!((sum.absolute_error() - 0.15).abs() < 1e-10);
 /// ```
+#[must_use = "BoundedValue tracks error margins; discarding it silently drops error tracking"]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct BoundedValue<T> {
     /// The computed/approximate value.
@@ -251,6 +252,7 @@ impl BoundedValue<f64> {
     // === Checked arithmetic operations ===
 
     /// Checked addition that returns a Result.
+    #[must_use]
     pub fn checked_add(self, rhs: Self) -> HelixResult<Self> {
         // Check for NaN/Inf in inputs
         if self.is_nan() || rhs.is_nan() {
@@ -279,6 +281,7 @@ impl BoundedValue<f64> {
     }
 
     /// Checked subtraction that returns a Result.
+    #[must_use]
     pub fn checked_sub(self, rhs: Self) -> HelixResult<Self> {
         if self.is_nan() || rhs.is_nan() {
             return Err(ArithmeticError::nan_detected("subtraction").into());
@@ -304,6 +307,7 @@ impl BoundedValue<f64> {
     }
 
     /// Checked multiplication that returns a Result.
+    #[must_use]
     pub fn checked_mul(self, rhs: Self) -> HelixResult<Self> {
         if self.is_nan() || rhs.is_nan() {
             return Err(ArithmeticError::nan_detected("multiplication").into());
@@ -329,6 +333,7 @@ impl BoundedValue<f64> {
     }
 
     /// Checked division that returns a Result.
+    #[must_use]
     pub fn checked_div(self, rhs: Self) -> HelixResult<Self> {
         if self.is_nan() || rhs.is_nan() {
             return Err(ArithmeticError::nan_detected("division").into());
@@ -364,6 +369,7 @@ impl BoundedValue<f64> {
     }
 
     /// Saturating addition that clamps overflow instead of returning an error.
+    #[must_use]
     pub fn saturating_add(self, rhs: Self) -> Self {
         let mut result = self + rhs;
         result.sanitize();
@@ -371,6 +377,7 @@ impl BoundedValue<f64> {
     }
 
     /// Saturating subtraction that clamps overflow instead of returning an error.
+    #[must_use]
     pub fn saturating_sub(self, rhs: Self) -> Self {
         let mut result = self - rhs;
         result.sanitize();
@@ -378,6 +385,7 @@ impl BoundedValue<f64> {
     }
 
     /// Saturating multiplication that clamps overflow instead of returning an error.
+    #[must_use]
     pub fn saturating_mul(self, rhs: Self) -> Self {
         let mut result = self * rhs;
         result.sanitize();
@@ -386,6 +394,7 @@ impl BoundedValue<f64> {
 
     /// Saturating division that clamps overflow instead of returning an error.
     /// Returns a value with maximum error if dividing by near-zero.
+    #[must_use]
     pub fn saturating_div(self, rhs: Self) -> Self {
         let mut result = self / rhs;
         result.sanitize();

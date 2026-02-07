@@ -76,6 +76,16 @@ impl Hash {
         Ok(Self(bytes))
     }
 
+    /// Computes the SHA-256 hash of the given data.
+    ///
+    /// This is a plain SHA-256 hash without domain separation (unlike Merkle
+    /// tree leaf/node hashing). Use this for content integrity verification.
+    pub fn compute(data: &[u8]) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        Self(hasher.finalize().into())
+    }
+
     /// Checks if this is a zero hash.
     pub fn is_zero(&self) -> bool {
         self.0 == [0u8; HASH_SIZE]

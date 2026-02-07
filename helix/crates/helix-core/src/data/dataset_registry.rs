@@ -365,7 +365,7 @@ impl DatasetEntry {
 }
 
 /// Configuration for the dataset registry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegistryConfig {
     /// Maximum number of datasets.
     pub max_datasets: usize,
@@ -689,6 +689,42 @@ impl DatasetCommitmentRegistry {
     pub fn is_empty(&self) -> bool {
         self.datasets.is_empty()
     }
+
+    /// Saves the registry to a JSON file.
+    pub fn save_to_file(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let snapshot = DatasetRegistrySnapshot {
+            entries: self.datasets.values().cloned().collect(),
+            config: self.config.clone(),
+        };
+        let json = serde_json::to_string_pretty(&snapshot)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(path, json)
+    }
+
+    /// Loads the registry from a JSON file, rebuilding indices.
+    pub fn load_from_file(path: &std::path::Path) -> std::io::Result<Self> {
+        let json = std::fs::read_to_string(path)?;
+        let snapshot: DatasetRegistrySnapshot = serde_json::from_str(&json)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let mut registry = Self::new(snapshot.config);
+        for entry in snapshot.entries {
+            // Direct insert bypassing validation (data was already validated on first register)
+            let id = entry.id.clone();
+            let root = entry.commitment.merkle_root;
+            let status = entry.status;
+            registry.by_root.insert(root, id.clone());
+            registry.by_status.entry(status).or_default().push(id.clone());
+            registry.datasets.insert(id, entry);
+        }
+        Ok(registry)
+    }
+}
+
+/// Serializable snapshot of a DatasetCommitmentRegistry for persistence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DatasetRegistrySnapshot {
+    entries: Vec<DatasetEntry>,
+    config: RegistryConfig,
 }
 
 /// Registry statistics.
@@ -900,5 +936,41 @@ mod tests {
         assert_eq!(stats.active_datasets, 3);
         assert_eq!(stats.pending_datasets, 2);
         assert_eq!(stats.total_samples, 100 + 200 + 300 + 400 + 500);
+    }
+
+    #[test]
+    fn test_save_and_load_roundtrip() {
+        let mut registry = DatasetCommitmentRegistry::default_registry();
+
+        let root1 = Hash::from_slice(b"root-1-data-hash-pad!");
+        let root2 = Hash::from_slice(b"root-2-data-hash-pad!");
+
+        let entry1 = DatasetEntry::new(
+            DatasetId::new("ds-1"),
+            DatasetMetadata::new("dataset-1", 100),
+            DatasetCommitment::new(root1, 10),
+        ).with_status(DatasetStatus::Active);
+
+        let entry2 = DatasetEntry::new(
+            DatasetId::new("ds-2"),
+            DatasetMetadata::new("dataset-2", 200),
+            DatasetCommitment::new(root2, 12),
+        ).with_status(DatasetStatus::Pending);
+
+        registry.register(entry1).unwrap();
+        registry.register(entry2).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dataset_registry.json");
+
+        registry.save_to_file(&path).unwrap();
+        let loaded = DatasetCommitmentRegistry::load_from_file(&path).unwrap();
+
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.get(&DatasetId::new("ds-1")).is_ok());
+        assert!(loaded.get(&DatasetId::new("ds-2")).is_ok());
+        assert_eq!(loaded.get(&DatasetId::new("ds-1")).unwrap().metadata.sample_count, 100);
+        assert_eq!(loaded.list_by_status(DatasetStatus::Active).len(), 1);
+        assert_eq!(loaded.list_by_status(DatasetStatus::Pending).len(), 1);
     }
 }

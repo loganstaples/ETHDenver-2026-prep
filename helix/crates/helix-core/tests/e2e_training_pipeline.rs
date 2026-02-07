@@ -280,7 +280,7 @@ impl SimpleMLP {
 
 /// Quantize a f64 value to u64 for witness (fixed-point representation).
 fn quantize_to_u64(value: f64) -> u64 {
-    const SCALE: f64 = 1e9; // 9 decimal places of precision
+    const SCALE: f64 = 1e12; // 12 decimal places of precision, matches TensorWitness::SCALE
     let scaled = (value * SCALE).clamp(0.0, u64::MAX as f64);
     scaled as u64
 }

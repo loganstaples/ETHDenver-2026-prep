@@ -362,7 +362,7 @@ pub struct ShardRegistry {
 }
 
 /// Configuration for shard registry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardRegistryConfig {
     /// Default replication factor.
     pub default_replication: u32,
@@ -843,6 +843,57 @@ impl ShardRegistry {
             missing_samples: missing,
         }
     }
+
+    /// Saves the registry to a JSON file.
+    pub fn save_to_file(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let snapshot = ShardRegistrySnapshot {
+            shards: self.shards.values().cloned().collect(),
+            workers: self.workers.values().cloned().collect(),
+            assignments: self.assignments.clone(),
+            progress: self.progress.values().cloned().collect(),
+            config: self.config.clone(),
+        };
+        let json = serde_json::to_string_pretty(&snapshot)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(path, json)
+    }
+
+    /// Loads the registry from a JSON file, rebuilding indices.
+    pub fn load_from_file(path: &std::path::Path) -> std::io::Result<Self> {
+        let json = std::fs::read_to_string(path)?;
+        let snapshot: ShardRegistrySnapshot = serde_json::from_str(&json)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let mut registry = Self::new(snapshot.config);
+        for worker in snapshot.workers {
+            registry.register_worker(worker);
+        }
+        for shard in snapshot.shards {
+            let shard_id = shard.shard_id;
+            let assigned = shard.assigned_workers.clone();
+            registry.register_shard(shard);
+            for worker_id in assigned {
+                registry.assign_shard(shard_id, worker_id);
+            }
+        }
+        for (shard_id, progress) in snapshot.assignments.keys().zip(snapshot.progress.iter()) {
+            registry.progress.insert(*shard_id, progress.clone());
+        }
+        // Restore any remaining progress entries
+        for p in snapshot.progress {
+            registry.progress.entry(p.shard_id).or_insert(p);
+        }
+        Ok(registry)
+    }
+}
+
+/// Serializable snapshot of a ShardRegistry for persistence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ShardRegistrySnapshot {
+    shards: Vec<ShardMetadata>,
+    workers: Vec<WorkerInfo>,
+    assignments: HashMap<ShardId, Vec<WorkerId>>,
+    progress: Vec<ShardProgress>,
+    config: ShardRegistryConfig,
 }
 
 /// Overall progress summary.
@@ -1750,5 +1801,29 @@ mod tests {
         assert!(removed.is_some());
         assert!(registry.get_shard(ShardId(0)).is_none());
         assert!(registry.get_worker_shards(&WorkerId::new("w1")).is_empty());
+    }
+
+    #[test]
+    fn test_save_and_load_roundtrip() {
+        let mut registry = ShardRegistry::default_registry();
+        registry.register_worker(WorkerInfo::new(WorkerId::new("w1")));
+        registry.register_worker(WorkerInfo::new(WorkerId::new("w2")));
+        registry.register_shard(ShardMetadata::new(ShardId(0), 100, 1024));
+        registry.register_shard(ShardMetadata::new(ShardId(1), 200, 2048));
+        registry.assign_shard(ShardId(0), WorkerId::new("w1"));
+        registry.assign_shard(ShardId(1), WorkerId::new("w2"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shard_registry.json");
+
+        registry.save_to_file(&path).unwrap();
+        let loaded = ShardRegistry::load_from_file(&path).unwrap();
+
+        assert!(loaded.get_shard(ShardId(0)).is_some());
+        assert!(loaded.get_shard(ShardId(1)).is_some());
+        assert_eq!(loaded.get_shard(ShardId(0)).unwrap().num_samples, 100);
+        assert_eq!(loaded.get_shard(ShardId(1)).unwrap().num_samples, 200);
+        assert!(loaded.get_worker(&WorkerId::new("w1")).is_some());
+        assert!(loaded.get_worker(&WorkerId::new("w2")).is_some());
     }
 }
