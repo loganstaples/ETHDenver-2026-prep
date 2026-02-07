@@ -1,106 +1,423 @@
 mod sc_client;
 
-use crate::sc_client::{SCClient, TrainingProofInputs};
+use helix_node::sc_client::SCClient;
+use helix_node::api::http::{ApiState, OrchestratorSnapshot, RoundInfo, WorkerInfo as ApiWorkerInfo};
+use helix_node::network::messages::{
+    GradientMessage, HeartbeatMessage, MessagePayload, NodeCapabilities, PeerId, PeerInfo,
+    TrainingMessage, TrainingParams,
+};
+use helix_node::network::runner::{NetworkEvent, NetworkRunnerBuilder};
+use helix_node::round_commit::{RoundCommitConfig, RoundCommitManager};
 use helix_node::trainer::Trainer;
-use helix_prover::halo2curves::bn256::Fr;
-use helix_prover::halo2curves::ff::PrimeField;
-use tokio::time::{sleep, Duration};
-use log::{info, error};
+use helix_node::training::orchestrator::{
+    OrchestratorConfig, OrchestratorEvent, TrainingOrchestrator,
+};
 
-use ethers::types::U256;
+use log::{error, info, warn};
+use parking_lot::RwLock;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::broadcast;
 
-/// Converts a Fr field element to U256 for smart contract calls.
-fn fr_to_u256(fr: &Fr) -> U256 {
-    let repr = fr.to_repr();
-    U256::from_little_endian(repr.as_ref())
+/// Reads an env var or returns a default.
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    dotenv::dotenv().ok();
     env_logger::init();
-    info!("Starting Helix Training Node...");
 
-    let client = match SCClient::new().await {
-        Ok(c) => c,
-        Err(e) => {
-            error!("Failed to initialize SCClient: {}", e);
-            return Ok(());
+    let role = env_or("HELIX_NODE_ROLE", "worker");
+    let listen_addr: SocketAddr = env_or("HELIX_LISTEN_ADDR", "127.0.0.1:9000")
+        .parse()
+        .expect("invalid HELIX_LISTEN_ADDR");
+
+    info!("Starting Helix Node (role={}, addr={})", role, listen_addr);
+
+    match role.as_str() {
+        "worker" => run_worker(listen_addr).await,
+        "aggregator" => run_aggregator(listen_addr).await,
+        _ => {
+            error!("Unknown HELIX_NODE_ROLE: '{}'. Use 'worker' or 'aggregator'.", role);
+            std::process::exit(1);
         }
+    }
+}
+
+// ============================================================================
+// Worker Role
+// ============================================================================
+
+async fn run_worker(listen_addr: SocketAddr) -> anyhow::Result<()> {
+    let aggregator_addr: SocketAddr = env_or("HELIX_AGGREGATOR_ADDR", "127.0.0.1:9000")
+        .parse()
+        .expect("invalid HELIX_AGGREGATOR_ADDR");
+
+    let local_id = PeerId::random();
+    info!("Worker {} starting, will connect to aggregator at {}", local_id, aggregator_addr);
+
+    // Build network runner
+    let network = NetworkRunnerBuilder::new()
+        .local_id(local_id.clone())
+        .listen_addr(listen_addr)
+        .capabilities(NodeCapabilities {
+            can_train: true,
+            can_aggregate: false,
+            can_prove: true,
+            gpu_memory_mb: 0,
+            cpu_cores: std::thread::available_parallelism()
+                .map(|n| n.get() as u32)
+                .unwrap_or(4),
+            storage_gb: 10,
+        })
+        .build()?;
+
+    let network = Arc::new(network);
+    network.start().await?;
+
+    // Connect to aggregator
+    let agg_peer = PeerInfo {
+        id: PeerId::from_string("aggregator"),
+        address: aggregator_addr.to_string(),
+        capabilities: NodeCapabilities {
+            can_aggregate: true,
+            ..Default::default()
+        },
+        last_seen: 0,
+        reputation: 100,
     };
+    network.connect_peer(agg_peer).await?;
+    info!("Connected to aggregator at {}", aggregator_addr);
 
-    // Real 2-layer MLP: 4 inputs, 8 hidden, 2 outputs.
-    let mut trainer = Trainer::new(4, 8, 2, 0.01, 42);
-    let model_id: u64 = 0;
+    // Heartbeat loop: send heartbeats to aggregator so it registers us
+    let network_hb = network.clone();
+    tokio::spawn(async move {
+        let mut seq = 0u64;
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            network_hb
+                .broadcast(MessagePayload::Heartbeat(HeartbeatMessage {
+                    seq,
+                    is_pong: false,
+                    load: 30,
+                }))
+                .await;
+            seq += 1;
+        }
+    });
 
-    let args: Vec<String> = std::env::args().collect();
-    let one_shot = args.contains(&"--one-shot".to_string());
-
-    info!(
-        "Node initialized (model: {}×{}×{}, {} params). Polling for rounds...",
-        trainer.model().d_in,
-        trainer.model().d_hid,
-        trainer.model().d_out,
-        trainer.model().num_params(),
-    );
-
-    // Demo input/target (would come from DataLoader in production).
-    let x = vec![1.0, 0.5, -0.3, 0.8];
-    let target = vec![1.0, 0.0];
+    // Main event loop: wait for RoundStart, train, send gradient
+    let mut trainer: Option<Trainer> = None;
 
     loop {
-        match client.get_model_state(model_id).await {
-            Ok(state) => {
-                info!("Current Round: {}, Active: {}", state.current_round, state.active);
-
-                if !state.active {
-                    info!("Model not active, waiting...");
-                    sleep(Duration::from_secs(10)).await;
-                    continue;
-                }
-
-                info!("Training step {}...", trainer.step_count() + 1);
-                match trainer.train_step(&x, &target) {
-                    Ok(result) => {
+        match network.next_event().await {
+            Some(NetworkEvent::TrainingMessage { from, message }) => {
+                match message {
+                    TrainingMessage::RoundStart {
+                        round_id,
+                        model_hash,
+                        params,
+                    } => {
                         info!(
-                            "Proof generated ({} bytes, loss={:.6})! Submitting...",
-                            result.proof.len(),
-                            result.loss
+                            "Received RoundStart #{} from {} (model {}x{}x{}, lr={}, seed={})",
+                            round_id,
+                            from,
+                            params.d_in,
+                            params.d_hid,
+                            params.d_out,
+                            params.learning_rate,
+                            params.model_seed,
                         );
 
-                        // Convert public inputs from Fr to U256
-                        let public_inputs: Vec<U256> = result.public_inputs
-                            .iter()
-                            .map(fr_to_u256)
-                            .collect();
+                        // Initialize trainer if needed (same seed = same initial model)
+                        if trainer.is_none() {
+                            trainer = Some(Trainer::new(
+                                params.d_in,
+                                params.d_hid,
+                                params.d_out,
+                                params.learning_rate,
+                                params.model_seed,
+                            ));
+                        }
 
-                        match client
-                            .submit_proof_raw(
-                                model_id,
-                                state.current_round,
-                                result.proof,
-                                public_inputs,
-                            )
-                            .await
-                        {
-                            Ok(receipt) => {
+                        let t = trainer.as_mut().unwrap();
+
+                        // Generate synthetic data from seed (deterministic)
+                        let (x, target) = generate_training_data(params.d_in, params.d_out, params.model_seed + round_id);
+
+                        info!("Training step {} (round {})...", t.step_count() + 1, round_id);
+                        match t.train_step(&x, &target) {
+                            Ok(result) => {
                                 info!(
-                                    "Update submitted: {:?}",
-                                    receipt.transaction_hash
+                                    "Proof generated: {} bytes, loss={:.6}, commitment={:?}",
+                                    result.proof.len(),
+                                    result.loss,
+                                    hex::encode(&result.commitment[..4]),
                                 );
-                                if one_shot {
-                                    info!("One-shot mode: exiting.");
-                                    return Ok(());
-                                }
+
+                                // Send gradient + proof back to aggregator
+                                network
+                                    .broadcast(MessagePayload::Gradient(
+                                        GradientMessage::ShareGradient {
+                                            round_id,
+                                            gradient_commitment: result.commitment,
+                                            error_bound: result.loss * 0.01, // conservative error bound
+                                            proof: result.proof,
+                                        },
+                                    ))
+                                    .await;
+
+                                info!("Gradient sent for round {}", round_id);
                             }
-                            Err(e) => error!("Submission failed: {}", e),
+                            Err(e) => {
+                                error!("Training failed for round {}: {}", round_id, e);
+                            }
                         }
                     }
-                    Err(e) => error!("Training failed: {}", e),
+                    TrainingMessage::RoundComplete { round_id, .. } => {
+                        info!("Round {} completed", round_id);
+                    }
+                    _ => {}
                 }
             }
-            Err(e) => error!("Error fetching model state: {}", e),
+            Some(NetworkEvent::Heartbeat { .. }) => {
+                // Heartbeat pongs handled automatically
+            }
+            Some(NetworkEvent::PeerDiscovered(peer)) => {
+                info!("Peer discovered: {} at {}", peer.id, peer.address);
+            }
+            Some(NetworkEvent::Error { error, .. }) => {
+                warn!("Network error: {}", error);
+            }
+            None => {
+                warn!("Network event stream ended");
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// Aggregator Role
+// ============================================================================
+
+async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
+    let min_workers: usize = env_or("HELIX_MIN_WORKERS", "1").parse().unwrap_or(1);
+    let d_in: usize = env_or("HELIX_D_IN", "4").parse().unwrap_or(4);
+    let d_hid: usize = env_or("HELIX_D_HID", "8").parse().unwrap_or(8);
+    let d_out: usize = env_or("HELIX_D_OUT", "2").parse().unwrap_or(2);
+    let model_seed: u64 = env_or("HELIX_MODEL_SEED", "42").parse().unwrap_or(42);
+    let learning_rate: f64 = env_or("HELIX_LR", "0.01").parse().unwrap_or(0.01);
+    let http_port: u16 = env_or("HELIX_HTTP_PORT", "9001").parse().unwrap_or(9001);
+
+    let local_id = PeerId::from_string("aggregator");
+    info!(
+        "Aggregator starting on {} (min_workers={}, model={}x{}x{})",
+        listen_addr, min_workers, d_in, d_hid, d_out
+    );
+
+    // Build network runner
+    let network = NetworkRunnerBuilder::new()
+        .local_id(local_id.clone())
+        .listen_addr(listen_addr)
+        .capabilities(NodeCapabilities {
+            can_train: false,
+            can_aggregate: true,
+            can_prove: false,
+            gpu_memory_mb: 0,
+            cpu_cores: std::thread::available_parallelism()
+                .map(|n| n.get() as u32)
+                .unwrap_or(4),
+            storage_gb: 10,
+        })
+        .build()?;
+
+    let network = Arc::new(network);
+    network.start().await?;
+    info!("Aggregator listening on {}", listen_addr);
+
+    // Create orchestrator
+    let orch_config = OrchestratorConfig {
+        min_workers,
+        collection_timeout: Duration::from_secs(120),
+        heartbeat_interval: Duration::from_secs(10),
+        worker_timeout: Duration::from_secs(60),
+        default_params: TrainingParams {
+            learning_rate,
+            batch_size: 1,
+            local_epochs: 1,
+            max_error_bound: 0.1,
+            d_in,
+            d_hid,
+            d_out,
+            model_seed,
+        },
+        ..Default::default()
+    };
+
+    let orchestrator = TrainingOrchestrator::new(local_id.clone(), orch_config, network.clone());
+    orchestrator.set_leader(true);
+
+    // Wire up RoundCommitManager with SCClient if env vars are set
+    let rpc_url = env_or("HELIX_ETH_RPC", "");
+    let private_key = env_or("PRIVATE_KEY", "");
+    let coordinator_addr = env_or("COORDINATOR_ADDRESS", "");
+
+    if !rpc_url.is_empty() && !private_key.is_empty() && !coordinator_addr.is_empty() {
+        info!("Connecting to chain at {} (coordinator={})", rpc_url, coordinator_addr);
+        match SCClient::with_config(&rpc_url, &private_key, &coordinator_addr).await {
+            Ok(client) => {
+                let client = Arc::new(client);
+                let commit_config = RoundCommitConfig {
+                    model_id: 0,
+                    min_proofs: 1,
+                    collection_timeout: Duration::from_secs(120),
+                    ..Default::default()
+                };
+                let manager = RoundCommitManager::with_client(commit_config, client);
+                orchestrator.set_round_commit_manager(manager);
+                info!("On-chain proof submission enabled");
+            }
+            Err(e) => {
+                warn!("Failed to connect to chain: {}. Running without on-chain submission.", e);
+            }
+        }
+    } else {
+        info!("No chain config (HELIX_ETH_RPC, PRIVATE_KEY, COORDINATOR_ADDRESS). Running without on-chain submission.");
+    }
+
+    let mut event_rx = orchestrator.start().await;
+
+    // Compute initial model hash
+    let initial_model = helix_node::trainer::MlpModel::new_random(d_in, d_hid, d_out, model_seed);
+    let model_hash = initial_model.commitment();
+    info!(
+        "Model initialized: {}x{}x{} ({} params), commitment={}",
+        d_in,
+        d_hid,
+        d_out,
+        initial_model.num_params(),
+        hex::encode(&model_hash[..8]),
+    );
+
+    // Set up shared API state
+    let (round_trigger_tx, mut round_trigger_rx) = broadcast::channel::<()>(16);
+    let api_snapshot = Arc::new(RwLock::new(OrchestratorSnapshot::default()));
+    let api_state = Arc::new(ApiState {
+        orchestrator_workers: api_snapshot.clone(),
+        round_trigger_tx: round_trigger_tx.clone(),
+    });
+
+    // Start HTTP API
+    let http_addr: SocketAddr = format!("0.0.0.0:{}", http_port).parse().unwrap();
+    let api_state_clone = api_state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = helix_node::api::http::start_api_server(http_addr, api_state_clone).await {
+            error!("HTTP API error: {}", e);
+        }
+    });
+
+    let orchestrator_ref = &orchestrator;
+
+    // Spawn event logger + snapshot updater
+    let snapshot_for_events = api_snapshot.clone();
+    let mut completed_rounds = 0u64;
+    tokio::spawn(async move {
+        while let Some(event) = event_rx.recv().await {
+            match &event {
+                OrchestratorEvent::WorkerJoined { peer_id } => {
+                    info!("Worker joined: {}", peer_id);
+                }
+                OrchestratorEvent::WorkerLeft { peer_id } => {
+                    info!("Worker left: {}", peer_id);
+                }
+                OrchestratorEvent::RoundStarted { round_id, workers } => {
+                    info!("Round {} started with {} workers", round_id, workers.len());
+                }
+                OrchestratorEvent::GradientReceived { round_id, peer_id } => {
+                    info!("Gradient received for round {} from {}", round_id, peer_id);
+                }
+                OrchestratorEvent::RoundCompleted { round_id, result_hash } => {
+                    completed_rounds += 1;
+                    snapshot_for_events.write().completed_rounds = completed_rounds;
+                    info!(
+                        "Round {} completed, result={}",
+                        round_id,
+                        hex::encode(&result_hash[..8])
+                    );
+                }
+                OrchestratorEvent::RoundFailed { round_id, reason } => {
+                    error!("Round {} failed: {}", round_id, reason);
+                }
+                _ => {}
+            }
+        }
+    });
+
+    // Polling loop: check worker count, update snapshot, start rounds
+    let mut round_number = 0u64;
+    loop {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        let stats = orchestrator_ref.worker_stats();
+
+        // Update API snapshot
+        {
+            let mut snap = api_snapshot.write();
+            snap.worker_count = stats.total;
+            snap.available_workers = stats.available;
+            snap.computing_workers = stats.computing;
+            snap.current_round = orchestrator_ref.current_round().map(|(id, phase)| RoundInfo {
+                round_id: id,
+                phase: format!("{:?}", phase),
+                gradients_received: 0,
+                workers_assigned: stats.computing,
+            });
         }
 
-        sleep(Duration::from_secs(10)).await;
+        info!(
+            "Workers: total={}, available={}, computing={}",
+            stats.total, stats.available, stats.computing
+        );
+
+        // Check for manual round trigger from HTTP API
+        let manual_trigger = round_trigger_rx.try_recv().is_ok();
+
+        // Start a new round if we have enough workers and no active round
+        if (stats.available >= min_workers || manual_trigger) && orchestrator_ref.current_round().is_none() {
+            if stats.available < 1 {
+                continue;
+            }
+            round_number += 1;
+            info!("Starting round {} with {} available workers", round_number, stats.available);
+            match orchestrator_ref.start_round(model_hash).await {
+                Ok(id) => info!("Round {} started successfully (id={})", round_number, id),
+                Err(e) => error!("Failed to start round: {}", e),
+            }
+        }
     }
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/// Generates deterministic synthetic training data from a seed.
+fn generate_training_data(d_in: usize, d_out: usize, seed: u64) -> (Vec<f64>, Vec<f64>) {
+    let mut rng = seed;
+    let mut next = || -> f64 {
+        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((rng >> 33) as f64 / (1u64 << 31) as f64) - 1.0
+    };
+
+    let x: Vec<f64> = (0..d_in).map(|_| next() * 0.5).collect();
+    let target: Vec<f64> = (0..d_out).map(|_| next().abs()).collect();
+
+    (x, target)
 }

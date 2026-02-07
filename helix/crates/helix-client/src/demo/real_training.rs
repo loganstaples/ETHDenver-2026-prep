@@ -298,7 +298,7 @@ impl RealTrainingExecutor {
         );
 
         // Generate the actual proof (this is the expensive ZK proof generation)
-        let proof_result = prover.prove(&witness);
+        let proof_result = prover.prove(&witness).map_err(|e| anyhow::anyhow!("Proof generation failed: {:?}", e))?;
 
         let proof_time = step_start.elapsed();
         self.total_proof_time += proof_time;

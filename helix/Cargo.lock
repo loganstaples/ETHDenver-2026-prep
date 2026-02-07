@@ -2901,6 +2901,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum",
  "bincode",
  "bytes",
  "chrono",
@@ -2933,6 +2934,7 @@ dependencies = [
  "tokio",
  "tokio-rustls 0.26.4",
  "tokio-test",
+ "tower 0.5.3",
  "uuid 1.20.0",
  "webpki-roots 0.26.11",
 ]

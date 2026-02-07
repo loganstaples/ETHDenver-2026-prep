@@ -18,6 +18,12 @@ use crate::network::messages::{
     TrainingParams,
 };
 use crate::network::runner::{NetworkEvent, NetworkRunner};
+use crate::round_commit::{
+    RoundCommitConfig, RoundCommitManager, WorkerProof,
+};
+use crate::sc_client::{SCClient, TrainingProofInputs};
+use crate::training::DistributedRoundId;
+use ethers::types::U256;
 
 use super::verification::{GradientValidator, ProofVerifier, ValidationResult, VerificationConfig};
 
@@ -63,6 +69,10 @@ impl Default for OrchestratorConfig {
                 batch_size: 32,
                 local_epochs: 5,
                 max_error_bound: 0.1,
+                d_in: 4,
+                d_hid: 8,
+                d_out: 2,
+                model_seed: 42,
             },
         }
     }
@@ -204,6 +214,8 @@ pub struct TrainingOrchestrator {
     running: Arc<std::sync::atomic::AtomicBool>,
     /// Whether this node is the leader.
     is_leader: Arc<RwLock<bool>>,
+    /// Round commit manager for proof aggregation + on-chain submission.
+    round_commit: Arc<RwLock<Option<RoundCommitManager>>>,
 }
 
 impl TrainingOrchestrator {
@@ -232,7 +244,13 @@ impl TrainingOrchestrator {
             event_tx,
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             is_leader: Arc::new(RwLock::new(false)),
+            round_commit: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Sets up the round commit manager with an on-chain client.
+    pub fn set_round_commit_manager(&self, manager: RoundCommitManager) {
+        *self.round_commit.write() = Some(manager);
     }
 
     /// Starts the orchestrator.
@@ -599,21 +617,19 @@ impl TrainingOrchestrator {
 
     async fn aggregate_and_commit(&self) {
         let round_id;
-        let result_hash;
+        let gradients: Vec<(PeerId, CollectedGradient)>;
+        let worker_ids: Vec<PeerId>;
+        let model_hash: [u8; 32];
 
         {
             let mut round_guard = self.current_round.write();
             if let Some(ref mut round) = *round_guard {
                 round_id = round.id;
-
-                // Compute aggregated commitment
-                let mut combined = [0u8; 32];
-                for (_, gradient) in &round.gradients {
-                    for (i, byte) in gradient.commitment.iter().enumerate() {
-                        combined[i] ^= byte;
-                    }
-                }
-                result_hash = combined;
+                model_hash = round.model_hash;
+                gradients = round.gradients.iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                worker_ids = round.workers.iter().cloned().collect();
 
                 round.phase = RoundPhase::Committing;
                 round.phase_started = Instant::now();
@@ -622,15 +638,145 @@ impl TrainingOrchestrator {
             }
         }
 
-        // Broadcast aggregated result
+        // Try using RoundCommitManager for real proof aggregation + on-chain submission
+        let has_commit_manager = self.round_commit.read().is_some();
+
+        if has_commit_manager {
+            let result = self.aggregate_with_commit_manager(
+                round_id,
+                &gradients,
+                &worker_ids,
+                model_hash,
+            ).await;
+
+            match result {
+                Ok(result_hash) => {
+                    log::info!(
+                        "Round {} aggregated via RoundCommitManager, tx={}",
+                        round_id,
+                        hex::encode(result_hash)
+                    );
+                    self.network.broadcast(MessagePayload::Gradient(
+                        GradientMessage::AggregatedGradient {
+                            round_id,
+                            commitment: result_hash,
+                            proof: vec![], // Proof already submitted on-chain
+                        },
+                    )).await;
+                    self.complete_round(result_hash).await;
+                    return;
+                }
+                Err(e) => {
+                    log::warn!(
+                        "RoundCommitManager submission failed for round {}: {}, falling back to local aggregation",
+                        round_id, e
+                    );
+                }
+            }
+        }
+
+        // Fallback: local Merkle aggregation (no on-chain submission)
+        let mut combined = [0u8; 32];
+        for (_, gradient) in &gradients {
+            for (i, byte) in gradient.commitment.iter().enumerate() {
+                combined[i] ^= byte;
+            }
+        }
+
         self.network.broadcast(MessagePayload::Gradient(GradientMessage::AggregatedGradient {
             round_id,
-            commitment: result_hash,
-            proof: vec![], // In production, would generate aggregation proof
+            commitment: combined,
+            proof: vec![],
         })).await;
 
-        // Complete round
-        self.complete_round(result_hash).await;
+        self.complete_round(combined).await;
+    }
+
+    /// Aggregates proofs via RoundCommitManager and submits to chain.
+    async fn aggregate_with_commit_manager(
+        &self,
+        round_id: u64,
+        gradients: &[(PeerId, CollectedGradient)],
+        worker_ids: &[PeerId],
+        model_hash: [u8; 32],
+    ) -> Result<[u8; 32], String> {
+        let dist_round_id = DistributedRoundId {
+            session_id: 1,
+            round_number: round_id,
+        };
+
+        // Start collection
+        let commit_id = {
+            let mut manager = self.round_commit.write();
+            let manager = manager.as_mut().ok_or("No commit manager")?;
+            manager
+                .start_collection(dist_round_id, worker_ids.to_vec())
+                .map_err(|e| format!("start_collection: {}", e))?
+        };
+
+        // Submit each worker's proof
+        for (idx, (peer_id, gradient)) in gradients.iter().enumerate() {
+            let worker_proof = WorkerProof {
+                worker_id: peer_id.clone(),
+                proof: gradient.proof.clone(),
+                public_inputs: TrainingProofInputs {
+                    old_hash_lo: U256::from_big_endian(&model_hash[..16]),
+                    old_hash_hi: U256::from_big_endian(&model_hash[16..]),
+                    new_hash_lo: U256::from_big_endian(&gradient.commitment[..16]),
+                    new_hash_hi: U256::from_big_endian(&gradient.commitment[16..]),
+                    loss: U256::zero(),
+                    error_bound: U256::from((gradient.error_bound * 1e18) as u64),
+                    step_number: U256::from(round_id),
+                },
+                error_bound: gradient.error_bound,
+                share_index: idx,
+                gradient_commitment: gradient.commitment,
+                submitted_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            };
+
+            let mut manager = self.round_commit.write();
+            let manager = manager.as_mut().ok_or("No commit manager")?;
+            manager
+                .submit_proof(commit_id, worker_proof)
+                .map_err(|e| format!("submit_proof: {}", e))?;
+        }
+
+        // Use first worker's commitment as new_commitment (representative proof)
+        let new_commitment = gradients
+            .first()
+            .map(|(_, g)| g.commitment)
+            .unwrap_or([0u8; 32]);
+
+        // Finalize collection and aggregate
+        let aggregated = {
+            let mut manager = self.round_commit.write();
+            let manager = manager.as_mut().ok_or("No commit manager")?;
+            manager
+                .finalize_collection(commit_id, model_hash, new_commitment)
+                .map_err(|e| format!("finalize_collection: {}", e))?
+        };
+
+        // Submit to chain
+        let result = {
+            let mut manager = self.round_commit.write();
+            let manager = manager.as_mut().ok_or("No commit manager")?;
+            manager
+                .submit_to_chain(commit_id)
+                .await
+                .map_err(|e| format!("submit_to_chain: {}", e))?
+        };
+
+        log::info!(
+            "On-chain proof submitted: tx={:?}, block={}, gas={}",
+            result.tx_hash,
+            result.block_number,
+            result.gas_used,
+        );
+
+        Ok(aggregated.gradient_commitment)
     }
 
     async fn complete_round(&self, result_hash: [u8; 32]) {

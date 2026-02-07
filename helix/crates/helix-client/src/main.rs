@@ -277,6 +277,42 @@ struct TrainArgs {
     /// Output directory for metrics and checkpoints
     #[arg(long, short)]
     output_dir: Option<PathBuf>,
+
+    /// Live mode: spawn real helix-node processes for distributed training
+    #[arg(long)]
+    live: bool,
+
+    /// Number of worker nodes (live mode)
+    #[arg(long, default_value = "3")]
+    workers: u32,
+
+    /// Model dimensions as "d_in,d_hid,d_out" (live mode)
+    #[arg(long, default_value = "4,8,2")]
+    model: String,
+
+    /// Model seed (live mode)
+    #[arg(long, default_value = "42")]
+    model_seed: u64,
+
+    /// Path to helix-node binary (live mode, defaults to searching PATH)
+    #[arg(long)]
+    node_binary: Option<PathBuf>,
+
+    /// Ethereum RPC URL (live mode, defaults to http://localhost:8545)
+    #[arg(long, default_value = "http://localhost:8545")]
+    rpc_url: String,
+
+    /// Private key for on-chain transactions (live mode)
+    #[arg(long, env = "PRIVATE_KEY", default_value = "")]
+    private_key: String,
+
+    /// Coordinator contract address (live mode)
+    #[arg(long, env = "COORDINATOR_ADDRESS", default_value = "")]
+    coordinator_address: String,
+
+    /// HTTP API port for the aggregator (live mode)
+    #[arg(long, default_value = "9001")]
+    http_port: u16,
 }
 
 #[derive(Args)]
@@ -846,6 +882,10 @@ async fn cmd_export(args: &ExportArgs, _cli: &Cli) -> Result<()> {
 }
 
 async fn cmd_train(args: &TrainArgs, _cli: &Cli, shutdown: broadcast::Receiver<()>) -> Result<()> {
+    if args.live {
+        return cmd_train_live(args, shutdown).await;
+    }
+
     let options = TrainOptions {
         config: args.train_config.clone(),
         model_id: args.model_id,
@@ -869,6 +909,217 @@ async fn cmd_train(args: &TrainArgs, _cli: &Cli, shutdown: broadcast::Receiver<(
             return Err(anyhow::anyhow!("{}", error));
         }
     }
+
+    Ok(())
+}
+
+/// Live training: spawn real helix-node processes and run distributed ZK-verified training.
+async fn cmd_train_live(args: &TrainArgs, mut shutdown: broadcast::Receiver<()>) -> Result<()> {
+    use orchestrator::{
+        LiveNetworkConfig, LiveTrainingOrchestrator, NetworkOrchestratorConfig,
+    };
+
+    // Parse model dimensions
+    let dims: Vec<usize> = args
+        .model
+        .split(',')
+        .map(|s| s.trim().parse::<usize>())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|_| anyhow::anyhow!("Invalid --model format. Expected d_in,d_hid,d_out (e.g. 4,8,2)"))?;
+    if dims.len() != 3 {
+        return Err(anyhow::anyhow!("--model requires exactly 3 dimensions: d_in,d_hid,d_out"));
+    }
+    let (d_in, d_hid, d_out) = (dims[0], dims[1], dims[2]);
+
+    let max_rounds = args.max_rounds.unwrap_or(5);
+    let learning_rate = args.learning_rate.unwrap_or(0.01);
+
+    // Resolve helix-node binary
+    let node_binary = match &args.node_binary {
+        Some(p) => p.clone(),
+        None => {
+            // Try to find it relative to cargo target dir
+            let candidates = [
+                PathBuf::from("target/debug/helix-node"),
+                PathBuf::from("target/release/helix-node"),
+                PathBuf::from("helix-node"),
+            ];
+            candidates
+                .iter()
+                .find(|p| p.exists())
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!(
+                    "helix-node binary not found. Build it first:\n  cargo build -p helix-node\nOr specify --node-binary <path>"
+                ))?
+        }
+    };
+
+    println!();
+    println!("{}", "═".repeat(60).cyan());
+    println!("{}", " HELIX Live Distributed Training".cyan().bold());
+    println!("{}", "═".repeat(60).cyan());
+    println!();
+
+    println!("{}", "Configuration:".yellow().bold());
+    println!("  Model dims:    {}x{}x{} ({} params)",
+        d_in, d_hid, d_out,
+        d_in * d_hid + d_hid + d_hid * d_out + d_out
+    );
+    println!("  Workers:       {}", args.workers);
+    println!("  Rounds:        {}", max_rounds);
+    println!("  Learning rate: {}", learning_rate);
+    println!("  Node binary:   {}", node_binary.display());
+    println!("  HTTP API:      http://127.0.0.1:{}", args.http_port);
+    if !args.rpc_url.is_empty() && !args.private_key.is_empty() {
+        println!("  Chain RPC:     {}", args.rpc_url);
+        println!("  Coordinator:   {}", args.coordinator_address);
+    } else {
+        println!("  Chain:         {} (no on-chain submission)", "offline".yellow());
+    }
+    println!();
+
+    let live_config = LiveNetworkConfig {
+        node_binary: node_binary.clone(),
+        eth_rpc: args.rpc_url.clone(),
+        private_key: args.private_key.clone(),
+        coordinator_address: args.coordinator_address.clone(),
+        model_dims: (d_in, d_hid, d_out),
+        model_seed: args.model_seed,
+        learning_rate,
+        http_port: args.http_port,
+    };
+
+    let live_orch = LiveTrainingOrchestrator::new(args.workers, max_rounds, live_config);
+
+    // Start all nodes
+    let mut progress = ProgressDisplay::new();
+    progress.start_spinner("Starting aggregator + workers...");
+    live_orch.start().await?;
+    progress.finish_spinner(&format!(
+        "Started 1 aggregator + {} workers",
+        args.workers
+    ));
+
+    // Wait for workers to register with aggregator
+    progress.start_spinner("Waiting for workers to connect...");
+    let poll_timeout = std::time::Instant::now();
+    loop {
+        if poll_timeout.elapsed() > Duration::from_secs(30) {
+            live_orch.stop().await?;
+            return Err(anyhow::anyhow!("Timeout waiting for workers to connect"));
+        }
+
+        match live_orch.poll_health().await {
+            Ok(health) => {
+                let workers = health.get("workers").and_then(|v| v.as_u64()).unwrap_or(0);
+                if workers >= args.workers as u64 {
+                    break;
+                }
+            }
+            Err(_) => {} // API not ready yet
+        }
+
+        // Check for shutdown
+        if shutdown.try_recv().is_ok() {
+            live_orch.stop().await?;
+            return Err(anyhow::anyhow!("Interrupted"));
+        }
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    progress.finish_spinner(&format!("{} workers connected", args.workers));
+    println!();
+
+    // Run training rounds
+    println!("{}", "═".repeat(60).cyan());
+    println!("{}", " Training Progress".cyan().bold());
+    println!("{}", "═".repeat(60).cyan());
+    println!();
+
+    for round in 1..=max_rounds {
+        // Check for shutdown
+        if shutdown.try_recv().is_ok() {
+            println!("\n{}", "Training interrupted by user".yellow());
+            break;
+        }
+
+        // Trigger a round
+        progress.start_spinner(&format!("Round {}/{} - Starting...", round, max_rounds));
+        match live_orch.trigger_round().await {
+            Ok(_) => {}
+            Err(e) => {
+                progress.finish_spinner_error(&format!("Round {} - Failed to trigger: {}", round, e));
+                // Wait and retry — aggregator may need time
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        }
+
+        // Poll round status until complete
+        let round_start = std::time::Instant::now();
+        let round_timeout = Duration::from_secs(120);
+        loop {
+            if round_start.elapsed() > round_timeout {
+                progress.finish_spinner_error(&format!("Round {} - Timeout", round));
+                break;
+            }
+
+            if shutdown.try_recv().is_ok() {
+                break;
+            }
+
+            match live_orch.poll_round_status().await {
+                Ok(status) => {
+                    let current_round = status.get("current_round").and_then(|v| {
+                        v.as_object().and_then(|r| r.get("round_id").and_then(|id| id.as_u64()))
+                    });
+                    let completed = status.get("completed_rounds").and_then(|v| v.as_u64()).unwrap_or(0);
+
+                    if completed >= round as u64 {
+                        let elapsed = round_start.elapsed().as_millis();
+                        progress.finish_spinner(&format!(
+                            "Round {}/{} - Completed ({}ms)",
+                            round, max_rounds, elapsed
+                        ));
+                        break;
+                    }
+
+                    if current_round.is_none() && completed < round as u64 {
+                        // Round hasn't started yet or completed before we could see it
+                        // Give it more time
+                    }
+                }
+                Err(_) => {} // Transient error
+            }
+
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    println!();
+    println!("{}", "═".repeat(60).green());
+    println!("{}", " Training Complete".green().bold());
+    println!("{}", "═".repeat(60).green());
+    println!();
+
+    // Final status
+    match live_orch.poll_round_status().await {
+        Ok(status) => {
+            let completed = status.get("completed_rounds").and_then(|v| v.as_u64()).unwrap_or(0);
+            let workers = status.get("worker_count").and_then(|v| v.as_u64()).unwrap_or(0);
+            println!("  Rounds completed: {}", completed);
+            println!("  Workers:          {}", workers);
+        }
+        Err(_) => {
+            println!("  (Unable to fetch final status)");
+        }
+    }
+    println!();
+
+    // Stop all nodes
+    progress.start_spinner("Shutting down nodes...");
+    live_orch.stop().await?;
+    progress.finish_spinner("All nodes stopped");
 
     Ok(())
 }

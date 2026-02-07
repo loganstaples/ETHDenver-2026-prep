@@ -244,6 +244,14 @@ pub struct TrainingParams {
     pub local_epochs: u32,
     /// Maximum error bound.
     pub max_error_bound: f64,
+    /// Model input dimension.
+    pub d_in: usize,
+    /// Model hidden dimension.
+    pub d_hid: usize,
+    /// Model output dimension.
+    pub d_out: usize,
+    /// Random seed for deterministic model init.
+    pub model_seed: u64,
 }
 
 /// Gradient exchange messages.

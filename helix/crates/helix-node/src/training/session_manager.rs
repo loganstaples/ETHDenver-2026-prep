@@ -1136,7 +1136,7 @@ mod tests {
                 ..Default::default()
             },
             layers: vec![
-                (0, LayerWeights {
+                LayerWeights {
                     layer_idx: 0,
                     weights: vec![
                         ("w1".to_string(), WeightData {
@@ -1145,10 +1145,11 @@ mod tests {
                             error_bound: 0.0,
                         }),
                     ].into_iter().collect(),
-                }),
-            ].into_iter().collect(),
+                },
+            ],
             embeddings: None,
             lm_head: None,
+            extra_weights: std::collections::HashMap::new(),
         }
     }
 

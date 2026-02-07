@@ -257,6 +257,10 @@ impl ComputeNode {
                                 batch_size: 32,
                                 local_epochs: 5,
                                 max_error_bound: 0.1,
+                                d_in: 4,
+                                d_hid: 8,
+                                d_out: 2,
+                                model_seed: 42,
                             });
                         self.register_for_round(round_id, shard, params).await;
                     }
@@ -316,6 +320,10 @@ mod tests {
             batch_size: 32,
             local_epochs: 5,
             max_error_bound: 0.1,
+            d_in: 4,
+            d_hid: 8,
+            d_out: 2,
+            model_seed: 42,
         };
         
         node.register_for_round(1, 0, params).await;
@@ -339,6 +347,10 @@ mod tests {
             batch_size: 32,
             local_epochs: 5,
             max_error_bound: 0.1,
+            d_in: 4,
+            d_hid: 8,
+            d_out: 2,
+            model_seed: 42,
         };
         
         node.register_for_round(1, 0, params).await;

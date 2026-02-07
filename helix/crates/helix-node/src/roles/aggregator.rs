@@ -442,6 +442,10 @@ mod tests {
             batch_size: 32,
             local_epochs: 5,
             max_error_bound: 0.1,
+            d_in: 4,
+            d_hid: 8,
+            d_out: 2,
+            model_seed: 42,
         };
         
         let _msg = node.start_round([1; 32], params).await;
@@ -464,6 +468,10 @@ mod tests {
             batch_size: 32,
             local_epochs: 5,
             max_error_bound: 0.1,
+            d_in: 4,
+            d_hid: 8,
+            d_out: 2,
+            model_seed: 42,
         };
         
         node.start_round([1; 32], params).await;
