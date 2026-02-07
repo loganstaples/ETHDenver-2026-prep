@@ -18,7 +18,7 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 
 use super::commitment::{BatchCommitment, CommitmentError, DatasetCommitment, SampleCommitment};
-use super::dataset::{Batch, DatasetMetadata, DataType, Sample};
+use super::dataset::{Batch, DatasetMetadata, Sample};
 use super::merkle::{
     Hash, MerkleProof, MerkleTree, MultiProof, Sha256Hasher, TreePosition, HASH_SIZE,
 };
@@ -1350,6 +1350,7 @@ impl Default for ParallelVerificationConfig {
 /// exceeds `min_proofs_per_thread`.
 pub struct ParallelBatchVerifier {
     /// Configuration.
+    #[allow(dead_code)]
     config: ParallelVerificationConfig,
     /// Dataset commitment.
     commitment: Arc<DatasetCommitment>,

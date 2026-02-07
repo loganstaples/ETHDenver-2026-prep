@@ -251,7 +251,7 @@ impl MatrixErrorPropagation {
     ///
     /// By checking C*r = A*(B*r) for random r, we can detect errors with high probability
     /// and provide statistical guarantees.
-    pub fn freivalds_error_bound(&self, num_checks: usize) -> ProbabilisticError {
+    pub fn freivalds_error_bound(&self, _num_checks: usize) -> ProbabilisticError {
         // With num_checks random vector checks:
         // Probability of missing an error ≤ 2^(-num_checks)
         // For practical purposes, 20 checks gives ~10^-6 false positive rate
@@ -407,7 +407,7 @@ impl NormalizationErrorPropagation {
         let sigma = self.input_std.max(self.epsilon.sqrt());
 
         // Error in mean: ε_μ = sum(ε_x) / n ≈ ε_x
-        let eps_mean = eps_x; // Conservative: mean error same as input
+        let _eps_mean = eps_x; // Conservative: mean error same as input
 
         // Error in std: complex, but bounded by input error
         let eps_std = eps_x; // Conservative
@@ -467,7 +467,7 @@ impl NormalizationErrorPropagation {
         // log-sum-exp has gradient bounded by softmax outputs themselves
         // Error in log-sum-exp: |δlse| ≤ max_i(y_i) * max_i(|δx_i|)
         // Typical case: max output is dominant → error concentrates there
-        let lse_factor = 1.0; // Worst case is when all y_i equal
+        let _lse_factor = 1.0; // Worst case is when all y_i equal
 
         // Combined tight worst-case bound
         // Using the minimum of multiple valid bounds
@@ -579,7 +579,7 @@ impl AttentionErrorPropagation {
     /// Attention: softmax(QK^T / sqrt(d)) @ V
     pub fn output_error(&self) -> ProbabilisticError {
         let d = self.head_dim as f64;
-        let n = self.seq_len as f64;
+        let _n = self.seq_len as f64;
 
         // Step 1: QK^T matmul
         let qk_error = MatrixErrorPropagation::new(

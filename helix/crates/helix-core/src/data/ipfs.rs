@@ -136,13 +136,13 @@ impl IpfsClient {
     }
 
     /// Pins content so it won't be garbage collected.
-    pub async fn pin(&self, cid: &Cid) -> Result<(), IpfsError> {
+    pub async fn pin(&self, _cid: &Cid) -> Result<(), IpfsError> {
         // Would make API call in production
         Ok(())
     }
 
     /// Unpins content.
-    pub async fn unpin(&self, cid: &Cid) -> Result<(), IpfsError> {
+    pub async fn unpin(&self, _cid: &Cid) -> Result<(), IpfsError> {
         // Would make API call in production
         Ok(())
     }

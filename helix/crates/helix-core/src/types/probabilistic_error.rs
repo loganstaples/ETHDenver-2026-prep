@@ -423,7 +423,7 @@ impl ProbabilisticError {
     ///
     /// For f(x) where x has error ε:
     /// error(f(x)) ≈ |f'(x)| * ε
-    pub fn through_function(&self, value: f64, derivative: f64) -> ProbabilisticError {
+    pub fn through_function(&self, _value: f64, derivative: f64) -> ProbabilisticError {
         let d_abs = derivative.abs();
         ProbabilisticError {
             mean: self.mean * derivative,

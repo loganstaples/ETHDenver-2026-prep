@@ -241,12 +241,14 @@ pub struct FilecoinClient {
     /// Configuration.
     pub config: FilecoinConfig,
     /// Statistics.
+    #[allow(dead_code)]
     stats: FilecoinStats,
     /// Miner reputation cache.
     miner_reputations: HashMap<String, MinerReputation>,
     /// Deal cache.
     deal_cache: HashMap<u64, DealInfo>,
     /// Verification history.
+    #[allow(dead_code)]
     verification_history: HashMap<u64, Vec<DealVerificationResult>>,
 }
 
@@ -390,6 +392,7 @@ pub struct FilecoinDataSource {
     /// Filecoin client.
     client: FilecoinClient,
     /// Local cache.
+    #[allow(dead_code)]
     cache: DataCache,
     /// Mock storage for testing.
     mock_storage: HashMap<String, MockDeal>,

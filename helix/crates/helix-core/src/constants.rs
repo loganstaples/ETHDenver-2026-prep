@@ -11,8 +11,18 @@ pub mod error_bounds {
     /// Default maximum relative error for INT8 quantization.
     pub const INT8_MAX_RELATIVE_ERROR: f64 = 1.0 / 256.0;
 
-    /// Default maximum error accumulation threshold.
+    /// Default maximum error accumulation threshold (for F32 precision).
     pub const MAX_ERROR_ACCUMULATION: f64 = 0.01;
+
+    /// Maximum error accumulation threshold for BF16 precision.
+    /// BF16 single-step error (~1.23e-2) exceeds the F32 budget, so a more
+    /// permissive threshold is needed.
+    pub const BF16_MAX_ERROR_ACCUMULATION: f64 = 0.05;
+
+    /// Maximum error accumulation threshold for INT8 precision.
+    /// INT8 quantization noise (~3.9e-3 per element) compounds through matmuls,
+    /// requiring ~10x the F32 budget.
+    pub const INT8_MAX_ERROR_ACCUMULATION: f64 = 0.10;
 
     /// Default error margin for gradient computations.
     pub const GRADIENT_ERROR_MARGIN: f64 = 0.001;

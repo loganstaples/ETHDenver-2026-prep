@@ -2798,6 +2798,7 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "ed25519-dalek",
+ "libc",
  "proptest",
  "rand 0.8.5",
  "rand_distr",

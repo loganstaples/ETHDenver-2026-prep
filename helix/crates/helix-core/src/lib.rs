@@ -26,7 +26,6 @@ pub mod constants;
 pub mod data;
 pub mod demo;
 pub mod error;
-pub mod integration;
 pub mod traits;
 pub mod types;
 pub mod validation;

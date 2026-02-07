@@ -9,6 +9,7 @@ use crate::error::{ArithmeticError, BoundsError, HelixResult};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::ops::{Add, Div, Mul, Neg, Sub};
+use tracing;
 
 /// Maximum allowed error bound to prevent overflow in subsequent computations.
 /// Note: This is a permissive upper limit for clamping. For practical error tracking,
@@ -42,7 +43,7 @@ pub const DIVISION_THRESHOLD: f64 = 1e-15;
 /// use helix_core::types::{BoundedValue, ErrorMargin};
 ///
 /// // Create a bounded value with absolute error
-/// let x = BoundedValue::with_absolute_error(10.0, 0.1);
+/// let x = BoundedValue::<f64>::with_absolute_error(10.0, 0.1);
 /// assert_eq!(x.value(), 10.0);
 /// assert!((x.absolute_error() - 0.1).abs() < 1e-10);
 ///
@@ -51,7 +52,7 @@ pub const DIVISION_THRESHOLD: f64 = 1e-15;
 /// assert!((x.upper_bound() - 10.1).abs() < 1e-10);
 ///
 /// // Arithmetic propagates errors
-/// let y = BoundedValue::with_absolute_error(5.0, 0.05);
+/// let y = BoundedValue::<f64>::with_absolute_error(5.0, 0.05);
 /// let sum = x + y;  // Error adds: 0.1 + 0.05 = 0.15
 /// assert_eq!(sum.value(), 15.0);
 /// assert!((sum.absolute_error() - 0.15).abs() < 1e-10);
@@ -221,6 +222,11 @@ impl BoundedValue<f64> {
     pub fn clamp_error(&mut self) {
         let abs_err = self.absolute_error();
         if abs_err > MAX_ERROR_BOUND || abs_err.is_infinite() {
+            tracing::warn!(
+                original_error = abs_err,
+                clamped_to = MAX_ERROR_BOUND,
+                "Error bound exceeds MAX_ERROR_BOUND, clamping"
+            );
             self.error = ErrorMargin::absolute(MAX_ERROR_BOUND);
         }
     }
@@ -234,9 +240,14 @@ impl BoundedValue<f64> {
     /// Sanitizes the value by replacing NaN with zero and clamping infinities.
     pub fn sanitize(&mut self) {
         if self.value.is_nan() {
+            tracing::warn!("Sanitizing NaN value to 0.0 with maximum error bound");
             self.value = 0.0;
             self.error = ErrorMargin::absolute(MAX_ERROR_BOUND);
         } else if self.value.is_infinite() {
+            tracing::warn!(
+                original_value = self.value,
+                "Sanitizing infinite value to f64::MAX with maximum error bound"
+            );
             self.value = self.value.signum() * f64::MAX;
             self.error = ErrorMargin::absolute(MAX_ERROR_BOUND);
         }
@@ -372,6 +383,14 @@ impl BoundedValue<f64> {
     #[must_use]
     pub fn saturating_add(self, rhs: Self) -> Self {
         let mut result = self + rhs;
+        if !result.is_finite() || !result.has_finite_error() {
+            tracing::debug!(
+                op = "saturating_add",
+                lhs = self.value,
+                rhs = rhs.value,
+                "Saturating arithmetic required sanitization"
+            );
+        }
         result.sanitize();
         result
     }
@@ -380,6 +399,14 @@ impl BoundedValue<f64> {
     #[must_use]
     pub fn saturating_sub(self, rhs: Self) -> Self {
         let mut result = self - rhs;
+        if !result.is_finite() || !result.has_finite_error() {
+            tracing::debug!(
+                op = "saturating_sub",
+                lhs = self.value,
+                rhs = rhs.value,
+                "Saturating arithmetic required sanitization"
+            );
+        }
         result.sanitize();
         result
     }
@@ -388,6 +415,14 @@ impl BoundedValue<f64> {
     #[must_use]
     pub fn saturating_mul(self, rhs: Self) -> Self {
         let mut result = self * rhs;
+        if !result.is_finite() || !result.has_finite_error() {
+            tracing::debug!(
+                op = "saturating_mul",
+                lhs = self.value,
+                rhs = rhs.value,
+                "Saturating arithmetic required sanitization"
+            );
+        }
         result.sanitize();
         result
     }
@@ -397,6 +432,14 @@ impl BoundedValue<f64> {
     #[must_use]
     pub fn saturating_div(self, rhs: Self) -> Self {
         let mut result = self / rhs;
+        if !result.is_finite() || !result.has_finite_error() {
+            tracing::debug!(
+                op = "saturating_div",
+                lhs = self.value,
+                rhs = rhs.value,
+                "Saturating arithmetic required sanitization"
+            );
+        }
         result.sanitize();
         result
     }
@@ -483,6 +526,21 @@ impl BoundedValue<f64> {
             return Err(BoundsError::ErrorExplosion {
                 accumulated: abs_err,
                 safe_limit: MAX_SAFE_ERROR,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Checks if error has exceeded a custom safe threshold.
+    /// Use this for precision-aware error checking (e.g., BF16/INT8 have
+    /// different safe limits than F32).
+    pub fn check_safe_error_with_limit(&self, limit: f64) -> HelixResult<()> {
+        let abs_err = self.absolute_error();
+        if abs_err > limit {
+            return Err(BoundsError::ErrorExplosion {
+                accumulated: abs_err,
+                safe_limit: limit,
             }
             .into());
         }

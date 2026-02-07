@@ -582,7 +582,7 @@ impl FusedOperation {
             .map(|(idx, v)| {
                 let mut val = v.value();
 
-                for (op_idx, op) in ops.iter().enumerate() {
+                for (_op_idx, op) in ops.iter().enumerate() {
                     val = match op {
                         ElementwiseOp::Add => {
                             val + inputs
@@ -832,7 +832,7 @@ mod tests {
         let b = BoundedTensor::from_exact(vec![1.0, 0.0, 0.0, 1.0], vec![2, 2]);
         let c = BoundedTensor::from_exact(vec![1.0, 1.0], vec![2]);
 
-        let (result, analysis) = fused_op.execute(vec![&a, &b, &c]).unwrap();
+        let (result, _analysis) = fused_op.execute(vec![&a, &b, &c]).unwrap();
 
         assert_eq!(result.shape(), &vec![2, 2]);
         // A @ B + C = [[1, 2], [3, 4]] + [1, 1] = [[2, 3], [4, 5]]

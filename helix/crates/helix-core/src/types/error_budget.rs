@@ -7,6 +7,7 @@
 use super::precision::Precision;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use tracing;
 
 /// Configuration for error budget allocation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -541,10 +542,21 @@ impl BudgetAllocator {
         let mut allocations: Vec<f64> = vec![budget / n as f64; n];
 
         // Gradient descent iterations
-        const ITERATIONS: usize = 100;
-        const LEARNING_RATE: f64 = 0.01;
+        const MAX_ITERATIONS: usize = 100;
+        const INITIAL_LEARNING_RATE: f64 = 0.01;
+        const CONVERGENCE_THRESHOLD: f64 = 1e-8;
+        const LR_DECAY_INTERVAL: usize = 20;
+        const LR_DECAY_FACTOR: f64 = 0.95;
 
-        for _ in 0..ITERATIONS {
+        let mut lr = INITIAL_LEARNING_RATE;
+        let mut final_iteration = MAX_ITERATIONS;
+
+        for iteration in 0..MAX_ITERATIONS {
+            // Decay learning rate periodically
+            if iteration > 0 && iteration % LR_DECAY_INTERVAL == 0 {
+                lr *= LR_DECAY_FACTOR;
+            }
+
             // Compute gradient for each allocation
             let gradients: Vec<f64> = self
                 .components
@@ -561,9 +573,22 @@ impl BudgetAllocator {
                 })
                 .collect();
 
+            // Check convergence: L2 norm of gradient
+            let grad_norm: f64 = gradients.iter().map(|g| g * g).sum::<f64>().sqrt();
+            if grad_norm < CONVERGENCE_THRESHOLD {
+                final_iteration = iteration;
+                tracing::debug!(
+                    iteration = iteration,
+                    grad_norm = grad_norm,
+                    threshold = CONVERGENCE_THRESHOLD,
+                    "Optimal allocation converged early"
+                );
+                break;
+            }
+
             // Update allocations
             for i in 0..n {
-                allocations[i] -= LEARNING_RATE * gradients[i];
+                allocations[i] -= lr * gradients[i];
                 allocations[i] = allocations[i].max(self.config.min_allocation * self.config.total_budget);
             }
 
@@ -574,6 +599,8 @@ impl BudgetAllocator {
                     *a *= budget / total;
                 }
             }
+
+            final_iteration = iteration + 1;
         }
 
         // Create allocation results
@@ -591,7 +618,10 @@ impl BudgetAllocator {
                     budget: clamped,
                     precision: self.precision_for_budget(clamped, c),
                     confidence: 0.9,
-                    reason: "Optimal allocation (loss minimization)".to_string(),
+                    reason: format!(
+                        "Optimal allocation (loss minimization, {} iterations)",
+                        final_iteration
+                    ),
                 }
             })
             .collect()
@@ -951,5 +981,49 @@ mod tests {
         let summary = allocator.summary();
         assert_eq!(summary.component_summaries.len(), 1);
         assert!((summary.total_consumed - 0.005).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_optimal_convergence_early_stopping() {
+        let config = BudgetAllocationConfig {
+            total_budget: 1.0,
+            strategy: AllocationStrategy::Optimal,
+            min_allocation: 0.0,
+            max_allocation: 1.0,
+            reserve_fraction: 0.0,
+            update_interval: 100,
+            smoothing_factor: 0.9,
+        };
+
+        let mut allocator = BudgetAllocator::new(config);
+        // Use components with identical sensitivity so the optimal solution
+        // (equal allocation) is found quickly and converges early.
+        allocator.add_component(
+            BudgetComponent::new("a", ComponentType::FeedForward).with_sensitivity(0.5),
+        );
+        allocator.add_component(
+            BudgetComponent::new("b", ComponentType::FeedForward).with_sensitivity(0.5),
+        );
+
+        let result = allocator.allocate();
+        assert_eq!(result.allocations.len(), 2);
+
+        // Both should get roughly equal allocation
+        let a_budget = result.get("a").unwrap().budget;
+        let b_budget = result.get("b").unwrap().budget;
+        assert!(
+            (a_budget - b_budget).abs() < 0.01,
+            "Equal-sensitivity components should get similar budgets: {} vs {}",
+            a_budget,
+            b_budget
+        );
+
+        // The reason should indicate early convergence (fewer than 100 iterations)
+        let reason = &result.allocations[0].reason;
+        assert!(
+            reason.contains("iterations"),
+            "Reason should mention iteration count: {}",
+            reason
+        );
     }
 }

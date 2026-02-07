@@ -607,7 +607,7 @@ impl DatasetCommitmentRegistry {
         &self,
         id: &DatasetId,
         merkle_root: &Hash,
-        hasher: &H,
+        _hasher: &H,
     ) -> RegistryResult<bool> {
         let entry = self.get(id)?;
 

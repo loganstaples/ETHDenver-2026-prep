@@ -5,7 +5,6 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::{Read, Write};
 
 /// Model format for serialization.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -193,6 +192,7 @@ pub struct ModelSerializer {
     /// Format to use.
     format: ModelFormat,
     /// Compression to use.
+    #[allow(dead_code)]
     compression: ModelCompression,
 }
 

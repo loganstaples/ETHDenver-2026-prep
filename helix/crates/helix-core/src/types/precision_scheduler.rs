@@ -399,7 +399,7 @@ impl PrecisionScheduler {
         let is_diverging = loss_trend > 0.0 && self.stats.loss_history.len() >= 10;
 
         // Check for gradient explosion
-        let (_, grad_std, grad_max) = self.stats.grad_norm_stats();
+        let (_, _grad_std, grad_max) = self.stats.grad_norm_stats();
         let has_gradient_explosion = grad_max > self.config.grad_explosion_threshold;
 
         // Check error budget
@@ -450,14 +450,14 @@ impl PrecisionScheduler {
     }
 
     /// Increases precision.
-    fn increase_precision(&mut self, reason: &str) {
+    fn increase_precision(&mut self, _reason: &str) {
         let increased = match self.current_forward_precision {
             Precision::INT4 => Precision::INT8,
             Precision::INT8 => Precision::F16,
             Precision::F16 => Precision::BF16,
             Precision::BF16 => Precision::F32,
             Precision::F32 => Precision::F32, // Already max
-            Precision::Custom { bits, max_relative_error } => {
+            Precision::Custom { bits, max_relative_error: _ } => {
                 if bits < 32 {
                     Precision::F32
                 } else {
@@ -474,14 +474,14 @@ impl PrecisionScheduler {
     }
 
     /// Decreases precision.
-    fn decrease_precision(&mut self, reason: &str) {
+    fn decrease_precision(&mut self, _reason: &str) {
         let decreased = match self.current_forward_precision {
             Precision::F32 => Precision::BF16,
             Precision::BF16 => Precision::F16,
             Precision::F16 => Precision::INT8,
             Precision::INT8 => Precision::INT8, // Don't go lower
             Precision::INT4 => Precision::INT4, // Already min
-            Precision::Custom { bits, max_relative_error } => {
+            Precision::Custom { bits, max_relative_error: _ } => {
                 if bits > 8 {
                     Precision::INT8
                 } else {
@@ -562,7 +562,7 @@ impl PrecisionScheduler {
 
     /// Generates a summary report.
     pub fn summary(&self) -> PrecisionSchedulerSummary {
-        let (grad_mean, grad_std, grad_max) = self.stats.grad_norm_stats();
+        let (grad_mean, _grad_std, grad_max) = self.stats.grad_norm_stats();
 
         PrecisionSchedulerSummary {
             total_steps: self.current_step,

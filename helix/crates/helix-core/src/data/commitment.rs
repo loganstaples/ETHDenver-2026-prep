@@ -1017,7 +1017,7 @@ impl DatasetCommitmentRegistry {
     pub fn verify_sample_membership(
         &self,
         commitment_id: &Hash,
-        sample: &Sample,
+        _sample: &Sample,
         proof: &super::merkle::MerkleProof,
     ) -> Result<bool, CommitmentError> {
         let reg = self.get(commitment_id)

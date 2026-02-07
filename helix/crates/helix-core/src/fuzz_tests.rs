@@ -8,11 +8,11 @@
 mod tests {
     use crate::config::{TrainingConfig, VMConfig};
     use crate::types::{
-        BoundedTensor, BoundedValue, ErrorMargin, Precision, TensorBuilder,
-        MAX_ERROR_BOUND, MAX_TENSOR_DIMS, MAX_TENSOR_ELEMENTS,
+        BoundedTensor, BoundedValue, ErrorMargin, TensorBuilder,
+        MAX_TENSOR_DIMS,
     };
     use crate::validation::{
-        validate_config, validate_training_config, validate_vm_config,
+        validate_training_config, validate_vm_config,
         sanitize_f64, InputSanitizer, RecoveryContext, RecoveryStrategy,
     };
 

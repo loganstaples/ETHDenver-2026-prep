@@ -9,12 +9,9 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::{Read, Write};
 use std::time::SystemTime;
 
-use super::merkle::{Hash, MerkleHasher, MerkleTree, MerkleTreeBuilder, Sha256Hasher, HASH_SIZE};
-use crate::traits::BinarySerializable;
-use crate::traits::serializable::SerializeError;
+use super::merkle::{Hash, MerkleHasher, MerkleTreeBuilder, Sha256Hasher};
 
 /// Unique identifier for a provenance record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -876,6 +873,7 @@ impl std::fmt::Display for ProvenanceError {
 impl std::error::Error for ProvenanceError {}
 
 /// Decodes a hex string to bytes.
+#[cfg(feature = "crypto-verify")]
 fn hex_decode(hex: &str) -> Result<Vec<u8>, String> {
     if hex.len() % 2 != 0 {
         return Err("Hex string has odd length".to_string());

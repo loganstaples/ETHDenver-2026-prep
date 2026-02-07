@@ -668,7 +668,7 @@ mod tests {
         let mut shuffler = DeterministicShuffler::new(seed.clone());
 
         let result1 = shuffler.shuffle(100);
-        let result2 = shuffler.shuffle(100);
+        let _result2 = shuffler.shuffle(100);
 
         // Same seed should produce same shuffle (when same epoch)
         let mut shuffler2 = DeterministicShuffler::new(seed);

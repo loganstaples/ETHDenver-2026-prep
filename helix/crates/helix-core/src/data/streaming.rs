@@ -38,6 +38,11 @@ pub struct StreamingVerificationConfig {
     pub enable_checkpoints: bool,
     /// Checkpoint interval (number of batches).
     pub checkpoint_interval: usize,
+    /// Maximum number of pending batches for backpressure.
+    /// When the number of processed results reaches this limit,
+    /// `verify_stream()` yields control to allow the consumer to drain.
+    /// Set to 0 to disable backpressure (unlimited).
+    pub max_pending_batches: usize,
 }
 
 impl Default for StreamingVerificationConfig {
@@ -51,6 +56,7 @@ impl Default for StreamingVerificationConfig {
             proof_cache_size: 10000,
             enable_checkpoints: true,
             checkpoint_interval: 100,
+            max_pending_batches: 1000,
         }
     }
 }
@@ -76,6 +82,7 @@ impl StreamingVerificationConfig {
             precompute_level: 2,
             proof_cache_size: 50000,
             checkpoint_interval: 50,
+            max_pending_batches: 5000,
             ..Default::default()
         }
     }
@@ -88,6 +95,7 @@ impl StreamingVerificationConfig {
             parallel_verification: false,
             precompute_level: 1,
             proof_cache_size: 1000,
+            max_pending_batches: 100,
             ..Default::default()
         }
     }
@@ -232,6 +240,7 @@ pub struct BatchVerificationResult {
 }
 
 /// Pre-computed verification data for fast lookups.
+#[allow(dead_code)]
 struct PrecomputedData {
     /// Root hash of the dataset.
     root: Hash,
@@ -447,11 +456,23 @@ impl<H: MerkleHasher> StreamingBatchVerifier<H> {
     }
 
     /// Verifies a stream of batches, yielding results.
+    ///
+    /// When `max_pending_batches` is set (non-zero), this iterator will only
+    /// process up to that many batches. This provides backpressure: a fast
+    /// producer cannot cause unbounded memory growth because the consumer
+    /// must drain results before more batches are processed. Call
+    /// `verify_stream()` again on the remaining iterator to continue.
     pub fn verify_stream<'a>(
         &'a mut self,
         batches: impl Iterator<Item = VerificationBatch> + 'a,
     ) -> impl Iterator<Item = BatchVerificationResult> + 'a {
-        batches.map(move |batch| self.verify_batch(&batch))
+        let limit = self.config.max_pending_batches;
+        let bounded: Box<dyn Iterator<Item = VerificationBatch> + 'a> = if limit > 0 {
+            Box::new(batches.take(limit))
+        } else {
+            Box::new(batches)
+        };
+        bounded.map(move |batch| self.verify_batch(&batch))
     }
 
     /// Updates statistics after batch verification.
@@ -753,6 +774,64 @@ mod tests {
         // Most batches should meet target
         let compliance = verifier.stats().target_compliance_rate();
         println!("Target compliance rate: {:.1}%", compliance * 100.0);
+    }
+
+    #[test]
+    fn test_backpressure_limits_batches() {
+        let hasher = Sha256Hasher;
+        let leaves: Vec<Vec<u8>> = (0..100).map(|i| format!("leaf_{}", i).into_bytes()).collect();
+        let leaf_refs: Vec<&[u8]> = leaves.iter().map(|v| v.as_slice()).collect();
+        let tree = MerkleTree::from_leaves(hasher.clone(), &leaf_refs).unwrap();
+
+        // Set a small backpressure limit
+        let config = StreamingVerificationConfig {
+            max_pending_batches: 5,
+            enable_checkpoints: false,
+            ..Default::default()
+        };
+
+        let mut verifier = StreamingBatchVerifier::from_tree_sha256(&tree, config);
+
+        // Create 20 batches (more than the limit)
+        let batches: Vec<VerificationBatch> = (0..20).map(|batch_idx| {
+            let start = (batch_idx * 5) % 100;
+            let indices: Vec<usize> = (start..start + 5).collect();
+            let hashes: Vec<Hash> = indices.iter().map(|&i| hasher.hash_leaf(&leaves[i])).collect();
+            VerificationBatch::from_hashes(batch_idx, indices, hashes)
+        }).collect();
+
+        // With max_pending_batches=5, verify_stream should only process 5 batches
+        let results: Vec<_> = verifier.verify_stream(batches.into_iter()).collect();
+        assert_eq!(results.len(), 5, "Backpressure should limit to 5 batches");
+        assert!(results.iter().all(|r| r.success), "All processed batches should succeed");
+    }
+
+    #[test]
+    fn test_backpressure_disabled() {
+        let hasher = Sha256Hasher;
+        let leaves: Vec<Vec<u8>> = (0..100).map(|i| format!("leaf_{}", i).into_bytes()).collect();
+        let leaf_refs: Vec<&[u8]> = leaves.iter().map(|v| v.as_slice()).collect();
+        let tree = MerkleTree::from_leaves(hasher.clone(), &leaf_refs).unwrap();
+
+        // Disable backpressure (max_pending_batches=0)
+        let config = StreamingVerificationConfig {
+            max_pending_batches: 0,
+            enable_checkpoints: false,
+            ..Default::default()
+        };
+
+        let mut verifier = StreamingBatchVerifier::from_tree_sha256(&tree, config);
+
+        let batches: Vec<VerificationBatch> = (0..20).map(|batch_idx| {
+            let start = (batch_idx * 5) % 100;
+            let indices: Vec<usize> = (start..start + 5).collect();
+            let hashes: Vec<Hash> = indices.iter().map(|&i| hasher.hash_leaf(&leaves[i])).collect();
+            VerificationBatch::from_hashes(batch_idx, indices, hashes)
+        }).collect();
+
+        // With backpressure disabled, all batches should process
+        let results: Vec<_> = verifier.verify_stream(batches.into_iter()).collect();
+        assert_eq!(results.len(), 20, "All 20 batches should process with backpressure disabled");
     }
 
     #[test]

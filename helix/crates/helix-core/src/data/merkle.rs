@@ -856,6 +856,7 @@ impl<H: MerkleHasher> std::fmt::Debug for MerkleTree<H> {
 /// Builder for creating Merkle trees incrementally.
 pub struct MerkleTreeBuilder<H: MerkleHasher = Sha256Hasher> {
     hasher: H,
+    #[allow(dead_code)]
     config: MerkleTreeConfig,
     leaves: Vec<Hash>,
 }
@@ -1161,7 +1162,7 @@ impl<H: MerkleHasher> StreamingMerkleBuilder<H> {
         // The streaming approach is mainly for computing the root efficiently
 
         // Collect all level roots and reconstruct
-        let mut all_leaves: Vec<Hash> = Vec::new();
+        let _all_leaves: Vec<Hash> = Vec::new();
 
         // We don't have the original leaves anymore if we were truly streaming
         // In this case, return a tree with just the root for verification
@@ -1208,6 +1209,7 @@ pub struct ChunkedMerkleBuilder<H: MerkleHasher = Sha256Hasher> {
     /// All leaf hashes (stored for proof generation).
     leaves: Vec<Hash>,
     /// Maximum leaves to hold in memory before computing.
+    #[allow(dead_code)]
     chunk_size: usize,
     /// Statistics.
     chunks_processed: usize,
@@ -1425,6 +1427,7 @@ impl Default for ParallelConfig {
 /// Builds a Merkle tree in parallel.
 pub struct ParallelMerkleBuilder<H: MerkleHasher + Send + Sync + 'static = Sha256Hasher> {
     hasher: Arc<H>,
+    #[allow(dead_code)]
     config: ParallelConfig,
     leaves: Vec<Hash>,
 }

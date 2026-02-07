@@ -2,4 +2,4 @@
 
 pub mod model;
 
-pub use model::{DemoModel, DemoModelConfig, DemoTrainer, TrainingResult};
+pub use model::{DemoModel, DemoModelConfig, DemoTrainer, DemoTrainingStep, TrainingResult};

@@ -134,12 +134,50 @@ impl MemoryTracker {
         }
     }
 
-    /// Estimates current memory usage (heap approximation).
+    /// Estimates current memory usage via mach task_info on macOS.
     #[cfg(target_os = "macos")]
     fn estimate_current_memory() -> usize {
-        // macOS: Use mach task_info (simplified)
-        // For accurate tracking, use a custom global allocator
-        0
+        use std::mem;
+
+        // mach_task_basic_info flavor constant
+        const MACH_TASK_BASIC_INFO: u32 = 20;
+
+        #[repr(C)]
+        struct MachTaskBasicInfo {
+            virtual_size: u64,
+            resident_size: u64,
+            resident_size_max: u64,
+            user_time: [u64; 2],    // time_value_t (seconds, microseconds)
+            system_time: [u64; 2],  // time_value_t
+            policy: i32,
+            suspend_count: i32,
+        }
+
+        extern "C" {
+            fn mach_task_self() -> u32;
+            fn task_info(
+                target_task: u32,
+                flavor: u32,
+                task_info_out: *mut MachTaskBasicInfo,
+                task_info_count: *mut u32,
+            ) -> i32;
+        }
+
+        unsafe {
+            let mut info: MachTaskBasicInfo = mem::zeroed();
+            let mut count = (mem::size_of::<MachTaskBasicInfo>() / mem::size_of::<u32>()) as u32;
+            let ret = task_info(
+                mach_task_self(),
+                MACH_TASK_BASIC_INFO,
+                &mut info as *mut _,
+                &mut count,
+            );
+            if ret == 0 {
+                info.resident_size as usize
+            } else {
+                0
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -946,6 +984,37 @@ mod tests {
         let json = runner.to_json();
         assert!(json.contains("test_op"));
         assert!(json.contains("compute"));
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn test_memory_tracker_reports_nonzero() {
+        let tracker_before = MemoryTracker::new();
+
+        // Allocate a known-size chunk of memory
+        let allocation_size = 10 * 1024 * 1024; // 10 MB
+        let large_vec: Vec<u8> = vec![42u8; allocation_size];
+
+        // Force the allocation to not be optimized away
+        std::hint::black_box(&large_vec);
+
+        let mut tracker_after = MemoryTracker::new();
+        tracker_after.update();
+
+        // The current estimate should be non-zero on macOS/Linux
+        let current = MemoryTracker::estimate_current_memory();
+        assert!(
+            current > 0,
+            "MemoryTracker should report non-zero memory on this platform"
+        );
+
+        // After allocating 10MB, the delta should be measurable
+        // (allowing for some variance due to OS memory management)
+        let delta = current.saturating_sub(tracker_before.start_bytes);
+        println!("Memory delta after 10MB allocation: {} bytes", delta);
+
+        // Drop the allocation
+        drop(large_vec);
     }
 
     #[test]

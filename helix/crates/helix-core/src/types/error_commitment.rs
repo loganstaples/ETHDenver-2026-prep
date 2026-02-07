@@ -259,7 +259,8 @@ impl ErrorCommitmentBuilder {
 /// Tracks error accumulation across multiple training steps with commitment generation.
 ///
 /// This tracker maintains a running commitment that can be efficiently updated
-/// as new errors are accumulated during training.
+/// as new errors are accumulated during training. The checksum is cached and
+/// only recomputed when the state changes (i.e., after `record_step()`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorCommitmentTracker {
     /// Current accumulated error.
@@ -275,6 +276,9 @@ pub struct ErrorCommitmentTracker {
     error_history: Vec<f64>,
     /// Whether to track history.
     track_history: bool,
+    /// Cached checksum (invalidated on state changes).
+    #[serde(skip)]
+    cached_checksum: Option<[u8; 32]>,
 }
 
 impl ErrorCommitmentTracker {
@@ -287,6 +291,7 @@ impl ErrorCommitmentTracker {
             budget_limit,
             error_history: Vec::new(),
             track_history: false,
+            cached_checksum: None,
         }
     }
 
@@ -299,6 +304,7 @@ impl ErrorCommitmentTracker {
             budget_limit,
             error_history: Vec::new(),
             track_history: true,
+            cached_checksum: None,
         }
     }
 
@@ -309,6 +315,7 @@ impl ErrorCommitmentTracker {
             self.error_history.push(step_error);
         }
         self.current_step += 1;
+        self.cached_checksum = None; // Invalidate cache
     }
 
     /// Returns the current commitment.
@@ -321,14 +328,20 @@ impl ErrorCommitmentTracker {
         )
     }
 
-    /// Returns the current checksum.
-    pub fn checksum(&self) -> [u8; 32] {
-        self.commitment().compute_checksum()
+    /// Returns the current checksum, using a cached value when available.
+    pub fn checksum(&mut self) -> [u8; 32] {
+        if let Some(cached) = self.cached_checksum {
+            return cached;
+        }
+        let checksum = self.commitment().compute_checksum();
+        self.cached_checksum = Some(checksum);
+        checksum
     }
 
     /// Returns the compact checksum (64-bit).
-    pub fn checksum_compact(&self) -> u64 {
-        self.commitment().checksum_compact()
+    pub fn checksum_compact(&mut self) -> u64 {
+        let checksum = self.checksum();
+        u64::from_le_bytes(checksum[0..8].try_into().unwrap())
     }
 
     /// Checks if still within budget.
@@ -364,6 +377,7 @@ impl ErrorCommitmentTracker {
         self.accumulated_error = 0.0;
         self.current_step = 0;
         self.error_history.clear();
+        self.cached_checksum = None;
     }
 }
 
@@ -494,10 +508,33 @@ mod tests {
         assert!((tracker.error_history()[0] - 0.001).abs() < 1e-15);
         assert!((tracker.error_history()[1] - 0.002).abs() < 1e-15);
 
-        // Checksum should be deterministic
+        // Checksum should be deterministic and cached
         let checksum1 = tracker.checksum();
+        let checksum2 = tracker.checksum(); // Should return cached value
+        assert_eq!(checksum1, checksum2);
+    }
+
+    #[test]
+    fn test_error_commitment_tracker_checksum_caching() {
+        let model_id = [1u8; 32];
+        let mut tracker = ErrorCommitmentTracker::new(model_id, 0.01);
+
+        tracker.record_step(0.001);
+
+        // First call computes and caches
+        let checksum1 = tracker.checksum();
+        // Second call returns cached value (same result)
         let checksum2 = tracker.checksum();
         assert_eq!(checksum1, checksum2);
+
+        // After record_step, cache is invalidated and recomputed
+        tracker.record_step(0.002);
+        let checksum3 = tracker.checksum();
+        assert_ne!(checksum1, checksum3, "Checksum should change after record_step");
+
+        // Cached value should persist until next mutation
+        let checksum4 = tracker.checksum();
+        assert_eq!(checksum3, checksum4);
     }
 
     #[test]

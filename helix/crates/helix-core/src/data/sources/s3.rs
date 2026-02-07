@@ -642,6 +642,7 @@ pub struct S3DataSource {
     /// Configuration.
     config: S3Config,
     /// Local cache.
+    #[allow(dead_code)]
     cache: DataCache,
     /// Statistics.
     stats: S3Stats,

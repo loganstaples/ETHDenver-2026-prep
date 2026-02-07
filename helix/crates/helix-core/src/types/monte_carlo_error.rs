@@ -568,6 +568,7 @@ pub enum ActivationType {
 #[derive(Debug, Clone)]
 pub struct MultistageMonteCarlo {
     estimators: Vec<MonteCarloEstimator>,
+    #[allow(dead_code)]
     correlation_matrix: Option<Vec<Vec<f64>>>,
 }
 

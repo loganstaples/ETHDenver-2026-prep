@@ -474,7 +474,7 @@ impl PrecisionSelector {
         &self,
         precision: &Precision,
         error: f64,
-        characteristics: &OperationCharacteristics,
+        _characteristics: &OperationCharacteristics,
     ) -> f64 {
         let weights = &self.config.weights;
 

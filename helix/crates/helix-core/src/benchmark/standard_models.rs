@@ -335,8 +335,8 @@ impl StandardBenchmarkSuite {
     /// Runs the benchmark for a single model.
     pub fn benchmark_model(&mut self, config: &ModelConfig) -> ModelBenchmarkResult {
         // Create simulated computation
-        let d = config.hidden_dim;
-        let seq_len = config.seq_length;
+        let _d = config.hidden_dim;
+        let _seq_len = config.seq_length;
 
         // Warmup
         for _ in 0..self.warmup_iters {

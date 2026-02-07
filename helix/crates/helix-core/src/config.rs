@@ -1,5 +1,6 @@
 //! Configuration structures for HELIX components.
 
+use crate::error::{HelixResult, ValidationError};
 use crate::types::Precision;
 use serde::{Deserialize, Serialize};
 
@@ -10,6 +11,9 @@ pub struct VMConfig {
     pub default_precision: Precision,
     /// Maximum error accumulation before warning.
     pub max_error_accumulation: f64,
+    /// Maximum safe error threshold for detecting numerical instability.
+    /// If any single value's error exceeds this, the computation is flagged.
+    pub max_safe_error: f64,
     /// Whether to collect execution trace for proofs.
     pub collect_trace: bool,
     /// Memory limit in bytes.
@@ -18,15 +22,79 @@ pub struct VMConfig {
     pub max_operations: usize,
 }
 
+impl VMConfig {
+    /// Creates a `VMConfig` with precision-appropriate error budgets.
+    ///
+    /// - `F32`: max_error_accumulation = 0.01
+    /// - `F16` / `BF16`: max_error_accumulation = 0.05
+    /// - `INT8` / `INT4`: max_error_accumulation = 0.10
+    pub fn for_precision(precision: Precision) -> Self {
+        use crate::constants::error_bounds;
+
+        let max_error_accumulation = match precision {
+            Precision::F32 => error_bounds::MAX_ERROR_ACCUMULATION,
+            Precision::F16 | Precision::BF16 => error_bounds::BF16_MAX_ERROR_ACCUMULATION,
+            Precision::INT8 | Precision::INT4 => error_bounds::INT8_MAX_ERROR_ACCUMULATION,
+            Precision::Custom { max_relative_error, .. } => {
+                // For custom precision, scale budget based on relative error
+                if max_relative_error <= 1.19e-7 { error_bounds::MAX_ERROR_ACCUMULATION }
+                else if max_relative_error <= 9.77e-4 { error_bounds::BF16_MAX_ERROR_ACCUMULATION }
+                else { error_bounds::INT8_MAX_ERROR_ACCUMULATION }
+            }
+        };
+
+        Self {
+            default_precision: precision,
+            max_error_accumulation,
+            max_safe_error: 1e6,
+            collect_trace: true,
+            memory_limit: 1024 * 1024 * 1024,
+            max_operations: 10_000_000,
+        }
+    }
+}
+
 impl Default for VMConfig {
     fn default() -> Self {
         Self {
             default_precision: Precision::F32,
             max_error_accumulation: 0.01,
+            max_safe_error: 1e6,
             collect_trace: true,
             memory_limit: 1024 * 1024 * 1024, // 1GB
             max_operations: 10_000_000,
         }
+    }
+}
+
+impl VMConfig {
+    /// Validates this configuration.
+    pub fn validate(&self) -> HelixResult<()> {
+        if self.max_error_accumulation <= 0.0 {
+            return Err(ValidationError::InvalidValue {
+                field: "max_error_accumulation".to_string(),
+                value: self.max_error_accumulation.to_string(),
+                reason: "must be positive".to_string(),
+            }
+            .into());
+        }
+        if self.memory_limit == 0 {
+            return Err(ValidationError::InvalidValue {
+                field: "memory_limit".to_string(),
+                value: "0".to_string(),
+                reason: "must be greater than 0".to_string(),
+            }
+            .into());
+        }
+        if self.max_operations == 0 {
+            return Err(ValidationError::InvalidValue {
+                field: "max_operations".to_string(),
+                value: "0".to_string(),
+                reason: "must be greater than 0".to_string(),
+            }
+            .into());
+        }
+        Ok(())
     }
 }
 
@@ -48,9 +116,32 @@ impl Default for ProverConfig {
         Self {
             num_threads: num_cpus(),
             key_cache_path: None,
-            recursive_proofs: true,
+            recursive_proofs: false,
             max_chunk_size: 1024,
         }
+    }
+}
+
+impl ProverConfig {
+    /// Validates this configuration.
+    pub fn validate(&self) -> HelixResult<()> {
+        if self.num_threads == 0 {
+            return Err(ValidationError::InvalidValue {
+                field: "num_threads".to_string(),
+                value: "0".to_string(),
+                reason: "must be greater than 0".to_string(),
+            }
+            .into());
+        }
+        if self.max_chunk_size == 0 {
+            return Err(ValidationError::InvalidValue {
+                field: "max_chunk_size".to_string(),
+                value: "0".to_string(),
+                reason: "must be greater than 0".to_string(),
+            }
+            .into());
+        }
+        Ok(())
     }
 }
 
@@ -105,6 +196,37 @@ impl Default for TrainingConfig {
     }
 }
 
+impl TrainingConfig {
+    /// Validates this configuration.
+    pub fn validate(&self) -> HelixResult<()> {
+        if self.batch_size == 0 {
+            return Err(ValidationError::InvalidValue {
+                field: "batch_size".to_string(),
+                value: "0".to_string(),
+                reason: "must be greater than 0".to_string(),
+            }
+            .into());
+        }
+        if self.learning_rate <= 0.0 {
+            return Err(ValidationError::InvalidValue {
+                field: "learning_rate".to_string(),
+                value: self.learning_rate.to_string(),
+                reason: "must be positive".to_string(),
+            }
+            .into());
+        }
+        if self.max_gradient_error <= 0.0 {
+            return Err(ValidationError::InvalidValue {
+                field: "max_gradient_error".to_string(),
+                value: self.max_gradient_error.to_string(),
+                reason: "must be positive".to_string(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+}
+
 /// Complete configuration for a HELIX node.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct HelixConfig {
@@ -116,6 +238,16 @@ pub struct HelixConfig {
     pub network: NetworkConfig,
     /// Training configuration.
     pub training: TrainingConfig,
+}
+
+impl HelixConfig {
+    /// Validates all sub-configurations.
+    pub fn validate(&self) -> HelixResult<()> {
+        self.vm.validate()?;
+        self.prover.validate()?;
+        self.training.validate()?;
+        Ok(())
+    }
 }
 
 /// Helper to get number of CPUs.
@@ -134,5 +266,115 @@ mod tests {
         let config = HelixConfig::default();
         assert_eq!(config.vm.default_precision, Precision::F32);
         assert!(config.prover.num_threads > 0);
+    }
+
+    #[test]
+    fn test_recursive_proofs_default_false() {
+        let config = ProverConfig::default();
+        assert!(!config.recursive_proofs);
+    }
+
+    #[test]
+    fn test_valid_config_validates() {
+        let config = HelixConfig::default();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_vm_config_invalid_error_accumulation() {
+        let mut config = VMConfig::default();
+        config.max_error_accumulation = 0.0;
+        assert!(config.validate().is_err());
+        config.max_error_accumulation = -1.0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_vm_config_invalid_memory_limit() {
+        let mut config = VMConfig::default();
+        config.memory_limit = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_vm_config_invalid_max_operations() {
+        let mut config = VMConfig::default();
+        config.max_operations = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_prover_config_invalid_threads() {
+        let mut config = ProverConfig::default();
+        config.num_threads = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_prover_config_invalid_chunk_size() {
+        let mut config = ProverConfig::default();
+        config.max_chunk_size = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_training_config_invalid_batch_size() {
+        let mut config = TrainingConfig::default();
+        config.batch_size = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_training_config_invalid_learning_rate() {
+        let mut config = TrainingConfig::default();
+        config.learning_rate = 0.0;
+        assert!(config.validate().is_err());
+        config.learning_rate = -0.01;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_training_config_invalid_gradient_error() {
+        let mut config = TrainingConfig::default();
+        config.max_gradient_error = 0.0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_helix_config_propagates_validation() {
+        let mut config = HelixConfig::default();
+        config.vm.memory_limit = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = HelixConfig::default();
+        config.prover.num_threads = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = HelixConfig::default();
+        config.training.batch_size = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_vm_config_for_precision() {
+        let f32_config = VMConfig::for_precision(Precision::F32);
+        assert_eq!(f32_config.max_error_accumulation, 0.01);
+        assert_eq!(f32_config.max_safe_error, 1e6);
+
+        let bf16_config = VMConfig::for_precision(Precision::BF16);
+        assert_eq!(bf16_config.max_error_accumulation, 0.05);
+
+        let int8_config = VMConfig::for_precision(Precision::INT8);
+        assert_eq!(int8_config.max_error_accumulation, 0.10);
+
+        let f16_config = VMConfig::for_precision(Precision::F16);
+        assert_eq!(f16_config.max_error_accumulation, 0.05);
+
+        let int4_config = VMConfig::for_precision(Precision::INT4);
+        assert_eq!(int4_config.max_error_accumulation, 0.10);
+
+        // Budget increases with decreasing precision
+        assert!(f32_config.max_error_accumulation < bf16_config.max_error_accumulation);
+        assert!(bf16_config.max_error_accumulation < int8_config.max_error_accumulation);
     }
 }

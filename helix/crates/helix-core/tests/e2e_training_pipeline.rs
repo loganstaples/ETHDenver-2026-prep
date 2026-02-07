@@ -9,14 +9,14 @@
 //!
 //! Run with: cargo test --test e2e_training_pipeline
 
-use helix_core::data::{Batch, Sample};
 use helix_core::traits::{Provable, SimpleWitness, Witness};
 use helix_core::types::{
     AllocationStrategy, BudgetAllocator, BudgetAllocationConfig,
     BudgetComponent, ComponentType,
 };
-use helix_core::constants::error_bounds::MAX_ERROR_ACCUMULATION;
+use helix_core::config::VMConfig;
 use helix_core::types::bounded_value::MAX_SAFE_ERROR;
+use helix_core::types::Precision;
 use helix_core::{
     BoundedTensor, BoundedValue, ErrorMargin, HelixResult,
 };
@@ -64,6 +64,7 @@ struct TrainingStep {
     /// Input batch
     input: BoundedTensor,
     /// Target labels (one-hot encoded)
+    #[allow(dead_code)]
     target: BoundedTensor,
     /// Forward pass intermediates
     forward: ForwardResult,
@@ -133,7 +134,7 @@ impl SimpleMLP {
         let scale2 = 1.0 / (hidden_dim as f64).sqrt();
 
         let w1_data: Vec<f64> = (0..input_dim * hidden_dim)
-            .map(|i| ((i as f64 * 0.1).sin() * scale1))
+            .map(|i| (i as f64 * 0.1).sin() * scale1)
             .collect();
         let w1 = BoundedTensor::try_from_approximate(
             w1_data,
@@ -144,7 +145,7 @@ impl SimpleMLP {
         let b1 = BoundedTensor::try_zeros(vec![hidden_dim])?;
 
         let w2_data: Vec<f64> = (0..hidden_dim * output_dim)
-            .map(|i| ((i as f64 * 0.2).cos() * scale2))
+            .map(|i| (i as f64 * 0.2).cos() * scale2)
             .collect();
         let w2 = BoundedTensor::try_from_approximate(
             w2_data,
@@ -643,7 +644,7 @@ fn test_e2e_full_training_loop() {
         max_error_seen = max_error_seen.max(training_step.forward.output.max_error());
 
         // Generate witness
-        let witness = training_step.generate_witness();
+        let _witness = training_step.generate_witness();
         witnesses_generated += 1;
 
         // Verify error bounds haven't exploded
@@ -1031,12 +1032,9 @@ fn test_regression_attention_error_accumulation() {
 /// Regression test: Verify error bounds with BF16-level precision over 1000 steps.
 ///
 /// BF16 (Brain Float 16) has an epsilon of approximately 3.91e-3, which is
-/// significantly larger than f64's machine epsilon. This test verifies that the
-/// error tracking pipeline remains stable even when starting with BF16-scale
-/// quantization noise on the input tensors.
-///
-/// The key question: does the MAX_ERROR_ACCUMULATION budget of 0.01 hold when
-/// input precision is at BF16 levels?
+/// significantly larger than f64's machine epsilon. This test uses the
+/// precision-aware `VMConfig::for_precision(BF16)` budget (0.05) instead of
+/// the default F32 budget (0.01).
 #[test]
 fn test_regression_1000_steps_bf16_precision() {
     let input_dim = 8;
@@ -1045,6 +1043,10 @@ fn test_regression_1000_steps_bf16_precision() {
     let batch_size = 4;
     let num_steps = 1000;
 
+    // Use precision-aware config
+    let vm_config = VMConfig::for_precision(Precision::BF16);
+    let budget = vm_config.max_error_accumulation; // 0.05 for BF16
+
     // BF16 epsilon: 2^-8 ≈ 3.91e-3
     let bf16_epsilon: f64 = 3.91e-3;
 
@@ -1052,7 +1054,6 @@ fn test_regression_1000_steps_bf16_precision() {
 
     let start = Instant::now();
     let mut max_error_per_100 = Vec::new();
-    let mut cumulative_input_error = 0.0_f64;
     let mut max_single_step_error = 0.0_f64;
 
     for step in 0..num_steps {
@@ -1081,7 +1082,6 @@ fn test_regression_1000_steps_bf16_precision() {
             .max(training_step.gradients.dw2.max_error());
 
         max_single_step_error = max_single_step_error.max(current_max_error);
-        cumulative_input_error += bf16_epsilon;
 
         // Sample every 100 steps
         if step % 100 == 99 {
@@ -1090,9 +1090,9 @@ fn test_regression_1000_steps_bf16_precision() {
 
         // Critical check: error must stay within safe bounds
         assert!(
-            current_max_error < MAX_SAFE_ERROR,
-            "BF16 error explosion at step {}: {:.2e} exceeds MAX_SAFE_ERROR {:.2e}",
-            step, current_max_error, MAX_SAFE_ERROR
+            current_max_error < vm_config.max_safe_error,
+            "BF16 error explosion at step {}: {:.2e} exceeds max_safe_error {:.2e}",
+            step, current_max_error, vm_config.max_safe_error
         );
     }
 
@@ -1100,36 +1100,31 @@ fn test_regression_1000_steps_bf16_precision() {
     let final_error = *max_error_per_100.last().unwrap_or(&0.0);
     let initial_error = *max_error_per_100.first().unwrap_or(&0.0);
 
-    // Check whether the MAX_ERROR_ACCUMULATION budget of 0.01 holds.
-    // With BF16 epsilon of 3.91e-3 on inputs, per-step errors are higher
-    // but each step is independent (model weights are not updated), so
-    // error does not compound across steps -- each step starts fresh.
-    let budget_holds = max_single_step_error < MAX_ERROR_ACCUMULATION;
+    // With precision-aware budget, BF16 per-step error should fit
+    let budget_holds = max_single_step_error < budget;
 
     println!("=== BF16 Precision 1000-Step Regression Test ===");
     println!("BF16 epsilon: {:.2e}", bf16_epsilon);
+    println!("Precision-aware budget (BF16_MAX_ERROR_ACCUMULATION): {}", budget);
     println!("Steps completed: {} in {:?}", num_steps, elapsed);
     println!("Initial max error (step 100): {:.2e}", initial_error);
     println!("Final max error (step 1000): {:.2e}", final_error);
     println!("Max single-step error: {:.2e}", max_single_step_error);
-    println!("MAX_ERROR_ACCUMULATION budget (0.01) holds per step: {}", budget_holds);
+    println!("Budget holds per step: {}", budget_holds);
     println!("Max errors per 100 steps: {:?}",
         max_error_per_100.iter().map(|e| format!("{:.2e}", e)).collect::<Vec<_>>());
 
-    if !budget_holds {
-        println!(
-            "NOTE: BF16 precision causes per-step error {:.2e} to exceed \
-             MAX_ERROR_ACCUMULATION {:.2e}. A larger budget or higher precision \
-             may be needed for BF16 inputs.",
-            max_single_step_error, MAX_ERROR_ACCUMULATION
-        );
-    }
-
-    // Even if the budget doesn't hold per-step, the error must remain finite
-    // and bounded (not exponentially exploding)
+    // With BF16-appropriate budget, per-step error should now pass
     assert!(
-        max_single_step_error < MAX_SAFE_ERROR,
-        "BF16: max single-step error {:.2e} exceeds MAX_SAFE_ERROR",
+        budget_holds,
+        "BF16: max single-step error {:.2e} exceeds BF16 budget {:.2e}",
+        max_single_step_error, budget
+    );
+
+    // Error must remain finite and bounded
+    assert!(
+        max_single_step_error < vm_config.max_safe_error,
+        "BF16: max single-step error {:.2e} exceeds max_safe_error",
         max_single_step_error
     );
 
@@ -1146,13 +1141,9 @@ fn test_regression_1000_steps_bf16_precision() {
 
 /// Regression test: Verify error bounds with INT8-level precision over 1000 steps.
 ///
-/// INT8 quantization has an epsilon of 1/256 ≈ 3.906e-3. This is very close
-/// to BF16's epsilon but comes from a fundamentally different source (uniform
-/// quantization vs floating-point rounding). This test verifies that the
-/// error tracking pipeline handles INT8-scale noise correctly.
-///
-/// The key question: does the MAX_ERROR_ACCUMULATION budget of 0.01 hold when
-/// input precision is at INT8 quantization levels?
+/// INT8 quantization has an epsilon of 1/256 ≈ 3.906e-3. This test uses the
+/// precision-aware `VMConfig::for_precision(INT8)` budget (0.10) instead of
+/// the default F32 budget (0.01).
 #[test]
 fn test_regression_1000_steps_int8_precision() {
     let input_dim = 8;
@@ -1160,6 +1151,10 @@ fn test_regression_1000_steps_int8_precision() {
     let output_dim = 2;
     let batch_size = 4;
     let num_steps = 1000;
+
+    // Use precision-aware config
+    let vm_config = VMConfig::for_precision(Precision::INT8);
+    let budget = vm_config.max_error_accumulation; // 0.10 for INT8
 
     // INT8 epsilon: 1/256 ≈ 3.906e-3
     let int8_epsilon: f64 = 1.0 / 256.0;
@@ -1202,7 +1197,7 @@ fn test_regression_1000_steps_int8_precision() {
 
         max_single_step_error = max_single_step_error.max(current_max_error);
 
-        if current_max_error < MAX_ERROR_ACCUMULATION {
+        if current_max_error < budget {
             error_within_budget_count += 1;
         }
 
@@ -1213,9 +1208,9 @@ fn test_regression_1000_steps_int8_precision() {
 
         // Critical check: error must stay within safe bounds
         assert!(
-            current_max_error < MAX_SAFE_ERROR,
-            "INT8 error explosion at step {}: {:.2e} exceeds MAX_SAFE_ERROR {:.2e}",
-            step, current_max_error, MAX_SAFE_ERROR
+            current_max_error < vm_config.max_safe_error,
+            "INT8 error explosion at step {}: {:.2e} exceeds max_safe_error {:.2e}",
+            step, current_max_error, vm_config.max_safe_error
         );
     }
 
@@ -1223,35 +1218,33 @@ fn test_regression_1000_steps_int8_precision() {
     let final_error = *max_error_per_100.last().unwrap_or(&0.0);
     let initial_error = *max_error_per_100.first().unwrap_or(&0.0);
 
-    // Check whether the MAX_ERROR_ACCUMULATION budget of 0.01 holds per step.
-    let budget_holds = max_single_step_error < MAX_ERROR_ACCUMULATION;
+    let budget_holds = max_single_step_error < budget;
     let budget_hold_pct = (error_within_budget_count as f64 / num_steps as f64) * 100.0;
 
     println!("=== INT8 Precision 1000-Step Regression Test ===");
     println!("INT8 epsilon: {:.6e} (1/256)", int8_epsilon);
+    println!("Precision-aware budget (INT8_MAX_ERROR_ACCUMULATION): {}", budget);
     println!("Steps completed: {} in {:?}", num_steps, elapsed);
     println!("Initial max error (step 100): {:.2e}", initial_error);
     println!("Final max error (step 1000): {:.2e}", final_error);
     println!("Max single-step error: {:.2e}", max_single_step_error);
-    println!("MAX_ERROR_ACCUMULATION budget (0.01) holds per step: {}", budget_holds);
+    println!("Budget holds per step: {}", budget_holds);
     println!("Steps within budget: {}/{} ({:.1}%)",
         error_within_budget_count, num_steps, budget_hold_pct);
     println!("Max errors per 100 steps: {:?}",
         max_error_per_100.iter().map(|e| format!("{:.2e}", e)).collect::<Vec<_>>());
 
-    if !budget_holds {
-        println!(
-            "NOTE: INT8 quantization causes per-step error {:.2e} to exceed \
-             MAX_ERROR_ACCUMULATION {:.2e}. This is expected for low-precision \
-             quantized inputs. Consider using per-precision budget limits.",
-            max_single_step_error, MAX_ERROR_ACCUMULATION
-        );
-    }
-
-    // Even if per-step budget doesn't hold, error must remain finite and bounded
+    // With INT8-appropriate budget, per-step error should now pass
     assert!(
-        max_single_step_error < MAX_SAFE_ERROR,
-        "INT8: max single-step error {:.2e} exceeds MAX_SAFE_ERROR",
+        budget_holds,
+        "INT8: max single-step error {:.2e} exceeds INT8 budget {:.2e}",
+        max_single_step_error, budget
+    );
+
+    // Error must remain finite and bounded
+    assert!(
+        max_single_step_error < vm_config.max_safe_error,
+        "INT8: max single-step error {:.2e} exceeds max_safe_error",
         max_single_step_error
     );
 

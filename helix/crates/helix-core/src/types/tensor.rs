@@ -304,7 +304,7 @@ impl BoundedTensor {
             ).into());
         }
 
-        for (i, (&idx, &dim)) in indices.iter().zip(&self.shape).enumerate() {
+        for (_i, (&idx, &dim)) in indices.iter().zip(&self.shape).enumerate() {
             if idx >= dim {
                 return Err(ArithmeticError::index_out_of_bounds(
                     indices.to_vec(),
@@ -1185,6 +1185,22 @@ impl BoundedTensor {
         Ok(result)
     }
 
+    /// Checked matrix multiplication with a configurable error threshold.
+    /// Use this for precision-aware checking (e.g., BF16/INT8 budgets).
+    pub fn checked_matmul_with_limit(&self, other: &BoundedTensor, safe_limit: f64) -> HelixResult<Self> {
+        let result = self.matmul(other)?;
+
+        let max_err = result.par_max_error();
+        if max_err > safe_limit {
+            return Err(BoundsError::ErrorExplosion {
+                accumulated: max_err,
+                safe_limit,
+            }.into());
+        }
+
+        Ok(result)
+    }
+
     // =========================================================================
     // BATCHED OPERATIONS
     // =========================================================================
@@ -1342,7 +1358,7 @@ impl BoundedTensor {
                     // Compute softmax with numerical stability
                     // softmax(x) = exp(x - max) / sum(exp(x - max))
                     let max_bounded = BoundedValue::exact(max_score);
-                    let mut exp_scores: Vec<BoundedValue<f64>> = scores
+                    let exp_scores: Vec<BoundedValue<f64>> = scores
                         .iter()
                         .map(|s| {
                             let shifted = s.saturating_sub(max_bounded);
@@ -1444,6 +1460,19 @@ impl BoundedTensor {
             return Err(BoundsError::ErrorExplosion {
                 accumulated: max_err,
                 safe_limit: MAX_SAFE_ERROR,
+            }.into());
+        }
+        Ok(())
+    }
+
+    /// Checks if any element's error exceeds a configurable threshold.
+    /// Use this for precision-aware checking (e.g., BF16/INT8 budgets).
+    pub fn check_error_explosion_with_limit(&self, safe_limit: f64) -> HelixResult<()> {
+        let max_err = self.par_max_error();
+        if max_err > safe_limit {
+            return Err(BoundsError::ErrorExplosion {
+                accumulated: max_err,
+                safe_limit,
             }.into());
         }
         Ok(())
@@ -1946,7 +1975,7 @@ impl BoundedTensor {
 
         let output_size = batch * channels * out_height * out_width;
         let mut output_data = Vec::with_capacity(output_size);
-        let pool_size = (kernel_size * kernel_size) as f64;
+        let _pool_size = (kernel_size * kernel_size) as f64;
 
         for b in 0..batch {
             for c in 0..channels {
@@ -1998,7 +2027,7 @@ impl PartialEq for BoundedTensor {
 // PROVABLE TRAIT IMPLEMENTATION
 // =============================================================================
 
-use crate::traits::{Provable, SimpleWitness, Witness};
+use crate::traits::{Provable, Witness};
 
 /// Witness for a BoundedTensor, containing quantized values and error bounds.
 #[derive(Debug, Clone)]

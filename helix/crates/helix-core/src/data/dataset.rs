@@ -273,7 +273,7 @@ impl InMemoryDataset {
     }
 
     /// Creates an iterator over batches.
-    pub fn iter(&mut self) -> DatasetIterator {
+    pub fn iter(&mut self) -> DatasetIterator<'_> {
         self.reset();
         DatasetIterator { dataset: self }
     }

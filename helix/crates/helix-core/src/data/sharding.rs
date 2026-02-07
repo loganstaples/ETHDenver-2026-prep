@@ -1235,7 +1235,7 @@ impl DataSharder {
             class_samples.entry(class).or_default().push(i);
         }
 
-        let num_classes = class_samples.len();
+        let _num_classes = class_samples.len();
         let mut shards: Vec<Vec<usize>> = (0..self.config.num_shards)
             .map(|_| Vec::new())
             .collect();

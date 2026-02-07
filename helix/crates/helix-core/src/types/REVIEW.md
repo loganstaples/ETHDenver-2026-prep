@@ -81,8 +81,8 @@ types/
 - `IntoBounded` trait makes it easy to lift raw `f64`/`f32`/`i32` into the bounded system
 
 **Weaknesses:**
-- Operator overloads (Add, Sub, Mul, Div) use saturating behavior without warning -- callers might not realize errors are being silently clamped
-- `MAX_SAFE_ERROR = 1e6` as a hard-coded constant should probably be configurable per training run
+- ~~Operator overloads (Add, Sub, Mul, Div) use saturating behavior without warning -- callers might not realize errors are being silently clamped~~ **RESOLVED:** Added `tracing` instrumentation to all silent operations: `tracing::warn!` when `sanitize()` replaces NaN or Inf values, `tracing::warn!` when `clamp_error()` caps error at `MAX_ERROR_BOUND`, and `tracing::debug!` when saturating arithmetic (add/sub/mul/div) requires sanitization. In production with `tracing` subscribers enabled, all silent clamping is now observable.
+- ~~`MAX_SAFE_ERROR = 1e6` as a hard-coded constant should probably be configurable per training run~~ **RESOLVED:** Added `check_safe_error_with_limit(limit: f64)` to `BoundedValue<T>`, allowing callers to provide a custom safe error threshold. The original `check_safe_error()` is retained for backward compatibility. `VMConfig::for_precision()` provides precision-appropriate defaults.
 
 ### 3. `precision.rs` -- 107 lines
 
@@ -321,7 +321,7 @@ types/
 **Weaknesses:**
 - Optimal strategy's loss model (`sensitivity / allocation^2`) is a rough heuristic
 - No constraint that allocations sum exactly to budget (handled post-hoc via normalization, which can distort individual allocations)
-- 100 iterations may not converge for complex allocation landscapes
+- ~~100 iterations may not converge for complex allocation landscapes~~ **RESOLVED:** Added convergence checking: early stopping when gradient L2 norm < 1e-8, learning rate decay (0.95 every 20 iterations), `tracing::debug!` logging of early convergence with iteration count. Test `test_optimal_convergence_early_stopping` verifies early termination.
 
 ### 14. `error_commitment.rs` -- 563 lines
 
@@ -340,6 +340,7 @@ types/
 - 1e12 scaling preserves 12 decimal places -- sufficient for error values down to 1e-12
 - lo/hi split matches contract's `_hashPair(lo, hi)` using keccak256
 - Tracker automatically manages step progression
+- **Checksum caching:** `ErrorCommitmentTracker` caches the SHA256 checksum and invalidates on `record_step()` or `reset()`. Repeated `checksum()` calls between steps return the cached value without recomputation.
 
 **Critical note:** The contract uses keccak256 for `_hashPair`, but the commitment uses SHA256. These are different hash functions. The commitment hash is an *input* to the circuit, which then gets included in the proof -- the contract doesn't re-hash the commitment. This is correct as designed, but the two hash functions serve different roles.
 
@@ -401,13 +402,13 @@ types/
 
 ## Ideas for Improvement
 
-1. **Streaming error commitment updates.** Currently `ErrorCommitmentTracker::record_step()` recomputes the full SHA256 on every step. For long training runs, an incremental hash (Merkle-based accumulation) would be more efficient.
+1. **Streaming error commitment updates.** ~~Currently `ErrorCommitmentTracker::record_step()` recomputes the full SHA256 on every step.~~ **PARTIALLY RESOLVED:** Checksum caching added — repeated `checksum()` calls between steps avoid redundant SHA256 computation. For full optimization, an incremental hash (Merkle-based accumulation) on the `record_step()` path itself would further improve efficiency.
 
 2. ~~**Cross-module integration tests.**~~ **DONE:** Added `tests/cross_module_integration.rs` with two tests: `test_full_types_pipeline_no_mocking` (full pipeline: BoundedTensor → matmul → AdaptivePrecisionController → PrecisionSelector → BudgetAllocator → ErrorCheckpoint → ErrorCommitment → checksum_split) and `test_chained_ops_error_propagation_pipeline` (chained operations with error composition verification).
 
 3. **Budget-aware fusion optimizer.** The tensor fusion optimizer could use error budget information to decide whether fusion is worthwhile -- if the budget is tight, fuse aggressively; if loose, skip fusion overhead.
 
-4. **Configurable MAX_SAFE_ERROR.** The 1e6 threshold for error explosion detection should be configurable per training run, since deeper networks legitimately accumulate more error.
+4. ~~**Configurable MAX_SAFE_ERROR.**~~ **DONE:** Added `check_safe_error_with_limit(limit: f64)` to `BoundedValue<T>` and `check_error_explosion_with_limit(safe_limit: f64)` / `checked_matmul_with_limit(safe_limit: f64)` to `BoundedTensor`. `VMConfig::for_precision()` provides precision-appropriate defaults for the error budget.
 
 ---
 
@@ -442,4 +443,4 @@ The types/ module is **demo-ready**. The error visualization structures support 
 
 ### Health Score: 9/10
 
-The types/ module is the intellectual core of HELIX. Its error algebra is mathematically sound, the ZK commitment path is well-defined, and the advanced modules (Monte Carlo, budget optimization, precision scheduling) demonstrate research-grade thinking. Successive rounds of improvements have resolved nearly all original weaknesses: quantization scaling is unified, shape hash collisions are fixed, budget and precision systems are integrated, `#[must_use]` annotations prevent silent error drops, magic constants are documented with derivation sources, and empirical validation tests verify tensor fusion reductions. The latest production readiness work has further matured the module: property-based testing (proptest) validates error algebra invariants across thousands of random inputs, the circuit-contract 7-element public input layout is integration-tested end-to-end, BF16/INT8 regression tests empirically document precision-budget tradeoffs, Monte Carlo sampling scales adaptively with matrix dimension, precision scheduler phase transitions are metric-driven, in-place tensor operations reduce hot-path cloning, and Criterion benchmarks establish performance baselines for all core operations. The remaining gaps are SIMD/BLAS optimization for tensor operations and recalibration of `MAX_ERROR_ACCUMULATION` for sub-F32 precisions.
+The types/ module is the intellectual core of HELIX. Its error algebra is mathematically sound, the ZK commitment path is well-defined, and the advanced modules (Monte Carlo, budget optimization, precision scheduling) demonstrate research-grade thinking. Successive rounds of improvements have resolved nearly all original weaknesses: quantization scaling is unified, shape hash collisions are fixed, budget and precision systems are integrated, `#[must_use]` annotations prevent silent error drops, magic constants are documented with derivation sources, and empirical validation tests verify tensor fusion reductions. Rounds 1-2 matured the module with: proptest-validated error algebra invariants, circuit-contract integration testing, BF16/INT8 regression tests with precision-aware budgets, adaptive Monte Carlo sampling, metric-driven precision scheduling, in-place tensor operations, and Criterion performance benchmarks. Round 3 added: (1) `tracing` instrumentation in `BoundedValue` — all silent operations (NaN/Inf sanitization, error clamping, saturating arithmetic) are now observable via `tracing::warn!`/`tracing::debug!`, and (2) convergence checking in the error budget optimizer with early stopping (gradient norm < 1e-8), learning rate decay, and structured logging. The remaining gaps are SIMD/BLAS optimization for tensor operations. The `MAX_ERROR_ACCUMULATION` recalibration for sub-F32 precisions has been resolved via per-precision constants and `VMConfig::for_precision()`.

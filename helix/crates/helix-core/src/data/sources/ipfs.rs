@@ -15,7 +15,6 @@
 //! - Connection pooling and caching
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::SystemTime;
 
 use super::{
@@ -233,6 +232,7 @@ pub struct IpfsDataSource {
     /// Configuration.
     config: IpfsSourceConfig,
     /// Local cache.
+    #[allow(dead_code)]
     cache: DataCache,
     /// Statistics.
     stats: IpfsStats,
@@ -980,8 +980,10 @@ pub struct IpfsPinningClient {
     /// API endpoint.
     endpoint: String,
     /// API key/token.
+    #[allow(dead_code)]
     api_key: Option<String>,
     /// API secret (for services like Infura that need both).
+    #[allow(dead_code)]
     api_secret: Option<String>,
     /// Request timeout in seconds.
     timeout_secs: u64,
@@ -1262,6 +1264,7 @@ impl IpfsPinningClient {
     }
 
     /// Builds authorization header for the service.
+    #[allow(dead_code)]
     fn auth_header(&self) -> Option<(String, String)> {
         match &self.service {
             PinningService::Pinata => {
