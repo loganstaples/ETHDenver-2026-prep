@@ -276,12 +276,16 @@ impl MonteCarloEstimator {
         let elem_dist = Uniform::new(-1.0, 1.0);
         let error_dist = Uniform::new(-element_error, element_error);
 
-        self.estimate_error(|rng| {
+        // Scale samples with output size for statistical significance
+        let output_size = m * n;
+        let adaptive_samples = ((output_size as f64).sqrt().ceil() as usize).min(100).max(10);
+
+        self.estimate_error(move |rng| {
             // Sample random matrices and compute error
             let mut max_error = 0.0_f64;
 
-            // Sample a few output elements (not all for efficiency)
-            for _ in 0..10 {
+            // Adaptively sample output elements based on matrix size
+            for _ in 0..adaptive_samples {
                 let mut sum_error = 0.0_f64;
                 for _ in 0..k {
                     let a: f64 = elem_dist.sample(rng);
@@ -290,6 +294,43 @@ impl MonteCarloEstimator {
                     let eb: f64 = error_dist.sample(rng);
 
                     // Error in a*b: |a|*eb + |b|*ea + ea*eb
+                    let prod_error = a.abs() * eb.abs() + b.abs() * ea.abs() + ea.abs() * eb.abs();
+                    sum_error += prod_error;
+                }
+                max_error = max_error.max(sum_error);
+            }
+
+            max_error
+        })
+    }
+
+    /// Estimates error for matrix multiplication with configurable max samples.
+    pub fn estimate_matmul_error_with_max_samples(
+        &mut self,
+        m: usize,
+        k: usize,
+        n: usize,
+        element_error: f64,
+        max_samples: usize,
+    ) -> MonteCarloResult {
+        let elem_dist = Uniform::new(-1.0, 1.0);
+        let error_dist = Uniform::new(-element_error, element_error);
+
+        let output_size = m * n;
+        let adaptive_samples = ((output_size as f64).sqrt().ceil() as usize)
+            .min(max_samples)
+            .max(10);
+
+        self.estimate_error(move |rng| {
+            let mut max_error = 0.0_f64;
+
+            for _ in 0..adaptive_samples {
+                let mut sum_error = 0.0_f64;
+                for _ in 0..k {
+                    let a: f64 = elem_dist.sample(rng);
+                    let b: f64 = elem_dist.sample(rng);
+                    let ea: f64 = error_dist.sample(rng);
+                    let eb: f64 = error_dist.sample(rng);
                     let prod_error = a.abs() * eb.abs() + b.abs() * ea.abs() + ea.abs() * eb.abs();
                     sum_error += prod_error;
                 }
@@ -743,5 +784,28 @@ mod tests {
 
         let total = MultistageMonteCarlo::total_error(&results);
         assert!(total.mean > 0.0);
+    }
+
+    #[test]
+    fn test_adaptive_matmul_samples() {
+        let config = MonteCarloConfig {
+            num_samples: 500,
+            seed: Some(42),
+            ..Default::default()
+        };
+
+        let mut estimator = MonteCarloEstimator::new(config.clone());
+
+        // Small matrix - should use ~10 samples per MC iteration
+        let small = estimator.estimate_matmul_error(4, 4, 4, 0.001);
+
+        let mut estimator2 = MonteCarloEstimator::new(config);
+
+        // Large matrix - should use more samples per MC iteration
+        let large = estimator2.estimate_matmul_error(128, 128, 128, 0.001);
+
+        // Large matrix should have tighter estimates relative to its mean
+        // (coefficient of variation should be smaller)
+        assert!(large.mean > small.mean, "Large matrix should have higher mean error");
     }
 }

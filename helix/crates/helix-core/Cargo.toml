@@ -12,6 +12,14 @@ rand_distr = "0.4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 sha2 = "0.10"
 rayon = "1.10"
+tracing = "0.1"
+reqwest = { version = "0.12", features = ["rustls-tls"], optional = true }
+ed25519-dalek = { version = "2.1", optional = true }
+
+[features]
+default = []
+ipfs-fetch = ["reqwest"]
+crypto-verify = ["ed25519-dalek"]
 
 [dev-dependencies]
 proptest = "1.4"
@@ -20,4 +28,8 @@ criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]
 name = "data_pipeline_benchmarks"
+harness = false
+
+[[bench]]
+name = "error_algebra_benchmarks"
 harness = false

@@ -362,6 +362,48 @@ impl Attestation {
         data.extend_from_slice(&self.timestamp.to_le_bytes());
         Sha256Hasher.hash_leaf(&data)
     }
+
+    /// Verifies the attestation signature using ed25519.
+    ///
+    /// Requires the `crypto-verify` feature to be enabled.
+    /// The signature is expected to be hex-encoded.
+    /// The public key should be 32 bytes (ed25519 public key).
+    ///
+    /// Returns Ok(true) if the signature is valid, Ok(false) if invalid,
+    /// or Err if the feature is not enabled or inputs are malformed.
+    #[cfg(feature = "crypto-verify")]
+    pub fn verify(&self, public_key_bytes: &[u8]) -> Result<bool, ProvenanceError> {
+        use ed25519_dalek::{Signature, VerifyingKey, Verifier};
+
+        // Parse the public key
+        let key_bytes: [u8; 32] = public_key_bytes.try_into()
+            .map_err(|_| ProvenanceError::VerificationFailed(
+                format!("Invalid public key length: expected 32, got {}", public_key_bytes.len())
+            ))?;
+
+        let verifying_key = VerifyingKey::from_bytes(&key_bytes)
+            .map_err(|e| ProvenanceError::VerificationFailed(format!("Invalid public key: {}", e)))?;
+
+        // Decode the hex signature
+        let sig_bytes = hex_decode(&self.signature)
+            .map_err(|e| ProvenanceError::VerificationFailed(format!("Invalid hex signature: {}", e)))?;
+
+        let signature = Signature::from_slice(&sig_bytes)
+            .map_err(|e| ProvenanceError::VerificationFailed(format!("Invalid signature format: {}", e)))?;
+
+        // The message is the statement hash bytes
+        let message = self.statement_hash.as_bytes();
+
+        Ok(verifying_key.verify(message, &signature).is_ok())
+    }
+
+    /// Placeholder verification when crypto-verify feature is not enabled.
+    #[cfg(not(feature = "crypto-verify"))]
+    pub fn verify(&self, _public_key_bytes: &[u8]) -> Result<bool, ProvenanceError> {
+        Err(ProvenanceError::VerificationFailed(
+            "crypto-verify feature not enabled; cannot verify signatures".to_string()
+        ))
+    }
 }
 
 /// Types of attestations.
@@ -833,6 +875,20 @@ impl std::fmt::Display for ProvenanceError {
 
 impl std::error::Error for ProvenanceError {}
 
+/// Decodes a hex string to bytes.
+fn hex_decode(hex: &str) -> Result<Vec<u8>, String> {
+    if hex.len() % 2 != 0 {
+        return Err("Hex string has odd length".to_string());
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&hex[i..i + 2], 16)
+                .map_err(|e| format!("Invalid hex at position {}: {}", i, e))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1086,5 +1142,89 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert!(loaded.get(&record_id).is_some());
         assert_eq!(loaded.find_by_original(&hash1).len(), 1);
+    }
+
+    #[cfg(feature = "crypto-verify")]
+    mod crypto_tests {
+        use super::*;
+
+        #[test]
+        fn test_attestation_verify_valid_signature() {
+            use ed25519_dalek::{SigningKey, Signer};
+            use rand::rngs::OsRng;
+
+            // Generate a keypair
+            let signing_key = SigningKey::generate(&mut OsRng);
+            let verifying_key = signing_key.verifying_key();
+
+            // Create a statement hash
+            let statement_hash = Hash::from_slice(b"test attestation statement");
+
+            // Sign the statement hash
+            let signature = signing_key.sign(statement_hash.as_bytes());
+            let sig_hex: String = signature.to_bytes().iter().map(|b| format!("{:02x}", b)).collect();
+
+            let attestation = Attestation::new(
+                AttestationType::DataIntegrity,
+                "test_attester".to_string(),
+                statement_hash,
+                sig_hex,
+            );
+
+            // Verify with correct key
+            let result = attestation.verify(verifying_key.as_bytes());
+            assert!(result.is_ok());
+            assert!(result.unwrap());
+        }
+
+        #[test]
+        fn test_attestation_verify_invalid_signature() {
+            use ed25519_dalek::SigningKey;
+            use rand::rngs::OsRng;
+
+            let signing_key = SigningKey::generate(&mut OsRng);
+            let verifying_key = signing_key.verifying_key();
+
+            let statement_hash = Hash::from_slice(b"test statement");
+
+            // Use a fake signature
+            let fake_sig = "00".repeat(64); // 64 bytes of zeros
+
+            let attestation = Attestation::new(
+                AttestationType::DataIntegrity,
+                "test_attester".to_string(),
+                statement_hash,
+                fake_sig,
+            );
+
+            let result = attestation.verify(verifying_key.as_bytes());
+            assert!(result.is_ok());
+            assert!(!result.unwrap());
+        }
+
+        #[test]
+        fn test_attestation_verify_wrong_key() {
+            use ed25519_dalek::{SigningKey, Signer};
+            use rand::rngs::OsRng;
+
+            let signing_key = SigningKey::generate(&mut OsRng);
+            let wrong_key = SigningKey::generate(&mut OsRng);
+
+            let statement_hash = Hash::from_slice(b"test statement");
+            let signature = signing_key.sign(statement_hash.as_bytes());
+            let sig_hex: String = signature.to_bytes().iter().map(|b| format!("{:02x}", b)).collect();
+
+            let attestation = Attestation::new(
+                AttestationType::DataIntegrity,
+                "test_attester".to_string(),
+                statement_hash,
+                sig_hex,
+            );
+
+            // Verify with wrong key should return false
+            let result = attestation.verify(wrong_key.verifying_key().as_bytes());
+            assert!(result.is_ok());
+            assert!(!result.unwrap());
+        }
     }
 }

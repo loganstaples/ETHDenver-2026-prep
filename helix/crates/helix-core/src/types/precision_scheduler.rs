@@ -79,6 +79,12 @@ pub struct PrecisionSchedulerConfig {
     pub auto_adjust: bool,
     /// Number of stable steps before decreasing precision.
     pub stable_steps_threshold: usize,
+    /// Loss variance threshold for Warmup->Main transition.
+    pub warmup_exit_variance_threshold: f64,
+    /// Loss improvement rate threshold for Main->FineTune transition.
+    pub finetune_entry_improvement_threshold: f64,
+    /// Gradient norm threshold for FineTune->Cooldown transition.
+    pub cooldown_entry_grad_threshold: f64,
 }
 
 impl Default for PrecisionSchedulerConfig {
@@ -97,6 +103,9 @@ impl Default for PrecisionSchedulerConfig {
             total_error_budget: 0.01,
             auto_adjust: true,
             stable_steps_threshold: 100,
+            warmup_exit_variance_threshold: 0.05,
+            finetune_entry_improvement_threshold: 0.001,
+            cooldown_entry_grad_threshold: 0.01,
         }
     }
 }
@@ -309,18 +318,71 @@ impl PrecisionScheduler {
         self.get_decision()
     }
 
-    /// Updates the training phase based on current step.
+    /// Updates the training phase based on current step and metrics.
     fn update_phase(&mut self) {
-        if self.current_step < self.config.warmup_steps {
-            self.current_phase = TrainingPhase::Warmup;
-        } else if self.current_step
-            >= self.config.total_steps.saturating_sub(self.config.cooldown_steps)
-        {
-            self.current_phase = TrainingPhase::Cooldown;
+        // Step-based boundaries as fallbacks
+        let step_based_phase = if self.current_step < self.config.warmup_steps {
+            TrainingPhase::Warmup
+        } else if self.current_step >= self.config.total_steps.saturating_sub(self.config.cooldown_steps) {
+            TrainingPhase::Cooldown
         } else if self.current_step >= self.config.total_steps * 9 / 10 {
-            self.current_phase = TrainingPhase::FineTune;
+            TrainingPhase::FineTune
         } else {
-            self.current_phase = TrainingPhase::Main;
+            TrainingPhase::Main
+        };
+
+        // Metric-based transitions (override step-based when sufficient data)
+        let metric_phase = self.detect_phase_from_metrics();
+
+        // Use metric-based phase if available, otherwise fall back to step-based
+        self.current_phase = metric_phase.unwrap_or(step_based_phase);
+    }
+
+    /// Detects training phase from metrics.
+    /// Returns None if insufficient data for metric-based detection.
+    fn detect_phase_from_metrics(&self) -> Option<TrainingPhase> {
+        // Need enough history for meaningful metrics
+        if self.stats.loss_history.len() < 10 {
+            return None;
+        }
+
+        let loss_var = self.stats.loss_variance();
+        let loss_trend = self.stats.loss_trend();
+        let (grad_mean, _, _) = self.stats.grad_norm_stats();
+
+        match self.current_phase {
+            TrainingPhase::Warmup => {
+                // Warmup -> Main: when loss variance drops below threshold (training stabilized)
+                if loss_var < self.config.warmup_exit_variance_threshold
+                    && self.stats.loss_history.len() >= self.config.loss_window_size / 2
+                {
+                    Some(TrainingPhase::Main)
+                } else {
+                    None
+                }
+            }
+            TrainingPhase::Main => {
+                // Main -> FineTune: when loss improvement rate drops below threshold
+                if loss_trend.abs() < self.config.finetune_entry_improvement_threshold
+                    && self.stats.loss_history.len() >= self.config.loss_window_size
+                {
+                    Some(TrainingPhase::FineTune)
+                } else {
+                    None
+                }
+            }
+            TrainingPhase::FineTune => {
+                // FineTune -> Cooldown: when gradient norm falls below threshold
+                if grad_mean > 0.0
+                    && grad_mean < self.config.cooldown_entry_grad_threshold
+                    && self.stats.grad_norm_history.len() >= self.config.grad_norm_window_size / 2
+                {
+                    Some(TrainingPhase::Cooldown)
+                } else {
+                    None
+                }
+            }
+            _ => None,
         }
     }
 
@@ -762,5 +824,36 @@ mod tests {
 
         let eval_schedule = LayerPrecisionSchedule::for_phase(TrainingPhase::Evaluation);
         assert_eq!(eval_schedule.attention, Precision::INT8);
+    }
+
+    #[test]
+    fn test_metric_based_phase_transition() {
+        let config = PrecisionSchedulerConfig {
+            total_steps: 10000,
+            warmup_steps: 1000, // Long warmup
+            warmup_exit_variance_threshold: 0.01,
+            finetune_entry_improvement_threshold: 0.001,
+            cooldown_entry_grad_threshold: 0.01,
+            ..Default::default()
+        };
+
+        let mut scheduler = PrecisionScheduler::new(config);
+
+        // Start in warmup
+        assert_eq!(scheduler.current_phase(), TrainingPhase::Warmup);
+
+        // Feed very stable losses (low variance) - should trigger metric-based exit
+        for i in 0..50 {
+            let loss = 1.0 + 0.001 * (i as f64 % 3.0 - 1.0); // Very low variance
+            scheduler.step(loss, 1.0, 0.0001);
+        }
+
+        // Should have transitioned to Main based on metrics, not step count
+        // (step count is only 50, warmup_steps is 1000)
+        assert_eq!(
+            scheduler.current_phase(),
+            TrainingPhase::Main,
+            "Should transition to Main based on low loss variance"
+        );
     }
 }

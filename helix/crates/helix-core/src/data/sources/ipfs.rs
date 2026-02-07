@@ -533,8 +533,53 @@ impl IpfsDataSource {
             return Ok(data);
         }
 
-        // In a real implementation, would try gateways here
-        // For now, return not found
+        // Try fetching from IPFS gateway when ipfs-fetch feature is enabled
+        #[cfg(feature = "ipfs-fetch")]
+        {
+            let gateways = std::iter::once(self.config.gateway_url.as_str())
+                .chain(self.config.fallback_gateways.iter().map(|s| s.as_str()));
+
+            for gateway in gateways {
+                let url = format!("{}/{}", gateway.trim_end_matches('/'), id);
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(self.config.timeout_secs))
+                    .build()
+                    .map_err(|e| DataSourceError::Custom(format!("HTTP client error: {}", e)))?;
+
+                match client.get(&url).send().await {
+                    Ok(response) => {
+                        if response.status().is_success() {
+                            let data = response.bytes().await
+                                .map_err(|e| DataSourceError::Custom(format!("Failed to read response: {}", e)))?
+                                .to_vec();
+
+                            // Check max file size
+                            if data.len() > self.config.max_file_size {
+                                return Err(DataSourceError::Custom(format!(
+                                    "File too large: {} bytes (max: {})",
+                                    data.len(), self.config.max_file_size
+                                )));
+                            }
+
+                            // Verify hash if requested
+                            if let Some(expected) = verify_hash {
+                                let actual = self.compute_hash(&data);
+                                if actual != expected {
+                                    return Err(DataSourceError::IntegrityError {
+                                        expected,
+                                        actual,
+                                    });
+                                }
+                            }
+
+                            return Ok(data);
+                        }
+                    }
+                    Err(_) => continue, // Try next gateway
+                }
+            }
+        }
+
         Err(DataSourceError::NotFound(id.to_string()))
     }
 

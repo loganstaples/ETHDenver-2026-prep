@@ -854,3 +854,127 @@ mod tests {
         assert_eq!(v.absolute_error(), MAX_ERROR_BOUND);
     }
 }
+
+#[cfg(test)]
+mod proptest_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Strategy for generating valid BoundedValue<f64> instances.
+    fn bounded_value_strategy() -> impl Strategy<Value = BoundedValue<f64>> {
+        (-1e6..1e6f64, 0.0..1e3f64).prop_map(|(value, error)| {
+            BoundedValue::new(value, ErrorMargin::absolute(error))
+        })
+    }
+
+    /// Strategy for non-zero BoundedValue (for division).
+    fn nonzero_bounded_value_strategy() -> impl Strategy<Value = BoundedValue<f64>> {
+        prop_oneof![
+            (0.001..1e6f64, 0.0..1e3f64).prop_map(|(v, e)| BoundedValue::new(v, ErrorMargin::absolute(e))),
+            (-1e6..-0.001f64, 0.0..1e3f64).prop_map(|(v, e)| BoundedValue::new(v, ErrorMargin::absolute(e))),
+        ]
+    }
+
+    proptest! {
+        /// Error monotonicity: addition error >= max of individual errors.
+        #[test]
+        fn prop_addition_error_monotonicity(
+            a in bounded_value_strategy(),
+            b in bounded_value_strategy()
+        ) {
+            let sum = a.saturating_add(b);
+            let sum_error = sum.absolute_error();
+            // Addition error should be at least as large as either input error
+            // (absolute errors add: εa + εb >= max(εa, εb))
+            prop_assert!(
+                sum_error >= a.absolute_error().min(b.absolute_error()) - 1e-10,
+                "Sum error {} should be >= min({}, {})",
+                sum_error, a.absolute_error(), b.absolute_error()
+            );
+        }
+
+        /// Commutativity of addition: a + b ≈ b + a in both value and error.
+        #[test]
+        fn prop_addition_commutativity(
+            a in bounded_value_strategy(),
+            b in bounded_value_strategy()
+        ) {
+            let ab = a.saturating_add(b);
+            let ba = b.saturating_add(a);
+            prop_assert!(
+                (ab.value() - ba.value()).abs() < 1e-10,
+                "Values differ: {} vs {}", ab.value(), ba.value()
+            );
+            prop_assert!(
+                (ab.absolute_error() - ba.absolute_error()).abs() < 1e-10,
+                "Errors differ: {} vs {}", ab.absolute_error(), ba.absolute_error()
+            );
+        }
+
+        /// Error bound validity: error is never negative or NaN.
+        #[test]
+        fn prop_error_never_negative_or_nan(
+            a in bounded_value_strategy(),
+            b in bounded_value_strategy()
+        ) {
+            let sum = a.saturating_add(b);
+            prop_assert!(!sum.absolute_error().is_nan(), "Sum error is NaN");
+            prop_assert!(sum.absolute_error() >= 0.0, "Sum error is negative: {}", sum.absolute_error());
+
+            let product = a.saturating_mul(b);
+            prop_assert!(!product.absolute_error().is_nan(), "Product error is NaN");
+            prop_assert!(product.absolute_error() >= 0.0, "Product error is negative: {}", product.absolute_error());
+
+            let diff = a.saturating_sub(b);
+            prop_assert!(!diff.absolute_error().is_nan(), "Diff error is NaN");
+            prop_assert!(diff.absolute_error() >= 0.0, "Diff error is negative: {}", diff.absolute_error());
+        }
+
+        /// Multiplication commutativity.
+        #[test]
+        fn prop_multiplication_commutativity(
+            a in bounded_value_strategy(),
+            b in bounded_value_strategy()
+        ) {
+            let ab = a.saturating_mul(b);
+            let ba = b.saturating_mul(a);
+            let value_diff = (ab.value() - ba.value()).abs();
+            prop_assert!(
+                value_diff < 1e-6,
+                "Multiplication not commutative: {} vs {} (diff={})",
+                ab.value(), ba.value(), value_diff
+            );
+        }
+
+        /// Division error never negative or NaN for non-zero divisors.
+        #[test]
+        fn prop_division_error_valid(
+            a in bounded_value_strategy(),
+            b in nonzero_bounded_value_strategy()
+        ) {
+            let result = a.saturating_div(b);
+            prop_assert!(!result.absolute_error().is_nan(), "Division error is NaN");
+            prop_assert!(result.absolute_error() >= 0.0, "Division error is negative");
+            prop_assert!(result.value().is_finite(), "Division value not finite");
+        }
+
+        /// Saturating operations clamp rather than overflow.
+        #[test]
+        fn prop_saturating_ops_clamp(
+            a in bounded_value_strategy(),
+            b in bounded_value_strategy()
+        ) {
+            let sum = a.saturating_add(b);
+            prop_assert!(
+                sum.absolute_error() <= MAX_ERROR_BOUND,
+                "Sum error {} exceeds MAX_ERROR_BOUND {}", sum.absolute_error(), MAX_ERROR_BOUND
+            );
+
+            let product = a.saturating_mul(b);
+            prop_assert!(
+                product.absolute_error() <= MAX_ERROR_BOUND,
+                "Product error {} exceeds MAX_ERROR_BOUND {}", product.absolute_error(), MAX_ERROR_BOUND
+            );
+        }
+    }
+}

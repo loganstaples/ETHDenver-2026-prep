@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use thiserror::Error;
+use tracing;
 
 /// Top-level error type for HELIX operations.
 #[derive(Error, Debug)]
@@ -134,6 +135,60 @@ impl HelixError {
             recovery_hint: self.recovery_hint().map(String::from),
             fields: self.structured_fields(),
         }
+    }
+
+    /// Emits this error as a tracing event with structured fields.
+    pub fn emit_tracing_event(&self) {
+        let log_ctx = self.to_log_context();
+        match log_ctx.severity {
+            ErrorSeverity::Critical => {
+                tracing::error!(
+                    error_type = log_ctx.error_type,
+                    recoverable = log_ctx.recoverable,
+                    recovery_hint = log_ctx.recovery_hint.as_deref().unwrap_or("none"),
+                    "{}",
+                    log_ctx.message
+                );
+            }
+            ErrorSeverity::Error => {
+                tracing::error!(
+                    error_type = log_ctx.error_type,
+                    recoverable = log_ctx.recoverable,
+                    recovery_hint = log_ctx.recovery_hint.as_deref().unwrap_or("none"),
+                    "{}",
+                    log_ctx.message
+                );
+            }
+            ErrorSeverity::Warning => {
+                tracing::warn!(
+                    error_type = log_ctx.error_type,
+                    recoverable = log_ctx.recoverable,
+                    recovery_hint = log_ctx.recovery_hint.as_deref().unwrap_or("none"),
+                    "{}",
+                    log_ctx.message
+                );
+            }
+            ErrorSeverity::Info => {
+                tracing::info!(
+                    error_type = log_ctx.error_type,
+                    recoverable = log_ctx.recoverable,
+                    recovery_hint = log_ctx.recovery_hint.as_deref().unwrap_or("none"),
+                    "{}",
+                    log_ctx.message
+                );
+            }
+        }
+    }
+
+    /// Creates a tracing span for this error context.
+    pub fn as_tracing_span(&self) -> tracing::Span {
+        let log_ctx = self.to_log_context();
+        tracing::error_span!(
+            "helix_error",
+            error_type = log_ctx.error_type,
+            severity = %log_ctx.severity,
+            recoverable = log_ctx.recoverable,
+        )
     }
 
     /// Returns the error type name for logging.

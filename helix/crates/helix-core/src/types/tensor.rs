@@ -270,6 +270,11 @@ impl BoundedTensor {
         &self.shape
     }
 
+    /// Returns the shape as a slice (avoids cloning).
+    pub fn shape_slice(&self) -> &[usize] {
+        &self.shape
+    }
+
     /// Returns the number of elements.
     pub fn len(&self) -> usize {
         self.data.len()
@@ -697,6 +702,28 @@ impl BoundedTensor {
     pub fn scale(&self, scalar: BoundedValue<f64>) -> Self {
         let data: Vec<_> = self.data.iter().map(|a| *a * scalar).collect();
         Self::new(data, self.shape.clone())
+    }
+
+    /// Adds another tensor element-wise in place, avoiding allocation.
+    pub fn add_inplace(&mut self, other: &BoundedTensor) -> HelixResult<()> {
+        if self.shape != other.shape {
+            return Err(ArithmeticError::shape_mismatch(
+                "add_inplace",
+                self.shape.clone(),
+                other.shape.clone(),
+            ).into());
+        }
+        for (a, b) in self.data.iter_mut().zip(other.data.iter()) {
+            *a = a.saturating_add(*b);
+        }
+        Ok(())
+    }
+
+    /// Scales all elements in place, avoiding allocation.
+    pub fn scale_inplace(&mut self, scalar: BoundedValue<f64>) {
+        for v in self.data.iter_mut() {
+            *v = v.saturating_mul(scalar);
+        }
     }
 
     /// Scalar multiplication with validation.

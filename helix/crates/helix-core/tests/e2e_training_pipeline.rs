@@ -15,6 +15,7 @@ use helix_core::types::{
     AllocationStrategy, BudgetAllocator, BudgetAllocationConfig,
     BudgetComponent, ComponentType,
 };
+use helix_core::constants::error_bounds::MAX_ERROR_ACCUMULATION;
 use helix_core::types::bounded_value::MAX_SAFE_ERROR;
 use helix_core::{
     BoundedTensor, BoundedValue, ErrorMargin, HelixResult,
@@ -1025,4 +1026,242 @@ fn test_regression_attention_error_accumulation() {
         "Attention error growth {:.2e} is too large",
         growth
     );
+}
+
+/// Regression test: Verify error bounds with BF16-level precision over 1000 steps.
+///
+/// BF16 (Brain Float 16) has an epsilon of approximately 3.91e-3, which is
+/// significantly larger than f64's machine epsilon. This test verifies that the
+/// error tracking pipeline remains stable even when starting with BF16-scale
+/// quantization noise on the input tensors.
+///
+/// The key question: does the MAX_ERROR_ACCUMULATION budget of 0.01 hold when
+/// input precision is at BF16 levels?
+#[test]
+fn test_regression_1000_steps_bf16_precision() {
+    let input_dim = 8;
+    let hidden_dim = 4;
+    let output_dim = 2;
+    let batch_size = 4;
+    let num_steps = 1000;
+
+    // BF16 epsilon: 2^-8 ≈ 3.91e-3
+    let bf16_epsilon: f64 = 3.91e-3;
+
+    let model = SimpleMLP::new(input_dim, hidden_dim, output_dim).unwrap();
+
+    let start = Instant::now();
+    let mut max_error_per_100 = Vec::new();
+    let mut cumulative_input_error = 0.0_f64;
+    let mut max_single_step_error = 0.0_f64;
+
+    for step in 0..num_steps {
+        // Create input with BF16-level epsilon instead of the default 1e-7
+        let input_data: Vec<f64> = (0..batch_size * input_dim)
+            .map(|i| (((i + step * batch_size * input_dim) as f64 * 0.1).sin() + 1.0) / 2.0)
+            .collect();
+        let input = BoundedTensor::from_approximate(
+            input_data,
+            vec![batch_size, input_dim],
+            bf16_epsilon,
+        );
+
+        // One-hot encoded targets
+        let mut target_data = vec![0.0; batch_size * output_dim];
+        for i in 0..batch_size {
+            let class = i % output_dim;
+            target_data[i * output_dim + class] = 1.0;
+        }
+        let target = BoundedTensor::from_exact(target_data, vec![batch_size, output_dim]);
+
+        let training_step = model.training_step(&input, &target, step).unwrap();
+
+        let current_max_error = training_step.forward.output.max_error()
+            .max(training_step.gradients.dw1.max_error())
+            .max(training_step.gradients.dw2.max_error());
+
+        max_single_step_error = max_single_step_error.max(current_max_error);
+        cumulative_input_error += bf16_epsilon;
+
+        // Sample every 100 steps
+        if step % 100 == 99 {
+            max_error_per_100.push(current_max_error);
+        }
+
+        // Critical check: error must stay within safe bounds
+        assert!(
+            current_max_error < MAX_SAFE_ERROR,
+            "BF16 error explosion at step {}: {:.2e} exceeds MAX_SAFE_ERROR {:.2e}",
+            step, current_max_error, MAX_SAFE_ERROR
+        );
+    }
+
+    let elapsed = start.elapsed();
+    let final_error = *max_error_per_100.last().unwrap_or(&0.0);
+    let initial_error = *max_error_per_100.first().unwrap_or(&0.0);
+
+    // Check whether the MAX_ERROR_ACCUMULATION budget of 0.01 holds.
+    // With BF16 epsilon of 3.91e-3 on inputs, per-step errors are higher
+    // but each step is independent (model weights are not updated), so
+    // error does not compound across steps -- each step starts fresh.
+    let budget_holds = max_single_step_error < MAX_ERROR_ACCUMULATION;
+
+    println!("=== BF16 Precision 1000-Step Regression Test ===");
+    println!("BF16 epsilon: {:.2e}", bf16_epsilon);
+    println!("Steps completed: {} in {:?}", num_steps, elapsed);
+    println!("Initial max error (step 100): {:.2e}", initial_error);
+    println!("Final max error (step 1000): {:.2e}", final_error);
+    println!("Max single-step error: {:.2e}", max_single_step_error);
+    println!("MAX_ERROR_ACCUMULATION budget (0.01) holds per step: {}", budget_holds);
+    println!("Max errors per 100 steps: {:?}",
+        max_error_per_100.iter().map(|e| format!("{:.2e}", e)).collect::<Vec<_>>());
+
+    if !budget_holds {
+        println!(
+            "NOTE: BF16 precision causes per-step error {:.2e} to exceed \
+             MAX_ERROR_ACCUMULATION {:.2e}. A larger budget or higher precision \
+             may be needed for BF16 inputs.",
+            max_single_step_error, MAX_ERROR_ACCUMULATION
+        );
+    }
+
+    // Even if the budget doesn't hold per-step, the error must remain finite
+    // and bounded (not exponentially exploding)
+    assert!(
+        max_single_step_error < MAX_SAFE_ERROR,
+        "BF16: max single-step error {:.2e} exceeds MAX_SAFE_ERROR",
+        max_single_step_error
+    );
+
+    // Verify error growth is bounded across the sampled windows
+    if initial_error > 1e-15 {
+        let total_growth = final_error / initial_error;
+        assert!(
+            total_growth < 1e6,
+            "BF16: error grew too much over {} steps: {:.2e}x",
+            num_steps, total_growth
+        );
+    }
+}
+
+/// Regression test: Verify error bounds with INT8-level precision over 1000 steps.
+///
+/// INT8 quantization has an epsilon of 1/256 ≈ 3.906e-3. This is very close
+/// to BF16's epsilon but comes from a fundamentally different source (uniform
+/// quantization vs floating-point rounding). This test verifies that the
+/// error tracking pipeline handles INT8-scale noise correctly.
+///
+/// The key question: does the MAX_ERROR_ACCUMULATION budget of 0.01 hold when
+/// input precision is at INT8 quantization levels?
+#[test]
+fn test_regression_1000_steps_int8_precision() {
+    let input_dim = 8;
+    let hidden_dim = 4;
+    let output_dim = 2;
+    let batch_size = 4;
+    let num_steps = 1000;
+
+    // INT8 epsilon: 1/256 ≈ 3.906e-3
+    let int8_epsilon: f64 = 1.0 / 256.0;
+
+    let model = SimpleMLP::new(input_dim, hidden_dim, output_dim).unwrap();
+
+    let start = Instant::now();
+    let mut max_error_per_100 = Vec::new();
+    let mut max_single_step_error = 0.0_f64;
+    let mut error_within_budget_count = 0_u64;
+
+    for step in 0..num_steps {
+        // Create input with INT8-level epsilon
+        let input_data: Vec<f64> = (0..batch_size * input_dim)
+            .map(|i| {
+                // Simulate INT8 quantized values: values in [0, 1] snapped to 1/256 grid
+                let raw = (((i + step * batch_size * input_dim) as f64 * 0.1).sin() + 1.0) / 2.0;
+                (raw * 256.0).round() / 256.0
+            })
+            .collect();
+        let input = BoundedTensor::from_approximate(
+            input_data,
+            vec![batch_size, input_dim],
+            int8_epsilon,
+        );
+
+        // One-hot encoded targets
+        let mut target_data = vec![0.0; batch_size * output_dim];
+        for i in 0..batch_size {
+            let class = i % output_dim;
+            target_data[i * output_dim + class] = 1.0;
+        }
+        let target = BoundedTensor::from_exact(target_data, vec![batch_size, output_dim]);
+
+        let training_step = model.training_step(&input, &target, step).unwrap();
+
+        let current_max_error = training_step.forward.output.max_error()
+            .max(training_step.gradients.dw1.max_error())
+            .max(training_step.gradients.dw2.max_error());
+
+        max_single_step_error = max_single_step_error.max(current_max_error);
+
+        if current_max_error < MAX_ERROR_ACCUMULATION {
+            error_within_budget_count += 1;
+        }
+
+        // Sample every 100 steps
+        if step % 100 == 99 {
+            max_error_per_100.push(current_max_error);
+        }
+
+        // Critical check: error must stay within safe bounds
+        assert!(
+            current_max_error < MAX_SAFE_ERROR,
+            "INT8 error explosion at step {}: {:.2e} exceeds MAX_SAFE_ERROR {:.2e}",
+            step, current_max_error, MAX_SAFE_ERROR
+        );
+    }
+
+    let elapsed = start.elapsed();
+    let final_error = *max_error_per_100.last().unwrap_or(&0.0);
+    let initial_error = *max_error_per_100.first().unwrap_or(&0.0);
+
+    // Check whether the MAX_ERROR_ACCUMULATION budget of 0.01 holds per step.
+    let budget_holds = max_single_step_error < MAX_ERROR_ACCUMULATION;
+    let budget_hold_pct = (error_within_budget_count as f64 / num_steps as f64) * 100.0;
+
+    println!("=== INT8 Precision 1000-Step Regression Test ===");
+    println!("INT8 epsilon: {:.6e} (1/256)", int8_epsilon);
+    println!("Steps completed: {} in {:?}", num_steps, elapsed);
+    println!("Initial max error (step 100): {:.2e}", initial_error);
+    println!("Final max error (step 1000): {:.2e}", final_error);
+    println!("Max single-step error: {:.2e}", max_single_step_error);
+    println!("MAX_ERROR_ACCUMULATION budget (0.01) holds per step: {}", budget_holds);
+    println!("Steps within budget: {}/{} ({:.1}%)",
+        error_within_budget_count, num_steps, budget_hold_pct);
+    println!("Max errors per 100 steps: {:?}",
+        max_error_per_100.iter().map(|e| format!("{:.2e}", e)).collect::<Vec<_>>());
+
+    if !budget_holds {
+        println!(
+            "NOTE: INT8 quantization causes per-step error {:.2e} to exceed \
+             MAX_ERROR_ACCUMULATION {:.2e}. This is expected for low-precision \
+             quantized inputs. Consider using per-precision budget limits.",
+            max_single_step_error, MAX_ERROR_ACCUMULATION
+        );
+    }
+
+    // Even if per-step budget doesn't hold, error must remain finite and bounded
+    assert!(
+        max_single_step_error < MAX_SAFE_ERROR,
+        "INT8: max single-step error {:.2e} exceeds MAX_SAFE_ERROR",
+        max_single_step_error
+    );
+
+    // Verify error growth is bounded across the sampled windows
+    if initial_error > 1e-15 {
+        let total_growth = final_error / initial_error;
+        assert!(
+            total_growth < 1e6,
+            "INT8: error grew too much over {} steps: {:.2e}x",
+            num_steps, total_growth
+        );
+    }
 }

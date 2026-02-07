@@ -201,7 +201,7 @@ data/
 - Privacy-preserving transformation tracking is forward-looking
 
 **Weaknesses:**
-- Signatures in attestations are `Vec<u8>` -- not cryptographically verified (placeholder implementation)
+- ~~Signatures in attestations are `Vec<u8>` -- not cryptographically verified (placeholder implementation)~~ **RESOLVED:** Added `Attestation::verify(&self, public_key_bytes: &[u8]) -> Result<bool>` with ed25519-dalek signature verification, feature-gated behind `crypto-verify`. Verifies the signature over the attestation's content hash (SHA-256 of attester + attestation_type + timestamp + content_hash). Tests cover valid signatures, invalid signatures, and wrong-key rejection.
 - No integration with on-chain attestation contracts
 - ~~ProvenanceRegistry is in-memory only~~ **RESOLVED:** `save_to_file()` / `load_from_file()` added with roundtrip tests
 
@@ -271,10 +271,10 @@ data/
 
 **What they do:** IPFS and Filecoin data source implementations.
 
-**Current state:** Primarily mock implementations. The trait methods exist and return plausible results from in-memory storage, but no actual IPFS gateway or Filecoin Lotus API calls are made.
+**Current state:** IPFS now has a real gateway fetch implementation alongside its mock storage, feature-gated behind `ipfs-fetch` (requires `reqwest`). When the feature is enabled, `fetch_internal()` first checks local storage, then attempts HTTP GET to configurable IPFS gateways (default: `https://ipfs.io/ipfs/{cid}`, `https://dweb.link/ipfs/{cid}`, `https://cloudflare-ipfs.com/ipfs/{cid}`). Fetched data is SHA-256 verified against the expected CID. Gateway health tracking and configurable timeouts are included. Filecoin remains mock-only.
 
-**Strengths:** API surface is well-designed for future real implementations.
-**Weakness:** Not functional for production use -- testing and demo only.
+**Strengths:** API surface is well-designed. IPFS real fetch demonstrates decentralized data sourcing with content verification.
+**Weakness:** Filecoin is mock-only. IPFS gateway fetch requires the `ipfs-fetch` feature flag and network access.
 
 ---
 
@@ -296,13 +296,13 @@ data/
 
 ## Weaknesses
 
-1. **Data sources are mock-only.** All three source implementations (S3, IPFS, Filecoin) operate on in-memory mock storage. No actual HTTP/network requests are made. For a demo, this means data must be pre-loaded rather than fetched from decentralized storage.
+1. **Data sources are partially mock-only.** ~~All three source implementations (S3, IPFS, Filecoin) operate on in-memory mock storage.~~ **PARTIALLY RESOLVED:** IPFS now has real gateway fetch via HTTP GET (feature-gated behind `ipfs-fetch`), with SHA-256 hash verification, gateway health tracking, and retry logic. S3 and Filecoin remain mock-only. For a demo with IPFS, data can be fetched from real gateways; for S3/Filecoin, data must be pre-loaded.
 
 2. ~~**All registries and state are in-memory.**~~ **RESOLVED:** Added `save_to_file()` / `load_from_file()` JSON persistence to `ShardRegistry`, `ProvenanceRegistry`, and `DatasetCommitmentRegistry`. All three use snapshot-based serialization with index rebuilding on load. Roundtrip tests verify correctness.
 
 3. ~~**No content verification on fetch.**~~ **RESOLVED:** Added `verify_fetched_data()` utility and integrated hash verification into `MultiSourceFetcher::fetch()`. When `FetchOptions.verify_hash` is set, fetched data is checked against the expected SHA-256 hash, returning `IntegrityError` on mismatch.
 
-4. **Attestation signatures are placeholders.** The provenance system accepts `Vec<u8>` signatures without verification. For a real audit trail, these need cryptographic verification (ed25519, ECDSA, etc.).
+4. ~~**Attestation signatures are placeholders.**~~ **RESOLVED:** Added `Attestation::verify(&self, public_key_bytes: &[u8]) -> Result<bool>` with ed25519-dalek signature verification, feature-gated behind `crypto-verify`. The method validates the ed25519 signature over a SHA-256 hash of the attestation content (attester + type + timestamp + content_hash). Tests verify correct behavior for valid, invalid, and wrong-key signatures.
 
 5. ~~**No parallel proof verification.**~~ **RESOLVED:** `ParallelBatchVerifier::verify_all()` and `verify_and_collect_failures()` now use `rayon::par_iter()` for batches >= 50 proofs, with sequential fallback for small batches.
 
@@ -324,11 +324,11 @@ data/
 
 4. ~~**Add disk persistence for ShardRegistry.**~~ **DONE:** Added JSON persistence (`save_to_file()` / `load_from_file()`) to ShardRegistry, ProvenanceRegistry, and DatasetCommitmentRegistry. All include roundtrip tests.
 
-5. **Implement real IPFS fetch.** An HTTP gateway fetch (`https://ipfs.io/ipfs/{cid}`) would demonstrate decentralized data sourcing for the demo. This requires only a simple HTTP GET with hash verification.
+5. ~~**Implement real IPFS fetch.**~~ **DONE:** Added real HTTP GET to IPFS gateways in `fetch_internal()`, feature-gated behind `ipfs-fetch` (requires `reqwest`). Supports configurable gateways (defaults: ipfs.io, dweb.link, cloudflare-ipfs.com), gateway health tracking, and SHA-256 hash verification of fetched content against expected CID.
 
 ### Nice to Have
 
-6. **Verify attestation signatures.** Use ed25519-dalek or similar to validate provenance attestation signatures.
+6. ~~**Verify attestation signatures.**~~ **DONE:** Added ed25519-dalek signature verification to `Attestation::verify()`, feature-gated behind `crypto-verify`. Tests cover valid, invalid, and wrong-key scenarios.
 
 7. **Optimize sparse Merkle tree.** Use a sentinel hash for empty subtrees and lazy materialization for unpopulated paths.
 
@@ -387,7 +387,7 @@ data/
 - Commitment serialization for on-chain submission
 
 ### Needs Attention
-- Data must be pre-loaded into mock storage (no real fetch)
+- ~~Data must be pre-loaded into mock storage (no real fetch)~~ **PARTIALLY RESOLVED:** IPFS data can now be fetched from real gateways (feature-gated behind `ipfs-fetch`). S3/Filecoin still require pre-loading.
 - Provenance display requires UI integration (data structures exist but no rendering)
 - ~~ShardRegistry state lost on restart~~ **RESOLVED:** Persistence added
 
@@ -404,12 +404,12 @@ data/
 | Aspect | Score | Notes |
 |--------|-------|-------|
 | Architecture | 8/10 | Clean layering from primitives to pipeline |
-| Security | 8.5/10 | Domain separation correct; content verification added |
-| Completeness | 8.5/10 | Full lifecycle covered; disk persistence added; real I/O missing |
+| Security | 9/10 | Domain separation correct; content verification added; attestation signatures cryptographically verifiable (ed25519) |
+| Completeness | 9/10 | Full lifecycle covered; disk persistence added; IPFS real fetch added; attestation verification added |
 | Scalability | 9/10 | Tested at 1M elements with streaming/incremental builders |
-| Testing | 8/10 | Strong integration and benchmark coverage |
-| Demo Readiness | 7/10 | Core flows work; data sourcing requires pre-loading |
+| Testing | 8.5/10 | Strong integration and benchmark coverage; attestation crypto tests added |
+| Demo Readiness | 8/10 | Core flows work; IPFS can fetch from real gateways; S3/Filecoin still require pre-loading |
 
-### Health Score: 8.5/10
+### Health Score: 9/10
 
-The data/ module provides a thorough, well-tested data infrastructure that covers the complete lifecycle from sourcing through commitment through distribution through verification. The Merkle tree implementation with 5 construction methods is production-grade, and the benchmark coverage at 1M elements validates real-world scalability. Recent improvements have addressed the original weaknesses: content verification on fetch is implemented, batch proof verification is parallelized, and disk persistence is available for all registries (ShardRegistry, ProvenanceRegistry, DatasetCommitmentRegistry). The main remaining gap is mock-only data sources (no real IPFS/S3/Filecoin network I/O). For the ETHDenver demo, the commitment and proof verification paths are solid -- data just needs to be pre-loaded into mock storage rather than fetched from decentralized sources.
+The data/ module provides a thorough, well-tested data infrastructure that covers the complete lifecycle from sourcing through commitment through distribution through verification. The Merkle tree implementation with 5 construction methods is production-grade, and the benchmark coverage at 1M elements validates real-world scalability. Successive rounds of improvements have addressed nearly all original weaknesses: content verification on fetch is implemented, batch proof verification is parallelized, disk persistence is available for all registries, IPFS now supports real gateway fetch (feature-gated behind `ipfs-fetch` with reqwest), and attestation signatures are cryptographically verifiable via ed25519-dalek (feature-gated behind `crypto-verify`). The remaining gaps are: S3 and Filecoin sources remain mock-only, and on-chain attestation anchoring is not yet implemented. For the ETHDenver demo, the commitment and proof verification paths are solid, IPFS data can be fetched from real decentralized gateways, and provenance attestations can be cryptographically verified.
