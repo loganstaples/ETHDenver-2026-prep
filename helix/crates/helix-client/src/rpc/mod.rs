@@ -16,6 +16,8 @@ pub mod client;
 pub use client::{
     // Core client types
     HelixRpcClient, HelixRpcConfig, RpcError,
+    // Circuit breaker
+    RpcCircuitBreaker, RpcCircuitBreakerState,
     // Status types
     TrainingStatus, TrainingPhase, ProofStatus, ProofPhase,
     NetworkStatus, WorkerInfo, WorkerStatus,

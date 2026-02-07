@@ -1038,7 +1038,13 @@ async fn cmd_dashboard(args: &DashboardArgs, _cli: &Cli, mut shutdown: broadcast
     println!("{}", "Starting HELIX Status Dashboard...".cyan().bold());
     println!("  Address: http://{}:{}", args.host, args.port);
 
-    let app = dashboard::create_dashboard_router(args.cors);
+    let config = dashboard::DashboardConfig {
+        auth_token: None,
+        allowed_origins: if args.cors { Vec::new() } else { vec!["http://localhost".to_string()] },
+        rate_limit_per_second: 30,
+    };
+
+    let app = dashboard::create_dashboard_router(config);
 
     let listener = tokio::net::TcpListener::bind(format!("{}:{}", args.host, args.port)).await?;
 

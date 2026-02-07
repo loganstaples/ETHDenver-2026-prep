@@ -231,6 +231,63 @@ pub enum RecoveryEvent {
     },
 }
 
+/// Resettable component that can be restarted during recovery
+pub trait Resettable: Send + Sync {
+    /// Reset component to initial state
+    fn reset(&self) -> Result<()>;
+    /// Check if the component is healthy
+    fn is_healthy(&self) -> bool;
+    /// Component name
+    fn name(&self) -> &str;
+}
+
+/// Registry of resettable components for coordinated recovery
+pub struct ComponentRegistry {
+    components: HashMap<String, Box<dyn Resettable>>,
+}
+
+impl ComponentRegistry {
+    pub fn new() -> Self {
+        Self {
+            components: HashMap::new(),
+        }
+    }
+
+    /// Register a component for managed recovery
+    pub fn register(&mut self, component: Box<dyn Resettable>) {
+        let name = component.name().to_string();
+        self.components.insert(name, component);
+    }
+
+    /// Reset a specific component by name
+    pub fn reset_component(&self, name: &str) -> Result<()> {
+        if let Some(component) = self.components.get(name) {
+            component.reset()
+        } else {
+            Err(anyhow!("Component '{}' not found in registry", name))
+        }
+    }
+
+    /// Check if a specific component is healthy
+    pub fn is_healthy(&self, name: &str) -> Option<bool> {
+        self.components.get(name).map(|c| c.is_healthy())
+    }
+
+    /// Reset all registered components
+    pub fn reset_all(&self) -> Vec<(String, Result<()>)> {
+        self.components
+            .iter()
+            .map(|(name, c)| (name.clone(), c.reset()))
+            .collect()
+    }
+}
+
+impl Default for ComponentRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Demo recovery manager
 pub struct RecoveryManager {
     /// Configuration
@@ -245,6 +302,10 @@ pub struct RecoveryManager {
     event_tx: Option<mpsc::Sender<RecoveryEvent>>,
     /// Degraded mode active
     degraded: Arc<RwLock<bool>>,
+    /// Registry of resettable components
+    component_registry: Arc<RwLock<ComponentRegistry>>,
+    /// RPC endpoint for health checks
+    rpc_endpoint: Option<String>,
 }
 
 /// Recovery statistics
@@ -274,6 +335,8 @@ impl RecoveryManager {
             stats: Arc::new(RwLock::new(RecoveryStats::default())),
             event_tx: None,
             degraded: Arc::new(RwLock::new(false)),
+            component_registry: Arc::new(RwLock::new(ComponentRegistry::new())),
+            rpc_endpoint: None,
         }
     }
 
@@ -287,6 +350,16 @@ impl RecoveryManager {
     /// Create for demo mode
     pub fn demo_mode() -> Self {
         Self::new(RecoveryConfig::demo_mode())
+    }
+
+    /// Set the RPC endpoint for real health checks
+    pub fn set_rpc_endpoint(&mut self, endpoint: String) {
+        self.rpc_endpoint = Some(endpoint);
+    }
+
+    /// Register a component in the recovery manager's component registry
+    pub async fn register_component(&self, component: Box<dyn Resettable>) {
+        self.component_registry.write().await.register(component);
     }
 
     /// Emit event
@@ -467,29 +540,49 @@ impl RecoveryManager {
         }
     }
 
-    /// Execute a recovery action
+    /// Execute a recovery action against real components
     async fn execute_recovery(&self, action: &RecoveryAction) -> Result<()> {
         match action {
             RecoveryAction::Retry => {
-                // Just return Ok, caller will retry
+                // Signal to caller that retry is warranted
+                tracing::info!("Recovery action: retry requested");
                 Ok(())
             }
             RecoveryAction::Skip => {
-                // Skip the operation
+                tracing::info!("Recovery action: skipping failed operation");
                 Ok(())
             }
             RecoveryAction::Restart { component } => {
-                // Simulate restart
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                tracing::info!("Restarted component: {}", component);
-                Ok(())
+                // Attempt real component reset via the registry
+                let registry = self.component_registry.read().await;
+                match registry.reset_component(component) {
+                    Ok(()) => {
+                        tracing::info!("Successfully restarted component: {}", component);
+                        Ok(())
+                    }
+                    Err(_) => {
+                        // Component not in registry — fall back to timed wait
+                        tracing::warn!(
+                            "Component '{}' not in registry, waiting before retry",
+                            component
+                        );
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        Ok(())
+                    }
+                }
             }
             RecoveryAction::Fallback { description } => {
-                tracing::info!("Using fallback: {}", description);
+                tracing::info!("Activating fallback: {}", description);
+                // Mark system degraded since we're using a fallback path
+                *self.degraded.write().await = true;
+                self.emit(RecoveryEvent::DegradationActivated {
+                    reason: format!("Fallback activated: {}", description),
+                    impact: "Switched to fallback implementation".to_string(),
+                })
+                .await;
                 Ok(())
             }
             RecoveryAction::Degrade { description } => {
-                // Activate degraded mode
                 *self.degraded.write().await = true;
 
                 self.emit(RecoveryEvent::DegradationActivated {
@@ -507,6 +600,7 @@ impl RecoveryManager {
                 Err(anyhow!("Recovery aborted: {}", reason))
             }
             RecoveryAction::WaitAndRetry { delay } => {
+                tracing::info!("Recovery: waiting {:?} before retry", delay);
                 tokio::time::sleep(*delay).await;
                 Ok(())
             }
@@ -517,19 +611,36 @@ impl RecoveryManager {
         }
     }
 
-    /// Run health check for a component
+    /// Run a real health check for a component.
+    /// Checks the component registry first; falls back to basic liveness.
     pub async fn health_check(&self, component: &str) -> HealthCheck {
         let start = Instant::now();
 
-        // Simulate health check
-        let healthy = true;
+        // Try the component registry for a real health signal
+        let registry = self.component_registry.read().await;
+        let (healthy, details) = match registry.is_healthy(component) {
+            Some(h) => (
+                h,
+                if h {
+                    Some("Component reports healthy".to_string())
+                } else {
+                    Some("Component reports unhealthy".to_string())
+                },
+            ),
+            None => {
+                // Component not registered — do a basic check
+                (true, Some("Component not registered; assumed healthy".to_string()))
+            }
+        };
+        drop(registry);
+
         let response_time = start.elapsed();
 
         let check = HealthCheck {
             component: component.to_string(),
             healthy,
             response_time,
-            details: None,
+            details,
             timestamp: Instant::now(),
         };
 
@@ -756,67 +867,101 @@ impl RecoveryManager {
         }
     }
 
-    /// Check memory availability
+    /// Check memory availability by attempting a test allocation
     async fn check_memory(&self) -> PreDemoCheck {
         let start = Instant::now();
 
-        // Check if we can allocate reasonable memory (simulate)
-        let passed = true; // In production, would check actual memory
+        // Attempt a 64 MB test allocation to verify memory is available
+        let passed = std::panic::catch_unwind(|| {
+            let _test: Vec<u8> = Vec::with_capacity(64 * 1024 * 1024);
+            true
+        })
+        .unwrap_or(false);
 
         PreDemoCheck {
             name: "Memory Check".to_string(),
             passed,
             duration: start.elapsed(),
             details: if passed {
-                Some("Sufficient memory available".to_string())
+                Some("Sufficient memory available (64 MB test passed)".to_string())
             } else {
-                Some("Low memory warning".to_string())
+                Some("Low memory — could not allocate 64 MB".to_string())
             },
         }
     }
 
-    /// Check network connectivity
+    /// Check network connectivity by attempting a DNS resolution
     async fn check_network(&self) -> PreDemoCheck {
         let start = Instant::now();
 
-        // Simulate network check
-        let passed = true;
+        // Try to resolve a well-known address as a connectivity signal
+        let passed = tokio::net::lookup_host("1.1.1.1:80").await.is_ok();
 
         PreDemoCheck {
             name: "Network Check".to_string(),
             passed,
             duration: start.elapsed(),
-            details: Some("Network connectivity OK".to_string()),
+            details: if passed {
+                Some("Network connectivity OK".to_string())
+            } else {
+                Some("Network check failed (DNS resolution)".to_string())
+            },
         }
     }
 
-    /// Check RPC endpoint availability
+    /// Check RPC endpoint availability by attempting a TCP connection
     async fn check_rpc_endpoint(&self) -> PreDemoCheck {
         let start = Instant::now();
 
-        // In production, would try to connect to RPC endpoint
-        let passed = true; // Assume available or will use mock
+        let endpoint = self
+            .rpc_endpoint
+            .as_deref()
+            .unwrap_or("127.0.0.1:9545");
+
+        // Strip scheme for raw TCP connect
+        let addr = endpoint
+            .strip_prefix("http://")
+            .or_else(|| endpoint.strip_prefix("https://"))
+            .unwrap_or(endpoint);
+
+        let passed = tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::net::TcpStream::connect(addr),
+        )
+        .await
+        .map(|r| r.is_ok())
+        .unwrap_or(false);
 
         PreDemoCheck {
             name: "RPC Endpoint Check".to_string(),
             passed,
             duration: start.elapsed(),
-            details: Some("RPC endpoint check complete".to_string()),
+            details: if passed {
+                Some(format!("RPC endpoint {} reachable", endpoint))
+            } else {
+                Some(format!("RPC endpoint {} not reachable (will use mock mode)", endpoint))
+            },
         }
     }
 
-    /// Check proving system readiness
+    /// Check proving system readiness via component registry
     async fn check_proving_system(&self) -> PreDemoCheck {
         let start = Instant::now();
 
-        // Simulate proving system check
-        let passed = true;
+        let registry = self.component_registry.read().await;
+        let passed = registry
+            .is_healthy("proof_generator")
+            .unwrap_or(true); // If not registered, assume OK
 
         PreDemoCheck {
             name: "Proving System Check".to_string(),
             passed,
             duration: start.elapsed(),
-            details: Some("Proving system ready".to_string()),
+            details: if passed {
+                Some("Proving system ready".to_string())
+            } else {
+                Some("Proving system reports unhealthy".to_string())
+            },
         }
     }
 
@@ -1054,12 +1199,48 @@ impl HeartbeatMonitor {
             .collect()
     }
 
-    /// Check if a specific component is healthy
+    /// Check if a specific component is healthy based on heartbeat freshness
     pub async fn is_healthy(&self, component: &str) -> bool {
         if let Some(last) = self.last_heartbeat.read().await.get(component) {
             Instant::now().duration_since(*last) <= self.timeout
         } else {
             false
+        }
+    }
+
+    /// Actively check a component by verifying heartbeat freshness and attempting a TCP probe.
+    /// Returns a health check result with timing information.
+    pub async fn check_component(&self, component: &str, addr: Option<&str>) -> super::recovery::HealthCheck {
+        let start = Instant::now();
+
+        // First check heartbeat freshness
+        let heartbeat_ok = self.is_healthy(component).await;
+
+        // If an address is provided, also do a TCP probe
+        let probe_ok = if let Some(a) = addr {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                tokio::net::TcpStream::connect(a),
+            )
+            .await
+            .map(|r| r.is_ok())
+            .unwrap_or(false)
+        } else {
+            true
+        };
+
+        let healthy = heartbeat_ok && probe_ok;
+
+        super::recovery::HealthCheck {
+            component: component.to_string(),
+            healthy,
+            response_time: start.elapsed(),
+            details: Some(format!(
+                "heartbeat={}, probe={}",
+                if heartbeat_ok { "ok" } else { "stale" },
+                if probe_ok { "ok" } else { "failed" }
+            )),
+            timestamp: Instant::now(),
         }
     }
 

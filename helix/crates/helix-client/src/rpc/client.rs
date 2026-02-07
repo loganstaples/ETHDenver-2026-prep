@@ -59,8 +59,10 @@ pub struct HelixRpcConfig {
     pub timeout_secs: u64,
     /// Maximum retries on failure
     pub max_retries: u32,
-    /// Retry delay in milliseconds
+    /// Base retry delay in milliseconds (used for exponential backoff)
     pub retry_delay_ms: u64,
+    /// Maximum backoff delay in milliseconds
+    pub max_backoff_ms: u64,
     /// Enable request compression
     pub compress: bool,
     /// Authentication token (if required)
@@ -74,6 +76,7 @@ impl Default for HelixRpcConfig {
             timeout_secs: 30,
             max_retries: 3,
             retry_delay_ms: 500,
+            max_backoff_ms: 10_000,
             compress: false,
             auth_token: None,
         }
@@ -491,6 +494,86 @@ struct JsonRpcError {
     message: String,
 }
 
+/// Circuit breaker state for RPC requests
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcCircuitBreakerState {
+    /// Normal operation — requests flow through
+    Closed,
+    /// Breaker tripped — requests are rejected immediately
+    Open,
+    /// Testing recovery — one probe request allowed
+    HalfOpen,
+}
+
+/// Circuit breaker that prevents hammering a down endpoint
+#[derive(Debug)]
+pub struct RpcCircuitBreaker {
+    /// Current state
+    pub state: RpcCircuitBreakerState,
+    /// Consecutive failure count
+    pub failure_count: u32,
+    /// Failure threshold to trip breaker
+    pub threshold: u32,
+    /// Time of last failure
+    pub last_failure_time: Option<Instant>,
+    /// How long to wait before transitioning Open → HalfOpen
+    pub reset_timeout: Duration,
+}
+
+impl RpcCircuitBreaker {
+    pub fn new(threshold: u32, reset_timeout: Duration) -> Self {
+        Self {
+            state: RpcCircuitBreakerState::Closed,
+            failure_count: 0,
+            threshold,
+            last_failure_time: None,
+            reset_timeout,
+        }
+    }
+
+    /// Check whether a request should be allowed
+    pub fn allow_request(&mut self) -> bool {
+        match self.state {
+            RpcCircuitBreakerState::Closed => true,
+            RpcCircuitBreakerState::Open => {
+                // Check if reset_timeout has elapsed → transition to HalfOpen
+                if let Some(last) = self.last_failure_time {
+                    if last.elapsed() >= self.reset_timeout {
+                        self.state = RpcCircuitBreakerState::HalfOpen;
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
+            RpcCircuitBreakerState::HalfOpen => true,
+        }
+    }
+
+    /// Record a successful request
+    pub fn record_success(&mut self) {
+        self.failure_count = 0;
+        self.state = RpcCircuitBreakerState::Closed;
+    }
+
+    /// Record a failed request (after all retries exhausted)
+    pub fn record_failure(&mut self) {
+        self.failure_count += 1;
+        self.last_failure_time = Some(Instant::now());
+        if self.failure_count >= self.threshold {
+            self.state = RpcCircuitBreakerState::Open;
+        }
+    }
+}
+
+impl Default for RpcCircuitBreaker {
+    fn default() -> Self {
+        Self::new(5, Duration::from_secs(30))
+    }
+}
+
 /// HELIX Node RPC Client
 pub struct HelixRpcClient {
     /// HTTP client
@@ -505,6 +588,8 @@ pub struct HelixRpcClient {
     last_success: Arc<RwLock<Option<Instant>>>,
     /// Cached node capabilities
     capabilities: Arc<RwLock<Option<NodeCapabilities>>>,
+    /// Circuit breaker to avoid hammering downed endpoints
+    circuit_breaker: Arc<RwLock<RpcCircuitBreaker>>,
 }
 
 impl HelixRpcClient {
@@ -523,6 +608,7 @@ impl HelixRpcClient {
             connected: Arc::new(RwLock::new(false)),
             last_success: Arc::new(RwLock::new(None)),
             capabilities: Arc::new(RwLock::new(None)),
+            circuit_breaker: Arc::new(RwLock::new(RpcCircuitBreaker::default())),
         })
     }
 
@@ -560,12 +646,27 @@ impl HelixRpcClient {
         *self.connected.read().await
     }
 
-    /// Send JSON-RPC request
+    /// Get a reference to the circuit breaker (for testing / monitoring)
+    pub fn circuit_breaker(&self) -> &Arc<RwLock<RpcCircuitBreaker>> {
+        &self.circuit_breaker
+    }
+
+    /// Send JSON-RPC request with exponential backoff and circuit breaker
     async fn send_request<P: Serialize, R: for<'de> Deserialize<'de>>(
         &self,
         method: &str,
         params: P,
     ) -> Result<R, RpcError> {
+        // Check circuit breaker before attempting
+        {
+            let mut cb = self.circuit_breaker.write().await;
+            if !cb.allow_request() {
+                return Err(RpcError::NodeUnavailable(
+                    "Circuit breaker is open — endpoint unavailable".to_string(),
+                ));
+            }
+        }
+
         let id = {
             let mut counter = self.request_id.write().await;
             *counter += 1;
@@ -583,7 +684,12 @@ impl HelixRpcClient {
 
         for attempt in 0..=self.config.max_retries {
             if attempt > 0 {
-                tokio::time::sleep(Duration::from_millis(self.config.retry_delay_ms)).await;
+                // Exponential backoff with jitter
+                let base_delay = self.config.retry_delay_ms * (1u64 << attempt.min(6));
+                let capped_delay = base_delay.min(self.config.max_backoff_ms);
+                let jitter = rand::random::<u64>() % (capped_delay / 4 + 1);
+                let delay = capped_delay + jitter;
+                tokio::time::sleep(Duration::from_millis(delay)).await;
             }
 
             let mut request_builder = self.client
@@ -599,6 +705,8 @@ impl HelixRpcClient {
                     match response.json::<JsonRpcResponse<R>>().await {
                         Ok(rpc_response) => {
                             if let Some(error) = rpc_response.error {
+                                // RPC-level errors are not retried — they are deterministic
+                                self.circuit_breaker.write().await.record_success();
                                 return Err(RpcError::RpcError {
                                     code: error.code,
                                     message: error.message,
@@ -607,6 +715,7 @@ impl HelixRpcClient {
 
                             if let Some(result) = rpc_response.result {
                                 *self.last_success.write().await = Some(Instant::now());
+                                self.circuit_breaker.write().await.record_success();
                                 return Ok(result);
                             }
 
@@ -622,6 +731,9 @@ impl HelixRpcClient {
                 }
             }
         }
+
+        // All retries exhausted — record failure in circuit breaker
+        self.circuit_breaker.write().await.record_failure();
 
         Err(last_error.unwrap_or_else(|| RpcError::ConnectionFailed("Unknown error".to_string())))
     }
@@ -947,6 +1059,7 @@ impl Clone for HelixRpcClient {
             connected: self.connected.clone(),
             last_success: self.last_success.clone(),
             capabilities: self.capabilities.clone(),
+            circuit_breaker: self.circuit_breaker.clone(),
         }
     }
 }
