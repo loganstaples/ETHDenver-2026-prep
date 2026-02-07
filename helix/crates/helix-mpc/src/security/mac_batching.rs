@@ -12,17 +12,18 @@
 //!   verify Σ r_i * MAC(x_i) = α * Σ r_i * x_i
 //!
 //! This reduces verification cost while maintaining security with high probability.
+//!
+//! All arithmetic uses exact Fr field operations — no floating-point tolerance.
 
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
-use sha2::{Digest, Sha256};
 
-use crate::error::{MPCError, MPCResult};
+use crate::error::MPCResult;
+use crate::field::Fr;
 use crate::types::PartyId;
 
 /// Configuration for batched MAC verification.
@@ -32,8 +33,6 @@ pub struct BatchMACConfig {
     pub max_batch_size: usize,
     /// Security parameter (bits) for random linear combination.
     pub security_bits: usize,
-    /// Tolerance for floating-point comparison.
-    pub tolerance: f64,
     /// Enable adaptive batching based on throughput.
     pub adaptive_batching: bool,
     /// Target throughput (verifications/second).
@@ -45,7 +44,6 @@ impl Default for BatchMACConfig {
         Self {
             max_batch_size: 1000,
             security_bits: 128,
-            tolerance: 1e-6,
             adaptive_batching: true,
             target_throughput: 10000.0,
         }
@@ -55,10 +53,10 @@ impl Default for BatchMACConfig {
 /// A pending MAC verification.
 #[derive(Debug, Clone)]
 struct PendingMAC {
-    /// Value share.
-    value: f64,
-    /// MAC share.
-    mac: f64,
+    /// Value share (in Fr).
+    value: Fr,
+    /// MAC share (in Fr).
+    mac: Fr,
     /// Party ID.
     party: PartyId,
     /// Label for debugging.
@@ -68,13 +66,14 @@ struct PendingMAC {
 }
 
 /// Batched MAC verifier with random linear combination.
+/// All arithmetic uses exact Fr field operations.
 pub struct BatchMACVerifier {
     /// Configuration.
     config: BatchMACConfig,
     /// Pending MACs by party.
     pending: RwLock<Vec<PendingMAC>>,
-    /// Alpha shares from all parties.
-    alpha_shares: RwLock<Vec<f64>>,
+    /// Alpha shares from all parties (in Fr).
+    alpha_shares: RwLock<Vec<Fr>>,
     /// Random generator.
     rng: RwLock<ChaCha20Rng>,
     /// Statistics.
@@ -111,8 +110,8 @@ impl BatchMACVerifier {
         }
     }
 
-    /// Sets the alpha shares for all parties.
-    pub fn set_alpha_shares(&self, shares: Vec<f64>) {
+    /// Sets the alpha shares for all parties (in Fr).
+    pub fn set_alpha_shares(&self, shares: Vec<Fr>) {
         *self.alpha_shares.write() = shares;
     }
 
@@ -122,7 +121,7 @@ impl BatchMACVerifier {
     }
 
     /// Queues a MAC for batch verification.
-    pub fn queue(&self, value: f64, mac: f64, party: PartyId, label: String) {
+    pub fn queue(&self, value: Fr, mac: Fr, party: PartyId, label: String) {
         let mut pending = self.pending.write();
         pending.push(PendingMAC {
             value,
@@ -141,18 +140,18 @@ impl BatchMACVerifier {
     /// Queues multiple MACs.
     pub fn queue_batch(
         &self,
-        values: &[f64],
-        macs: &[f64],
+        values: &[Fr],
+        macs: &[Fr],
         party: PartyId,
         label_prefix: &str,
     ) {
         let mut pending = self.pending.write();
         let now = Instant::now();
 
-        for (i, (&v, &m)) in values.iter().zip(macs.iter()).enumerate() {
+        for (i, (v, m)) in values.iter().zip(macs.iter()).enumerate() {
             pending.push(PendingMAC {
-                value: v,
-                mac: m,
+                value: *v,
+                mac: *m,
                 party: party.clone(),
                 label: format!("{}-{}", label_prefix, i),
                 queued_at: now,
@@ -166,6 +165,7 @@ impl BatchMACVerifier {
     }
 
     /// Verifies all pending MACs using random linear combination.
+    /// Uses exact Fr arithmetic — no tolerance needed.
     pub fn flush(&self) -> MPCResult<BatchVerificationResult> {
         let start = Instant::now();
         let pending = std::mem::take(&mut *self.pending.write());
@@ -179,30 +179,34 @@ impl BatchMACVerifier {
         }
 
         let alpha_shares = self.alpha_shares.read();
-        let alpha: f64 = alpha_shares.iter().sum();
+        let mut alpha = Fr::ZERO;
+        for a in alpha_shares.iter() {
+            alpha = Fr::add(&alpha, a);
+        }
 
-        // Generate random coefficients
+        // Generate random coefficients using Fr::random for cryptographic security
         let seed = self.verification_seed.read().unwrap_or_else(|| {
             self.rng.write().gen()
         });
         let mut rng = ChaCha20Rng::seed_from_u64(seed);
 
-        let coefficients: Vec<f64> = (0..pending.len())
-            .map(|_| rng.gen_range(1.0..2f64.powi(self.config.security_bits as i32 / 4)))
+        let coefficients: Vec<Fr> = (0..pending.len())
+            .map(|_| Fr::random(&mut rng))
             .collect();
 
-        // Compute random linear combination
-        let mut combined_value = 0.0;
-        let mut combined_mac = 0.0;
+        // Compute random linear combination in Fr
+        let mut combined_value = Fr::ZERO;
+        let mut combined_mac = Fr::ZERO;
 
         for (i, p) in pending.iter().enumerate() {
-            combined_value += coefficients[i] * p.value;
-            combined_mac += coefficients[i] * p.mac;
+            // Use raw field multiplication for random coefficients (not fixed-point)
+            combined_value = Fr::add(&combined_value, &Fr::mul(&coefficients[i], &p.value));
+            combined_mac = Fr::add(&combined_mac, &Fr::mul(&coefficients[i], &p.mac));
         }
 
-        // Verify: combined_mac should equal alpha * combined_value
-        let expected_mac = alpha * combined_value;
-        let batch_valid = (combined_mac - expected_mac).abs() <= self.config.tolerance * pending.len() as f64;
+        // Verify: combined_mac should equal alpha * combined_value (exact field mul)
+        let expected_mac = Fr::mul(&alpha, &combined_value);
+        let batch_valid = combined_mac.ct_eq(&expected_mac).to_bool();
 
         let duration = start.elapsed();
         self.stats.verification_time_ns.fetch_add(duration.as_nanos() as u64, Ordering::SeqCst);
@@ -221,7 +225,7 @@ impl BatchMACVerifier {
         } else {
             // Batch failed - identify culprit(s) by individual verification
             self.stats.failures.fetch_add(1, Ordering::SeqCst);
-            let failed = self.identify_failures(&pending, alpha);
+            let failed = self.identify_failures(&pending, &alpha);
 
             self.stats.macs_verified.fetch_add((pending.len() - failed.len()) as u64, Ordering::SeqCst);
 
@@ -233,13 +237,13 @@ impl BatchMACVerifier {
         }
     }
 
-    /// Identifies individual MAC failures.
-    fn identify_failures(&self, pending: &[PendingMAC], alpha: f64) -> Vec<MACFailure> {
+    /// Identifies individual MAC failures using exact Fr comparison.
+    fn identify_failures(&self, pending: &[PendingMAC], alpha: &Fr) -> Vec<MACFailure> {
         pending
             .iter()
             .filter_map(|p| {
-                let expected = alpha * p.value;
-                if (p.mac - expected).abs() > self.config.tolerance {
+                let expected = Fr::mul(alpha, &p.value);
+                if !p.mac.ct_eq(&expected).to_bool() {
                     Some(MACFailure {
                         party: p.party.clone(),
                         label: p.label.clone(),
@@ -290,19 +294,19 @@ pub struct BatchVerificationResult {
     pub duration: Duration,
 }
 
-/// A MAC verification failure.
+/// A MAC verification failure (all values in Fr).
 #[derive(Debug, Clone)]
 pub struct MACFailure {
     /// Party that submitted the invalid MAC.
     pub party: PartyId,
     /// Label identifying the value.
     pub label: String,
-    /// Expected MAC value.
-    pub expected_mac: f64,
-    /// Actual MAC value received.
-    pub actual_mac: f64,
-    /// The value that was MACed.
-    pub value: f64,
+    /// Expected MAC value (in Fr).
+    pub expected_mac: Fr,
+    /// Actual MAC value received (in Fr).
+    pub actual_mac: Fr,
+    /// The value that was MACed (in Fr).
+    pub value: Fr,
 }
 
 /// Snapshot of MAC verification statistics.
@@ -317,6 +321,7 @@ pub struct BatchMACStatsSnapshot {
 }
 
 /// Streaming MAC verifier for continuous verification.
+/// Uses Fr field arithmetic for all MAC operations.
 pub struct StreamingMACVerifier {
     /// Inner batch verifier.
     inner: BatchMACVerifier,
@@ -336,13 +341,13 @@ impl StreamingMACVerifier {
         }
     }
 
-    /// Sets alpha shares.
-    pub fn set_alpha_shares(&self, shares: Vec<f64>) {
+    /// Sets alpha shares (in Fr).
+    pub fn set_alpha_shares(&self, shares: Vec<Fr>) {
         self.inner.set_alpha_shares(shares);
     }
 
     /// Adds a MAC and potentially triggers verification.
-    pub fn add(&self, value: f64, mac: f64, party: PartyId, label: String) -> Option<BatchVerificationResult> {
+    pub fn add(&self, value: Fr, mac: Fr, party: PartyId, label: String) -> Option<BatchVerificationResult> {
         self.inner.queue(value, mac, party, label);
 
         let should_verify = {
@@ -371,6 +376,7 @@ impl StreamingMACVerifier {
 }
 
 /// Parallel MAC verifier using multiple threads.
+/// Uses Fr field arithmetic for all MAC operations.
 pub struct ParallelMACVerifier {
     /// Number of workers.
     num_workers: usize,
@@ -394,15 +400,15 @@ impl ParallelMACVerifier {
         }
     }
 
-    /// Sets alpha shares for all workers.
-    pub fn set_alpha_shares(&self, shares: Vec<f64>) {
+    /// Sets alpha shares for all workers (in Fr).
+    pub fn set_alpha_shares(&self, shares: Vec<Fr>) {
         for worker in &self.workers {
             worker.set_alpha_shares(shares.clone());
         }
     }
 
     /// Queues a MAC to a worker.
-    pub fn queue(&self, value: f64, mac: f64, party: PartyId, label: String) {
+    pub fn queue(&self, value: Fr, mac: Fr, party: PartyId, label: String) {
         let idx = (self.next_worker.fetch_add(1, Ordering::SeqCst) as usize) % self.num_workers;
         self.workers[idx].queue(value, mac, party, label);
     }
@@ -448,23 +454,23 @@ mod tests {
     fn setup_verifier() -> BatchMACVerifier {
         let config = BatchMACConfig {
             max_batch_size: 100,
-            tolerance: 1e-6,
             ..Default::default()
         };
         let verifier = BatchMACVerifier::new(config);
-        // Set alpha = 5.0 split across 2 parties
-        verifier.set_alpha_shares(vec![2.0, 3.0]);
+        // Set alpha = 5 split across 2 parties: alpha_1=2, alpha_2=3
+        verifier.set_alpha_shares(vec![Fr::from_u64(2), Fr::from_u64(3)]);
         verifier
     }
 
     #[test]
     fn test_batch_mac_verification_success() {
         let verifier = setup_verifier();
+        let alpha = Fr::from_u64(5);
 
-        // Queue valid MACs (value, mac where mac = 5 * value)
+        // Queue valid MACs (value, mac where mac = 5 * value via raw field mul)
         for i in 0..10 {
-            let value = i as f64;
-            let mac = 5.0 * value; // alpha = 5.0
+            let value = Fr::from_u64(i);
+            let mac = Fr::mul(&alpha, &value);
             verifier.queue(value, mac, PartyId::from_index(0), format!("test-{}", i));
         }
 
@@ -476,16 +482,19 @@ mod tests {
     #[test]
     fn test_batch_mac_verification_failure() {
         let verifier = setup_verifier();
+        let alpha = Fr::from_u64(5);
 
         // Queue mostly valid MACs with one bad one
         for i in 0..9 {
-            let value = i as f64;
-            let mac = 5.0 * value;
+            let value = Fr::from_u64(i);
+            let mac = Fr::mul(&alpha, &value);
             verifier.queue(value, mac, PartyId::from_index(0), format!("test-{}", i));
         }
 
-        // Bad MAC
-        verifier.queue(10.0, 100.0, PartyId::from_index(1), "bad".into()); // Should be 50.0
+        // Bad MAC: value=10, mac should be 50 but we give 100
+        let bad_value = Fr::from_u64(10);
+        let bad_mac = Fr::from_u64(100);
+        verifier.queue(bad_value, bad_mac, PartyId::from_index(1), "bad".into());
 
         let result = verifier.flush().unwrap();
         assert_eq!(result.verified_count, 9);
@@ -496,9 +505,10 @@ mod tests {
     #[test]
     fn test_queue_batch() {
         let verifier = setup_verifier();
+        let alpha = Fr::from_u64(5);
 
-        let values: Vec<f64> = (0..20).map(|i| i as f64).collect();
-        let macs: Vec<f64> = values.iter().map(|v| 5.0 * v).collect();
+        let values: Vec<Fr> = (0..20).map(|i| Fr::from_u64(i)).collect();
+        let macs: Vec<Fr> = values.iter().map(|v| Fr::mul(&alpha, v)).collect();
 
         verifier.queue_batch(&values, &macs, PartyId::from_index(0), "batch");
 
@@ -510,18 +520,18 @@ mod tests {
     fn test_streaming_verifier() {
         let config = BatchMACConfig::default();
         let verifier = StreamingMACVerifier::new(config, Duration::from_millis(10));
-        verifier.set_alpha_shares(vec![5.0]);
+        verifier.set_alpha_shares(vec![Fr::from_u64(5)]);
 
-        // Add some MACs
+        let alpha = Fr::from_u64(5);
         for i in 0..5 {
-            let result = verifier.add(i as f64, 5.0 * i as f64, PartyId::from_index(0), format!("test-{}", i));
-            // May or may not verify based on timing
+            let value = Fr::from_u64(i);
+            let mac = Fr::mul(&alpha, &value);
+            let result = verifier.add(value, mac, PartyId::from_index(0), format!("test-{}", i));
             if let Some(r) = result {
                 assert!(r.failed.is_empty());
             }
         }
 
-        // Force flush
         let result = verifier.flush().unwrap();
         assert!(result.failed.is_empty());
     }
@@ -530,11 +540,13 @@ mod tests {
     fn test_parallel_verifier() {
         let config = BatchMACConfig::default();
         let verifier = ParallelMACVerifier::new(4, config);
-        verifier.set_alpha_shares(vec![5.0]);
+        verifier.set_alpha_shares(vec![Fr::from_u64(5)]);
 
-        // Distribute MACs across workers
+        let alpha = Fr::from_u64(5);
         for i in 0..100 {
-            verifier.queue(i as f64, 5.0 * i as f64, PartyId::from_index(0), format!("test-{}", i));
+            let value = Fr::from_u64(i);
+            let mac = Fr::mul(&alpha, &value);
+            verifier.queue(value, mac, PartyId::from_index(0), format!("test-{}", i));
         }
 
         let results = verifier.flush_all().unwrap();
@@ -546,11 +558,14 @@ mod tests {
     fn test_deterministic_verification() {
         let config = BatchMACConfig::default();
         let verifier = BatchMACVerifier::new(config);
-        verifier.set_alpha_shares(vec![5.0]);
+        verifier.set_alpha_shares(vec![Fr::from_u64(5)]);
         verifier.set_verification_seed(12345);
 
+        let alpha = Fr::from_u64(5);
         for i in 0..10 {
-            verifier.queue(i as f64, 5.0 * i as f64, PartyId::from_index(0), format!("test-{}", i));
+            let value = Fr::from_u64(i);
+            let mac = Fr::mul(&alpha, &value);
+            verifier.queue(value, mac, PartyId::from_index(0), format!("test-{}", i));
         }
 
         let result = verifier.flush().unwrap();

@@ -1,17 +1,20 @@
 //! Demo integration tests for helix-client
 //!
 //! Tests cover: dashboard endpoints, auth middleware, rate limiting,
-//! RPC circuit breaker, and recovery manager flows.
+//! RPC circuit breaker, recovery manager flows, HelixClient facade,
+//! benchmark correctness, config validation, and dashboard data consistency.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt; // for `oneshot`
 
 use helix_client::dashboard::{
-    create_dashboard_router, create_dashboard_router_with_state, DashboardConfig, DashboardState,
+    create_dashboard_router, create_dashboard_router_with_state,
+    demo_nodes, demo_metrics, demo_events, demo_training_status, populate_demo_network,
+    DashboardConfig, DashboardState, NetworkStatus,
 };
 use helix_client::rpc::client::{
     HelixRpcConfig, HelixRpcClient, RpcCircuitBreaker, RpcCircuitBreakerState,
@@ -19,6 +22,9 @@ use helix_client::rpc::client::{
 use helix_client::demo::recovery::{
     CircuitBreaker, CircuitState, ErrorCategory, RecoveryConfig, RecoveryManager,
 };
+use helix_client::HelixClient;
+use helix_client::config::ConfigProfile;
+use helix_client::benchmark::{BenchmarkResults, BenchmarkType};
 
 // ============================================================================
 // Dashboard endpoint tests
@@ -410,4 +416,159 @@ fn test_rpc_config_has_max_backoff() {
     assert_eq!(config.max_backoff_ms, 10_000);
     assert_eq!(config.retry_delay_ms, 500);
     assert_eq!(config.max_retries, 3);
+}
+
+// ============================================================================
+// HelixClient facade tests
+// ============================================================================
+
+#[test]
+fn test_helix_client_from_profile() {
+    let client = HelixClient::from_profile(ConfigProfile::Local)
+        .expect("Local profile should produce a valid client");
+
+    assert_eq!(client.config().profile, ConfigProfile::Local);
+    // Starts in mock mode
+    assert!(!client.is_connected());
+}
+
+#[test]
+fn test_helix_client_with_dashboard() {
+    let dashboard = DashboardState::with_defaults();
+    let client = HelixClient::from_profile(ConfigProfile::Local)
+        .unwrap()
+        .with_dashboard(dashboard);
+
+    assert!(client.dashboard_state().is_some());
+}
+
+#[test]
+fn test_helix_client_rejects_invalid_config() {
+    let mut config = helix_client::config::HelixConfig::default();
+    config.training.batch_size = 0; // invalid
+    assert!(HelixClient::new(config).is_err());
+}
+
+// ============================================================================
+// Benchmark NaN safety tests
+// ============================================================================
+
+#[test]
+fn test_benchmark_results_nan_safety() {
+    let samples = vec![1.0, f64::NAN, 3.0, 2.0, f64::NAN];
+    // Should not panic
+    let results = BenchmarkResults::from_samples(
+        BenchmarkType::ProofGen,
+        5,
+        0,
+        samples,
+    );
+    // Mean will be NaN due to NaN inputs, but the important thing is no panic
+    assert!(!results.p50_ms.is_infinite());
+}
+
+#[test]
+fn test_benchmark_percentile_sorted() {
+    // Known sorted input: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    let samples: Vec<f64> = (1..=10).map(|x| x as f64).collect();
+    let results = BenchmarkResults::from_samples(
+        BenchmarkType::ProofVerify,
+        10,
+        0,
+        samples,
+    );
+
+    assert_eq!(results.min_ms, 1.0);
+    assert_eq!(results.max_ms, 10.0);
+    assert_eq!(results.mean_ms, 5.5);
+    // P50 of [1..10]: index = (10 * 50 / 100) = 5 → element at [5] = 6.0
+    assert_eq!(results.p50_ms, 6.0);
+    // Std dev of 1..10 = sqrt(8.25) ≈ 2.872
+    assert!((results.std_dev_ms - 2.872).abs() < 0.01);
+}
+
+// ============================================================================
+// Config validation tests
+// ============================================================================
+
+#[test]
+fn test_config_default_validates() {
+    let config = helix_client::config::HelixConfig::default();
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn test_config_rejects_zero_batch_size() {
+    let mut config = helix_client::config::HelixConfig::default();
+    config.training.batch_size = 0;
+    let err = config.validate().unwrap_err();
+    assert!(err.to_string().contains("Batch size"));
+}
+
+#[test]
+fn test_config_rejects_negative_learning_rate() {
+    let mut config = helix_client::config::HelixConfig::default();
+    config.training.learning_rate = -0.5;
+    let err = config.validate().unwrap_err();
+    assert!(err.to_string().contains("Learning rate"));
+}
+
+// ============================================================================
+// Dashboard data consistency tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_dashboard_defaults_and_fallback_match() {
+    // Verify that with_defaults() and handler fallbacks return identical data.
+    // We test this by:
+    // 1. Getting data from an empty-state dashboard (handler fallbacks)
+    // 2. Comparing against the demo_*() helper functions directly
+
+    let empty_config = DashboardConfig::default();
+    let app = create_dashboard_router(empty_config);
+
+    // -- /api/nodes --
+    let req = Request::builder().uri("/api/nodes").body(Body::empty()).unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let handler_nodes: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let helper_nodes = serde_json::to_value(&demo_nodes()).unwrap();
+    assert_eq!(handler_nodes, helper_nodes, "/api/nodes fallback should match demo_nodes()");
+
+    // -- /api/metrics --
+    let req = Request::builder().uri("/api/metrics").body(Body::empty()).unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let handler_metrics: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(handler_metrics, demo_metrics(), "/api/metrics fallback should match demo_metrics()");
+
+    // -- /api/events --
+    let req = Request::builder().uri("/api/events").body(Body::empty()).unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let handler_events: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let helper_events = serde_json::to_value(&demo_events()).unwrap();
+    assert_eq!(handler_events, helper_events, "/api/events fallback should match demo_events()");
+
+    // -- /api/training --
+    let req = Request::builder().uri("/api/training").body(Body::empty()).unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let handler_training: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let helper_training = serde_json::to_value(&demo_training_status()).unwrap();
+    assert_eq!(handler_training, helper_training, "/api/training fallback should match demo_training_status()");
+
+    // -- /api/network (populate_demo_network) --
+    let req = Request::builder().uri("/api/network").body(Body::empty()).unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let handler_network: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let mut expected_network = NetworkStatus::default();
+    populate_demo_network(&mut expected_network);
+    // uptime_seconds will differ, so just check the populated fields
+    assert_eq!(handler_network["node_id"], "helix-node-a1b2c3d4");
+    assert_eq!(handler_network["status"], "online");
+    assert_eq!(handler_network["peer_count"], 4);
+    assert_eq!(handler_network["block_height"], 12_345_678);
+    assert_eq!(handler_network["chain_id"], 31337);
 }

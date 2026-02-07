@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 
 use crate::types::PartyId;
 use crate::sharing::tensor::TensorShare;
-use crate::field::Fr;
+use crate::field::{Fr, ct_eq_hash};
 
 /// A commitment to a share value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,20 +104,20 @@ impl ShareCommitment {
         }
     }
 
-    /// Verifies a commitment against a value.
+    /// Verifies a commitment against a value (constant-time comparison).
     pub fn verify_scalar(&self, value: f64, blinding: &[u8; 32]) -> bool {
         let expected = Self::hash_with_blinding(&value.to_le_bytes(), blinding);
-        self.hash == expected
+        ct_eq_hash(&self.hash, &expected).to_bool()
     }
 
-    /// Verifies a commitment against a vector.
+    /// Verifies a commitment against a vector (constant-time comparison).
     pub fn verify_vector(&self, values: &[f64], blinding: &[u8; 32]) -> bool {
         let mut data = Vec::with_capacity(values.len() * 8);
         for v in values {
             data.extend_from_slice(&v.to_le_bytes());
         }
         let expected = Self::hash_with_blinding(&data, blinding);
-        self.hash == expected
+        ct_eq_hash(&self.hash, &expected).to_bool()
     }
 
     /// Verifies a commitment against a tensor share.
@@ -125,14 +125,14 @@ impl ShareCommitment {
         self.verify_fr_vector(&tensor.data, blinding)
     }
 
-    /// Verifies a commitment against a vector of Fr field elements.
+    /// Verifies a commitment against a vector of Fr field elements (constant-time comparison).
     pub fn verify_fr_vector(&self, values: &[Fr], blinding: &[u8; 32]) -> bool {
         let mut data = Vec::with_capacity(values.len() * 32);
         for v in values {
             data.extend_from_slice(&v.to_bytes_le());
         }
         let expected = Self::hash_with_blinding(&data, blinding);
-        self.hash == expected
+        ct_eq_hash(&self.hash, &expected).to_bool()
     }
 
     /// Computes H(data || blinding).
@@ -292,139 +292,190 @@ mod tests {
 }
 
 // ============================================================================
-// Pedersen Commitments (Homomorphic)
+// Pedersen Commitments (Homomorphic, real EC point operations)
 // ============================================================================
 
-/// Pedersen commitment scheme using discrete log.
+use halo2curves::bn256::{G1Affine, G1};
+use halo2curves::group::{Group, Curve};
+use halo2curves::bn256::Fr as Halo2Fr;
+use halo2curves::ff::{Field, PrimeField};
+
+/// Pedersen commitment scheme using BN254 elliptic curve.
 ///
-/// Commitment: C(v, r) = g^v * h^r
+/// Commitment: C(v, r) = v*G + r*H where G, H are generator points.
 ///
 /// Properties:
-/// - Additively homomorphic: C(a, r1) * C(b, r2) = C(a+b, r1+r2)
+/// - Additively homomorphic: C(a, r1) + C(b, r2) = C(a+b, r1+r2)
 /// - Information-theoretically hiding (given random r)
 /// - Computationally binding (under discrete log assumption)
-///
-/// For the demo, we simulate this with big integers in a prime field.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct PedersenCommitment {
-    /// The commitment value (simulated as hash)
-    pub value: [u8; 32],
-    /// Generator g (simulated)
-    pub generator_g: [u8; 32],
-    /// Generator h (simulated)
-    pub generator_h: [u8; 32],
+    /// The commitment point on BN254 G1
+    pub point: G1Affine,
+}
+
+impl Serialize for PedersenCommitment {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use halo2curves::group::GroupEncoding;
+        let bytes = self.point.to_bytes();
+        serializer.serialize_bytes(bytes.as_ref())
+    }
+}
+
+impl<'de> Deserialize<'de> for PedersenCommitment {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use halo2curves::group::GroupEncoding;
+        let bytes: Vec<u8> = Deserialize::deserialize(deserializer)?;
+        let mut repr = <G1Affine as GroupEncoding>::Repr::default();
+        if bytes.len() != repr.as_ref().len() {
+            return Err(serde::de::Error::custom("invalid point length"));
+        }
+        repr.as_mut().copy_from_slice(&bytes);
+        let point = G1Affine::from_bytes(&repr);
+        if point.is_some().into() {
+            Ok(Self { point: point.unwrap() })
+        } else {
+            Err(serde::de::Error::custom("invalid curve point"))
+        }
+    }
+}
+
+impl PartialEq for PedersenCommitment {
+    fn eq(&self, other: &Self) -> bool {
+        self.point == other.point
+    }
 }
 
 impl PedersenCommitment {
-    /// Creates a new Pedersen commitment to a value.
-    ///
-    /// In a real implementation, this would use elliptic curve points.
-    /// Here we simulate with hashes.
-    pub fn commit(value: f64, blinding: f64, generators: &PedersenGenerators) -> Self {
-        // Simulate: C = H(g, v) XOR H(h, r)
-        let mut hasher_g = Sha256::new();
-        hasher_g.update(&generators.g);
-        hasher_g.update(&value.to_le_bytes());
-        let h_gv: [u8; 32] = hasher_g.finalize().into();
+    /// Creates a new Pedersen commitment: C = value*G + blinding*H
+    pub fn commit(value: &Fr, blinding: &Fr, generators: &PedersenGenerators) -> Self {
+        let g_proj = G1::from(generators.g);
+        let h_proj = G1::from(generators.h);
+        let point = (g_proj * value.inner() + h_proj * blinding.inner()).to_affine();
+        Self { point }
+    }
 
-        let mut hasher_h = Sha256::new();
-        hasher_h.update(&generators.h);
-        hasher_h.update(&blinding.to_le_bytes());
-        let h_hr: [u8; 32] = hasher_h.finalize().into();
-
-        // Combine (simulated point addition)
-        let mut combined = [0u8; 32];
-        for i in 0..32 {
-            combined[i] = h_gv[i] ^ h_hr[i];
-        }
-
-        Self {
-            value: combined,
-            generator_g: generators.g,
-            generator_h: generators.h,
-        }
+    /// Creates a commitment from an f64 value (convenience wrapper).
+    pub fn commit_f64(value: f64, blinding: f64, generators: &PedersenGenerators) -> Self {
+        Self::commit(&Fr::from_f64(value), &Fr::from_f64(blinding), generators)
     }
 
     /// Creates a commitment to a vector of values.
-    pub fn commit_vector(values: &[f64], blindings: &[f64], generators: &PedersenGenerators) -> Vec<Self> {
+    pub fn commit_vector(values: &[Fr], blindings: &[Fr], generators: &PedersenGenerators) -> Vec<Self> {
         values
             .iter()
             .zip(blindings.iter())
-            .map(|(v, r)| Self::commit(*v, *r, generators))
+            .map(|(v, r)| Self::commit(v, r, generators))
             .collect()
     }
 
-    /// Verifies a commitment opening.
-    pub fn verify(&self, value: f64, blinding: f64, generators: &PedersenGenerators) -> bool {
+    /// Verifies a commitment opening: checks that point == value*G + blinding*H
+    pub fn verify(&self, value: &Fr, blinding: &Fr, generators: &PedersenGenerators) -> bool {
         let expected = Self::commit(value, blinding, generators);
-        self.value == expected.value
+        self.point == expected.point
+    }
+
+    /// Verifies with f64 values (convenience wrapper).
+    pub fn verify_f64(&self, value: f64, blinding: f64, generators: &PedersenGenerators) -> bool {
+        self.verify(&Fr::from_f64(value), &Fr::from_f64(blinding), generators)
     }
 
     /// Adds two commitments (homomorphic property).
-    /// C(a) + C(b) = C(a+b) with combined blinding factors.
+    /// C(a, r1) + C(b, r2) = C(a+b, r1+r2)
     pub fn add(&self, other: &PedersenCommitment) -> PedersenCommitment {
-        let mut combined = [0u8; 32];
-        for i in 0..32 {
-            combined[i] = self.value[i] ^ other.value[i];
-        }
-
-        PedersenCommitment {
-            value: combined,
-            generator_g: self.generator_g,
-            generator_h: self.generator_h,
-        }
+        let sum = (G1::from(self.point) + G1::from(other.point)).to_affine();
+        PedersenCommitment { point: sum }
     }
 
-    /// Scales a commitment by a public constant.
-    /// C(a) * c = C(a*c) with scaled blinding.
-    pub fn scale(&self, scalar: f64) -> PedersenCommitment {
-        // In real implementation: point multiplication
-        // Simulated: hash with scalar
-        let mut hasher = Sha256::new();
-        hasher.update(&self.value);
-        hasher.update(&scalar.to_le_bytes());
-
-        PedersenCommitment {
-            value: hasher.finalize().into(),
-            generator_g: self.generator_g,
-            generator_h: self.generator_h,
-        }
+    /// Scales a commitment by a scalar.
+    /// scalar * C(a, r) = C(scalar*a, scalar*r)
+    pub fn scale(&self, scalar: &Fr) -> PedersenCommitment {
+        let scaled = (G1::from(self.point) * scalar.inner()).to_affine();
+        PedersenCommitment { point: scaled }
     }
 }
 
-/// Generator points for Pedersen commitments.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Generator points for Pedersen commitments on BN254 G1.
+#[derive(Debug, Clone)]
 pub struct PedersenGenerators {
-    /// Generator g
-    pub g: [u8; 32],
-    /// Generator h (with unknown discrete log relative to g)
-    pub h: [u8; 32],
+    /// Generator g (standard BN254 generator)
+    pub g: G1Affine,
+    /// Generator h (nothing-up-my-sleeve derived, unknown discrete log w.r.t. g)
+    pub h: G1Affine,
+}
+
+impl Serialize for PedersenGenerators {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use halo2curves::group::GroupEncoding;
+        use serde::ser::SerializeTuple;
+        let g_bytes = self.g.to_bytes();
+        let h_bytes = self.h.to_bytes();
+        let mut t = serializer.serialize_tuple(2)?;
+        t.serialize_element(g_bytes.as_ref())?;
+        t.serialize_element(h_bytes.as_ref())?;
+        t.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for PedersenGenerators {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use halo2curves::group::GroupEncoding;
+        let (g_bytes, h_bytes): (Vec<u8>, Vec<u8>) = Deserialize::deserialize(deserializer)?;
+        let mut g_repr = <G1Affine as GroupEncoding>::Repr::default();
+        let mut h_repr = <G1Affine as GroupEncoding>::Repr::default();
+        if g_bytes.len() != g_repr.as_ref().len() || h_bytes.len() != h_repr.as_ref().len() {
+            return Err(serde::de::Error::custom("invalid generator bytes length"));
+        }
+        g_repr.as_mut().copy_from_slice(&g_bytes);
+        h_repr.as_mut().copy_from_slice(&h_bytes);
+        let g = G1Affine::from_bytes(&g_repr);
+        let h = G1Affine::from_bytes(&h_repr);
+        if g.is_some().into() && h.is_some().into() {
+            Ok(Self { g: g.unwrap(), h: h.unwrap() })
+        } else {
+            Err(serde::de::Error::custom("invalid generator curve points"))
+        }
+    }
 }
 
 impl PedersenGenerators {
-    /// Creates generators from a seed.
+    /// Creates generators from a seed (for testing).
     pub fn from_seed(seed: u64) -> Self {
         let mut rng = ChaCha20Rng::seed_from_u64(seed);
-
-        let mut g = [0u8; 32];
-        let mut h = [0u8; 32];
-        rng.fill(&mut g);
-        rng.fill(&mut h);
-
+        let scalar = Halo2Fr::random(&mut rng);
+        let g = G1Affine::generator();
+        let h = (G1::generator() * scalar).to_affine();
         Self { g, h }
     }
 
-    /// Creates generators using hash-to-curve (simulated).
+    /// Creates generators using nothing-up-my-sleeve derivation.
+    ///
+    /// g is the standard BN254 generator. h is derived by hashing the domain
+    /// string to a scalar and multiplying the generator by it. This ensures
+    /// nobody knows the discrete log of h relative to g.
     pub fn nothing_up_my_sleeve(domain: &str) -> Self {
-        let mut hasher_g = Sha256::new();
-        hasher_g.update(domain.as_bytes());
-        hasher_g.update(b"generator_g");
-        let g: [u8; 32] = hasher_g.finalize().into();
+        let g = G1Affine::generator();
 
-        let mut hasher_h = Sha256::new();
-        hasher_h.update(domain.as_bytes());
-        hasher_h.update(b"generator_h");
-        let h: [u8; 32] = hasher_h.finalize().into();
+        // Derive h by hashing domain to get a scalar, then h = scalar * G
+        let mut hasher = Sha256::new();
+        hasher.update(domain.as_bytes());
+        hasher.update(b"pedersen_generator_h");
+        let hash: [u8; 32] = hasher.finalize().into();
+
+        // Convert hash to Fr by interpreting as little-endian bytes mod r.
+        // Use from_repr which reduces mod the field modulus.
+        let mut repr = <Halo2Fr as PrimeField>::Repr::default();
+        repr.as_mut().copy_from_slice(&hash);
+        // If the bytes happen to be >= modulus, from_repr returns None.
+        // In that case, just zero the high byte and retry (deterministic).
+        let scalar = Halo2Fr::from_repr(repr).unwrap_or_else(|| {
+            let mut adjusted = hash;
+            adjusted[31] &= 0x0F; // Clear high nibble to ensure < modulus
+            let mut repr2 = <Halo2Fr as PrimeField>::Repr::default();
+            repr2.as_mut().copy_from_slice(&adjusted);
+            Halo2Fr::from_repr(repr2).unwrap_or(Halo2Fr::ONE)
+        });
+        let h = (G1::generator() * scalar).to_affine();
 
         Self { g, h }
     }
@@ -467,7 +518,7 @@ impl GradientCommitment {
         gradients: &[f64],
         error_bound: f64,
         pre_state_hash: [u8; 32],
-        blinding: f64,
+        blinding: &Fr,
     ) -> Self {
         let generators = PedersenGenerators::default();
 
@@ -476,7 +527,7 @@ impl GradientCommitment {
 
         // Compute Pedersen commitment to sum
         let sum: f64 = gradients.iter().sum();
-        let sum_commitment = PedersenCommitment::commit(sum, blinding, &generators);
+        let sum_commitment = PedersenCommitment::commit(&Fr::from_f64(sum), blinding, &generators);
 
         Self {
             party: party.clone(),
@@ -490,21 +541,21 @@ impl GradientCommitment {
     }
 
     /// Verifies that revealed gradients match the commitment.
-    pub fn verify(&self, gradients: &[f64], blinding: f64) -> bool {
+    pub fn verify(&self, gradients: &[f64], blinding: &Fr) -> bool {
         if gradients.len() != self.num_elements {
             return false;
         }
 
-        // Verify Merkle root
+        // Verify Merkle root (constant-time)
         let computed_root = compute_merkle_root(gradients);
-        if computed_root != self.merkle_root {
+        if !ct_eq_hash(&computed_root, &self.merkle_root).to_bool() {
             return false;
         }
 
         // Verify sum commitment
         let generators = PedersenGenerators::default();
         let sum: f64 = gradients.iter().sum();
-        self.sum_commitment.verify(sum, blinding, &generators)
+        self.sum_commitment.verify(&Fr::from_f64(sum), blinding, &generators)
     }
 
     /// Generates a Merkle proof for a specific element.
@@ -532,7 +583,7 @@ pub struct MerkleProof {
 }
 
 impl MerkleProof {
-    /// Verifies the proof against a root hash.
+    /// Verifies the proof against a root hash (constant-time comparison).
     pub fn verify(&self, root: &[u8; 32]) -> bool {
         let mut current = hash_f64(self.value);
 
@@ -544,7 +595,7 @@ impl MerkleProof {
             };
         }
 
-        &current == root
+        ct_eq_hash(&current, root).to_bool()
     }
 }
 
@@ -668,7 +719,7 @@ impl AggregatedGradientCommitment {
             return Self {
                 round: 0,
                 party_commitments: vec![],
-                aggregated_sum: PedersenCommitment::commit(0.0, 0.0, &generators),
+                aggregated_sum: PedersenCommitment::commit(&Fr::ZERO, &Fr::ZERO, &generators),
                 total_error_bound: 0.0,
                 root: [0u8; 32],
             };
@@ -702,7 +753,7 @@ impl AggregatedGradientCommitment {
     }
 
     /// Verifies that the aggregated sum matches the expected total.
-    pub fn verify_sum(&self, expected_sum: f64, total_blinding: f64) -> bool {
+    pub fn verify_sum(&self, expected_sum: &Fr, total_blinding: &Fr) -> bool {
         let generators = PedersenGenerators::default();
         self.aggregated_sum.verify(expected_sum, total_blinding, &generators)
     }
@@ -715,36 +766,62 @@ mod tests_advanced {
     #[test]
     fn test_pedersen_commitment() {
         let generators = PedersenGenerators::default();
-        let value = 42.0;
-        let blinding = 123.0;
+        let value = Fr::from_f64(42.0);
+        let blinding = Fr::from_f64(123.0);
 
-        let commitment = PedersenCommitment::commit(value, blinding, &generators);
-        assert!(commitment.verify(value, blinding, &generators));
-        assert!(!commitment.verify(value + 1.0, blinding, &generators));
+        let commitment = PedersenCommitment::commit(&value, &blinding, &generators);
+        assert!(commitment.verify(&value, &blinding, &generators));
+        assert!(!commitment.verify(&Fr::from_f64(43.0), &blinding, &generators));
     }
 
     #[test]
     fn test_pedersen_homomorphic() {
         let generators = PedersenGenerators::default();
 
-        let a = 10.0;
-        let b = 20.0;
-        let r1 = 1.0;
-        let r2 = 2.0;
+        let a = Fr::from_f64(10.0);
+        let b = Fr::from_f64(20.0);
+        let r1 = Fr::from_f64(1.0);
+        let r2 = Fr::from_f64(2.0);
 
-        let ca = PedersenCommitment::commit(a, r1, &generators);
-        let cb = PedersenCommitment::commit(b, r2, &generators);
+        let ca = PedersenCommitment::commit(&a, &r1, &generators);
+        let cb = PedersenCommitment::commit(&b, &r2, &generators);
         let cab = ca.add(&cb);
 
-        // The sum commitment should verify with sum of values and blindings
-        // Note: This is a simulation - real EC would preserve this exactly
+        // Real homomorphic property: C(a,r1) + C(b,r2) = C(a+b, r1+r2)
+        let sum_val = Fr::add(&a, &b);
+        let sum_blind = Fr::add(&r1, &r2);
+        assert!(
+            cab.verify(&sum_val, &sum_blind, &generators),
+            "Homomorphic addition must hold: C(a)+C(b) should verify with (a+b, r1+r2)"
+        );
+    }
+
+    #[test]
+    fn test_pedersen_scale() {
+        let generators = PedersenGenerators::default();
+
+        let v = Fr::from_f64(5.0);
+        let r = Fr::from_f64(7.0);
+        let scalar = Fr::from_f64(3.0);
+
+        let c = PedersenCommitment::commit(&v, &r, &generators);
+        let scaled = c.scale(&scalar);
+
+        // scalar * C(v, r) = C(scalar*v, scalar*r)
+        // Use raw field multiplication to match EC scalar multiplication in scale()
+        let sv = Fr::mul(&v, &scalar);
+        let sr = Fr::mul(&r, &scalar);
+        assert!(
+            scaled.verify(&sv, &sr, &generators),
+            "Scalar multiplication must hold"
+        );
     }
 
     #[test]
     fn test_gradient_commitment() {
         let party = PartyId::from_index(0);
         let gradients = vec![0.1, 0.2, 0.3, 0.4];
-        let blinding = 42.0;
+        let blinding = Fr::from_f64(42.0);
 
         let commitment = GradientCommitment::create(
             &party,
@@ -752,11 +829,11 @@ mod tests_advanced {
             &gradients,
             0.01,
             [0u8; 32],
-            blinding,
+            &blinding,
         );
 
-        assert!(commitment.verify(&gradients, blinding));
-        assert!(!commitment.verify(&[0.1, 0.2, 0.3, 0.5], blinding));
+        assert!(commitment.verify(&gradients, &blinding));
+        assert!(!commitment.verify(&[0.1, 0.2, 0.3, 0.5], &blinding));
     }
 
     #[test]
@@ -775,13 +852,16 @@ mod tests_advanced {
         let gradients1 = vec![0.1, 0.2];
         let gradients2 = vec![0.3, 0.4];
 
+        let r1 = Fr::from_f64(1.0);
+        let r2 = Fr::from_f64(2.0);
+
         let c1 = GradientCommitment::create(
             &PartyId::from_index(0),
             1,
             &gradients1,
             0.01,
             [0u8; 32],
-            1.0,
+            &r1,
         );
 
         let c2 = GradientCommitment::create(
@@ -790,11 +870,16 @@ mod tests_advanced {
             &gradients2,
             0.02,
             [0u8; 32],
-            2.0,
+            &r2,
         );
 
         let agg = AggregatedGradientCommitment::aggregate(vec![c1, c2]);
         assert_eq!(agg.party_commitments.len(), 2);
         assert!((agg.total_error_bound - 0.03).abs() < 0.001);
+
+        // Verify homomorphic sum: (0.1+0.2) + (0.3+0.4) = 1.0
+        let total_sum = Fr::from_f64(1.0);
+        let total_blind = Fr::add(&r1, &r2);
+        assert!(agg.verify_sum(&total_sum, &total_blind));
     }
 }

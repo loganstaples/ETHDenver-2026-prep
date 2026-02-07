@@ -206,7 +206,10 @@ impl TrainingStepProver {
         let ivc_proof = self
             .ivc_prover
             .finalize()
-            .unwrap_or_else(|_| Vec::new());
+            .unwrap_or_else(|e| {
+                tracing::error!("IVC proof finalization failed for chunked training step: {e}");
+                Vec::new()
+            });
 
         Ok(TrainingStepProof {
             aggregated_proof,
@@ -292,7 +295,10 @@ impl TrainingStepProver {
         let ivc_proof = self
             .ivc_prover
             .finalize()
-            .unwrap_or_else(|_| Vec::new());
+            .unwrap_or_else(|e| {
+                tracing::error!("IVC proof finalization failed for ML training step: {e}");
+                Vec::new()
+            });
 
         Ok(MLTrainingStepProof {
             ml_proof: ml_result,

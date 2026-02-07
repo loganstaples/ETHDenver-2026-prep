@@ -193,7 +193,10 @@ impl GradientProver {
         // Generate proof
         let pi_refs: Vec<&[Fr]> = vec![&public_inputs];
         let proof = self.pipeline.prove(&circuit, &pi_refs)
-            .unwrap_or_else(|_| Vec::new());
+            .unwrap_or_else(|e| {
+                tracing::error!("Gradient proof generation failed for layer {}: {e}", data.layer_index);
+                Vec::new()
+            });
 
         let elapsed_ms = start.elapsed().as_millis() as u64;
 

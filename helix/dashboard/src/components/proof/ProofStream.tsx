@@ -18,7 +18,6 @@ import {
     Zap,
     Activity,
     AlertTriangle,
-    Filter,
 } from 'lucide-react';
 import { useProofStream, type ProofStreamItem, type ProofStage } from '@/hooks/useProofStream';
 
@@ -111,10 +110,6 @@ function getStageInfo(stage: ProofStage): {
                 icon: <Clock className="w-4 h-4" />,
             };
     }
-}
-
-function formatAddress(address: string): string {
-    return `${address.slice(0, 6)}...${address.slice(-4)}`;
 }
 
 function formatDuration(ms: number): string {
@@ -374,12 +369,12 @@ export default function ProofStream({
     modelId,
     maxDisplay = 10,
     showStats = true,
-    showOnChain = true,
+    showOnChain: _showOnChain = true,
     compact = false,
     enableSimulation = true,
     className = '',
 }: ProofStreamProps) {
-    const [selectedProof, setSelectedProof] = useState<ProofStreamItem | null>(null);
+    const [_selectedProof, setSelectedProof] = useState<ProofStreamItem | null>(null);
     const [filter, setFilter] = useState<'all' | 'active' | 'verified' | 'failed'>('all');
 
     const {

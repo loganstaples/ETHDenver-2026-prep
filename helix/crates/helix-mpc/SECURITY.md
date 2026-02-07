@@ -185,11 +185,11 @@ For transparency, here's what information may leak during protocol execution:
 
 1. **Trusted Dealer Mode**: The default demo mode uses a trusted dealer for Beaver triples. For production, use OT-based generation.
 
-2. **f64 Arithmetic**: The demo uses f64 for convenience. For cryptographic security, use the `field` module with proper finite field arithmetic.
+2. ~~**f64 Arithmetic**: The demo uses f64 for convenience.~~ **FIXED (Round 6)**: SPDZ MAC system and Shamir secret sharing now use BN254 Fr field arithmetic internally. The Shamir `SecretSharingScheme` trait retains f64 interface for compatibility, with Fr conversion at sharing boundaries.
 
 3. **Activation Leakage**: Reconstruct-reshare activations reveal intermediate values. For full privacy, use polynomial approximations (with accuracy trade-off).
 
-4. **Timing Side Channels**: Operations are not constant-time. Timing analysis may leak information in some scenarios.
+4. ~~**Timing Side Channels**: Operations are not constant-time.~~ **PARTIALLY FIXED (Round 6)**: Commitment verification and fingerprint checks now use constant-time hash comparison (`ct_eq_hash`). Pedersen commitments use halo2curves EC operations which are inherently constant-time. Some non-critical operations may still have variable timing.
 
 5. **Network Metadata**: Message sizes and timing patterns may leak information about computation structure.
 

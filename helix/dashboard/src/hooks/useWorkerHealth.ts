@@ -7,8 +7,8 @@
  */
 
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { useWebSocket, type WebSocketMessage } from '@/lib/websocket';
-import { useContractEvents, useStake } from './useContract';
+import { useWebSocket } from '@/lib/websocket';
+import { useContractEvents } from './useContract';
 import { generateMockNodeInfo } from '@/lib/api';
 import { formatEther } from 'viem';
 
@@ -348,7 +348,7 @@ function detectWorkerIssues(worker: WorkerHealth): WorkerIssue[] {
 export function useWorkerHealth(options: UseWorkerHealthOptions = {}): UseWorkerHealthReturn {
     const {
         modelId,
-        workerAddress,
+        workerAddress: _workerAddress,
         enableWebSocket = true,
         enablePolling = true,
         pollingInterval = 3000,

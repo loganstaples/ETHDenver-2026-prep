@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 
 interface TrainingMetrics {
     epoch: number;
@@ -32,9 +32,9 @@ interface TrainingProgressProps {
 export default function TrainingProgress({
     modelName = 'HELIX Model',
     initialMetrics,
-    rounds = [],
+    rounds: _rounds = [],
 }: TrainingProgressProps) {
-    const [metrics, setMetrics] = useState<TrainingMetrics>(
+    const [metrics, _setMetrics] = useState<TrainingMetrics>(
         initialMetrics || {
             epoch: 3,
             totalEpochs: 10,
@@ -47,18 +47,18 @@ export default function TrainingProgress({
         }
     );
 
-    const [lossHistory, setLossHistory] = useState<number[]>([
+    const [lossHistory, _setLossHistory] = useState<number[]>([
         0.892, 0.654, 0.512, 0.423, 0.342,
     ]);
 
-    const [accuracyHistory, setAccuracyHistory] = useState<number[]>([
+    const [accuracyHistory, _setAccuracyHistory] = useState<number[]>([
         0.543, 0.672, 0.745, 0.812, 0.876,
     ]);
 
     const epochProgress = (metrics.epoch / metrics.totalEpochs) * 100;
     const batchProgress = (metrics.batchesCompleted / metrics.totalBatches) * 100;
 
-    const formatTime = (timestamp: number) => {
+    const _formatTime = (timestamp: number) => {
         return new Date(timestamp).toLocaleTimeString();
     };
 

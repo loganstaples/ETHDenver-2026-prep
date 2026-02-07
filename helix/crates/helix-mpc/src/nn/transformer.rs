@@ -10,6 +10,8 @@
 //!
 //! All weight parameters are secret-shared across parties.
 
+use rand::Rng;
+
 use crate::beaver::pool::BeaverPool;
 use crate::error::MPCResult;
 use crate::field::Fr;
@@ -75,6 +77,7 @@ impl SecureTransformerBlock {
         config: &SecureTransformerConfig,
         seq_len: usize,
         pools: &mut [BeaverPool],
+        rng: &mut impl Rng,
     ) -> MPCResult<Vec<Vec<Fr>>> {
         let num_parties = x_shares.len();
         let d = config.d_model;
@@ -85,6 +88,7 @@ impl SecureTransformerBlock {
             &weights.ln1_gamma,
             config,
             seq_len,
+            rng,
         );
 
         // Step 2: Multi-head attention.
@@ -98,6 +102,7 @@ impl SecureTransformerBlock {
             &attn_config,
             seq_len,
             pools,
+            rng,
         )?;
 
         // Step 3: Residual connection: x + attn_out.
@@ -117,6 +122,7 @@ impl SecureTransformerBlock {
             &weights.ln2_gamma,
             config,
             seq_len,
+            rng,
         );
 
         // Step 5: Feed-forward network.
@@ -127,6 +133,7 @@ impl SecureTransformerBlock {
             config,
             seq_len,
             pools,
+            rng,
         )?;
 
         // Step 6: Residual connection.
@@ -149,6 +156,7 @@ impl SecureTransformerBlock {
         gamma_shares: &[Vec<Fr>],
         config: &SecureTransformerConfig,
         seq_len: usize,
+        rng: &mut impl Rng,
     ) -> Vec<Vec<Fr>> {
         let num_parties = x_shares.len();
         let d = config.d_model;
@@ -173,7 +181,7 @@ impl SecureTransformerBlock {
                     }
                     g.iter().map(|v| v.to_f64()).collect()
                 };
-                SecureNormalization::rms_norm(&pos_shares, &gamma_vals, 1e-5)
+                SecureNormalization::rms_norm(&pos_shares, &gamma_vals, 1e-5, rng)
             } else {
                 let gamma_vals: Vec<f64> = {
                     let mut g = vec![Fr::ZERO; d];
@@ -185,7 +193,7 @@ impl SecureTransformerBlock {
                     g.iter().map(|v| v.to_f64()).collect()
                 };
                 let beta = vec![0.0; d];
-                SecureNormalization::layer_norm(&pos_shares, &gamma_vals, &beta, 1e-5)
+                SecureNormalization::layer_norm(&pos_shares, &gamma_vals, &beta, 1e-5, rng)
             };
 
             // Write back.
@@ -207,6 +215,7 @@ impl SecureTransformerBlock {
         config: &SecureTransformerConfig,
         seq_len: usize,
         pools: &mut [BeaverPool],
+        rng: &mut impl Rng,
     ) -> MPCResult<Vec<Vec<Fr>>> {
         let d = config.d_model;
         let d_ff = config.d_ff;
@@ -226,6 +235,7 @@ impl SecureTransformerBlock {
         let activated = SecureActivation::apply_reconstruct_reshare(
             &up_out,
             config.activation,
+            rng,
         );
 
         // Down projection: [seq_len x d_ff] @ [d_ff x d_model]

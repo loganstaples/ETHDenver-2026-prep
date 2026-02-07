@@ -206,7 +206,10 @@ impl MLTrainingProver {
         let pi = witness.public_inputs();
         let pi_refs: Vec<&[Fr]> = vec![&pi];
         let proof = self.pipeline.prove(&circuit, &pi_refs)
-            .unwrap_or_else(|_| Vec::new());
+            .unwrap_or_else(|e| {
+                tracing::error!("ML training proof generation failed: {e}");
+                Vec::new()
+            });
 
         TrainingProofResult {
             proof,

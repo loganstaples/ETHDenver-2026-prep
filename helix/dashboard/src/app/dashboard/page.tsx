@@ -18,9 +18,9 @@ export default function DashboardPage() {
     // Real contract state
     const {
         nextModelId,
-        slashingRecordCount,
-        defaultMinStake,
-        isLoading: contractLoading,
+        slashingRecordCount: _slashingRecordCount,
+        defaultMinStake: _defaultMinStake,
+        isLoading: _contractLoading,
     } = useContractState();
 
     // Real contract events

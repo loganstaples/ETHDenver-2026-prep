@@ -25,6 +25,7 @@ use std::collections::HashMap;
 
 use super::commitment::ShareCommitment;
 use crate::error::{MPCError, MPCResult};
+use crate::field::ct_eq_hash;
 use crate::types::PartyId;
 
 /// Verifier for share consistency and honest behavior.
@@ -151,13 +152,13 @@ impl ShareVerifier {
     }
 
     /// Verifies that a party's share hasn't been tampered with since the
-    /// last known good fingerprint.
+    /// last known good fingerprint (constant-time comparison).
     pub fn verify_fingerprint(
         data: &[f64],
         expected_fingerprint: &[u8; 32],
     ) -> bool {
         let current = Self::share_fingerprint(data);
-        current == *expected_fingerprint
+        ct_eq_hash(&current, expected_fingerprint).to_bool()
     }
 }
 

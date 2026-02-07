@@ -5,9 +5,6 @@ import { useContractEvents, useContractState } from './useContract';
 import {
     type NodeInfo,
     type NodeMetrics,
-    type NodePerformance,
-    type NetworkStats,
-    type WebSocketMessage,
     getApiClient,
     generateMockNodeInfo,
 } from '@/lib/api';
@@ -145,7 +142,7 @@ export function useNodes(options: UseNodesOptions = {}): UseNodesReturn {
 
     // Contract data
     const { proofEvents, stakedEvents, slashedEvents } = useContractEvents();
-    const { slashingRecordCount } = useContractState();
+    const { slashingRecordCount: _slashingRecordCount } = useContractState();
 
     // API client
     const apiClient = useMemo(() => getApiClient(), []);

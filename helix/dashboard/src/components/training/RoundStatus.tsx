@@ -46,7 +46,7 @@ export default function RoundStatus({ modelId = BigInt(0) }: RoundStatusProps) {
 
     // Build round history from events
     const roundHistory = useMemo(() => {
-        const rounds: RoundData[] = [];
+        const _rounds: RoundData[] = [];
         const roundMap = new Map<string, RoundData>();
 
         // Process round started events

@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useMemo } from 'react';
 import { useContractEvents, useModel, useErrorBound } from '@/hooks/useContract';
 
 interface MetricDataPoint {
@@ -17,9 +17,9 @@ type TimeRange = '1h' | '6h' | '24h' | '7d';
 type MetricType = 'proofs' | 'rounds' | 'error' | 'participation';
 
 export default function TrainingMetrics({ modelId = BigInt(0) }: TrainingMetricsProps) {
-    const { model, isLoading: modelLoading } = useModel(modelId);
+    const { model: _model, isLoading: _modelLoading } = useModel(modelId);
     const { errorBound } = useErrorBound(modelId);
-    const { proofEvents, roundStartedEvents, roundCompletedEvents, stakedEvents } = useContractEvents();
+    const { proofEvents, roundStartedEvents: _roundStartedEvents, roundCompletedEvents, stakedEvents: _stakedEvents } = useContractEvents();
 
     const [timeRange, setTimeRange] = useState<TimeRange>('24h');
     const [selectedMetric, setSelectedMetric] = useState<MetricType>('proofs');
@@ -31,14 +31,10 @@ export default function TrainingMetrics({ modelId = BigInt(0) }: TrainingMetrics
         { key: '7d', label: '7 Days', seconds: 604800 },
     ];
 
-    const getTimeRangeSeconds = () => {
-        return timeRanges.find((t) => t.key === timeRange)?.seconds || 86400;
-    };
-
     // Generate metric data based on events
     const metricData = useMemo((): MetricDataPoint[] => {
         const now = Date.now() / 1000;
-        const rangeSeconds = getTimeRangeSeconds();
+        const rangeSeconds = timeRanges.find((t) => t.key === timeRange)?.seconds || 86400;
         const startTime = now - rangeSeconds;
 
         // Generate time buckets
@@ -135,6 +131,7 @@ export default function TrainingMetrics({ modelId = BigInt(0) }: TrainingMetrics
             });
         }
         return result;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [selectedMetric, timeRange, proofEvents, roundCompletedEvents, modelId, errorBound]);
 
     const maxValue = Math.max(...metricData.map((d) => d.value), 1);

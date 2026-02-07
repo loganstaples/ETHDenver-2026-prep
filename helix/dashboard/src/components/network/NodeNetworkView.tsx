@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 
 interface NetworkNode {
     id: string;
@@ -45,7 +45,7 @@ export default function NodeNetworkView({
         { id: 'node_06', type: 'compute', status: 'offline', address: '0x5678...9012', peers: 0, lastSeen: Date.now() - 300000, metrics: { cpu: 0, memory: 0 }, position: { x: 50, y: 85 } },
     ];
 
-    const mockConnections: Connection[] = connections || [
+    const _mockConnections: Connection[] = connections || [
         { from: 'node_01', to: 'node_02', latency: 12, bandwidth: 150 },
         { from: 'node_01', to: 'node_03', latency: 8, bandwidth: 200 },
         { from: 'node_01', to: 'node_04', latency: 15, bandwidth: 100 },

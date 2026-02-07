@@ -24,9 +24,19 @@ import '@rainbow-me/rainbowkit/styles.css';
 
 const { wallets } = getDefaultWallets();
 
+// WalletConnect requires a non-empty projectId even during SSR/build.
+// Use a placeholder to avoid build failures; real connections need a valid ID.
+const projectId = process.env.NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID || 'PLACEHOLDER_PROJECT_ID';
+if (projectId === 'PLACEHOLDER_PROJECT_ID' && typeof window !== 'undefined') {
+    console.warn(
+        '[HELIX] Missing NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID. ' +
+        'Wallet connection will not work. See .env.example for setup.'
+    );
+}
+
 const config = getDefaultConfig({
     appName: 'Helix Dashboard',
-    projectId: 'YOUR_PROJECT_ID',
+    projectId,
     wallets: [
         ...wallets,
         {
@@ -46,7 +56,15 @@ const config = getDefaultConfig({
     ssr: true,
 });
 
-const queryClient = new QueryClient();
+const queryClient = new QueryClient({
+    defaultOptions: {
+        queries: {
+            staleTime: 30_000,
+            retry: 2,
+            refetchOnWindowFocus: false,
+        },
+    },
+});
 
 export function Providers({ children }: { children: React.ReactNode }) {
     const [mounted, setMounted] = React.useState(false);

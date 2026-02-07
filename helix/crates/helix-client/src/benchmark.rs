@@ -98,7 +98,7 @@ impl BenchmarkResults {
         let std_dev = variance.sqrt();
 
         let mut sorted = samples.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
         let min = sorted.first().cloned().unwrap_or(0.0);
         let max = sorted.last().cloned().unwrap_or(0.0);
@@ -267,18 +267,26 @@ where
         samples.push(elapsed);
     }
 
+    let n = samples.len() as f64;
+    let mean = samples.iter().sum::<f64>() / n;
+    let variance = samples.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+    let std_dev = variance.sqrt();
+
+    let mut sorted = samples.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
     BenchmarkResults {
         benchmark: name.to_string(),
         iterations,
         warmup: 0,
-        mean_ms: samples.iter().sum::<f64>() / samples.len() as f64,
-        min_ms: samples.iter().cloned().fold(f64::INFINITY, f64::min),
-        max_ms: samples.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
-        std_dev_ms: 0.0, // Simplified
-        p50_ms: percentile(&samples, 50.0),
-        p95_ms: percentile(&samples, 95.0),
-        p99_ms: percentile(&samples, 99.0),
-        throughput_ops_s: 1000.0 / (samples.iter().sum::<f64>() / samples.len() as f64),
+        mean_ms: mean,
+        min_ms: sorted.first().cloned().unwrap_or(0.0),
+        max_ms: sorted.last().cloned().unwrap_or(0.0),
+        std_dev_ms: std_dev,
+        p50_ms: percentile(&sorted, 50.0),
+        p95_ms: percentile(&sorted, 95.0),
+        p99_ms: percentile(&sorted, 99.0),
+        throughput_ops_s: 1000.0 / mean,
         samples,
     }
 }

@@ -34,7 +34,7 @@ export default function ErrorBoundsVisualization({
     ];
 
     const totalError = mockBounds[mockBounds.length - 1]?.outputError || 0;
-    const maxAmp = Math.max(...mockBounds.map(b => b.amplification));
+    const _maxAmp = Math.max(...mockBounds.map(b => b.amplification));
 
     const getRiskColor = (risk: string) => {
         const colors: Record<string, string> = {
@@ -288,7 +288,7 @@ export default function ErrorBoundsVisualization({
             </div>
 
             <div className="visualization">
-                {mockBounds.map((bound, idx) => {
+                {mockBounds.map((bound, _idx) => {
                     const width = Math.min(
                         (Math.log10(bound.outputError + 1e-10) + 10) * 10,
                         100

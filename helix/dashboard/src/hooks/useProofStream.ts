@@ -6,7 +6,7 @@
  */
 
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { useWebSocket, type WebSocketMessage } from '@/lib/websocket';
+import { useWebSocket } from '@/lib/websocket';
 import { useContractEvents } from './useContract';
 import { generateMockProofInfo } from '@/lib/api';
 
@@ -137,7 +137,7 @@ export function useProofStream(options: UseProofStreamOptions = {}): UseProofStr
 
     // State
     const [proofs, setProofs] = useState<ProofStreamItem[]>([]);
-    const [pendingVerifications, setPendingVerifications] = useState<OnChainVerification[]>([]);
+    const [pendingVerifications, _setPendingVerifications] = useState<OnChainVerification[]>([]);
     const [confirmedVerifications, setConfirmedVerifications] = useState<OnChainVerification[]>([]);
     const [isLoading, setIsLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);

@@ -283,8 +283,8 @@ impl WireCodec {
 
     /// Encodes a message to wire format.
     pub fn encode(&self, message: &NetworkMessage) -> Result<BytesMut, WireError> {
-        // Serialize message to JSON
-        let payload = serde_json::to_vec(message)
+        // Serialize message to bincode
+        let payload = bincode::serialize(message)
             .map_err(|e| WireError::SerializationFailed(e.to_string()))?;
 
         if payload.len() > MAX_MESSAGE_SIZE {
@@ -363,7 +363,7 @@ impl WireCodec {
         let final_payload = payload.to_vec();
 
         // Deserialize
-        let message: NetworkMessage = serde_json::from_slice(&final_payload)
+        let message: NetworkMessage = bincode::deserialize(&final_payload)
             .map_err(|e| WireError::DeserializationFailed(e.to_string()))?;
 
         Ok(Some(message))
@@ -587,6 +587,31 @@ mod tests {
         for (orig, restored) in values.iter().zip(floats.iter()) {
             assert!((orig - restored).abs() < 0.01);
         }
+    }
+
+    #[test]
+    fn test_bincode_smaller_than_json() {
+        use crate::network::messages::GradientMessage;
+
+        let message = NetworkMessage::new(
+            PeerId::from_string("test-peer"),
+            MessagePayload::Gradient(GradientMessage::ShareGradient {
+                round_id: 42,
+                gradient_commitment: [0xAB; 32],
+                error_bound: 0.001,
+                proof: vec![1u8; 256],
+            }),
+        );
+
+        let bincode_bytes = bincode::serialize(&message).unwrap();
+        let json_bytes = serde_json::to_vec(&message).unwrap();
+
+        assert!(
+            bincode_bytes.len() < json_bytes.len(),
+            "bincode ({} bytes) should be smaller than JSON ({} bytes)",
+            bincode_bytes.len(),
+            json_bytes.len(),
+        );
     }
 
     #[test]

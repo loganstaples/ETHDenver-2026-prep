@@ -13,9 +13,12 @@
 //! The public scale (gamma) and shift (beta) parameters of LayerNorm
 //! can be applied as local operations on shares.
 
+use rand::Rng;
+
 use crate::beaver::pool::BeaverPool;
 use crate::error::MPCResult;
 use crate::field::Fr;
+use super::reshare_values;
 
 /// Secure normalization operations.
 pub struct SecureNormalization;
@@ -36,6 +39,7 @@ impl SecureNormalization {
         gamma: &[f64],
         beta: &[f64],
         eps: f64,
+        rng: &mut impl Rng,
     ) -> Vec<Vec<Fr>> {
         let num_parties = shares.len();
         let dim = shares[0].len();
@@ -64,7 +68,7 @@ impl SecureNormalization {
             .collect();
 
         // Step 3: Re-share.
-        reshare_values(&normalized, num_parties)
+        reshare_values(&normalized, num_parties, rng)
     }
 
     /// Secure RMS Normalization.
@@ -77,6 +81,7 @@ impl SecureNormalization {
         shares: &[Vec<Fr>],
         gamma: &[f64],
         eps: f64,
+        rng: &mut impl Rng,
     ) -> Vec<Vec<Fr>> {
         let num_parties = shares.len();
         let dim = shares[0].len();
@@ -102,7 +107,7 @@ impl SecureNormalization {
             .map(|(i, v)| gamma[i] * v * inv_rms)
             .collect();
 
-        reshare_values(&normalized, num_parties)
+        reshare_values(&normalized, num_parties, rng)
     }
 
     /// Secure softmax using reconstruct-compute-reshare.
@@ -110,7 +115,7 @@ impl SecureNormalization {
     /// softmax(x)_i = exp(x_i) / sum(exp(x_j))
     ///
     /// Uses the numerically stable variant: subtract max before exp.
-    pub fn softmax(shares: &[Vec<Fr>]) -> Vec<Vec<Fr>> {
+    pub fn softmax(shares: &[Vec<Fr>], rng: &mut impl Rng) -> Vec<Vec<Fr>> {
         let num_parties = shares.len();
         let dim = shares[0].len();
 
@@ -131,13 +136,13 @@ impl SecureNormalization {
         let sum_exp: f64 = exp_values.iter().sum();
         let softmax_values: Vec<f64> = exp_values.iter().map(|e| e / sum_exp).collect();
 
-        reshare_values(&softmax_values, num_parties)
+        reshare_values(&softmax_values, num_parties, rng)
     }
 
     /// Batch softmax: applies softmax independently to each row of a matrix.
     ///
     /// `shares[party][row][col]` → applies softmax across cols for each row.
-    pub fn batch_softmax(shares: &[Vec<Vec<Fr>>]) -> Vec<Vec<Vec<Fr>>> {
+    pub fn batch_softmax(shares: &[Vec<Vec<Fr>>], rng: &mut impl Rng) -> Vec<Vec<Vec<Fr>>> {
         let num_parties = shares.len();
         let num_rows = shares[0].len();
 
@@ -149,7 +154,7 @@ impl SecureNormalization {
                 .map(|p| p[row].clone())
                 .collect();
 
-            let softmax_row = Self::softmax(&row_shares);
+            let softmax_row = Self::softmax(&row_shares, rng);
 
             for (i, party_result) in softmax_row.into_iter().enumerate() {
                 result[i].push(party_result);
@@ -212,36 +217,13 @@ impl SecureNormalization {
     }
 }
 
-/// Creates additive shares of values.
-fn reshare_values(values: &[f64], num_parties: usize) -> Vec<Vec<Fr>> {
-    use rand::SeedableRng;
-    use rand::Rng;
-    use rand_chacha::ChaCha20Rng;
-
-    let dim = values.len();
-    let mut rng = ChaCha20Rng::seed_from_u64(0xA0EDA112E);
-    let mut shares: Vec<Vec<Fr>> = vec![vec![Fr::ZERO; dim]; num_parties];
-
-    for d in 0..dim {
-        let target = Fr::from_f64(values[d]);
-        let mut sum = Fr::ZERO;
-        for i in 0..num_parties - 1 {
-            let r = Fr::from_f64(rng.gen_range(-100.0..100.0));
-            shares[i][d] = r.clone();
-            sum = Fr::add(&sum, &r);
-        }
-        shares[num_parties - 1][d] = Fr::sub(&target, &sum);
-    }
-
-    shares
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::field::ops::sum;
     use rand::{Rng, SeedableRng};
     use rand_chacha::ChaCha20Rng;
+    use crate::protocols::reshare_values;
 
     fn split_vector(values: &[f64], n: usize, seed: u64) -> Vec<Vec<Fr>> {
         let dim = values.len();
@@ -278,8 +260,9 @@ mod tests {
         let gamma = vec![1.0; 4];
         let beta = vec![0.0; 4];
         let shares = split_vector(&values, 3, 42);
+        let mut rng = ChaCha20Rng::seed_from_u64(42);
 
-        let result_shares = SecureNormalization::layer_norm(&shares, &gamma, &beta, 1e-5);
+        let result_shares = SecureNormalization::layer_norm(&shares, &gamma, &beta, 1e-5, &mut rng);
         let result = reconstruct(&result_shares);
 
         // LayerNorm should produce zero-mean, unit-variance output.
@@ -295,8 +278,9 @@ mod tests {
         let values = vec![1.0, 2.0, 3.0, 4.0];
         let gamma = vec![1.0; 4];
         let shares = split_vector(&values, 3, 42);
+        let mut rng = ChaCha20Rng::seed_from_u64(42);
 
-        let result_shares = SecureNormalization::rms_norm(&shares, &gamma, 1e-5);
+        let result_shares = SecureNormalization::rms_norm(&shares, &gamma, 1e-5, &mut rng);
         let result = reconstruct(&result_shares);
 
         // RMSNorm: x / rms * gamma
@@ -317,8 +301,9 @@ mod tests {
     fn test_softmax() {
         let values = vec![1.0, 2.0, 3.0];
         let shares = split_vector(&values, 3, 42);
+        let mut rng = ChaCha20Rng::seed_from_u64(42);
 
-        let result_shares = SecureNormalization::softmax(&shares);
+        let result_shares = SecureNormalization::softmax(&shares, &mut rng);
         let result = reconstruct(&result_shares);
 
         // Softmax should sum to 1.
@@ -340,8 +325,9 @@ mod tests {
         let gamma = vec![2.0; 4]; // Scale by 2
         let beta = vec![1.0; 4]; // Shift by 1
         let shares = split_vector(&values, 3, 42);
+        let mut rng = ChaCha20Rng::seed_from_u64(42);
 
-        let result_shares = SecureNormalization::layer_norm(&shares, &gamma, &beta, 1e-5);
+        let result_shares = SecureNormalization::layer_norm(&shares, &gamma, &beta, 1e-5, &mut rng);
         let result = reconstruct(&result_shares);
 
         // Mean of result should be beta (since gamma * normalized has mean 0).
@@ -365,8 +351,9 @@ mod tests {
                 .map(|i| vec![s1[i].clone(), s2[i].clone()])
                 .collect()
         };
+        let mut rng = ChaCha20Rng::seed_from_u64(42);
 
-        let result_shares = SecureNormalization::batch_softmax(&shares);
+        let result_shares = SecureNormalization::batch_softmax(&shares, &mut rng);
 
         // Row 2 (uniform input) should give uniform softmax.
         let row2_result: Vec<f64> = {

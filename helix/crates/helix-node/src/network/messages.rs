@@ -64,6 +64,58 @@ impl NetworkMessage {
     pub fn increment_hops(&mut self) {
         self.hops = self.hops.saturating_add(1);
     }
+
+    /// Computes the signing hash for this message (SHA-256 of canonical fields).
+    fn signing_hash(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(self.id.as_bytes());
+        hasher.update(self.sender.0.as_bytes());
+        hasher.update(self.timestamp.to_le_bytes());
+        // Serialize payload deterministically with bincode
+        if let Ok(payload_bytes) = bincode::serialize(&self.payload) {
+            hasher.update(&payload_bytes);
+        }
+        hasher.update([self.hops]);
+        hasher.finalize().into()
+    }
+
+    /// Signs this message with an ed25519 signing key.
+    #[cfg(feature = "crypto-sign")]
+    pub fn sign(&mut self, key: &ed25519_dalek::SigningKey) {
+        use ed25519_dalek::Signer;
+        let hash = self.signing_hash();
+        let sig = key.sign(&hash);
+        self.signature = Some(sig.to_bytes().to_vec());
+    }
+
+    /// Verifies this message's signature against a verifying key.
+    #[cfg(feature = "crypto-sign")]
+    pub fn verify_signature(&self, vk: &ed25519_dalek::VerifyingKey) -> bool {
+        use ed25519_dalek::{Signature, Verifier};
+        let sig_bytes = match &self.signature {
+            Some(s) => s,
+            None => return false,
+        };
+        let sig = match Signature::from_slice(sig_bytes) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let hash = self.signing_hash();
+        vk.verify(&hash, &sig).is_ok()
+    }
+
+    /// Stub sign when crypto-sign is disabled (no-op).
+    #[cfg(not(feature = "crypto-sign"))]
+    pub fn sign_noop(&mut self) {
+        // No-op: signing not available without crypto-sign feature
+    }
+
+    /// Stub verify when crypto-sign is disabled (always true).
+    #[cfg(not(feature = "crypto-sign"))]
+    pub fn verify_signature_noop(&self) -> bool {
+        true
+    }
 }
 
 /// Message payload types.
@@ -270,14 +322,14 @@ pub struct HeartbeatMessage {
     pub load: u8,
 }
 
-/// Serializes a message to bytes.
-pub fn serialize_message(msg: &NetworkMessage) -> Result<Vec<u8>, serde_json::Error> {
-    serde_json::to_vec(msg)
+/// Serializes a message to bytes using bincode.
+pub fn serialize_message(msg: &NetworkMessage) -> Result<Vec<u8>, Box<bincode::ErrorKind>> {
+    bincode::serialize(msg)
 }
 
-/// Deserializes a message from bytes.
-pub fn deserialize_message(data: &[u8]) -> Result<NetworkMessage, serde_json::Error> {
-    serde_json::from_slice(data)
+/// Deserializes a message from bytes using bincode.
+pub fn deserialize_message(data: &[u8]) -> Result<NetworkMessage, Box<bincode::ErrorKind>> {
+    bincode::deserialize(data)
 }
 
 #[cfg(test)]
@@ -305,5 +357,97 @@ mod tests {
     fn test_peer_id() {
         let id = PeerId::random();
         assert!(!id.0.is_empty());
+    }
+
+    #[cfg(feature = "crypto-sign")]
+    #[test]
+    fn test_sign_verify_roundtrip() {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let verifying_key = signing_key.verifying_key();
+
+        let mut msg = NetworkMessage::new(
+            PeerId::random(),
+            MessagePayload::Heartbeat(HeartbeatMessage {
+                seq: 1,
+                is_pong: false,
+                load: 50,
+            }),
+        );
+
+        msg.sign(&signing_key);
+        assert!(msg.signature.is_some());
+        assert!(msg.verify_signature(&verifying_key));
+    }
+
+    #[cfg(feature = "crypto-sign")]
+    #[test]
+    fn test_tampered_payload_rejected() {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let verifying_key = signing_key.verifying_key();
+
+        let mut msg = NetworkMessage::new(
+            PeerId::random(),
+            MessagePayload::Heartbeat(HeartbeatMessage {
+                seq: 1,
+                is_pong: false,
+                load: 50,
+            }),
+        );
+
+        msg.sign(&signing_key);
+
+        // Tamper with payload
+        msg.payload = MessagePayload::Heartbeat(HeartbeatMessage {
+            seq: 999,
+            is_pong: true,
+            load: 0,
+        });
+
+        assert!(!msg.verify_signature(&verifying_key));
+    }
+
+    #[cfg(feature = "crypto-sign")]
+    #[test]
+    fn test_wrong_key_rejected() {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let wrong_key = SigningKey::generate(&mut OsRng);
+        let wrong_vk = wrong_key.verifying_key();
+
+        let mut msg = NetworkMessage::new(
+            PeerId::random(),
+            MessagePayload::Heartbeat(HeartbeatMessage {
+                seq: 1,
+                is_pong: false,
+                load: 50,
+            }),
+        );
+
+        msg.sign(&signing_key);
+        assert!(!msg.verify_signature(&wrong_vk));
+    }
+
+    #[cfg(not(feature = "crypto-sign"))]
+    #[test]
+    fn test_noop_signing() {
+        let mut msg = NetworkMessage::new(
+            PeerId::random(),
+            MessagePayload::Heartbeat(HeartbeatMessage {
+                seq: 1,
+                is_pong: false,
+                load: 50,
+            }),
+        );
+
+        msg.sign_noop();
+        assert!(msg.verify_signature_noop());
     }
 }

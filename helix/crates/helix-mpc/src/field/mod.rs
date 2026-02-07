@@ -64,8 +64,9 @@ pub use unified::Fr;
 pub use unified::batch;
 pub use unified::{FIXED_POINT_SCALE, FIXED_POINT_SCALE_BITS, HALF_MODULUS, MODULUS};
 pub use constant_time::{
-    ct_assign_array, ct_assign_u64, ct_eq_array, ct_eq_u64, ct_ge_array, ct_ge_u64, ct_gt_u64,
-    ct_le_u64, ct_lt_array, ct_lt_u64, ct_swap_array, ct_swap_u64, CtChoice, SecureBuffer,
+    ct_assign_array, ct_assign_u64, ct_eq_array, ct_eq_hash, ct_eq_u64, ct_ge_array, ct_ge_u64,
+    ct_gt_u64, ct_le_u64, ct_lt_array, ct_lt_u64, ct_swap_array, ct_swap_u64, CtChoice,
+    SecureBuffer,
 };
 pub use ops::{
     add_vec, from_f64_vec, from_u64_vec, inner_product, inner_product_fixed, lagrange_interpolate,

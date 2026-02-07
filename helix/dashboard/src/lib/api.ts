@@ -202,212 +202,17 @@ export interface NetworkStats {
     activeTrainingSessions: number;
 }
 
-// WebSocket Message Types
-export type WebSocketMessageType =
-    | 'node_update'
-    | 'proof_update'
-    | 'training_update'
-    | 'round_update'
-    | 'adversarial_event'
-    | 'network_stats'
-    | 'error_bound_update'
-    | 'heartbeat'
-    | 'subscribe'
-    | 'unsubscribe';
-
-export interface WebSocketMessage<T = unknown> {
-    type: WebSocketMessageType;
-    timestamp: number;
-    data: T;
-    channel?: string;
-}
-
-// ============================================================================
-// WebSocket Manager
-// ============================================================================
-
-type MessageHandler<T = unknown> = (message: WebSocketMessage<T>) => void;
-
-export class WebSocketManager {
-    private ws: WebSocket | null = null;
-    private url: string;
-    private reconnectAttempts = 0;
-    private maxReconnectAttempts = 10;
-    private reconnectDelay = 1000;
-    private handlers: Map<WebSocketMessageType, Set<MessageHandler>> = new Map();
-    private subscriptions: Set<string> = new Set();
-    private heartbeatInterval: ReturnType<typeof setInterval> | null = null;
-    private isConnecting = false;
-    private messageQueue: WebSocketMessage[] = [];
-
-    constructor(url: string) {
-        this.url = url;
-    }
-
-    connect(): Promise<void> {
-        return new Promise((resolve, reject) => {
-            if (this.ws?.readyState === WebSocket.OPEN) {
-                resolve();
-                return;
-            }
-
-            if (this.isConnecting) {
-                // Wait for existing connection attempt
-                const checkConnection = setInterval(() => {
-                    if (this.ws?.readyState === WebSocket.OPEN) {
-                        clearInterval(checkConnection);
-                        resolve();
-                    }
-                }, 100);
-                return;
-            }
-
-            this.isConnecting = true;
-
-            try {
-                this.ws = new WebSocket(this.url);
-
-                this.ws.onopen = () => {
-                    this.isConnecting = false;
-                    this.reconnectAttempts = 0;
-                    this.startHeartbeat();
-
-                    // Resubscribe to previous channels
-                    this.subscriptions.forEach(channel => {
-                        this.send({ type: 'subscribe', timestamp: Date.now(), data: { channel } });
-                    });
-
-                    // Flush message queue
-                    while (this.messageQueue.length > 0) {
-                        const msg = this.messageQueue.shift();
-                        if (msg) this.send(msg);
-                    }
-
-                    resolve();
-                };
-
-                this.ws.onmessage = (event) => {
-                    try {
-                        const message: WebSocketMessage = JSON.parse(event.data);
-                        this.handleMessage(message);
-                    } catch (err) {
-                        console.error('Failed to parse WebSocket message:', err);
-                    }
-                };
-
-                this.ws.onclose = () => {
-                    this.isConnecting = false;
-                    this.stopHeartbeat();
-                    this.attemptReconnect();
-                };
-
-                this.ws.onerror = (error) => {
-                    this.isConnecting = false;
-                    console.error('WebSocket error:', error);
-                    reject(error);
-                };
-            } catch (err) {
-                this.isConnecting = false;
-                reject(err);
-            }
-        });
-    }
-
-    disconnect(): void {
-        this.stopHeartbeat();
-        if (this.ws) {
-            this.ws.close();
-            this.ws = null;
-        }
-        this.subscriptions.clear();
-        this.handlers.clear();
-    }
-
-    subscribe(channel: string): void {
-        this.subscriptions.add(channel);
-        if (this.ws?.readyState === WebSocket.OPEN) {
-            this.send({ type: 'subscribe', timestamp: Date.now(), data: { channel } });
-        }
-    }
-
-    unsubscribe(channel: string): void {
-        this.subscriptions.delete(channel);
-        if (this.ws?.readyState === WebSocket.OPEN) {
-            this.send({ type: 'unsubscribe', timestamp: Date.now(), data: { channel } });
-        }
-    }
-
-    on<T = unknown>(type: WebSocketMessageType, handler: MessageHandler<T>): () => void {
-        if (!this.handlers.has(type)) {
-            this.handlers.set(type, new Set());
-        }
-        this.handlers.get(type)!.add(handler as MessageHandler);
-
-        return () => {
-            this.handlers.get(type)?.delete(handler as MessageHandler);
-        };
-    }
-
-    send(message: WebSocketMessage): void {
-        if (this.ws?.readyState === WebSocket.OPEN) {
-            this.ws.send(JSON.stringify(message));
-        } else {
-            this.messageQueue.push(message);
-        }
-    }
-
-    get isConnected(): boolean {
-        return this.ws?.readyState === WebSocket.OPEN;
-    }
-
-    private handleMessage(message: WebSocketMessage): void {
-        const handlers = this.handlers.get(message.type);
-        if (handlers) {
-            handlers.forEach(handler => {
-                try {
-                    handler(message);
-                } catch (err) {
-                    console.error('Error in WebSocket handler:', err);
-                }
-            });
-        }
-    }
-
-    private startHeartbeat(): void {
-        this.heartbeatInterval = setInterval(() => {
-            this.send({ type: 'heartbeat', timestamp: Date.now(), data: {} });
-        }, 30000);
-    }
-
-    private stopHeartbeat(): void {
-        if (this.heartbeatInterval) {
-            clearInterval(this.heartbeatInterval);
-            this.heartbeatInterval = null;
-        }
-    }
-
-    private attemptReconnect(): void {
-        if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-            console.error('Max reconnect attempts reached');
-            return;
-        }
-
-        this.reconnectAttempts++;
-        const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1);
-
-        setTimeout(() => {
-            this.connect().catch(console.error);
-        }, delay);
-    }
-}
-
 // ============================================================================
 // API Client
 // ============================================================================
 
+import { HelixWebSocketClient, type WebSocketMessage } from './websocket';
+
+type MessageHandler<T = unknown> = (message: WebSocketMessage<T>) => void;
+
 export class HelixApiClient {
     private config: Required<ApiConfig>;
-    private wsManager: WebSocketManager | null = null;
+    private wsClient: HelixWebSocketClient | null = null;
     private abortControllers: Map<string, AbortController> = new Map();
 
     constructor(config: Partial<ApiConfig> = {}) {
@@ -421,38 +226,38 @@ export class HelixApiClient {
     }
 
     // ========================================================================
-    // WebSocket Methods
+    // WebSocket Methods (delegates to HelixWebSocketClient from websocket.ts)
     // ========================================================================
 
     async connectWebSocket(): Promise<void> {
-        if (!this.wsManager) {
-            this.wsManager = new WebSocketManager(this.config.wsUrl);
+        if (!this.wsClient) {
+            this.wsClient = new HelixWebSocketClient({ url: this.config.wsUrl });
         }
-        await this.wsManager.connect();
+        await this.wsClient.connect();
     }
 
     disconnectWebSocket(): void {
-        this.wsManager?.disconnect();
-        this.wsManager = null;
+        this.wsClient?.disconnect();
+        this.wsClient = null;
     }
 
     subscribeToChannel(channel: string): void {
-        this.wsManager?.subscribe(channel);
+        this.wsClient?.subscribe(channel);
     }
 
     unsubscribeFromChannel(channel: string): void {
-        this.wsManager?.unsubscribe(channel);
+        this.wsClient?.unsubscribe(channel);
     }
 
-    onWebSocketMessage<T = unknown>(type: WebSocketMessageType, handler: MessageHandler<T>): () => void {
-        if (!this.wsManager) {
-            this.wsManager = new WebSocketManager(this.config.wsUrl);
+    onWebSocketMessage<T = unknown>(type: string, handler: MessageHandler<T>): () => void {
+        if (!this.wsClient) {
+            this.wsClient = new HelixWebSocketClient({ url: this.config.wsUrl });
         }
-        return this.wsManager.on(type, handler);
+        return this.wsClient.on(type, handler);
     }
 
     get isWebSocketConnected(): boolean {
-        return this.wsManager?.isConnected || false;
+        return this.wsClient?.state === 'connected';
     }
 
     // ========================================================================

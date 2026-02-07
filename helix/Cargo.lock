@@ -2906,6 +2906,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "dotenv",
+ "ed25519-dalek",
  "env_logger",
  "ethers",
  "futures",

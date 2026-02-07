@@ -420,7 +420,7 @@ export default function LiveTopology({
     const [hoveredWorkerId, setHoveredWorkerId] = useState<string | null>(null);
 
     const {
-        workers,
+        workers: _workers,
         computeWorkers,
         aggregators,
         verifiers,
@@ -503,7 +503,7 @@ export default function LiveTopology({
         });
 
         return { nodePositions: positions, connections: conns };
-    }, [workers, computeWorkers, aggregators, verifiers, dimensions]);
+    }, [computeWorkers, aggregators, verifiers, dimensions]);
 
     const handleSelectWorker = useCallback((workerId: string) => {
         setSelectedWorkerId(workerId);

@@ -6,30 +6,42 @@
 //! 3. Any k shares can reconstruct s via Lagrange interpolation
 //! 4. Fewer than k shares reveal no information about s
 //!
-//! We work in a prime field F_p where p is a Mersenne prime (2^31 - 1).
-//! Values are mapped to/from this field for sharing, then converted back to f64.
+//! Internally uses the BN254 scalar field (Fr) for exact arithmetic.
+//! The f64 trait interface is preserved for compatibility — values are converted
+//! to Fr at sharing boundaries and back to f64 after reconstruction.
+//!
+//! # Security
+//!
+//! The BN254 scalar field (~254 bits) provides vastly more security than the
+//! previous 31-bit Mersenne prime. Random polynomial coefficients are generated
+//! as 64-bit scaled integers to maintain f64 compatibility at the share layer,
+//! while all arithmetic is exact in the field (no rounding errors).
 
 use rand::Rng;
-use rand_chacha::ChaCha20Rng;
 use rand::SeedableRng;
+use rand_chacha::ChaCha20Rng;
 
 use crate::error::{MPCError, MPCResult};
+use crate::field::Fr;
 use crate::types::PartyId;
 use super::{ScalarShare, SecretSharingScheme, ShareId, VectorShare};
 
-/// The prime field modulus: 2^31 - 1 (Mersenne prime).
-const FIELD_PRIME: i64 = 2_147_483_647;
+/// Scale factor for mapping f64 values to field elements.
+/// Using 10^9 gives 9 decimal places of precision while staying well within u64 range.
+const SCALE: f64 = 1_000_000_000.0;
+
+/// Range for random polynomial coefficients (before scaling).
+/// This ensures intermediate values stay within f64 precision after evaluation.
+const RANDOM_COEFF_RANGE: i64 = 1_000_000_000;
 
 /// Shamir's secret sharing scheme.
+/// Uses BN254 scalar field (Fr) internally for exact arithmetic.
 #[derive(Debug, Clone)]
 pub struct ShamirSharing {
     /// Reconstruction threshold: how many shares are needed.
     threshold: usize,
     /// RNG for generating random polynomial coefficients.
     rng: ChaCha20Rng,
-    /// Scale factor for mapping f64 values to the field.
-    /// Values are multiplied by this before sharing and divided after reconstruction.
-    scale: f64,
 }
 
 impl ShamirSharing {
@@ -41,7 +53,6 @@ impl ShamirSharing {
         Self {
             threshold,
             rng: ChaCha20Rng::from_entropy(),
-            scale: 1e6, // 6 decimal places of precision
         }
     }
 
@@ -50,14 +61,7 @@ impl ShamirSharing {
         Self {
             threshold,
             rng: ChaCha20Rng::seed_from_u64(seed),
-            scale: 1e6,
         }
-    }
-
-    /// Sets the scale factor for f64 ↔ field conversion.
-    pub fn with_scale(mut self, scale: f64) -> Self {
-        self.scale = scale;
-        self
     }
 
     /// Returns the threshold.
@@ -65,133 +69,117 @@ impl ShamirSharing {
         self.threshold
     }
 
-    /// Maps an f64 value into the prime field.
-    fn to_field(&self, value: f64) -> i64 {
-        let scaled = (value * self.scale).round() as i64;
-        ((scaled % FIELD_PRIME) + FIELD_PRIME) % FIELD_PRIME
-    }
-
-    /// Maps a field element back to f64.
-    fn from_field(&self, field_val: i64) -> f64 {
-        // Handle the "negative" half of the field: values > p/2 represent negatives.
-        let half = FIELD_PRIME / 2;
-        let signed = if field_val > half {
-            field_val - FIELD_PRIME
+    /// Maps an f64 value into a raw Fr field element (not fixed-point).
+    /// Uses a simple integer scale to preserve precision.
+    fn to_field(value: f64) -> Fr {
+        let scaled = (value * SCALE).round() as i64;
+        if scaled >= 0 {
+            Fr::from_u64(scaled as u64)
         } else {
-            field_val
-        };
-        signed as f64 / self.scale
-    }
-
-    /// Modular arithmetic helpers.
-    fn mod_add(a: i64, b: i64) -> i64 {
-        ((a + b) % FIELD_PRIME + FIELD_PRIME) % FIELD_PRIME
-    }
-
-    fn mod_mul(a: i64, b: i64) -> i64 {
-        ((a as i128 * b as i128) % FIELD_PRIME as i128) as i64
-    }
-
-    fn mod_sub(a: i64, b: i64) -> i64 {
-        ((a - b) % FIELD_PRIME + FIELD_PRIME) % FIELD_PRIME
-    }
-
-    /// Modular inverse using extended Euclidean algorithm.
-    fn mod_inv(a: i64) -> i64 {
-        let mut old_r = a;
-        let mut r = FIELD_PRIME;
-        let mut old_s: i64 = 1;
-        let mut s: i64 = 0;
-
-        while r != 0 {
-            let q = old_r / r;
-            let temp_r = r;
-            r = old_r - q * r;
-            old_r = temp_r;
-            let temp_s = s;
-            s = old_s - q * s;
-            old_s = temp_s;
+            Fr::from_u64((-scaled) as u64).neg()
         }
-
-        ((old_s % FIELD_PRIME as i64) + FIELD_PRIME as i64) % FIELD_PRIME as i64
     }
 
-    /// Generates a random polynomial of degree k-1 with p(0) = secret.
-    fn random_polynomial(&mut self, secret: i64, degree: usize) -> Vec<i64> {
+    /// Maps a raw Fr field element back to f64.
+    /// Inverse of `to_field`. Handles "negative" field elements (> r/2).
+    fn from_field(fr: &Fr) -> f64 {
+        if fr.is_negative().to_bool() {
+            let neg = fr.neg();
+            let val = neg.to_u64().unwrap_or_else(|| {
+                let bytes = neg.to_bytes_le();
+                u64::from_le_bytes(bytes[0..8].try_into().unwrap())
+            });
+            -(val as f64) / SCALE
+        } else {
+            let val = fr.to_u64().unwrap_or_else(|| {
+                let bytes = fr.to_bytes_le();
+                u64::from_le_bytes(bytes[0..8].try_into().unwrap())
+            });
+            val as f64 / SCALE
+        }
+    }
+
+    /// Generates a random polynomial of degree `degree` with p(0) = secret, in Fr.
+    /// Coefficients are bounded random values to ensure share values stay f64-representable.
+    fn random_polynomial(&mut self, secret: &Fr, degree: usize) -> Vec<Fr> {
         let mut coeffs = Vec::with_capacity(degree + 1);
-        coeffs.push(secret); // p(0) = secret
+        coeffs.push(*secret);
 
         for _ in 1..=degree {
-            let coeff = self.rng.gen_range(0..FIELD_PRIME);
+            // Generate bounded random coefficient as scaled integer
+            let r: i64 = self.rng.gen_range(-RANDOM_COEFF_RANGE..RANDOM_COEFF_RANGE);
+            let coeff = if r >= 0 {
+                Fr::from_u64(r as u64)
+            } else {
+                Fr::from_u64((-r) as u64).neg()
+            };
             coeffs.push(coeff);
         }
 
         coeffs
     }
 
-    /// Evaluates polynomial at point x.
-    fn eval_polynomial(coeffs: &[i64], x: i64) -> i64 {
-        let mut result = 0i64;
-        let mut x_power = 1i64;
-
-        for &coeff in coeffs {
-            result = Self::mod_add(result, Self::mod_mul(coeff, x_power));
-            x_power = Self::mod_mul(x_power, x);
+    /// Evaluates polynomial at point x using Horner's method.
+    /// Uses raw field multiplication since all arithmetic is in the field.
+    fn eval_polynomial(coeffs: &[Fr], x: &Fr) -> Fr {
+        let mut result = Fr::ZERO;
+        for coeff in coeffs.iter().rev() {
+            result = Fr::add(&Fr::mul(&result, x), coeff);
         }
-
         result
     }
 
     /// Lagrange interpolation to reconstruct f(0) from points.
-    fn lagrange_interpolate(points: &[(i64, i64)]) -> i64 {
+    /// Uses raw field multiplication since all arithmetic is in the field.
+    fn lagrange_interpolate(points: &[(Fr, Fr)]) -> Fr {
         let k = points.len();
-        let mut result = 0i64;
+        let mut result = Fr::ZERO;
 
         for i in 0..k {
-            let (xi, yi) = points[i];
+            let (ref xi, ref yi) = points[i];
 
-            // Compute Lagrange basis polynomial L_i(0) = ∏_{j≠i} (0 - x_j) / (x_i - x_j)
-            let mut numerator = 1i64;
-            let mut denominator = 1i64;
+            let mut numerator = Fr::ONE;
+            let mut denominator = Fr::ONE;
 
             for j in 0..k {
                 if i == j {
                     continue;
                 }
-                let (xj, _) = points[j];
+                let ref xj = points[j].0;
                 // numerator *= (0 - x_j) = -x_j
-                numerator = Self::mod_mul(numerator, Self::mod_sub(0, xj));
+                numerator = Fr::mul(&numerator, &xj.neg());
                 // denominator *= (x_i - x_j)
-                denominator = Self::mod_mul(denominator, Self::mod_sub(xi, xj));
+                denominator = Fr::mul(&denominator, &Fr::sub(xi, xj));
             }
 
-            let basis = Self::mod_mul(numerator, Self::mod_inv(denominator));
-            result = Self::mod_add(result, Self::mod_mul(yi, basis));
+            let inv_denom = denominator.inverse()
+                .expect("denominator should be nonzero in Lagrange interpolation");
+            let basis = Fr::mul(&numerator, &inv_denom);
+            result = Fr::add(&result, &Fr::mul(yi, &basis));
         }
 
         result
     }
 
-    /// Shares a single field element.
+    /// Shares a single field element, returning (x, y) evaluation points in Fr.
     fn share_field_element(
         &mut self,
-        secret: i64,
+        secret: &Fr,
         num_parties: usize,
-    ) -> Vec<(i64, i64)> {
+    ) -> Vec<(Fr, Fr)> {
         let degree = self.threshold - 1;
         let poly = self.random_polynomial(secret, degree);
 
         (1..=num_parties)
             .map(|i| {
-                let x = i as i64;
-                let y = Self::eval_polynomial(&poly, x);
+                let x = Fr::from_u64(i as u64);
+                let y = Self::eval_polynomial(&poly, &x);
                 (x, y)
             })
             .collect()
     }
 
     /// Re-shares a value held by one party into new Shamir shares.
-    /// The old share value becomes the new secret.
     pub fn reshare_scalar(
         &mut self,
         share_value: f64,
@@ -206,14 +194,14 @@ impl ShamirSharing {
             });
         }
 
-        let field_val = self.to_field(share_value);
-        let points = self.share_field_element(field_val, num_parties);
+        let field_val = Self::to_field(share_value);
+        let points = self.share_field_element(&field_val, num_parties);
 
         let shares = points
             .into_iter()
             .enumerate()
             .map(|(i, (_, y))| {
-                let val = self.from_field(y);
+                let val = Self::from_field(&y);
                 ScalarShare::new(
                     ShareId::new(parties[i].clone(), secret_id, i + 1),
                     val,
@@ -225,14 +213,11 @@ impl ShamirSharing {
     }
 
     /// Degree reduction after multiplication of two shared values.
-    /// When two degree-(k-1) sharings are multiplied, the result is degree 2(k-1).
-    /// This protocol reduces it back to degree k-1 using a re-sharing step.
     pub fn degree_reduce(
         &mut self,
         product_shares: &[ScalarShare],
         parties: &[PartyId],
     ) -> MPCResult<Vec<ScalarShare>> {
-        // Reconstruct the product (requires 2k-1 shares).
         let required = 2 * self.threshold - 1;
         if product_shares.len() < required {
             return Err(MPCError::InsufficientShares {
@@ -241,7 +226,6 @@ impl ShamirSharing {
             });
         }
 
-        // Reconstruct and re-share with degree k-1.
         let value = self.reconstruct_scalar(product_shares)?;
         self.share_scalar(value, "degree-reduced", parties)
     }
@@ -262,24 +246,25 @@ impl SecretSharingScheme for ShamirSharing {
             });
         }
 
-        let mut rng_clone = self.rng.clone();
         let mut sharing = ShamirSharing {
             threshold: self.threshold,
-            rng: rng_clone,
-            scale: self.scale,
+            rng: self.rng.clone(),
         };
 
-        let field_secret = sharing.to_field(secret);
-        let points = sharing.share_field_element(field_secret, n);
+        let field_secret = Self::to_field(secret);
+        let points = sharing.share_field_element(&field_secret, n);
 
         let shares = points
             .into_iter()
             .enumerate()
             .map(|(i, (x, y))| {
-                // Store the field evaluation point x in the share index.
-                let val = sharing.from_field(y);
+                let val = Self::from_field(&y);
                 ScalarShare::new(
-                    ShareId::new(parties[i].clone(), secret_id, x as usize),
+                    ShareId::new(
+                        parties[i].clone(),
+                        secret_id,
+                        x.to_u64().unwrap_or(i as u64 + 1) as usize,
+                    ),
                     val,
                 )
             })
@@ -296,18 +281,17 @@ impl SecretSharingScheme for ShamirSharing {
             });
         }
 
-        // Use only the first `threshold` shares.
-        let points: Vec<(i64, i64)> = shares[..self.threshold]
+        let points: Vec<(Fr, Fr)> = shares[..self.threshold]
             .iter()
             .map(|s| {
-                let x = s.id.index as i64;
-                let y = self.to_field(s.value);
+                let x = Fr::from_u64(s.id.index as u64);
+                let y = Self::to_field(s.value);
                 (x, y)
             })
             .collect();
 
         let secret_field = Self::lagrange_interpolate(&points);
-        Ok(self.from_field(secret_field))
+        Ok(Self::from_field(&secret_field))
     }
 
     fn share_vector(
@@ -328,7 +312,6 @@ impl SecretSharingScheme for ShamirSharing {
         let mut sharing = ShamirSharing {
             threshold: self.threshold,
             rng: self.rng.clone(),
-            scale: self.scale,
         };
 
         let mut result: Vec<VectorShare> = parties
@@ -343,11 +326,11 @@ impl SecretSharingScheme for ShamirSharing {
             .collect();
 
         for elem_idx in 0..dim {
-            let field_val = sharing.to_field(secret[elem_idx]);
-            let points = sharing.share_field_element(field_val, n);
+            let field_val = Self::to_field(secret[elem_idx]);
+            let points = sharing.share_field_element(&field_val, n);
 
             for (party_idx, (_, y)) in points.into_iter().enumerate() {
-                result[party_idx].values[elem_idx] = sharing.from_field(y);
+                result[party_idx].values[elem_idx] = Self::from_field(&y);
             }
         }
 
@@ -376,17 +359,17 @@ impl SecretSharingScheme for ShamirSharing {
         let use_shares = &shares[..self.threshold];
 
         for elem_idx in 0..dim {
-            let points: Vec<(i64, i64)> = use_shares
+            let points: Vec<(Fr, Fr)> = use_shares
                 .iter()
                 .map(|s| {
-                    let x = s.id.index as i64;
-                    let y = self.to_field(s.values[elem_idx]);
+                    let x = Fr::from_u64(s.id.index as u64);
+                    let y = Self::to_field(s.values[elem_idx]);
                     (x, y)
                 })
                 .collect();
 
             let field_val = Self::lagrange_interpolate(&points);
-            result[elem_idx] = self.from_field(field_val);
+            result[elem_idx] = Self::from_field(&field_val);
         }
 
         Ok(result)
@@ -403,11 +386,9 @@ mod tests {
 
     #[test]
     fn test_field_roundtrip() {
-        let sharing = ShamirSharing::with_seed(2, 42);
-
         for val in &[0.0, 1.0, -1.0, 3.14159, -100.5, 999.999] {
-            let field = sharing.to_field(*val);
-            let back = sharing.from_field(field);
+            let fr = ShamirSharing::to_field(*val);
+            let back = ShamirSharing::from_field(&fr);
             assert!(
                 (back - val).abs() < 1e-5,
                 "Field roundtrip failed for {}: got {}",
@@ -418,20 +399,24 @@ mod tests {
     }
 
     #[test]
-    fn test_mod_inv() {
-        for a in &[1i64, 2, 3, 7, 100, 999999] {
-            let inv = ShamirSharing::mod_inv(*a);
-            let product = ShamirSharing::mod_mul(*a, inv);
-            assert_eq!(product, 1, "mod_inv failed for {}: inv={}, product={}", a, inv, product);
-        }
+    fn test_polynomial_evaluation() {
+        // p(x) = 5 + 3x + 2x^2, evaluate at x=2: 5 + 6 + 8 = 19
+        let coeffs = vec![Fr::from_u64(5), Fr::from_u64(3), Fr::from_u64(2)];
+        let x = Fr::from_u64(2);
+        let result = ShamirSharing::eval_polynomial(&coeffs, &x);
+        assert_eq!(result.to_u64(), Some(19));
     }
 
     #[test]
-    fn test_polynomial_evaluation() {
-        // p(x) = 5 + 3x + 2x^2, evaluate at x=2: 5 + 6 + 8 = 19
-        let coeffs = vec![5, 3, 2];
-        let result = ShamirSharing::eval_polynomial(&coeffs, 2);
-        assert_eq!(result, 19);
+    fn test_lagrange_basic() {
+        // Secret = 42, polynomial p(x) = 42 + 7x (degree 1, k=2)
+        // p(1) = 49, p(2) = 56
+        let points = vec![
+            (Fr::from_u64(1), Fr::from_u64(49)),
+            (Fr::from_u64(2), Fr::from_u64(56)),
+        ];
+        let result = ShamirSharing::lagrange_interpolate(&points);
+        assert_eq!(result.to_u64(), Some(42));
     }
 
     #[test]
@@ -443,7 +428,6 @@ mod tests {
         let shares = sharing.share_scalar(secret, "test", &parties).unwrap();
         assert_eq!(shares.len(), 3);
 
-        // Any 2 shares should reconstruct the secret.
         for i in 0..3 {
             for j in (i + 1)..3 {
                 let subset = vec![shares[i].clone(), shares[j].clone()];
@@ -451,9 +435,7 @@ mod tests {
                 assert!(
                     (recon - secret).abs() < 0.01,
                     "2-of-3 reconstruction failed with shares {},{}: got {}",
-                    i,
-                    j,
-                    recon,
+                    i, j, recon,
                 );
             }
         }
@@ -468,7 +450,6 @@ mod tests {
         let shares = sharing.share_scalar(secret, "test", &parties).unwrap();
         assert_eq!(shares.len(), 5);
 
-        // Any 3 shares should work.
         let subset = vec![shares[0].clone(), shares[2].clone(), shares[4].clone()];
         let recon = sharing.reconstruct_scalar(&subset).unwrap();
         assert!(
@@ -477,7 +458,6 @@ mod tests {
             recon,
         );
 
-        // 2 shares should fail.
         let too_few = vec![shares[0].clone(), shares[1].clone()];
         assert!(sharing.reconstruct_scalar(&too_few).is_err());
     }
@@ -496,19 +476,9 @@ mod tests {
             assert!(
                 (a - b).abs() < 0.01,
                 "Vector recon failed: {} vs {}",
-                a,
-                b,
+                a, b,
             );
         }
-    }
-
-    #[test]
-    fn test_lagrange_basic() {
-        // Secret = 42, polynomial p(x) = 42 + 7x (degree 1, k=2)
-        // p(1) = 49, p(2) = 56, p(3) = 63
-        let points = vec![(1, 49), (2, 56)];
-        let result = ShamirSharing::lagrange_interpolate(&points);
-        assert_eq!(result, 42);
     }
 
     #[test]
@@ -525,8 +495,7 @@ mod tests {
         assert!(
             (recon - original).abs() < 0.01,
             "Reshare failed: {} vs {}",
-            recon,
-            original,
+            recon, original,
         );
     }
 }

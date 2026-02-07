@@ -615,9 +615,11 @@ export function useWebSocket(options: UseWebSocketOptions = {}): UseWebSocketRet
             cleanupRef.current.forEach((cleanup) => cleanup());
             cleanupRef.current = [];
         };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [url, autoConnect]);
 
     // Subscribe to channels
+    const channelsKey = channels.join(',');
     useEffect(() => {
         if (!clientRef.current) return;
 
@@ -628,7 +630,8 @@ export function useWebSocket(options: UseWebSocketOptions = {}): UseWebSocketRet
         return () => {
             unsubscribes.forEach((unsub) => unsub());
         };
-    }, [channels.join(',')]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [channelsKey]);
 
     const connect = useCallback(async () => {
         await clientRef.current?.connect();

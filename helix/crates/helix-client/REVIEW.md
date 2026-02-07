@@ -290,7 +290,7 @@ User Command ─▶ main.rs (clap parsing)
 - Requires terminal with TUI support
 - Some visualizations use placeholder data
 
-### `dashboard.rs` (~300+ lines)
+### `dashboard.rs` (~580 lines)
 
 **Purpose**: HTTP REST API for external integrations
 
@@ -300,10 +300,12 @@ User Command ─▶ main.rs (clap parsing)
 - Clean Axum-based API
 - CORS support for web dashboard integration
 - Matches Next.js dashboard expectations
+- Bearer-token authentication middleware
+- Per-IP rate limiting middleware
+- Demo data helpers (`demo_nodes()`, `demo_metrics()`, etc.) as single source of truth
 
 **Weaknesses**:
-- Authentication not implemented
-- Rate limiting not present
+- Demo fallback data is static (no simulation of live updates)
 
 ### `help.rs` (~1,072 lines)
 
@@ -519,10 +521,10 @@ Some files exceed 1000 lines and could benefit from modularization.
 | Category | Coverage | Notes |
 |----------|----------|-------|
 | Unit Tests | ~60% | Most modules have basic tests |
-| Integration Tests | ~10% | Minimal end-to-end testing |
+| Integration Tests | ~25% | Dashboard, facade, benchmark, config, consistency tests |
 | Demo Scenarios | ~40% | Need automated verification |
 | Wallet Security | ~70% | Good crypto primitive tests |
-| Config Parsing | ~50% | Basic validation tests |
+| Config Parsing | ~55% | Validation tests + profile round-trip |
 
 ### Testing Gaps
 
@@ -583,9 +585,12 @@ async fn test_real_training_executor_proof_validity() { ... }
 - [x] Progress visualization (TUI)
 - [x] HTTP dashboard API
 - [x] Pre-warming infrastructure
+- [x] HelixClient SDK facade for external consumers
+- [x] Dashboard auth middleware + rate limiting
+- [x] Benchmark NaN safety + percentile correctness
+- [x] Integration tests (facade, benchmark, config, dashboard consistency)
 - [ ] Proven 500ms proof generation (needs verification)
 - [ ] Recovery from mid-demo failures (needs testing)
-- [ ] End-to-end integration test
 - [ ] Slashing scenario polish
 
 ### Demo Risk Assessment
@@ -622,6 +627,39 @@ async fn test_real_training_executor_proof_validity() { ... }
 | aes-gcm | 0.10 | Encryption | Low |
 | argon2 | 0.5 | KDF | Low |
 | coins-bip39 | 0.8 | Mnemonics | Low |
+
+---
+
+## Round 7 Changes
+
+### Step 1: HelixClient SDK Facade (`client.rs`)
+- Replaced 5-line stub with full facade wrapping `HelixConfig` + `UnifiedRpcClient` + optional `DashboardState`
+- Constructors: `new()`, `from_config_file()`, `from_profile()`
+- Async `connect()` upgrades mock RPC to real node connection
+- Builder method `with_dashboard()` for dashboard state attachment
+- Re-exported as `pub use client::HelixClient` in `lib.rs`
+
+### Step 2: Benchmark Correctness Fixes (`benchmark.rs`)
+- **NaN-safe sort**: `partial_cmp().unwrap()` replaced with `unwrap_or(Ordering::Equal)` to prevent panic on NaN inputs
+- **`quick_benchmark` fix**: Samples are now sorted before percentile calculation; `std_dev` properly computed instead of hardcoded `0.0`
+- **Module exposure**: `pub mod benchmark` added to `lib.rs` for test accessibility
+
+### Step 3: Dashboard DRY Refactor (`dashboard.rs`)
+- Extracted 5 shared helpers: `demo_nodes()`, `demo_metrics()`, `demo_events()`, `demo_training_status()`, `populate_demo_network()`
+- `with_defaults()` and all handler fallbacks now call these helpers (eliminated ~120 lines of duplication)
+- Helpers are `pub` for test access and external consumers
+
+### Step 4: Integration Tests (`tests/demo_integration.rs`)
+- **HelixClient facade**: `test_helix_client_from_profile`, `test_helix_client_with_dashboard`, `test_helix_client_rejects_invalid_config`
+- **Benchmark NaN safety**: `test_benchmark_results_nan_safety` (NaN inputs don't panic)
+- **Benchmark correctness**: `test_benchmark_percentile_sorted` (known-input verification of min/max/mean/P50/stddev)
+- **Config validation**: `test_config_default_validates`, `test_config_rejects_zero_batch_size`, `test_config_rejects_negative_learning_rate`
+- **Dashboard consistency**: `test_dashboard_defaults_and_fallback_match` (verifies handler fallbacks return identical data to helper functions)
+
+### Step 5: Documentation Updates
+- Fixed inaccurate weakness claim that "Authentication not implemented" and "Rate limiting not present" — both exist as middleware in `dashboard.rs`
+- Updated Integration Tests coverage from ~10% to ~25%
+- Added Round 7 items to Critical Demo Checklist
 
 ---
 

@@ -334,7 +334,10 @@ impl GKRToHalo2Aggregator {
                     })
                     .collect();
 
-                pipeline.prove(&circuit, &[&pi]).unwrap_or_else(|_| vec![])
+                pipeline.prove(&circuit, &[&pi]).unwrap_or_else(|e| {
+                    tracing::error!("GKR-to-Halo2 aggregation proof generation failed: {e}");
+                    vec![]
+                })
             }
             None => {
                 // Return placeholder if not set up

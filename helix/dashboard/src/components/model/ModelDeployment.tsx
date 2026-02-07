@@ -15,9 +15,9 @@ interface ModelConfig {
 }
 
 export default function ModelDeployment() {
-    const { registerModel, isRegistering, registrationError, registrationSuccess } = useModelRegistration();
+    const { registerModel, isRegistering, registrationError, registrationSuccess: _registrationSuccess } = useModelRegistration();
     const { startRound, isStartingRound } = useRoundManagement(BigInt(0));
-    const { defaultMinStake, isLoading: stateLoading } = useContractState();
+    const { defaultMinStake, isLoading: _stateLoading } = useContractState();
 
     const [currentStep, setCurrentStep] = useState<DeploymentStep>('configure');
     const [config, setConfig] = useState<ModelConfig>({
@@ -29,7 +29,7 @@ export default function ModelDeployment() {
         roundDuration: '3600',
     });
     const [uploadProgress, setUploadProgress] = useState(0);
-    const [registeredModelId, setRegisteredModelId] = useState<bigint | null>(null);
+    const [registeredModelId, _setRegisteredModelId] = useState<bigint | null>(null);
 
     const steps: { key: DeploymentStep; label: string; icon: string }[] = [
         { key: 'configure', label: 'Configure', icon: '1' },

@@ -11,6 +11,7 @@ pub mod gkr_to_halo2;
 
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use tracing;
 
 use super::chunking::ChunkId;
 use super::parallel::ChunkProof;
@@ -174,7 +175,11 @@ impl ProofAggregator {
     }
 
     /// Verifies an aggregated proof.
+    ///
+    /// # WARNING: DEMO ONLY
+    /// This verification is a placeholder and does not provide cryptographic security guarantees.
     pub fn verify(&self, agg: &AggregatedProof) -> bool {
+        tracing::warn!("verify: WARNING DEMO ONLY — not cryptographically sound");
         // Placeholder verification
         // Actual implementation would verify the aggregated proof
         // against the root commitment and public inputs

@@ -2,7 +2,7 @@
 
 import classNames from 'clsx';
 import { motion } from 'framer-motion';
-import { Boxes, LayoutDashboard, Settings, Activity, MonitorDot } from 'lucide-react';
+import { Boxes, LayoutDashboard, MonitorDot, GraduationCap, Server, Zap } from 'lucide-react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { ConnectButton } from '@rainbow-me/rainbowkit';
@@ -11,8 +11,9 @@ const sidebarItems = [
     { name: 'Overview', href: '/', icon: LayoutDashboard },
     { name: 'Status', href: '/status', icon: MonitorDot },
     { name: 'Models', href: '/models', icon: Boxes },
-    { name: 'Network', href: '/network', icon: Activity },
-    { name: 'Settings', href: '/settings', icon: Settings },
+    { name: 'Training', href: '/training', icon: GraduationCap },
+    { name: 'Nodes', href: '/nodes', icon: Server },
+    { name: 'Proofs', href: '/proofs', icon: Zap },
 ];
 
 export function Layout({ children }: { children: React.ReactNode }) {

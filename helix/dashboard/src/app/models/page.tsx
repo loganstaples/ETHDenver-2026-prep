@@ -1,7 +1,7 @@
 'use client';
 
 import { motion } from 'framer-motion';
-import { BadgeCheck, Clock, ExternalLink } from 'lucide-react';
+import { Clock } from 'lucide-react';
 
 const mockModels = [
     { id: '0x1a...4f2', name: 'GPT-2-Small', type: 'NLP', rounds: 42, status: 'Training', accuracy: '89.4%' },

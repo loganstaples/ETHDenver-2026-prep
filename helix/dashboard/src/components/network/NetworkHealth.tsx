@@ -15,7 +15,7 @@ interface HealthMetric {
 export default function NetworkHealth() {
     const { data: blockNumber } = useBlockNumber({ watch: true });
     const chainId = useChainId();
-    const { nextModelId, slashingRecordCount, defaultMinStake, isLoading } = useContractState();
+    const { nextModelId, slashingRecordCount, defaultMinStake: _defaultMinStake, isLoading } = useContractState();
     const { proofEvents, roundStartedEvents, roundCompletedEvents, stakedEvents, slashedEvents } = useContractEvents();
 
     const [latency, setLatency] = useState(0);
@@ -29,7 +29,7 @@ export default function NetworkHealth() {
             setLatency(diff);
             setLastBlockTime(now);
         }
-    }, [blockNumber]);
+    }, [blockNumber, lastBlockTime]);
 
     // Calculate health metrics
     const healthMetrics = useMemo((): HealthMetric[] => {
@@ -39,8 +39,8 @@ export default function NetworkHealth() {
 
         // Recent activity counts
         const recentProofs = proofEvents.filter((e) => e.timestamp > oneHourAgo).length;
-        const recentRounds = roundStartedEvents.filter((e) => e.timestamp > oneHourAgo).length;
-        const recentSlashes = slashedEvents.filter((e) => e.timestamp > oneDayAgo).length;
+        const _recentRounds = roundStartedEvents.filter((e) => e.timestamp > oneHourAgo).length;
+        const _recentSlashes = slashedEvents.filter((e) => e.timestamp > oneDayAgo).length;
         const activeStakers = new Set(stakedEvents.map((e) => e.prover)).size;
 
         // Calculate completion rate
@@ -471,7 +471,7 @@ export default function NetworkHealth() {
                                             <div className="event-dot" style={{ backgroundColor: colors[type] }} />
                                             <span className="event-text">
                                                 {labels[type]} - Model #{event.modelId.toString()}
-                                                {isProof && ` by ${(event as any).prover.slice(0, 8)}...`}
+                                                {isProof && ` by ${(event as unknown as { prover: string }).prover.slice(0, 8)}...`}
                                             </span>
                                             <span className="event-time">
                                                 {new Date(event.timestamp * 1000).toLocaleTimeString()}

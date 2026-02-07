@@ -2,10 +2,9 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { useAccount, useChainId, usePublicClient, useWalletClient } from 'wagmi';
-import { formatEther, parseEther, type Address } from 'viem';
+import { parseEther, type Address } from 'viem';
 import {
     HELIX_COORDINATOR_ABI,
-    CONTRACT_ADDRESSES,
     getContractAddress,
     type Model,
     type Round,
@@ -415,7 +414,7 @@ export function useModelRegistration() {
                 setTxHash(hash);
 
                 if (publicClient) {
-                    const receipt = await publicClient.waitForTransactionReceipt({ hash });
+                    const _receipt = await publicClient.waitForTransactionReceipt({ hash });
                     // Parse logs to get modelId (from ModelRegistered event)
                     // For simplicity, we'll refetch the nextModelId
                     const newModelId = await publicClient.readContract({
@@ -492,7 +491,7 @@ export function useRoundManagement(modelId: bigint | number) {
 }
 
 // Hook for real-time event listening
-export function useContractEvents(modelId?: bigint | number) {
+export function useContractEvents(_modelId?: bigint | number) {
     const chainId = useChainId();
     const publicClient = usePublicClient();
     const [events, setEvents] = useState<{

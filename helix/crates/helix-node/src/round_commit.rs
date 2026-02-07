@@ -338,10 +338,51 @@ impl ProofCollector {
 // Proof Aggregator
 // ============================================================================
 
-/// Aggregates proofs from multiple workers into a single submission.
+/// Aggregates proofs from multiple workers into a single submission
+/// using a SHA-256 Merkle tree for cryptographic binding.
 pub struct ProofAggregator;
 
 impl ProofAggregator {
+    /// Computes the SHA-256 Merkle root of sorted worker commitments.
+    /// Commitments are sorted by worker ID for deterministic ordering.
+    pub fn merkle_root(proofs: &HashMap<PeerId, WorkerProof>) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+
+        // Sort by worker ID for deterministic ordering
+        let mut entries: Vec<_> = proofs.iter().collect();
+        entries.sort_by(|(a, _), (b, _)| a.0.cmp(&b.0));
+
+        // Leaf hashes: H(worker_id || gradient_commitment)
+        let mut leaves: Vec<[u8; 32]> = entries
+            .iter()
+            .map(|(peer_id, proof)| {
+                let mut hasher = Sha256::new();
+                hasher.update(peer_id.0.as_bytes());
+                hasher.update(proof.gradient_commitment);
+                hasher.finalize().into()
+            })
+            .collect();
+
+        // Build binary Merkle tree
+        while leaves.len() > 1 {
+            let mut next_level = Vec::with_capacity((leaves.len() + 1) / 2);
+            for chunk in leaves.chunks(2) {
+                let mut hasher = Sha256::new();
+                hasher.update(chunk[0]);
+                if chunk.len() > 1 {
+                    hasher.update(chunk[1]);
+                } else {
+                    // Odd leaf: hash with itself
+                    hasher.update(chunk[0]);
+                }
+                next_level.push(hasher.finalize().into());
+            }
+            leaves = next_level;
+        }
+
+        leaves.into_iter().next().unwrap_or([0u8; 32])
+    }
+
     /// Aggregates multiple worker proofs into a single round proof.
     pub fn aggregate(
         commit_id: RoundCommitId,
@@ -356,35 +397,45 @@ impl ProofAggregator {
         let contributors: Vec<PeerId> = proofs.keys().cloned().collect();
         let num_contributors = contributors.len();
 
-        // Calculate total error bound
+        // Error bound: use max (worst-case bound for the same computation)
         let total_error_bound: f64 = proofs.values()
             .map(|p| p.error_bound)
-            .sum();
+            .fold(0.0f64, f64::max);
 
-        // Combine proof bytes (simplified - in production use proper aggregation)
-        let mut combined_proof = Vec::new();
-        for proof in proofs.values() {
-            combined_proof.extend(&proof.proof);
+        // Compute Merkle root of sorted commitments
+        let gradient_commitment = Self::merkle_root(&proofs);
+
+        // Build structured AggregatedProofEnvelope via bincode
+        let mut proof_entries: Vec<(String, u32, Vec<u8>)> = Vec::new();
+        // Sort for deterministic output
+        let mut sorted_proofs: Vec<_> = proofs.into_iter().collect();
+        sorted_proofs.sort_by(|(a, _), (b, _)| a.0.cmp(&b.0));
+
+        let first_inputs = sorted_proofs.first()
+            .ok_or(RoundCommitError::NoProofs)?
+            .1.public_inputs.clone();
+
+        for (peer_id, proof) in &sorted_proofs {
+            proof_entries.push((
+                peer_id.0.clone(),
+                proof.proof.len() as u32,
+                proof.proof.clone(),
+            ));
         }
 
-        // Take the first proof's public inputs as base (in production, combine properly)
-        let first_proof = proofs.values().next()
-            .ok_or(RoundCommitError::NoProofs)?;
+        let envelope = AggregatedProofEnvelope {
+            num_proofs: num_contributors as u32,
+            proof_entries,
+            merkle_root: gradient_commitment,
+        };
 
-        // Compute gradient commitment (XOR of all commitments for simplicity)
-        let gradient_commitment = proofs.values()
-            .fold([0u8; 32], |acc, p| {
-                let mut result = [0u8; 32];
-                for i in 0..32 {
-                    result[i] = acc[i] ^ p.gradient_commitment[i];
-                }
-                result
-            });
+        let combined_proof = bincode::serialize(&envelope)
+            .map_err(|e| RoundCommitError::SubmissionFailed(format!("Envelope serialization failed: {}", e)))?;
 
         Ok(AggregatedRoundProof {
             commit_id,
             proof: combined_proof,
-            public_inputs: first_proof.public_inputs.clone(),
+            public_inputs: first_inputs,
             total_error_bound,
             num_contributors,
             old_commitment,
@@ -393,6 +444,26 @@ impl ProofAggregator {
             contributors,
         })
     }
+
+    /// Verifies that an aggregated commitment matches the individual worker commitments.
+    pub fn verify_aggregation(
+        proofs: &HashMap<PeerId, WorkerProof>,
+        expected_root: &[u8; 32],
+    ) -> bool {
+        let computed = Self::merkle_root(proofs);
+        computed == *expected_root
+    }
+}
+
+/// Structured envelope for aggregated proofs (bincode-serialized).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AggregatedProofEnvelope {
+    /// Number of individual proofs.
+    pub num_proofs: u32,
+    /// Per-worker proof entries: (worker_id, proof_len, proof_bytes).
+    pub proof_entries: Vec<(String, u32, Vec<u8>)>,
+    /// Merkle root of sorted commitments.
+    pub merkle_root: [u8; 32],
 }
 
 // ============================================================================
@@ -997,14 +1068,13 @@ mod tests {
         let commit_id = RoundCommitId::new(1, 1);
         let mut proofs = HashMap::new();
 
-        proofs.insert(
-            create_test_peer_id(1),
-            create_test_proof(create_test_peer_id(1), 0),
-        );
-        proofs.insert(
-            create_test_peer_id(2),
-            create_test_proof(create_test_peer_id(2), 1),
-        );
+        let mut proof1 = create_test_proof(create_test_peer_id(1), 0);
+        proof1.gradient_commitment = [0xAA; 32];
+        let mut proof2 = create_test_proof(create_test_peer_id(2), 1);
+        proof2.gradient_commitment = [0xBB; 32];
+
+        proofs.insert(create_test_peer_id(1), proof1);
+        proofs.insert(create_test_peer_id(2), proof2);
 
         let old_commitment = [1u8; 32];
         let new_commitment = [2u8; 32];
@@ -1021,6 +1091,91 @@ mod tests {
         assert_eq!(aggregated.old_commitment, old_commitment);
         assert_eq!(aggregated.new_commitment, new_commitment);
         assert!(!aggregated.proof.is_empty());
+
+        // Verify the envelope can be deserialized
+        let envelope: super::AggregatedProofEnvelope =
+            bincode::deserialize(&aggregated.proof).unwrap();
+        assert_eq!(envelope.num_proofs, 2);
+        assert_eq!(envelope.merkle_root, aggregated.gradient_commitment);
+    }
+
+    #[test]
+    fn test_merkle_root_deterministic() {
+        // Merkle root should be the same regardless of HashMap insertion order
+        let mut proofs_a = HashMap::new();
+        let mut proof1 = create_test_proof(create_test_peer_id(1), 0);
+        proof1.gradient_commitment = [0xAA; 32];
+        let mut proof2 = create_test_proof(create_test_peer_id(2), 1);
+        proof2.gradient_commitment = [0xBB; 32];
+
+        proofs_a.insert(create_test_peer_id(1), proof1.clone());
+        proofs_a.insert(create_test_peer_id(2), proof2.clone());
+
+        let mut proofs_b = HashMap::new();
+        proofs_b.insert(create_test_peer_id(2), proof2);
+        proofs_b.insert(create_test_peer_id(1), proof1);
+
+        let root_a = ProofAggregator::merkle_root(&proofs_a);
+        let root_b = ProofAggregator::merkle_root(&proofs_b);
+
+        assert_eq!(root_a, root_b, "Merkle root must be order-independent");
+        assert_ne!(root_a, [0u8; 32], "Merkle root should not be zero");
+    }
+
+    #[test]
+    fn test_verify_aggregation_accepts_valid() {
+        let mut proofs = HashMap::new();
+        let mut proof1 = create_test_proof(create_test_peer_id(1), 0);
+        proof1.gradient_commitment = [0xAA; 32];
+        let mut proof2 = create_test_proof(create_test_peer_id(2), 1);
+        proof2.gradient_commitment = [0xBB; 32];
+
+        proofs.insert(create_test_peer_id(1), proof1);
+        proofs.insert(create_test_peer_id(2), proof2);
+
+        let root = ProofAggregator::merkle_root(&proofs);
+        assert!(ProofAggregator::verify_aggregation(&proofs, &root));
+    }
+
+    #[test]
+    fn test_verify_aggregation_rejects_tampered() {
+        let mut proofs = HashMap::new();
+        let mut proof1 = create_test_proof(create_test_peer_id(1), 0);
+        proof1.gradient_commitment = [0xAA; 32];
+        let mut proof2 = create_test_proof(create_test_peer_id(2), 1);
+        proof2.gradient_commitment = [0xBB; 32];
+
+        proofs.insert(create_test_peer_id(1), proof1);
+        proofs.insert(create_test_peer_id(2), proof2);
+
+        let root = ProofAggregator::merkle_root(&proofs);
+
+        // Tamper with one commitment
+        proofs.get_mut(&create_test_peer_id(1)).unwrap().gradient_commitment = [0xFF; 32];
+        assert!(!ProofAggregator::verify_aggregation(&proofs, &root));
+    }
+
+    #[test]
+    fn test_error_bound_uses_max() {
+        let commit_id = RoundCommitId::new(1, 1);
+        let mut proofs = HashMap::new();
+
+        let mut proof1 = create_test_proof(create_test_peer_id(1), 0);
+        proof1.error_bound = 0.01;
+        let mut proof2 = create_test_proof(create_test_peer_id(2), 1);
+        proof2.error_bound = 0.05;
+
+        proofs.insert(create_test_peer_id(1), proof1);
+        proofs.insert(create_test_peer_id(2), proof2);
+
+        let aggregated = ProofAggregator::aggregate(
+            commit_id,
+            proofs,
+            [1u8; 32],
+            [2u8; 32],
+        ).unwrap();
+
+        assert_eq!(aggregated.total_error_bound, 0.05);
     }
 
     #[test]

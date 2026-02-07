@@ -24,7 +24,7 @@ interface UnifiedEvent {
 
 export default function OnChainExplorer() {
     const chainId = useChainId();
-    const { nextModelId, slashingRecordCount, isLoading: stateLoading } = useContractState();
+    const { nextModelId, slashingRecordCount: _slashingRecordCount, isLoading: stateLoading } = useContractState();
     const {
         proofEvents,
         roundStartedEvents,

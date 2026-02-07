@@ -44,3 +44,29 @@ pub use proved_arithmetic::{
     WitnessSummary, WitnessedOperation, create_shared_capture,
 };
 pub use reshare::Resharing;
+
+use crate::field::Fr;
+use rand::Rng;
+
+/// Creates additive shares of f64 values using a cryptographically secure RNG.
+///
+/// Each value is converted to Fr, then split into `num_parties` additive shares
+/// such that the shares sum to the original value. The last party gets the
+/// residual share (value minus sum of random shares).
+pub(crate) fn reshare_values(values: &[f64], num_parties: usize, rng: &mut impl Rng) -> Vec<Vec<Fr>> {
+    let dim = values.len();
+    let mut shares: Vec<Vec<Fr>> = vec![vec![Fr::ZERO; dim]; num_parties];
+
+    for d in 0..dim {
+        let target = Fr::from_f64(values[d]);
+        let mut sum = Fr::ZERO;
+        for i in 0..num_parties - 1 {
+            let r = Fr::from_f64(rng.gen_range(-100.0..100.0));
+            shares[i][d] = r.clone();
+            sum = Fr::add(&sum, &r);
+        }
+        shares[num_parties - 1][d] = Fr::sub(&target, &sum);
+    }
+
+    shares
+}

@@ -250,7 +250,8 @@ impl CircuitBridge {
         );
 
         // Generate proof using the prover
-        let result = self.prover.prove(&circuit_witness);
+        let result = self.prover.prove(&circuit_witness)
+            .map_err(|e| MPCError::ProtocolError(format!("proof generation failed: {:?}", e)))?;
 
         let elapsed = start.elapsed();
 

@@ -6,9 +6,9 @@
  */
 
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { useWebSocket, type WebSocketMessage } from '@/lib/websocket';
+import { useWebSocket } from '@/lib/websocket';
 import { useContractEvents, useModel, useErrorBound } from './useContract';
-import { getApiClient, generateMockTrainingMetrics } from '@/lib/api';
+import { generateMockTrainingMetrics } from '@/lib/api';
 
 // ============================================================================
 // Types
@@ -166,7 +166,7 @@ export function useTrainingStatus(options: UseTrainingStatusOptions): UseTrainin
     const { proofEvents, slashedEvents } = useContractEvents(modelIdBigInt);
 
     // WebSocket Connection
-    const { isConnected, subscribe, on } = useWebSocket({
+    const { isConnected, subscribe: _subscribe, on } = useWebSocket({
         autoConnect: enableWebSocket,
         channels: enableWebSocket ? [`training:${modelIdBigInt.toString()}`] : [],
     });

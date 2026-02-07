@@ -7,7 +7,7 @@
 
 import React, { useMemo, useRef, useEffect, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { TrendingDown, TrendingUp, Minus, Activity, Zap, AlertTriangle } from 'lucide-react';
+import { TrendingDown, TrendingUp, Minus, Activity, Zap } from 'lucide-react';
 import { useTrainingStatus } from '@/hooks/useTrainingStatus';
 
 // ============================================================================
@@ -76,7 +76,7 @@ export default function LiveLossCurve({
     height = 300,
     showAccuracy = true,
     showErrorBound = true,
-    showThroughput = false,
+    showThroughput: _showThroughput = false,
     enablePolling = true,
     className = '',
 }: LiveLossCurveProps) {
@@ -89,7 +89,7 @@ export default function LiveLossCurve({
         lossHistory,
         accuracyHistory,
         errorBoundHistory,
-        throughputHistory,
+        throughputHistory: _throughputHistory,
         status,
         config,
         isLoading,

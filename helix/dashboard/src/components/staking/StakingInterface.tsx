@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from 'react';
 import { useAccount } from 'wagmi';
-import { formatEther, parseEther } from 'viem';
+import { formatEther } from 'viem';
 import { useStake, useStaking, useModel, useContractState } from '@/hooks/useContract';
 
 interface StakingInterfaceProps {
@@ -10,9 +10,9 @@ interface StakingInterfaceProps {
 }
 
 export default function StakingInterface({ modelId }: StakingInterfaceProps) {
-    const { isConnected, address } = useAccount();
+    const { isConnected, address: _address } = useAccount();
     const { stake, loading: stakeLoading, refetch: refetchStake } = useStake(modelId);
-    const { model, isLoading: modelLoading } = useModel(modelId);
+    const { model, isLoading: _modelLoading } = useModel(modelId);
     const contractState = useContractState();
     const { stakeTokens, unstakeTokens, pending, txHash, error } = useStaking(modelId);
 

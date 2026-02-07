@@ -4,11 +4,7 @@ import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { useContractEvents, useModel, useErrorBound } from './useContract';
 import {
     type TrainingMetrics,
-    type TrainingRound,
-    type TrainingSession,
-    type ErrorBoundEntry,
     type AdversarialEvent,
-    type WebSocketMessage,
     getApiClient,
     generateMockTrainingMetrics,
     generateMockAdversarialEvent,
@@ -157,7 +153,7 @@ export interface UseTrainingReturn {
 export function useTraining(options: UseTrainingOptions = {}): UseTrainingReturn {
     const {
         modelId = BigInt(1),
-        sessionId,
+        sessionId: _sessionId,
         autoRefresh = true,
         refreshInterval = 2000,
         enableWebSocket = true,
@@ -348,7 +344,7 @@ export function useTraining(options: UseTrainingOptions = {}): UseTrainingReturn
             const currentRound = model?.currentRound || BigInt(roundStartedEvents.length || 5);
             roundRef.current = currentRound;
 
-            const contractRounds: TrainingRoundData[] = roundStartedEvents.map((event, index) => {
+            const contractRounds: TrainingRoundData[] = roundStartedEvents.map((event, _index) => {
                 const completedEvent = roundCompletedEvents.find(
                     (c) => c.roundId === event.roundId && c.modelId === event.modelId
                 );

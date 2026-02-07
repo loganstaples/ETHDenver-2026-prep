@@ -260,17 +260,30 @@ pub mod benchmark {
 
         // Benchmark GKR
         let gkr_config = GKRConfig::for_testing();
-        let mut gkr_prover = GKRProver::new(gkr_config);
+        let mut gkr_prover = GKRProver::new(gkr_config.clone());
+        let gkr_verifier = GKRVerifier::new(gkr_config);
 
         let start = Instant::now();
         let mut total_proving = Duration::ZERO;
+        let mut total_verification = Duration::ZERO;
         let mut proof_size = 0;
+        let mut last_proof = None;
 
         for _ in 0..iterations {
             let prove_start = Instant::now();
             if let Ok(proof) = gkr_prover.prove(circuit, inputs) {
                 total_proving += prove_start.elapsed();
                 proof_size = proof.size_bytes();
+                last_proof = Some(proof);
+            }
+        }
+
+        // Benchmark verification using the last generated proof
+        if let Some(ref proof) = last_proof {
+            for _ in 0..iterations {
+                let verify_start = Instant::now();
+                let _ = gkr_verifier.verify(proof, circuit, inputs);
+                total_verification += verify_start.elapsed();
             }
         }
 
@@ -278,7 +291,7 @@ pub mod benchmark {
             backend: BackendType::GKR,
             setup_time: Duration::ZERO, // GKR has no setup
             proving_time: total_proving / iterations as u32,
-            verification_time: Duration::ZERO, // TODO: Add verification
+            verification_time: total_verification / iterations as u32,
             proof_size,
             iterations,
         });

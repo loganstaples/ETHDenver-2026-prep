@@ -26,6 +26,7 @@ use super::zk_layer::{ZeroKnowledgeLayer, ZKConfig, MaskedPolynomial};
 use helix_circuits::halo2_proofs::arithmetic::Field;
 use helix_circuits::halo2curves::ff::PrimeField;
 use std::time::Instant;
+use tracing;
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
@@ -516,7 +517,11 @@ impl GKRVerifier {
     }
 
     /// Verifies just the structure of a proof (without input check).
+    ///
+    /// # WARNING: DEMO ONLY
+    /// This verification is a placeholder and does not provide cryptographic security guarantees.
     pub fn verify_structure(&self, proof: &GKRProof) -> GKRResult<bool> {
+        tracing::warn!("verify_structure: WARNING DEMO ONLY — not cryptographically sound");
         // Check proof has correct structure
         if proof.layer_proofs.is_empty() {
             return Err(GKRError::InvalidProof("No layer proofs".to_string()));

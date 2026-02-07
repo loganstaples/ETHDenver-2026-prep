@@ -21,6 +21,7 @@ hex = "0.4.3"
 uuid = { version = "1.0", features = ["v4", "serde"] }
 rand = "0.8"
 sha2 = "0.10"
+ed25519-dalek = { version = "2.1", features = ["rand_core"], optional = true }
 
 # Network transport (B2.1)
 tokio-rustls = "0.26"
@@ -55,4 +56,5 @@ tokio-test = "0.4"
 [features]
 default = []
 dht = ["libp2p-kad"]
+crypto-sign = ["ed25519-dalek"]
 

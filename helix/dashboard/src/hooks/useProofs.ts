@@ -5,9 +5,7 @@ import { useContractEvents } from './useContract';
 import {
     type ProofInfo,
     type ProofGenerationProgress,
-    type WebSocketMessage,
     getApiClient,
-    generateMockProofInfo,
 } from '@/lib/api';
 
 // ============================================================================
@@ -658,7 +656,7 @@ export function useProofs(options: UseProofsOptions = {}): UseProofsReturn {
 export function useProofGeneration(proofId: string) {
     const [progress, setProgress] = useState<ProofGenerationProgress | null>(null);
     const [isComplete, setIsComplete] = useState(false);
-    const [error, setError] = useState<string | null>(null);
+    const [error, _setError] = useState<string | null>(null);
 
     useEffect(() => {
         const stages: ProofGenerationProgress['stage'][] = ['witness', 'setup', 'proving', 'verifying'];

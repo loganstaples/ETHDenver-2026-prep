@@ -40,7 +40,10 @@ impl StateProver {
         // The current StateTransitionCircuit doesn't implement instance columns in configure/synthesize.
         // So public_inputs is empty.
         self.pipeline.prove(&circuit, &[])
-            .unwrap_or_else(|_| Vec::new())
+            .unwrap_or_else(|e| {
+                tracing::error!("State transition proof generation failed: {e}");
+                Vec::new()
+            })
     }
 }
 

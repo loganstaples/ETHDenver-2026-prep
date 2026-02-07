@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use tracing;
 
 use crate::pipeline::ProverPipeline;
 use crate::provers::ivc_circuit::IVCStepCircuit;
@@ -71,6 +72,8 @@ pub struct IVCConfig {
     pub store_intermediates: bool,
     /// Compression level for proofs.
     pub compression_level: u8,
+    /// K parameter for the IVC step circuit (2^K rows).
+    pub circuit_k: u32,
 }
 
 impl Default for IVCConfig {
@@ -80,6 +83,7 @@ impl Default for IVCConfig {
             max_accumulated_error: 1.0,
             store_intermediates: true,
             compression_level: 6,
+            circuit_k: 5,
         }
     }
 }
@@ -98,9 +102,6 @@ pub struct IVCProver {
     pipeline: ProverPipeline<IVCStepCircuit>,
 }
 
-/// K parameter for the IVC step circuit (2^K rows).
-const IVC_K: u32 = 5;
-
 impl IVCProver {
     /// Creates a new IVC prover with initial state.
     pub fn new(initial_commitment: [u8; 32]) -> Self {
@@ -109,7 +110,7 @@ impl IVCProver {
 
     /// Creates a prover with custom config.
     pub fn with_config(initial_commitment: [u8; 32], config: IVCConfig) -> Self {
-        let mut pipeline = ProverPipeline::new(IVC_K);
+        let mut pipeline = ProverPipeline::new(config.circuit_k);
         pipeline.setup(&IVCStepCircuit::default());
 
         Self {
@@ -249,7 +250,10 @@ impl IVCProver {
             let pi: Vec<Fr> = circuit.public_inputs();
             let pi_refs: Vec<&[Fr]> = vec![&pi];
             let step_proof = self.pipeline.prove(&circuit, &pi_refs)
-                .unwrap_or_else(|_| Vec::new());
+                .unwrap_or_else(|e| {
+                    tracing::error!("IVC folded step proof generation failed at step {}: {e}", step.step);
+                    Vec::new()
+                });
 
             // Length-prefixed proof bytes
             folded.extend_from_slice(&(step_proof.len() as u32).to_le_bytes());
@@ -324,11 +328,15 @@ pub fn fold_states(state1: &IVCState, state2: &IVCState) -> IVCState {
 }
 
 /// Verifies an IVC chain from a serialized proof.
+///
+/// # WARNING: DEMO ONLY
+/// This verification is a placeholder and does not provide cryptographic security guarantees.
 pub fn verify_ivc_chain(
     initial_commitment: [u8; 32],
     final_commitment: [u8; 32],
     proof: &[u8],
 ) -> bool {
+    tracing::warn!("verify_ivc_chain: WARNING DEMO ONLY — not cryptographically sound");
     // Placeholder verification
     if proof.len() < 24 {
         return false;

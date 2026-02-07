@@ -578,26 +578,8 @@ impl MLTrainingProverV2 {
     }
 
     /// Generates a Halo2 proof for the given witness.
-    pub fn prove(&self, witness: &MLTrainingStepV2Witness) -> TrainingProofResultV2 {
+    pub fn prove(&self, witness: &MLTrainingStepV2Witness) -> TrainingProverResult<TrainingProofResultV2> {
         self.prove_with_options(witness, no_progress_callback(), None)
-            .unwrap_or_else(|_e| {
-                // Return a failed result with error info
-                TrainingProofResultV2 {
-                    proof: Vec::new(),
-                    public_inputs: Vec::new(),
-                    loss: Fr::zero(),
-                    total_error: Fr::zero(),
-                    step_number: witness.step_number,
-                    old_state_hash: witness.old_state_hash,
-                    new_state_hash: witness.new_state_hash,
-                    verified: false,
-                    generation_time: Duration::ZERO,
-                    verification_time: None,
-                    attempts: 0,
-                    from_cache: false,
-                    witness_hash: None,
-                }
-            })
     }
 
     /// Generates a proof with progress callbacks and cancellation support.
@@ -882,6 +864,9 @@ fn create_zero_witness(d_in: usize, d_hid: usize, d_out: usize) -> MLTrainingSte
         old_state_hash: (Fr::zero(), Fr::zero()),
         new_state_hash: (Fr::zero(), Fr::zero()),
         step_number: 0,
+        model_id: [0u8; 32],
+        error_budget: Fr::zero(),
+        error_checksum: Fr::zero(),
     }
 }
 
@@ -1256,7 +1241,7 @@ mod tests {
             Fr::from(1),
         );
 
-        let result = prover.prove(&witness);
+        let result = prover.prove(&witness).expect("prove should succeed");
 
         assert!(!result.proof.is_empty());
         assert!(prover.verify_result(&result));
@@ -1298,7 +1283,7 @@ mod tests {
             Fr::from(1),
         );
 
-        let result = prover.prove(&witness);
+        let result = prover.prove(&witness).expect("prove should succeed");
 
         // Corrupt a public input
         let mut bad_pi = result.public_inputs.clone();

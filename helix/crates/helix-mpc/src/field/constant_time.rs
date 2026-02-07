@@ -222,6 +222,20 @@ pub fn ct_assign_array<const N: usize>(condition: CtChoice, target: &mut [u64; N
     }
 }
 
+/// Constant-time comparison for 32-byte hash values.
+///
+/// Compares byte-by-byte using XOR accumulation to avoid early-exit
+/// timing leaks that could reveal information about secret commitments.
+#[inline]
+pub fn ct_eq_hash(a: &[u8; 32], b: &[u8; 32]) -> CtChoice {
+    let mut diff = 0u8;
+    for i in 0..32 {
+        diff |= a[i] ^ b[i];
+    }
+    // diff == 0 iff a == b
+    CtChoice::from_bool(diff == 0)
+}
+
 /// A secure buffer that zeroizes on drop.
 #[derive(Clone)]
 pub struct SecureBuffer<const N: usize> {

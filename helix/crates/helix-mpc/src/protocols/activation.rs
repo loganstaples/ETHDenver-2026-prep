@@ -15,10 +15,13 @@
 //! mode where activations are approximated by low-degree polynomials that can
 //! be evaluated on shares using Beaver triples.
 
+use rand::Rng;
+
 use crate::beaver::pool::BeaverPool;
 use crate::error::MPCResult;
 use crate::field::Fr;
 use crate::protocols::arithmetic::SecureArithmetic;
+use super::reshare_values;
 
 /// Supported activation functions.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -48,6 +51,7 @@ impl SecureActivation {
     pub fn apply_reconstruct_reshare(
         shares: &[Vec<Fr>],
         activation: ActivationType,
+        rng: &mut impl Rng,
     ) -> Vec<Vec<Fr>> {
         let num_parties = shares.len();
         let dim = shares[0].len();
@@ -69,15 +73,15 @@ impl SecureActivation {
             .map(|v| apply_activation(*v, activation))
             .collect();
 
-        // Step 3: Re-share (party 0 acts as dealer, gives full value as its share,
-        // others get zero). In a real system, proper random sharing would be used.
-        reshare_values(&activated, num_parties)
+        // Step 3: Re-share using cryptographically secure randomness.
+        reshare_values(&activated, num_parties, rng)
     }
 
     /// Batch version: applies activation to multiple vectors at once.
     pub fn apply_batch_reconstruct_reshare(
         batch_shares: &[Vec<Vec<Fr>>],
         activation: ActivationType,
+        rng: &mut impl Rng,
     ) -> Vec<Vec<Vec<Fr>>> {
         let num_parties = batch_shares.len();
         let batch_size = batch_shares[0].len();
@@ -90,7 +94,7 @@ impl SecureActivation {
                 .map(|p| p[b].clone())
                 .collect();
 
-            let activated = Self::apply_reconstruct_reshare(&item_shares, activation);
+            let activated = Self::apply_reconstruct_reshare(&item_shares, activation, rng);
 
             for (i, party_result) in activated.into_iter().enumerate() {
                 results[i].push(party_result);
@@ -252,39 +256,15 @@ fn apply_activation(x: f64, activation: ActivationType) -> f64 {
     }
 }
 
-/// Creates additive shares of values using a deterministic split.
-/// Party 0 gets the value minus random offsets; others get random offsets.
-fn reshare_values(values: &[f64], num_parties: usize) -> Vec<Vec<Fr>> {
-    use rand::Rng;
-    use rand::SeedableRng;
-    use rand_chacha::ChaCha20Rng;
-
-    let dim = values.len();
-    let mut rng = ChaCha20Rng::seed_from_u64(0xAC71A710);
-    let mut shares: Vec<Vec<Fr>> = vec![vec![Fr::ZERO; dim]; num_parties];
-
-    for d in 0..dim {
-        let mut sum = Fr::ZERO;
-        for i in 0..num_parties - 1 {
-            let r = Fr::from_f64(rng.gen_range(-100.0..100.0));
-            shares[i][d] = r.clone();
-            sum = Fr::add(&sum, &r);
-        }
-        shares[num_parties - 1][d] = Fr::sub(&Fr::from_f64(values[d]), &sum);
-    }
-
-    shares
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::beaver::dealer::TrustedDealer;
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha20Rng;
 
     fn split_vector(values: &[f64], n: usize, seed: u64) -> Vec<Vec<Fr>> {
         use rand::Rng;
-        use rand::SeedableRng;
-        use rand_chacha::ChaCha20Rng;
 
         let dim = values.len();
         let mut rng = ChaCha20Rng::seed_from_u64(seed);
@@ -317,9 +297,10 @@ mod tests {
     fn test_relu_reconstruct_reshare() {
         let values = vec![-2.0, -1.0, 0.0, 1.0, 2.0];
         let shares = split_vector(&values, 3, 42);
+        let mut rng = ChaCha20Rng::seed_from_u64(42);
 
         let result_shares =
-            SecureActivation::apply_reconstruct_reshare(&shares, ActivationType::ReLU);
+            SecureActivation::apply_reconstruct_reshare(&shares, ActivationType::ReLU, &mut rng);
 
         let result = reconstruct(&result_shares);
         let expected = vec![0.0, 0.0, 0.0, 1.0, 2.0];
@@ -338,9 +319,10 @@ mod tests {
     fn test_sigmoid_reconstruct_reshare() {
         let values = vec![-3.0, 0.0, 3.0];
         let shares = split_vector(&values, 3, 42);
+        let mut rng = ChaCha20Rng::seed_from_u64(42);
 
         let result_shares =
-            SecureActivation::apply_reconstruct_reshare(&shares, ActivationType::Sigmoid);
+            SecureActivation::apply_reconstruct_reshare(&shares, ActivationType::Sigmoid, &mut rng);
 
         let result = reconstruct(&result_shares);
 
@@ -360,9 +342,10 @@ mod tests {
     fn test_gelu_reconstruct_reshare() {
         let values = vec![-1.0, 0.0, 1.0];
         let shares = split_vector(&values, 3, 42);
+        let mut rng = ChaCha20Rng::seed_from_u64(42);
 
         let result_shares =
-            SecureActivation::apply_reconstruct_reshare(&shares, ActivationType::GELU);
+            SecureActivation::apply_reconstruct_reshare(&shares, ActivationType::GELU, &mut rng);
 
         let result = reconstruct(&result_shares);
 
@@ -410,10 +393,12 @@ mod tests {
     fn test_leaky_relu() {
         let values = vec![-2.0, -1.0, 0.0, 1.0, 2.0];
         let shares = split_vector(&values, 3, 42);
+        let mut rng = ChaCha20Rng::seed_from_u64(42);
 
         let result_shares = SecureActivation::apply_reconstruct_reshare(
             &shares,
             ActivationType::LeakyReLU(0.01),
+            &mut rng,
         );
 
         let result = reconstruct(&result_shares);

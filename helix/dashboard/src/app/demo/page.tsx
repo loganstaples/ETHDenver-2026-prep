@@ -5,12 +5,11 @@
  * Guided tour and demonstration of the HELIX training dashboard.
  */
 
-import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
     Play,
     Pause,
-    SkipForward,
     RefreshCw,
     ChevronRight,
     ChevronLeft,
@@ -21,8 +20,6 @@ import {
     Server,
     AlertTriangle,
     CheckCircle,
-    Clock,
-    Cpu,
     Globe,
     TrendingDown,
     ExternalLink,

@@ -47,6 +47,111 @@ impl Default for DashboardConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Demo data helpers (single source of truth)
+// ---------------------------------------------------------------------------
+
+/// The 3 demo nodes used by `with_defaults()` and handler fallbacks.
+pub fn demo_nodes() -> Vec<NodeInfo> {
+    vec![
+        NodeInfo {
+            id: "helix-node-a1b2c3d4".to_string(),
+            address: "0x742d35Cc6634C0532925a3b844Bc454e4438f44e".to_string(),
+            role: "worker".to_string(),
+            status: "active".to_string(),
+            stake: 1.5,
+            reputation: 0.98,
+            proofs_submitted: 42,
+        },
+        NodeInfo {
+            id: "helix-node-e5f6g7h8".to_string(),
+            address: "0x8626f6940E2eb28930eFb4CeF49B2d1F2C9C1199".to_string(),
+            role: "worker".to_string(),
+            status: "active".to_string(),
+            stake: 1.0,
+            reputation: 0.95,
+            proofs_submitted: 38,
+        },
+        NodeInfo {
+            id: "helix-agg-01".to_string(),
+            address: "0xdD2FD4581271e230360230F9337D5c0430Bf44C0".to_string(),
+            role: "aggregator".to_string(),
+            status: "active".to_string(),
+            stake: 2.5,
+            reputation: 1.0,
+            proofs_submitted: 0,
+        },
+    ]
+}
+
+/// Demo metrics JSON blob.
+pub fn demo_metrics() -> serde_json::Value {
+    serde_json::json!({
+        "training": {
+            "rounds_completed": 42,
+            "proofs_generated": 127,
+            "proofs_verified": 125,
+            "avg_round_time_ms": 2500,
+            "avg_proof_time_ms": 1200,
+        },
+        "network": {
+            "messages_sent": 15678,
+            "messages_received": 14532,
+            "bytes_sent": 45_678_901u64,
+            "bytes_received": 43_210_987u64,
+        },
+        "performance": {
+            "cpu_usage_percent": 23.5,
+            "memory_usage_mb": 1234,
+            "disk_usage_mb": 5678,
+        }
+    })
+}
+
+/// Demo events list.
+pub fn demo_events() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({
+            "type": "RoundCompleted",
+            "timestamp": "2024-01-15T14:30:00Z",
+            "data": { "model_id": 0, "round_id": 42, "prover": "0x742d35Cc6634C0532925a3b844Bc454e4438f44e" }
+        }),
+        serde_json::json!({
+            "type": "ProofSubmitted",
+            "timestamp": "2024-01-15T14:29:55Z",
+            "data": { "model_id": 0, "round_id": 42, "worker": "0x742d35Cc6634C0532925a3b844Bc454e4438f44e" }
+        }),
+        serde_json::json!({
+            "type": "WorkerJoined",
+            "timestamp": "2024-01-15T14:00:00Z",
+            "data": { "model_id": 0, "worker": "0x8626f6940E2eb28930eFb4CeF49B2d1F2C9C1199", "stake": "1.0 ETH" }
+        }),
+    ]
+}
+
+/// Default training status returned when no live data is available.
+pub fn demo_training_status() -> TrainingStatus {
+    TrainingStatus {
+        model_id: 0,
+        current_round: 42,
+        total_rounds: 100,
+        proofs_submitted: 127,
+        proofs_verified: 125,
+        error_bound: 45.2,
+        max_error: 1000.0,
+        is_active: true,
+    }
+}
+
+/// Fill an empty `NetworkStatus` with demo values (in-place).
+pub fn populate_demo_network(status: &mut NetworkStatus) {
+    status.node_id = "helix-node-a1b2c3d4".to_string();
+    status.status = "online".to_string();
+    status.peer_count = 4;
+    status.block_height = 12_345_678;
+    status.chain_id = 31337;
+}
+
+// ---------------------------------------------------------------------------
 // Dashboard State
 // ---------------------------------------------------------------------------
 
@@ -89,83 +194,11 @@ impl DashboardState {
     pub fn with_defaults() -> Arc<Self> {
         let state = Self::new(DashboardConfig::default());
 
-        // Pre-populate nodes
-        let nodes = vec![
-            NodeInfo {
-                id: "helix-node-a1b2c3d4".to_string(),
-                address: "0x742d35Cc6634C0532925a3b844Bc454e4438f44e".to_string(),
-                role: "worker".to_string(),
-                status: "active".to_string(),
-                stake: 1.5,
-                reputation: 0.98,
-                proofs_submitted: 42,
-            },
-            NodeInfo {
-                id: "helix-node-e5f6g7h8".to_string(),
-                address: "0x8626f6940E2eb28930eFb4CeF49B2d1F2C9C1199".to_string(),
-                role: "worker".to_string(),
-                status: "active".to_string(),
-                stake: 1.0,
-                reputation: 0.95,
-                proofs_submitted: 38,
-            },
-            NodeInfo {
-                id: "helix-agg-01".to_string(),
-                address: "0xdD2FD4581271e230360230F9337D5c0430Bf44C0".to_string(),
-                role: "aggregator".to_string(),
-                status: "active".to_string(),
-                stake: 2.5,
-                reputation: 1.0,
-                proofs_submitted: 0,
-            },
-        ];
-
-        // Pre-populate metrics
-        let metrics = serde_json::json!({
-            "training": {
-                "rounds_completed": 42,
-                "proofs_generated": 127,
-                "proofs_verified": 125,
-                "avg_round_time_ms": 2500,
-                "avg_proof_time_ms": 1200,
-            },
-            "network": {
-                "messages_sent": 15678,
-                "messages_received": 14532,
-                "bytes_sent": 45_678_901u64,
-                "bytes_received": 43_210_987u64,
-            },
-            "performance": {
-                "cpu_usage_percent": 23.5,
-                "memory_usage_mb": 1234,
-                "disk_usage_mb": 5678,
-            }
-        });
-
-        // Pre-populate events
-        let events = vec![
-            serde_json::json!({
-                "type": "RoundCompleted",
-                "timestamp": "2024-01-15T14:30:00Z",
-                "data": { "model_id": 0, "round_id": 42, "prover": "0x742d35Cc6634C0532925a3b844Bc454e4438f44e" }
-            }),
-            serde_json::json!({
-                "type": "ProofSubmitted",
-                "timestamp": "2024-01-15T14:29:55Z",
-                "data": { "model_id": 0, "round_id": 42, "worker": "0x742d35Cc6634C0532925a3b844Bc454e4438f44e" }
-            }),
-            serde_json::json!({
-                "type": "WorkerJoined",
-                "timestamp": "2024-01-15T14:00:00Z",
-                "data": { "model_id": 0, "worker": "0x8626f6940E2eb28930eFb4CeF49B2d1F2C9C1199", "stake": "1.0 ETH" }
-            }),
-        ];
-
         let arc = Arc::new(state);
         // Use try_write to populate synchronously (no contention at init time)
-        *arc.nodes.try_write().unwrap() = nodes;
-        *arc.metrics.try_write().unwrap() = metrics;
-        *arc.events.try_write().unwrap() = events;
+        *arc.nodes.try_write().unwrap() = demo_nodes();
+        *arc.metrics.try_write().unwrap() = demo_metrics();
+        *arc.events.try_write().unwrap() = demo_events();
         arc
     }
 
@@ -191,8 +224,9 @@ impl DashboardState {
         let mut events = self.events.write().await;
         events.push(event);
         // Cap at 1000 events
-        if events.len() > 1000 {
-            events.drain(..events.len() - 1000);
+        let len = events.len();
+        if len > 1000 {
+            events.drain(..len - 1000);
         }
     }
 
@@ -486,13 +520,8 @@ async fn network_handler(
     let mut status = state.network_status.read().await.clone();
     status.uptime_seconds = state.uptime_secs();
 
-    // Populate with demo values if not set
     if status.node_id.is_empty() {
-        status.node_id = "helix-node-a1b2c3d4".to_string();
-        status.status = "online".to_string();
-        status.peer_count = 4;
-        status.block_height = 12_345_678;
-        status.chain_id = 31337;
+        populate_demo_network(&mut status);
     }
 
     Json(status)
@@ -504,18 +533,8 @@ async fn training_handler(
 ) -> Json<TrainingStatus> {
     let status = state.training_status.read().await.clone();
 
-    // Return demo values if not set
     if !status.is_active && status.total_rounds == 0 {
-        Json(TrainingStatus {
-            model_id: 0,
-            current_round: 42,
-            total_rounds: 100,
-            proofs_submitted: 127,
-            proofs_verified: 125,
-            error_bound: 45.2,
-            max_error: 1000.0,
-            is_active: true,
-        })
+        Json(demo_training_status())
     } else {
         Json(status)
     }
@@ -527,36 +546,7 @@ async fn nodes_handler(
 ) -> Json<Vec<NodeInfo>> {
     let nodes = state.nodes.read().await;
     if nodes.is_empty() {
-        // Fallback demo data
-        Json(vec![
-            NodeInfo {
-                id: "helix-node-a1b2c3d4".to_string(),
-                address: "0x742d35Cc6634C0532925a3b844Bc454e4438f44e".to_string(),
-                role: "worker".to_string(),
-                status: "active".to_string(),
-                stake: 1.5,
-                reputation: 0.98,
-                proofs_submitted: 42,
-            },
-            NodeInfo {
-                id: "helix-node-e5f6g7h8".to_string(),
-                address: "0x8626f6940E2eb28930eFb4CeF49B2d1F2C9C1199".to_string(),
-                role: "worker".to_string(),
-                status: "active".to_string(),
-                stake: 1.0,
-                reputation: 0.95,
-                proofs_submitted: 38,
-            },
-            NodeInfo {
-                id: "helix-agg-01".to_string(),
-                address: "0xdD2FD4581271e230360230F9337D5c0430Bf44C0".to_string(),
-                role: "aggregator".to_string(),
-                status: "active".to_string(),
-                stake: 2.5,
-                reputation: 1.0,
-                proofs_submitted: 0,
-            },
-        ])
+        Json(demo_nodes())
     } else {
         Json(nodes.clone())
     }
@@ -568,27 +558,7 @@ async fn metrics_handler(
 ) -> Json<serde_json::Value> {
     let metrics = state.metrics.read().await;
     if metrics.is_null() || metrics.as_object().map_or(true, |m| m.is_empty()) {
-        // Fallback demo data
-        Json(serde_json::json!({
-            "training": {
-                "rounds_completed": 42,
-                "proofs_generated": 127,
-                "proofs_verified": 125,
-                "avg_round_time_ms": 2500,
-                "avg_proof_time_ms": 1200,
-            },
-            "network": {
-                "messages_sent": 15678,
-                "messages_received": 14532,
-                "bytes_sent": 45_678_901u64,
-                "bytes_received": 43_210_987u64,
-            },
-            "performance": {
-                "cpu_usage_percent": 23.5,
-                "memory_usage_mb": 1234,
-                "disk_usage_mb": 5678,
-            }
-        }))
+        Json(demo_metrics())
     } else {
         Json(metrics.clone())
     }
@@ -600,24 +570,7 @@ async fn events_handler(
 ) -> Json<Vec<serde_json::Value>> {
     let events = state.events.read().await;
     if events.is_empty() {
-        // Fallback demo data
-        Json(vec![
-            serde_json::json!({
-                "type": "RoundCompleted",
-                "timestamp": "2024-01-15T14:30:00Z",
-                "data": { "model_id": 0, "round_id": 42, "prover": "0x742d35Cc6634C0532925a3b844Bc454e4438f44e" }
-            }),
-            serde_json::json!({
-                "type": "ProofSubmitted",
-                "timestamp": "2024-01-15T14:29:55Z",
-                "data": { "model_id": 0, "round_id": 42, "worker": "0x742d35Cc6634C0532925a3b844Bc454e4438f44e" }
-            }),
-            serde_json::json!({
-                "type": "WorkerJoined",
-                "timestamp": "2024-01-15T14:00:00Z",
-                "data": { "model_id": 0, "worker": "0x8626f6940E2eb28930eFb4CeF49B2d1F2C9C1199", "stake": "1.0 ETH" }
-            }),
-        ])
+        Json(demo_events())
     } else {
         Json(events.clone())
     }

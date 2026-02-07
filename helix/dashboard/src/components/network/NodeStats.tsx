@@ -22,8 +22,8 @@ interface WorkerNode {
 }
 
 export default function NodeStats() {
-    const { address } = useAccount();
-    const { slashingRecordCount, isLoading: stateLoading } = useContractState();
+    const { address: _address } = useAccount();
+    const { slashingRecordCount: _slashingRecordCount, isLoading: stateLoading } = useContractState();
     const { proofEvents, stakedEvents, slashedEvents } = useContractEvents();
     const [workers, setWorkers] = useState<WorkerNode[]>([]);
     const [selectedWorker, setSelectedWorker] = useState<WorkerNode | null>(null);

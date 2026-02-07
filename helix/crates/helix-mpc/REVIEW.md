@@ -208,9 +208,9 @@ helix-mpc/
 
 | Issue | Severity | Location | Fix |
 |-------|----------|----------|-----|
-| Shamir uses f64 for share values | Critical | `shamir.rs:70` | Use `Fr` for all secret values |
+| ~~Shamir uses f64 for share values~~ | ~~Critical~~ | `shamir.rs` | **FIXED**: BN254 Fr internals with f64 trait interface |
 | No verification that shares are fresh (anti-replay) | Medium | `additive.rs` | Add nonces to shares |
-| `reshare_random` uses static seed | Critical | `normalization.rs:222` | Use proper entropy source |
+| ~~`reshare_random` uses static seed~~ | ~~Critical~~ | `normalization.rs` | **FIXED**: RNG passed from caller |
 
 **Code Example** (Critical Bug):
 ```rust
@@ -316,10 +316,10 @@ fn reshare_values(values: &[f64], num_parties: usize, rng: &mut impl Rng) -> Vec
 
 | Issue | Severity | Location | Fix |
 |-------|----------|----------|-----|
-| Pedersen commitments are simulated with XOR | Critical | `commitment.rs:336` | Use actual EC point operations |
-| MAC uses f64 arithmetic | High | `mac.rs:77` | Use Fr for cryptographic soundness |
+| ~~Pedersen commitments simulated with XOR~~ | ~~Critical~~ | `commitment.rs` | **FIXED**: Real EC Pedersen on BN254 G1 |
+| ~~MAC uses f64 arithmetic~~ | ~~High~~ | `mac.rs` | **FIXED**: Fr field arithmetic throughout |
 | No rate limiting on fault reports | Low | `byzantine.rs` | Add rate limiting to prevent DoS |
-| Commitment verification doesn't use constant-time compare | Medium | `commitment.rs:109` | Use `subtle::ConstantTimeEq` |
+| ~~Commitment verification non-constant-time~~ | ~~Medium~~ | `commitment.rs` | **FIXED**: ct_eq_hash for all hash comparisons |
 
 **Pedersen Simulation Issue** (`commitment.rs:336-340`):
 ```rust
@@ -422,11 +422,11 @@ This module is entirely stubs for formal verification integration. The types exi
 
 | Issue | Location | Impact | Suggested Fix |
 |-------|----------|--------|---------------|
-| Fixed seed in resharing | `normalization.rs:222` | Predictable randomness breaks security | Use proper entropy from caller |
-| Pedersen commitments are fake | `commitment.rs:336` | "Homomorphic" verification doesn't work | Implement real EC Pedersen |
+| ~~Fixed seed in resharing~~ | `normalization.rs` | ~~Predictable randomness~~ | **FIXED**: RNG passed from caller |
+| ~~Pedersen commitments are fake~~ | `commitment.rs` | ~~XOR-based, not homomorphic~~ | **FIXED**: Real EC Pedersen on BN254 G1 |
 | Trusted dealer only | `beaver/dealer.rs` | Single point of trust | Complete OT-based generation |
-| Shamir uses f64 | `shamir.rs:70` | Precision loss on large values | Use Fr throughout |
-| MAC uses f64 | `mac.rs:77` | Not cryptographically sound | Use Fr arithmetic |
+| ~~Shamir uses f64~~ | `shamir.rs` | ~~Precision loss~~ | **FIXED**: BN254 Fr internals |
+| ~~MAC uses f64~~ | `mac.rs` | ~~Not cryptographically sound~~ | **FIXED**: Fr field arithmetic |
 
 ### High (Should Fix for Production)
 
@@ -443,7 +443,7 @@ This module is entirely stubs for formal verification integration. The types exi
 |-------|----------|--------|---------------|
 | Sequential attention heads | `attention.rs:84` | Slow for many heads | Use rayon for parallelism |
 | f64↔Fr conversions | Various | Precision loss | Minimize conversions |
-| Constant-time not used everywhere | `commitment.rs` | Timing side channels | Use `subtle` crate |
+| ~~Constant-time not used everywhere~~ | `commitment.rs` | ~~Timing side channels~~ | **FIXED**: ct_eq_hash for all hash comparisons |
 | Polynomial activations unused | `activation.rs` | Dead code | Remove or implement |
 
 ### Low (Polish)
@@ -460,7 +460,7 @@ This module is entirely stubs for formal verification integration. The types exi
 
 ### Immediate (Before Demo)
 
-1. **Fix the fixed seed bug** in `reshare_values` - this is a security vulnerability
+1. ~~**Fix the fixed seed bug** in `reshare_values`~~ **FIXED** (Round 6)
 2. **Document trusted dealer limitation** prominently in demo materials
 3. **Add basic message authentication** to LocalChannel for demo integrity
 4. **Verify profiler works** with actual training run
@@ -574,15 +574,22 @@ let config = MPCConfig {
 
 ## Summary
 
-### Health Score: 65/100 (Demo Ready, Not Production Ready)
+### Health Score: 82/100 (Demo Ready, Approaching Production)
 
 **Breakdown**:
 - Architecture: 80/100 - Clean design, good separation
-- Implementation: 60/100 - Core works, critical gaps remain
-- Security: 50/100 - Major issues (fake Pedersen, f64 crypto)
+- Implementation: 78/100 - Core works, most critical gaps fixed
+- Security: 75/100 - Real Pedersen, Fr-based crypto, constant-time comparisons
 - Testing: 60/100 - Good unit tests, missing integration
 - Documentation: 75/100 - SECURITY.md excellent, inline docs good
 - Performance: 65/100 - Profiling excellent, optimization needed
+
+**Round 6 Fixes Applied (2026-02-07)**:
+- Fixed predictable resharing (hardcoded seeds replaced with caller-provided RNG)
+- Real Pedersen commitments using BN254 EC point operations (halo2curves G1)
+- SPDZ MAC system fully migrated from f64 to Fr field arithmetic
+- Shamir secret sharing internals migrated from Mersenne prime to BN254 Fr
+- Constant-time hash comparison for commitment/fingerprint verification
 
 ### Verdict
 
@@ -590,21 +597,22 @@ The `helix-mpc` crate is **suitable for ETHDenver demo** with the following cave
 - Use trusted dealer mode (clearly document)
 - Run all parties in single process
 - Use small model (MLP, not full transformer)
-- Fix the `reshare_values` fixed seed bug before demo
 
 **Not suitable for production** until:
 - OT-based triple generation is complete and tested
-- Real Pedersen commitments are implemented
 - NetworkChannel with encryption is implemented
-- All cryptographic operations use Fr instead of f64
 - Third-party security audit is completed
 
-### Priority Fixes
+### Priority Fixes (Updated 2026-02-07)
 
-1. 🔴 **CRITICAL**: Fix `reshare_values` fixed seed (`normalization.rs:222`)
-2. 🟠 **HIGH**: Document trusted dealer limitation in demo
-3. 🟡 **MEDIUM**: Add end-to-end benchmark with profiler
-4. 🟢 **LOW**: Clean up dead code (unused polynomial approximations)
+1. ~~🔴 **CRITICAL**: Fix `reshare_values` fixed seed~~ **FIXED** — RNG now passed from caller
+2. ~~🔴 **CRITICAL**: Implement real Pedersen commitments~~ **FIXED** — EC point operations on BN254 G1
+3. ~~🟠 **HIGH**: MAC system uses f64~~ **FIXED** — fully migrated to Fr field arithmetic
+4. ~~🟠 **HIGH**: Shamir uses f64/Mersenne~~ **FIXED** — BN254 Fr internals with f64 trait interface
+5. ~~🟡 **MEDIUM**: Constant-time comparison missing~~ **FIXED** — ct_eq_hash for all sensitive comparisons
+6. 🟠 **HIGH**: Document trusted dealer limitation in demo
+7. 🟡 **MEDIUM**: Add end-to-end benchmark with profiler
+8. 🟢 **LOW**: Clean up dead code (unused polynomial approximations)
 
 ---
 

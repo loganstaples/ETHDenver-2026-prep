@@ -11,6 +11,8 @@
 //! The softmax step requires reconstruction (reveals attention patterns
 //! but not weights), consistent with the MPC-ML security model.
 
+use rand::Rng;
+
 use crate::beaver::pool::BeaverPool;
 use crate::error::MPCResult;
 use crate::field::Fr;
@@ -58,6 +60,7 @@ impl SecureAttention {
         config: &SecureAttentionConfig,
         seq_len: usize,
         pools: &mut [BeaverPool],
+        rng: &mut impl Rng,
     ) -> MPCResult<Vec<Vec<Fr>>> {
         let num_parties = x_shares.len();
         let d = config.d_model;
@@ -95,6 +98,7 @@ impl SecureAttention {
                 seq_len,
                 dk,
                 pools,
+                rng,
             )?;
 
             head_outputs[head] = head_out;
@@ -123,6 +127,7 @@ impl SecureAttention {
         seq_len: usize,
         head_dim: usize,
         pools: &mut [BeaverPool],
+        rng: &mut impl Rng,
     ) -> MPCResult<Vec<Vec<Fr>>> {
         let num_parties = q_shares.len();
         let scale = Fr::from_f64(1.0 / (head_dim as f64).sqrt());
@@ -162,7 +167,7 @@ impl SecureAttention {
             })
             .collect();
 
-        let softmax_attn = SecureNormalization::batch_softmax(&attn_rows);
+        let softmax_attn = SecureNormalization::batch_softmax(&attn_rows, rng);
 
         // Flatten back to [seq_len x seq_len].
         let attn_shares: Vec<Vec<Fr>> = softmax_attn

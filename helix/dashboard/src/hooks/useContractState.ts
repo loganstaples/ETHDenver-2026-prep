@@ -8,13 +8,10 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useAccount, useChainId, usePublicClient, useBlockNumber } from 'wagmi';
 import { formatEther, type Address } from 'viem';
-import { useWebSocket, type WebSocketMessage } from '@/lib/websocket';
+import { useWebSocket } from '@/lib/websocket';
 import {
     HELIX_COORDINATOR_ABI,
     getContractAddress,
-    type Model,
-    type Round,
-    type Stake,
 } from '@/lib/contracts';
 
 // ============================================================================
@@ -151,7 +148,7 @@ export function useContractState(options: UseContractStateOptions = {}): UseCont
         modelId,
         enableWebSocket = true,
         enableAutoRefresh = true,
-        refreshInterval = 10000,
+        refreshInterval: _refreshInterval = 10000,
         onEvent,
     } = options;
 
@@ -171,7 +168,7 @@ export function useContractState(options: UseContractStateOptions = {}): UseCont
     const [currentRound, setCurrentRound] = useState<RoundDetails | null>(null);
     const [recentRounds, setRecentRounds] = useState<RoundDetails[]>([]);
     const [userStake, setUserStake] = useState<StakeDetails | null>(null);
-    const [userRewards, setUserRewards] = useState<RewardInfo | null>(null);
+    const [userRewards, _setUserRewards] = useState<RewardInfo | null>(null);
     const [recentEvents, setRecentEvents] = useState<ContractEvent[]>([]);
     const [isLoading, setIsLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
