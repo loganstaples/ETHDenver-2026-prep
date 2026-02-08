@@ -53,7 +53,7 @@ contract BatchVerifier {
     // ============ BN254 Constants ============
     uint256 internal constant R = 21888242871839275222246405745257275088548364400416034343698204186575808495617;
     uint256 internal constant P = 21888242871839275222246405745257275088696311157297823662689037894645226208583;
-    uint256 internal constant NUM_INSTANCES = 7;
+    uint256 internal constant NUM_INSTANCES = 8;
     uint256 internal constant MIN_PROOF_LENGTH = 320;
 
     // ============ Structs ============

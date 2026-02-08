@@ -5,6 +5,7 @@ import "forge-std/Test.sol";
 import "../src/verification/BatchVerifier.sol";
 import "../src/verification/Halo2Verifier.sol";
 import "../src/mocks/MockVerifier.sol";
+import "./ProofFixtures.t.sol";
 
 /// @title BatchVerificationTest
 /// @notice Comprehensive tests for batch proof verification
@@ -57,7 +58,7 @@ contract BatchVerificationTest is Test {
 
         // Deploy contracts
         mockVerifier = new MockVerifier();
-        realVerifier = new Halo2Verifier();
+        realVerifier = new Halo2Verifier(Halo2VKDefaults.g2Generator());
         batchVerifier = new BatchVerifier(address(mockVerifier));
     }
 
@@ -68,7 +69,7 @@ contract BatchVerificationTest is Test {
     }
 
     function _createValidPublicInputs() internal pure returns (uint256[] memory) {
-        uint256[] memory inputs = new uint256[](7);
+        uint256[] memory inputs = new uint256[](8);
         inputs[0] = 12345;  // oldHashLo
         inputs[1] = 67890;  // oldHashHi
         inputs[2] = 1111;   // newHashLo
@@ -76,11 +77,12 @@ contract BatchVerificationTest is Test {
         inputs[4] = 100;    // loss
         inputs[5] = 10;     // errorBound
         inputs[6] = 1;      // stepNumber
+        inputs[7] = 0;      // errorChecksum (placeholder for verifier-only tests)
         return inputs;
     }
 
     function _createInvalidFieldElementInputs() internal pure returns (uint256[] memory) {
-        uint256[] memory inputs = new uint256[](7);
+        uint256[] memory inputs = new uint256[](8);
         inputs[0] = 12345;
         inputs[1] = 67890;
         inputs[2] = 1111;
@@ -88,11 +90,12 @@ contract BatchVerificationTest is Test {
         inputs[4] = type(uint256).max; // Exceeds scalar field
         inputs[5] = 10;
         inputs[6] = 1;
+        inputs[7] = 0;      // errorChecksum (placeholder)
         return inputs;
     }
 
     function _createWrongCountInputs() internal pure returns (uint256[] memory) {
-        return new uint256[](5); // Only 5 instead of 7
+        return new uint256[](5); // Only 5 instead of 8
     }
 
     // ============ Single Verification Tests ============
@@ -290,7 +293,7 @@ contract BatchVerificationTest is Test {
         });
 
         // Use different public inputs for second proof to avoid same hash
-        uint256[] memory inputs2 = new uint256[](7);
+        uint256[] memory inputs2 = new uint256[](8);
         inputs2[0] = 22222;  // Different oldHashLo
         inputs2[1] = 33333;  // Different oldHashHi
         inputs2[2] = 4444;   // Different newHashLo
@@ -298,6 +301,7 @@ contract BatchVerificationTest is Test {
         inputs2[4] = 200;    // Different loss
         inputs2[5] = 20;     // Different errorBound
         inputs2[6] = 2;      // Different stepNumber
+        inputs2[7] = 0;      // errorChecksum (placeholder)
 
         submissions[1] = BatchVerifier.ProofSubmission({
             proof: _createValidProof(),

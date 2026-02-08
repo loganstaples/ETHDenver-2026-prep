@@ -7,6 +7,7 @@ import "../src/core/TrainingRound.sol";
 import "../src/verification/AggregationVerifier.sol";
 import "../src/verification/SlashingEvidence.sol";
 import "../src/mocks/MockVerifier.sol";
+import "./ProofFixtures.t.sol";
 
 /// @title ByzantineWorkerTest
 /// @notice Comprehensive Byzantine fault tolerance testing for HELIX protocol
@@ -96,9 +97,10 @@ contract ByzantineWorkerTest is Test {
 
     function _createValidPublicInputs(
         uint256 oldLo, uint256 oldHi,
-        uint256 newLo, uint256 newHi
+        uint256 newLo, uint256 newHi,
+        uint256 modelId
     ) internal pure returns (uint256[] memory) {
-        uint256[] memory inputs = new uint256[](7);
+        uint256[] memory inputs = new uint256[](8);
         inputs[0] = oldLo;
         inputs[1] = oldHi;
         inputs[2] = newLo;
@@ -106,6 +108,7 @@ contract ByzantineWorkerTest is Test {
         inputs[4] = 100;  // loss
         inputs[5] = 10;   // error bound
         inputs[6] = 1;    // step
+        inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(inputs[5], inputs[6], modelId, 1e18);
         return inputs;
     }
 
@@ -119,7 +122,7 @@ contract ByzantineWorkerTest is Test {
         // Byzantine worker submits invalid proof
         mockVerifier.setShouldPass(false);
 
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         uint256 treasuryBefore = treasury.balance;
@@ -141,7 +144,7 @@ contract ByzantineWorkerTest is Test {
 
         mockVerifier.setShouldPass(true);
 
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         // Honest worker submits first
@@ -167,7 +170,7 @@ contract ByzantineWorkerTest is Test {
         // First Byzantine submits invalid in round 1
         mockVerifier.setShouldPass(false);
 
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         vm.prank(byzantineWorkers[0]);
@@ -184,7 +187,7 @@ contract ByzantineWorkerTest is Test {
 
         // Second Byzantine submits invalid in round 2
         mockVerifier.setShouldPass(false);
-        uint256[] memory inputs2 = _createValidPublicInputs(1111, 2222, 3333, 4444);
+        uint256[] memory inputs2 = _createValidPublicInputs(1111, 2222, 3333, 4444, modelId);
 
         vm.prank(byzantineWorkers[1]);
         coordinator.submitProof(modelId, 2, proof, inputs2);
@@ -207,7 +210,7 @@ contract ByzantineWorkerTest is Test {
         mockVerifier.setShouldPass(true);
 
         // Byzantine tries to use wrong old commitment
-        uint256[] memory inputs = _createValidPublicInputs(99999, 88888, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(99999, 88888, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         vm.prank(byzantineWorkers[0]);
@@ -223,7 +226,7 @@ contract ByzantineWorkerTest is Test {
         mockVerifier.setShouldPass(true);
 
         // Byzantine sets specific malicious commitment (0, 0)
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 0, 0);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 0, 0, modelId);
         bytes memory proof = new bytes(320);
 
         vm.prank(byzantineWorkers[0]);
@@ -244,7 +247,7 @@ contract ByzantineWorkerTest is Test {
 
         mockVerifier.setShouldPass(true);
 
-        uint256[] memory inputs = new uint256[](7);
+        uint256[] memory inputs = new uint256[](8);
         inputs[0] = hashLo;
         inputs[1] = hashHi;
         inputs[2] = 1111;
@@ -252,6 +255,7 @@ contract ByzantineWorkerTest is Test {
         inputs[4] = 100;
         inputs[5] = coordinator.maxErrorBound() + 1;  // Exceeds maximum
         inputs[6] = 1;
+        inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(inputs[5], inputs[6], modelId, 1e18);
 
         bytes memory proof = new bytes(320);
 
@@ -283,7 +287,7 @@ contract ByzantineWorkerTest is Test {
             uint256 newLo = currentLo + 1;
             uint256 newHi = currentHi + 1;
 
-            uint256[] memory inputs = new uint256[](7);
+            uint256[] memory inputs = new uint256[](8);
             inputs[0] = currentLo;
             inputs[1] = currentHi;
             inputs[2] = newLo;
@@ -291,6 +295,7 @@ contract ByzantineWorkerTest is Test {
             inputs[4] = 100;
             inputs[5] = errorPerRound;
             inputs[6] = i + 1;
+            inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(inputs[5], inputs[6], modelId, 1e18);
 
             bytes memory proof = new bytes(320);
 
@@ -341,7 +346,7 @@ contract ByzantineWorkerTest is Test {
 
         // First Sybil submits valid
         mockVerifier.setShouldPass(true);
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         vm.prank(sybilCluster[0]);
@@ -362,7 +367,7 @@ contract ByzantineWorkerTest is Test {
 
         mockVerifier.setShouldPass(true);
 
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         // Fast forward past deadline
@@ -500,7 +505,7 @@ contract ByzantineWorkerTest is Test {
         _stakeAllWorkers(modelId, STANDARD_STAKE);
         mockVerifier.setShouldPass(true);
 
-        uint256[] memory inputs = _createValidPublicInputs(12345, 67890, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(12345, 67890, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         vm.prank(honestWorkers[0]);
@@ -522,7 +527,7 @@ contract ByzantineWorkerTest is Test {
         // Byzantine workers get slashed
         mockVerifier.setShouldPass(false);
 
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         for (uint256 i = 0; i < byzantineWorkers.length; i++) {
@@ -548,7 +553,7 @@ contract ByzantineWorkerTest is Test {
 
         mockVerifier.setShouldPass(false);
 
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         // All Byzantine workers try invalid proofs
@@ -575,7 +580,7 @@ contract ByzantineWorkerTest is Test {
         // Byzantine submits invalid
         mockVerifier.setShouldPass(false);
 
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         vm.prank(byzantineWorkers[0]);
@@ -598,7 +603,7 @@ contract ByzantineWorkerTest is Test {
 
         mockVerifier.setShouldPass(true);
 
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         // Honest completes round 1
@@ -623,7 +628,7 @@ contract ByzantineWorkerTest is Test {
         // Byzantine submits "valid" proof
         mockVerifier.setShouldPass(true);
 
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         vm.prank(byzantineWorkers[0]);
@@ -656,7 +661,7 @@ contract ByzantineWorkerTest is Test {
         // Byzantine submits invalid
         mockVerifier.setShouldPass(false);
 
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         vm.prank(byzantineWorkers[0]);
@@ -681,7 +686,7 @@ contract ByzantineWorkerTest is Test {
 
         mockVerifier.setShouldPass(false);
 
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         vm.prank(byzantineWorkers[0]);
@@ -701,7 +706,7 @@ contract ByzantineWorkerTest is Test {
         // Get slashed
         mockVerifier.setShouldPass(false);
 
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         vm.prank(byzantineWorkers[0]);

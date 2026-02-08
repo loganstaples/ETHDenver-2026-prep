@@ -5,6 +5,7 @@ import "forge-std/Test.sol";
 import "../src/verification/HelixVerifier.sol";
 import "../src/verification/Halo2Verifier.sol";
 import "../src/mocks/MockVerifier.sol";
+import "./ProofFixtures.t.sol";
 
 /// @title VerifierTest
 /// @notice Comprehensive tests for verifier contracts
@@ -19,7 +20,7 @@ contract VerifierTest is Test {
 
     function setUp() public {
         helixVerifier = new HelixVerifier();
-        halo2Verifier = new Halo2Verifier();
+        halo2Verifier = new Halo2Verifier(Halo2VKDefaults.g2Generator());
         mockVerifier = new MockVerifier();
     }
 
@@ -39,7 +40,7 @@ contract VerifierTest is Test {
 
     function test_Halo2Verifier_RejectsWrongInputCount() public view {
         bytes memory proof = new bytes(320);
-        uint256[] memory inputs = new uint256[](5); // Wrong count, should be 7
+        uint256[] memory inputs = new uint256[](5); // Wrong count, should be 8
 
         bool valid = halo2Verifier.verifyProof(proof, inputs);
         assertFalse(valid);
@@ -192,7 +193,7 @@ contract VerifierTest is Test {
         helixVerifier.initialize(selectors, perms, 1024, 12345, 1000);
 
         bytes memory proof = new bytes(256);
-        uint256[] memory inputs = new uint256[](5); // Should be 7
+        uint256[] memory inputs = new uint256[](5); // Should be 8
 
         bool valid = helixVerifier.verifyProof(proof, inputs);
         assertFalse(valid);
@@ -378,7 +379,7 @@ contract VerifierTest is Test {
     // ============ Helper Functions ============
 
     function _createValidPublicInputs() internal pure returns (uint256[] memory) {
-        uint256[] memory inputs = new uint256[](7);
+        uint256[] memory inputs = new uint256[](8);
         inputs[0] = 1;     // oldHashLo
         inputs[1] = 2;     // oldHashHi
         inputs[2] = 3;     // newHashLo
@@ -386,6 +387,7 @@ contract VerifierTest is Test {
         inputs[4] = 100;   // loss
         inputs[5] = 10;    // errorBound
         inputs[6] = 1;     // stepNumber
+        inputs[7] = 0;     // errorChecksum (placeholder for verifier-only tests)
         return inputs;
     }
 

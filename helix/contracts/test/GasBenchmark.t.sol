@@ -6,6 +6,7 @@ import "../src/core/HelixCoordinatorV2.sol";
 import "../src/verification/Halo2Verifier.sol";
 import "../src/verification/HelixVerifier.sol";
 import "../src/mocks/MockVerifier.sol";
+import "./ProofFixtures.t.sol";
 
 /// @title GasBenchmark
 /// @notice Comprehensive gas benchmarking for all HELIX contract operations
@@ -37,7 +38,7 @@ contract GasBenchmark is Test {
         // Deploy contracts
         mockVerifier = new MockVerifier();
         coordinator = new HelixCoordinatorV2(address(mockVerifier), treasury);
-        halo2Verifier = new Halo2Verifier();
+        halo2Verifier = new Halo2Verifier(Halo2VKDefaults.g2Generator());
         helixVerifier = new HelixVerifier();
 
         // Fund provers
@@ -121,6 +122,7 @@ contract GasBenchmark is Test {
 
         bytes memory proof = _createValidProof();
         uint256[] memory inputs = _createValidPublicInputs();
+        inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(inputs[5], inputs[6], modelId, 1e18);
 
         vm.prank(prover1);
         uint256 gasBefore = gasleft();
@@ -141,6 +143,7 @@ contract GasBenchmark is Test {
 
         bytes memory proof = _createValidProof();
         uint256[] memory inputs = _createValidPublicInputs();
+        inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(inputs[5], inputs[6], modelId, 1e18);
 
         vm.prank(prover1);
         uint256 gasBefore = gasleft();
@@ -385,6 +388,7 @@ contract GasBenchmark is Test {
         // 4. Submit proof
         bytes memory proof = _createValidProof();
         uint256[] memory inputs = _createValidPublicInputsForCommitment(100, 200);
+        inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(inputs[5], inputs[6], newModelId, 1e18);
 
         vm.prank(prover1);
         gasBefore = gasleft();
@@ -427,7 +431,7 @@ contract GasBenchmark is Test {
     /// @notice Create valid public inputs that match the model's initial commitment
     /// @dev The initial commitment (12345) was registered in setUp
     function _createValidPublicInputs() internal pure returns (uint256[] memory) {
-        uint256[] memory inputs = new uint256[](7);
+        uint256[] memory inputs = new uint256[](8);
         // Use lo=1, hi=2 as our "old" values
         // The model must be registered with commitment = keccak256(1, 2)
         inputs[0] = 1;         // oldHashLo
@@ -437,12 +441,13 @@ contract GasBenchmark is Test {
         inputs[4] = 100;       // loss
         inputs[5] = 10;        // errorBound
         inputs[6] = 1;         // stepNumber
+        inputs[7] = 0;         // errorChecksum (placeholder for verifier-only tests)
         return inputs;
     }
 
     /// @notice Create public inputs for a model with specific lo/hi commitment values
     function _createValidPublicInputsForCommitment(uint256 lo, uint256 hi) internal pure returns (uint256[] memory) {
-        uint256[] memory inputs = new uint256[](7);
+        uint256[] memory inputs = new uint256[](8);
         inputs[0] = lo;        // oldHashLo
         inputs[1] = hi;        // oldHashHi
         inputs[2] = 3;         // newHashLo
@@ -450,6 +455,7 @@ contract GasBenchmark is Test {
         inputs[4] = 100;       // loss
         inputs[5] = 10;        // errorBound
         inputs[6] = 1;         // stepNumber
+        inputs[7] = 0;         // errorChecksum (placeholder, set by caller for coordinator tests)
         return inputs;
     }
 }

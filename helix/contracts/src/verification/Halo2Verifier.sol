@@ -5,7 +5,8 @@ import "../interfaces/IHelixVerifier.sol";
 
 /// @title Halo2Verifier
 /// @notice Gas-optimized BN254 pairing-based verifier for Halo2 KZG proofs
-/// @dev Implements full pairing verification using Ethereum precompiles with assembly optimizations
+/// @dev Implements full pairing verification using Ethereum precompiles with assembly optimizations.
+///      The SRS [s]₂ point is set at deployment via constructor, allowing parameterized VK setup.
 contract Halo2Verifier is IHelixVerifier {
     // ============ BN254 Curve Constants ============
 
@@ -20,19 +21,13 @@ contract Halo2Verifier is IHelixVerifier {
     uint256 internal constant EC_MUL = 0x07;
     uint256 internal constant EC_PAIRING = 0x08;
 
-    // ============ Verification Key Constants ============
+    // ============ Verification Key (Fixed Constants) ============
 
     /// @notice G1 generator point
     uint256 internal constant VK_G1_X = 1;
     uint256 internal constant VK_G1_Y = 2;
 
-    /// @notice SRS [s]₂ point (G2 coordinates)
-    uint256 internal constant VK_S_G2_X0 = 11559732032986387107991004021392285783925812861821192530917403151452391805634;
-    uint256 internal constant VK_S_G2_X1 = 10857046999023057135944570762232829481370756359578518086990519993285655852781;
-    uint256 internal constant VK_S_G2_Y0 = 4082367875863433681332203403145435568316851327593401208105741076214120093531;
-    uint256 internal constant VK_S_G2_Y1 = 8495653923123431417604973247489272438418190587263600148770280649306958101930;
-
-    /// @notice Negative G2 generator -[1]₂
+    /// @notice Negative G2 generator -[1]₂ (fixed, independent of SRS)
     uint256 internal constant VK_NEG_G2_X0 = 11559732032986387107991004021392285783925812861821192530917403151452391805634;
     uint256 internal constant VK_NEG_G2_X1 = 10857046999023057135944570762232829481370756359578518086990519993285655852781;
     uint256 internal constant VK_NEG_G2_Y0 = 17805874995975841540914202342111839520379459829704422454583296818431106115052;
@@ -44,6 +39,14 @@ contract Halo2Verifier is IHelixVerifier {
     /// @notice Number of public inputs (MLTrainingStepCircuit has 8)
     /// Inputs: [oldHashLo, oldHashHi, newHashLo, newHashHi, loss, errorBound, stepNumber, errorChecksum]
     uint256 internal constant NUM_INSTANCES = 8;
+
+    // ============ Verification Key (Immutable - set at deployment) ============
+
+    /// @notice SRS [s]₂ point (G2 coordinates) - parameterized per trusted setup
+    uint256 public immutable VK_S_G2_X0;
+    uint256 public immutable VK_S_G2_X1;
+    uint256 public immutable VK_S_G2_Y0;
+    uint256 public immutable VK_S_G2_Y1;
 
     // ============ State ============
 
@@ -61,8 +64,15 @@ contract Halo2Verifier is IHelixVerifier {
 
     // ============ Constructor ============
 
-    constructor() {
+    /// @notice Deploys the verifier with the given SRS [s]₂ point
+    /// @param sG2 The SRS G2 point coordinates: [x0, x1, y0, y1]
+    ///        For testing with trivial SRS (s=1), pass the G2 generator via Halo2VKDefaults.g2Generator()
+    constructor(uint256[4] memory sG2) {
         owner = msg.sender;
+        VK_S_G2_X0 = sG2[0];
+        VK_S_G2_X1 = sG2[1];
+        VK_S_G2_Y0 = sG2[2];
+        VK_S_G2_Y1 = sG2[3];
     }
 
     // ============ External Functions ============
@@ -354,10 +364,17 @@ contract Halo2Verifier is IHelixVerifier {
     }
 
     /// @notice Optimized pairing check using assembly
+    /// @dev Checks: e(A, -[1]₂) * e(B, [s]₂) == 1
     function _ecPairingOptimized(
         uint256 ax, uint256 ay,
         uint256 bx, uint256 by
     ) internal view returns (bool success) {
+        // Load immutables into local vars for assembly access
+        uint256 sg2x0 = VK_S_G2_X0;
+        uint256 sg2x1 = VK_S_G2_X1;
+        uint256 sg2y0 = VK_S_G2_Y0;
+        uint256 sg2y1 = VK_S_G2_Y1;
+
         assembly {
             let ptr := mload(0x40)
 
@@ -372,10 +389,10 @@ contract Halo2Verifier is IHelixVerifier {
             // Second pairing: (B, S_G2)
             mstore(add(ptr, 192), bx)
             mstore(add(ptr, 224), by)
-            mstore(add(ptr, 256), VK_S_G2_X0)
-            mstore(add(ptr, 288), VK_S_G2_X1)
-            mstore(add(ptr, 320), VK_S_G2_Y0)
-            mstore(add(ptr, 352), VK_S_G2_Y1)
+            mstore(add(ptr, 256), sg2x0)
+            mstore(add(ptr, 288), sg2x1)
+            mstore(add(ptr, 320), sg2y0)
+            mstore(add(ptr, 352), sg2y1)
 
             // Pairing precompile: returns 1 if valid
             success := staticcall(gas(), EC_PAIRING, ptr, 384, ptr, 32)
@@ -385,35 +402,46 @@ contract Halo2Verifier is IHelixVerifier {
         }
     }
 
-    /// @notice Optimized Fiat-Shamir challenge computation
+    /// @notice Fiat-Shamir challenge computation matching Rust Keccak256Write transcript
+    /// @dev Protocol (keccak mode):
+    ///   1. Absorb all instances (public inputs) as big-endian uint256 values
+    ///   2. Absorb all proof bytes (advice commitments + opening proofs in big-endian)
+    ///   3. Compute seed = keccak256(instances || proof)
+    ///   4. alpha = uint256(seed) % R                           [squeeze_count = 0]
+    ///   5. beta  = uint256(keccak256(seed || uint256(1))) % R  [squeeze_count = 1]
+    ///   6. gamma = uint256(keccak256(seed || uint256(2))) % R  [squeeze_count = 2]
+    ///
+    /// This matches the Rust Keccak256Write::squeeze_challenge() pattern where:
+    ///   - squeeze_count=0: hash(state) reduced mod R
+    ///   - squeeze_count=N: hash(hash(state) || N) reduced mod R
     function _computeChallengesOptimized(
         bytes memory proof,
         uint256[] memory instances
     ) internal pure returns (uint256 alpha, uint256 beta, uint256 gamma) {
         bytes32 seed;
         assembly {
-            // Compute keccak256(proof || instances) efficiently
-            let proofLen := mload(proof)
             let instancesLen := mul(mload(instances), 32)
-            let totalLen := add(proofLen, instancesLen)
+            let proofLen := mload(proof)
+            let totalLen := add(instancesLen, proofLen)
 
             let ptr := mload(0x40)
 
-            // Copy proof data
-            let proofData := add(proof, 32)
-            for { let i := 0 } lt(i, proofLen) { i := add(i, 32) } {
-                mstore(add(ptr, i), mload(add(proofData, i)))
-            }
-
-            // Copy instances data
+            // Copy instances first (matching transcript absorption order)
             let instancesData := add(instances, 32)
             for { let i := 0 } lt(i, instancesLen) { i := add(i, 32) } {
-                mstore(add(add(ptr, proofLen), i), mload(add(instancesData, i)))
+                mstore(add(ptr, i), mload(add(instancesData, i)))
+            }
+
+            // Copy proof data after instances
+            let proofData := add(proof, 32)
+            for { let i := 0 } lt(i, proofLen) { i := add(i, 32) } {
+                mstore(add(add(ptr, instancesLen), i), mload(add(proofData, i)))
             }
 
             seed := keccak256(ptr, totalLen)
         }
 
+        // Challenge derivation matching Rust Keccak256Write::squeeze_challenge()
         alpha = uint256(seed) % R;
         beta = uint256(keccak256(abi.encodePacked(seed, uint256(1)))) % R;
         gamma = uint256(keccak256(abi.encodePacked(seed, uint256(2)))) % R;
@@ -467,5 +495,18 @@ contract Halo2Verifier is IHelixVerifier {
         this.batchVerify(proofs, publicInputsArray);
         gasUsed = startGas - gasleft();
         perProofGas = gasUsed / proofs.length;
+    }
+}
+
+/// @title Halo2VKDefaults
+/// @notice Provides default VK values for testing (BN254 G2 generator, s=1)
+library Halo2VKDefaults {
+    /// @notice Returns the BN254 G2 generator point (trivial SRS with s=1)
+    /// @dev Use this for tests. For production, use the real SRS [s]₂ from trusted setup.
+    function g2Generator() internal pure returns (uint256[4] memory sG2) {
+        sG2[0] = 11559732032986387107991004021392285783925812861821192530917403151452391805634;
+        sG2[1] = 10857046999023057135944570762232829481370756359578518086990519993285655852781;
+        sG2[2] = 4082367875863433681332203403145435568316851327593401208105741076214120093531;
+        sG2[3] = 8495653923123431417604973247489272438418190587263600148770280649306958101930;
     }
 }

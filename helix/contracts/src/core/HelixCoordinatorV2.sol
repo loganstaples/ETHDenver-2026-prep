@@ -595,26 +595,71 @@ contract HelixCoordinatorV2 {
 
     /// @notice Computes the expected error checksum for verification
     /// @dev Matches the Rust implementation in helix-core/types/error_commitment.rs
-    /// @param errorBound The step error bound (scaled)
-    /// @param stepNumber The training step number
-    /// @param modelId The model identifier
-    /// @param errorBudget The maximum error budget (scaled)
-    /// @return The first 8 bytes of keccak256 hash as uint64
+    ///      Layout: SHA256(errorBound_LE64 || stepNumber_LE64 || modelId_32bytes || errorBudget_LE64)
+    ///      Total input: 56 bytes. Output: first 8 bytes interpreted as LE u64.
+    /// @param errorBound The step error bound (truncated to u64)
+    /// @param stepNumber The training step number (truncated to u64)
+    /// @param modelId The model identifier (as bytes32, big-endian)
+    /// @param errorBudget The maximum error budget (truncated to u64)
+    /// @return The first 8 bytes of SHA256 hash interpreted as little-endian u64
     function _computeErrorChecksum(
         uint256 errorBound,
         uint256 stepNumber,
         uint256 modelId,
         uint256 errorBudget
     ) internal pure returns (uint256) {
-        // Compute keccak256 of packed data (matches Rust checksum_compact())
-        bytes32 hash = keccak256(abi.encodePacked(
-            errorBound,
-            stepNumber,
-            bytes32(modelId), // Pad modelId to 32 bytes
-            errorBudget
-        ));
-        // Return first 8 bytes as uint64 (compact checksum)
-        return uint256(uint64(bytes8(hash)));
+        // Build the 56-byte preimage matching Rust's compute_checksum():
+        //   error_scaled.to_le_bytes()  (8 bytes)
+        //   step_number.to_le_bytes()   (8 bytes)
+        //   model_id                    (32 bytes)
+        //   budget_scaled.to_le_bytes() (8 bytes)
+        bytes memory data = new bytes(56);
+        assembly {
+            let ptr := add(data, 32)
+
+            // Write errorBound as LE u64 (byte-swap from BE)
+            let eb := and(errorBound, 0xFFFFFFFFFFFFFFFF)
+            // Reverse bytes: swap pairs at each level
+            eb := or(and(shr(8, eb), 0x00FF00FF00FF00FF), shl(8, and(eb, 0x00FF00FF00FF00FF)))
+            eb := or(and(shr(16, eb), 0x0000FFFF0000FFFF), shl(16, and(eb, 0x0000FFFF0000FFFF)))
+            eb := or(shr(32, eb), shl(32, and(eb, 0x00000000FFFFFFFF)))
+            // Store as big-endian bytes8 (which now represents LE u64 in memory)
+            mstore(ptr, shl(192, eb))
+
+            // Write stepNumber as LE u64
+            let sn := and(stepNumber, 0xFFFFFFFFFFFFFFFF)
+            sn := or(and(shr(8, sn), 0x00FF00FF00FF00FF), shl(8, and(sn, 0x00FF00FF00FF00FF)))
+            sn := or(and(shr(16, sn), 0x0000FFFF0000FFFF), shl(16, and(sn, 0x0000FFFF0000FFFF)))
+            sn := or(shr(32, sn), shl(32, and(sn, 0x00000000FFFFFFFF)))
+            mstore(add(ptr, 8), shl(192, sn))
+
+            // Write modelId as 32 bytes (big-endian, matching Rust [u8; 32])
+            mstore(add(ptr, 16), modelId)
+
+            // Write errorBudget as LE u64
+            let bg := and(errorBudget, 0xFFFFFFFFFFFFFFFF)
+            bg := or(and(shr(8, bg), 0x00FF00FF00FF00FF), shl(8, and(bg, 0x00FF00FF00FF00FF)))
+            bg := or(and(shr(16, bg), 0x0000FFFF0000FFFF), shl(16, and(bg, 0x0000FFFF0000FFFF)))
+            bg := or(shr(32, bg), shl(32, and(bg, 0x00000000FFFFFFFF)))
+            mstore(add(ptr, 48), shl(192, bg))
+        }
+
+        bytes32 hash = sha256(data);
+
+        // Extract first 8 bytes as LE u64 (matching Rust u64::from_le_bytes(hash[0..8]))
+        // hash[0] is the first SHA256 output byte. LE u64 = h[0] + h[1]*256 + ... + h[7]*2^56
+        uint256 result;
+        assembly {
+            // bytes32 in Solidity: hash[0] at bits 248-255, hash[1] at 240-247, etc.
+            // Extract first 8 bytes as BE u64, then byte-swap to LE
+            let be := shr(192, hash) // top 64 bits = first 8 bytes as BE u64
+            // Reverse bytes to get LE interpretation
+            be := or(and(shr(8, be), 0x00FF00FF00FF00FF), shl(8, and(be, 0x00FF00FF00FF00FF)))
+            be := or(and(shr(16, be), 0x0000FFFF0000FFFF), shl(16, and(be, 0x0000FFFF0000FFFF)))
+            be := or(shr(32, be), shl(32, and(be, 0x00000000FFFFFFFF)))
+            result := be
+        }
+        return result;
     }
 
     // ============ Slashing ============

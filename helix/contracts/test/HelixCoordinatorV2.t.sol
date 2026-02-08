@@ -4,6 +4,7 @@ pragma solidity ^0.8.19;
 import "forge-std/Test.sol";
 import "../src/core/HelixCoordinatorV2.sol";
 import "../src/verification/Halo2Verifier.sol";
+import "./ProofFixtures.t.sol";
 
 /// @title HelixCoordinatorV2Test
 /// @notice Integration tests for HelixCoordinatorV2 with real Halo2Verifier
@@ -19,22 +20,6 @@ contract HelixCoordinatorV2Test is Test {
     uint256 constant MIN_STAKE = 0.1 ether;
     uint256 constant ROUND_DURATION = 1 hours;
 
-    /// @notice Helper function to compute error checksum (matches contract implementation)
-    function _computeErrorChecksum(
-        uint256 errorBound,
-        uint256 stepNumber,
-        uint256 modelId,
-        uint256 errorBudget
-    ) internal pure returns (uint256) {
-        bytes32 hash = keccak256(abi.encodePacked(
-            errorBound,
-            stepNumber,
-            bytes32(modelId),
-            errorBudget
-        ));
-        return uint256(uint64(bytes8(hash)));
-    }
-
     event ModelRegistered(uint256 indexed modelId, address indexed owner, uint256 initialCommitment, uint256 minStake, string ipfsHash);
     event RoundStarted(uint256 indexed modelId, uint256 indexed roundId, uint256 deadline, uint256 modelCommitment);
     event Staked(address indexed prover, uint256 indexed modelId, uint256 amount, uint256 totalStake);
@@ -47,7 +32,7 @@ contract HelixCoordinatorV2Test is Test {
         prover2 = makeAddr("prover2");
 
         // Deploy verifier and coordinator
-        verifier = new Halo2Verifier();
+        verifier = new Halo2Verifier(Halo2VKDefaults.g2Generator());
         coordinator = new HelixCoordinatorV2(address(verifier), treasury);
 
         // Fund provers
@@ -188,7 +173,7 @@ contract HelixCoordinatorV2Test is Test {
         publicInputs[4] = 100; // loss
         publicInputs[5] = 10; // error_bound
         publicInputs[6] = 1; // step
-        publicInputs[7] = _computeErrorChecksum(10, 1, modelId, coordinator.maxErrorBound()); // error_checksum
+        publicInputs[7] = ProofFixtureHardcoded.computeErrorChecksum(10, 1, modelId, coordinator.maxErrorBound()); // error_checksum
 
         uint256 treasuryBefore = treasury.balance;
 
@@ -283,7 +268,7 @@ contract HelixCoordinatorV2Test is Test {
         publicInputs[4] = 100;
         publicInputs[5] = 10;
         publicInputs[6] = 1;
-        publicInputs[7] = _computeErrorChecksum(10, 1, modelId, coordinator.maxErrorBound());
+        publicInputs[7] = ProofFixtureHardcoded.computeErrorChecksum(10, 1, modelId, coordinator.maxErrorBound());
 
         vm.prank(prover1);
         coordinator.submitProof(modelId, 1, invalidProof, publicInputs);
@@ -313,7 +298,7 @@ contract HelixCoordinatorV2Test is Test {
     }
 
     function test_SetVerifier() public {
-        Halo2Verifier newVerifier = new Halo2Verifier();
+        Halo2Verifier newVerifier = new Halo2Verifier(Halo2VKDefaults.g2Generator());
         coordinator.setVerifier(address(newVerifier));
         assertEq(address(coordinator.verifier()), address(newVerifier));
     }
@@ -350,7 +335,7 @@ contract HelixCoordinatorV2Test is Test {
         publicInputs[4] = 100;
         publicInputs[5] = 10;
         publicInputs[6] = 1;
-        publicInputs[7] = _computeErrorChecksum(10, 1, modelId, coordinator.maxErrorBound());
+        publicInputs[7] = ProofFixtureHardcoded.computeErrorChecksum(10, 1, modelId, coordinator.maxErrorBound());
 
         vm.prank(prover1);
         coordinator.submitProof(modelId, 1, invalidProof, publicInputs);

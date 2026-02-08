@@ -4,6 +4,7 @@ pragma solidity ^0.8.19;
 import "forge-std/Test.sol";
 import "../src/core/HelixCoordinatorV2.sol";
 import "../src/mocks/MockVerifier.sol";
+import "./ProofFixtures.t.sol";
 
 /// @title FuzzTest
 /// @notice Fuzz testing for HELIX protocol staking and unstaking flows
@@ -190,7 +191,7 @@ contract FuzzTest is Test {
         // Submit invalid proof
         mockVerifier.setShouldPass(false);
 
-        uint256[] memory inputs = new uint256[](7);
+        uint256[] memory inputs = new uint256[](8);
         inputs[0] = hashLo;
         inputs[1] = hashHi;
         inputs[2] = 1111;
@@ -198,6 +199,7 @@ contract FuzzTest is Test {
         inputs[4] = 100;
         inputs[5] = 10;
         inputs[6] = 1;
+        inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(10, 1, modelId, 1e18);
 
         bytes memory proof = new bytes(320);
 
@@ -245,7 +247,7 @@ contract FuzzTest is Test {
 
         mockVerifier.setShouldPass(false);
 
-        uint256[] memory inputs = new uint256[](7);
+        uint256[] memory inputs = new uint256[](8);
         inputs[0] = hashLo;
         inputs[1] = hashHi;
         inputs[2] = 1111;
@@ -253,6 +255,7 @@ contract FuzzTest is Test {
         inputs[4] = 100;
         inputs[5] = 10;
         inputs[6] = 1;
+        inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(10, 1, modelId, 1e18);
 
         bytes memory proof = new bytes(320);
 
@@ -318,7 +321,7 @@ contract FuzzTest is Test {
 
         mockVerifier.setShouldPass(true);
 
-        uint256[] memory inputs = new uint256[](7);
+        uint256[] memory inputs = new uint256[](8);
         inputs[0] = hashLo;
         inputs[1] = hashHi;
         inputs[2] = 1111;
@@ -326,6 +329,7 @@ contract FuzzTest is Test {
         inputs[4] = 100;
         inputs[5] = errorBound;  // Fuzzed error bound
         inputs[6] = 1;
+        inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(errorBound, 1, modelId, 1e18);
 
         bytes memory proof = new bytes(320);
 
@@ -429,7 +433,7 @@ contract FuzzTest is Test {
 
             // Since proofs fail, the model commitment stays the same
             // So we always use the same old commitment
-            uint256[] memory inputs = new uint256[](7);
+            uint256[] memory inputs = new uint256[](8);
             inputs[0] = hashLo;
             inputs[1] = hashHi;
             inputs[2] = hashLo + 1;  // New commitment values (won't be stored since proof fails)
@@ -437,6 +441,7 @@ contract FuzzTest is Test {
             inputs[4] = 100;
             inputs[5] = 10;
             inputs[6] = i + 1;
+            inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(10, i + 1, modelId, 1e18);
 
             bytes memory proof = new bytes(320);
 
@@ -478,7 +483,7 @@ contract FuzzTest is Test {
 
         mockVerifier.setShouldPass(false);
 
-        uint256[] memory inputs = new uint256[](7);
+        uint256[] memory inputs = new uint256[](8);
         inputs[0] = hashLo;
         inputs[1] = hashHi;
         inputs[2] = 1111;
@@ -486,6 +491,7 @@ contract FuzzTest is Test {
         inputs[4] = 100;
         inputs[5] = 10;
         inputs[6] = 1;
+        inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(10, 1, modelId, 1e18);
 
         bytes memory proof = new bytes(320);
 

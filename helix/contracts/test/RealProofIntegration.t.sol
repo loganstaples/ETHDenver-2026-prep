@@ -68,7 +68,7 @@ contract RealProofIntegrationTest is Test {
         maliciousProver = makeAddr("maliciousProver");
 
         // Deploy real verifier
-        verifier = new Halo2Verifier();
+        verifier = new Halo2Verifier(Halo2VKDefaults.g2Generator());
 
         // Deploy coordinator with real verifier
         coordinator = new HelixCoordinatorV2(address(verifier), treasury);
@@ -92,7 +92,7 @@ contract RealProofIntegrationTest is Test {
 
         // Verify format
         assertEq(proof.length, 320, "Proof should be 320 bytes");
-        assertEq(inputs.length, 7, "Should have 7 public inputs");
+        assertEq(inputs.length, 8, "Should have 8 public inputs");
 
         // Verify public inputs structure
         assertEq(inputs[6], 1, "Step number should be 1");
@@ -149,6 +149,7 @@ contract RealProofIntegrationTest is Test {
         // Create proof with matching public inputs
         bytes memory proof = ProofFixtureHardcoded.createValidProof();
         uint256[] memory inputs = ProofFixtureHardcoded.createValidPublicInputsStep1();
+        inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(inputs[5], inputs[6], modelId, 1e18);
 
         // Submit proof (will fail verification, triggering slash)
         vm.prank(prover1);
@@ -185,7 +186,7 @@ contract RealProofIntegrationTest is Test {
         assertEq(inputs[6], 1, "stepNumber incorrect");
 
         // All should be valid field elements (< R)
-        for (uint i = 0; i < 7; i++) {
+        for (uint i = 0; i < 8; i++) {
             assertTrue(inputs[i] < R, "Public input exceeds field order");
         }
     }
@@ -262,6 +263,7 @@ contract RealProofIntegrationTest is Test {
         // Submit invalid proof
         bytes memory invalidProof = ProofFixtureHardcoded.createInvalidProof();
         uint256[] memory inputs = ProofFixtureHardcoded.createValidPublicInputsStep1();
+        inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(inputs[5], inputs[6], modelId, 1e18);
 
         // Expect slashing event
         vm.expectEmit(true, true, true, false);
@@ -292,9 +294,7 @@ contract RealProofIntegrationTest is Test {
 
         bytes memory invalidProof = ProofFixtureHardcoded.createInvalidProof();
         uint256[] memory inputs = ProofFixtureHardcoded.createValidPublicInputsStep1();
-
-        // Get record count before
-        // Note: slashingRecords is public array, need to access length
+        inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(inputs[5], inputs[6], modelId, 1e18);
 
         vm.prank(maliciousProver);
         coordinator.submitProof(modelId, 1, invalidProof, inputs);
@@ -459,6 +459,7 @@ contract RealProofIntegrationTest is Test {
         // 4. Submit proof
         bytes memory proof = ProofFixtureHardcoded.createValidProof();
         uint256[] memory inputs = ProofFixtureHardcoded.createValidPublicInputsStep1();
+        inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(inputs[5], inputs[6], modelId, 1e18);
 
         vm.prank(prover1);
         coordinator.submitProof(modelId, 1, proof, inputs);
@@ -544,7 +545,7 @@ contract RealProofGasBenchmark is Test {
     Halo2Verifier public verifier;
 
     function setUp() public {
-        verifier = new Halo2Verifier();
+        verifier = new Halo2Verifier(Halo2VKDefaults.g2Generator());
     }
 
     /// @notice Benchmark single proof verification gas

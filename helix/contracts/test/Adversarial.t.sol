@@ -7,6 +7,7 @@ import "../src/core/TrainingRound.sol";
 import "../src/verification/Halo2Verifier.sol";
 import "../src/verification/AggregationVerifier.sol";
 import "../src/mocks/MockVerifier.sol";
+import "./ProofFixtures.t.sol";
 
 /// @title AdversarialTest
 /// @notice Comprehensive adversarial testing for HELIX protocol security
@@ -47,7 +48,7 @@ contract AdversarialTest is Test {
         frontrunner = makeAddr("frontrunner");
 
         // Deploy contracts
-        realVerifier = new Halo2Verifier();
+        realVerifier = new Halo2Verifier(Halo2VKDefaults.g2Generator());
         mockVerifier = new MockVerifier();
         coordinator = new HelixCoordinatorV2(address(mockVerifier), treasury);
         trainingRound = new TrainingRound();
@@ -77,9 +78,10 @@ contract AdversarialTest is Test {
 
     function _createValidPublicInputs(
         uint256 oldLo, uint256 oldHi,
-        uint256 newLo, uint256 newHi
+        uint256 newLo, uint256 newHi,
+        uint256 modelId
     ) internal pure returns (uint256[] memory) {
-        uint256[] memory inputs = new uint256[](7);
+        uint256[] memory inputs = new uint256[](8);
         inputs[0] = oldLo;
         inputs[1] = oldHi;
         inputs[2] = newLo;
@@ -87,6 +89,7 @@ contract AdversarialTest is Test {
         inputs[4] = 100;  // loss
         inputs[5] = 10;   // error bound
         inputs[6] = 1;    // step
+        inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(inputs[5], inputs[6], modelId, 1e18);
         return inputs;
     }
 
@@ -101,7 +104,7 @@ contract AdversarialTest is Test {
 
         mockVerifier.setShouldPass(false);
 
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         uint256 treasuryBefore = treasury.balance;
@@ -130,7 +133,7 @@ contract AdversarialTest is Test {
 
         // Proof too short (less than 320 bytes)
         bytes memory shortProof = hex"deadbeef";
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
 
         vm.prank(attacker1);
         coordinator.submitProof(modelId, 1, shortProof, inputs);
@@ -147,7 +150,7 @@ contract AdversarialTest is Test {
         vm.prank(attacker1);
         coordinator.stake{value: LARGE_STAKE}(modelId);
 
-        // Only 5 inputs instead of 7
+        // Only 5 inputs instead of 8
         uint256[] memory wrongInputs = new uint256[](5);
         bytes memory proof = new bytes(320);
 
@@ -165,7 +168,7 @@ contract AdversarialTest is Test {
         coordinator.stake{value: LARGE_STAKE}(modelId);
 
         // Public input exceeds scalar field R
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         inputs[4] = type(uint256).max;  // Invalid: exceeds field
 
         bytes memory proof = new bytes(320);
@@ -189,7 +192,7 @@ contract AdversarialTest is Test {
 
         mockVerifier.setShouldPass(true);
 
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         // First submission succeeds
@@ -214,7 +217,7 @@ contract AdversarialTest is Test {
 
         mockVerifier.setShouldPass(true);
 
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         // Honest prover submits first
@@ -239,7 +242,7 @@ contract AdversarialTest is Test {
         mockVerifier.setShouldPass(true);
 
         // Use wrong old commitment values
-        uint256[] memory inputs = _createValidPublicInputs(99999, 88888, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(99999, 88888, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         vm.prank(attacker1);
@@ -258,7 +261,7 @@ contract AdversarialTest is Test {
 
         // Try to set a specific malicious new commitment
         // The commitment is computed from inputs[2] and inputs[3]
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 0, 0);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 0, 0, modelId);
         bytes memory proof = new bytes(320);
 
         vm.prank(attacker1);
@@ -284,7 +287,7 @@ contract AdversarialTest is Test {
 
         mockVerifier.setShouldPass(true);
 
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         // Frontrunner sees honest proof in mempool and submits with higher gas
@@ -314,7 +317,7 @@ contract AdversarialTest is Test {
 
         uint256 newHashLo = 1111;
         uint256 newHashHi = 2222;
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, newHashLo, newHashHi);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, newHashLo, newHashHi, modelId);
         bytes memory proof = new bytes(320);
 
         // Submit to round 1
@@ -332,18 +335,18 @@ contract AdversarialTest is Test {
         coordinator.submitProof(modelId, 2, proof, inputs);
 
         // Even with correct old commitment, replaying same new commitment would be suspicious
-        uint256[] memory inputs2 = _createValidPublicInputs(newHashLo, newHashHi, 3333, 4444);
+        uint256[] memory inputs2 = _createValidPublicInputs(newHashLo, newHashHi, 3333, 4444, modelId);
         vm.prank(honestProver);
         coordinator.submitProof(modelId, 2, proof, inputs2);
     }
 
     /// @notice Test replay attack with Halo2Verifier's verifyAndRecord
     function test_ReplayPreventionVerifier() public {
-        Halo2Verifier verifier = new Halo2Verifier();
+        Halo2Verifier verifier = new Halo2Verifier(Halo2VKDefaults.g2Generator());
 
         bytes memory proof = new bytes(320);
-        uint256[] memory inputs = new uint256[](7);
-        for (uint i = 0; i < 7; i++) inputs[i] = i + 1;
+        uint256[] memory inputs = new uint256[](8);
+        for (uint i = 0; i < 8; i++) inputs[i] = i + 1;
 
         // First verification and record
         bool result1 = verifier.verifyAndRecord(proof, inputs);
@@ -364,7 +367,7 @@ contract AdversarialTest is Test {
 
         mockVerifier.setShouldPass(false);
 
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         // Get slashed
@@ -386,7 +389,7 @@ contract AdversarialTest is Test {
 
         mockVerifier.setShouldPass(false);
 
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         // First slashing
@@ -421,7 +424,7 @@ contract AdversarialTest is Test {
 
         mockVerifier.setShouldPass(false);
 
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         // Slashing should still work, funds stay in contract
@@ -445,7 +448,7 @@ contract AdversarialTest is Test {
         // Proof passes initially (mock says yes)
         mockVerifier.setShouldPass(true);
 
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         vm.prank(attacker1);
@@ -468,7 +471,8 @@ contract AdversarialTest is Test {
         (uint256 modelId,,) = _setupModelAndRound();
 
         bytes memory proof = new bytes(320);
-        uint256[] memory inputs = new uint256[](7);
+        uint256[] memory inputs = new uint256[](8);
+        inputs[7] = 0;
 
         // Try to challenge round that doesn't exist
         vm.expectRevert("Round not completed");
@@ -486,7 +490,7 @@ contract AdversarialTest is Test {
 
         mockVerifier.setShouldPass(true);
 
-        uint256[] memory inputs = new uint256[](7);
+        uint256[] memory inputs = new uint256[](8);
         inputs[0] = hashLo;
         inputs[1] = hashHi;
         inputs[2] = 1111;
@@ -494,6 +498,7 @@ contract AdversarialTest is Test {
         inputs[4] = 100;
         inputs[5] = coordinator.maxErrorBound() + 1;  // Exceeds maximum
         inputs[6] = 1;
+        inputs[7] = 0;  // Checksum irrelevant; reverts before checksum check
 
         bytes memory proof = new bytes(320);
 
@@ -524,7 +529,7 @@ contract AdversarialTest is Test {
             uint256 newLo = currentLo + 1;
             uint256 newHi = currentHi + 1;
 
-            uint256[] memory inputs = new uint256[](7);
+            uint256[] memory inputs = new uint256[](8);
             inputs[0] = currentLo;
             inputs[1] = currentHi;
             inputs[2] = newLo;
@@ -532,6 +537,7 @@ contract AdversarialTest is Test {
             inputs[4] = 100;
             inputs[5] = 100;  // High error bound each round
             inputs[6] = i + 1;
+            inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(inputs[5], inputs[6], modelId, 1e18);
 
             bytes memory proof = new bytes(320);
 
@@ -671,8 +677,9 @@ contract AdversarialTest is Test {
         mockVerifier.setShouldPass(true);
 
         bytes memory proof = new bytes(320);
-        uint256[] memory inputs = new uint256[](7);
+        uint256[] memory inputs = new uint256[](8);
         for (uint i = 0; i < 7; i++) inputs[i] = i + 1;
+        inputs[7] = 0;
 
         vm.prank(attacker1);
         aggregationVerifier.submitContribution(
@@ -694,8 +701,9 @@ contract AdversarialTest is Test {
         mockVerifier.setShouldPass(true);
 
         bytes memory proof = new bytes(320);
-        uint256[] memory inputs = new uint256[](7);
+        uint256[] memory inputs = new uint256[](8);
         for (uint i = 0; i < 7; i++) inputs[i] = i + 1;
+        inputs[7] = 0;
 
         // Add enough contributions
         vm.prank(honestProver);
@@ -728,8 +736,9 @@ contract AdversarialTest is Test {
         mockVerifier.setShouldPass(true);
 
         bytes memory proof = new bytes(320);
-        uint256[] memory inputs = new uint256[](7);
+        uint256[] memory inputs = new uint256[](8);
         for (uint i = 0; i < 7; i++) inputs[i] = i + 1;
+        inputs[7] = 0;
 
         // Error bound exceeds config max (default 1000)
         vm.prank(attacker1);
@@ -782,7 +791,7 @@ contract AdversarialTest is Test {
 
         // Create a very large proof (10KB)
         bytes memory largeProof = new bytes(10240);
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
 
         // Measure gas - should complete within reasonable limits
         uint256 gasBefore = gasleft();
@@ -818,7 +827,7 @@ contract AdversarialTest is Test {
 
             mockVerifier.setShouldPass(false);
 
-            uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111 + i, 2222 + i);
+            uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111 + i, 2222 + i, modelId);
             bytes memory proof = new bytes(320);
 
             vm.prank(attacker);
@@ -840,7 +849,7 @@ contract AdversarialTest is Test {
 
         mockVerifier.setShouldPass(false);
 
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         uint256 expectedSlashAmount = LARGE_STAKE / 2;
@@ -879,7 +888,7 @@ contract AdversarialTest is Test {
 
         // Attacker cannot withdraw before being slashed
         mockVerifier.setShouldPass(false);
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         vm.prank(attacker1);
@@ -900,7 +909,7 @@ contract AdversarialTest is Test {
 
         mockVerifier.setShouldPass(false);
 
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         // Attacker gets slashed
@@ -947,7 +956,7 @@ contract AdversarialTest is Test {
 
         // Attack model 0
         mockVerifier.setShouldPass(false);
-        uint256[] memory inputs = new uint256[](7);
+        uint256[] memory inputs = new uint256[](8);
         inputs[0] = 1;
         inputs[1] = 2;
         inputs[2] = 3;
@@ -955,6 +964,7 @@ contract AdversarialTest is Test {
         inputs[4] = 100;
         inputs[5] = 10;
         inputs[6] = 1;
+        inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(inputs[5], inputs[6], modelIds[0], 1e18);
         bytes memory proof = new bytes(320);
 
         vm.prank(attacker1);
@@ -982,7 +992,7 @@ contract AdversarialTest is Test {
         coordinator.stake{value: LARGE_STAKE}(modelId);
 
         // Test with zero values (except commitment)
-        uint256[] memory inputs = new uint256[](7);
+        uint256[] memory inputs = new uint256[](8);
         inputs[0] = hashLo;
         inputs[1] = hashHi;
         inputs[2] = 0;  // Zero new hash
@@ -990,6 +1000,7 @@ contract AdversarialTest is Test {
         inputs[4] = 0;  // Zero loss
         inputs[5] = 0;  // Zero error bound
         inputs[6] = 0;  // Zero step number
+        inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(inputs[5], inputs[6], modelId, 1e18);
 
         bytes memory proof = new bytes(320);
 
@@ -1009,7 +1020,7 @@ contract AdversarialTest is Test {
         coordinator.stake{value: LARGE_STAKE}(modelId);
 
         // Test with max uint128 for hash values
-        uint256[] memory inputs = new uint256[](7);
+        uint256[] memory inputs = new uint256[](8);
         inputs[0] = hashLo;
         inputs[1] = hashHi;
         inputs[2] = type(uint128).max;  // Large new hash lo
@@ -1017,6 +1028,7 @@ contract AdversarialTest is Test {
         inputs[4] = type(uint128).max;  // Large loss
         inputs[5] = 10;  // Valid error bound
         inputs[6] = type(uint64).max;  // Large step number
+        inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(inputs[5], inputs[6], modelId, 1e18);
 
         bytes memory proof = new bytes(320);
 
@@ -1047,7 +1059,7 @@ contract AdversarialTest is Test {
 
         // First attacker submits invalid
         mockVerifier.setShouldPass(false);
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         vm.prank(attackers[0]);
@@ -1085,7 +1097,7 @@ contract AdversarialTest is Test {
 
         mockVerifier.setShouldPass(true);
 
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         // Warp to exactly deadline (should still work)
@@ -1108,7 +1120,7 @@ contract AdversarialTest is Test {
 
         mockVerifier.setShouldPass(true);
 
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         // Warp to 1 second after deadline
@@ -1133,7 +1145,7 @@ contract AdversarialTest is Test {
 
         mockVerifier.setShouldPass(false);
 
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         vm.prank(attacker1);
@@ -1157,7 +1169,7 @@ contract AdversarialTest is Test {
 
         mockVerifier.setShouldPass(false);
 
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         vm.prank(attacker1);
@@ -1181,7 +1193,7 @@ contract AdversarialTest is Test {
 
         mockVerifier.setShouldPass(false);
 
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         vm.prank(attacker1);
@@ -1207,7 +1219,7 @@ contract AdversarialTest is Test {
 
         mockVerifier.setShouldPass(false);
 
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         // Note: submitProof doesn't have whenNotPaused modifier in current implementation
@@ -1255,14 +1267,16 @@ contract AdversarialTest is Test {
         mockVerifier.setShouldPass(true);
 
         // Submit proof with high error bound
-        uint256[] memory inputs = new uint256[](7);
+        uint256 maxEB = coordinator.maxErrorBound();
+        uint256[] memory inputs = new uint256[](8);
         inputs[0] = hashLo;
         inputs[1] = hashHi;
         inputs[2] = 1111;
         inputs[3] = 2222;
         inputs[4] = 100;
-        inputs[5] = coordinator.maxErrorBound();  // Max allowed error
+        inputs[5] = maxEB;  // Max allowed error
         inputs[6] = 1;
+        inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(inputs[5], inputs[6], modelId, 1e18);
 
         bytes memory proof = new bytes(320);
 
@@ -1271,13 +1285,13 @@ contract AdversarialTest is Test {
 
         // Check accumulated error
         uint256 accumulated = coordinator.getAccumulatedErrorBound(modelId);
-        assertEq(accumulated, coordinator.maxErrorBound());
+        assertEq(accumulated, maxEB);
 
         // Model is still acceptable at this threshold
-        assertTrue(coordinator.isModelErrorAcceptable(modelId, coordinator.maxErrorBound()));
+        assertTrue(coordinator.isModelErrorAcceptable(modelId, maxEB));
 
         // But not acceptable below
-        assertFalse(coordinator.isModelErrorAcceptable(modelId, coordinator.maxErrorBound() - 1));
+        assertFalse(coordinator.isModelErrorAcceptable(modelId, maxEB - 1));
     }
 
     /// @notice Test accumulated error reset
@@ -1289,7 +1303,7 @@ contract AdversarialTest is Test {
 
         mockVerifier.setShouldPass(true);
 
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         vm.prank(honestProver);

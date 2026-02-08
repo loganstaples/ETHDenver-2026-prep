@@ -38,8 +38,8 @@ library ProofFixtures {
     /// @notice Expected proof length in bytes
     uint256 constant EXPECTED_PROOF_LENGTH = 320;
 
-    /// @notice Expected number of public inputs
-    uint256 constant EXPECTED_PUBLIC_INPUTS = 7;
+    /// @notice Expected number of public inputs (7 circuit inputs + 1 errorChecksum)
+    uint256 constant EXPECTED_PUBLIC_INPUTS = 8;
 }
 
 /// @title ProofFixturesLoader
@@ -65,11 +65,11 @@ contract ProofFixturesLoader is Test {
         bytes memory proofHex = vm.parseJson(json, ".proof.bytes_hex");
         fixture.proofBytes = abi.decode(proofHex, (bytes));
 
-        // Parse public inputs array
-        fixture.publicInputs = new uint256[](7);
+        // Parse public inputs array (8 elements including errorChecksum)
+        fixture.publicInputs = new uint256[](8);
         bytes memory inputsData = vm.parseJson(json, ".public_inputs.values_array");
         bytes32[] memory inputsRaw = abi.decode(inputsData, (bytes32[]));
-        for (uint i = 0; i < 7; i++) {
+        for (uint i = 0; i < 8; i++) {
             fixture.publicInputs[i] = uint256(inputsRaw[i]);
         }
 
@@ -121,7 +121,7 @@ contract ProofFixturesLoader is Test {
         proof = vm.parseBytes(hexString);
     }
 
-    /// @notice Creates public inputs array from individual values
+    /// @notice Creates public inputs array from individual values (8 elements)
     /// @return inputs The public inputs array
     function createPublicInputs(
         uint256 oldHashLo,
@@ -130,9 +130,10 @@ contract ProofFixturesLoader is Test {
         uint256 newHashHi,
         uint256 loss,
         uint256 errorBound,
-        uint256 stepNumber
+        uint256 stepNumber,
+        uint256 errorChecksum
     ) public pure returns (uint256[] memory inputs) {
-        inputs = new uint256[](7);
+        inputs = new uint256[](8);
         inputs[0] = oldHashLo;
         inputs[1] = oldHashHi;
         inputs[2] = newHashLo;
@@ -140,6 +141,7 @@ contract ProofFixturesLoader is Test {
         inputs[4] = loss;
         inputs[5] = errorBound;
         inputs[6] = stepNumber;
+        inputs[7] = errorChecksum;
     }
 
     /// @notice Computes the commitment hash matching Solidity's _hashPair
@@ -289,10 +291,64 @@ library ProofFixtureHardcoded {
         }
     }
 
-    /// @notice Creates valid public inputs for step 1
+    /// @notice Computes error checksum matching HelixCoordinatorV2._computeErrorChecksum
+    /// @dev SHA256(errorBound_LE64 || stepNumber_LE64 || modelId_32bytes || errorBudget_LE64)
+    ///      Returns first 8 bytes as LE u64.
+    function computeErrorChecksum(
+        uint256 errorBound,
+        uint256 stepNumber,
+        uint256 modelId,
+        uint256 errorBudget
+    ) internal pure returns (uint256) {
+        bytes memory data = new bytes(56);
+        assembly {
+            let ptr := add(data, 32)
+
+            // Write errorBound as LE u64
+            let eb := and(errorBound, 0xFFFFFFFFFFFFFFFF)
+            eb := or(and(shr(8, eb), 0x00FF00FF00FF00FF), shl(8, and(eb, 0x00FF00FF00FF00FF)))
+            eb := or(and(shr(16, eb), 0x0000FFFF0000FFFF), shl(16, and(eb, 0x0000FFFF0000FFFF)))
+            eb := or(shr(32, eb), shl(32, and(eb, 0x00000000FFFFFFFF)))
+            mstore(ptr, shl(192, eb))
+
+            // Write stepNumber as LE u64
+            let sn := and(stepNumber, 0xFFFFFFFFFFFFFFFF)
+            sn := or(and(shr(8, sn), 0x00FF00FF00FF00FF), shl(8, and(sn, 0x00FF00FF00FF00FF)))
+            sn := or(and(shr(16, sn), 0x0000FFFF0000FFFF), shl(16, and(sn, 0x0000FFFF0000FFFF)))
+            sn := or(shr(32, sn), shl(32, and(sn, 0x00000000FFFFFFFF)))
+            mstore(add(ptr, 8), shl(192, sn))
+
+            // Write modelId as 32 bytes
+            mstore(add(ptr, 16), modelId)
+
+            // Write errorBudget as LE u64
+            let bg := and(errorBudget, 0xFFFFFFFFFFFFFFFF)
+            bg := or(and(shr(8, bg), 0x00FF00FF00FF00FF), shl(8, and(bg, 0x00FF00FF00FF00FF)))
+            bg := or(and(shr(16, bg), 0x0000FFFF0000FFFF), shl(16, and(bg, 0x0000FFFF0000FFFF)))
+            bg := or(shr(32, bg), shl(32, and(bg, 0x00000000FFFFFFFF)))
+            mstore(add(ptr, 48), shl(192, bg))
+        }
+
+        bytes32 hash = sha256(data);
+
+        uint256 result;
+        assembly {
+            let be := shr(192, hash)
+            be := or(and(shr(8, be), 0x00FF00FF00FF00FF), shl(8, and(be, 0x00FF00FF00FF00FF)))
+            be := or(and(shr(16, be), 0x0000FFFF0000FFFF), shl(16, and(be, 0x0000FFFF0000FFFF)))
+            be := or(shr(32, be), shl(32, and(be, 0x00000000FFFFFFFF)))
+            result := be
+        }
+        return result;
+    }
+
+    /// @notice Default max error bound matching HelixCoordinatorV2 default
+    uint256 constant DEFAULT_MAX_ERROR_BOUND = 1e18;
+
+    /// @notice Creates valid public inputs for step 1 (8 elements including errorChecksum)
     /// @return inputs Public inputs array
     function createValidPublicInputsStep1() internal pure returns (uint256[] memory inputs) {
-        inputs = new uint256[](7);
+        inputs = new uint256[](8);
         inputs[0] = 0x3039;  // oldHashLo (12345)
         inputs[1] = 0x3042;  // oldHashHi (12354)
         inputs[2] = 0x7b16;  // newHashLo (31510)
@@ -300,11 +356,14 @@ library ProofFixtureHardcoded {
         inputs[4] = 1000;    // loss
         inputs[5] = 10;      // errorBound
         inputs[6] = 1;       // stepNumber
+        // errorChecksum: computed on-demand by caller using computeErrorChecksum()
+        // For standalone verifier tests (no coordinator), a placeholder is fine
+        inputs[7] = 0;
     }
 
     /// @notice Creates valid public inputs for step 2
     function createValidPublicInputsStep2() internal pure returns (uint256[] memory inputs) {
-        inputs = new uint256[](7);
+        inputs = new uint256[](8);
         inputs[0] = 0x7b16;  // oldHashLo (matches step 1 newHashLo)
         inputs[1] = 0x7b32;  // oldHashHi
         inputs[2] = 0xc350;  // newHashLo (50000)
@@ -312,11 +371,12 @@ library ProofFixtureHardcoded {
         inputs[4] = 800;     // loss (decreased)
         inputs[5] = 8;       // errorBound
         inputs[6] = 2;       // stepNumber
+        inputs[7] = 0;
     }
 
     /// @notice Creates valid public inputs for step 3
     function createValidPublicInputsStep3() internal pure returns (uint256[] memory inputs) {
-        inputs = new uint256[](7);
+        inputs = new uint256[](8);
         inputs[0] = 0xc350;  // oldHashLo
         inputs[1] = 0xc36e;  // oldHashHi
         inputs[2] = 0x10b8e; // newHashLo (68494)
@@ -324,5 +384,13 @@ library ProofFixtureHardcoded {
         inputs[4] = 700;     // loss (decreased)
         inputs[5] = 5;       // errorBound
         inputs[6] = 3;       // stepNumber
+        inputs[7] = 0;
+    }
+
+    /// @notice Creates public inputs with a valid error checksum for coordinator tests
+    /// @param modelId The model ID to compute checksum for
+    function createValidPublicInputsWithChecksum(uint256 modelId) internal pure returns (uint256[] memory inputs) {
+        inputs = createValidPublicInputsStep1();
+        inputs[7] = computeErrorChecksum(inputs[5], inputs[6], modelId, DEFAULT_MAX_ERROR_BOUND);
     }
 }

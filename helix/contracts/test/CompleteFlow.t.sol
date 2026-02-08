@@ -8,6 +8,7 @@ import "../src/verification/Halo2Verifier.sol";
 import "../src/verification/DataVerifier.sol";
 import "../src/verification/SlashingEvidence.sol";
 import "../src/mocks/MockVerifier.sol";
+import "./ProofFixtures.t.sol";
 
 /// @title CompleteFlowTest
 /// @notice Tests the complete flow: register → commit data → train → verify
@@ -140,7 +141,7 @@ contract CompleteFlowTest is Test {
 
         uint256 newHashLo = 11111;
         uint256 newHashHi = 22222;
-        uint256[] memory publicInputs = new uint256[](7);
+        uint256[] memory publicInputs = new uint256[](8);
         publicInputs[0] = hashLo;
         publicInputs[1] = hashHi;
         publicInputs[2] = newHashLo;
@@ -148,6 +149,7 @@ contract CompleteFlowTest is Test {
         publicInputs[4] = 100;  // loss
         publicInputs[5] = 10;   // error bound
         publicInputs[6] = 1;    // step
+        publicInputs[7] = ProofFixtureHardcoded.computeErrorChecksum(publicInputs[5], publicInputs[6], modelId, 1e18);
 
         bytes memory proof = new bytes(320);
 
@@ -290,7 +292,7 @@ contract CompleteFlowTest is Test {
         // Submit invalid proof (should slash)
         mockVerifier.setShouldPass(false);
 
-        uint256[] memory inputs = new uint256[](7);
+        uint256[] memory inputs = new uint256[](8);
         inputs[0] = hashLo;
         inputs[1] = hashHi;
         inputs[2] = 1111;
@@ -298,6 +300,7 @@ contract CompleteFlowTest is Test {
         inputs[4] = 100;
         inputs[5] = 10;
         inputs[6] = 1;
+        inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(inputs[5], inputs[6], modelId, 1e18);
 
         bytes memory proof = new bytes(320);
 
@@ -407,7 +410,7 @@ contract CompleteFlowTest is Test {
 
         mockVerifier.setShouldPass(true);
 
-        uint256[] memory inputs = new uint256[](7);
+        uint256[] memory inputs = new uint256[](8);
         inputs[0] = hashLo;
         inputs[1] = hashHi;
         inputs[2] = 1111;
@@ -415,6 +418,7 @@ contract CompleteFlowTest is Test {
         inputs[4] = 100;
         inputs[5] = 10;
         inputs[6] = 1;
+        inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(inputs[5], inputs[6], modelId, 1e18);
 
         bytes memory proof = new bytes(320);
 

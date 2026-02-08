@@ -7,6 +7,7 @@ import "../src/verification/SlashingEvidence.sol";
 import "../src/token/Staking.sol";
 import "../src/mocks/MockVerifier.sol";
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "./ProofFixtures.t.sol";
 
 /// @title MockHelixToken
 /// @notice Simple ERC20 for testing
@@ -133,9 +134,10 @@ contract SlashingFlowTest is Test {
 
     function _createValidPublicInputs(
         uint256 oldLo, uint256 oldHi,
-        uint256 newLo, uint256 newHi
+        uint256 newLo, uint256 newHi,
+        uint256 modelId
     ) internal pure returns (uint256[] memory) {
-        uint256[] memory inputs = new uint256[](7);
+        uint256[] memory inputs = new uint256[](8);
         inputs[0] = oldLo;
         inputs[1] = oldHi;
         inputs[2] = newLo;
@@ -143,6 +145,7 @@ contract SlashingFlowTest is Test {
         inputs[4] = 100;  // loss
         inputs[5] = 10;   // error bound
         inputs[6] = 1;    // step
+        inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(inputs[5], inputs[6], modelId, 1e18);
         return inputs;
     }
 
@@ -161,7 +164,7 @@ contract SlashingFlowTest is Test {
         mockVerifier.setShouldPass(false);
 
         // Prepare invalid proof
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         // Record initial state
@@ -196,7 +199,7 @@ contract SlashingFlowTest is Test {
         // Byzantine worker submits a valid-looking proof initially
         mockVerifier.setShouldPass(true);
 
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         vm.prank(byzantineWorker);
@@ -227,7 +230,7 @@ contract SlashingFlowTest is Test {
         mockVerifier.setShouldPass(false);
 
         // Submit invalid proof and get slashed
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         vm.prank(byzantineWorker);
@@ -579,8 +582,9 @@ contract SlashingFlowTest is Test {
 
         // Store crypto evidence
         bytes memory invalidProof = new bytes(320);
-        uint256[] memory publicInputs = new uint256[](7);
+        uint256[] memory publicInputs = new uint256[](8);
         for (uint i = 0; i < 7; i++) publicInputs[i] = i + 1;
+        publicInputs[7] = 0;
 
         slashingEvidence.storeCryptoEvidence(
             evidenceId,
@@ -730,7 +734,7 @@ contract SlashingFlowTest is Test {
 
         // First worker submits valid proof
         mockVerifier.setShouldPass(true);
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         vm.prank(workers[0]);
@@ -742,7 +746,7 @@ contract SlashingFlowTest is Test {
 
         // Second worker submits invalid proof
         mockVerifier.setShouldPass(false);
-        uint256[] memory inputs2 = _createValidPublicInputs(1111, 2222, 3333, 4444);
+        uint256[] memory inputs2 = _createValidPublicInputs(1111, 2222, 3333, 4444, modelId);
 
         vm.prank(workers[1]);
         coordinator.submitProof(modelId, 2, proof, inputs2);
@@ -764,7 +768,7 @@ contract SlashingFlowTest is Test {
 
         mockVerifier.setShouldPass(false);
 
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         vm.prank(byzantineWorker);
@@ -806,7 +810,7 @@ contract SlashingFlowTest is Test {
 
         mockVerifier.setShouldPass(false);
 
-        uint256[] memory inputs = _createValidPublicInputs(12345, 67890, 1111, 2222);
+        uint256[] memory inputs = _createValidPublicInputs(12345, 67890, 1111, 2222, modelId);
         bytes memory proof = new bytes(320);
 
         uint256 contractBalanceBefore = address(coordNoTreasury).balance;

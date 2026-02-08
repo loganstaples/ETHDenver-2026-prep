@@ -8,6 +8,7 @@ import "../src/verification/Halo2Verifier.sol";
 import "../src/verification/AggregationVerifier.sol";
 import "../src/verification/BoundsChecker.sol";
 import "../src/mocks/MockVerifier.sol";
+import "./ProofFixtures.t.sol";
 
 /// @title IntegrationTest
 /// @notice Full end-to-end integration tests for HELIX protocol
@@ -55,7 +56,7 @@ contract IntegrationTest is Test {
         attacker = makeAddr("attacker");
 
         // Deploy core contracts
-        verifier = new Halo2Verifier();
+        verifier = new Halo2Verifier(Halo2VKDefaults.g2Generator());
         mockVerifier = new MockVerifier();
         coordinator = new HelixCoordinatorV2(address(mockVerifier), treasury);
         trainingRound = new TrainingRound();
@@ -112,7 +113,7 @@ contract IntegrationTest is Test {
         uint256 newHashHi = 22222;
         uint256 expectedNewCommitment = uint256(keccak256(abi.encodePacked(newHashLo, newHashHi)));
 
-        uint256[] memory publicInputs = new uint256[](7);
+        uint256[] memory publicInputs = new uint256[](8);
         publicInputs[0] = oldHashLo;
         publicInputs[1] = oldHashHi;
         publicInputs[2] = newHashLo;
@@ -120,6 +121,7 @@ contract IntegrationTest is Test {
         publicInputs[4] = 100;  // loss
         publicInputs[5] = 10;   // error bound
         publicInputs[6] = 1;    // step
+        publicInputs[7] = ProofFixtureHardcoded.computeErrorChecksum(publicInputs[5], publicInputs[6], modelId, 1e18);
 
         bytes memory proof = new bytes(320);
 
@@ -169,7 +171,7 @@ contract IntegrationTest is Test {
             uint256 newHashHi = hashHi + round;
             uint256 newCommitment = uint256(keccak256(abi.encodePacked(newHashLo, newHashHi)));
 
-            uint256[] memory inputs = new uint256[](7);
+            uint256[] memory inputs = new uint256[](8);
             inputs[0] = hashLo;
             inputs[1] = hashHi;
             inputs[2] = newHashLo;
@@ -177,6 +179,7 @@ contract IntegrationTest is Test {
             inputs[4] = 100 - round * 10;  // decreasing loss
             inputs[5] = 5;  // error bound per step
             inputs[6] = round;
+            inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(inputs[5], inputs[6], modelId, 1e18);
 
             bytes memory proof = new bytes(320);
 
@@ -224,7 +227,7 @@ contract IntegrationTest is Test {
         // Prover 2 submits first
         uint256 newHashLo = 1111;
         uint256 newHashHi = 2222;
-        uint256[] memory inputs = new uint256[](7);
+        uint256[] memory inputs = new uint256[](8);
         inputs[0] = hashLo;
         inputs[1] = hashHi;
         inputs[2] = newHashLo;
@@ -232,6 +235,7 @@ contract IntegrationTest is Test {
         inputs[4] = 50;
         inputs[5] = 5;
         inputs[6] = 1;
+        inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(inputs[5], inputs[6], modelId, 1e18);
 
         bytes memory proof = new bytes(320);
 
@@ -279,7 +283,7 @@ contract IntegrationTest is Test {
         // Submit invalid proof to model1
         mockVerifier.setShouldPass(false);
 
-        uint256[] memory inputs = new uint256[](7);
+        uint256[] memory inputs = new uint256[](8);
         inputs[0] = 1;
         inputs[1] = 2;
         inputs[2] = 5;
@@ -287,6 +291,7 @@ contract IntegrationTest is Test {
         inputs[4] = 100;
         inputs[5] = 10;
         inputs[6] = 1;
+        inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(inputs[5], inputs[6], model1, 1e18);
 
         bytes memory proof = new bytes(320);
 
@@ -360,7 +365,7 @@ contract IntegrationTest is Test {
         mockVerifier.setShouldPass(true);
 
         // Try to submit with error bound exceeding maximum
-        uint256[] memory inputs = new uint256[](7);
+        uint256[] memory inputs = new uint256[](8);
         inputs[0] = hashLo;
         inputs[1] = hashHi;
         inputs[2] = 501;
@@ -368,6 +373,7 @@ contract IntegrationTest is Test {
         inputs[4] = 100;
         inputs[5] = coordinator.maxErrorBound() + 1;  // Exceeds max
         inputs[6] = 1;
+        inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(inputs[5], inputs[6], modelId, 1e18);
 
         bytes memory proof = new bytes(320);
 
@@ -403,7 +409,7 @@ contract IntegrationTest is Test {
             uint256 newHashLo = hashLo + i + 1;
             uint256 newHashHi = hashHi + i + 1;
 
-            uint256[] memory inputs = new uint256[](7);
+            uint256[] memory inputs = new uint256[](8);
             inputs[0] = hashLo;
             inputs[1] = hashHi;
             inputs[2] = newHashLo;
@@ -411,6 +417,7 @@ contract IntegrationTest is Test {
             inputs[4] = 100;
             inputs[5] = errorBounds[i];
             inputs[6] = i + 1;
+            inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(inputs[5], inputs[6], modelId, 1e18);
 
             bytes memory proof = new bytes(320);
 
@@ -456,7 +463,7 @@ contract IntegrationTest is Test {
         // Fast forward past deadline
         vm.warp(block.timestamp + ROUND_DURATION + 1);
 
-        uint256[] memory inputs = new uint256[](7);
+        uint256[] memory inputs = new uint256[](8);
         inputs[0] = hashLo;
         inputs[1] = hashHi;
         inputs[2] = 901;
@@ -464,6 +471,7 @@ contract IntegrationTest is Test {
         inputs[4] = 100;
         inputs[5] = 10;
         inputs[6] = 1;
+        inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(inputs[5], inputs[6], modelId, 1e18);
 
         bytes memory proof = new bytes(320);
 
@@ -523,7 +531,7 @@ contract IntegrationTest is Test {
         // Submit invalid proof
         mockVerifier.setShouldPass(false);
 
-        uint256[] memory inputs = new uint256[](7);
+        uint256[] memory inputs = new uint256[](8);
         inputs[0] = hashLo;
         inputs[1] = hashHi;
         inputs[2] = 1101;
@@ -531,6 +539,7 @@ contract IntegrationTest is Test {
         inputs[4] = 100;
         inputs[5] = 10;
         inputs[6] = 1;
+        inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(inputs[5], inputs[6], modelId, 1e18);
 
         bytes memory proof = new bytes(320);
 
@@ -609,7 +618,7 @@ contract IntegrationTest is Test {
 
         // Submit contributions
         bytes memory proof = new bytes(320);
-        uint256[] memory inputs = new uint256[](7);
+        uint256[] memory inputs = new uint256[](8);
         inputs[0] = 1;
         inputs[1] = 2;
         inputs[2] = 3;
@@ -617,6 +626,7 @@ contract IntegrationTest is Test {
         inputs[4] = 100;
         inputs[5] = 10;
         inputs[6] = 1;
+        inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(inputs[5], inputs[6], modelId, 1e18);
 
         vm.prank(prover1);
         aggregationVerifier.submitContribution(
@@ -718,7 +728,7 @@ contract IntegrationTest is Test {
         coordinator.setVerifier(address(newVerifier));
 
         // Now proof succeeds
-        uint256[] memory inputs = new uint256[](7);
+        uint256[] memory inputs = new uint256[](8);
         inputs[0] = hashLo;
         inputs[1] = hashHi;
         inputs[2] = 1301;
@@ -726,6 +736,7 @@ contract IntegrationTest is Test {
         inputs[4] = 100;
         inputs[5] = 10;
         inputs[6] = 1;
+        inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(inputs[5], inputs[6], modelId, 1e18);
 
         bytes memory proof = new bytes(320);
 
@@ -769,7 +780,7 @@ contract IntegrationTest is Test {
         mockVerifier.setShouldPass(true);
 
         // Verify commitment matching works correctly with large values
-        uint256[] memory inputs = new uint256[](7);
+        uint256[] memory inputs = new uint256[](8);
         inputs[0] = lo;
         inputs[1] = hi;
         inputs[2] = lo + 1;
@@ -777,6 +788,7 @@ contract IntegrationTest is Test {
         inputs[4] = 100;
         inputs[5] = 10;
         inputs[6] = 1;
+        inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(inputs[5], inputs[6], modelId, 1e18);
 
         bytes memory proof = new bytes(320);
 

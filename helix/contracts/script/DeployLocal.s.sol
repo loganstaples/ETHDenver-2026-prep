@@ -71,7 +71,7 @@ contract DeployLocalScript is Script {
         console.log("Phase 1: Deploying Core Infrastructure...");
 
         // Deploy Verifier
-        verifier = new Halo2Verifier();
+        verifier = new Halo2Verifier(Halo2VKDefaults.g2Generator());
         console.log("  Halo2Verifier:", address(verifier));
 
         // Deploy Coordinator
@@ -342,7 +342,7 @@ contract LocalIntegrationTest is Script {
 
         // 1. Deploy contracts
         console.log("\n[1/6] Deploying Verifier and Coordinator...");
-        verifier = new Halo2Verifier();
+        verifier = new Halo2Verifier(Halo2VKDefaults.g2Generator());
         coordinator = new HelixCoordinatorV2(address(verifier), treasury);
         console.log("  Halo2Verifier:", address(verifier));
         console.log("  Coordinator:", address(coordinator));
@@ -419,7 +419,7 @@ contract LocalIntegrationTest is Script {
 
         vm.startBroadcast(deployerPrivateKey);
 
-        verifier = new Halo2Verifier();
+        verifier = new Halo2Verifier(Halo2VKDefaults.g2Generator());
         console.log("Halo2Verifier deployed:", address(verifier));
 
         bytes memory validProof = _createValidProof();
@@ -477,7 +477,7 @@ contract LocalIntegrationTest is Script {
 
         vm.startBroadcast(deployerPrivateKey);
 
-        verifier = new Halo2Verifier();
+        verifier = new Halo2Verifier(Halo2VKDefaults.g2Generator());
         coordinator = new HelixCoordinatorV2(address(verifier), treasury);
 
         // Setup
@@ -563,7 +563,7 @@ contract LocalIntegrationTest is Script {
 
     /// @notice Creates public inputs matching Rust circuit format
     function _createPublicInputs() internal pure returns (uint256[] memory inputs) {
-        inputs = new uint256[](7);
+        inputs = new uint256[](8);
         inputs[0] = 0x3039;  // oldHashLo
         inputs[1] = 0x3042;  // oldHashHi
         inputs[2] = 0x7b16;  // newHashLo
@@ -571,5 +571,6 @@ contract LocalIntegrationTest is Script {
         inputs[4] = 1000;    // loss
         inputs[5] = 10;      // errorBound
         inputs[6] = 1;       // stepNumber
+        inputs[7] = 0;       // errorChecksum (not needed for deployment)
     }
 }
