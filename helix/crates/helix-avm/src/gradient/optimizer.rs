@@ -402,6 +402,161 @@ impl LRScheduler for WarmupScheduler {
     }
 }
 
+/// Combined linear warmup followed by cosine decay to min_lr.
+///
+/// This is the most commonly used scheduler in modern ML training:
+/// 1. Linear warmup from 0 to `peak_lr` over `warmup_steps`
+/// 2. Cosine decay from `peak_lr` to `min_lr` over remaining steps
+pub struct LinearWarmupCosineDecay {
+    peak_lr: f64,
+    min_lr: f64,
+    warmup_steps: usize,
+    total_steps: usize,
+}
+
+impl LinearWarmupCosineDecay {
+    pub fn new(peak_lr: f64, min_lr: f64, warmup_steps: usize, total_steps: usize) -> Self {
+        Self {
+            peak_lr,
+            min_lr,
+            warmup_steps,
+            total_steps,
+        }
+    }
+}
+
+impl LRScheduler for LinearWarmupCosineDecay {
+    fn get_lr(&self, step: usize) -> f64 {
+        if step < self.warmup_steps {
+            // Linear warmup
+            self.peak_lr * (step + 1) as f64 / self.warmup_steps.max(1) as f64
+        } else {
+            // Cosine decay
+            let decay_steps = self.total_steps.saturating_sub(self.warmup_steps).max(1);
+            let progress = (step - self.warmup_steps).min(decay_steps) as f64 / decay_steps as f64;
+            let cosine_decay = 0.5 * (1.0 + (std::f64::consts::PI * progress).cos());
+            self.min_lr + (self.peak_lr - self.min_lr) * cosine_decay
+        }
+    }
+}
+
+/// Exponential learning rate decay.
+///
+/// lr = initial_lr * gamma^step
+pub struct ExponentialLR {
+    initial_lr: f64,
+    gamma: f64,
+}
+
+impl ExponentialLR {
+    pub fn new(initial_lr: f64, gamma: f64) -> Self {
+        Self { initial_lr, gamma }
+    }
+}
+
+impl LRScheduler for ExponentialLR {
+    fn get_lr(&self, step: usize) -> f64 {
+        self.initial_lr * self.gamma.powi(step as i32)
+    }
+}
+
+/// Polynomial learning rate decay.
+///
+/// lr = (initial_lr - end_lr) * (1 - step/total_steps)^power + end_lr
+pub struct PolynomialLR {
+    initial_lr: f64,
+    end_lr: f64,
+    total_steps: usize,
+    power: f64,
+}
+
+impl PolynomialLR {
+    pub fn new(initial_lr: f64, end_lr: f64, total_steps: usize, power: f64) -> Self {
+        Self {
+            initial_lr,
+            end_lr,
+            total_steps,
+            power,
+        }
+    }
+
+    /// Creates a linear decay (power=1.0).
+    pub fn linear(initial_lr: f64, end_lr: f64, total_steps: usize) -> Self {
+        Self::new(initial_lr, end_lr, total_steps, 1.0)
+    }
+}
+
+impl LRScheduler for PolynomialLR {
+    fn get_lr(&self, step: usize) -> f64 {
+        let step = step.min(self.total_steps);
+        let ratio = 1.0 - step as f64 / self.total_steps.max(1) as f64;
+        (self.initial_lr - self.end_lr) * ratio.powf(self.power) + self.end_lr
+    }
+}
+
+/// One-cycle learning rate policy (Smith, 2018).
+///
+/// Phase 1 (0 → pct_start): Linear warmup from div_factor*max_lr to max_lr
+/// Phase 2 (pct_start → 1.0): Cosine decay from max_lr to max_lr/final_div_factor
+pub struct OneCycleLR {
+    max_lr: f64,
+    div_factor: f64,
+    final_div_factor: f64,
+    total_steps: usize,
+    pct_start: f64,
+}
+
+impl OneCycleLR {
+    pub fn new(max_lr: f64, total_steps: usize) -> Self {
+        Self {
+            max_lr,
+            div_factor: 25.0,
+            final_div_factor: 1e4,
+            total_steps,
+            pct_start: 0.3,
+        }
+    }
+
+    /// Sets the initial lr divisor (initial_lr = max_lr / div_factor).
+    pub fn with_div_factor(mut self, div_factor: f64) -> Self {
+        self.div_factor = div_factor;
+        self
+    }
+
+    /// Sets the final lr divisor (final_lr = max_lr / final_div_factor).
+    pub fn with_final_div_factor(mut self, final_div_factor: f64) -> Self {
+        self.final_div_factor = final_div_factor;
+        self
+    }
+
+    /// Sets the percentage of training spent in warmup phase.
+    pub fn with_pct_start(mut self, pct_start: f64) -> Self {
+        self.pct_start = pct_start;
+        self
+    }
+}
+
+impl LRScheduler for OneCycleLR {
+    fn get_lr(&self, step: usize) -> f64 {
+        let total = self.total_steps.max(1) as f64;
+        let progress = (step as f64 / total).min(1.0);
+        let initial_lr = self.max_lr / self.div_factor;
+        let final_lr = self.max_lr / self.final_div_factor;
+
+        if progress <= self.pct_start {
+            // Phase 1: warmup
+            let phase_progress = progress / self.pct_start.max(1e-10);
+            initial_lr + (self.max_lr - initial_lr) * phase_progress
+        } else {
+            // Phase 2: cosine annealing
+            let phase_progress =
+                (progress - self.pct_start) / (1.0 - self.pct_start).max(1e-10);
+            let cosine = 0.5 * (1.0 + (std::f64::consts::PI * phase_progress).cos());
+            final_lr + (self.max_lr - final_lr) * cosine
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,15 +614,89 @@ mod tests {
     #[test]
     fn test_cosine_scheduler() {
         let scheduler = CosineAnnealingLR::new(0.1, 0.0, 100);
-        
+
         // At step 0, should be initial_lr
         assert!((scheduler.get_lr(0) - 0.1).abs() < 1e-10);
-        
+
         // At step 50, should be around half
         let mid_lr = scheduler.get_lr(50);
         assert!(mid_lr > 0.04 && mid_lr < 0.06);
-        
+
         // At step 100, should be min_lr
         assert!((scheduler.get_lr(100) - 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_linear_warmup_cosine_decay() {
+        let scheduler = LinearWarmupCosineDecay::new(0.001, 1e-6, 100, 1000);
+
+        // During warmup: linear increase
+        assert!((scheduler.get_lr(0) - 0.001 / 100.0).abs() < 1e-8);
+        assert!((scheduler.get_lr(49) - 0.001 * 50.0 / 100.0).abs() < 1e-8);
+        assert!((scheduler.get_lr(99) - 0.001).abs() < 1e-8);
+
+        // After warmup: cosine decay
+        let at_warmup_end = scheduler.get_lr(100);
+        assert!((at_warmup_end - 0.001).abs() < 1e-6);
+
+        // Midpoint of decay
+        let mid = scheduler.get_lr(550);
+        assert!(mid > 1e-6 && mid < 0.001);
+
+        // End: should approach min_lr
+        let end = scheduler.get_lr(1000);
+        assert!((end - 1e-6).abs() < 1e-7);
+    }
+
+    #[test]
+    fn test_exponential_lr() {
+        let scheduler = ExponentialLR::new(0.1, 0.9);
+
+        assert!((scheduler.get_lr(0) - 0.1).abs() < 1e-10);
+        assert!((scheduler.get_lr(1) - 0.09).abs() < 1e-10);
+        assert!((scheduler.get_lr(2) - 0.081).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_polynomial_lr_linear() {
+        let scheduler = PolynomialLR::linear(0.1, 0.0, 100);
+
+        assert!((scheduler.get_lr(0) - 0.1).abs() < 1e-10);
+        assert!((scheduler.get_lr(50) - 0.05).abs() < 1e-10);
+        assert!((scheduler.get_lr(100) - 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_polynomial_lr_quadratic() {
+        let scheduler = PolynomialLR::new(0.1, 0.0, 100, 2.0);
+
+        assert!((scheduler.get_lr(0) - 0.1).abs() < 1e-10);
+        // (1 - 50/100)^2 = 0.25
+        assert!((scheduler.get_lr(50) - 0.025).abs() < 1e-10);
+        assert!((scheduler.get_lr(100) - 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_one_cycle_lr() {
+        let scheduler = OneCycleLR::new(0.01, 1000).with_pct_start(0.3);
+
+        // Start: max_lr / div_factor = 0.01 / 25 = 0.0004
+        let start = scheduler.get_lr(0);
+        assert!((start - 0.0004).abs() < 1e-6);
+
+        // At pct_start (step 300): should be at max_lr
+        let peak = scheduler.get_lr(300);
+        assert!((peak - 0.01).abs() < 1e-4);
+
+        // End: max_lr / final_div_factor = 0.01 / 10000 = 1e-6
+        let end = scheduler.get_lr(1000);
+        assert!((end - 1e-6).abs() < 1e-7);
+
+        // Should be monotonically decreasing after peak
+        let lr_400 = scheduler.get_lr(400);
+        let lr_600 = scheduler.get_lr(600);
+        let lr_800 = scheduler.get_lr(800);
+        assert!(lr_400 > lr_600);
+        assert!(lr_600 > lr_800);
     }
 }

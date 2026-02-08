@@ -34,7 +34,7 @@ pub use layer::{Layer, Sequential};
 pub use linear::{Linear, LinearConfig, LinearError};
 pub use mlp::{ActivationType, GatedMLP, MLP, MLPConfig, MLPError};
 pub use transformer::{
-    NormPosition, NormType, TransformerBlock, TransformerConfig, TransformerError,
+    NormPosition, NormType, ProvableBlock, TransformerBlock, TransformerConfig, TransformerError,
     TransformerModel, TransformerStack,
 };
 

@@ -12,12 +12,14 @@
 pub mod arithmetic;
 pub mod bounds;
 pub mod circuit_bridge;
+pub mod data;
 pub mod gradient;
 pub mod memory;
 pub mod models;
 pub mod nn;
 pub mod ops;
 pub mod quantization;
+pub mod training;
 pub mod vm;
 pub mod witness;
 
@@ -51,5 +53,17 @@ pub use models::{
 pub use nn::large_model::{
     LargeModelConfig, LargeModelExecutor, LargeModelError,
     chunked_attention, estimate_forward_memory, compute_optimal_batch_size,
+};
+
+// Re-export data pipeline types
+pub use data::{
+    Augmentation, DataPipeline, PipelineConfig, TrainingBatch,
+    create_mnist_like_loader, create_synthetic_loader,
+};
+
+// Re-export training types
+pub use training::{
+    MnistTrainingConfig, MnistTrainingResult, TrainingStepResult,
+    train_mnist,
 };
 

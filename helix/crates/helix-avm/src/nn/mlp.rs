@@ -145,6 +145,16 @@ impl MLP {
         self.fc1.out_features()
     }
 
+    /// Returns the first linear layer (d_model → d_ff).
+    pub fn fc1(&self) -> &Linear {
+        &self.fc1
+    }
+
+    /// Returns the second linear layer (d_ff → d_model).
+    pub fn fc2(&self) -> &Linear {
+        &self.fc2
+    }
+
     /// Forward pass.
     ///
     /// Input shape: (seq_len, d_model) or (batch, seq_len, d_model)

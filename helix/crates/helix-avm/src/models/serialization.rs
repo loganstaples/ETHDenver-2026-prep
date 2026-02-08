@@ -38,6 +38,7 @@ use helix_core::types::{BoundedTensor, BoundedValue};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::path::Path;
 use thiserror::Error;
 
 /// Errors during serialization.
@@ -590,6 +591,54 @@ impl ModelSerializer {
         self.deserialize(&data)
     }
 
+    /// Saves a checkpoint to a file at the given path.
+    ///
+    /// Creates the file (and parent directories) if they don't exist.
+    /// Overwrites any existing file at the path.
+    pub fn save_to_file(
+        &self,
+        checkpoint: &Checkpoint,
+        path: impl AsRef<Path>,
+    ) -> Result<(), SerializationError> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = std::fs::File::create(path)?;
+        self.save(checkpoint, &mut file)
+    }
+
+    /// Loads a checkpoint from a file at the given path.
+    pub fn load_from_file(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<Checkpoint, SerializationError> {
+        let mut file = std::fs::File::open(path)?;
+        self.load(&mut file)
+    }
+
+    /// Saves a model that implements `ModelCheckpoint` to a file.
+    ///
+    /// Convenience method that collects the checkpoint and writes it in one step.
+    pub fn save_model(
+        &self,
+        model: &dyn ModelCheckpoint,
+        path: impl AsRef<Path>,
+    ) -> Result<(), SerializationError> {
+        let checkpoint = model.checkpoint();
+        self.save_to_file(&checkpoint, path)
+    }
+
+    /// Loads a checkpoint from a file and applies it to a model.
+    pub fn load_model(
+        &self,
+        model: &mut dyn ModelCheckpoint,
+        path: impl AsRef<Path>,
+    ) -> Result<(), SerializationError> {
+        let checkpoint = self.load_from_file(path)?;
+        model.load_checkpoint(&checkpoint)
+    }
+
     /// Validates that a checkpoint matches expected shapes.
     pub fn validate_shapes(
         &self,
@@ -809,5 +858,62 @@ mod tests {
         assert_eq!(TensorDType::F64.to_byte(), 0);
         assert_eq!(TensorDType::from_byte(0), Some(TensorDType::F64));
         assert_eq!(TensorDType::from_byte(255), None);
+    }
+
+    #[test]
+    fn test_save_load_file() {
+        let dir = std::env::temp_dir().join("helix_test_checkpoint");
+        let path = dir.join("test_model.helixchk");
+
+        let mut checkpoint = Checkpoint::new(
+            CheckpointMetadata::new("test_file_io", "mlp")
+                .with_param_count(100)
+                .with_training_step(42)
+                .with_training_loss(0.123),
+        );
+
+        let tensor = BoundedTensor::from_approximate(
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            vec![2, 3],
+            0.01,
+        );
+        checkpoint.add_tensor("layer1.weight", &tensor);
+
+        let serializer = ModelSerializer::new();
+        serializer.save_to_file(&checkpoint, &path).unwrap();
+
+        let loaded = serializer.load_from_file(&path).unwrap();
+        assert_eq!(loaded.metadata.model_name, "test_file_io");
+        assert_eq!(loaded.metadata.training_step, 42);
+
+        let t = loaded.get_tensor("layer1.weight").unwrap();
+        assert_eq!(t.shape(), &vec![2, 3]);
+        assert!((t.values()[0] - 1.0).abs() < 1e-10);
+
+        // Cleanup
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_save_load_creates_directories() {
+        let dir = std::env::temp_dir()
+            .join("helix_test_nested")
+            .join("deep")
+            .join("path");
+        let path = dir.join("model.helixchk");
+
+        let checkpoint = Checkpoint::new(CheckpointMetadata::new("nested", "test"));
+        let serializer = ModelSerializer::new();
+        serializer.save_to_file(&checkpoint, &path).unwrap();
+
+        let loaded = serializer.load_from_file(&path).unwrap();
+        assert_eq!(loaded.metadata.model_name, "nested");
+
+        // Cleanup
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(
+            std::env::temp_dir().join("helix_test_nested"),
+        );
     }
 }

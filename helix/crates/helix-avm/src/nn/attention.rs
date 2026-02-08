@@ -320,6 +320,26 @@ impl MultiHeadAttention {
         Ok(output)
     }
 
+    /// Returns the Q projection layer.
+    pub fn w_q(&self) -> &Linear {
+        &self.w_q
+    }
+
+    /// Returns the K projection layer.
+    pub fn w_k(&self) -> &Linear {
+        &self.w_k
+    }
+
+    /// Returns the V projection layer.
+    pub fn w_v(&self) -> &Linear {
+        &self.w_v
+    }
+
+    /// Returns the output projection layer.
+    pub fn w_o(&self) -> &Linear {
+        &self.w_o
+    }
+
     /// Self-attention forward pass (Q = K = V = input).
     pub fn forward_self(&self, input: &BoundedTensor) -> Result<BoundedTensor, AttentionError> {
         self.forward(input, input, input)

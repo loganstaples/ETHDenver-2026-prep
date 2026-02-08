@@ -35,7 +35,10 @@ pub use loss::{
     huber_loss, mae_loss, mse_grad, mse_loss, softmax_cross_entropy_grad,
     softmax_cross_entropy_loss,
 };
-pub use optimizer::{Adam, CosineAnnealingLR, LRScheduler, Optimizer, SGD, StepLR, WarmupScheduler};
+pub use optimizer::{
+    Adam, CosineAnnealingLR, ExponentialLR, LRScheduler, LinearWarmupCosineDecay, OneCycleLR,
+    Optimizer, PolynomialLR, SGD, StepLR, WarmupScheduler,
+};
 pub use training::{EpochMetrics, StepMetrics, Trainer, TrainingConfig, TrainingState};
 
 /// Prelude for convenient imports.

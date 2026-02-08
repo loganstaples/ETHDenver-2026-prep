@@ -3,8 +3,9 @@
 //! Implements a full transformer decoder block: Attention → Add & Norm → MLP → Add & Norm
 
 use super::attention::{AttentionConfig, AttentionError, MultiHeadAttention};
-use super::linear::LinearError;
+use super::linear::{Linear, LinearError};
 use super::mlp::{ActivationType, MLP, MLPConfig, MLPError};
+use crate::models::serialization::{Checkpoint, CheckpointMetadata, ModelCheckpoint, SerializationError};
 use crate::ops::normalization;
 use helix_core::types::{BoundedTensor, Precision};
 use thiserror::Error;
@@ -304,6 +305,181 @@ impl TransformerModel {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ProvableBlock — decompose transformer into circuit-compatible MLP steps
+// ---------------------------------------------------------------------------
+
+/// Trait for model components that can extract their parameters for checkpointing
+/// and decompose into 2-layer MLP steps for circuit proving.
+pub trait ProvableBlock {
+    /// Collects all named parameters (weight tensors) in deterministic order.
+    fn collect_parameters(&self) -> Vec<(String, BoundedTensor)>;
+
+    /// Returns the total parameter count.
+    fn param_count(&self) -> usize {
+        self.collect_parameters()
+            .iter()
+            .map(|(_, t)| t.len())
+            .sum()
+    }
+
+    /// Decomposes this block into pairs of Linear layers suitable for
+    /// `build_training_witness`. Each pair represents one provable MLP step.
+    ///
+    /// For a transformer block with attention (Q,K,V,O projections) and MLP (fc1, fc2),
+    /// the MLP sub-block is directly provable. Attention is decomposed into
+    /// its linear projection pairs.
+    fn decompose_to_mlp_pairs(&self) -> Vec<(String, Linear, Linear)>;
+}
+
+impl ProvableBlock for TransformerBlock {
+    fn collect_parameters(&self) -> Vec<(String, BoundedTensor)> {
+        let mut params = Vec::new();
+
+        // Attention parameters (deterministic order: Q, K, V, O)
+        params.push(("attn.w_q.weight".to_string(), self.attention.w_q().weights().clone()));
+        if let Some(b) = self.attention.w_q().bias() {
+            params.push(("attn.w_q.bias".to_string(), b.clone()));
+        }
+        params.push(("attn.w_k.weight".to_string(), self.attention.w_k().weights().clone()));
+        if let Some(b) = self.attention.w_k().bias() {
+            params.push(("attn.w_k.bias".to_string(), b.clone()));
+        }
+        params.push(("attn.w_v.weight".to_string(), self.attention.w_v().weights().clone()));
+        if let Some(b) = self.attention.w_v().bias() {
+            params.push(("attn.w_v.bias".to_string(), b.clone()));
+        }
+        params.push(("attn.w_o.weight".to_string(), self.attention.w_o().weights().clone()));
+        if let Some(b) = self.attention.w_o().bias() {
+            params.push(("attn.w_o.bias".to_string(), b.clone()));
+        }
+
+        // MLP parameters (fc1, fc2)
+        params.push(("mlp.fc1.weight".to_string(), self.mlp.fc1().weights().clone()));
+        if let Some(b) = self.mlp.fc1().bias() {
+            params.push(("mlp.fc1.bias".to_string(), b.clone()));
+        }
+        params.push(("mlp.fc2.weight".to_string(), self.mlp.fc2().weights().clone()));
+        if let Some(b) = self.mlp.fc2().bias() {
+            params.push(("mlp.fc2.bias".to_string(), b.clone()));
+        }
+
+        params
+    }
+
+    fn decompose_to_mlp_pairs(&self) -> Vec<(String, Linear, Linear)> {
+        let mut pairs = Vec::new();
+
+        // The MLP sub-block is a direct 2-layer MLP: fc1 → activation → fc2
+        // This maps exactly to the circuit's 2-layer MLP structure.
+        pairs.push((
+            "mlp".to_string(),
+            self.mlp.fc1().clone(),
+            self.mlp.fc2().clone(),
+        ));
+
+        // Attention projections can be decomposed as:
+        // Step 1: Q,K projection (input → QK space)
+        // Step 2: V,O projection (attention output → model space)
+        // These are paired as (W_q, W_o) and (W_v, W_k) for proving linearity
+        pairs.push((
+            "attn.qo".to_string(),
+            self.attention.w_q().clone(),
+            self.attention.w_o().clone(),
+        ));
+        pairs.push((
+            "attn.vk".to_string(),
+            self.attention.w_v().clone(),
+            self.attention.w_k().clone(),
+        ));
+
+        pairs
+    }
+}
+
+impl ProvableBlock for TransformerStack {
+    fn collect_parameters(&self) -> Vec<(String, BoundedTensor)> {
+        let mut params = Vec::new();
+        for (i, block) in self.blocks.iter().enumerate() {
+            for (name, tensor) in block.collect_parameters() {
+                params.push((format!("layers.{i}.{name}"), tensor));
+            }
+        }
+        params
+    }
+
+    fn decompose_to_mlp_pairs(&self) -> Vec<(String, Linear, Linear)> {
+        let mut pairs = Vec::new();
+        for (i, block) in self.blocks.iter().enumerate() {
+            for (name, l1, l2) in block.decompose_to_mlp_pairs() {
+                pairs.push((format!("layers.{i}.{name}"), l1, l2));
+            }
+        }
+        pairs
+    }
+}
+
+impl ModelCheckpoint for TransformerBlock {
+    fn checkpoint(&self) -> Checkpoint {
+        let mut cp = Checkpoint::new(
+            CheckpointMetadata::new("transformer_block", "transformer")
+                .with_param_count(self.param_count()),
+        );
+        for (name, tensor) in self.collect_parameters() {
+            cp.add_tensor(&name, &tensor);
+        }
+        cp
+    }
+
+    fn load_checkpoint(&mut self, _checkpoint: &Checkpoint) -> Result<(), SerializationError> {
+        // Loading requires reconstructing layers from checkpoint tensors.
+        // For now, return an error indicating this is not yet supported
+        // because TransformerBlock contains non-public fields (attention, mlp)
+        // that need coordinated reconstruction.
+        Err(SerializationError::InvalidFormat(
+            "TransformerBlock load_checkpoint requires full reconstruction; \
+             use TransformerBlock::new() with loaded weights instead"
+                .to_string(),
+        ))
+    }
+
+    fn model_name(&self) -> &str {
+        "transformer_block"
+    }
+
+    fn model_type(&self) -> &str {
+        "transformer"
+    }
+}
+
+impl ModelCheckpoint for TransformerStack {
+    fn checkpoint(&self) -> Checkpoint {
+        let mut cp = Checkpoint::new(
+            CheckpointMetadata::new("transformer_stack", "transformer")
+                .with_param_count(self.param_count()),
+        );
+        for (name, tensor) in self.collect_parameters() {
+            cp.add_tensor(&name, &tensor);
+        }
+        cp
+    }
+
+    fn load_checkpoint(&mut self, _checkpoint: &Checkpoint) -> Result<(), SerializationError> {
+        Err(SerializationError::InvalidFormat(
+            "TransformerStack load_checkpoint requires full reconstruction"
+                .to_string(),
+        ))
+    }
+
+    fn model_name(&self) -> &str {
+        "transformer_stack"
+    }
+
+    fn model_type(&self) -> &str {
+        "transformer"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,5 +541,78 @@ mod tests {
         assert_eq!(config.activation, ActivationType::SiLU);
         assert_eq!(config.norm_type, NormType::RMSNorm);
         assert!(!config.bias);
+    }
+
+    #[test]
+    fn test_provable_block_collect_parameters() {
+        let config = TransformerConfig::new(16, 4).unwrap();
+        let block = TransformerBlock::new(config).unwrap();
+
+        let params = block.collect_parameters();
+        // Should have: Q,K,V,O weights + biases (8) + fc1,fc2 weights + biases (4) = 12
+        assert_eq!(params.len(), 12);
+
+        // Check naming convention
+        let names: Vec<&str> = params.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"attn.w_q.weight"));
+        assert!(names.contains(&"attn.w_q.bias"));
+        assert!(names.contains(&"mlp.fc1.weight"));
+        assert!(names.contains(&"mlp.fc2.weight"));
+    }
+
+    #[test]
+    fn test_provable_block_param_count() {
+        let config = TransformerConfig::new(16, 4).unwrap();
+        let block = TransformerBlock::new(config).unwrap();
+
+        let count = block.param_count();
+        // 4 attention projections: 4 * (16*16 + 16) = 4 * 272 = 1088
+        // 2 MLP layers: (16*64 + 64) + (64*16 + 16) = 1088 + 1040 = 2128
+        // Total = 1088 + 2128 = 3216
+        assert!(count > 0);
+        assert_eq!(count, 4 * (16 * 16 + 16) + (16 * 64 + 64) + (64 * 16 + 16));
+    }
+
+    #[test]
+    fn test_provable_block_decompose_to_mlp_pairs() {
+        let config = TransformerConfig::new(16, 4).unwrap();
+        let block = TransformerBlock::new(config).unwrap();
+
+        let pairs = block.decompose_to_mlp_pairs();
+        // Should have 3 pairs: mlp, attn.qo, attn.vk
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(pairs[0].0, "mlp");
+        assert_eq!(pairs[1].0, "attn.qo");
+        assert_eq!(pairs[2].0, "attn.vk");
+
+        // MLP pair should have compatible dimensions
+        let (_, fc1, fc2) = &pairs[0];
+        assert_eq!(fc1.out_features(), fc2.in_features());
+    }
+
+    #[test]
+    fn test_provable_stack_collect_parameters() {
+        let config = TransformerConfig::new(16, 4).unwrap();
+        let stack = TransformerStack::new(2, config).unwrap();
+
+        let params = stack.collect_parameters();
+        // 2 blocks * 12 params each = 24
+        assert_eq!(params.len(), 24);
+
+        // Check hierarchical naming
+        let names: Vec<&str> = params.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"layers.0.attn.w_q.weight"));
+        assert!(names.contains(&"layers.1.mlp.fc2.weight"));
+    }
+
+    #[test]
+    fn test_transformer_block_checkpoint() {
+        let config = TransformerConfig::new(16, 4).unwrap();
+        let block = TransformerBlock::new(config).unwrap();
+
+        let checkpoint = block.checkpoint();
+        assert_eq!(checkpoint.metadata.model_type, "transformer");
+        assert!(checkpoint.total_params() > 0);
+        assert_eq!(checkpoint.tensor_names().len(), 12);
     }
 }

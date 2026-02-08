@@ -398,32 +398,95 @@ pub struct CircuitWeights {
     pub b2: Vec<f64>,
 }
 
+/// Maximum absolute value for weights/activations before quantization clamping.
+///
+/// Values beyond this magnitude would overflow the circuit's ReLU lookup table
+/// or produce field elements too large for practical proof generation.
+const MAX_QUANTIZATION_VALUE: f64 = 1e6;
+
+/// Validates that all values in a slice are finite (not NaN or infinite).
+fn validate_finite(values: &[f64], name: &str) -> Result<(), String> {
+    for (i, &v) in values.iter().enumerate() {
+        if !v.is_finite() {
+            return Err(format!(
+                "{name}[{i}] is not finite: {v}. All values must be finite for circuit compatibility."
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Clamps all values to `[-MAX_QUANTIZATION_VALUE, MAX_QUANTIZATION_VALUE]`.
+///
+/// Values beyond this range would overflow the circuit's lookup tables.
+fn clamp_for_circuit(values: &mut [f64]) {
+    for v in values.iter_mut() {
+        *v = v.clamp(-MAX_QUANTIZATION_VALUE, MAX_QUANTIZATION_VALUE);
+    }
+}
+
 /// Extracts flat weight vectors from two AVM `Linear` layers.
 ///
 /// Layer 1: (d_in → d_hid), Layer 2: (d_hid → d_out).
 /// Weights in `Linear` are stored as `[out_features, in_features]` row-major,
 /// which is exactly the layout the circuit expects.
+///
+/// Returns an error if weights contain NaN or infinity.
 pub fn model_to_circuit_weights(
     layer1: &crate::nn::Linear,
     layer2: &crate::nn::Linear,
-) -> CircuitWeights {
+) -> Result<CircuitWeights, String> {
     let d_in = layer1.in_features();
     let d_hid = layer1.out_features();
     let d_out = layer2.out_features();
 
-    let w1: Vec<f64> = layer1.weights().values();
-    let b1: Vec<f64> = layer1
+    // Validate dimension compatibility
+    if layer2.in_features() != d_hid {
+        return Err(format!(
+            "Layer dimension mismatch: layer1 out_features={d_hid} != layer2 in_features={}",
+            layer2.in_features()
+        ));
+    }
+
+    let mut w1: Vec<f64> = layer1.weights().values();
+    let mut b1: Vec<f64> = layer1
         .bias()
         .map(|b| b.values())
         .unwrap_or_else(|| vec![0.0; d_hid]);
 
-    let w2: Vec<f64> = layer2.weights().values();
-    let b2: Vec<f64> = layer2
+    let mut w2: Vec<f64> = layer2.weights().values();
+    let mut b2: Vec<f64> = layer2
         .bias()
         .map(|b| b.values())
         .unwrap_or_else(|| vec![0.0; d_out]);
 
-    CircuitWeights {
+    // Validate all values are finite
+    validate_finite(&w1, "w1")?;
+    validate_finite(&b1, "b1")?;
+    validate_finite(&w2, "w2")?;
+    validate_finite(&b2, "b2")?;
+
+    // Validate expected lengths
+    if w1.len() != d_hid * d_in {
+        return Err(format!(
+            "w1 length {} != d_hid*d_in={}*{}={}",
+            w1.len(), d_hid, d_in, d_hid * d_in
+        ));
+    }
+    if w2.len() != d_out * d_hid {
+        return Err(format!(
+            "w2 length {} != d_out*d_hid={}*{}={}",
+            w2.len(), d_out, d_hid, d_out * d_hid
+        ));
+    }
+
+    // Clamp to circuit-safe range
+    clamp_for_circuit(&mut w1);
+    clamp_for_circuit(&mut b1);
+    clamp_for_circuit(&mut w2);
+    clamp_for_circuit(&mut b2);
+
+    Ok(CircuitWeights {
         d_in,
         d_hid,
         d_out,
@@ -431,7 +494,7 @@ pub fn model_to_circuit_weights(
         b1,
         w2,
         b2,
-    }
+    })
 }
 
 /// Reconstructs two AVM `Linear` layers from flat circuit-weight vectors.
@@ -516,8 +579,8 @@ pub fn build_training_witness_with_scale(
     use helix_circuits::halo2curves::ff::Field;
     use helix_circuits::{compute_state_hash_v2, compute_witness_v2};
 
-    // 1. Extract flat weights from AVM layers
-    let cw = model_to_circuit_weights(layer1, layer2);
+    // 1. Extract flat weights from AVM layers (with validation)
+    let cw = model_to_circuit_weights(layer1, layer2)?;
 
     if input.len() != cw.d_in {
         return Err(format!(
@@ -531,6 +594,16 @@ pub fn build_training_witness_with_scale(
             "target length {} != d_out {}",
             target.len(),
             cw.d_out
+        ));
+    }
+
+    // Validate inputs and targets are finite
+    validate_finite(input, "input")?;
+    validate_finite(target, "target")?;
+
+    if learning_rate <= 0.0 || !learning_rate.is_finite() {
+        return Err(format!(
+            "learning_rate must be finite and positive, got {learning_rate}"
         ));
     }
 
@@ -614,10 +687,83 @@ pub fn build_training_witness_with_scale(
 
     witness.finalize_error_checksum();
 
+    // Verify witness consistency before returning
+    verify_witness_consistency(&witness, cw.d_in, cw.d_hid, cw.d_out)?;
+
     Ok(TrainingWitnessOutput {
         witness,
         relu_range,
     })
+}
+
+/// Verifies that a witness has internally consistent dimensions and non-trivial state hashes.
+///
+/// This catches bugs where the witness was partially initialized or has mismatched vectors.
+#[cfg(any(feature = "circuit-bridge", test))]
+fn verify_witness_consistency(
+    witness: &helix_circuits::MLTrainingStepV2Witness,
+    d_in: usize,
+    d_hid: usize,
+    d_out: usize,
+) -> Result<(), String> {
+    use helix_circuits::halo2curves::bn256::Fr;
+    use helix_circuits::halo2curves::ff::Field;
+
+    // Verify dimension fields
+    if witness.d_in != d_in {
+        return Err(format!("Witness d_in={} != expected {d_in}", witness.d_in));
+    }
+    if witness.d_hid != d_hid {
+        return Err(format!("Witness d_hid={} != expected {d_hid}", witness.d_hid));
+    }
+    if witness.d_out != d_out {
+        return Err(format!("Witness d_out={} != expected {d_out}", witness.d_out));
+    }
+
+    // Verify vector lengths
+    let checks = [
+        ("x", witness.x.len(), d_in),
+        ("target", witness.target.len(), d_out),
+        ("w1", witness.w1.len(), d_hid * d_in),
+        ("b1", witness.b1.len(), d_hid),
+        ("w2", witness.w2.len(), d_out * d_hid),
+        ("b2", witness.b2.len(), d_out),
+        ("h_pre", witness.h_pre.len(), d_hid),
+        ("h", witness.h.len(), d_hid),
+        ("y", witness.y.len(), d_out),
+        ("w1_new", witness.w1_new.len(), d_hid * d_in),
+        ("b1_new", witness.b1_new.len(), d_hid),
+        ("w2_new", witness.w2_new.len(), d_out * d_hid),
+        ("b2_new", witness.b2_new.len(), d_out),
+    ];
+
+    for (name, actual, expected) in checks {
+        if actual != expected {
+            return Err(format!(
+                "Witness vector {name} has length {actual}, expected {expected}"
+            ));
+        }
+    }
+
+    // Verify state hashes are non-trivial (both halves should be non-zero
+    // for any non-trivial weight set)
+    if witness.old_state_hash.0 == Fr::ZERO && witness.old_state_hash.1 == Fr::ZERO {
+        return Err("Old state hash is (0, 0) — likely uninitialized".to_string());
+    }
+    if witness.new_state_hash.0 == Fr::ZERO && witness.new_state_hash.1 == Fr::ZERO {
+        return Err("New state hash is (0, 0) — likely uninitialized".to_string());
+    }
+
+    // Public inputs should have exactly 8 elements
+    let pi = witness.public_inputs();
+    if pi.len() != 8 {
+        return Err(format!(
+            "Public inputs have {} elements, expected 8",
+            pi.len()
+        ));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -754,7 +900,7 @@ mod tests {
         )
         .unwrap();
 
-        let cw = model_to_circuit_weights(&l1, &l2);
+        let cw = model_to_circuit_weights(&l1, &l2).unwrap();
         assert_eq!(cw.d_in, 2);
         assert_eq!(cw.d_hid, 2);
         assert_eq!(cw.d_out, 1);
@@ -784,7 +930,7 @@ mod tests {
         )
         .unwrap();
 
-        let cw = model_to_circuit_weights(&l1, &l2);
+        let cw = model_to_circuit_weights(&l1, &l2).unwrap();
         let (r1, r2) = circuit_weights_to_model(&cw);
 
         assert_eq!(r1.in_features(), 2);
@@ -792,7 +938,7 @@ mod tests {
         assert_eq!(r2.in_features(), 2);
         assert_eq!(r2.out_features(), 1);
 
-        let r_cw = model_to_circuit_weights(&r1, &r2);
+        let r_cw = model_to_circuit_weights(&r1, &r2).unwrap();
         for (a, b) in cw.w1.iter().zip(r_cw.w1.iter()) {
             assert!((a - b).abs() < 1e-10);
         }
