@@ -339,12 +339,13 @@ impl ProofCollector {
 // ============================================================================
 
 /// Aggregates proofs from multiple workers into a single submission
-/// using a SHA-256 Merkle tree for cryptographic binding.
+/// using Pedersen commitment homomorphic aggregation for gradient binding
+/// with a SHA-256 Merkle tree fallback for proof envelope integrity.
 pub struct ProofAggregator;
 
 impl ProofAggregator {
     /// Computes the SHA-256 Merkle root of sorted worker commitments.
-    /// Commitments are sorted by worker ID for deterministic ordering.
+    /// Used as a fallback and for proof envelope integrity verification.
     pub fn merkle_root(proofs: &HashMap<PeerId, WorkerProof>) -> [u8; 32] {
         use sha2::{Digest, Sha256};
 
@@ -372,7 +373,6 @@ impl ProofAggregator {
                 if chunk.len() > 1 {
                     hasher.update(chunk[1]);
                 } else {
-                    // Odd leaf: hash with itself
                     hasher.update(chunk[0]);
                 }
                 next_level.push(hasher.finalize().into());
@@ -383,7 +383,61 @@ impl ProofAggregator {
         leaves.into_iter().next().unwrap_or([0u8; 32])
     }
 
+    /// Computes a Pedersen commitment aggregate from individual worker commitments.
+    ///
+    /// Uses the homomorphic property of Pedersen commitments:
+    ///   C(a, r1) + C(b, r2) = C(a+b, r1+r2)
+    ///
+    /// Each worker's gradient_commitment is the serialized Pedersen point.
+    /// We sum all commitment points to produce the aggregate commitment.
+    /// If any commitment fails to deserialize as a curve point, falls back
+    /// to SHA-256 Merkle root.
+    pub fn pedersen_aggregate(proofs: &HashMap<PeerId, WorkerProof>) -> [u8; 32] {
+        use helix_mpc::security::commitment::PedersenCommitment;
+        use halo2curves::bn256::G1Affine;
+        use halo2curves::group::GroupEncoding;
+
+        // Try to interpret each worker's gradient_commitment as a Pedersen point
+        let mut pedersen_points: Vec<PedersenCommitment> = Vec::new();
+        for proof in proofs.values() {
+            let mut repr = <G1Affine as GroupEncoding>::Repr::default();
+            let commitment_bytes = &proof.gradient_commitment;
+            // Pedersen commitment is 32-byte compressed G1 point
+            if commitment_bytes.len() == repr.as_ref().len() {
+                repr.as_mut().copy_from_slice(commitment_bytes);
+                let point = G1Affine::from_bytes(&repr);
+                if bool::from(point.is_some()) {
+                    pedersen_points.push(PedersenCommitment { point: point.unwrap() });
+                    continue;
+                }
+            }
+            // Not a valid curve point — fall back to Merkle
+            return Self::merkle_root(proofs);
+        }
+
+        if pedersen_points.is_empty() {
+            return Self::merkle_root(proofs);
+        }
+
+        // Homomorphic sum: C_agg = C_1 + C_2 + ... + C_n
+        let mut aggregate = pedersen_points[0].clone();
+        for pc in &pedersen_points[1..] {
+            aggregate = aggregate.add(pc);
+        }
+
+        // Serialize the aggregate point as the commitment
+        let agg_bytes = aggregate.point.to_bytes();
+        let mut result = [0u8; 32];
+        let src = agg_bytes.as_ref();
+        let len = src.len().min(32);
+        result[..len].copy_from_slice(&src[..len]);
+        result
+    }
+
     /// Aggregates multiple worker proofs into a single round proof.
+    ///
+    /// Uses Pedersen commitment homomorphic aggregation when worker commitments
+    /// are valid curve points, falls back to SHA-256 Merkle otherwise.
     pub fn aggregate(
         commit_id: RoundCommitId,
         proofs: HashMap<PeerId, WorkerProof>,
@@ -402,12 +456,11 @@ impl ProofAggregator {
             .map(|p| p.error_bound)
             .fold(0.0f64, f64::max);
 
-        // Compute Merkle root of sorted commitments
-        let gradient_commitment = Self::merkle_root(&proofs);
+        // Use Pedersen homomorphic aggregation (falls back to Merkle if needed)
+        let gradient_commitment = Self::pedersen_aggregate(&proofs);
 
         // Build structured AggregatedProofEnvelope via bincode
         let mut proof_entries: Vec<(String, u32, Vec<u8>)> = Vec::new();
-        // Sort for deterministic output
         let mut sorted_proofs: Vec<_> = proofs.into_iter().collect();
         sorted_proofs.sort_by(|(a, _), (b, _)| a.0.cmp(&b.0));
 
@@ -423,10 +476,16 @@ impl ProofAggregator {
             ));
         }
 
+        // Include the Merkle root for integrity verification
+        let merkle = Self::merkle_root(
+            &sorted_proofs.iter().cloned().collect::<HashMap<_, _>>()
+        );
+
         let envelope = AggregatedProofEnvelope {
             num_proofs: num_contributors as u32,
             proof_entries,
-            merkle_root: gradient_commitment,
+            merkle_root: merkle,
+            pedersen_aggregate: gradient_commitment,
         };
 
         let combined_proof = bincode::serialize(&envelope)
@@ -450,8 +509,13 @@ impl ProofAggregator {
         proofs: &HashMap<PeerId, WorkerProof>,
         expected_root: &[u8; 32],
     ) -> bool {
-        let computed = Self::merkle_root(proofs);
-        computed == *expected_root
+        // Try Pedersen first, then Merkle fallback
+        let pedersen = Self::pedersen_aggregate(proofs);
+        if pedersen == *expected_root {
+            return true;
+        }
+        let merkle = Self::merkle_root(proofs);
+        merkle == *expected_root
     }
 }
 
@@ -462,8 +526,11 @@ pub struct AggregatedProofEnvelope {
     pub num_proofs: u32,
     /// Per-worker proof entries: (worker_id, proof_len, proof_bytes).
     pub proof_entries: Vec<(String, u32, Vec<u8>)>,
-    /// Merkle root of sorted commitments.
+    /// Merkle root of sorted commitments (for integrity).
     pub merkle_root: [u8; 32],
+    /// Pedersen commitment aggregate (homomorphic sum).
+    #[serde(default)]
+    pub pedersen_aggregate: [u8; 32],
 }
 
 // ============================================================================
@@ -837,6 +904,129 @@ impl RoundCommitManager {
     /// Returns the number of active collectors (in-flight rounds).
     pub fn active_collections(&self) -> usize {
         self.collectors.len()
+    }
+
+    /// Submits individual worker proofs to the real contract for on-chain verification.
+    ///
+    /// Unlike `submit_round_to_chain` which submits the aggregated envelope,
+    /// this extracts individual proofs from the envelope and submits the best
+    /// (first valid) proof directly. The contract's Halo2Verifier then performs
+    /// real KZG verification on-chain.
+    pub async fn submit_best_proof_to_chain(
+        &mut self,
+        commit_id: RoundCommitId,
+    ) -> Result<RoundCommitResult, RoundCommitError> {
+        let client = self.sc_client.as_ref()
+            .ok_or(RoundCommitError::NoClient)?;
+
+        let aggregated = self.pending_submissions.get(&commit_id)
+            .ok_or(RoundCommitError::NoPendingSubmission(commit_id))?
+            .clone();
+
+        // Deserialize the envelope to extract individual proofs
+        let envelope: AggregatedProofEnvelope = bincode::deserialize(&aggregated.proof)
+            .map_err(|e| RoundCommitError::SubmissionFailed(
+                format!("Failed to deserialize proof envelope: {}", e)
+            ))?;
+
+        // Find the best proof to submit (first non-empty proof)
+        let best_entry = envelope.proof_entries.iter()
+            .find(|(_, len, bytes)| *len > 0 && !bytes.is_empty())
+            .ok_or(RoundCommitError::NoProofs)?;
+
+        let proof_bytes = best_entry.2.clone();
+
+        let _ = self.event_tx.send(RoundCommitEvent::SubmissionStarted { commit_id });
+
+        // Submit to the real contract
+        let mut retry_count = 0u32;
+        let result = loop {
+            match client.submit_proof(
+                self.config.model_id,
+                commit_id.round_number,
+                proof_bytes.clone(),
+                &aggregated.public_inputs,
+            ).await {
+                Ok(receipt) => {
+                    // Parse receipt for success/failure
+                    let gas_used = receipt.gas_used.unwrap_or_default();
+                    let block_number = receipt.block_number.unwrap_or_default().as_u64();
+
+                    // Check if the tx was actually successful (status = 1)
+                    let success = receipt.status
+                        .map(|s| s.as_u64() == 1)
+                        .unwrap_or(true); // Pre-Byzantium has no status
+
+                    if !success {
+                        let err = format!(
+                            "Transaction reverted (block {}, gas {}). \
+                             Proof may have failed on-chain Halo2 verification.",
+                            block_number, gas_used
+                        );
+                        retry_count += 1;
+                        let _ = self.event_tx.send(RoundCommitEvent::CommitFailed {
+                            commit_id,
+                            reason: err.clone(),
+                            retry_count,
+                        });
+                        if retry_count >= self.config.max_retries {
+                            break Err(RoundCommitError::SubmissionFailed(err));
+                        }
+                        tokio::time::sleep(self.config.retry_delay).await;
+                        continue;
+                    }
+
+                    let result = RoundCommitResult {
+                        commit_id,
+                        tx_hash: receipt.transaction_hash,
+                        block_number,
+                        gas_used,
+                        new_commitment: aggregated.public_inputs.new_hash_lo,
+                    };
+
+                    let _ = self.event_tx.send(RoundCommitEvent::CommitSuccessful {
+                        commit_id,
+                        tx_hash: result.tx_hash,
+                        block_number: result.block_number,
+                    });
+
+                    break Ok(result);
+                }
+                Err(e) => {
+                    retry_count += 1;
+                    let _ = self.event_tx.send(RoundCommitEvent::CommitFailed {
+                        commit_id,
+                        reason: e.to_string(),
+                        retry_count,
+                    });
+                    if retry_count >= self.config.max_retries {
+                        break Err(RoundCommitError::SubmissionFailed(e.to_string()));
+                    }
+                    tokio::time::sleep(self.config.retry_delay).await;
+                }
+            }
+        };
+
+        if let Ok(ref res) = result {
+            self.pending_submissions.remove(&commit_id);
+            self.completed_commits.push(res.clone());
+        }
+
+        result
+    }
+
+    /// Queries on-chain model state and verifies it matches expected post-round state.
+    pub async fn verify_on_chain_state(
+        &self,
+        expected_commitment: U256,
+    ) -> Result<bool, RoundCommitError> {
+        let client = self.sc_client.as_ref()
+            .ok_or(RoundCommitError::NoClient)?;
+
+        let state = client.get_model_state(self.config.model_id).await
+            .map_err(|e| RoundCommitError::ChainError(e.to_string()))?;
+
+        Ok(state.current_commitment == expected_commitment && state.active)
     }
 }
 

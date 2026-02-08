@@ -2,7 +2,10 @@ mod sc_client;
 
 use helix_node::sc_client::SCClient;
 use helix_node::api::http::{ApiState, OrchestratorSnapshot, RoundInfo};
-use helix_node::api::rpc::{ProofStatusEntry, RpcState, start_rpc_server};
+use helix_node::api::rpc::{
+    ProofStatusEntry, RpcState, start_rpc_server,
+    NodeConfigSnapshot, MPCStatusSnapshot,
+};
 use helix_node::network::messages::{
     GradientMessage, HeartbeatMessage, MessagePayload, NodeCapabilities, PeerId, PeerInfo,
     TrainingMessage, TrainingParams,
@@ -121,12 +124,20 @@ async fn run_worker(listen_addr: SocketAddr) -> anyhow::Result<()> {
     let api_snapshot = Arc::new(RwLock::new(OrchestratorSnapshot::default()));
     let proof_status = Arc::new(RwLock::new(Vec::<ProofStatusEntry>::new()));
 
+    let (stop_trigger_tx_w, _) = broadcast::channel::<()>(16);
     let rpc_state = Arc::new(RpcState {
         snapshot: api_snapshot.clone(),
         round_trigger_tx: round_trigger_tx.clone(),
+        stop_trigger_tx: stop_trigger_tx_w,
         node_role: "worker".to_string(),
         start_time: std::time::Instant::now(),
         proof_status: proof_status.clone(),
+        proof_queue: Arc::new(RwLock::new(Vec::new())),
+        node_config: Arc::new(RwLock::new(NodeConfigSnapshot::default())),
+        aggregation_results: Arc::new(RwLock::new(Vec::new())),
+        mpc_status: Arc::new(RwLock::new(MPCStatusSnapshot::default())),
+        model_id: Arc::new(RwLock::new(None)),
+        rpc_addr: format!("0.0.0.0:{}", rpc_port),
     });
 
     // Start JSON-RPC server
@@ -398,12 +409,20 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
     });
 
     // Start JSON-RPC server
+    let (stop_trigger_tx_a, _) = broadcast::channel::<()>(16);
     let rpc_state = Arc::new(RpcState {
         snapshot: api_snapshot.clone(),
         round_trigger_tx: round_trigger_tx.clone(),
+        stop_trigger_tx: stop_trigger_tx_a,
         node_role: "aggregator".to_string(),
         start_time: std::time::Instant::now(),
         proof_status: proof_status.clone(),
+        proof_queue: Arc::new(RwLock::new(Vec::new())),
+        node_config: Arc::new(RwLock::new(NodeConfigSnapshot::default())),
+        aggregation_results: Arc::new(RwLock::new(Vec::new())),
+        mpc_status: Arc::new(RwLock::new(MPCStatusSnapshot::default())),
+        model_id: Arc::new(RwLock::new(None)),
+        rpc_addr: format!("0.0.0.0:{}", rpc_port),
     });
     let rpc_addr: SocketAddr = format!("0.0.0.0:{}", rpc_port).parse().unwrap();
     let rpc_state_clone = rpc_state.clone();

@@ -79,6 +79,7 @@ pub use session::{
 pub use mpc::{
     MPCTrainingConfig, MPCTrainingRound, MPCStepResult,
     WorkerComputation, AdversarialDetector, SlashingEvent, SlashingReason,
+    MPCWorkerHandle,
     model_to_flat, flat_to_model,
 };
 
@@ -91,6 +92,7 @@ pub use orchestrator::{
 pub use verification::{
     GradientValidator, ProofType, ProofVerifier, ValidationResult,
     VerificationConfig, VerificationResult, VerificationStats,
+    ByzantineGradientFilter, ByzantineStrategy, FilterResult,
 };
 
 pub use state_machine::{

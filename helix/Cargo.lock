@@ -2900,6 +2900,7 @@ dependencies = [
  "env_logger",
  "ethers",
  "futures",
+ "halo2curves",
  "helix-avm",
  "helix-core",
  "helix-mpc",

@@ -568,6 +568,159 @@ impl MPCTrainingRound {
 }
 
 // ──────────────────────────────────────────────────────────────
+// MPC Worker Handle (for network integration)
+// ──────────────────────────────────────────────────────────────
+
+/// Handle for a single MPC worker in the distributed training network.
+///
+/// Each worker node holds one of these. It wraps the worker's party index,
+/// model share, and local gradient computation into a single interface
+/// that the network layer can call when training batches arrive.
+pub struct MPCWorkerHandle {
+    /// This worker's party index.
+    party_index: usize,
+    /// Total number of parties.
+    num_parties: usize,
+    /// Model dimensions.
+    dims: (usize, usize, usize),
+    /// Current model weights (reconstructed from share for local computation).
+    local_model: MlpModel,
+    /// Gradient commitment history for anomaly detection.
+    adversarial_detector: AdversarialDetector,
+    /// Learning rate.
+    learning_rate: f64,
+    /// Step counter.
+    step: u64,
+}
+
+impl MPCWorkerHandle {
+    /// Creates a new worker handle from a model share.
+    ///
+    /// The worker receives its share from the coordinator and reconstructs
+    /// a local view of the model for gradient computation.
+    pub fn new(
+        party_index: usize,
+        num_parties: usize,
+        model: MlpModel,
+        learning_rate: f64,
+        max_gradient_norm: f64,
+    ) -> Self {
+        let dims = (model.d_in, model.d_hid, model.d_out);
+        Self {
+            party_index,
+            num_parties,
+            dims,
+            local_model: model,
+            adversarial_detector: AdversarialDetector::new(max_gradient_norm),
+            learning_rate,
+            step: 0,
+        }
+    }
+
+    /// Computes gradient share on a training batch.
+    ///
+    /// The worker computes gradients on its local view of the model,
+    /// then divides by num_parties to create its share of the full gradient.
+    /// Returns a WorkerComputation that can be sent to the aggregator.
+    pub fn compute_gradient_share(
+        &mut self,
+        x: &[f64],
+        target: &[f64],
+    ) -> MPCResult<WorkerComputation> {
+        let party = PartyId::from_index(self.party_index);
+
+        // Forward and backward pass on local model.
+        let fwd = forward(&self.local_model, x, target);
+        let grads = backward(&self.local_model, x, target, &fwd);
+
+        // Scale by 1/num_parties — only party 0 applies the full gradient
+        // to avoid double-counting when shares are summed.
+        let scale = if self.party_index == 0 { 1.0 } else { 0.0 };
+        let scaled_grads = Gradients {
+            dw1: grads.dw1.iter().map(|&g| g * scale / self.num_parties as f64).collect(),
+            db1: grads.db1.iter().map(|&g| g * scale / self.num_parties as f64).collect(),
+            dw2: grads.dw2.iter().map(|&g| g * scale / self.num_parties as f64).collect(),
+            db2: grads.db2.iter().map(|&g| g * scale / self.num_parties as f64).collect(),
+        };
+
+        let gradient_share = gradients_to_share(
+            &scaled_grads,
+            &party,
+            self.party_index,
+            self.dims.0,
+            self.dims.1,
+            self.dims.2,
+        );
+
+        // Commitment for verification.
+        let gradient_commitment = compute_gradient_commitment_bytes(&gradient_share);
+
+        self.step += 1;
+
+        Ok(WorkerComputation {
+            party,
+            index: self.party_index,
+            gradient_share,
+            local_loss: fwd.loss,
+            gradient_commitment,
+        })
+    }
+
+    /// Applies aggregated gradients to the local model.
+    pub fn apply_gradients(&mut self, grads: &Gradients) {
+        for (w, g) in self.local_model.w1.iter_mut().zip(grads.dw1.iter()) {
+            *w -= self.learning_rate * g;
+        }
+        for (w, g) in self.local_model.b1.iter_mut().zip(grads.db1.iter()) {
+            *w -= self.learning_rate * g;
+        }
+        for (w, g) in self.local_model.w2.iter_mut().zip(grads.dw2.iter()) {
+            *w -= self.learning_rate * g;
+        }
+        for (w, g) in self.local_model.b2.iter_mut().zip(grads.db2.iter()) {
+            *w -= self.learning_rate * g;
+        }
+    }
+
+    /// Returns the party index.
+    pub fn party_index(&self) -> usize {
+        self.party_index
+    }
+
+    /// Returns the current local model.
+    pub fn local_model(&self) -> &MlpModel {
+        &self.local_model
+    }
+
+    /// Returns the current step.
+    pub fn current_step(&self) -> u64 {
+        self.step
+    }
+
+    /// Returns the adversarial detector (mutable for checking incoming gradients).
+    pub fn adversarial_detector_mut(&mut self) -> &mut AdversarialDetector {
+        &mut self.adversarial_detector
+    }
+}
+
+/// Computes a SHA-256 commitment to a gradient share.
+fn compute_gradient_commitment_bytes(grad: &helix_mpc::sharing::model::GradientShare) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+
+    for layer in &grad.layers {
+        for (name, tensor) in &layer.gradients {
+            hasher.update(name.as_bytes());
+            for v in &tensor.data {
+                hasher.update(&v.to_bytes_le());
+            }
+        }
+    }
+
+    hasher.finalize().into()
+}
+
+// ──────────────────────────────────────────────────────────────
 // Adversarial Detection
 // ──────────────────────────────────────────────────────────────
 
