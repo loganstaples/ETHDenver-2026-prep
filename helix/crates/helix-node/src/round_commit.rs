@@ -728,6 +728,116 @@ impl RoundCommitManager {
         self.pending_submissions.remove(&commit_id);
         Ok(())
     }
+
+    /// High-level method: collects proofs for a round, aggregates, and submits on-chain.
+    ///
+    /// This is called by the aggregator after a training round completes.
+    /// It takes the collected worker proofs (already in EVM format from V2 prover),
+    /// aggregates them, and submits to the coordinator contract.
+    pub async fn submit_round_to_chain(
+        &mut self,
+        round_id: DistributedRoundId,
+        worker_proofs: Vec<WorkerProof>,
+        old_commitment: [u8; 32],
+        new_commitment: [u8; 32],
+    ) -> Result<RoundCommitResult, RoundCommitError> {
+        // Clone the client Arc upfront to avoid borrow conflicts with &mut self
+        let client = self.sc_client.clone()
+            .ok_or(RoundCommitError::NoClient)?;
+
+        if worker_proofs.is_empty() {
+            return Err(RoundCommitError::NoProofs);
+        }
+
+        // Start collection
+        let workers: Vec<PeerId> = worker_proofs.iter().map(|p| p.worker_id.clone()).collect();
+        let commit_id = self.start_collection(round_id, workers)?;
+
+        // Submit all proofs
+        for proof in worker_proofs {
+            self.submit_proof(commit_id, proof)?;
+        }
+
+        // Finalize collection and aggregate
+        let aggregated = self.finalize_collection(commit_id, old_commitment, new_commitment)?;
+
+        // Build the TrainingProofInputs from aggregated data for on-chain submission
+        let proof_inputs = TrainingProofInputs {
+            old_hash_lo: U256::from_big_endian(&old_commitment[..16]),
+            old_hash_hi: U256::from_big_endian(&old_commitment[16..]),
+            new_hash_lo: U256::from_big_endian(&new_commitment[..16]),
+            new_hash_hi: U256::from_big_endian(&new_commitment[16..]),
+            loss: aggregated.public_inputs.loss,
+            error_bound: U256::from((aggregated.total_error_bound * 1e18) as u64),
+            step_number: U256::from(commit_id.round_number),
+        };
+
+        // Submit to chain via SCClient
+        let _ = self.event_tx.send(RoundCommitEvent::SubmissionStarted { commit_id });
+        let model_id = self.config.model_id;
+        let max_retries = self.config.max_retries;
+        let retry_delay = self.config.retry_delay;
+
+        let mut retry_count = 0u32;
+        let result = loop {
+            match client.submit_proof(
+                model_id,
+                commit_id.round_number,
+                aggregated.proof.clone(),
+                &proof_inputs,
+            ).await {
+                Ok(receipt) => {
+                    let result = RoundCommitResult {
+                        commit_id,
+                        tx_hash: receipt.transaction_hash,
+                        block_number: receipt.block_number.unwrap_or_default().as_u64(),
+                        gas_used: receipt.gas_used.unwrap_or_default(),
+                        new_commitment: U256::from_big_endian(&new_commitment[..]),
+                    };
+
+                    let _ = self.event_tx.send(RoundCommitEvent::CommitSuccessful {
+                        commit_id,
+                        tx_hash: result.tx_hash,
+                        block_number: result.block_number,
+                    });
+
+                    break Ok(result);
+                }
+                Err(e) => {
+                    retry_count += 1;
+
+                    let _ = self.event_tx.send(RoundCommitEvent::CommitFailed {
+                        commit_id,
+                        reason: e.to_string(),
+                        retry_count,
+                    });
+
+                    if retry_count >= max_retries {
+                        break Err(RoundCommitError::SubmissionFailed(e.to_string()));
+                    }
+
+                    tokio::time::sleep(retry_delay).await;
+                }
+            }
+        };
+
+        if let Ok(ref res) = result {
+            self.pending_submissions.remove(&commit_id);
+            self.completed_commits.push(res.clone());
+        }
+
+        result
+    }
+
+    /// Returns pending submissions for flushing during shutdown.
+    pub fn pending_commit_ids(&self) -> Vec<RoundCommitId> {
+        self.pending_submissions.keys().cloned().collect()
+    }
+
+    /// Returns the number of active collectors (in-flight rounds).
+    pub fn active_collections(&self) -> usize {
+        self.collectors.len()
+    }
 }
 
 // ============================================================================

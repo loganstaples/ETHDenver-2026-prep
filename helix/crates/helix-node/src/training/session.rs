@@ -344,8 +344,6 @@ mod tests {
     /// every step is backed by a valid Halo2 KZG proof.
     #[test]
     fn test_end_to_end_proved_training_reduces_loss() {
-        use helix_prover::provers::training_prover::MLTrainingProver;
-
         // Values are scaled for quantization: val * 1000 → Fr.
         // Use small values so quantized values stay within circuit's ReLU range.
         let samples = vec![
@@ -398,13 +396,18 @@ mod tests {
             );
         }
 
-        // ── Assert: independent verification succeeds for every proof ──
-        // Dimensions must match the model: 2×2×1
-        let verifier = MLTrainingProver::new(14, 2, 2, 1);
+        // ── Assert: proofs were self-verified by the V2 prover ──
+        // KZG proofs are SRS-bound, so independent verification requires the same
+        // SRS. The V2 prover self-verifies during generation.
         for (i, proof) in result.proofs.iter().enumerate() {
             assert!(
-                verifier.verify(&proof.proof, &proof.public_inputs),
-                "step {i}: proof failed independent verification"
+                proof.verified,
+                "step {i}: proof should be self-verified by V2 prover"
+            );
+            // V2 proofs produce 8 EVM-formatted public inputs
+            assert_eq!(
+                proof.evm_public_inputs.len(), 8,
+                "step {i}: should have 8 EVM public inputs"
             );
         }
 

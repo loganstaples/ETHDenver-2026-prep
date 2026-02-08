@@ -1,7 +1,8 @@
 mod sc_client;
 
 use helix_node::sc_client::SCClient;
-use helix_node::api::http::{ApiState, OrchestratorSnapshot, RoundInfo, WorkerInfo as ApiWorkerInfo};
+use helix_node::api::http::{ApiState, OrchestratorSnapshot, RoundInfo};
+use helix_node::api::rpc::{ProofStatusEntry, RpcState, start_rpc_server};
 use helix_node::network::messages::{
     GradientMessage, HeartbeatMessage, MessagePayload, NodeCapabilities, PeerId, PeerInfo,
     TrainingMessage, TrainingParams,
@@ -23,6 +24,28 @@ use tokio::sync::broadcast;
 /// Reads an env var or returns a default.
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// Creates a shutdown signal future that resolves on SIGINT or SIGTERM.
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to register SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => info!("Received SIGINT, initiating graceful shutdown..."),
+            _ = sigterm.recv() => info!("Received SIGTERM, initiating graceful shutdown..."),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await.ok();
+        info!("Received SIGINT, initiating graceful shutdown...");
+    }
 }
 
 #[tokio::main]
@@ -55,6 +78,7 @@ async fn run_worker(listen_addr: SocketAddr) -> anyhow::Result<()> {
     let aggregator_addr: SocketAddr = env_or("HELIX_AGGREGATOR_ADDR", "127.0.0.1:9000")
         .parse()
         .expect("invalid HELIX_AGGREGATOR_ADDR");
+    let rpc_port: u16 = env_or("HELIX_RPC_PORT", "9002").parse().unwrap_or(9002);
 
     let local_id = PeerId::random();
     info!("Worker {} starting, will connect to aggregator at {}", local_id, aggregator_addr);
@@ -92,9 +116,31 @@ async fn run_worker(listen_addr: SocketAddr) -> anyhow::Result<()> {
     network.connect_peer(agg_peer).await?;
     info!("Connected to aggregator at {}", aggregator_addr);
 
+    // Set up shared state for RPC
+    let (round_trigger_tx, _) = broadcast::channel::<()>(16);
+    let api_snapshot = Arc::new(RwLock::new(OrchestratorSnapshot::default()));
+    let proof_status = Arc::new(RwLock::new(Vec::<ProofStatusEntry>::new()));
+
+    let rpc_state = Arc::new(RpcState {
+        snapshot: api_snapshot.clone(),
+        round_trigger_tx: round_trigger_tx.clone(),
+        node_role: "worker".to_string(),
+        start_time: std::time::Instant::now(),
+        proof_status: proof_status.clone(),
+    });
+
+    // Start JSON-RPC server
+    let rpc_addr: SocketAddr = format!("0.0.0.0:{}", rpc_port).parse().unwrap();
+    let rpc_state_clone = rpc_state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = start_rpc_server(rpc_addr, rpc_state_clone).await {
+            error!("JSON-RPC server error: {}", e);
+        }
+    });
+
     // Heartbeat loop: send heartbeats to aggregator so it registers us
     let network_hb = network.clone();
-    tokio::spawn(async move {
+    let hb_handle = tokio::spawn(async move {
         let mut seq = 0u64;
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
@@ -111,96 +157,122 @@ async fn run_worker(listen_addr: SocketAddr) -> anyhow::Result<()> {
 
     // Main event loop: wait for RoundStart, train, send gradient
     let mut trainer: Option<Trainer> = None;
+    let mut steps_completed = 0u64;
 
-    loop {
-        match network.next_event().await {
-            Some(NetworkEvent::TrainingMessage { from, message }) => {
-                match message {
-                    TrainingMessage::RoundStart {
-                        round_id,
-                        model_hash,
-                        params,
-                    } => {
-                        info!(
-                            "Received RoundStart #{} from {} (model {}x{}x{}, lr={}, seed={})",
-                            round_id,
-                            from,
-                            params.d_in,
-                            params.d_hid,
-                            params.d_out,
-                            params.learning_rate,
-                            params.model_seed,
-                        );
-
-                        // Initialize trainer if needed (same seed = same initial model)
-                        if trainer.is_none() {
-                            trainer = Some(Trainer::new(
-                                params.d_in,
-                                params.d_hid,
-                                params.d_out,
-                                params.learning_rate,
-                                params.model_seed,
-                            ));
-                        }
-
-                        let t = trainer.as_mut().unwrap();
-
-                        // Generate synthetic data from seed (deterministic)
-                        let (x, target) = generate_training_data(params.d_in, params.d_out, params.model_seed + round_id);
-
-                        info!("Training step {} (round {})...", t.step_count() + 1, round_id);
-                        match t.train_step(&x, &target) {
-                            Ok(result) => {
+    let result = tokio::select! {
+        _ = shutdown_signal() => {
+            info!("Worker shutting down...");
+            Ok(())
+        }
+        result = async {
+            loop {
+                match network.next_event().await {
+                    Some(NetworkEvent::TrainingMessage { from, message }) => {
+                        match message {
+                            TrainingMessage::RoundStart {
+                                round_id,
+                                model_hash: _,
+                                params,
+                            } => {
                                 info!(
-                                    "Proof generated: {} bytes, loss={:.6}, commitment={:?}",
-                                    result.proof.len(),
-                                    result.loss,
-                                    hex::encode(&result.commitment[..4]),
+                                    "Received RoundStart #{} from {} (model {}x{}x{}, lr={}, seed={})",
+                                    round_id,
+                                    from,
+                                    params.d_in,
+                                    params.d_hid,
+                                    params.d_out,
+                                    params.learning_rate,
+                                    params.model_seed,
                                 );
 
-                                // Send gradient + proof back to aggregator
-                                network
-                                    .broadcast(MessagePayload::Gradient(
-                                        GradientMessage::ShareGradient {
-                                            round_id,
-                                            gradient_commitment: result.commitment,
-                                            error_bound: result.loss * 0.01, // conservative error bound
-                                            proof: result.proof,
-                                        },
-                                    ))
-                                    .await;
+                                // Initialize trainer if needed (same seed = same initial model)
+                                if trainer.is_none() {
+                                    trainer = Some(Trainer::new(
+                                        params.d_in,
+                                        params.d_hid,
+                                        params.d_out,
+                                        params.learning_rate,
+                                        params.model_seed,
+                                    ));
+                                }
 
-                                info!("Gradient sent for round {}", round_id);
+                                let t = trainer.as_mut().unwrap();
+
+                                // Generate synthetic data from seed (deterministic)
+                                let (x, target) = generate_training_data(params.d_in, params.d_out, params.model_seed + round_id);
+
+                                info!("Training step {} (round {})...", t.step_count() + 1, round_id);
+                                match t.train_step(&x, &target) {
+                                    Ok(result) => {
+                                        info!(
+                                            "Proof generated: {} bytes (EVM: {}), loss={:.6}, verified={}, commitment={:?}",
+                                            result.proof.len(),
+                                            result.evm_proof.as_ref().map(|p| p.len()).unwrap_or(0),
+                                            result.loss,
+                                            result.verified,
+                                            hex::encode(&result.commitment[..4]),
+                                        );
+
+                                        // Use EVM-formatted proof if available, otherwise raw
+                                        let proof_bytes = result.evm_proof.unwrap_or(result.proof);
+
+                                        // Send gradient + proof back to aggregator
+                                        network
+                                            .broadcast(MessagePayload::Gradient(
+                                                GradientMessage::ShareGradient {
+                                                    round_id,
+                                                    gradient_commitment: result.commitment,
+                                                    error_bound: result.loss * 0.01,
+                                                    proof: proof_bytes,
+                                                },
+                                            ))
+                                            .await;
+
+                                        steps_completed += 1;
+                                        info!("Gradient sent for round {} (total steps: {})", round_id, steps_completed);
+
+                                        // Update proof status
+                                        proof_status.write().push(ProofStatusEntry {
+                                            round_id,
+                                            status: "submitted".to_string(),
+                                            proofs_collected: 1,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        error!("Training failed for round {}: {}", round_id, e);
+                                    }
+                                }
                             }
-                            Err(e) => {
-                                error!("Training failed for round {}: {}", round_id, e);
+                            TrainingMessage::RoundComplete { round_id, .. } => {
+                                info!("Round {} completed", round_id);
                             }
+                            _ => {}
                         }
                     }
-                    TrainingMessage::RoundComplete { round_id, .. } => {
-                        info!("Round {} completed", round_id);
+                    Some(NetworkEvent::Heartbeat { .. }) => {
+                        // Heartbeat pongs handled automatically
+                    }
+                    Some(NetworkEvent::PeerDiscovered(peer)) => {
+                        info!("Peer discovered: {} at {}", peer.id, peer.address);
+                    }
+                    Some(NetworkEvent::Error { error, .. }) => {
+                        warn!("Network error: {}", error);
+                    }
+                    None => {
+                        warn!("Network event stream ended");
+                        break;
                     }
                     _ => {}
                 }
             }
-            Some(NetworkEvent::Heartbeat { .. }) => {
-                // Heartbeat pongs handled automatically
-            }
-            Some(NetworkEvent::PeerDiscovered(peer)) => {
-                info!("Peer discovered: {} at {}", peer.id, peer.address);
-            }
-            Some(NetworkEvent::Error { error, .. }) => {
-                warn!("Network error: {}", error);
-            }
-            None => {
-                warn!("Network event stream ended");
-                break;
-            }
-            _ => {}
-        }
-    }
+            Ok::<(), anyhow::Error>(())
+        } => result,
+    };
 
-    Ok(())
+    // Graceful cleanup
+    hb_handle.abort();
+    info!("Worker shutdown complete (steps_completed={})", steps_completed);
+    result
 }
 
 // ============================================================================
@@ -215,6 +287,7 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
     let model_seed: u64 = env_or("HELIX_MODEL_SEED", "42").parse().unwrap_or(42);
     let learning_rate: f64 = env_or("HELIX_LR", "0.01").parse().unwrap_or(0.01);
     let http_port: u16 = env_or("HELIX_HTTP_PORT", "9001").parse().unwrap_or(9001);
+    let rpc_port: u16 = env_or("HELIX_RPC_PORT", "9002").parse().unwrap_or(9002);
 
     let local_id = PeerId::from_string("aggregator");
     info!(
@@ -309,6 +382,7 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
     // Set up shared API state
     let (round_trigger_tx, mut round_trigger_rx) = broadcast::channel::<()>(16);
     let api_snapshot = Arc::new(RwLock::new(OrchestratorSnapshot::default()));
+    let proof_status = Arc::new(RwLock::new(Vec::<ProofStatusEntry>::new()));
     let api_state = Arc::new(ApiState {
         orchestrator_workers: api_snapshot.clone(),
         round_trigger_tx: round_trigger_tx.clone(),
@@ -323,10 +397,27 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
         }
     });
 
+    // Start JSON-RPC server
+    let rpc_state = Arc::new(RpcState {
+        snapshot: api_snapshot.clone(),
+        round_trigger_tx: round_trigger_tx.clone(),
+        node_role: "aggregator".to_string(),
+        start_time: std::time::Instant::now(),
+        proof_status: proof_status.clone(),
+    });
+    let rpc_addr: SocketAddr = format!("0.0.0.0:{}", rpc_port).parse().unwrap();
+    let rpc_state_clone = rpc_state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = start_rpc_server(rpc_addr, rpc_state_clone).await {
+            error!("JSON-RPC server error: {}", e);
+        }
+    });
+
     let orchestrator_ref = &orchestrator;
 
     // Spawn event logger + snapshot updater
     let snapshot_for_events = api_snapshot.clone();
+    let proof_status_events = proof_status.clone();
     let mut completed_rounds = 0u64;
     tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
@@ -339,13 +430,28 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
                 }
                 OrchestratorEvent::RoundStarted { round_id, workers } => {
                     info!("Round {} started with {} workers", round_id, workers.len());
+                    proof_status_events.write().push(ProofStatusEntry {
+                        round_id: *round_id,
+                        status: "collecting".to_string(),
+                        proofs_collected: 0,
+                    });
                 }
                 OrchestratorEvent::GradientReceived { round_id, peer_id } => {
                     info!("Gradient received for round {} from {}", round_id, peer_id);
+                    // Update proof collection count
+                    let mut status = proof_status_events.write();
+                    if let Some(entry) = status.iter_mut().find(|e| e.round_id == *round_id) {
+                        entry.proofs_collected += 1;
+                    }
                 }
                 OrchestratorEvent::RoundCompleted { round_id, result_hash } => {
                     completed_rounds += 1;
                     snapshot_for_events.write().completed_rounds = completed_rounds;
+                    // Update proof status
+                    let mut status = proof_status_events.write();
+                    if let Some(entry) = status.iter_mut().find(|e| e.round_id == *round_id) {
+                        entry.status = "completed".to_string();
+                    }
                     info!(
                         "Round {} completed, result={}",
                         round_id,
@@ -354,54 +460,76 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
                 }
                 OrchestratorEvent::RoundFailed { round_id, reason } => {
                     error!("Round {} failed: {}", round_id, reason);
+                    let mut status = proof_status_events.write();
+                    if let Some(entry) = status.iter_mut().find(|e| e.round_id == *round_id) {
+                        entry.status = "failed".to_string();
+                    }
                 }
                 _ => {}
             }
         }
     });
 
-    // Polling loop: check worker count, update snapshot, start rounds
+    // Polling loop with graceful shutdown
     let mut round_number = 0u64;
-    loop {
-        tokio::time::sleep(Duration::from_secs(5)).await;
 
-        let stats = orchestrator_ref.worker_stats();
-
-        // Update API snapshot
-        {
-            let mut snap = api_snapshot.write();
-            snap.worker_count = stats.total;
-            snap.available_workers = stats.available;
-            snap.computing_workers = stats.computing;
-            snap.current_round = orchestrator_ref.current_round().map(|(id, phase)| RoundInfo {
-                round_id: id,
-                phase: format!("{:?}", phase),
-                gradients_received: 0,
-                workers_assigned: stats.computing,
-            });
-        }
-
-        info!(
-            "Workers: total={}, available={}, computing={}",
-            stats.total, stats.available, stats.computing
-        );
-
-        // Check for manual round trigger from HTTP API
-        let manual_trigger = round_trigger_rx.try_recv().is_ok();
-
-        // Start a new round if we have enough workers and no active round
-        if (stats.available >= min_workers || manual_trigger) && orchestrator_ref.current_round().is_none() {
-            if stats.available < 1 {
-                continue;
-            }
-            round_number += 1;
-            info!("Starting round {} with {} available workers", round_number, stats.available);
-            match orchestrator_ref.start_round(model_hash).await {
-                Ok(id) => info!("Round {} started successfully (id={})", round_number, id),
-                Err(e) => error!("Failed to start round: {}", e),
+    tokio::select! {
+        _ = shutdown_signal() => {
+            info!("Aggregator shutting down...");
+            // Flush pending proofs
+            let pending = proof_status.read().iter()
+                .filter(|e| e.status == "collecting")
+                .count();
+            if pending > 0 {
+                warn!("Shutting down with {} pending proof collections", pending);
             }
         }
+        _ = async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+
+                let stats = orchestrator_ref.worker_stats();
+
+                // Update API snapshot
+                {
+                    let mut snap = api_snapshot.write();
+                    snap.worker_count = stats.total;
+                    snap.available_workers = stats.available;
+                    snap.computing_workers = stats.computing;
+                    snap.current_round = orchestrator_ref.current_round().map(|(id, phase)| RoundInfo {
+                        round_id: id,
+                        phase: format!("{:?}", phase),
+                        gradients_received: 0,
+                        workers_assigned: stats.computing,
+                    });
+                }
+
+                info!(
+                    "Workers: total={}, available={}, computing={}",
+                    stats.total, stats.available, stats.computing
+                );
+
+                // Check for manual round trigger from HTTP API or RPC
+                let manual_trigger = round_trigger_rx.try_recv().is_ok();
+
+                // Start a new round if we have enough workers and no active round
+                if (stats.available >= min_workers || manual_trigger) && orchestrator_ref.current_round().is_none() {
+                    if stats.available < 1 {
+                        continue;
+                    }
+                    round_number += 1;
+                    info!("Starting round {} with {} available workers", round_number, stats.available);
+                    match orchestrator_ref.start_round(model_hash).await {
+                        Ok(id) => info!("Round {} started successfully (id={})", round_number, id),
+                        Err(e) => error!("Failed to start round: {}", e),
+                    }
+                }
+            }
+        } => {}
     }
+
+    info!("Aggregator shutdown complete (rounds_completed={})", round_number);
+    Ok(())
 }
 
 // ============================================================================

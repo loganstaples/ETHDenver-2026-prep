@@ -1,18 +1,17 @@
-//! Real ML Training Pipeline with ZK Proof Generation.
+//! Real ML Training Pipeline with ZK Proof Generation (V2).
 //!
-//! Replaces the previous mocked trainer with a complete pipeline:
+//! Uses `MLTrainingProverV2` for EVM-compatible KZG proofs:
 //! 1. Native forward pass (matmul + bias + ReLU + matmul + bias)
 //! 2. MSE loss computation
 //! 3. Native backward pass (full gradient computation)
 //! 4. SGD weight update
 //! 5. Quantisation to `Fr` field elements
-//! 6. ZK proof generation via `MLTrainingProver`
+//! 6. ZK proof generation via `MLTrainingProverV2` (EVM-formatted output)
 //!
 //! The model is a 2-layer MLP: `x → W1·x + b1 → ReLU → W2·h + b2 → output`.
 
 use helix_prover::halo2curves::bn256::Fr;
-use helix_prover::provers::step_prover::{TrainingStepData, TrainingStepProver};
-use helix_prover::provers::training_prover::MLTrainingProver;
+use helix_prover::MLTrainingProverV2;
 use sha2::{Digest, Sha256};
 
 // ──────────────────────────────────────────────────────────────
@@ -261,10 +260,6 @@ pub fn sgd_update(model: &mut MlpModel, grads: &Gradients, lr: f64) {
 /// `Fr_val = round(f64_val * QUANT_SCALE)` (mod p for negatives).
 const QUANT_SCALE: f64 = 1000.0;
 
-/// BN254 field modulus p (for negative encoding).
-const BN254_P_STR: &str =
-    "30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001";
-
 /// Quantises an f64 to Fr, handling negatives via p - |v|.
 fn quantize(val: f64) -> Fr {
     let scaled = (val * QUANT_SCALE).round();
@@ -289,8 +284,13 @@ fn quantize_vec(vals: &[f64]) -> Vec<Fr> {
 /// Result from a single training step with ZK proof.
 #[derive(Debug)]
 pub struct ProvedStep {
-    /// The Halo2 KZG proof bytes.
+    /// The Halo2 KZG proof bytes (raw transcript format).
     pub proof: Vec<u8>,
+    /// EVM-formatted proof bytes (320 bytes: 3 advice + 2 opening points).
+    /// `None` if EVM serialization failed (non-fatal).
+    pub evm_proof: Option<Vec<u8>>,
+    /// EVM-formatted public inputs (8 × 32-byte big-endian arrays).
+    pub evm_public_inputs: Vec<[u8; 32]>,
     /// Model state commitment (SHA-256 of weights after update).
     pub commitment: [u8; 32],
     /// Loss before this step's weight update.
@@ -299,6 +299,8 @@ pub struct ProvedStep {
     pub step: u64,
     /// Public inputs for independent verification.
     pub public_inputs: Vec<Fr>,
+    /// Whether the proof was self-verified by the prover.
+    pub verified: bool,
 }
 
 /// Metrics collected during a training run.
@@ -318,20 +320,18 @@ pub struct TrainingMetrics {
 // Trainer
 // ──────────────────────────────────────────────────────────────
 
-/// Real ML trainer with ZK proof generation.
+/// Real ML trainer with ZK proof generation (V2).
 ///
-/// Holds a 2-layer MLP and an `MLTrainingProver`.  Each call to
+/// Holds a 2-layer MLP and an `MLTrainingProverV2`.  Each call to
 /// `train_step` runs native forward+backward, updates weights via SGD,
-/// then generates a Halo2 KZG proof that the step was computed correctly.
+/// then generates a Halo2 KZG proof with EVM-compatible output.
 pub struct Trainer {
     /// The model being trained.
     model: MlpModel,
     /// Learning rate for SGD.
     lr: f64,
-    /// Halo2 circuit size parameter (2^k rows).
-    k: u32,
     /// Prover instance (lazily initialised).
-    prover: Option<MLTrainingProver>,
+    prover: Option<MLTrainingProverV2>,
     /// Step counter.
     step_count: u64,
 }
@@ -343,7 +343,6 @@ impl Trainer {
         Self {
             model,
             lr,
-            k: 14,
             prover: None,
             step_count: 0,
         }
@@ -354,16 +353,9 @@ impl Trainer {
         Self {
             model,
             lr,
-            k: 14,
             prover: None,
             step_count: 0,
         }
-    }
-
-    /// Sets the circuit size parameter.
-    pub fn with_k(mut self, k: u32) -> Self {
-        self.k = k;
-        self
     }
 
     /// Returns a reference to the current model.
@@ -388,7 +380,7 @@ impl Trainer {
     /// 3. Snapshot old weights
     /// 4. SGD update
     /// 5. Quantise everything to Fr
-    /// 6. Generate Halo2 proof via MLTrainingProver
+    /// 6. Generate Halo2 proof via MLTrainingProverV2 (with EVM output)
     pub fn train_step(&mut self, x: &[f64], target: &[f64]) -> anyhow::Result<ProvedStep> {
         assert_eq!(x.len(), self.model.d_in, "input dimension mismatch");
         assert_eq!(target.len(), self.model.d_out, "target dimension mismatch");
@@ -420,10 +412,9 @@ impl Trainer {
         let b2_fr = quantize_vec(&old_b2);
         let lr_fr = quantize(self.lr);
 
-        // 6. Generate ZK proof.
+        // 6. Generate ZK proof via V2 prover.
         if self.prover.is_none() {
-            self.prover = Some(MLTrainingProver::new(
-                self.k,
+            self.prover = Some(MLTrainingProverV2::new(
                 self.model.d_in,
                 self.model.d_hid,
                 self.model.d_out,
@@ -431,7 +422,7 @@ impl Trainer {
         }
         let prover = self.prover.as_ref().unwrap();
 
-        let witness = MLTrainingProver::build_witness(
+        let witness = MLTrainingProverV2::build_witness(
             self.model.d_in,
             self.model.d_hid,
             self.model.d_out,
@@ -443,21 +434,30 @@ impl Trainer {
             &b2_fr,
             lr_fr,
             self.step_count,
+            Fr::from(1u64), // base_error
         );
-        let proof_result = prover.prove(&witness);
+        let proof_result = prover.prove(&witness)
+            .map_err(|e| anyhow::anyhow!("Proof generation failed at step {}: {}", self.step_count, e))?;
 
         if !prover.verify_result(&proof_result) {
             anyhow::bail!("Proof self-verification failed at step {}", self.step_count);
         }
 
+        // Convert to EVM format (non-fatal if it fails)
+        let evm_proof = proof_result.to_evm_proof().ok();
+        let evm_public_inputs = proof_result.to_evm_public_inputs();
+
         let commitment = self.model.commitment();
 
         Ok(ProvedStep {
             proof: proof_result.proof,
+            evm_proof,
+            evm_public_inputs,
             commitment,
             loss,
             step: self.step_count,
             public_inputs: proof_result.public_inputs,
+            verified: proof_result.verified,
         })
     }
 
@@ -551,15 +551,6 @@ impl Trainer {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn xor_dataset() -> Vec<(Vec<f64>, Vec<f64>)> {
-        vec![
-            (vec![0.0, 0.0], vec![0.0]),
-            (vec![0.0, 1.0], vec![1.0]),
-            (vec![1.0, 0.0], vec![1.0]),
-            (vec![1.0, 1.0], vec![0.0]),
-        ]
-    }
 
     fn simple_dataset() -> Vec<(Vec<f64>, Vec<f64>)> {
         // Simple regression: y ≈ x1 + x2
@@ -677,12 +668,7 @@ mod tests {
     }
 
     #[test]
-    fn test_train_step_with_proof() {
-        // Use the EXACT same values as the circuit's make_tiny_circuit() test.
-        // Values are integers matching the circuit expectation: Fr::from(n).
-        // IMPORTANT: Quantization scale is 1000, so 1.0 → Fr::from(1000).
-        // But the circuit test uses raw integers like Fr::from(1).
-        // To match, we use 0.001 so 0.001 * 1000 = 1.
+    fn test_train_step_with_proof_v2() {
         let model = MlpModel::new(
             2,
             2,
@@ -694,7 +680,6 @@ mod tests {
         );
 
         let mut trainer = Trainer::with_model(model, 0.001); // lr: 1 after ×1000
-        // x, target: need to be small so that ×1000 gives small integers.
         let x = vec![0.001, 0.001]; // [1, 1] after quantization
         let target = vec![0.005]; // [5] after quantization
 
@@ -704,13 +689,16 @@ mod tests {
         assert!(result.loss > 0.0, "loss should be positive");
         assert_eq!(result.step, 1);
         assert_ne!(result.commitment, [0u8; 32], "commitment should be non-zero");
+        // V2 prover self-verifies during generation
+        assert!(result.verified, "proof should be self-verified");
 
-        // Verify the proof independently (dims 2×2×1).
-        let verifier = MLTrainingProver::new(14, 2, 2, 1);
-        assert!(
-            verifier.verify(&result.proof, &result.public_inputs),
-            "proof should verify"
-        );
+        // EVM public inputs should have 8 elements (V2 format)
+        assert_eq!(result.evm_public_inputs.len(), 8, "V2 should produce 8 public inputs");
+
+        // Each EVM public input should be 32 bytes
+        for (i, pi) in result.evm_public_inputs.iter().enumerate() {
+            assert_eq!(pi.len(), 32, "public input {} should be 32 bytes", i);
+        }
     }
 
     #[test]
@@ -735,8 +723,7 @@ mod tests {
     }
 
     #[test]
-    fn test_two_consecutive_proved_steps() {
-        // Use the same scale as test_train_step_with_proof.
+    fn test_two_consecutive_proved_steps_v2() {
         let model = MlpModel::new(
             2,
             2,
@@ -747,7 +734,6 @@ mod tests {
             vec![0.0],
         );
 
-        // Very small lr so weight updates are tiny.
         let mut trainer = Trainer::with_model(model, 0.0001);
 
         let x = vec![0.001, 0.001]; // [1, 1] after quantization
@@ -757,15 +743,12 @@ mod tests {
         let r1 = trainer.train_step(&x, &target);
         assert!(r1.is_ok(), "step 1 failed: {:?}", r1.err());
         let r1 = r1.unwrap();
-        eprintln!("Step 1: loss={:.6}, proof_len={}", r1.loss, r1.proof.len());
+        eprintln!("Step 1: loss={:.6}, proof_len={}, verified={}", r1.loss, r1.proof.len(), r1.verified);
 
-        // Step 2 on the same sample.
+        // Step 2.
         let r2 = trainer.train_step(&x, &target);
         assert!(r2.is_ok(), "step 2 failed: {:?}", r2.err());
         let r2 = r2.unwrap();
-        eprintln!("Step 2: loss={:.6}, proof_len={}", r2.loss, r2.proof.len());
-
-        // With very small values, loss might not decrease much.
-        // Just verify both steps succeed.
+        eprintln!("Step 2: loss={:.6}, proof_len={}, verified={}", r2.loss, r2.proof.len(), r2.verified);
     }
 }
