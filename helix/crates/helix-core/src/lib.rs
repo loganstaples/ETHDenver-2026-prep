@@ -38,7 +38,7 @@ mod fuzz_tests;
 // ============================================================================
 
 // Config and error types
-pub use config::{HelixConfig, ProverConfig, TrainingConfig, VMConfig};
+pub use config::{ChainConfig, HelixConfig, ProverConfig, TlsConfig, TrainingConfig, VMConfig};
 pub use error::{
     ArithmeticError, BoundsError, CircuitError, DataError, ErrorContext, ErrorSeverity,
     HelixError, HelixResult, LogContext, NetworkError, OverflowError, ResultExt,
@@ -62,3 +62,12 @@ pub use types::{
 
 // Data verification essentials
 pub use data::{Hash, MerkleTree, Sha256Hasher, HASH_SIZE};
+
+// Data loading
+pub use data::{DataLoader, InMemoryDataLoader, ShardedDataLoader};
+
+// Coordination types for distributed training
+pub use types::{
+    AttestationChain, GradientCommitment, NodeId, RoundDescriptor, SessionId,
+    TrainingAttestation, TrainingParams, TrainingStepReceipt,
+};

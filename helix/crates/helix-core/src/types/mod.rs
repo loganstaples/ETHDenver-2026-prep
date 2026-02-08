@@ -5,6 +5,10 @@ pub mod error_margin;
 pub mod precision;
 pub mod tensor;
 
+// Coordination and attestation types
+pub mod coordination;
+pub mod attestation;
+
 // Advanced error algebra modules
 pub mod probabilistic_error;
 pub mod error_composition;
@@ -103,3 +107,12 @@ pub use error_commitment::{
     ErrorCommitment, ErrorCommitmentBuilder, ErrorCommitmentPublicInputs,
     ErrorCommitmentTracker,
 };
+
+// Re-export coordination types
+pub use coordination::{
+    GradientCommitment, NodeId, RoundDescriptor, SessionId, TrainingParams,
+    TrainingStepReceipt,
+};
+
+// Re-export attestation types
+pub use attestation::{AttestationChain, TrainingAttestation};

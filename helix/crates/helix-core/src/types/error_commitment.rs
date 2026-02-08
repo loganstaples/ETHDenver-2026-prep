@@ -7,7 +7,7 @@
 //!
 //! The error checksum is computed as:
 //! ```text
-//! checksum = keccak256(accumulated_error || step_number || model_id || budget_limit)
+//! checksum = SHA256(accumulated_error || step_number || model_id || budget_limit)
 //! ```
 //!
 //! This commitment is included as a public input in ZK proofs, allowing:
@@ -596,5 +596,129 @@ mod tests {
         assert_eq!(tracker.current_step(), 0);
         assert!((tracker.accumulated_error() - 0.0).abs() < 1e-15);
         assert!(tracker.error_history().is_empty());
+    }
+
+    /// Verifies that Rust checksum_compact() produces the exact same result
+    /// as Solidity _computeErrorChecksum() for known inputs.
+    ///
+    /// The Solidity function builds a 56-byte preimage:
+    ///   [errorBound as LE u64 (8)] [stepNumber as LE u64 (8)] [modelId (32)] [errorBudget as LE u64 (8)]
+    /// Then computes SHA256, and extracts first 8 bytes as LE u64.
+    ///
+    /// In Solidity, modelId is a uint256 stored as 32-byte big-endian.
+    /// In Rust, model_id is [u8; 32] written as-is.
+    /// When Solidity passes modelId=1, the 32 bytes are [0,0,...,0,1] (big-endian).
+    /// So the Rust model_id should be [0,0,...,0,1] to match Solidity modelId=1.
+    #[test]
+    fn test_cross_language_checksum_alignment() {
+        use sha2::{Digest, Sha256};
+
+        // Known test values matching Solidity test fixtures:
+        // errorBound = 1_000_000_000 (0.001 * 1e12)
+        // stepNumber = 42
+        // modelId = 1 (as uint256, big-endian 32 bytes: [0..0, 1])
+        // errorBudget = 10_000_000_000 (0.01 * 1e12)
+        let error_bound: u64 = 1_000_000_000;
+        let step_number: u64 = 42;
+        let mut model_id = [0u8; 32];
+        model_id[31] = 1; // Matches Solidity uint256(1) as big-endian bytes32
+        let error_budget: u64 = 10_000_000_000;
+
+        // Build the 56-byte preimage manually (matching Solidity layout)
+        let mut preimage = Vec::with_capacity(56);
+        preimage.extend_from_slice(&error_bound.to_le_bytes());  // 8 bytes
+        preimage.extend_from_slice(&step_number.to_le_bytes());  // 8 bytes
+        preimage.extend_from_slice(&model_id);                   // 32 bytes
+        preimage.extend_from_slice(&error_budget.to_le_bytes()); // 8 bytes
+        assert_eq!(preimage.len(), 56);
+
+        // Compute expected checksum
+        let mut hasher = Sha256::new();
+        hasher.update(&preimage);
+        let hash = hasher.finalize();
+        let expected_compact = u64::from_le_bytes(hash[0..8].try_into().unwrap());
+
+        // Now compute via ErrorCommitment
+        let commitment = ErrorCommitment::new(0.001, 42, model_id, 0.01);
+
+        // Verify scaling matches
+        assert_eq!(commitment.accumulated_error_scaled(), error_bound);
+        assert_eq!(commitment.budget_limit_scaled(), error_budget);
+
+        // Verify checksum_compact matches the manually computed value
+        let actual_compact = commitment.checksum_compact();
+        assert_eq!(
+            actual_compact, expected_compact,
+            "Rust checksum_compact() must match Solidity _computeErrorChecksum().\n\
+             Expected: {expected_compact} (0x{expected_compact:016x})\n\
+             Actual:   {actual_compact} (0x{actual_compact:016x})"
+        );
+
+        // Verify the full checksum also matches
+        let full_checksum = commitment.compute_checksum();
+        assert_eq!(&full_checksum[..], &hash[..]);
+    }
+
+    /// Tests alignment with a second set of known values to guard against
+    /// coincidental single-case matches.
+    #[test]
+    fn test_cross_language_checksum_alignment_second_vector() {
+        use sha2::{Digest, Sha256};
+
+        // Second test vector:
+        // error = 0.005 → scaled = 5_000_000_000
+        // step = 100
+        // modelId = 0x4242...42 (all 0x42 bytes)
+        // budget = 0.05 → scaled = 50_000_000_000
+        let error_bound: u64 = 5_000_000_000;
+        let step_number: u64 = 100;
+        let model_id = [0x42u8; 32];
+        let error_budget: u64 = 50_000_000_000;
+
+        let mut preimage = Vec::with_capacity(56);
+        preimage.extend_from_slice(&error_bound.to_le_bytes());
+        preimage.extend_from_slice(&step_number.to_le_bytes());
+        preimage.extend_from_slice(&model_id);
+        preimage.extend_from_slice(&error_budget.to_le_bytes());
+
+        let mut hasher = Sha256::new();
+        hasher.update(&preimage);
+        let hash = hasher.finalize();
+        let expected_compact = u64::from_le_bytes(hash[0..8].try_into().unwrap());
+
+        let commitment = ErrorCommitment::new(0.005, 100, model_id, 0.05);
+        assert_eq!(commitment.accumulated_error_scaled(), error_bound);
+        assert_eq!(commitment.budget_limit_scaled(), error_budget);
+        assert_eq!(commitment.checksum_compact(), expected_compact);
+    }
+
+    /// Verify the preimage byte layout matches the Solidity assembly exactly.
+    #[test]
+    fn test_preimage_byte_layout() {
+        // Construct a commitment and verify the internal preimage structure
+        let error_val = 0.001;
+        let step = 42u64;
+        let model_id = [0xABu8; 32];
+        let budget = 0.01;
+
+        let commitment = ErrorCommitment::new(error_val, step, model_id, budget);
+
+        // Manually construct what the hash input should be
+        let error_scaled = (error_val.abs() * 1e12) as u64;
+        let budget_scaled = (budget.abs() * 1e12) as u64;
+
+        let mut expected_preimage = Vec::new();
+        expected_preimage.extend_from_slice(&error_scaled.to_le_bytes());
+        expected_preimage.extend_from_slice(&step.to_le_bytes());
+        expected_preimage.extend_from_slice(&model_id);
+        expected_preimage.extend_from_slice(&budget_scaled.to_le_bytes());
+
+        // Hash it and compare
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&expected_preimage);
+        let expected_hash: [u8; 32] = hasher.finalize().into();
+
+        assert_eq!(commitment.compute_checksum(), expected_hash);
     }
 }

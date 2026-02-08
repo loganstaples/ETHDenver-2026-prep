@@ -145,6 +145,30 @@ impl ProverConfig {
     }
 }
 
+/// TLS configuration for secure connections.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsConfig {
+    /// Whether TLS is enabled.
+    pub enabled: bool,
+    /// Path to TLS certificate file (PEM).
+    pub cert_path: Option<String>,
+    /// Path to TLS private key file (PEM).
+    pub key_path: Option<String>,
+    /// Path to CA certificate for peer verification.
+    pub ca_path: Option<String>,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cert_path: None,
+            key_path: None,
+            ca_path: None,
+        }
+    }
+}
+
 /// Configuration for network operations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkConfig {
@@ -156,6 +180,8 @@ pub struct NetworkConfig {
     pub connection_timeout: u64,
     /// Maximum number of peers.
     pub max_peers: usize,
+    /// TLS configuration for peer connections.
+    pub tls: TlsConfig,
 }
 
 impl Default for NetworkConfig {
@@ -165,7 +191,64 @@ impl Default for NetworkConfig {
             bootstrap_peers: vec![],
             connection_timeout: 30,
             max_peers: 50,
+            tls: TlsConfig::default(),
         }
+    }
+}
+
+/// Configuration for on-chain interaction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainConfig {
+    /// JSON-RPC URL for the target chain.
+    pub rpc_url: String,
+    /// Chain ID (e.g., 1 for Ethereum mainnet, 31337 for local).
+    pub chain_id: u64,
+    /// Address of the HelixCoordinatorV2 contract.
+    pub coordinator_address: String,
+    /// Address of the Halo2Verifier contract (optional, read from coordinator).
+    pub verifier_address: Option<String>,
+    /// Address of the HelixToken contract (optional).
+    pub token_address: Option<String>,
+    /// Number of block confirmations to wait for transactions.
+    pub confirmations: u64,
+    /// Gas price limit in gwei (0 = no limit).
+    pub gas_price_limit_gwei: u64,
+}
+
+impl Default for ChainConfig {
+    fn default() -> Self {
+        Self {
+            rpc_url: "http://localhost:8545".to_string(),
+            chain_id: 31337,
+            coordinator_address: String::new(),
+            verifier_address: None,
+            token_address: None,
+            confirmations: 1,
+            gas_price_limit_gwei: 0,
+        }
+    }
+}
+
+impl ChainConfig {
+    /// Validates this configuration.
+    pub fn validate(&self) -> HelixResult<()> {
+        if self.rpc_url.is_empty() {
+            return Err(ValidationError::InvalidValue {
+                field: "rpc_url".to_string(),
+                value: String::new(),
+                reason: "must not be empty".to_string(),
+            }
+            .into());
+        }
+        if self.chain_id == 0 {
+            return Err(ValidationError::InvalidValue {
+                field: "chain_id".to_string(),
+                value: "0".to_string(),
+                reason: "must be greater than 0".to_string(),
+            }
+            .into());
+        }
+        Ok(())
     }
 }
 
@@ -238,6 +321,8 @@ pub struct HelixConfig {
     pub network: NetworkConfig,
     /// Training configuration.
     pub training: TrainingConfig,
+    /// On-chain configuration.
+    pub chain: ChainConfig,
 }
 
 impl HelixConfig {
@@ -246,6 +331,7 @@ impl HelixConfig {
         self.vm.validate()?;
         self.prover.validate()?;
         self.training.validate()?;
+        self.chain.validate()?;
         Ok(())
     }
 }
@@ -353,6 +439,47 @@ mod tests {
         let mut config = HelixConfig::default();
         config.training.batch_size = 0;
         assert!(config.validate().is_err());
+
+        let mut config = HelixConfig::default();
+        config.chain.chain_id = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_chain_config_default() {
+        let config = ChainConfig::default();
+        assert_eq!(config.rpc_url, "http://localhost:8545");
+        assert_eq!(config.chain_id, 31337);
+        assert_eq!(config.confirmations, 1);
+        assert!(config.coordinator_address.is_empty());
+    }
+
+    #[test]
+    fn test_chain_config_validation() {
+        let mut config = ChainConfig::default();
+        assert!(config.validate().is_ok());
+
+        config.rpc_url = String::new();
+        assert!(config.validate().is_err());
+
+        config.rpc_url = "http://localhost:8545".to_string();
+        config.chain_id = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_tls_config_default() {
+        let config = TlsConfig::default();
+        assert!(!config.enabled);
+        assert!(config.cert_path.is_none());
+        assert!(config.key_path.is_none());
+        assert!(config.ca_path.is_none());
+    }
+
+    #[test]
+    fn test_network_config_has_tls() {
+        let config = NetworkConfig::default();
+        assert!(!config.tls.enabled);
     }
 
     #[test]
