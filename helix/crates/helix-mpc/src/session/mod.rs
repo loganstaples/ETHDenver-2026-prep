@@ -28,6 +28,8 @@ pub mod manager;
 pub mod multiplexer;
 pub mod network;
 pub mod party_selection;
+pub mod secure_channel;
+pub mod transport;
 
 #[cfg(test)]
 mod integration_tests;
@@ -37,7 +39,7 @@ pub use establishment::{
     AuthenticationMessage, EstablishedSession, KeyExchangeMessage, SessionConfig,
     SessionEstablishment, SessionPhase, simulate_session_establishment,
 };
-pub use manager::MPCSession;
+pub use manager::{ConnectedSession, MPCSession};
 pub use network::{AsyncMPCChannel, ConnectionState, NetworkChannel, NetworkConfig, TlsConfig};
 pub use key_rotation::{
     KeyRotationConfig, KeyRotationManager, KeyRotationStats, PFSManager,
@@ -51,3 +53,6 @@ pub use party_selection::{
     HeartbeatMessage, PartyMetricsSummary, PartySelector, RoundRobinSelector,
     SelectionConfig,
 };
+pub use transport::{HandshakeMessage, LocalTransport, MPCTransport};
+#[cfg(feature = "network-mpc")]
+pub use transport::TcpTransport;

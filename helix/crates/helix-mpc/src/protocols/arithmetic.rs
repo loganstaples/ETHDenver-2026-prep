@@ -224,6 +224,93 @@ impl SecureArithmetic {
 
         Ok(r_shares)
     }
+
+    // ========== BATCHED OPERATIONS (single round trip) ==========
+
+    /// Batched Beaver multiplication for an entire vector.
+    ///
+    /// Instead of sending one message per element, this method batches all
+    /// d/e shares into a single message, dramatically reducing round trips.
+    ///
+    /// Returns the party's share of the element-wise product vector.
+    pub fn batched_beaver_mask(
+        x_shares: &[Fr],
+        y_shares: &[Fr],
+        triples: &[BeaverTriple],
+    ) -> (Vec<Fr>, Vec<Fr>) {
+        assert_eq!(x_shares.len(), y_shares.len());
+        assert_eq!(x_shares.len(), triples.len());
+
+        let d_shares: Vec<Fr> = x_shares
+            .iter()
+            .zip(triples.iter())
+            .map(|(x, t)| Fr::sub(x, &t.a))
+            .collect();
+
+        let e_shares: Vec<Fr> = y_shares
+            .iter()
+            .zip(triples.iter())
+            .map(|(y, t)| Fr::sub(y, &t.b))
+            .collect();
+
+        (d_shares, e_shares)
+    }
+
+    /// Batched multiplication result computation after opening d and e vectors.
+    ///
+    /// `opened_d` and `opened_e` are the reconstructed (public) vectors of
+    /// (x - a) and (y - b). These are obtained by summing all parties'
+    /// d/e shares from [`batched_beaver_mask`].
+    pub fn batched_multiply_shares(
+        triples: &[BeaverTriple],
+        opened_d: &[Fr],
+        opened_e: &[Fr],
+        party_index: usize,
+    ) -> Vec<Fr> {
+        let n = triples.len();
+        assert_eq!(opened_d.len(), n);
+        assert_eq!(opened_e.len(), n);
+
+        (0..n)
+            .map(|i| Self::multiply_shares(&triples[i], &opened_d[i], &opened_e[i], party_index))
+            .collect()
+    }
+
+    /// Serializes a vector of Fr shares to bytes for network transport.
+    ///
+    /// This enables sending all d/e shares in a single message.
+    pub fn serialize_share_batch(shares: &[Fr]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(4 + shares.len() * 32);
+        buf.extend_from_slice(&(shares.len() as u32).to_le_bytes());
+        for s in shares {
+            buf.extend_from_slice(&s.to_bytes_le());
+        }
+        buf
+    }
+
+    /// Deserializes a batch of Fr shares from bytes.
+    pub fn deserialize_share_batch(data: &[u8]) -> MPCResult<Vec<Fr>> {
+        if data.len() < 4 {
+            return Err(MPCError::CommunicationError("batch too short".into()));
+        }
+        let count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        let expected_len = 4 + count * 32;
+        if data.len() < expected_len {
+            return Err(MPCError::CommunicationError(format!(
+                "batch truncated: expected {} bytes, got {}",
+                expected_len,
+                data.len()
+            )));
+        }
+        let mut shares = Vec::with_capacity(count);
+        for i in 0..count {
+            let offset = 4 + i * 32;
+            let mut bytes = [0u8; 32];
+            bytes.copy_from_slice(&data[offset..offset + 32]);
+            shares.push(Fr::from_bytes_le(&bytes));
+        }
+        Ok(shares)
+    }
 }
 
 #[cfg(test)]
@@ -315,6 +402,37 @@ mod tests {
         let e_expected = Fr::from_f64(1.0);
         assert!(d.ct_eq(&d_expected).to_bool());
         assert!(e.ct_eq(&e_expected).to_bool());
+    }
+
+    #[test]
+    fn test_batched_beaver_mask() {
+        let mut dealer = TrustedDealer::with_seed(42);
+        let triples = dealer.generate_scalar_triple(3);
+
+        let x_shares = vec![Fr::from_f64(1.0), Fr::from_f64(2.0), Fr::from_f64(3.0)];
+        let y_shares = vec![Fr::from_f64(4.0), Fr::from_f64(5.0), Fr::from_f64(6.0)];
+
+        // Single-element masks
+        let (d0, e0) = SecureArithmetic::beaver_mask(&x_shares[0], &y_shares[0], &triples[0]);
+
+        // Batched masks
+        let (d_batch, e_batch) =
+            SecureArithmetic::batched_beaver_mask(&x_shares, &y_shares, &triples);
+
+        assert!(d0.ct_eq(&d_batch[0]).to_bool());
+        assert!(e0.ct_eq(&e_batch[0]).to_bool());
+    }
+
+    #[test]
+    fn test_serialize_deserialize_batch() {
+        let shares = vec![Fr::from_f64(1.5), Fr::from_f64(-3.0), Fr::from_f64(0.0)];
+        let bytes = SecureArithmetic::serialize_share_batch(&shares);
+        let recovered = SecureArithmetic::deserialize_share_batch(&bytes).unwrap();
+
+        assert_eq!(shares.len(), recovered.len());
+        for (s, r) in shares.iter().zip(recovered.iter()) {
+            assert!(s.ct_eq(r).to_bool());
+        }
     }
 
     #[test]

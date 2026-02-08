@@ -8,6 +8,7 @@ description = "Multi-Party Computation engine for HELIX trustless AI training"
 default = ["parallel"]
 parallel = ["rayon"]
 metal = ["helix-prover/metal"]
+network-mpc = []
 
 [dependencies]
 helix-core = { path = "../helix-core" }

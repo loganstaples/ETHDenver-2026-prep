@@ -195,6 +195,34 @@ impl SecureMatmul {
         // Outer product is matmul of [m x 1] @ [1 x n]
         Self::simulate_matmul(u_shares, v_shares, triples, m, 1, n)
     }
+
+    /// Serializes a matrix of Fr elements to bytes for batched network transport.
+    ///
+    /// Format: [4-byte count LE][32-byte Fr elements...]
+    /// Sending the entire D/E matrix in one message instead of per-element
+    /// reduces round trips from O(m*k + k*n) to O(1).
+    pub fn serialize_matrix_batch(matrix: &[Fr]) -> Vec<u8> {
+        crate::protocols::arithmetic::SecureArithmetic::serialize_share_batch(matrix)
+    }
+
+    /// Deserializes a matrix batch from bytes.
+    pub fn deserialize_matrix_batch(data: &[u8]) -> MPCResult<Vec<Fr>> {
+        crate::protocols::arithmetic::SecureArithmetic::deserialize_share_batch(data)
+    }
+
+    /// Batched matrix Beaver mask: computes D = A - U and E = B - V for the
+    /// entire matrix at once, returning vectors ready for single-message
+    /// network transmission.
+    ///
+    /// This replaces per-element communication with a single broadcast of the
+    /// D [m*k] and E [k*n] vectors.
+    pub fn batched_beaver_mask(
+        a_share: &[Fr],
+        b_share: &[Fr],
+        triple: &MatrixBeaverTriple,
+    ) -> (Vec<Fr>, Vec<Fr>) {
+        Self::beaver_mask(a_share, b_share, triple)
+    }
 }
 
 /// Plain matrix multiplication: C = A @ B.
