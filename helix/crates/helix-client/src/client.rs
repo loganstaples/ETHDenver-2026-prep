@@ -107,6 +107,45 @@ impl HelixClient {
     pub fn rpc_mut(&mut self) -> &mut crate::rpc::client::UnifiedRpcClient {
         &mut self.rpc
     }
+
+    /// Run a full E2E training session using the `TrainingOrchestrator`.
+    ///
+    /// This orchestrates the complete flow:
+    /// 1. Start Anvil (if `start_anvil` is set)
+    /// 2. Deploy contracts (if `deploy_contracts` is set)
+    /// 3. Register model + stake on-chain (if chain feature enabled)
+    /// 4. Spawn aggregator + worker nodes
+    /// 5. Run training rounds with proof submission
+    /// 6. Clean up all processes
+    ///
+    /// After training completes, the RPC client is upgraded to connect to
+    /// the real node (if it was started).
+    pub async fn train(
+        &mut self,
+        orch_config: crate::orchestration::OrchestratorConfig,
+    ) -> Result<crate::orchestration::TrainingResult> {
+        let mut orchestrator = crate::orchestration::TrainingOrchestrator::new(orch_config);
+        let result = orchestrator.train().await;
+
+        // Always clean up processes, even on error
+        if let Err(e) = orchestrator.shutdown().await {
+            tracing::warn!("Shutdown error: {}", e);
+        }
+
+        // If deployment happened, update our config with new contract addresses
+        if let Some(ref deployment) = result.as_ref().ok().and_then(|r| r.deployment.as_ref()) {
+            self.config.contracts.coordinator = deployment.coordinator.clone();
+            self.config.contracts.verifier = deployment.verifier.clone();
+            if let Some(ref token) = deployment.token {
+                self.config.contracts.token = Some(token.clone());
+            }
+            if let Some(ref staking) = deployment.staking {
+                self.config.contracts.staking = Some(staking.clone());
+            }
+        }
+
+        result
+    }
 }
 
 /// Convert the crate-level `RpcConfig` into the rpc module's `HelixRpcConfig`.

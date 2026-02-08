@@ -14,6 +14,21 @@ use ethers::providers::{Http, Provider};
 use ethers::signers::{LocalWallet, Signer};
 use ethers::types::{Address, Bytes, U256};
 
+/// Addresses of contracts deployed via `deploy_with_forge`.
+///
+/// Intentionally self-contained so chain.rs compiles in both the lib *and*
+/// bin crate contexts (main.rs re-declares `mod rpc;`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ForgeDeployResult {
+    pub coordinator: String,
+    pub verifier: String,
+    pub token: Option<String>,
+    pub staking: Option<String>,
+    pub rewards: Option<String>,
+    pub registry: Option<String>,
+    pub treasury: String,
+}
+
 // Generate type-safe bindings (same ABI as helix-node sc_client.rs)
 abigen!(
     HelixCoordinatorV2,
@@ -409,6 +424,108 @@ impl ChainClient {
             filter
         };
         filter.query().await.map_err(|e| anyhow!("query_round_completed: {}", e))
+    }
+
+    /// Deploy contracts via `forge script` and return a `ChainClient`
+    /// connected to the freshly deployed coordinator.
+    ///
+    /// This is a convenience method that:
+    /// 1. Runs `forge script script/Deploy.s.sol --sig "runWithMock()" --broadcast`
+    /// 2. Parses the broadcast JSON for contract addresses
+    /// 3. Returns `(ChainClient, DeploymentResult)`
+    pub async fn deploy_with_forge(
+        rpc_url: &str,
+        private_key: &str,
+        contracts_dir: &std::path::Path,
+    ) -> Result<(Self, ForgeDeployResult)> {
+        use std::process::{Command, Stdio};
+
+        let pk = private_key.strip_prefix("0x").unwrap_or(private_key);
+
+        let output = Command::new("forge")
+            .arg("script")
+            .arg("script/Deploy.s.sol")
+            .arg("--sig")
+            .arg("runWithMock()")
+            .arg("--broadcast")
+            .arg("--rpc-url")
+            .arg(rpc_url)
+            .arg("--private-key")
+            .arg(pk)
+            .current_dir(contracts_dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|e| anyhow!("Failed to run forge: {}", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!("forge script failed: {}", stderr));
+        }
+
+        // Parse broadcast JSON
+        let broadcast_path = contracts_dir
+            .join("broadcast")
+            .join("Deploy.s.sol")
+            .join("31337")
+            .join("run-latest.json");
+
+        let content = std::fs::read_to_string(&broadcast_path)
+            .map_err(|e| anyhow!("Failed to read broadcast JSON: {}", e))?;
+
+        let json: serde_json::Value = serde_json::from_str(&content)
+            .map_err(|e| anyhow!("Failed to parse broadcast JSON: {}", e))?;
+
+        let transactions = json
+            .get("transactions")
+            .and_then(|t| t.as_array())
+            .ok_or_else(|| anyhow!("No 'transactions' in broadcast JSON"))?;
+
+        let mut addresses = std::collections::HashMap::new();
+        let mut deployer_addr = String::new();
+
+        for tx in transactions {
+            if let (Some(name), Some(addr)) = (
+                tx.get("contractName").and_then(|n| n.as_str()),
+                tx.get("contractAddress").and_then(|a| a.as_str()),
+            ) {
+                addresses.insert(name.to_string(), addr.to_string());
+            }
+            if deployer_addr.is_empty() {
+                if let Some(from) = tx.get("transaction")
+                    .and_then(|t| t.get("from"))
+                    .and_then(|f| f.as_str())
+                {
+                    deployer_addr = from.to_string();
+                }
+            }
+        }
+
+        let coordinator_addr = addresses
+            .get("HelixCoordinatorV2")
+            .or_else(|| addresses.get("HelixCoordinatorV3"))
+            .cloned()
+            .ok_or_else(|| anyhow!("Coordinator not found in broadcast"))?;
+
+        let verifier_addr = addresses
+            .get("MockVerifierForDeploy")
+            .or_else(|| addresses.get("Halo2Verifier"))
+            .cloned()
+            .unwrap_or_default();
+
+        let deployment = ForgeDeployResult {
+            coordinator: coordinator_addr.clone(),
+            verifier: verifier_addr,
+            token: addresses.get("HelixToken").cloned(),
+            staking: addresses.get("Staking").cloned(),
+            rewards: addresses.get("Rewards").cloned(),
+            registry: addresses.get("ModelRegistry").cloned(),
+            treasury: deployer_addr,
+        };
+
+        let client = Self::new(rpc_url, private_key, &coordinator_addr, None).await?;
+
+        Ok((client, deployment))
     }
 }
 

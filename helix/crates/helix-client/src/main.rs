@@ -389,6 +389,42 @@ struct DemoArgs {
     /// Skip contract deployment (assume already deployed)
     #[arg(long)]
     skip_deploy: bool,
+
+    /// Live mode: spawn real helix-node processes with Anvil and on-chain proof submission
+    #[arg(long)]
+    live: bool,
+
+    /// Path to helix-node binary (live mode, auto-detected if omitted)
+    #[arg(long)]
+    node_binary: Option<PathBuf>,
+
+    /// Path to contracts/ directory (live mode, auto-detected if omitted)
+    #[arg(long)]
+    contracts_dir: Option<PathBuf>,
+
+    /// Model dimensions as "d_in,d_hid,d_out" (live mode)
+    #[arg(long, default_value = "4,8,2")]
+    model: String,
+
+    /// Model seed (live mode)
+    #[arg(long, default_value = "42")]
+    model_seed: u64,
+
+    /// Private key for on-chain transactions (live mode, defaults to Anvil account 0)
+    #[arg(long, env = "PRIVATE_KEY", default_value = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")]
+    demo_private_key: String,
+
+    /// Pre-deployed coordinator address (live mode, skip deployment if set)
+    #[arg(long)]
+    coordinator_address: Option<String>,
+
+    /// Base TCP port for nodes (live mode)
+    #[arg(long, default_value = "9000")]
+    base_port: u16,
+
+    /// HTTP API port for aggregator (live mode)
+    #[arg(long, default_value = "9001")]
+    demo_http_port: u16,
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -1181,6 +1217,10 @@ async fn cmd_train_live(args: &TrainArgs, mut shutdown: broadcast::Receiver<()>)
 }
 
 async fn cmd_demo(args: &DemoArgs, _cli: &Cli, shutdown: broadcast::Receiver<()>) -> Result<()> {
+    if args.live {
+        return cmd_demo_live(args, shutdown).await;
+    }
+
     use demo::{DemoScenarioType, DemoBuilder};
 
     // Map CLI scenario to demo module scenario type
@@ -1213,6 +1253,182 @@ async fn cmd_demo(args: &DemoArgs, _cli: &Cli, shutdown: broadcast::Receiver<()>
 
     Ok(())
 }
+
+/// Live demo: Start Anvil, deploy contracts, spawn real helix-node processes,
+/// run distributed ZK-verified training with on-chain proof submission.
+///
+/// This is the 90-second ETHDenver demo with real components.
+async fn cmd_demo_live(args: &DemoArgs, mut shutdown: broadcast::Receiver<()>) -> Result<()> {
+    use helix_client::orchestration::{
+        find_contracts_dir, find_node_binary, OrchestratorConfig, TrainingOrchestrator,
+    };
+
+    // Parse model dimensions
+    let dims: Vec<usize> = args
+        .model
+        .split(',')
+        .map(|s| s.trim().parse::<usize>())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|_| anyhow::anyhow!("Invalid --model format. Expected d_in,d_hid,d_out"))?;
+    if dims.len() != 3 {
+        return Err(anyhow::anyhow!("--model requires exactly 3 dimensions"));
+    }
+    let (d_in, d_hid, d_out) = (dims[0], dims[1], dims[2]);
+
+    // Resolve paths
+    let node_binary = match &args.node_binary {
+        Some(p) => p.clone(),
+        None => find_node_binary()?,
+    };
+    let contracts_dir = match &args.contracts_dir {
+        Some(p) => p.clone(),
+        None => find_contracts_dir()?,
+    };
+
+    let deploy = args.coordinator_address.is_none() && !args.skip_deploy;
+    let coordinator = args.coordinator_address.clone().unwrap_or_default();
+
+    let config = OrchestratorConfig {
+        model_dims: (d_in, d_hid, d_out),
+        model_seed: args.model_seed,
+        learning_rate: 0.01,
+        rounds: args.rounds,
+        workers: args.workers,
+        node_binary: node_binary.clone(),
+        base_port: args.base_port,
+        http_port: args.demo_http_port,
+        eth_rpc_url: format!("http://127.0.0.1:{}", 8545),
+        private_key: args.demo_private_key.clone(),
+        contracts_dir: contracts_dir.clone(),
+        deploy_contracts: deploy,
+        coordinator_address: coordinator,
+        start_anvil: true,
+        anvil_port: 8545,
+        worker_timeout: Duration::from_secs(30),
+        round_timeout: Duration::from_secs(120),
+    };
+
+    // Print banner
+    println!();
+    println!("{}", "═".repeat(60).cyan());
+    println!("{}", " HELIX Live Demo — Real Distributed Training".cyan().bold());
+    println!("{}", "═".repeat(60).cyan());
+    println!();
+
+    println!("{}", "Configuration:".yellow().bold());
+    println!("  Model dims:    {}x{}x{} ({} params)",
+        d_in, d_hid, d_out,
+        d_in * d_hid + d_hid + d_hid * d_out + d_out
+    );
+    println!("  Workers:       {}", args.workers);
+    println!("  Rounds:        {}", args.rounds);
+    println!("  Node binary:   {}", node_binary.display());
+    println!("  Contracts:     {}", contracts_dir.display());
+    println!("  Deploy:        {}", if deploy { "yes (fresh Anvil + forge)" } else { "no (pre-deployed)" });
+    println!();
+
+    let mut orchestrator = TrainingOrchestrator::new(config);
+
+    // Phase 1: Start Anvil
+    let mut progress = ProgressDisplay::new();
+    progress.start_spinner("Starting Anvil...");
+    orchestrator.start_anvil().await?;
+    progress.finish_spinner("Anvil running on http://127.0.0.1:8545");
+
+    // Phase 2: Deploy contracts
+    if deploy {
+        progress.start_spinner("Deploying contracts via forge...");
+        orchestrator.deploy_contracts().await?;
+        if let Some(dep) = orchestrator.deployment() {
+            progress.finish_spinner(&format!(
+                "Contracts deployed (coordinator={})",
+                &dep.coordinator[..10]
+            ));
+        } else {
+            progress.finish_spinner("Contracts deployed");
+        }
+    }
+
+    // Phase 3: Spawn network
+    progress.start_spinner(&format!("Starting 1 aggregator + {} workers...", args.workers));
+    orchestrator.start_network().await?;
+    progress.finish_spinner(&format!("Network started ({} nodes)", 1 + args.workers));
+
+    // Phase 4: Wait for workers
+    progress.start_spinner("Waiting for workers to connect...");
+    orchestrator.wait_for_workers().await?;
+    progress.finish_spinner(&format!("{} workers connected", args.workers));
+
+    println!();
+    println!("{}", "═".repeat(60).cyan());
+    println!("{}", " Training Progress".cyan().bold());
+    println!("{}", "═".repeat(60).cyan());
+    println!();
+
+    // Phase 5: Training rounds
+    let start = std::time::Instant::now();
+    let mut rounds_completed = 0u32;
+
+    for round in 1..=args.rounds {
+        if shutdown.try_recv().is_ok() {
+            println!("\n{}", "Demo interrupted by user".yellow());
+            break;
+        }
+
+        progress.start_spinner(&format!("Round {}/{} — training...", round, args.rounds));
+
+        // Trigger round
+        let round_start = std::time::Instant::now();
+        match orchestrator.trigger_round().await {
+            Ok(_) => {}
+            Err(e) => {
+                progress.finish_spinner_error(&format!("Round {} failed: {}", round, e));
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        }
+
+        // Wait for completion
+        match orchestrator.wait_for_round_completion(round).await {
+            Ok(_status) => {
+                let elapsed = round_start.elapsed().as_millis();
+                progress.finish_spinner(&format!(
+                    "Round {}/{} — completed ({}ms)",
+                    round, args.rounds, elapsed
+                ));
+                rounds_completed = round;
+            }
+            Err(e) => {
+                progress.finish_spinner_error(&format!("Round {} — {}", round, e));
+            }
+        }
+    }
+
+    let total_elapsed = start.elapsed();
+
+    // Results
+    println!();
+    println!("{}", "═".repeat(60).green());
+    println!("{}", " Demo Complete".green().bold());
+    println!("{}", "═".repeat(60).green());
+    println!();
+    println!("  Rounds completed: {}/{}", rounds_completed, args.rounds);
+    println!("  Total time:       {:.1}s", total_elapsed.as_secs_f64());
+    println!("  Workers:          {}", args.workers);
+    if let Some(dep) = orchestrator.deployment() {
+        println!("  Coordinator:      {}", dep.coordinator);
+        println!("  Verifier:         {}", dep.verifier);
+    }
+    println!();
+
+    // Cleanup
+    progress.start_spinner("Shutting down...");
+    orchestrator.shutdown().await?;
+    progress.finish_spinner("All processes stopped");
+
+    Ok(())
+}
+
 
 async fn cmd_orchestrate(args: &OrchestrateArgs, _cli: &Cli) -> Result<()> {
     let mut progress = ProgressDisplay::new();
