@@ -1306,18 +1306,21 @@ mod pipeline_tests {
     };
     use super::super::transcript::Keccak256Write;
 
-    /// Full pipeline test: generate proof with Keccak256 transcript →
-    /// serialize to EVM format → verify structure matches Halo2Verifier.sol.
+    /// Full pipeline test: generate transcript bytes in Halo2's compressed
+    /// G1 format → serialize to EVM format → verify structure matches
+    /// Halo2Verifier.sol.
     #[test]
     fn test_e2e_proof_pipeline() {
+        use halo2curves::group::GroupEncoding;
+
         let g1 = G1Affine::generator();
 
-        // === Step 1: Simulate proof generation with Keccak256 transcript ===
-        // In a real system, `create_proof()` would use this transcript.
-        // Here we simulate the transcript output structure.
-        let mut transcript = Keccak256Write::init(Vec::new());
+        // === Step 1: Build transcript bytes in Halo2's compressed format ===
+        // In a real Halo2 proof, points are written via GroupEncoding::to_bytes()
+        // (32-byte compressed) and scalars via Fr::to_repr() (32-byte LE).
+        let mut transcript_bytes = Vec::new();
 
-        // Write 3 advice commitments (mimicking Halo2 prover)
+        // Write 3 advice commitments as compressed G1 points (32 bytes each)
         let advice_scalars = [Fr::from(111u64), Fr::from(222u64), Fr::from(333u64)];
         let advice_points: Vec<G1Affine> = advice_scalars
             .iter()
@@ -1325,28 +1328,24 @@ mod pipeline_tests {
             .collect();
 
         for point in &advice_points {
-            transcript.write_point(point).unwrap();
+            let compressed = point.to_bytes();
+            transcript_bytes.extend_from_slice(compressed.as_ref());
         }
 
-        // Squeeze Fiat-Shamir challenges (alpha, beta, gamma)
-        let alpha = transcript.squeeze_challenge();
-        let beta = transcript.squeeze_challenge();
-        let gamma = transcript.squeeze_challenge();
-        assert_ne!(alpha, Fr::zero());
-        assert_ne!(beta, Fr::zero());
-        assert_ne!(gamma, Fr::zero());
-
         // Write some evaluation scalars (intermediate transcript data)
-        transcript.write_scalar(&Fr::from(999u64)).unwrap();
-        transcript.write_scalar(&Fr::from(888u64)).unwrap();
+        let s1_repr = Fr::from(999u64).to_repr();
+        let s2_repr = Fr::from(888u64).to_repr();
+        transcript_bytes.extend_from_slice(s1_repr.as_ref());
+        transcript_bytes.extend_from_slice(s2_repr.as_ref());
 
-        // Write opening proof points W and W'
+        // Write opening proof points W and W' as compressed G1 (32 bytes each)
         let w = (g1 * Fr::from(444u64)).to_affine();
         let w_prime = (g1 * Fr::from(555u64)).to_affine();
-        transcript.write_point(&w).unwrap();
-        transcript.write_point(&w_prime).unwrap();
+        transcript_bytes.extend_from_slice(w.to_bytes().as_ref());
+        transcript_bytes.extend_from_slice(w_prime.to_bytes().as_ref());
 
-        let transcript_bytes = transcript.finalize();
+        // Total: 3*32 + 2*32 + 2*32 = 224 bytes
+        assert_eq!(transcript_bytes.len(), 224);
 
         // === Step 2: Serialize to EVM format ===
         let evm_proof_bytes = serialize_proof_for_evm(&transcript_bytes, 3).unwrap();

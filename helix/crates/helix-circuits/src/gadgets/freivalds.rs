@@ -88,30 +88,27 @@ impl<F: PrimeField> FreivaldsChip<F> {
         }
     }
 
-    /// Generates a pseudo-random challenge vector from a seed.
+    /// Generates a cryptographically secure challenge vector from a seed.
+    ///
+    /// Uses SHA-256 for deterministic but unpredictable challenge generation.
+    /// This is critical for Freivalds soundness: if the prover can predict
+    /// the challenge vector, they can craft invalid matrix multiplications
+    /// that pass verification.
     pub fn generate_challenge_vector(seed: u64, len: usize) -> Vec<F> {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
+        use sha2::{Digest, Sha256};
 
         let mut result = Vec::with_capacity(len);
-        let mut state = seed;
 
         for i in 0..len {
-            let mut hasher = DefaultHasher::new();
-            state.hash(&mut hasher);
-            i.hash(&mut hasher);
-            state = hasher.finish();
+            let mut hasher = Sha256::new();
+            hasher.update(b"HELIX_FREIVALDS_V1");
+            hasher.update(&seed.to_le_bytes());
+            hasher.update(&(i as u64).to_le_bytes());
+            let hash = hasher.finalize();
 
-            // Convert to field element
-            // Use repr approach that works generically
-            let bytes = state.to_le_bytes();
-            let mut repr = F::Repr::default();
-            let repr_bytes = repr.as_mut();
-            let copy_len = repr_bytes.len().min(8);
-            repr_bytes[..copy_len].copy_from_slice(&bytes[..copy_len]);
-            
-            // This is a simplified approach - for real use, need proper field sampling
-            result.push(F::from(state));
+            // Use first 8 bytes to create a field element
+            let val = u64::from_le_bytes(hash[0..8].try_into().unwrap());
+            result.push(F::from(val));
         }
 
         result

@@ -51,6 +51,8 @@ use halo2curves::group::Curve;
 use sha2::{Digest, Sha256};
 use std::marker::PhantomData;
 
+use crate::gadgets::poseidon::{poseidon_hash_two, poseidon_hash_many};
+
 use crate::verifier::{
     EvmProof, EvmProofBuilder, EvmPublicInputsArray,
     fr_to_evm_bytes, compute_hash_pair, NUM_PUBLIC_INPUTS as EVM_NUM_PUBLIC_INPUTS,
@@ -469,6 +471,52 @@ impl MLTrainingStepV2Witness {
         self.error_checksum = self.compute_error_checksum();
     }
 
+    /// Validates that all witness vectors have dimensions consistent with
+    /// `d_in`, `d_hid`, and `d_out`. Returns `Ok(())` if valid, or an
+    /// error string describing the first mismatch found.
+    ///
+    /// This should be called before constructing a circuit to catch
+    /// dimension bugs early (rather than getting cryptic constraint failures).
+    pub fn validate(&self) -> Result<(), String> {
+        let (d_in, d_hid, d_out) = (self.d_in, self.d_hid, self.d_out);
+
+        let checks: &[(&str, usize, usize)] = &[
+            ("x",        self.x.len(),        d_in),
+            ("target",   self.target.len(),   d_out),
+            ("w1",       self.w1.len(),       d_hid * d_in),
+            ("b1",       self.b1.len(),       d_hid),
+            ("w2",       self.w2.len(),       d_out * d_hid),
+            ("b2",       self.b2.len(),       d_out),
+            ("h_pre",    self.h_pre.len(),    d_hid),
+            ("h",        self.h.len(),        d_hid),
+            ("y",        self.y.len(),        d_out),
+            ("dy",       self.dy.len(),       d_out),
+            ("dw2",      self.dw2.len(),      d_out * d_hid),
+            ("db2",      self.db2.len(),      d_out),
+            ("dh",       self.dh.len(),       d_hid),
+            ("relu_mask",self.relu_mask.len(),d_hid),
+            ("dh_pre",   self.dh_pre.len(),   d_hid),
+            ("dw1",      self.dw1.len(),      d_hid * d_in),
+            ("db1",      self.db1.len(),      d_hid),
+            ("w1_new",   self.w1_new.len(),   d_hid * d_in),
+            ("b1_new",   self.b1_new.len(),   d_hid),
+            ("w2_new",   self.w2_new.len(),   d_out * d_hid),
+            ("b2_new",   self.b2_new.len(),   d_out),
+        ];
+
+        for &(name, actual, expected) in checks {
+            if actual != expected {
+                return Err(format!(
+                    "witness dimension mismatch: {}.len() = {} but expected {} \
+                     (d_in={}, d_hid={}, d_out={})",
+                    name, actual, expected, d_in, d_hid, d_out
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Converts public inputs to EVM-compatible format for Halo2Verifier.sol.
     ///
     /// This produces a properly formatted array that can be submitted to the
@@ -568,6 +616,30 @@ impl Default for MLTrainingStepV2Circuit {
 }
 
 impl MLTrainingStepV2Circuit {
+    /// Creates a circuit from a pre-computed witness and ReLU lookup range.
+    ///
+    /// This is the canonical constructor for use with the AVM bridge:
+    /// ```ignore
+    /// let output = helix_avm::circuit_bridge::build_training_witness(&l1, &l2, &x, &t, lr, step)?;
+    /// let circuit = MLTrainingStepV2Circuit::from_witness(output.witness, output.relu_range)?;
+    /// ```
+    ///
+    /// Validates witness dimensions before constructing the circuit. Uses
+    /// Freivalds verification and sensible defaults for exp lookup tables.
+    pub fn from_witness(
+        witness: MLTrainingStepV2Witness,
+        relu_range: usize,
+    ) -> Result<Self, String> {
+        witness.validate()?;
+        Ok(Self {
+            witness,
+            relu_range,
+            exp_range: 128,
+            exp_scale: 64,
+            use_freivalds: true,
+        })
+    }
+
     pub fn public_inputs(&self) -> Vec<Fr> {
         self.witness.public_inputs()
     }
@@ -1464,19 +1536,26 @@ fn assign_relu(
 // ---------------------------------------------------------------------------
 
 /// Generates Freivalds random challenge vector deterministically from a seed.
+///
+/// Uses SHA-256 for cryptographic security instead of DefaultHasher.
+/// The challenge vector must be unpredictable to the prover to maintain
+/// the soundness of Freivalds probabilistic verification.
 pub fn generate_freivalds_challenge(seed: u64, len: usize) -> Vec<Fr> {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
     let mut result = Vec::with_capacity(len);
-    let mut state = seed;
 
     for i in 0..len {
-        let mut hasher = DefaultHasher::new();
-        state.hash(&mut hasher);
-        i.hash(&mut hasher);
-        state = hasher.finish();
-        result.push(Fr::from(state));
+        let mut hasher = Sha256::new();
+        hasher.update(b"HELIX_FREIVALDS_V1");
+        hasher.update(&seed.to_le_bytes());
+        hasher.update(&(i as u64).to_le_bytes());
+        let hash: [u8; 32] = hasher.finalize().into();
+
+        // Convert to field element (clear top bits to stay below modulus)
+        let mut repr = [0u8; 32];
+        repr.copy_from_slice(&hash);
+        repr[31] &= 0x1F;
+        let val = Fr::from_repr_vartime(repr.into()).unwrap_or(Fr::from((i + 1) as u64));
+        result.push(val);
     }
 
     result
@@ -1666,34 +1745,26 @@ pub fn compute_witness_v2(
     }
 }
 
-/// Computes a SHA-256-based state hash for a weight set.
+/// Computes a Poseidon-based state hash for a weight set.
+///
+/// Uses circuit-friendly Poseidon hash instead of SHA-256 to enable
+/// in-circuit verification. Returns (lo, hi) where:
+/// - lo = Poseidon(all weights concatenated via sponge)
+/// - hi = Poseidon(lo, domain_separator) for the high part
+///
+/// This format maintains backward compatibility with EVM public inputs
+/// while using a ZK-friendly hash internally.
 pub fn compute_state_hash_v2(w1: &[Fr], b1: &[Fr], w2: &[Fr], b2: &[Fr]) -> (Fr, Fr) {
-    let mut hasher = Sha256::new();
-    for v in w1.iter().chain(b1).chain(w2).chain(b2) {
-        hasher.update(v.to_repr().as_ref());
-    }
-    let hash: [u8; 32] = hasher.finalize().into();
+    let all_weights: Vec<Fr> = w1.iter()
+        .chain(b1)
+        .chain(w2)
+        .chain(b2)
+        .copied()
+        .collect();
 
-    let lo = {
-        let mut buf = [0u8; 32];
-        buf[..16].copy_from_slice(&hash[..16]);
-        Fr::from_raw([
-            u64::from_le_bytes(buf[0..8].try_into().unwrap()),
-            u64::from_le_bytes(buf[8..16].try_into().unwrap()),
-            0,
-            0,
-        ])
-    };
-    let hi = {
-        let mut buf = [0u8; 32];
-        buf[..16].copy_from_slice(&hash[16..32]);
-        Fr::from_raw([
-            u64::from_le_bytes(buf[0..8].try_into().unwrap()),
-            u64::from_le_bytes(buf[8..16].try_into().unwrap()),
-            0,
-            0,
-        ])
-    };
+    let lo = poseidon_hash_many(&all_weights);
+    // Derive hi from lo with domain separation to fill both public input slots
+    let hi = poseidon_hash_two(lo, Fr::from(0x48454C49585F4849u64)); // "HELIX_HI" as domain
 
     (lo, hi)
 }
@@ -1826,5 +1897,141 @@ mod tests {
 
         let prover = MockProver::run(14, &circuit, vec![pi]).unwrap();
         prover.assert_satisfied();
+    }
+
+    /// Real proof generation and verification using KZG create_proof + SHPLONK.
+    /// This tests that the circuit actually produces a valid proof, not just
+    /// that MockProver is satisfied (which only checks constraints, not soundness).
+    #[test]
+    fn test_v2_real_proof_generation() {
+        use halo2_proofs::{
+            plonk::{create_proof, keygen_pk, keygen_vk, verify_proof_multi},
+            poly::kzg::{
+                commitment::{KZGCommitmentScheme, ParamsKZG},
+                multiopen::{ProverSHPLONK, VerifierSHPLONK},
+                strategy::SingleStrategy,
+            },
+            transcript::{
+                Blake2bRead, Blake2bWrite, Challenge255,
+                TranscriptReadBuffer, TranscriptWriterBuffer,
+            },
+            poly::commitment::Params,
+        };
+        use halo2curves::bn256::Bn256;
+        use rand_core::OsRng;
+
+        let (circuit, pi) = make_tiny_circuit_v2();
+        let k = 14;
+
+        // 1. Generate trusted setup parameters (SRS)
+        let params = ParamsKZG::<Bn256>::setup(k, OsRng);
+
+        // 2. Generate verification key and proving key
+        let vk = keygen_vk(&params, &circuit).expect("keygen_vk failed");
+        let pk = keygen_pk(&params, vk.clone(), &circuit).expect("keygen_pk failed");
+
+        // 3. Generate a real proof
+        let instances = vec![pi.clone()];
+        let mut transcript = Blake2bWrite::<Vec<u8>, G1Affine, Challenge255<_>>::init(vec![]);
+
+        create_proof::<
+            KZGCommitmentScheme<Bn256>,
+            ProverSHPLONK<'_, Bn256>,
+            _,
+            _,
+            _,
+            _,
+        >(
+            &params,
+            &pk,
+            &[circuit],
+            &[instances.clone()],
+            OsRng,
+            &mut transcript,
+        )
+        .expect("create_proof failed");
+
+        let proof = transcript.finalize();
+        assert!(!proof.is_empty(), "proof should not be empty");
+
+        // 4. Verify the proof
+        let mut verifier_transcript =
+            Blake2bRead::<_, G1Affine, Challenge255<_>>::init(proof.as_slice());
+        let verifier_params = params.verifier_params();
+        let verified = verify_proof_multi::<
+            KZGCommitmentScheme<Bn256>,
+            VerifierSHPLONK<Bn256>,
+            _,
+            _,
+            SingleStrategy<Bn256>,
+        >(&verifier_params, &vk, &[instances], &mut verifier_transcript);
+
+        assert!(verified, "real proof verification must succeed");
+    }
+
+    /// Test that a tampered proof (wrong public inputs) fails verification.
+    #[test]
+    fn test_v2_real_proof_rejects_wrong_inputs() {
+        use halo2_proofs::{
+            plonk::{create_proof, keygen_pk, keygen_vk, verify_proof_multi},
+            poly::kzg::{
+                commitment::{KZGCommitmentScheme, ParamsKZG},
+                multiopen::{ProverSHPLONK, VerifierSHPLONK},
+                strategy::SingleStrategy,
+            },
+            transcript::{
+                Blake2bRead, Blake2bWrite, Challenge255,
+                TranscriptReadBuffer, TranscriptWriterBuffer,
+            },
+            poly::commitment::Params,
+        };
+        use halo2curves::bn256::Bn256;
+        use rand_core::OsRng;
+
+        let (circuit, pi) = make_tiny_circuit_v2();
+        let k = 14;
+
+        let params = ParamsKZG::<Bn256>::setup(k, OsRng);
+        let vk = keygen_vk(&params, &circuit).expect("keygen_vk failed");
+        let pk = keygen_pk(&params, vk.clone(), &circuit).expect("keygen_pk failed");
+
+        let instances = vec![pi.clone()];
+        let mut transcript = Blake2bWrite::<Vec<u8>, G1Affine, Challenge255<_>>::init(vec![]);
+
+        create_proof::<
+            KZGCommitmentScheme<Bn256>,
+            ProverSHPLONK<'_, Bn256>,
+            _,
+            _,
+            _,
+            _,
+        >(
+            &params,
+            &pk,
+            &[circuit],
+            &[instances],
+            OsRng,
+            &mut transcript,
+        )
+        .expect("create_proof failed");
+
+        let proof = transcript.finalize();
+
+        // Tamper with public inputs: change the loss value
+        let mut bad_pi = pi;
+        bad_pi[4] = Fr::from(999u64); // Wrong loss
+
+        let mut verifier_transcript =
+            Blake2bRead::<_, G1Affine, Challenge255<_>>::init(proof.as_slice());
+        let verifier_params = params.verifier_params();
+        let verified = verify_proof_multi::<
+            KZGCommitmentScheme<Bn256>,
+            VerifierSHPLONK<Bn256>,
+            _,
+            _,
+            SingleStrategy<Bn256>,
+        >(&verifier_params, &vk, &[vec![bad_pi]], &mut verifier_transcript);
+
+        assert!(!verified, "proof must reject tampered public inputs");
     }
 }

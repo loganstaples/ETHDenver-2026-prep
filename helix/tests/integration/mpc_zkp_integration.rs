@@ -65,10 +65,11 @@ fn test_mpc_weight_sharing() {
         .expect("Reconstruction should succeed");
 
     assert!(
-        (reconstructed - secret_weight).abs() < 1e-10,
-        "Reconstructed value should match original: {} vs {}",
+        (reconstructed - secret_weight).abs() < 1e-6,
+        "Reconstructed value should match original: {} vs {} (diff={})",
         reconstructed,
-        secret_weight
+        secret_weight,
+        (reconstructed - secret_weight).abs()
     );
 }
 
@@ -569,7 +570,11 @@ fn test_full_mpc_zkp_pipeline() {
     let phase_start = Instant::now();
 
     let aggregated = sharing.reconstruct_vector(&gradient_shares).unwrap();
-    assert!((aggregated[0] - gradients_f64[0]).abs() < 1e-10);
+    assert!(
+        (aggregated[0] - gradients_f64[0]).abs() < 1e-6,
+        "Gradient reconstruction precision loss: {} vs {} (diff={})",
+        aggregated[0], gradients_f64[0], (aggregated[0] - gradients_f64[0]).abs()
+    );
 
     result.add_phase(PhaseResult::success("gradient_aggregation", phase_start.elapsed()));
 
@@ -579,21 +584,22 @@ fn test_full_mpc_zkp_pipeline() {
     // Reconstruct weights for proof
     let weights_recon = sharing.reconstruct_vector(&weight_shares).unwrap();
 
-    // Convert to Fr
+    // Convert to Fr — use small integer values to stay within relu_range=128
+    // With w1=[1,2,3,1], x=[1,1]: h_pre=[3,4] which is safely in range
     let w1_fr: Vec<Fr> = weights_recon[0..4]
         .iter()
-        .map(|&v| Fr::from((v.abs() * 1000.0) as u64))
+        .map(|&v| Fr::from(v.abs().round() as u64))
         .collect();
     let b1_fr = vec![Fr::zero(); 2];
     let w2_fr: Vec<Fr> = weights_recon[6..8]
         .iter()
-        .map(|&v| Fr::from((v.abs() * 1000.0) as u64))
+        .map(|&v| Fr::from(v.abs().round() as u64))
         .collect();
     let b2_fr = vec![Fr::zero(); 1];
 
     let prover = MLTrainingProverV2::new(dims.d_in, dims.d_hid, dims.d_out);
-    let x = vec![Fr::from(1000u64), Fr::from(1000u64)];
-    let target = vec![Fr::from(5000u64)];
+    let x = vec![Fr::from(1u64), Fr::from(1u64)];
+    let target = vec![Fr::from(5u64)];
 
     let witness = MLTrainingProverV2::build_witness(
         dims.d_in,

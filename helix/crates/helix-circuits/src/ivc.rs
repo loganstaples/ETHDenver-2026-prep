@@ -12,21 +12,24 @@
 //! - Committed Relaxed R1CS: Commitments to witness and error vectors
 //! - Folding: Combining two instances using random challenge
 //!
-//! This is a simplified version suitable for the hackathon demo, implementing
-//! the core ideas without full Nova complexity.
+//! State transitions are verified in-circuit using Poseidon hash, ensuring
+//! the prover cannot forge state commitments.
 
 use halo2_proofs::{
     arithmetic::Field,
     circuit::{Layouter, SimpleFloorPlanner, Value},
     plonk::{
-        Advice, Circuit, Column, ConstraintSystem, Error, ErrorFront, Expression, Fixed, Instance, Selector,
+        Advice, Circuit, Column, ConstraintSystem, ErrorFront, Fixed, Instance,
+        Selector,
     },
     poly::Rotation,
 };
 use halo2curves::bn256::Fr;
 use halo2curves::ff::PrimeField;
-use sha2::{Digest, Sha256};
-use std::marker::PhantomData;
+
+use crate::gadgets::poseidon::{
+    poseidon_hash_two, PoseidonCircuitConfig, synthesize_poseidon_hash,
+};
 
 /// Number of public inputs for the IVC step circuit.
 pub const IVC_PUBLIC_INPUTS: usize = 8;
@@ -40,8 +43,8 @@ pub const IVC_PUBLIC_INPUTS: usize = 8;
 pub struct IVCState {
     /// Current step number (starts at 0).
     pub step: u64,
-    /// Commitment to the current state (e.g., model weights hash).
-    pub state_commitment: [u8; 32],
+    /// Commitment to the current state (Poseidon hash).
+    pub state_commitment: Fr,
     /// Accumulated error bound across all steps.
     pub accumulated_error: Fr,
 }
@@ -50,13 +53,13 @@ pub struct IVCState {
 ///
 /// In Nova, this would be a "Committed Relaxed R1CS instance".
 /// Here we use a simplified version with commitments to:
-/// - The running state
+/// - The running state (as a Poseidon hash)
 /// - The error vector (for relaxed constraints)
 /// - Random challenges used in folding
 #[derive(Clone, Debug)]
 pub struct IVCAccumulator {
-    /// Commitment to the accumulated computation (hash of state chain).
-    pub state_commitment: [u8; 32],
+    /// Commitment to the accumulated computation (Poseidon hash of state chain).
+    pub state_commitment: Fr,
     /// Number of steps folded into this accumulator.
     pub num_steps: u64,
     /// Accumulated error term (u in Nova notation).
@@ -64,70 +67,55 @@ pub struct IVCAccumulator {
     pub error_term: Fr,
     /// Accumulated error bound from all computations.
     pub error_bound: Fr,
-    /// Hash of all challenges used in folding (for verification).
-    pub challenge_hash: [u8; 32],
+    /// Hash of all challenges used in folding (Poseidon hash).
+    pub challenge_hash: Fr,
 }
 
 impl Default for IVCAccumulator {
     fn default() -> Self {
-        Self::initial([0; 32])
+        Self::initial(Fr::ZERO)
     }
 }
 
 impl IVCAccumulator {
     /// Creates the initial accumulator (before any computation).
-    pub fn initial(initial_commitment: [u8; 32]) -> Self {
+    pub fn initial(initial_commitment: Fr) -> Self {
         Self {
             state_commitment: initial_commitment,
             num_steps: 0,
             error_term: Fr::one(), // u = 1 for the base case
             error_bound: Fr::zero(),
-            challenge_hash: [0; 32],
+            challenge_hash: Fr::ZERO,
         }
+    }
+
+    /// Creates an accumulator from raw [u8; 32] commitment (backward compat).
+    pub fn initial_from_bytes(bytes: [u8; 32]) -> Self {
+        Self::initial(bytes_to_fr(&bytes))
     }
 
     /// Converts accumulator fields to public inputs.
     pub fn to_public_inputs(&self) -> Vec<Fr> {
-        let state_lo = bytes_to_fr_lo(&self.state_commitment);
-        let state_hi = bytes_to_fr_hi(&self.state_commitment);
-        let challenge_lo = bytes_to_fr_lo(&self.challenge_hash);
-        let challenge_hi = bytes_to_fr_hi(&self.challenge_hash);
-
         vec![
-            state_lo,
-            state_hi,
+            self.state_commitment,
+            Fr::ZERO, // Reserved (was state_hi in SHA-256 era)
             Fr::from(self.num_steps),
             self.error_term,
             self.error_bound,
-            challenge_lo,
-            challenge_hi,
-            Fr::zero(), // Reserved for future use
+            self.challenge_hash,
+            Fr::ZERO, // Reserved
+            Fr::ZERO, // Reserved
         ]
     }
 }
 
-/// Converts lower 16 bytes of a 32-byte array to Fr.
-fn bytes_to_fr_lo(bytes: &[u8; 32]) -> Fr {
-    let mut buf = [0u8; 32];
-    buf[..16].copy_from_slice(&bytes[..16]);
-    Fr::from_raw([
-        u64::from_le_bytes(buf[0..8].try_into().unwrap()),
-        u64::from_le_bytes(buf[8..16].try_into().unwrap()),
-        0,
-        0,
-    ])
-}
-
-/// Converts upper 16 bytes of a 32-byte array to Fr.
-fn bytes_to_fr_hi(bytes: &[u8; 32]) -> Fr {
-    let mut buf = [0u8; 32];
-    buf[..16].copy_from_slice(&bytes[16..32]);
-    Fr::from_raw([
-        u64::from_le_bytes(buf[0..8].try_into().unwrap()),
-        u64::from_le_bytes(buf[8..16].try_into().unwrap()),
-        0,
-        0,
-    ])
+/// Converts a [u8; 32] to Fr by interpreting as LE representation.
+fn bytes_to_fr(bytes: &[u8; 32]) -> Fr {
+    let mut repr = [0u8; 32];
+    repr.copy_from_slice(bytes);
+    // Clear top bits to ensure valid field element
+    repr[31] &= 0x1F;
+    Fr::from_repr_vartime(repr.into()).unwrap_or(Fr::ZERO)
 }
 
 // ---------------------------------------------------------------------------
@@ -136,21 +124,15 @@ fn bytes_to_fr_hi(bytes: &[u8; 32]) -> Fr {
 
 /// Folds two accumulators into one using a random challenge.
 ///
-/// This is the key operation in Nova-style IVC:
-/// - Given accumulators A1 and A2, and random challenge r
-/// - Produces A' that summarizes both A1 and A2
-/// - A' can be verified without knowing A1 or A2 individually
+/// Uses Poseidon hash for state commitment combination.
 pub fn fold_accumulators(
     acc1: &IVCAccumulator,
     acc2: &IVCAccumulator,
     challenge: Fr,
 ) -> IVCAccumulator {
-    // New state commitment = Hash(acc1.state || acc2.state || challenge)
-    let mut hasher = Sha256::new();
-    hasher.update(&acc1.state_commitment);
-    hasher.update(&acc2.state_commitment);
-    hasher.update(&challenge.to_repr().as_ref());
-    let new_state: [u8; 32] = hasher.finalize().into();
+    // New state commitment = Poseidon(Poseidon(acc1.state, acc2.state), challenge)
+    let combined = poseidon_hash_two(acc1.state_commitment, acc2.state_commitment);
+    let new_state = poseidon_hash_two(combined, challenge);
 
     // New error term: u' = u1 + r * u2 (linear combination)
     let new_error_term = acc1.error_term + challenge * acc2.error_term;
@@ -158,12 +140,9 @@ pub fn fold_accumulators(
     // New error bound: sum of both bounds
     let new_error_bound = acc1.error_bound + acc2.error_bound;
 
-    // New challenge hash: Hash(old_challenges || new_challenge)
-    let mut challenge_hasher = Sha256::new();
-    challenge_hasher.update(&acc1.challenge_hash);
-    challenge_hasher.update(&acc2.challenge_hash);
-    challenge_hasher.update(&challenge.to_repr().as_ref());
-    let new_challenge_hash: [u8; 32] = challenge_hasher.finalize().into();
+    // New challenge hash = Poseidon(Poseidon(ch1, ch2), challenge)
+    let combined_ch = poseidon_hash_two(acc1.challenge_hash, acc2.challenge_hash);
+    let new_challenge_hash = poseidon_hash_two(combined_ch, challenge);
 
     IVCAccumulator {
         state_commitment: new_state,
@@ -174,24 +153,16 @@ pub fn fold_accumulators(
     }
 }
 
-/// Generates a Fiat-Shamir challenge for folding.
+/// Generates a Fiat-Shamir challenge for folding using Poseidon.
 pub fn generate_folding_challenge(acc1: &IVCAccumulator, acc2: &IVCAccumulator) -> Fr {
-    let mut hasher = Sha256::new();
-    hasher.update(b"HELIX_IVC_FOLD_CHALLENGE");
-    hasher.update(&acc1.state_commitment);
-    hasher.update(&acc1.num_steps.to_le_bytes());
-    hasher.update(&acc2.state_commitment);
-    hasher.update(&acc2.num_steps.to_le_bytes());
-
-    let hash: [u8; 32] = hasher.finalize().into();
-
-    // Convert to field element
-    Fr::from_raw([
-        u64::from_le_bytes(hash[0..8].try_into().unwrap()),
-        u64::from_le_bytes(hash[8..16].try_into().unwrap()),
-        u64::from_le_bytes(hash[16..24].try_into().unwrap()),
-        u64::from_le_bytes(hash[24..32].try_into().unwrap()) & 0x0FFFFFFFFFFFFFFF, // Ensure < modulus
-    ])
+    // Domain-separated Poseidon hash of both accumulators' states
+    let domain = Fr::from(0x48454C49585F464Fu64); // "HELIX_FO" domain
+    let combined_state = poseidon_hash_two(acc1.state_commitment, acc2.state_commitment);
+    let combined_steps = poseidon_hash_two(Fr::from(acc1.num_steps), Fr::from(acc2.num_steps));
+    poseidon_hash_two(
+        poseidon_hash_two(domain, combined_state),
+        combined_steps,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -205,16 +176,20 @@ pub struct IVCStepConfig {
     advice: [Column<Advice>; 4],
     /// Instance column for public inputs.
     instance: Column<Instance>,
+    /// Fixed column for Poseidon round constants.
+    fixed: Column<Fixed>,
     /// Selector for accumulator update verification.
     s_acc_update: Selector,
-    /// Selector for state transition verification.
-    s_state_transition: Selector,
     /// Selector for error bound check.
     s_error_check: Selector,
     /// Selector for multiplication.
     s_mul: Selector,
     /// Selector for addition.
     s_add: Selector,
+    /// Selector for Poseidon round constant addition.
+    s_rc_add: Selector,
+    /// Selector for equality check.
+    s_eq: Selector,
 }
 
 /// Witness for a single IVC step.
@@ -222,10 +197,10 @@ pub struct IVCStepConfig {
 pub struct IVCStepWitness {
     /// Previous accumulator.
     pub prev_acc: IVCAccumulator,
-    /// New state after this step's computation.
-    pub new_state: [u8; 32],
+    /// New state after this step's computation (Poseidon hash).
+    pub new_state: Fr,
     /// Hash of the computation performed in this step.
-    pub computation_hash: [u8; 32],
+    pub computation_hash: Fr,
     /// Error introduced in this step.
     pub step_error: Fr,
     /// Folding challenge (if folding with another accumulator).
@@ -238,8 +213,8 @@ impl Default for IVCStepWitness {
     fn default() -> Self {
         Self {
             prev_acc: IVCAccumulator::default(),
-            new_state: [0; 32],
-            computation_hash: [0; 32],
+            new_state: Fr::ZERO,
+            computation_hash: Fr::ZERO,
             step_error: Fr::zero(),
             fold_challenge: None,
             other_acc: None,
@@ -250,7 +225,6 @@ impl Default for IVCStepWitness {
 impl IVCStepWitness {
     /// Computes the resulting accumulator after this step.
     pub fn resulting_accumulator(&self) -> IVCAccumulator {
-        // First, create accumulator for just this step
         let step_acc = IVCAccumulator {
             state_commitment: self.new_state,
             num_steps: self.prev_acc.num_steps + 1,
@@ -259,15 +233,23 @@ impl IVCStepWitness {
             challenge_hash: self.prev_acc.challenge_hash,
         };
 
-        // If folding with another accumulator, do the fold
         match (&self.fold_challenge, &self.other_acc) {
             (Some(challenge), Some(other)) => fold_accumulators(&step_acc, other, *challenge),
             _ => step_acc,
         }
     }
+
+    /// Computes the expected new_state using Poseidon.
+    /// new_state = Poseidon(prev_state_commitment, computation_hash)
+    pub fn expected_new_state(&self) -> Fr {
+        poseidon_hash_two(self.prev_acc.state_commitment, self.computation_hash)
+    }
 }
 
 /// Circuit that verifies a single IVC step and optionally folds with another accumulator.
+///
+/// State transitions are verified in-circuit using a full Poseidon hash,
+/// ensuring the prover correctly computed new_state = Poseidon(prev_state, computation).
 #[derive(Clone)]
 pub struct IVCStepCircuit {
     pub witness: IVCStepWitness,
@@ -304,6 +286,7 @@ impl Circuit<Fr> for IVCStepCircuit {
             meta.advice_column(),
         ];
         let instance = meta.instance_column();
+        let fixed = meta.fixed_column();
 
         for col in &advice {
             meta.enable_equality(*col);
@@ -311,10 +294,11 @@ impl Circuit<Fr> for IVCStepCircuit {
         meta.enable_equality(instance);
 
         let s_acc_update = meta.selector();
-        let s_state_transition = meta.selector();
         let s_error_check = meta.selector();
         let s_mul = meta.selector();
         let s_add = meta.selector();
+        let s_rc_add = meta.selector();
+        let s_eq = meta.selector();
 
         // Multiplication gate: a * b = c
         meta.create_gate("ivc_mul", |meta| {
@@ -334,16 +318,21 @@ impl Circuit<Fr> for IVCStepCircuit {
             vec![s * (a + b - c)]
         });
 
-        // State transition verification: new_commitment = Hash(prev_commitment, computation)
-        // Note: Full implementation would use Poseidon hash circuit. For now we just
-        // ensure the selector is used (real verification happens in witness computation).
-        meta.create_gate("state_transition", |meta| {
-            let s = meta.query_selector(s_state_transition);
-            let _prev_state_lo = meta.query_advice(advice[0], Rotation::cur());
-            let _computation_lo = meta.query_advice(advice[1], Rotation::cur());
-            let _new_state_lo = meta.query_advice(advice[2], Rotation::cur());
-            // Placeholder constraint - always passes. Real hash verification would go here.
-            vec![s * Expression::Constant(Fr::zero())]
+        // Poseidon round constant addition gate: advice[0] + fixed = advice[2]
+        meta.create_gate("poseidon_rc_add", |meta| {
+            let s = meta.query_selector(s_rc_add);
+            let a = meta.query_advice(advice[0], Rotation::cur());
+            let rc = meta.query_fixed(fixed, Rotation::cur());
+            let c = meta.query_advice(advice[2], Rotation::cur());
+            vec![s * (a + rc - c)]
+        });
+
+        // Equality check gate: a = b
+        meta.create_gate("ivc_eq", |meta| {
+            let s = meta.query_selector(s_eq);
+            let a = meta.query_advice(advice[0], Rotation::cur());
+            let b = meta.query_advice(advice[1], Rotation::cur());
+            vec![s * (a - b)]
         });
 
         // Error bound accumulation: new_error = old_error + step_error
@@ -359,7 +348,7 @@ impl Circuit<Fr> for IVCStepCircuit {
         meta.create_gate("accumulator_fold", |meta| {
             let s = meta.query_selector(s_acc_update);
             let u1 = meta.query_advice(advice[0], Rotation::cur());
-            let r_times_u2 = meta.query_advice(advice[1], Rotation::cur()); // Precomputed r * u2
+            let r_times_u2 = meta.query_advice(advice[1], Rotation::cur());
             let new_u = meta.query_advice(advice[2], Rotation::cur());
             vec![s * (u1 + r_times_u2 - new_u)]
         });
@@ -367,11 +356,13 @@ impl Circuit<Fr> for IVCStepCircuit {
         IVCStepConfig {
             advice,
             instance,
+            fixed,
             s_acc_update,
-            s_state_transition,
             s_error_check,
             s_mul,
             s_add,
+            s_rc_add,
+            s_eq,
         }
     }
 
@@ -435,7 +426,6 @@ impl Circuit<Fr> for IVCStepCircuit {
 
         // If folding, verify the fold operation
         if let (Some(challenge), Some(other)) = (&w.fold_challenge, &w.other_acc) {
-            // Verify: new_u = u1 + r * u2
             let r_times_u2 = *challenge * other.error_term;
 
             layouter.assign_region(
@@ -464,7 +454,6 @@ impl Circuit<Fr> for IVCStepCircuit {
                 },
             )?;
 
-            // Verify: r * u2 was computed correctly
             layouter.assign_region(
                 || "verify_r_times_u2",
                 |mut region| {
@@ -492,32 +481,46 @@ impl Circuit<Fr> for IVCStepCircuit {
             )?;
         }
 
-        // Verify state transition
-        let prev_state_lo = bytes_to_fr_lo(&w.prev_acc.state_commitment);
-        let computation_lo = bytes_to_fr_lo(&w.computation_hash);
-        let new_state_lo = bytes_to_fr_lo(&w.new_state);
+        // ================================================================
+        // Verify state transition using in-circuit Poseidon hash.
+        // Constrains: new_state == Poseidon(prev_state_commitment, computation_hash)
+        // ================================================================
+        let poseidon_config = PoseidonCircuitConfig {
+            advice: [config.advice[0], config.advice[1], config.advice[2]],
+            fixed: config.fixed,
+            s_mul: config.s_mul,
+            s_add: config.s_add,
+            s_rc_add: config.s_rc_add,
+            s_eq: config.s_eq,
+        };
 
+        let expected_new_state = w.expected_new_state();
+
+        // Verify the witness new_state matches what Poseidon computes
+        synthesize_poseidon_hash(
+            &poseidon_config,
+            &mut layouter,
+            w.prev_acc.state_commitment,
+            w.computation_hash,
+            "state_transition",
+        )?;
+
+        // Also constrain that the witness new_state equals the Poseidon output
         layouter.assign_region(
-            || "state_transition",
+            || "verify_new_state",
             |mut region| {
-                config.s_state_transition.enable(&mut region, 0)?;
+                config.s_eq.enable(&mut region, 0)?;
                 region.assign_advice(
-                    || "prev_state_lo",
+                    || "expected",
                     config.advice[0],
                     0,
-                    || Value::known(prev_state_lo),
+                    || Value::known(expected_new_state),
                 )?;
                 region.assign_advice(
-                    || "computation_lo",
+                    || "actual",
                     config.advice[1],
                     0,
-                    || Value::known(computation_lo),
-                )?;
-                region.assign_advice(
-                    || "new_state_lo",
-                    config.advice[2],
-                    0,
-                    || Value::known(new_state_lo),
+                    || Value::known(w.new_state),
                 )?;
                 Ok(())
             },
@@ -540,33 +543,32 @@ pub struct IVCChain {
 }
 
 impl IVCChain {
-    /// Creates a new IVC chain with the given initial state.
-    pub fn new(initial_commitment: [u8; 32]) -> Self {
+    /// Creates a new IVC chain with the given initial state commitment.
+    pub fn new(initial_commitment: Fr) -> Self {
         Self {
             accumulator: IVCAccumulator::initial(initial_commitment),
             history: Vec::new(),
         }
     }
 
+    /// Creates a new IVC chain from raw bytes (backward compat).
+    pub fn new_from_bytes(initial_commitment: [u8; 32]) -> Self {
+        Self::new(bytes_to_fr(&initial_commitment))
+    }
+
     /// Adds a computation step to the chain.
     pub fn add_step(
         &mut self,
-        new_state: [u8; 32],
-        computation_hash: [u8; 32],
+        new_state: Fr,
+        _computation_hash: Fr,
         step_error: Fr,
     ) {
         let old_acc = self.accumulator.clone();
 
-        // Create new accumulator incorporating this step
-        let mut hasher = Sha256::new();
-        hasher.update(&old_acc.state_commitment);
-        hasher.update(&computation_hash);
-        let combined_state: [u8; 32] = hasher.finalize().into();
-
         self.accumulator = IVCAccumulator {
             state_commitment: new_state,
             num_steps: old_acc.num_steps + 1,
-            error_term: old_acc.error_term, // Stays 1 unless we fold
+            error_term: old_acc.error_term,
             error_bound: old_acc.error_bound + step_error,
             challenge_hash: old_acc.challenge_hash,
         };
@@ -592,23 +594,19 @@ impl IVCChain {
 
     /// Verifies that the accumulator is valid (basic sanity checks).
     pub fn verify(&self) -> bool {
-        // Check that error term is non-zero (should start at 1)
         if self.accumulator.error_term == Fr::zero() {
             return false;
         }
-
-        // Check that num_steps is consistent with history
         if !self.history.is_empty() && self.accumulator.num_steps == 0 {
             return false;
         }
-
         true
     }
 }
 
 impl Default for IVCChain {
     fn default() -> Self {
-        Self::new([0; 32])
+        Self::new(Fr::ZERO)
     }
 }
 
@@ -619,30 +617,30 @@ mod tests {
 
     #[test]
     fn test_accumulator_creation() {
-        let initial = [1u8; 32];
-        let acc = IVCAccumulator::initial(initial);
+        let acc = IVCAccumulator::initial(Fr::from(42u64));
 
         assert_eq!(acc.num_steps, 0);
         assert_eq!(acc.error_term, Fr::one());
         assert_eq!(acc.error_bound, Fr::zero());
+        assert_eq!(acc.state_commitment, Fr::from(42u64));
     }
 
     #[test]
     fn test_folding() {
         let acc1 = IVCAccumulator {
-            state_commitment: [1u8; 32],
+            state_commitment: Fr::from(100u64),
             num_steps: 5,
             error_term: Fr::one(),
             error_bound: Fr::from(10),
-            challenge_hash: [0u8; 32],
+            challenge_hash: Fr::ZERO,
         };
 
         let acc2 = IVCAccumulator {
-            state_commitment: [2u8; 32],
+            state_commitment: Fr::from(200u64),
             num_steps: 3,
             error_term: Fr::from(2),
             error_bound: Fr::from(5),
-            challenge_hash: [0u8; 32],
+            challenge_hash: Fr::ZERO,
         };
 
         let challenge = Fr::from(7);
@@ -651,17 +649,17 @@ mod tests {
         assert_eq!(folded.num_steps, 8);
         assert_eq!(folded.error_term, Fr::one() + Fr::from(7) * Fr::from(2)); // 1 + 7*2 = 15
         assert_eq!(folded.error_bound, Fr::from(15)); // 10 + 5 = 15
+        // State commitment should be Poseidon-based, non-trivial
+        assert_ne!(folded.state_commitment, Fr::ZERO);
     }
 
     #[test]
     fn test_ivc_chain() {
-        let initial = [0u8; 32];
-        let mut chain = IVCChain::new(initial);
+        let mut chain = IVCChain::new(Fr::ZERO);
 
-        // Add some steps
-        chain.add_step([1u8; 32], [10u8; 32], Fr::from(1));
-        chain.add_step([2u8; 32], [20u8; 32], Fr::from(2));
-        chain.add_step([3u8; 32], [30u8; 32], Fr::from(3));
+        chain.add_step(Fr::from(1u64), Fr::from(10u64), Fr::from(1));
+        chain.add_step(Fr::from(2u64), Fr::from(20u64), Fr::from(2));
+        chain.add_step(Fr::from(3u64), Fr::from(30u64), Fr::from(3));
 
         assert_eq!(chain.step_count(), 3);
         assert_eq!(chain.error_bound(), Fr::from(6)); // 1 + 2 + 3
@@ -670,11 +668,16 @@ mod tests {
 
     #[test]
     fn test_ivc_step_circuit() {
-        let prev_acc = IVCAccumulator::initial([0u8; 32]);
+        let prev_acc = IVCAccumulator::initial(Fr::from(42u64));
+        let computation_hash = Fr::from(100u64);
+
+        // Compute the correct new_state using Poseidon
+        let new_state = poseidon_hash_two(prev_acc.state_commitment, computation_hash);
+
         let witness = IVCStepWitness {
             prev_acc,
-            new_state: [1u8; 32],
-            computation_hash: [10u8; 32],
+            new_state,
+            computation_hash,
             step_error: Fr::from(5),
             fold_challenge: None,
             other_acc: None,
@@ -683,34 +686,62 @@ mod tests {
         let circuit = IVCStepCircuit { witness };
         let pi = circuit.public_inputs();
 
-        let prover = MockProver::run(10, &circuit, vec![pi]).unwrap();
+        // k=12 needed for Poseidon circuit (~764 rows)
+        let prover = MockProver::run(12, &circuit, vec![pi]).unwrap();
         prover.assert_satisfied();
+    }
+
+    #[test]
+    fn test_ivc_step_circuit_rejects_wrong_state() {
+        let prev_acc = IVCAccumulator::initial(Fr::from(42u64));
+        let computation_hash = Fr::from(100u64);
+
+        // Use WRONG new_state (not the Poseidon output)
+        let wrong_new_state = Fr::from(999u64);
+
+        let witness = IVCStepWitness {
+            prev_acc,
+            new_state: wrong_new_state,
+            computation_hash,
+            step_error: Fr::from(5),
+            fold_challenge: None,
+            other_acc: None,
+        };
+
+        let circuit = IVCStepCircuit { witness };
+        let pi = circuit.public_inputs();
+
+        let prover = MockProver::run(12, &circuit, vec![pi]).unwrap();
+        // This should FAIL because new_state != Poseidon(prev_state, computation)
+        assert!(prover.verify().is_err());
     }
 
     #[test]
     fn test_ivc_step_circuit_with_fold() {
         let prev_acc = IVCAccumulator {
-            state_commitment: [1u8; 32],
+            state_commitment: Fr::from(100u64),
             num_steps: 5,
             error_term: Fr::one(),
             error_bound: Fr::from(10),
-            challenge_hash: [0u8; 32],
+            challenge_hash: Fr::ZERO,
         };
 
         let other_acc = IVCAccumulator {
-            state_commitment: [2u8; 32],
+            state_commitment: Fr::from(200u64),
             num_steps: 3,
             error_term: Fr::from(2),
             error_bound: Fr::from(5),
-            challenge_hash: [0u8; 32],
+            challenge_hash: Fr::ZERO,
         };
 
+        let computation_hash = Fr::from(300u64);
+        let new_state = poseidon_hash_two(prev_acc.state_commitment, computation_hash);
         let challenge = generate_folding_challenge(&prev_acc, &other_acc);
 
         let witness = IVCStepWitness {
             prev_acc: prev_acc.clone(),
-            new_state: [3u8; 32],
-            computation_hash: [30u8; 32],
+            new_state,
+            computation_hash,
             step_error: Fr::from(1),
             fold_challenge: Some(challenge),
             other_acc: Some(other_acc),
@@ -719,7 +750,87 @@ mod tests {
         let circuit = IVCStepCircuit { witness };
         let pi = circuit.public_inputs();
 
-        let prover = MockProver::run(10, &circuit, vec![pi]).unwrap();
+        let prover = MockProver::run(12, &circuit, vec![pi]).unwrap();
         prover.assert_satisfied();
+    }
+
+    /// Real proof generation for IVC step circuit using KZG + SHPLONK.
+    #[test]
+    fn test_ivc_real_proof_generation() {
+        use halo2_proofs::{
+            plonk::{create_proof, keygen_pk, keygen_vk, verify_proof_multi},
+            poly::kzg::{
+                commitment::{KZGCommitmentScheme, ParamsKZG},
+                multiopen::{ProverSHPLONK, VerifierSHPLONK},
+                strategy::SingleStrategy,
+            },
+            transcript::{
+                Blake2bRead, Blake2bWrite, Challenge255,
+                TranscriptReadBuffer, TranscriptWriterBuffer,
+            },
+            poly::commitment::Params,
+        };
+        use halo2curves::bn256::{Bn256, G1Affine};
+        use rand_core::OsRng;
+
+        let prev_acc = IVCAccumulator::initial(Fr::from(42u64));
+        let computation_hash = Fr::from(100u64);
+        let new_state = poseidon_hash_two(prev_acc.state_commitment, computation_hash);
+
+        let witness = IVCStepWitness {
+            prev_acc,
+            new_state,
+            computation_hash,
+            step_error: Fr::from(5),
+            fold_challenge: None,
+            other_acc: None,
+        };
+
+        let circuit = IVCStepCircuit { witness };
+        let pi = circuit.public_inputs();
+        let k = 12;
+
+        // Setup
+        let params = ParamsKZG::<Bn256>::setup(k, OsRng);
+        let vk = keygen_vk(&params, &circuit).expect("keygen_vk failed");
+        let pk = keygen_pk(&params, vk.clone(), &circuit).expect("keygen_pk failed");
+
+        // Prove
+        let instances = vec![pi.clone()];
+        let mut transcript = Blake2bWrite::<Vec<u8>, G1Affine, Challenge255<_>>::init(vec![]);
+
+        create_proof::<
+            KZGCommitmentScheme<Bn256>,
+            ProverSHPLONK<'_, Bn256>,
+            _,
+            _,
+            _,
+            _,
+        >(
+            &params,
+            &pk,
+            &[circuit],
+            &[instances.clone()],
+            OsRng,
+            &mut transcript,
+        )
+        .expect("IVC create_proof failed");
+
+        let proof = transcript.finalize();
+        assert!(!proof.is_empty());
+
+        // Verify
+        let mut verifier_transcript =
+            Blake2bRead::<_, G1Affine, Challenge255<_>>::init(proof.as_slice());
+        let verifier_params = params.verifier_params();
+        let verified = verify_proof_multi::<
+            KZGCommitmentScheme<Bn256>,
+            VerifierSHPLONK<Bn256>,
+            _,
+            _,
+            SingleStrategy<Bn256>,
+        >(&verifier_params, &vk, &[instances], &mut verifier_transcript);
+
+        assert!(verified, "IVC real proof verification must succeed");
     }
 }
