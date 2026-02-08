@@ -653,6 +653,20 @@ impl SecureWallet {
         self.status == WalletStatus::Unlocked
     }
 
+    /// Convert the primary key to an ethers `LocalWallet` for on-chain signing.
+    ///
+    /// The wallet must be unlocked first. The returned signer is configured
+    /// with the given `chain_id` for EIP-155 replay protection.
+    #[cfg(feature = "chain")]
+    pub fn to_ethers_wallet(&self, chain_id: u64) -> Result<ethers::signers::LocalWallet> {
+        let primary_path = DerivationPath::ethereum(0, 0).as_str();
+        let key = self
+            .derived_keys
+            .get(&primary_path)
+            .ok_or_else(|| anyhow!("Wallet is locked or primary key not derived"))?;
+        key.to_ethers_wallet(chain_id)
+    }
+
     /// Export mnemonic (requires password confirmation)
     pub async fn export_mnemonic(&self, password: &str) -> Result<SecureMnemonic> {
         let encrypted: EncryptedWalletData = serde_json::from_str(

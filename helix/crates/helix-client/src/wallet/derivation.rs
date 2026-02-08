@@ -760,6 +760,22 @@ impl DerivedKey {
     pub fn private_key_bytes(&self) -> [u8; 32] {
         self.private_key.private_key_bytes()
     }
+
+    /// Convert to an ethers `LocalWallet` for on-chain transaction signing.
+    ///
+    /// The returned wallet is configured with the given `chain_id` for EIP-155
+    /// replay protection.
+    #[cfg(feature = "chain")]
+    pub fn to_ethers_wallet(&self, chain_id: u64) -> Result<ethers::signers::LocalWallet> {
+        use ethers::signers::{LocalWallet, Signer};
+        use std::str::FromStr;
+
+        let key_hex = hex::encode(self.private_key_bytes());
+        let wallet = LocalWallet::from_str(&key_hex)
+            .map_err(|e| anyhow!("Failed to create ethers LocalWallet: {}", e))?
+            .with_chain_id(chain_id);
+        Ok(wallet)
+    }
 }
 
 impl fmt::Debug for DerivedKey {

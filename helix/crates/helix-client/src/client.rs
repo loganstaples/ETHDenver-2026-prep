@@ -91,6 +91,22 @@ impl HelixClient {
     pub fn is_connected(&self) -> bool {
         self.rpc.is_connected()
     }
+
+    /// Attach an on-chain client by supplying a private key.
+    ///
+    /// Uses the RPC URL, chain ID, and coordinator address from this client's
+    /// configuration to create and attach a `ChainClient`.
+    #[cfg(feature = "chain")]
+    pub async fn connect_chain(&mut self, private_key: &str) -> Result<()> {
+        let chain = self.config.chain_client(private_key).await?;
+        self.rpc.set_chain_client(chain);
+        Ok(())
+    }
+
+    /// Mutable reference to the RPC client (for attaching chain client etc.).
+    pub fn rpc_mut(&mut self) -> &mut crate::rpc::client::UnifiedRpcClient {
+        &mut self.rpc
+    }
 }
 
 /// Convert the crate-level `RpcConfig` into the rpc module's `HelixRpcConfig`.

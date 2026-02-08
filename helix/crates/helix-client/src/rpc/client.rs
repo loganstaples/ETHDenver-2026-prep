@@ -1276,6 +1276,9 @@ pub struct UnifiedRpcClient {
     use_mock: bool,
     /// Connection status
     connected: bool,
+    /// On-chain client for contract interactions (chain feature)
+    #[cfg(feature = "chain")]
+    chain_client: Option<super::chain::ChainClient>,
 }
 
 impl UnifiedRpcClient {
@@ -1295,6 +1298,8 @@ impl UnifiedRpcClient {
                             mock_client,
                             use_mock: false,
                             connected: true,
+                            #[cfg(feature = "chain")]
+                            chain_client: None,
                         }
                     }
                     Err(e) => {
@@ -1304,6 +1309,8 @@ impl UnifiedRpcClient {
                             mock_client,
                             use_mock: true,
                             connected: false,
+                            #[cfg(feature = "chain")]
+                            chain_client: None,
                         }
                     }
                 }
@@ -1315,6 +1322,8 @@ impl UnifiedRpcClient {
                     mock_client,
                     use_mock: true,
                     connected: false,
+                    #[cfg(feature = "chain")]
+                    chain_client: None,
                 }
             }
         }
@@ -1327,7 +1336,21 @@ impl UnifiedRpcClient {
             mock_client: MockRpcClient::new(),
             use_mock: true,
             connected: false,
+            #[cfg(feature = "chain")]
+            chain_client: None,
         }
+    }
+
+    /// Attach an on-chain client for contract interactions.
+    #[cfg(feature = "chain")]
+    pub fn set_chain_client(&mut self, client: super::chain::ChainClient) {
+        self.chain_client = Some(client);
+    }
+
+    /// Get a reference to the on-chain client, if attached.
+    #[cfg(feature = "chain")]
+    pub fn chain_client(&self) -> Option<&super::chain::ChainClient> {
+        self.chain_client.as_ref()
     }
 
     /// Check if using mock mode
@@ -1506,6 +1529,95 @@ impl UnifiedRpcClient {
 impl Default for UnifiedRpcClient {
     fn default() -> Self {
         Self::mock_only()
+    }
+}
+
+// ============================================================================
+// On-Chain Integration (chain feature)
+// ============================================================================
+
+#[cfg(feature = "chain")]
+impl UnifiedRpcClient {
+    /// Submit a proof to the coordinator contract.
+    ///
+    /// Returns the transaction receipt or an error if no chain client is attached.
+    pub async fn submit_proof_onchain(
+        &self,
+        model_id: u64,
+        round_id: u64,
+        proof: Vec<u8>,
+        inputs: &super::chain::TrainingProofInputs,
+    ) -> anyhow::Result<ethers::types::TransactionReceipt> {
+        let chain = self
+            .chain_client
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No chain client attached — configure with --rpc-url and --private-key"))?;
+        chain.submit_proof(model_id, round_id, proof, inputs).await
+    }
+
+    /// Get model state from the coordinator contract.
+    pub async fn get_model_state_onchain(
+        &self,
+        model_id: u64,
+    ) -> anyhow::Result<super::chain::ChainModelState> {
+        let chain = self
+            .chain_client
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No chain client attached"))?;
+        chain.get_model_state(model_id).await
+    }
+
+    /// Get round state from the coordinator contract.
+    pub async fn get_round_state_onchain(
+        &self,
+        model_id: u64,
+        round_id: u64,
+    ) -> anyhow::Result<super::chain::ChainRoundState> {
+        let chain = self
+            .chain_client
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No chain client attached"))?;
+        chain.get_round_state(model_id, round_id).await
+    }
+
+    /// Stake ETH for a model via the coordinator contract.
+    pub async fn stake_onchain(
+        &self,
+        model_id: u64,
+        amount: ethers::types::U256,
+    ) -> anyhow::Result<ethers::types::TransactionReceipt> {
+        let chain = self
+            .chain_client
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No chain client attached"))?;
+        chain.stake(model_id, amount).await
+    }
+
+    /// Register a model via the coordinator contract.
+    pub async fn register_model_onchain(
+        &self,
+        ipfs_hash: &str,
+        initial_commitment: ethers::types::U256,
+        min_stake: ethers::types::U256,
+    ) -> anyhow::Result<(ethers::types::TransactionReceipt, u64)> {
+        let chain = self
+            .chain_client
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No chain client attached"))?;
+        chain.register_model(ipfs_hash, initial_commitment, min_stake).await
+    }
+
+    /// Start a round via the coordinator contract.
+    pub async fn start_round_onchain(
+        &self,
+        model_id: u64,
+        duration_secs: u64,
+    ) -> anyhow::Result<ethers::types::TransactionReceipt> {
+        let chain = self
+            .chain_client
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No chain client attached"))?;
+        chain.start_round(model_id, duration_secs).await
     }
 }
 

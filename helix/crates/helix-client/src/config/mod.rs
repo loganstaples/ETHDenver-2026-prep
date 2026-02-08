@@ -150,6 +150,26 @@ impl HelixConfig {
         Ok(())
     }
 
+    /// Create a `ChainClient` from this config.
+    ///
+    /// Requires the `chain` feature and a private key for signing transactions.
+    #[cfg(feature = "chain")]
+    pub async fn chain_client(
+        &self,
+        private_key: &str,
+    ) -> Result<crate::rpc::chain::ChainClient> {
+        if !self.contracts.has_coordinator() {
+            return Err(anyhow!("Coordinator address not configured"));
+        }
+        crate::rpc::chain::ChainClient::from_config(
+            &self.rpc.url,
+            self.rpc.chain_id,
+            &self.contracts.coordinator,
+            private_key,
+        )
+        .await
+    }
+
     /// Generate example configuration files for all profiles
     pub fn generate_examples(output_dir: &PathBuf) -> Result<()> {
         std::fs::create_dir_all(output_dir)?;
@@ -689,6 +709,11 @@ impl ContractConfig {
     /// Check if all required contracts are configured
     pub fn is_configured(&self) -> bool {
         !self.coordinator.is_empty() && !self.verifier.is_empty()
+    }
+
+    /// Check if chain interaction is possible (coordinator address set).
+    pub fn has_coordinator(&self) -> bool {
+        !self.coordinator.is_empty() && self.coordinator.starts_with("0x")
     }
 
     /// Validate contract addresses

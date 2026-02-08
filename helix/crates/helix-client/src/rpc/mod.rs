@@ -11,7 +11,13 @@
 //! - `RealTimeProofTracker` - Real-time proof generation tracking
 //! - `RealTimeTrainingTracker` - Real-time training progress tracking
 
+#[cfg(feature = "chain")]
+pub mod chain;
+
 pub mod client;
+
+#[cfg(feature = "chain")]
+pub use chain::{ChainClient, ChainModelState, ChainRoundState, ChainStakeInfo, TrainingProofInputs};
 
 pub use client::{
     // Core client types
