@@ -435,7 +435,13 @@ async fn write_handshake<S: tokio::io::AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// Maximum allowed message size (64 MB). Prevents memory exhaustion from
+/// malicious or corrupted length prefixes.
+#[cfg(feature = "network-mpc")]
+pub const MAX_MSG_SIZE: usize = 64 * 1024 * 1024;
+
 /// Background task: reads length-prefixed messages and forwards to channel.
+/// Enforces MAX_MSG_SIZE and logs errors before dropping the connection.
 #[cfg(feature = "network-mpc")]
 async fn reader_loop(
     mut reader: tokio::io::ReadHalf<tokio::net::TcpStream>,
@@ -444,21 +450,33 @@ async fn reader_loop(
     use tokio::io::AsyncReadExt;
     let mut len_buf = [0u8; 4];
     loop {
-        if reader.read_exact(&mut len_buf).await.is_err() {
+        if let Err(e) = reader.read_exact(&mut len_buf).await {
+            tracing::debug!("reader_loop: peer disconnected (read len): {}", e);
             break;
         }
         let len = u32::from_be_bytes(len_buf) as usize;
+        if len > MAX_MSG_SIZE {
+            tracing::error!(
+                "reader_loop: message too large ({} bytes, max {}), dropping connection",
+                len,
+                MAX_MSG_SIZE
+            );
+            break;
+        }
         let mut buf = vec![0u8; len];
-        if reader.read_exact(&mut buf).await.is_err() {
+        if let Err(e) = reader.read_exact(&mut buf).await {
+            tracing::debug!("reader_loop: peer disconnected (read body): {}", e);
             break;
         }
         if tx.send(buf).await.is_err() {
+            tracing::debug!("reader_loop: channel closed, stopping");
             break;
         }
     }
 }
 
 /// Background task: reads from channel and writes length-prefixed messages.
+/// Enforces MAX_MSG_SIZE on outgoing messages and logs errors.
 #[cfg(feature = "network-mpc")]
 async fn writer_loop(
     mut writer: tokio::io::WriteHalf<tokio::net::TcpStream>,
@@ -466,16 +484,56 @@ async fn writer_loop(
 ) {
     use tokio::io::AsyncWriteExt;
     while let Some(data) = rx.recv().await {
+        if data.len() > MAX_MSG_SIZE {
+            tracing::error!(
+                "writer_loop: refusing to send message of {} bytes (max {})",
+                data.len(),
+                MAX_MSG_SIZE
+            );
+            continue;
+        }
         let len = (data.len() as u32).to_be_bytes();
-        if writer.write_all(&len).await.is_err() {
+        if let Err(e) = writer.write_all(&len).await {
+            tracing::debug!("writer_loop: write len failed: {}", e);
             break;
         }
-        if writer.write_all(&data).await.is_err() {
+        if let Err(e) = writer.write_all(&data).await {
+            tracing::debug!("writer_loop: write body failed: {}", e);
             break;
         }
-        if writer.flush().await.is_err() {
+        if let Err(e) = writer.flush().await {
+            tracing::debug!("writer_loop: flush failed: {}", e);
             break;
         }
+    }
+}
+
+#[cfg(feature = "network-mpc")]
+impl TcpTransport {
+    /// Receives a message with a timeout.
+    pub async fn recv_timeout(
+        &self,
+        party: &PartyId,
+        timeout: Duration,
+    ) -> MPCResult<Vec<u8>> {
+        let rx_mutex = self.receivers.get(&party.0).ok_or_else(|| {
+            MPCError::CommunicationError(format!("no channel from party {}", party))
+        })?;
+        let mut rx = rx_mutex.lock().await;
+        tokio::time::timeout(timeout, rx.recv())
+            .await
+            .map_err(|_| MPCError::Timeout {
+                party: party.clone(),
+                phase: "recv".into(),
+            })?
+            .ok_or_else(|| {
+                MPCError::CommunicationError(format!("channel from {} closed", party))
+            })
+    }
+
+    /// Returns the total number of parties (self + peers).
+    pub fn num_parties(&self) -> usize {
+        self.peers_list.len() + 1
     }
 }
 
@@ -483,6 +541,13 @@ async fn writer_loop(
 #[async_trait]
 impl MPCTransport for TcpTransport {
     async fn send(&self, party: &PartyId, msg: &[u8]) -> MPCResult<()> {
+        if msg.len() > MAX_MSG_SIZE {
+            return Err(MPCError::CommunicationError(format!(
+                "message too large: {} bytes (max {})",
+                msg.len(),
+                MAX_MSG_SIZE
+            )));
+        }
         let tx = self.senders.get(&party.0).ok_or_else(|| {
             MPCError::CommunicationError(format!("no channel to party {}", party))
         })?;

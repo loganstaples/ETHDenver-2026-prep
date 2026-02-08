@@ -271,6 +271,10 @@ impl Fr {
     /// semantics for values that fit within the representable range.
     /// For values that represent negative numbers (>= r/2), we need to
     /// handle the sign carefully.
+    ///
+    /// **Note**: This uses integer truncation (`floor(product / 2^64)`), which
+    /// is correct for small values (< ~2^190) but breaks for large random
+    /// values (e.g., MPC shares). For MPC, use [`mpc_scale`] instead.
     #[inline]
     pub fn fixed_mul(&self, other: &Self) -> Self {
         // Check if either operand is "negative" (> r/2)
@@ -301,6 +305,37 @@ impl Fr {
         } else {
             result
         }
+    }
+
+    /// MPC-safe multiplication of a secret share by a fixed-point public value.
+    ///
+    /// Given `self` = a secret share (arbitrary field element) and `public_fp` =
+    /// a fixed-point encoded public value (from `from_f64`), computes:
+    ///   `result = self * public_fp * (2^64)^{-1} mod r`
+    ///
+    /// This is equivalent to `fixed_mul` but uses modular inverse instead of
+    /// byte-shift truncation, making it:
+    /// - **Correct for all field element sizes** (including random MPC shares)
+    /// - **Linear** (sum of scaled shares = scaled sum), which is required for
+    ///   additive secret sharing to work correctly
+    ///
+    /// Use this instead of `fixed_mul` whenever one or both operands might be
+    /// large random field elements (e.g., secret shares in MPC protocols).
+    #[inline]
+    pub fn mpc_scale(&self, public_fp: &Self) -> Self {
+        let product = Fr(self.0 * public_fp.0);
+        Fr(product.0 * Self::inv_2_64().0)
+    }
+
+    /// Returns (2^64)^{-1} mod r, cached after first computation.
+    #[inline]
+    fn inv_2_64() -> Fr {
+        use std::sync::OnceLock;
+        static INV: OnceLock<Fr> = OnceLock::new();
+        *INV.get_or_init(|| {
+            let two_64 = Halo2Fr::from(u64::MAX) + Halo2Fr::ONE;
+            Fr(two_64.invert().unwrap())
+        })
     }
 
     /// Checks if the value represents a "negative" number.
@@ -584,6 +619,48 @@ pub mod batch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_mpc_scale() {
+        // Verify mpc_scale works for small values (same as fixed_mul)
+        let a = Fr::from_f64(3.0);
+        let b = Fr::from_f64(4.0);
+        let result = a.mpc_scale(&b);
+        let got = result.to_f64();
+        // mpc_scale uses modular inverse so may differ slightly from
+        // fixed_mul (which uses truncation). But for powers-of-2 products,
+        // they should agree exactly.
+        assert!(
+            (got - 12.0).abs() < 1.0,
+            "3.0 * 4.0 via mpc_scale = {} (expected ~12.0)", got
+        );
+
+        // Verify mpc_scale is linear: sum(share_i * x) = sum(share_i) * x
+        use rand::{SeedableRng, RngCore};
+        use rand_chacha::ChaCha20Rng;
+        let mut rng = ChaCha20Rng::seed_from_u64(42);
+        let x = Fr::from_f64(0.1);
+        let secret = Fr::from_f64(100.0);
+
+        // Create 3 additive shares of secret
+        let s1 = Fr::random(&mut rng);
+        let s2 = Fr::random(&mut rng);
+        let s3 = Fr::sub(&Fr::sub(&secret, &s1), &s2);
+
+        // Scale each share by x
+        let r1 = s1.mpc_scale(&x);
+        let r2 = s2.mpc_scale(&x);
+        let r3 = s3.mpc_scale(&x);
+
+        // Reconstruct: sum should equal secret * x
+        let sum = Fr::add(&Fr::add(&r1, &r2), &r3);
+        let expected = secret.mpc_scale(&x);
+        assert!(
+            sum.ct_eq(&expected).to_bool(),
+            "mpc_scale not linear: sum={} expected={}",
+            sum.to_f64(), expected.to_f64()
+        );
+    }
 
     #[test]
     fn test_basic_arithmetic() {
