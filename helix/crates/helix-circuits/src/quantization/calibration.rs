@@ -21,18 +21,17 @@
 //! 3. Quantization error is within claimed bounds
 
 use halo2_proofs::{
-    arithmetic::Field,
-    circuit::{AssignedCell, Layouter, Region, SimpleFloorPlanner, Value},
+    circuit::{Layouter, Region, SimpleFloorPlanner, Value},
     plonk::{
-        Advice, Circuit, Column, ConstraintSystem, Error, ErrorFront, Expression, Fixed,
-        Instance, Selector, TableColumn,
+        Advice, Circuit, Column, ConstraintSystem, ErrorFront, Expression,
+        Instance, Selector,
     },
     poly::Rotation,
 };
 use halo2curves::ff::PrimeField;
 use std::marker::PhantomData;
 
-use super::{INT8_MAX, INT8_MIN, INT8_RANGE, INT4_MAX, INT4_MIN};
+use super::{INT8_MAX, INT8_MIN};
 
 /// Configuration for calibration verification circuits.
 #[derive(Clone, Debug)]

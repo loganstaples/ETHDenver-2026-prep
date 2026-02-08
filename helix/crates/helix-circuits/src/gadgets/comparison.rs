@@ -2,10 +2,10 @@
 //!
 //! Checks if `a <= b` by verifying `b - a` is in the range [0, 2^K).
 
-use crate::gadgets::range::{RangeChip, RangeConfig};
+use crate::gadgets::range::RangeConfig;
 use halo2_proofs::{
     circuit::{Layouter, Value},
-    plonk::{Error, ErrorFront},
+    plonk::ErrorFront,
 };
 use halo2curves::ff::PrimeField;
 

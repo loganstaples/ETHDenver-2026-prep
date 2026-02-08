@@ -20,10 +20,8 @@
 //! | PReLU     | x if x > 0, else α[channel]*x    | Learned negative slope      |
 
 use halo2_proofs::{
-    arithmetic::Field,
     circuit::{AssignedCell, Layouter, Region, Value},
-    plonk::{Advice, Column, ConstraintSystem, Error, ErrorFront, Selector, TableColumn},
-    poly::Rotation,
+    plonk::{Advice, Column, ConstraintSystem, ErrorFront, Selector},
 };
 use halo2curves::ff::PrimeField;
 use std::marker::PhantomData;
@@ -527,6 +525,7 @@ mod tests {
         plonk::Circuit,
     };
     use halo2curves::bn256::Fr;
+    use halo2curves::ff::Field;
 
     #[test]
     fn test_relu_table_entries() {

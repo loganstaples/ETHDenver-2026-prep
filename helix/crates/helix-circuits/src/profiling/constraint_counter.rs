@@ -21,7 +21,7 @@
 
 use halo2_proofs::{
     dev::MockProver,
-    plonk::{Circuit, ConstraintSystem, Error, ErrorFront},
+    plonk::{Circuit, Error},
 };
 use halo2curves::bn256::Fr;
 use std::collections::HashMap;
@@ -248,7 +248,7 @@ impl ConstraintCounter {
         // Use MockProver to analyze the circuit structure
         // Note: This is a simplified analysis - full analysis would require
         // access to internal halo2 structures
-        let prover = MockProver::run(k, circuit, vec![])?;
+        let _prover = MockProver::run(k, circuit, vec![])?;
 
         // Estimate constraints based on K parameter and circuit structure
         let total_rows = 1usize << k;
@@ -273,7 +273,7 @@ impl ConstraintCounter {
     }
 
     /// Estimates constraint breakdown from circuit parameters.
-    fn estimate_breakdown(&self, k: u32, total_rows: usize) -> ConstraintBreakdown {
+    fn estimate_breakdown(&self, _k: u32, total_rows: usize) -> ConstraintBreakdown {
         // These are estimates based on typical HELIX circuit structure
         // For accurate counts, would need to instrument the circuit
 
@@ -473,7 +473,7 @@ fn suggest_optimization(name: &str, constraints: usize) -> OptimizationPotential
 
 /// Counts constraints for a specific circuit region.
 pub struct RegionCounter {
-    name: String,
+    _name: String,
     constraints: usize,
     rows: usize,
 }
@@ -482,7 +482,7 @@ impl RegionCounter {
     /// Creates a new region counter.
     pub fn new(name: &str) -> Self {
         Self {
-            name: name.to_string(),
+            _name: name.to_string(),
             constraints: 0,
             rows: 0,
         }

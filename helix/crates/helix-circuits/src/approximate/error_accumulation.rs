@@ -12,7 +12,7 @@ use crate::gadgets::arithmetic::{ArithmeticChip, ArithmeticConfig};
 use crate::gadgets::range::{RangeChip, RangeConfig};
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
-    plonk::{Circuit, Column, Advice, ConstraintSystem, Error, ErrorFront, Selector, Instance},
+    plonk::{Circuit, Column, Advice, ConstraintSystem, ErrorFront, Selector, Instance},
     poly::Rotation,
 };
 use halo2curves::ff::PrimeField;
@@ -64,8 +64,8 @@ pub struct ErrorAccumulationConfig<F: PrimeField, const RANGE: usize> {
 /// A chip that proves error accumulation bounds.
 pub struct ErrorAccumulationChip<F: PrimeField, const RANGE: usize> {
     config: ErrorAccumulationConfig<F, RANGE>,
-    arithmetic_chip: ArithmeticChip<F>,
-    range_chip: RangeChip<F, RANGE>,
+    _arithmetic_chip: ArithmeticChip<F>,
+    _range_chip: RangeChip<F, RANGE>,
     _marker: PhantomData<F>,
 }
 
@@ -76,8 +76,8 @@ impl<F: PrimeField, const RANGE: usize> ErrorAccumulationChip<F, RANGE> {
         let range_chip = RangeChip::new(config.range.clone());
         Self {
             config,
-            arithmetic_chip,
-            range_chip,
+            _arithmetic_chip: arithmetic_chip,
+            _range_chip: range_chip,
             _marker: PhantomData,
         }
     }

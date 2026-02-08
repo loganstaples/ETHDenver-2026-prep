@@ -24,8 +24,7 @@
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
     plonk::{
-        Advice, Circuit, Column, ConstraintSystem, Error, ErrorFront, Expression, Instance, Selector,
-        TableColumn,
+        Advice, Circuit, Column, ConstraintSystem, ErrorFront, Instance, Selector,
     },
     poly::Rotation,
 };
@@ -157,7 +156,7 @@ impl<F: PrimeField> LayerNormChip<F> {
             let inv_std = meta.query_advice(advice[0], Rotation::cur());
             let var_plus_eps = meta.query_advice(advice[1], Rotation::cur());
             let scale_sq = meta.query_advice(advice[2], Rotation::cur());
-            let error_bound = meta.query_advice(advice[3], Rotation::cur());
+            let _error_bound = meta.query_advice(advice[3], Rotation::cur());
             // (inv_std² * var_plus_eps - scale_sq) should be within error_bound
             // For simplicity, we just verify the relationship approximately
             vec![s * (inv_std.clone() * inv_std * var_plus_eps - scale_sq)]
@@ -428,7 +427,7 @@ pub fn compute_layer_norm_witness(
     let mean = sum * n_field.invert().unwrap_or(Fr::ONE);
 
     // Track error for mean computation
-    let mean_error = tracker.dot_product_error(n, base_error);
+    let _mean_error = tracker.dot_product_error(n, base_error);
 
     // Compute variance
     let mut sum_sq = Fr::ZERO;
@@ -441,12 +440,12 @@ pub fn compute_layer_norm_witness(
 
     // variance = sum_sq / n
     let variance = sum_sq * n_field.invert().unwrap_or(Fr::ONE);
-    let variance_error = tracker.dot_product_error(n, base_error);
+    let _variance_error = tracker.dot_product_error(n, base_error);
 
     // Compute inverse standard deviation
     // inv_std = scale / sqrt(variance + epsilon)
     let var_plus_eps = variance + Fr::from(epsilon);
-    let scale = Fr::from(INV_SQRT_SCALE);
+    let _scale = Fr::from(INV_SQRT_SCALE);
 
     // Approximate sqrt using Newton-Raphson or direct computation
     let var_f64 = field_to_f64(var_plus_eps);

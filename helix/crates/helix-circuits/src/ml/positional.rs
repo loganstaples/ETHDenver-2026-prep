@@ -23,7 +23,7 @@
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
     plonk::{
-        Advice, Circuit, Column, ConstraintSystem, Error, ErrorFront, Expression, Fixed, Instance, Selector,
+        Advice, Circuit, Column, ConstraintSystem, ErrorFront, Instance, Selector,
         TableColumn,
     },
     poly::Rotation,

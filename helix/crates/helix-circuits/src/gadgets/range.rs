@@ -3,12 +3,11 @@
 //! Constrains a value to be within [0, RANGE).
 
 use halo2_proofs::{
-    circuit::{Layouter, Region, Value},
-    plonk::{ConstraintSystem, Error, ErrorFront, Expression, TableColumn, Selector},
+    circuit::{Layouter, Value},
+    plonk::{ConstraintSystem, ErrorFront, TableColumn},
     poly::Rotation,
 };
 use std::marker::PhantomData;
-use halo2_proofs::arithmetic::Field;
 use halo2curves::ff::PrimeField; // Need PrimeField for From<u64>
 
 /// Configuration for the Range Gadget.

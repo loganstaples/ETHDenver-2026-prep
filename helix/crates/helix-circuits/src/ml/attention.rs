@@ -30,14 +30,14 @@
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
     plonk::{
-        Advice, Circuit, Column, ConstraintSystem, Error, ErrorFront, Expression, Instance, Selector,
+        Advice, Circuit, Column, ConstraintSystem, ErrorFront, Instance, Selector,
         TableColumn,
     },
     poly::Rotation,
 };
 use halo2curves::bn256::Fr;
 use halo2curves::ff::{Field, PrimeField};
-use sha2::{Digest, Sha256};
+
 use std::marker::PhantomData;
 
 use crate::ml::training_step_v2::ErrorTracker;
@@ -355,7 +355,7 @@ impl<F: PrimeField> MultiHeadAttentionChip<F> {
         input: &[Vec<F>],  // [seq_len, d_in]
         weight: &[F],      // [d_in, d_out] flattened
         output: &[Vec<F>], // [seq_len, d_out]
-        errors: &[Vec<F>], // [seq_len, d_out]
+        _errors: &[Vec<F>], // [seq_len, d_out]
         seq_len: usize,
         d_in: usize,
         d_out: usize,
@@ -535,7 +535,7 @@ impl<F: PrimeField> MultiHeadAttentionChip<F> {
         head_outputs: &[Vec<Vec<F>>],  // [n_heads][seq_len][d_v]
         w_o: &[F],                      // [n_heads * d_v, d_model] flattened
         output: &[Vec<F>],              // [seq_len, d_model]
-        errors: &[Vec<F>],
+        _errors: &[Vec<F>],
         n_heads: usize,
         seq_len: usize,
         d_v: usize,
@@ -831,8 +831,8 @@ pub fn compute_mha_witness(
         // Softmax (simplified - uniform distribution for now to ensure sum = SOFTMAX_SCALE)
         let mut attn_weights = Vec::with_capacity(seq_len);
         let uniform_weight = Fr::from(SOFTMAX_SCALE / seq_len as u64);
-        let remainder = Fr::from(SOFTMAX_SCALE % seq_len as u64);
-        for i in 0..seq_len {
+        let _remainder = Fr::from(SOFTMAX_SCALE % seq_len as u64);
+        for _i in 0..seq_len {
             let mut row = vec![uniform_weight; seq_len];
             // Distribute remainder to first few elements
             for j in 0..(SOFTMAX_SCALE % seq_len as u64) as usize {
@@ -1000,14 +1000,14 @@ pub struct BoundedAttentionConfig<F: PrimeField, const RANGE: usize> {
 
 /// Legacy chip (kept for compatibility).
 pub struct BoundedAttentionChip<F: PrimeField, const RANGE: usize> {
-    chip: MultiHeadAttentionChip<F>,
+    _chip: MultiHeadAttentionChip<F>,
     _range: PhantomData<[(); RANGE]>,
 }
 
 impl<F: PrimeField, const RANGE: usize> BoundedAttentionChip<F, RANGE> {
     pub fn new(config: BoundedAttentionConfig<F, RANGE>) -> Self {
         Self {
-            chip: MultiHeadAttentionChip::new(config.config),
+            _chip: MultiHeadAttentionChip::new(config.config),
             _range: PhantomData,
         }
     }

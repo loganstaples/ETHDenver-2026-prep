@@ -7,7 +7,7 @@
 
 use halo2_proofs::{
     circuit::{Layouter, Value},
-    plonk::{Advice, Column, ConstraintSystem, Error, ErrorFront, Instance},
+    plonk::{Advice, Column, ConstraintSystem, ErrorFront, Instance},
 };
 use halo2curves::ff::PrimeField;
 use sha2::{Sha256, Digest};
@@ -28,7 +28,7 @@ pub struct ModelCommitConfig<F: PrimeField> {
 /// incompatibility with the PSE fork. For production use, integrate PSE's
 /// standalone poseidon crate or use the SHA-256 state hash from training_step_v2.
 pub struct ModelCommitChip<F: PrimeField> {
-    config: ModelCommitConfig<F>,
+    _config: ModelCommitConfig<F>,
     _marker: PhantomData<F>,
 }
 
@@ -50,7 +50,7 @@ impl<F: PrimeField> ModelCommitChip<F> {
 
     pub fn new(config: ModelCommitConfig<F>) -> Self {
         Self {
-            config,
+            _config: config,
             _marker: PhantomData,
         }
     }

@@ -27,11 +27,10 @@
 //! - Output: Requantized to INT8
 
 use halo2_proofs::{
-    arithmetic::Field,
-    circuit::{AssignedCell, Layouter, Region, SimpleFloorPlanner, Value},
+    circuit::{Layouter, Region, SimpleFloorPlanner, Value},
     plonk::{
-        Advice, Circuit, Column, ConstraintSystem, Error, ErrorFront, Expression, Fixed,
-        Instance, Selector, TableColumn,
+        Advice, Circuit, Column, ConstraintSystem, ErrorFront, Expression,
+        Selector, TableColumn,
     },
     poly::Rotation,
 };
@@ -642,7 +641,7 @@ impl<F: PrimeField> Default for Int4QuantCircuit<F> {
 
 impl<F: PrimeField> Int4QuantCircuit<F> {
     /// Creates a new INT4 quantization circuit.
-    pub fn new(values: Vec<f64>, scale: f64, fp_scale: u64) -> Self {
+    pub fn new(values: Vec<f64>, _scale: f64, fp_scale: u64) -> Self {
         let params = Int4WeightParams::from_range(
             values.iter().cloned().fold(f64::INFINITY, f64::min),
             values.iter().cloned().fold(f64::NEG_INFINITY, f64::max),

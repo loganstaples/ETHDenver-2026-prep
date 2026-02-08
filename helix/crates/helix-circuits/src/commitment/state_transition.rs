@@ -2,10 +2,9 @@
 
 use halo2_proofs::{
     circuit::{Layouter, Value},
-    plonk::{ConstraintSystem, Error, ErrorFront},
+    plonk::ErrorFront,
 };
 use halo2curves::ff::PrimeField;
-use crate::gadgets::arithmetic::{ArithmeticChip, ArithmeticConfig};
 use crate::approximate::bounded_add::{BoundedAddChip, BoundedAddConfig};
 use crate::approximate::bounded_mul::{BoundedMulChip, BoundedMulConfig};
 

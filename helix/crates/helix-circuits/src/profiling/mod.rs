@@ -39,12 +39,11 @@ pub use timing::{
     WitnessGenerationTiming, SynthesisTiming, ProvingTiming,
 };
 
-use halo2_proofs::plonk::{Circuit, Error, ErrorFront};
+use halo2_proofs::plonk::{Circuit, Error};
 use halo2curves::bn256::Fr;
 use std::time::{Duration, Instant};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
 /// Configuration for circuit profiling.
 #[derive(Debug, Clone)]
@@ -259,7 +258,7 @@ impl CircuitProfiler {
         k: u32,
         public_inputs: Vec<Vec<Fr>>,
     ) -> Result<CircuitProfile, Error> {
-        let start = Instant::now();
+        let _start = Instant::now();
         let initial_memory = get_memory_usage();
 
         // Profile constraints
@@ -451,6 +450,7 @@ impl CircuitProfiler {
 }
 
 /// Tracks individual operations for detailed profiling.
+#[allow(dead_code)]
 struct OperationTracker {
     operations: HashMap<String, OperationStats>,
     max_operations: usize,
@@ -471,6 +471,7 @@ impl OperationTracker {
         }
     }
 
+    #[allow(dead_code)]
     fn record(&mut self, name: &str, constraints: usize, time: Duration) {
         if self.operations.len() >= self.max_operations && !self.operations.contains_key(name) {
             return;
@@ -593,7 +594,7 @@ impl CircuitProfile {
     }
 }
 
-/// Global profiling context for cross-function profiling.
+// Global profiling context for cross-function profiling.
 thread_local! {
     static PROFILING_CONTEXT: std::cell::RefCell<Option<ProfilingContext>> = const { std::cell::RefCell::new(None) };
 }

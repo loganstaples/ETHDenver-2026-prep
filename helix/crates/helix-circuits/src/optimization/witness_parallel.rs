@@ -113,7 +113,7 @@ impl<F: PrimeField> WitnessChunk<F> {
 pub struct ParallelWitnessGenerator {
     config: ParallelConfig,
     cache: Arc<Mutex<ComputationCache>>,
-    stats: WitnessStats,
+    _stats: WitnessStats,
 }
 
 impl ParallelWitnessGenerator {
@@ -121,7 +121,7 @@ impl ParallelWitnessGenerator {
     pub fn new(config: ParallelConfig) -> Self {
         Self {
             cache: Arc::new(Mutex::new(ComputationCache::new(1000))),
-            stats: WitnessStats::default(),
+            _stats: WitnessStats::default(),
             config,
         }
     }
@@ -456,16 +456,16 @@ fn compute_total_error(h_pre_err: &[Fr], h_err: &[Fr], y_err: &[Fr], loss_err: F
 /// Statistics for witness generation.
 #[derive(Default)]
 struct WitnessStats {
-    total_generations: usize,
-    total_time: Duration,
-    cache_hits: usize,
-    cache_misses: usize,
+    _total_generations: usize,
+    _total_time: Duration,
+    _cache_hits: usize,
+    _cache_misses: usize,
 }
 
 /// Cache for computed values.
 struct ComputationCache {
     cache: HashMap<u64, Fr>,
-    max_size: usize,
+    _max_size: usize,
     hits: usize,
     misses: usize,
 }
@@ -474,12 +474,13 @@ impl ComputationCache {
     fn new(max_size: usize) -> Self {
         Self {
             cache: HashMap::new(),
-            max_size,
+            _max_size: max_size,
             hits: 0,
             misses: 0,
         }
     }
 
+    #[allow(dead_code)]
     fn get(&mut self, key: u64) -> Option<Fr> {
         match self.cache.get(&key) {
             Some(&v) => {
@@ -493,8 +494,9 @@ impl ComputationCache {
         }
     }
 
+    #[allow(dead_code)]
     fn insert(&mut self, key: u64, value: Fr) {
-        if self.cache.len() >= self.max_size {
+        if self.cache.len() >= self._max_size {
             // Simple eviction: remove a random entry
             if let Some(&k) = self.cache.keys().next() {
                 self.cache.remove(&k);
@@ -503,6 +505,7 @@ impl ComputationCache {
         self.cache.insert(key, value);
     }
 
+    #[allow(dead_code)]
     fn hit_rate(&self) -> f64 {
         let total = self.hits + self.misses;
         if total > 0 {
@@ -557,7 +560,7 @@ impl MatrixParallelizer {
     }
 
     /// Estimates parallel speedup.
-    pub fn estimate_speedup(&self, rows: usize, threads: usize) -> f64 {
+    pub fn estimate_speedup(&self, _rows: usize, threads: usize) -> f64 {
         // Amdahl's law with estimated 90% parallelizable
         let p = 0.9;
         1.0 / (1.0 - p + p / threads as f64)

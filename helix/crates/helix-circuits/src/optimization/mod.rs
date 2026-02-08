@@ -43,8 +43,6 @@ pub use witness_parallel::{
     MatrixParallelizer, BatchHasher, ParallelResult,
 };
 
-use halo2_proofs::plonk::{Circuit, Error};
-use halo2curves::bn256::Fr;
 use std::time::{Duration, Instant};
 use std::collections::HashMap;
 
@@ -245,9 +243,9 @@ impl OptimizationResult {
 /// Main circuit optimizer.
 pub struct CircuitOptimizer {
     config: OptimizationConfig,
-    constraint_reducer: ConstraintReducer,
+    _constraint_reducer: ConstraintReducer,
     lookup_compressor: LookupCompressor,
-    witness_parallelizer: ParallelWitnessGenerator,
+    _witness_parallelizer: ParallelWitnessGenerator,
     results: Vec<OptimizationResult>,
 }
 
@@ -255,9 +253,9 @@ impl CircuitOptimizer {
     /// Creates a new circuit optimizer.
     pub fn new(config: OptimizationConfig) -> Self {
         Self {
-            constraint_reducer: ConstraintReducer::new(config.clone()),
+            _constraint_reducer: ConstraintReducer::new(config.clone()),
             lookup_compressor: LookupCompressor::new(config.clone()),
-            witness_parallelizer: ParallelWitnessGenerator::new(ParallelConfig {
+            _witness_parallelizer: ParallelWitnessGenerator::new(ParallelConfig {
                 num_threads: config.num_threads,
                 chunk_size: 64,
                 enable_caching: config.enable_caching,

@@ -22,11 +22,10 @@
 //! This bound is tight and achieved when x is exactly between two quantization levels.
 
 use halo2_proofs::{
-    arithmetic::Field,
-    circuit::{AssignedCell, Layouter, Region, SimpleFloorPlanner, Value},
+    circuit::{Layouter, Region, SimpleFloorPlanner, Value},
     plonk::{
-        Advice, Circuit, Column, ConstraintSystem, Error, ErrorFront, Expression, Fixed,
-        Instance, Selector, TableColumn,
+        Advice, Circuit, Column, ConstraintSystem, ErrorFront, Expression,
+        Selector, TableColumn,
     },
     poly::Rotation,
 };

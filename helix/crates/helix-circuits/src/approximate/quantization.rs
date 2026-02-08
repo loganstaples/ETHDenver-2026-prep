@@ -46,14 +46,11 @@
 //! - Final bound: Sum of all quantization errors
 
 use crate::gadgets::arithmetic::{ArithmeticChip, ArithmeticConfig};
-use crate::gadgets::range::{RangeChip, RangeConfig};
-use crate::gadgets::lookup::{LookupTableChip, LookupTableConfig};
 use halo2_proofs::{
-    arithmetic::Field,
     circuit::{AssignedCell, Layouter, Region, SimpleFloorPlanner, Value},
     plonk::{
-        Advice, Circuit, Column, ConstraintSystem, Error, ErrorFront, Expression, Fixed,
-        Instance, Selector, TableColumn,
+        Advice, Circuit, Column, ConstraintSystem, ErrorFront,
+        Selector, TableColumn,
     },
     poly::Rotation,
 };
@@ -915,7 +912,7 @@ impl QuantErrorTracker {
 /// Estimates the error introduced by quantizing a neural network layer.
 pub fn estimate_layer_error(
     input_size: usize,
-    output_size: usize,
+    _output_size: usize,
     format: QuantFormat,
     scale: f64,
     weight_bound: f64,
@@ -943,6 +940,7 @@ mod tests {
     use super::*;
     use halo2_proofs::dev::MockProver;
     use halo2curves::bn256::Fr;
+    use halo2curves::ff::Field;
 
     #[test]
     fn test_quant_format_bounds() {

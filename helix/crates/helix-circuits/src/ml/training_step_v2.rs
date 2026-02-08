@@ -38,9 +38,9 @@
 
 use halo2_proofs::{
     arithmetic::Field,
-    circuit::{AssignedCell, Layouter, SimpleFloorPlanner, Value},
+    circuit::{Layouter, SimpleFloorPlanner, Value},
     plonk::{
-        Advice, Circuit, Column, ConstraintSystem, Error, ErrorFront, Expression, Fixed, Instance, Selector,
+        Advice, Circuit, Column, ConstraintSystem, ErrorFront, Instance, Selector,
         TableColumn,
     },
     poly::Rotation,
@@ -49,13 +49,12 @@ use halo2curves::bn256::{Fr, G1Affine};
 use halo2curves::ff::PrimeField;
 use halo2curves::group::Curve;
 use sha2::{Digest, Sha256};
-use std::marker::PhantomData;
 
 use crate::gadgets::poseidon::{poseidon_hash_two, poseidon_hash_many};
 
 use crate::verifier::{
-    EvmProof, EvmProofBuilder, EvmPublicInputsArray,
-    fr_to_evm_bytes, compute_hash_pair, NUM_PUBLIC_INPUTS as EVM_NUM_PUBLIC_INPUTS,
+    EvmProof, EvmPublicInputsArray,
+    compute_hash_pair, NUM_PUBLIC_INPUTS as EVM_NUM_PUBLIC_INPUTS,
     MIN_PROOF_SIZE, ProofFormatError,
 };
 
@@ -200,7 +199,7 @@ pub struct MLTrainingStepV2Config {
     /// Selector for Freivalds dot product verification.
     s_freivalds: Selector,
     /// Selector for error bound accumulation.
-    s_error_acc: Selector,
+    _s_error_acc: Selector,
 }
 
 // ---------------------------------------------------------------------------
@@ -977,7 +976,7 @@ impl Circuit<Fr> for MLTrainingStepV2Circuit {
             s_eq,
             s_relu,
             s_freivalds,
-            s_error_acc,
+            _s_error_acc: s_error_acc,
         }
     }
 

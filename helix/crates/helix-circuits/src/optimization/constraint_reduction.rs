@@ -17,7 +17,6 @@
 
 use super::OptimizationConfig;
 use halo2curves::bn256::Fr;
-use halo2curves::ff::PrimeField;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -327,13 +326,14 @@ pub struct OperationBatcher {
 }
 
 #[derive(Clone)]
-struct BatchedOperation {
+pub struct BatchedOperation {
     op_type: OperationType,
-    args: Vec<Fr>,
+    _args: Vec<Fr>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum OperationType {
+#[allow(dead_code)]
+pub enum OperationType {
     Mul,
     Add,
     Sub,
@@ -367,7 +367,7 @@ impl OperationBatcher {
         if self.pending_ops.len() >= self.max_batch_size {
             self.flush();
         }
-        self.pending_ops.push(BatchedOperation { op_type, args });
+        self.pending_ops.push(BatchedOperation { op_type, _args: args });
     }
 
     /// Flushes the current batch.

@@ -26,11 +26,10 @@
 //! - Hybrid strategies using GKR for dense operations
 
 use halo2_proofs::{
-    arithmetic::Field,
-    circuit::{AssignedCell, Layouter, Region, SimpleFloorPlanner, Value},
+    circuit::{Layouter, SimpleFloorPlanner, Value},
     plonk::{
-        Advice, Circuit, Column, ConstraintSystem, Error, ErrorFront, Expression, Fixed,
-        Instance, Selector, TableColumn,
+        Advice, Circuit, Column, ConstraintSystem, ErrorFront,
+        Instance, Selector,
     },
     poly::Rotation,
 };
@@ -38,7 +37,7 @@ use halo2curves::ff::PrimeField;
 use sha2::{Digest, Sha256};
 use std::marker::PhantomData;
 
-use super::layered::{LayeredCircuit, Layer, Gate, GateType};
+use super::layered::{LayeredCircuit, Gate, GateType};
 
 /// Configuration for circuit conversion.
 #[derive(Clone, Debug)]
@@ -66,7 +65,7 @@ impl Default for ConversionConfig {
 
 /// Halo2 to GKR converter.
 pub struct Halo2ToGkr<F: PrimeField> {
-    config: ConversionConfig,
+    _config: ConversionConfig,
     _marker: PhantomData<F>,
 }
 
@@ -74,7 +73,7 @@ impl<F: PrimeField> Halo2ToGkr<F> {
     /// Creates a new converter.
     pub fn new(config: ConversionConfig) -> Self {
         Self {
-            config,
+            _config: config,
             _marker: PhantomData,
         }
     }
@@ -121,7 +120,7 @@ impl<F: PrimeField> Halo2ToGkr<F> {
 
 /// GKR to Halo2 converter.
 pub struct GkrToHalo2<F: PrimeField> {
-    config: ConversionConfig,
+    _config: ConversionConfig,
     _marker: PhantomData<F>,
 }
 
@@ -129,7 +128,7 @@ impl<F: PrimeField> GkrToHalo2<F> {
     /// Creates a new converter.
     pub fn new(config: ConversionConfig) -> Self {
         Self {
-            config,
+            _config: config,
             _marker: PhantomData,
         }
     }
@@ -144,13 +143,31 @@ pub fn convert_halo2_to_layered<F: PrimeField>(
     converter.convert_arithmetic(num_inputs, operations)
 }
 
-/// Converts a layered circuit to Halo2 constraints.
+/// Converts a layered circuit to Halo2-compatible gate operations.
+///
+/// Extracts arithmetic gates from all layers (after the input layer) and returns
+/// them as (GateType, left_input, right_input) tuples suitable for Halo2 custom gates.
 pub fn convert_layered_to_halo2<F: PrimeField>(
-    _circuit: &LayeredCircuit<F>,
+    circuit: &LayeredCircuit<F>,
 ) -> Vec<(GateType, usize, usize)> {
-    // This would extract the operations from the layered circuit
-    // For now, return empty as this is a placeholder
-    Vec::new()
+    let mut operations = Vec::new();
+
+    // Skip the input layer (layer 0) — iterate computation layers only
+    for layer in circuit.layers.iter().skip(1) {
+        for gate in &layer.gates {
+            let op = match gate.gate_type {
+                GateType::Add => (GateType::Add, gate.left_input, gate.right_input),
+                GateType::Mul => (GateType::Mul, gate.left_input, gate.right_input),
+                GateType::Copy => (GateType::Copy, gate.left_input, 0),
+                GateType::Neg => (GateType::Neg, gate.left_input, 0),
+                GateType::Const => (GateType::Const, 0, 0),
+                GateType::Input => (GateType::Input, 0, 0),
+            };
+            operations.push(op);
+        }
+    }
+
+    operations
 }
 
 // ---------------------------------------------------------------------------
@@ -678,6 +695,28 @@ mod tests {
         assert!(!proof.layer_proofs.is_empty());
         assert!(!proof.output_claims.is_empty());
         assert_eq!(proof.inputs, inputs);
+    }
+
+    #[test]
+    fn test_layered_to_halo2_roundtrip() {
+        // Build a layered circuit: dot product of 2 pairs
+        let circuit = LayeredCircuitBuilder::<Fr>::dot_product(2);
+
+        // Convert to Halo2 operations
+        let operations = convert_layered_to_halo2(&circuit);
+        assert!(!operations.is_empty(), "should extract operations from layered circuit");
+
+        // Verify operations contain the expected gate types
+        let has_mul = operations.iter().any(|(g, _, _)| matches!(g, GateType::Mul));
+        let has_add = operations.iter().any(|(g, _, _)| matches!(g, GateType::Add));
+        assert!(has_mul, "dot product should have Mul gates");
+        assert!(has_add, "dot product should have Add gates");
+
+        // Convert back to layered and verify consistency
+        let num_inputs = circuit.num_inputs;
+        let reconverted = convert_halo2_to_layered::<Fr>(num_inputs, &operations);
+        assert_eq!(reconverted.num_inputs, num_inputs);
+        assert!(reconverted.num_outputs > 0);
     }
 
     #[test]

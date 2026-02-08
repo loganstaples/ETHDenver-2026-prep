@@ -4,8 +4,8 @@
 //! instead of O(n³), with failure probability 1/|F|.
 
 use halo2_proofs::{
-    circuit::{Layouter, Value, AssignedCell},
-    plonk::{Column, Advice, Selector, ConstraintSystem, Error, ErrorFront, Expression},
+    circuit::{Layouter, Value},
+    plonk::{Column, Advice, Selector, ConstraintSystem, ErrorFront},
     poly::Rotation,
 };
 use halo2curves::ff::PrimeField;
@@ -107,7 +107,9 @@ impl<F: PrimeField> FreivaldsChip<F> {
             let hash = hasher.finalize();
 
             // Use first 8 bytes to create a field element
-            let val = u64::from_le_bytes(hash[0..8].try_into().unwrap());
+            // Safety: hash is SHA-256 output (32 bytes), so [0..8] always fits [u8; 8]
+            let bytes: [u8; 8] = hash[0..8].try_into().expect("SHA-256 hash >= 8 bytes");
+            let val = u64::from_le_bytes(bytes);
             result.push(F::from(val));
         }
 

@@ -20,9 +20,8 @@
 //! 2. Circuits for computing the normalization
 
 use halo2_proofs::{
-    arithmetic::Field,
-    circuit::{AssignedCell, Layouter, Region, Value},
-    plonk::{Advice, Column, ConstraintSystem, Error, ErrorFront, Selector, TableColumn},
+    circuit::{Layouter, Region, Value},
+    plonk::{Advice, Column, ConstraintSystem, ErrorFront, Selector},
     poly::Rotation,
 };
 use halo2curves::ff::PrimeField;
@@ -712,6 +711,7 @@ mod tests {
         plonk::Circuit,
     };
     use halo2curves::bn256::Fr;
+    use halo2curves::ff::Field;
 
     #[test]
     fn test_sigmoid() {

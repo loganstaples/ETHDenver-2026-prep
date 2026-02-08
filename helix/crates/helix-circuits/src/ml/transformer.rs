@@ -35,7 +35,7 @@
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
     plonk::{
-        Advice, Circuit, Column, ConstraintSystem, Error, ErrorFront, Expression, Instance, Selector,
+        Advice, Circuit, Column, ConstraintSystem, ErrorFront, Instance, Selector,
         TableColumn,
     },
     poly::Rotation,
@@ -44,7 +44,7 @@ use halo2curves::bn256::Fr;
 use halo2curves::ff::{Field, PrimeField};
 use std::marker::PhantomData;
 
-use crate::ml::config::{TransformerBlockConfig, TransformerConfig, ActivationType};
+use crate::ml::config::{TransformerBlockConfig, TransformerConfig};
 use crate::ml::training_step_v2::ErrorTracker;
 
 /// Scale factor for FFN activations.
@@ -414,12 +414,12 @@ impl<F: PrimeField> TransformerBlockChip<F> {
     fn verify_layer_norm(
         &self,
         mut layouter: impl Layouter<F>,
-        input: &[Vec<F>],
+        _input: &[Vec<F>],
         output: &[Vec<F>],
-        mean: &[F],
-        inv_std: &[F],
-        gamma: &[F],
-        beta: &[F],
+        _mean: &[F],
+        _inv_std: &[F],
+        _gamma: &[F],
+        _beta: &[F],
         seq_len: usize,
         d_model: usize,
     ) -> Result<(), ErrorFront> {
@@ -449,19 +449,19 @@ impl<F: PrimeField> TransformerBlockChip<F> {
         mut layouter: impl Layouter<F>,
         input: &[Vec<F>],
         output: &[Vec<F>],
-        q: &[Vec<Vec<F>>],     // [n_heads][seq_len][d_k]
-        k: &[Vec<Vec<F>>],     // [n_heads][seq_len][d_k]
-        v: &[Vec<Vec<F>>],     // [n_heads][seq_len][d_v]
-        scores: &[Vec<Vec<F>>],  // [n_heads][seq_len][seq_len]
+        _q: &[Vec<Vec<F>>],     // [n_heads][seq_len][d_k]
+        _k: &[Vec<Vec<F>>],     // [n_heads][seq_len][d_k]
+        _v: &[Vec<Vec<F>>],     // [n_heads][seq_len][d_v]
+        _scores: &[Vec<Vec<F>>],  // [n_heads][seq_len][seq_len]
         weights: &[Vec<Vec<F>>], // [n_heads][seq_len][seq_len]
         w_q: &[Vec<F>],
-        w_k: &[Vec<F>],
-        w_v: &[Vec<F>],
-        w_o: &[F],
+        _w_k: &[Vec<F>],
+        _w_v: &[Vec<F>],
+        _w_o: &[F],
         n_heads: usize,
         seq_len: usize,
         d_k: usize,
-        d_v: usize,
+        _d_v: usize,
         d_model: usize,
     ) -> Result<(), ErrorFront> {
         // Simplified attention verification - verify key relationships
@@ -571,11 +571,11 @@ impl<F: PrimeField> TransformerBlockChip<F> {
         &self,
         mut layouter: impl Layouter<F>,
         input: &[Vec<F>],      // [seq_len, d_model]
-        hidden: &[Vec<F>],     // [seq_len, d_ff]
+        _hidden: &[Vec<F>],     // [seq_len, d_ff]
         activated: &[Vec<F>],  // [seq_len, d_ff]
-        output: &[Vec<F>],     // [seq_len, d_model]
+        _output: &[Vec<F>],     // [seq_len, d_model]
         w1: &[F],              // [d_model * d_ff]
-        b1: &[F],              // [d_ff]
+        _b1: &[F],              // [d_ff]
         w2: &[F],              // [d_ff * d_model]
         b2: &[F],              // [d_model]
         seq_len: usize,
@@ -899,7 +899,7 @@ pub fn compute_transformer_block_witness(
     let d_ff = config.d_ff;
     let pre_norm = config.pre_norm;
 
-    let mut tracker = ErrorTracker::new();
+    let tracker = ErrorTracker::new();
 
     // Layer norm 1
     let (ln1_output, ln1_mean, ln1_inv_std) = compute_layer_norm_values(input, &weights.ln1_gamma, &weights.ln1_beta);

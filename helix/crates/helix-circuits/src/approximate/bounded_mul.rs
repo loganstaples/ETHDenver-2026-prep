@@ -10,7 +10,7 @@ use crate::gadgets::arithmetic::{ArithmeticChip, ArithmeticConfig};
 use crate::gadgets::range::{RangeChip, RangeConfig};
 use halo2_proofs::{
     circuit::{Layouter, Value},
-    plonk::{Error, ErrorFront},
+    plonk::ErrorFront,
 };
 use halo2curves::ff::PrimeField;
 

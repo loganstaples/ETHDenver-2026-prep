@@ -18,7 +18,7 @@
 
 use halo2_proofs::{
     dev::MockProver,
-    plonk::{Circuit, Error, ErrorFront},
+    plonk::{Circuit, Error},
 };
 use halo2curves::bn256::Fr;
 use std::collections::HashMap;
@@ -392,7 +392,7 @@ fn compute_std_dev(durations: &[Duration], mean: Duration) -> Duration {
 /// Scoped timer that automatically records duration on drop.
 pub struct ScopedTimer<'a> {
     profiler: &'a mut TimingProfiler,
-    name: String,
+    _name: String,
     start: Instant,
 }
 
@@ -401,7 +401,7 @@ impl<'a> ScopedTimer<'a> {
     pub fn new(profiler: &'a mut TimingProfiler, name: &str) -> Self {
         Self {
             profiler,
-            name: name.to_string(),
+            _name: name.to_string(),
             start: Instant::now(),
         }
     }

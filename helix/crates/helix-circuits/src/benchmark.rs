@@ -14,7 +14,7 @@
 
 use halo2_proofs::{
     dev::MockProver,
-    plonk::{Circuit, ConstraintSystem, Error, ErrorFront},
+    plonk::{Circuit, ErrorFront},
 };
 use halo2curves::bn256::Fr;
 use std::time::{Duration, Instant};

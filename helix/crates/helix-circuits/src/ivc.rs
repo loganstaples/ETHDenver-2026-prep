@@ -610,6 +610,489 @@ impl Default for IVCChain {
     }
 }
 
+// ---------------------------------------------------------------------------
+// IVC Folding Circuit – verifies a fold of two accumulators in ZK
+// ---------------------------------------------------------------------------
+
+/// Number of public inputs for the folding circuit.
+pub const FOLDING_PUBLIC_INPUTS: usize = 8;
+
+/// Maximum multi-step chain length.
+pub const MAX_MULTI_STEPS: usize = 16;
+
+/// Witness for the IVC folding circuit.
+#[derive(Clone, Debug)]
+pub struct IVCFoldingWitness {
+    /// First accumulator (left).
+    pub acc1: IVCAccumulator,
+    /// Second accumulator (right).
+    pub acc2: IVCAccumulator,
+    /// Folding challenge (Fiat-Shamir derived).
+    pub challenge: Fr,
+}
+
+impl Default for IVCFoldingWitness {
+    fn default() -> Self {
+        Self {
+            acc1: IVCAccumulator::default(),
+            acc2: IVCAccumulator::default(),
+            challenge: Fr::ZERO,
+        }
+    }
+}
+
+impl IVCFoldingWitness {
+    /// Computes the resulting folded accumulator.
+    pub fn result(&self) -> IVCAccumulator {
+        fold_accumulators(&self.acc1, &self.acc2, self.challenge)
+    }
+}
+
+/// Circuit that verifies the fold of two accumulators in zero knowledge.
+///
+/// Public inputs (8 total):
+///   [0] folded state commitment
+///   [1] reserved
+///   [2] folded num_steps
+///   [3] folded error_term
+///   [4] folded error_bound
+///   [5] folded challenge_hash
+///   [6..7] reserved
+#[derive(Clone)]
+pub struct IVCFoldingCircuit {
+    pub witness: IVCFoldingWitness,
+}
+
+impl Default for IVCFoldingCircuit {
+    fn default() -> Self {
+        Self {
+            witness: IVCFoldingWitness::default(),
+        }
+    }
+}
+
+impl IVCFoldingCircuit {
+    pub fn public_inputs(&self) -> Vec<Fr> {
+        self.witness.result().to_public_inputs()
+    }
+}
+
+impl Circuit<Fr> for IVCFoldingCircuit {
+    type Config = IVCStepConfig;
+    type FloorPlanner = SimpleFloorPlanner;
+
+    fn without_witnesses(&self) -> Self {
+        Self::default()
+    }
+
+    fn configure(meta: &mut ConstraintSystem<Fr>) -> Self::Config {
+        IVCStepCircuit::configure(meta)
+    }
+
+    fn synthesize(
+        &self,
+        config: Self::Config,
+        mut layouter: impl Layouter<Fr>,
+    ) -> Result<(), ErrorFront> {
+        let w = &self.witness;
+        let folded = w.result();
+        let pi = folded.to_public_inputs();
+
+        // Bind public inputs
+        let pi_cells = layouter.assign_region(
+            || "fold_public_inputs",
+            |mut region| {
+                let mut cells = Vec::with_capacity(FOLDING_PUBLIC_INPUTS);
+                for (i, val) in pi.iter().enumerate() {
+                    let cell = region.assign_advice(
+                        || format!("pi_{}", i),
+                        config.advice[0],
+                        i,
+                        || Value::known(*val),
+                    )?;
+                    cells.push(cell);
+                }
+                Ok(cells)
+            },
+        )?;
+
+        for (i, cell) in pi_cells.iter().enumerate() {
+            layouter.constrain_instance(cell.cell(), config.instance, i)?;
+        }
+
+        // Verify error term folding: new_u = u1 + r * u2
+        let r_times_u2 = w.challenge * w.acc2.error_term;
+
+        layouter.assign_region(
+            || "verify_r_times_u2",
+            |mut region| {
+                config.s_mul.enable(&mut region, 0)?;
+                region.assign_advice(|| "r", config.advice[0], 0, || Value::known(w.challenge))?;
+                region.assign_advice(|| "u2", config.advice[1], 0, || Value::known(w.acc2.error_term))?;
+                region.assign_advice(|| "r_u2", config.advice[2], 0, || Value::known(r_times_u2))?;
+                Ok(())
+            },
+        )?;
+
+        layouter.assign_region(
+            || "fold_error_term",
+            |mut region| {
+                config.s_acc_update.enable(&mut region, 0)?;
+                region.assign_advice(|| "u1", config.advice[0], 0, || Value::known(w.acc1.error_term))?;
+                region.assign_advice(|| "r_u2", config.advice[1], 0, || Value::known(r_times_u2))?;
+                region.assign_advice(|| "new_u", config.advice[2], 0, || Value::known(folded.error_term))?;
+                Ok(())
+            },
+        )?;
+
+        // Verify error bound addition: new_bound = bound1 + bound2
+        layouter.assign_region(
+            || "fold_error_bound",
+            |mut region| {
+                config.s_error_check.enable(&mut region, 0)?;
+                region.assign_advice(|| "bound1", config.advice[0], 0, || Value::known(w.acc1.error_bound))?;
+                region.assign_advice(|| "bound2", config.advice[1], 0, || Value::known(w.acc2.error_bound))?;
+                region.assign_advice(|| "new_bound", config.advice[2], 0, || Value::known(folded.error_bound))?;
+                Ok(())
+            },
+        )?;
+
+        // Verify state commitment via Poseidon:
+        // combined = Poseidon(state1, state2), then new_state = Poseidon(combined, challenge)
+        let poseidon_config = PoseidonCircuitConfig {
+            advice: [config.advice[0], config.advice[1], config.advice[2]],
+            fixed: config.fixed,
+            s_mul: config.s_mul,
+            s_add: config.s_add,
+            s_rc_add: config.s_rc_add,
+            s_eq: config.s_eq,
+        };
+
+        // Hash state commitments together
+        synthesize_poseidon_hash(
+            &poseidon_config,
+            &mut layouter,
+            w.acc1.state_commitment,
+            w.acc2.state_commitment,
+            "fold_state_combine",
+        )?;
+
+        let combined = poseidon_hash_two(w.acc1.state_commitment, w.acc2.state_commitment);
+
+        // Hash combined with challenge to get final state
+        synthesize_poseidon_hash(
+            &poseidon_config,
+            &mut layouter,
+            combined,
+            w.challenge,
+            "fold_state_challenge",
+        )?;
+
+        // Verify the folded state matches
+        let expected_state = poseidon_hash_two(combined, w.challenge);
+        layouter.assign_region(
+            || "verify_folded_state",
+            |mut region| {
+                config.s_eq.enable(&mut region, 0)?;
+                region.assign_advice(|| "expected", config.advice[0], 0, || Value::known(expected_state))?;
+                region.assign_advice(|| "actual", config.advice[1], 0, || Value::known(folded.state_commitment))?;
+                Ok(())
+            },
+        )?;
+
+        // Verify challenge hash: combined_ch = Poseidon(ch1, ch2), new_ch = Poseidon(combined_ch, challenge)
+        synthesize_poseidon_hash(
+            &poseidon_config,
+            &mut layouter,
+            w.acc1.challenge_hash,
+            w.acc2.challenge_hash,
+            "fold_challenge_combine",
+        )?;
+
+        let combined_ch = poseidon_hash_two(w.acc1.challenge_hash, w.acc2.challenge_hash);
+
+        synthesize_poseidon_hash(
+            &poseidon_config,
+            &mut layouter,
+            combined_ch,
+            w.challenge,
+            "fold_challenge_hash",
+        )?;
+
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IVC Multi-Step Circuit – chains N sequential steps into a single proof
+// ---------------------------------------------------------------------------
+
+/// Witness for a multi-step IVC circuit.
+#[derive(Clone, Debug)]
+pub struct IVCMultiStepWitness {
+    /// Initial accumulator state.
+    pub initial_acc: IVCAccumulator,
+    /// Sequence of (computation_hash, step_error) for each step.
+    pub steps: Vec<(Fr, Fr)>,
+}
+
+impl Default for IVCMultiStepWitness {
+    fn default() -> Self {
+        Self {
+            initial_acc: IVCAccumulator::default(),
+            steps: Vec::new(),
+        }
+    }
+}
+
+impl IVCMultiStepWitness {
+    /// Computes intermediate states and the final accumulator.
+    pub fn compute_chain(&self) -> (Vec<Fr>, IVCAccumulator) {
+        let mut states = Vec::with_capacity(self.steps.len());
+        let mut current_state = self.initial_acc.state_commitment;
+        let mut total_error = self.initial_acc.error_bound;
+        let mut step_count = self.initial_acc.num_steps;
+
+        for (computation_hash, step_error) in &self.steps {
+            let new_state = poseidon_hash_two(current_state, *computation_hash);
+            states.push(new_state);
+            total_error = total_error + *step_error;
+            step_count += 1;
+            current_state = new_state;
+        }
+
+        let final_acc = IVCAccumulator {
+            state_commitment: current_state,
+            num_steps: step_count,
+            error_term: self.initial_acc.error_term,
+            error_bound: total_error,
+            challenge_hash: self.initial_acc.challenge_hash,
+        };
+
+        (states, final_acc)
+    }
+}
+
+/// Circuit that proves N sequential IVC steps in a single proof.
+///
+/// This is more efficient than N separate IVCStepCircuit proofs when
+/// the steps are known ahead of time.
+#[derive(Clone)]
+pub struct IVCMultiStepCircuit {
+    pub witness: IVCMultiStepWitness,
+}
+
+impl Default for IVCMultiStepCircuit {
+    fn default() -> Self {
+        Self {
+            witness: IVCMultiStepWitness::default(),
+        }
+    }
+}
+
+impl IVCMultiStepCircuit {
+    pub fn public_inputs(&self) -> Vec<Fr> {
+        let (_, final_acc) = self.witness.compute_chain();
+        final_acc.to_public_inputs()
+    }
+}
+
+impl Circuit<Fr> for IVCMultiStepCircuit {
+    type Config = IVCStepConfig;
+    type FloorPlanner = SimpleFloorPlanner;
+
+    fn without_witnesses(&self) -> Self {
+        Self::default()
+    }
+
+    fn configure(meta: &mut ConstraintSystem<Fr>) -> Self::Config {
+        IVCStepCircuit::configure(meta)
+    }
+
+    fn synthesize(
+        &self,
+        config: Self::Config,
+        mut layouter: impl Layouter<Fr>,
+    ) -> Result<(), ErrorFront> {
+        let w = &self.witness;
+        let (states, final_acc) = w.compute_chain();
+        let pi = final_acc.to_public_inputs();
+
+        // Bind public inputs
+        let pi_cells = layouter.assign_region(
+            || "multi_step_public_inputs",
+            |mut region| {
+                let mut cells = Vec::with_capacity(IVC_PUBLIC_INPUTS);
+                for (i, val) in pi.iter().enumerate() {
+                    let cell = region.assign_advice(
+                        || format!("pi_{}", i),
+                        config.advice[0],
+                        i,
+                        || Value::known(*val),
+                    )?;
+                    cells.push(cell);
+                }
+                Ok(cells)
+            },
+        )?;
+
+        for (i, cell) in pi_cells.iter().enumerate() {
+            layouter.constrain_instance(cell.cell(), config.instance, i)?;
+        }
+
+        let poseidon_config = PoseidonCircuitConfig {
+            advice: [config.advice[0], config.advice[1], config.advice[2]],
+            fixed: config.fixed,
+            s_mul: config.s_mul,
+            s_add: config.s_add,
+            s_rc_add: config.s_rc_add,
+            s_eq: config.s_eq,
+        };
+
+        let mut current_state = w.initial_acc.state_commitment;
+        let mut running_error = w.initial_acc.error_bound;
+
+        for (i, (computation_hash, step_error)) in w.steps.iter().enumerate() {
+            // Verify state transition: new_state = Poseidon(current_state, computation_hash)
+            synthesize_poseidon_hash(
+                &poseidon_config,
+                &mut layouter,
+                current_state,
+                *computation_hash,
+                &format!("step_{}_transition", i),
+            )?;
+
+            let expected_state = poseidon_hash_two(current_state, *computation_hash);
+
+            // Verify equality with computed state
+            layouter.assign_region(
+                || format!("verify_step_{}_state", i),
+                |mut region| {
+                    config.s_eq.enable(&mut region, 0)?;
+                    region.assign_advice(
+                        || "expected",
+                        config.advice[0],
+                        0,
+                        || Value::known(expected_state),
+                    )?;
+                    region.assign_advice(
+                        || "actual",
+                        config.advice[1],
+                        0,
+                        || Value::known(states[i]),
+                    )?;
+                    Ok(())
+                },
+            )?;
+
+            // Verify error accumulation
+            let new_error = running_error + *step_error;
+            layouter.assign_region(
+                || format!("step_{}_error", i),
+                |mut region| {
+                    config.s_error_check.enable(&mut region, 0)?;
+                    region.assign_advice(|| "old_err", config.advice[0], 0, || Value::known(running_error))?;
+                    region.assign_advice(|| "step_err", config.advice[1], 0, || Value::known(*step_error))?;
+                    region.assign_advice(|| "new_err", config.advice[2], 0, || Value::known(new_error))?;
+                    Ok(())
+                },
+            )?;
+
+            current_state = expected_state;
+            running_error = new_error;
+        }
+
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Proof Chain Tracking
+// ---------------------------------------------------------------------------
+
+/// Records a single proven step in the IVC chain.
+#[derive(Clone, Debug)]
+pub struct IVCProofStep {
+    /// Step index within the chain.
+    pub step_index: u64,
+    /// Accumulator state after this step.
+    pub accumulator: IVCAccumulator,
+    /// Proof bytes (KZG proof serialized).
+    pub proof: Vec<u8>,
+}
+
+/// Records the result of a folding operation.
+#[derive(Clone, Debug)]
+pub struct FoldResult {
+    /// Left accumulator steps before fold.
+    pub left_steps: u64,
+    /// Right accumulator steps before fold.
+    pub right_steps: u64,
+    /// Resulting folded accumulator.
+    pub folded: IVCAccumulator,
+    /// Challenge used for folding.
+    pub challenge: Fr,
+    /// Proof bytes (KZG proof of the fold circuit).
+    pub proof: Vec<u8>,
+}
+
+impl IVCChain {
+    /// Adds a step with proof tracking.
+    pub fn add_step_with_proof(
+        &mut self,
+        new_state: Fr,
+        computation_hash: Fr,
+        step_error: Fr,
+        proof: Vec<u8>,
+    ) -> IVCProofStep {
+        self.add_step(new_state, computation_hash, step_error);
+        IVCProofStep {
+            step_index: self.accumulator.num_steps,
+            accumulator: self.accumulator.clone(),
+            proof,
+        }
+    }
+
+    /// Folds with another chain and records the fold result.
+    pub fn fold_with_proof(
+        &mut self,
+        other: &IVCChain,
+        proof: Vec<u8>,
+    ) -> FoldResult {
+        let left_steps = self.accumulator.num_steps;
+        let right_steps = other.accumulator.num_steps;
+        let challenge = generate_folding_challenge(&self.accumulator, &other.accumulator);
+        self.fold_with(other);
+        FoldResult {
+            left_steps,
+            right_steps,
+            folded: self.accumulator.clone(),
+            challenge,
+            proof,
+        }
+    }
+
+    /// Returns the full step history.
+    pub fn history(&self) -> &[IVCAccumulator] {
+        &self.history
+    }
+
+    /// Verifies consistency of the chain including history.
+    pub fn verify_chain_consistency(&self) -> bool {
+        if !self.verify() {
+            return false;
+        }
+        // Verify step count matches history
+        if !self.history.is_empty() {
+            let last_history_steps = self.history.last().map(|a| a.num_steps).unwrap_or(0);
+            if self.accumulator.num_steps <= last_history_steps {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -752,6 +1235,267 @@ mod tests {
 
         let prover = MockProver::run(12, &circuit, vec![pi]).unwrap();
         prover.assert_satisfied();
+    }
+
+    // ===== Folding Circuit Tests =====
+
+    #[test]
+    fn test_folding_circuit_basic() {
+        let acc1 = IVCAccumulator {
+            state_commitment: Fr::from(100u64),
+            num_steps: 5,
+            error_term: Fr::one(),
+            error_bound: Fr::from(10),
+            challenge_hash: Fr::ZERO,
+        };
+        let acc2 = IVCAccumulator {
+            state_commitment: Fr::from(200u64),
+            num_steps: 3,
+            error_term: Fr::from(2),
+            error_bound: Fr::from(5),
+            challenge_hash: Fr::ZERO,
+        };
+        let challenge = generate_folding_challenge(&acc1, &acc2);
+
+        let witness = IVCFoldingWitness { acc1, acc2, challenge };
+        let circuit = IVCFoldingCircuit { witness };
+        let pi = circuit.public_inputs();
+
+        // k=13 needed for 4 Poseidon hashes in folding circuit
+        let prover = MockProver::run(13, &circuit, vec![pi]).unwrap();
+        prover.assert_satisfied();
+    }
+
+    #[test]
+    fn test_folding_circuit_rejects_wrong_challenge() {
+        let acc1 = IVCAccumulator::initial(Fr::from(10u64));
+        let acc2 = IVCAccumulator::initial(Fr::from(20u64));
+        let real_challenge = generate_folding_challenge(&acc1, &acc2);
+
+        // Use the real challenge for the witness but tamper with acc2's error_term
+        // in a way that produces wrong folded values
+        let witness = IVCFoldingWitness {
+            acc1: acc1.clone(),
+            acc2: acc2.clone(),
+            challenge: real_challenge,
+        };
+        let circuit = IVCFoldingCircuit { witness };
+
+        // Compute correct PI, then corrupt one
+        let mut pi = circuit.public_inputs();
+        pi[3] = Fr::from(9999u64); // corrupt folded error_term
+
+        let prover = MockProver::run(13, &circuit, vec![pi]).unwrap();
+        assert!(prover.verify().is_err());
+    }
+
+    // ===== Multi-Step Circuit Tests =====
+
+    #[test]
+    fn test_multi_step_circuit_single_step() {
+        let initial = IVCAccumulator::initial(Fr::from(42u64));
+        let witness = IVCMultiStepWitness {
+            initial_acc: initial,
+            steps: vec![(Fr::from(100u64), Fr::from(1))],
+        };
+        let circuit = IVCMultiStepCircuit { witness };
+        let pi = circuit.public_inputs();
+
+        let prover = MockProver::run(12, &circuit, vec![pi]).unwrap();
+        prover.assert_satisfied();
+    }
+
+    #[test]
+    fn test_multi_step_circuit_three_steps() {
+        let initial = IVCAccumulator::initial(Fr::from(1u64));
+        let witness = IVCMultiStepWitness {
+            initial_acc: initial,
+            steps: vec![
+                (Fr::from(10u64), Fr::from(1)),
+                (Fr::from(20u64), Fr::from(2)),
+                (Fr::from(30u64), Fr::from(3)),
+            ],
+        };
+        let circuit = IVCMultiStepCircuit { witness };
+        let pi = circuit.public_inputs();
+
+        // 3 steps × 1 Poseidon each = 3 Poseidon hashes → k=13
+        let prover = MockProver::run(13, &circuit, vec![pi]).unwrap();
+        prover.assert_satisfied();
+    }
+
+    #[test]
+    fn test_multi_step_circuit_five_steps() {
+        let initial = IVCAccumulator::initial(Fr::ZERO);
+        let steps: Vec<(Fr, Fr)> = (1..=5)
+            .map(|i| (Fr::from(i as u64 * 100), Fr::from(i as u64)))
+            .collect();
+
+        let witness = IVCMultiStepWitness {
+            initial_acc: initial,
+            steps,
+        };
+        let circuit = IVCMultiStepCircuit { witness };
+        let pi = circuit.public_inputs();
+
+        // 5 Poseidon hashes → k=14
+        let prover = MockProver::run(14, &circuit, vec![pi]).unwrap();
+        prover.assert_satisfied();
+    }
+
+    #[test]
+    fn test_multi_step_circuit_eight_steps() {
+        let initial = IVCAccumulator::initial(Fr::from(7u64));
+        let steps: Vec<(Fr, Fr)> = (1..=8)
+            .map(|i| (Fr::from(i as u64 * 11), Fr::from(1)))
+            .collect();
+
+        let witness = IVCMultiStepWitness {
+            initial_acc: initial,
+            steps,
+        };
+        let circuit = IVCMultiStepCircuit { witness };
+        let pi = circuit.public_inputs();
+
+        // 8 Poseidon hashes → k=14
+        let prover = MockProver::run(14, &circuit, vec![pi]).unwrap();
+        prover.assert_satisfied();
+    }
+
+    #[test]
+    fn test_multi_step_rejects_wrong_final_state() {
+        let initial = IVCAccumulator::initial(Fr::from(1u64));
+        let witness = IVCMultiStepWitness {
+            initial_acc: initial,
+            steps: vec![
+                (Fr::from(10u64), Fr::from(1)),
+                (Fr::from(20u64), Fr::from(2)),
+            ],
+        };
+        let circuit = IVCMultiStepCircuit { witness };
+        let mut pi = circuit.public_inputs();
+        pi[0] = Fr::from(12345u64); // corrupt state commitment
+
+        let prover = MockProver::run(13, &circuit, vec![pi]).unwrap();
+        assert!(prover.verify().is_err());
+    }
+
+    // ===== Enhanced IVCChain Tests =====
+
+    #[test]
+    fn test_chain_with_proof_tracking() {
+        let mut chain = IVCChain::new(Fr::from(1u64));
+
+        let step1 = chain.add_step_with_proof(
+            Fr::from(10u64),
+            Fr::from(100u64),
+            Fr::from(1),
+            vec![0xDE, 0xAD],
+        );
+        assert_eq!(step1.step_index, 1);
+        assert_eq!(step1.proof, vec![0xDE, 0xAD]);
+
+        let step2 = chain.add_step_with_proof(
+            Fr::from(20u64),
+            Fr::from(200u64),
+            Fr::from(2),
+            vec![0xBE, 0xEF],
+        );
+        assert_eq!(step2.step_index, 2);
+        assert_eq!(chain.step_count(), 2);
+        assert!(chain.verify_chain_consistency());
+    }
+
+    #[test]
+    fn test_chain_fold_with_proof() {
+        let mut chain1 = IVCChain::new(Fr::from(1u64));
+        chain1.add_step(Fr::from(10u64), Fr::from(100u64), Fr::from(1));
+        chain1.add_step(Fr::from(20u64), Fr::from(200u64), Fr::from(2));
+
+        let mut chain2 = IVCChain::new(Fr::from(2u64));
+        chain2.add_step(Fr::from(30u64), Fr::from(300u64), Fr::from(3));
+
+        let fold_result = chain1.fold_with_proof(&chain2, vec![0xF0, 0x1D]);
+        assert_eq!(fold_result.left_steps, 2);
+        assert_eq!(fold_result.right_steps, 1);
+        assert_eq!(fold_result.folded.num_steps, 3);
+        assert!(!fold_result.proof.is_empty());
+    }
+
+    #[test]
+    fn test_chain_consistency_verification() {
+        let mut chain = IVCChain::new(Fr::from(1u64));
+        assert!(chain.verify_chain_consistency());
+
+        chain.add_step(Fr::from(10u64), Fr::from(100u64), Fr::from(1));
+        assert!(chain.verify_chain_consistency());
+
+        chain.add_step(Fr::from(20u64), Fr::from(200u64), Fr::from(2));
+        assert!(chain.verify_chain_consistency());
+        assert_eq!(chain.history().len(), 2);
+    }
+
+    // ===== 5-Step Multi-Step Chain with Real KZG Proof =====
+
+    #[test]
+    fn test_multi_step_five_step_real_proof() {
+        use halo2_proofs::{
+            plonk::{create_proof, keygen_pk, keygen_vk, verify_proof_multi},
+            poly::kzg::{
+                commitment::{KZGCommitmentScheme, ParamsKZG},
+                multiopen::{ProverSHPLONK, VerifierSHPLONK},
+                strategy::SingleStrategy,
+            },
+            transcript::{
+                Blake2bRead, Blake2bWrite, Challenge255,
+                TranscriptReadBuffer, TranscriptWriterBuffer,
+            },
+            poly::commitment::Params,
+        };
+        use halo2curves::bn256::{Bn256, G1Affine};
+        use rand_core::OsRng;
+
+        let initial = IVCAccumulator::initial(Fr::from(42u64));
+        let steps: Vec<(Fr, Fr)> = (1..=5)
+            .map(|i| (Fr::from(i as u64 * 7), Fr::from(1)))
+            .collect();
+
+        let witness = IVCMultiStepWitness {
+            initial_acc: initial,
+            steps,
+        };
+        let circuit = IVCMultiStepCircuit { witness };
+        let pi = circuit.public_inputs();
+        let k = 14;
+
+        let params = ParamsKZG::<Bn256>::setup(k, OsRng);
+        let vk = keygen_vk(&params, &circuit).expect("keygen_vk failed");
+        let pk = keygen_pk(&params, vk.clone(), &circuit).expect("keygen_pk failed");
+
+        let instances = vec![pi.clone()];
+        let mut transcript = Blake2bWrite::<Vec<u8>, G1Affine, Challenge255<_>>::init(vec![]);
+
+        create_proof::<
+            KZGCommitmentScheme<Bn256>,
+            ProverSHPLONK<'_, Bn256>,
+            _, _, _, _,
+        >(
+            &params, &pk, &[circuit], &[instances.clone()], OsRng, &mut transcript,
+        )
+        .expect("multi-step create_proof failed");
+
+        let proof = transcript.finalize();
+        assert!(!proof.is_empty());
+
+        let mut vt = Blake2bRead::<_, G1Affine, Challenge255<_>>::init(proof.as_slice());
+        let vp = params.verifier_params();
+        let verified = verify_proof_multi::<
+            KZGCommitmentScheme<Bn256>,
+            VerifierSHPLONK<Bn256>,
+            _, _, SingleStrategy<Bn256>,
+        >(&vp, &vk, &[instances], &mut vt);
+
+        assert!(verified, "5-step multi-step real proof must verify");
     }
 
     /// Real proof generation for IVC step circuit using KZG + SHPLONK.

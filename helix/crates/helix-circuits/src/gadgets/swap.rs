@@ -1,7 +1,5 @@
 use halo2_proofs::{
-    circuit::{Layouter, Value, AssignedCell},
-    plonk::{Advice, Column, ConstraintSystem, Error, Selector},
-    poly::Rotation,
+    plonk::{Advice, Column, ConstraintSystem, Selector},
 };
 use halo2curves::ff::PrimeField;
 use std::marker::PhantomData;
@@ -15,7 +13,7 @@ pub struct SwapConfig {
 }
 
 pub struct SwapChip<F: PrimeField> {
-    config: SwapConfig,
+    _config: SwapConfig,
     _marker: PhantomData<F>,
 }
 

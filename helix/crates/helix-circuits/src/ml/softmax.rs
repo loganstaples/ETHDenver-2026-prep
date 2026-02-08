@@ -13,7 +13,7 @@
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
     plonk::{
-        Advice, Circuit, Column, ConstraintSystem, Error, ErrorFront, Expression, Instance, Selector,
+        Advice, Circuit, Column, ConstraintSystem, ErrorFront, Instance, Selector,
         TableColumn,
     },
     poly::Rotation,
@@ -31,12 +31,12 @@ pub struct SoftmaxConfig<F: PrimeField> {
     /// Advice columns for computation.
     advice: [Column<Advice>; 4],
     /// Instance column for public inputs.
-    instance: Column<Instance>,
+    _instance: Column<Instance>,
     /// Lookup table for exp approximation.
     exp_table_in: TableColumn,
     exp_table_out: TableColumn,
     /// Selector for multiplication.
-    s_mul: Selector,
+    _s_mul: Selector,
     /// Selector for addition.
     s_add: Selector,
     /// Selector for subtraction.
@@ -130,7 +130,7 @@ impl<F: PrimeField, const RANGE: usize, const SCALE: u64> SoftmaxChip<F, RANGE, 
             let sum = meta.query_advice(advice[0], Rotation::cur());
             let expected = meta.query_advice(advice[1], Rotation::cur());
             // Allow small tolerance for rounding errors
-            let tolerance = meta.query_advice(advice[2], Rotation::cur());
+            let _tolerance = meta.query_advice(advice[2], Rotation::cur());
             // |sum - expected| <= tolerance
             // Implemented as: (sum - expected + tolerance) * (expected - sum + tolerance) >= 0
             // But for simplicity, we just check equality in quantized form
@@ -150,10 +150,10 @@ impl<F: PrimeField, const RANGE: usize, const SCALE: u64> SoftmaxChip<F, RANGE, 
 
         SoftmaxConfig {
             advice,
-            instance,
+            _instance: instance,
             exp_table_in,
             exp_table_out,
-            s_mul,
+            _s_mul: s_mul,
             s_add,
             s_sub,
             s_exp,
@@ -334,7 +334,6 @@ impl<F: PrimeField, const RANGE: usize, const SCALE: u64> SoftmaxChip<F, RANGE, 
 
 /// Computes softmax in the clear for witness generation.
 pub fn compute_softmax<F: PrimeField>(scores: &[F], scale: u64) -> SoftmaxWitness<F> {
-    use halo2_proofs::arithmetic::Field;
 
     let n = scores.len();
     if n == 0 {

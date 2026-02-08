@@ -23,16 +23,15 @@
 
 use halo2_proofs::{
     arithmetic::Field,
-    circuit::{AssignedCell, Layouter, SimpleFloorPlanner, Value},
+    circuit::{Layouter, SimpleFloorPlanner, Value},
     plonk::{
-        Advice, Circuit, Column, ConstraintSystem, Error, ErrorFront, Expression, Fixed, Instance, Selector,
+        Advice, Circuit, Column, ConstraintSystem, ErrorFront, Instance, Selector,
         TableColumn,
     },
     poly::Rotation,
 };
 use halo2curves::bn256::Fr;
 use halo2curves::ff::PrimeField;
-use std::marker::PhantomData;
 
 /// Number of public inputs exposed by this circuit.
 pub const NUM_PUBLIC_INPUTS: usize = 7;
@@ -946,7 +945,7 @@ pub fn compute_witness(
     // h = ReLU(h_pre)
     // For field elements, we need to know if the value is "positive".
     // Convention: values in [0, p/2) are positive, [p/2, p) are negative.
-    let half_p = Fr::ZERO - Fr::ONE; // p - 1
+    let _half_p = Fr::ZERO - Fr::ONE; // p - 1
     // Actually we cannot compare Fr directly. For the demo, we'll use a simpler
     // approach: compute the relu mask from the original integer values.
     // Since we're using small integers, we track sign separately.

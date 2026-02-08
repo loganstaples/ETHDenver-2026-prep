@@ -2,8 +2,7 @@
 
 use halo2_proofs::{
     arithmetic::Field,
-    circuit::{Layouter, Value},
-    plonk::{Advice, Column, ConstraintSystem, Error, Fixed, Selector},
+    plonk::{Advice, Column, ConstraintSystem, Selector},
     poly::Rotation,
 };
 use std::marker::PhantomData;

@@ -18,10 +18,9 @@
 //! - Cost: O(n log n) for n lookups vs O(n²) for naive approaches
 
 use halo2_proofs::{
-    arithmetic::Field,
-    circuit::{AssignedCell, Layouter, Region, Value},
+    circuit::{Layouter, Region, Value},
     plonk::{
-        Advice, Column, ConstraintSystem, Error, ErrorFront, Expression, Fixed, Selector, TableColumn,
+        Advice, Column, ConstraintSystem, ErrorFront, Fixed, Selector, TableColumn,
     },
     poly::Rotation,
 };
@@ -667,7 +666,7 @@ pub struct LookupTableBuilder<F: PrimeField> {
     entries: Vec<(Vec<F>, Vec<F>)>,
     scale: u64,
     error_bound: Option<F>,
-    name: String,
+    _name: String,
     _marker: PhantomData<F>,
 }
 
@@ -678,7 +677,7 @@ impl<F: PrimeField> LookupTableBuilder<F> {
             entries: Vec::new(),
             scale,
             error_bound: None,
-            name: name.to_string(),
+            _name: name.to_string(),
             _marker: PhantomData,
         }
     }
@@ -750,7 +749,7 @@ pub struct PrecomputedTable<F: PrimeField> {
     /// Raw entries as field elements.
     entries: Vec<(F, F)>,
     /// Function name for debugging.
-    name: String,
+    _name: String,
     /// Error bound.
     error_bound: F,
     /// Scale factor.
@@ -779,7 +778,7 @@ impl<F: PrimeField> PrecomputedTable<F> {
 
         Self {
             entries,
-            name: format!("relu_{}", range),
+            _name: format!("relu_{}", range),
             error_bound: F::ZERO, // ReLU is exact
             scale: 1,
         }
@@ -825,7 +824,7 @@ impl<F: PrimeField> PrecomputedTable<F> {
 
         Self {
             entries,
-            name: format!("gelu_{}_{}", range, scale),
+            _name: format!("gelu_{}_{}", range, scale),
             error_bound: F::from((max_error * scale_f).ceil() as u64 + 1),
             scale,
         }
@@ -861,7 +860,7 @@ impl<F: PrimeField> PrecomputedTable<F> {
 
         Self {
             entries,
-            name: format!("sigmoid_{}_{}", range, scale),
+            _name: format!("sigmoid_{}_{}", range, scale),
             error_bound: F::from((max_error * scale_f).ceil() as u64 + 1),
             scale,
         }
@@ -892,6 +891,7 @@ impl<F: PrimeField> PrecomputedTable<F> {
 mod tests {
     use super::*;
     use halo2curves::bn256::Fr;
+    use halo2curves::ff::Field;
 
     #[test]
     fn test_plookup_table_creation() {

@@ -18,9 +18,8 @@
 
 use super::OptimizationConfig;
 use halo2curves::bn256::Fr;
-use halo2curves::ff::{Field, PrimeField};
+use halo2curves::ff::PrimeField;
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
 
 /// Result of lookup compression.
 #[derive(Debug, Clone)]
@@ -64,7 +63,7 @@ pub struct CompressedTable<F: PrimeField> {
     /// Original size.
     original_size: usize,
     /// Compression strategy used.
-    strategy: CompressionStrategy,
+    _strategy: CompressionStrategy,
     /// Range mapping for decompression.
     range_map: Option<RangeMap>,
     /// Error bound.
@@ -77,7 +76,7 @@ impl<F: PrimeField> CompressedTable<F> {
         Self {
             entries,
             original_size,
-            strategy,
+            _strategy: strategy,
             range_map: None,
             error_bound: F::ZERO,
         }
@@ -91,7 +90,7 @@ impl<F: PrimeField> CompressedTable<F> {
         let mut entries = Vec::new();
         let mut range_map = RangeMap::new();
 
-        for (i, (input, output)) in table.iter().enumerate() {
+        for (_i, (input, output)) in table.iter().enumerate() {
             // Convert field element to u64 for comparison
             let input_u64 = field_to_u64(input);
 
@@ -329,7 +328,7 @@ impl Default for RangeAnalyzer {
 
 /// Optimizer for lookup tables.
 pub struct TableOptimizer {
-    config: CompressedLookupConfig,
+    _config: CompressedLookupConfig,
     analyzers: HashMap<String, RangeAnalyzer>,
 }
 
@@ -337,7 +336,7 @@ impl TableOptimizer {
     /// Creates a new table optimizer.
     pub fn new(config: CompressedLookupConfig) -> Self {
         Self {
-            config,
+            _config: config,
             analyzers: HashMap::new(),
         }
     }
@@ -454,7 +453,7 @@ impl LookupCompressor {
 /// Computes optimal table size for given usage pattern.
 pub fn compute_optimal_table_size(
     unique_values: usize,
-    max_value: u64,
+    _max_value: u64,
     target_fill_rate: f64,
 ) -> usize {
     // Table size should be power of 2 for efficient plookup

@@ -13,7 +13,7 @@ use crate::gadgets::arithmetic::{ArithmeticChip, ArithmeticConfig};
 use crate::gadgets::range::{RangeChip, RangeConfig};
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
-    plonk::{Circuit, Column, Advice, ConstraintSystem, Error, ErrorFront, Selector, Instance},
+    plonk::{Circuit, Column, Advice, ConstraintSystem, ErrorFront, Selector, Instance},
     poly::Rotation,
 };
 use halo2curves::ff::PrimeField;
@@ -47,8 +47,8 @@ pub struct GradientVerificationConfig<F: PrimeField, const RANGE: usize> {
 pub struct GradientVerificationChip<F: PrimeField, const RANGE: usize> {
     config: GradientVerificationConfig<F, RANGE>,
     matmul_chip: BoundedMatMulChip<F, RANGE>,
-    arithmetic_chip: ArithmeticChip<F>,
-    range_chip: RangeChip<F, RANGE>,
+    _arithmetic_chip: ArithmeticChip<F>,
+    _range_chip: RangeChip<F, RANGE>,
     _marker: PhantomData<F>,
 }
 
@@ -61,8 +61,8 @@ impl<F: PrimeField, const RANGE: usize> GradientVerificationChip<F, RANGE> {
         Self {
             config,
             matmul_chip,
-            arithmetic_chip,
-            range_chip,
+            _arithmetic_chip: arithmetic_chip,
+            _range_chip: range_chip,
             _marker: PhantomData,
         }
     }
@@ -147,7 +147,7 @@ impl<F: PrimeField, const RANGE: usize> GradientVerificationChip<F, RANGE> {
         &self,
         mut layouter: impl Layouter<F>,
         forward_vals: &[Value<F>],
-        forward_errs: &[Value<F>],
+        _forward_errs: &[Value<F>],
         upstream_grad_vals: &[Value<F>],
         upstream_grad_errs: &[Value<F>],
         local_grad_vals: &[Value<F>],
@@ -292,7 +292,7 @@ impl<F: PrimeField, const RANGE: usize> GradientVerificationChip<F, RANGE> {
         input_grad_errs: &[Vec<Value<F>>],
     ) -> Result<(), ErrorFront> {
         let batch_size = upstream_grad_vals.len();
-        let out_features = upstream_grad_vals.first().map(|v| v.len()).unwrap_or(0);
+        let _out_features = upstream_grad_vals.first().map(|v| v.len()).unwrap_or(0);
         let in_features = weight_vals.len();
         
         // dX[b][i] = sum_j(dY[b][j] * W[i][j]) = dY[b] @ W[i]^T

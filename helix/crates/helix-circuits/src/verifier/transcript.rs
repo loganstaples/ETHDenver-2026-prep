@@ -22,7 +22,6 @@
 
 use halo2curves::bn256::{Fr, G1Affine, Fq};
 use halo2curves::ff::PrimeField;
-use halo2curves::group::prime::PrimeCurveAffine;
 use halo2curves::CurveAffine;
 use sha3::{Digest, Keccak256};
 use std::io::{self, Write};
@@ -206,15 +205,12 @@ impl<R: io::Read> Keccak256Read<R> {
             ));
         }
 
-        let point = G1Affine::from_xy(x.unwrap(), y.unwrap());
-        if bool::from(point.is_none()) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Point not on curve",
-            ));
-        }
-
-        let point = point.unwrap();
+        // Safety: x and y are guaranteed Some by the is_none() checks above
+        let (x_val, y_val) = (x.unwrap(), y.unwrap());
+        let point = G1Affine::from_xy(x_val, y_val);
+        let point = Option::from(point).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "Point not on curve")
+        })?;
         self.common_point(&point)?;
         Ok(point)
     }
@@ -224,15 +220,9 @@ impl<R: io::Read> Keccak256Read<R> {
         let mut bytes = [0u8; 32];
         self.reader.read_exact(&mut bytes)?;
 
-        let scalar = Fr::from_repr(bytes.into());
-        if bool::from(scalar.is_none()) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Invalid scalar in proof",
-            ));
-        }
-
-        let scalar = scalar.unwrap();
+        let scalar = Option::from(Fr::from_repr(bytes.into())).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "Invalid scalar in proof")
+        })?;
         self.common_scalar(&scalar)?;
         Ok(scalar)
     }

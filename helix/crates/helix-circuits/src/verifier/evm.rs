@@ -30,8 +30,8 @@ fn fq2_c1(f: &Fq2) -> Fq {
 
 use super::format_spec::{
     MIN_PROOF_SIZE, NUM_ADVICE_COMMITS, G1_POINT_SIZE, SCALAR_SIZE, NUM_PUBLIC_INPUTS,
-    fr_to_evm_bytes, g1_to_evm_bytes, fq_to_evm_bytes, evm_bytes_to_g1, evm_bytes_to_fr,
-    validate_proof_format, ProofFormatError, ProofStructure, EvmPublicInputs,
+    fr_to_evm_bytes, g1_to_evm_bytes, evm_bytes_to_g1,
+    validate_proof_format, ProofFormatError, ProofStructure,
 };
 
 /// Embedded verification key data for the Solidity contract.
@@ -1303,6 +1303,7 @@ mod pipeline_tests {
     use super::*;
     use super::super::format_spec::{
         serialize_proof_for_evm, validate_proof_format, ProofStructure,
+        evm_bytes_to_fr,
     };
     use super::super::transcript::Keccak256Write;
 

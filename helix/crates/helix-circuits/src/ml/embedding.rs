@@ -29,7 +29,7 @@
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
     plonk::{
-        Advice, Circuit, Column, ConstraintSystem, Error, ErrorFront, Expression, Fixed, Instance, Selector,
+        Advice, Circuit, Column, ConstraintSystem, ErrorFront, Fixed, Instance, Selector,
         TableColumn,
     },
     poly::Rotation,
@@ -129,8 +129,8 @@ impl<F: PrimeField> EmbeddingChip<F> {
         // Hash accumulation gate (for Merkle tree path)
         meta.create_gate("embed_hash", |meta| {
             let s = meta.query_selector(s_hash);
-            let left = meta.query_advice(advice[0], Rotation::cur());
-            let right = meta.query_advice(advice[1], Rotation::cur());
+            let _left = meta.query_advice(advice[0], Rotation::cur());
+            let _right = meta.query_advice(advice[1], Rotation::cur());
             let parent = meta.query_advice(advice[2], Rotation::cur());
             let expected = meta.query_advice(advice[3], Rotation::cur());
             // Simplified: parent should match expected

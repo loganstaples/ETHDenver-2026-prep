@@ -19,11 +19,10 @@
 //! ```
 
 use super::{
-    CircuitProfile, ConstraintProfile, TimingProfile, Bottleneck, BottleneckType,
-    constraint_counter::{OperationCost, OptimizationTechnique},
+    CircuitProfile, Bottleneck, BottleneckType,
+    constraint_counter::OptimizationTechnique,
 };
 use std::time::Duration;
-use std::collections::HashMap;
 
 /// Format for the optimization report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

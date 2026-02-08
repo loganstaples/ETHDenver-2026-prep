@@ -755,7 +755,7 @@ pub struct KeyCache {
     /// Cached verification key descriptors by circuit ID.
     vk_cache: RwLock<HashMap<[u8; 32], Arc<HelixVerificationKey>>>,
     /// Cache directory.
-    cache_dir: Option<PathBuf>,
+    _cache_dir: Option<PathBuf>,
     /// Maximum cached entries per type.
     max_entries: usize,
 }
@@ -766,7 +766,7 @@ impl KeyCache {
         Self {
             pk_cache: RwLock::new(HashMap::new()),
             vk_cache: RwLock::new(HashMap::new()),
-            cache_dir: None,
+            _cache_dir: None,
             max_entries: 16,
         }
     }
@@ -779,7 +779,7 @@ impl KeyCache {
         Ok(Self {
             pk_cache: RwLock::new(HashMap::new()),
             vk_cache: RwLock::new(HashMap::new()),
-            cache_dir: Some(path.to_path_buf()),
+            _cache_dir: Some(path.to_path_buf()),
             max_entries: 16,
         })
     }

@@ -9,13 +9,11 @@
 //! 4. Final output error is within acceptable range
 
 use crate::approximate::bounded_matmul::{BoundedMatMulChip, BoundedMatMulConfig};
-use crate::approximate::bounded_add::{BoundedAddChip, BoundedAddConfig};
 use crate::gadgets::arithmetic::{ArithmeticChip, ArithmeticConfig};
 use crate::gadgets::range::{RangeChip, RangeConfig};
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
-    plonk::{Circuit, Column, Advice, ConstraintSystem, Error, ErrorFront, Selector, Instance},
-    poly::Rotation,
+    plonk::{Circuit, Column, Advice, ConstraintSystem, ErrorFront, Selector, Instance},
 };
 use halo2curves::ff::PrimeField;
 use std::marker::PhantomData;

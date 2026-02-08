@@ -5,7 +5,7 @@
 
 use halo2_proofs::{
     circuit::Value,
-    plonk::{Column, Advice, Selector, ConstraintSystem, Expression},
+    plonk::{Column, Advice, Selector, ConstraintSystem},
     poly::Rotation,
 };
 use halo2curves::ff::PrimeField;

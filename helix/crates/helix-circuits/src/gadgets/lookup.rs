@@ -10,10 +10,9 @@
 //! - `ExpTableChip`: Scaled integer exp approximation for softmax
 
 use halo2_proofs::{
-    arithmetic::Field,
     circuit::{Layouter, Value},
     plonk::{
-        Advice, Column, ConstraintSystem, Error, ErrorFront, Expression, Selector, TableColumn,
+        Advice, Column, ConstraintSystem, ErrorFront, Selector, TableColumn,
     },
     poly::Rotation,
 };
