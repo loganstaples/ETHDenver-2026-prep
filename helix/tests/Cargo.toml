@@ -58,6 +58,10 @@ dashmap = "6.0"
 thiserror = "2.0"
 anyhow = "1.0"
 
+# Ethereum interaction (on-chain integration tests)
+ethers = { version = "2.0", optional = true }
+hex = { version = "0.4", optional = true }
+
 [dev-dependencies]
 proptest = "1.4"
 test-case = "3.3"
@@ -144,10 +148,16 @@ path = "integration/proof_chain.rs"
 name = "ci_validation"
 path = "ci_validation.rs"
 
+[[test]]
+name = "on_chain_verification"
+path = "integration/on_chain_verification.rs"
+required-features = ["on-chain"]
+
 [features]
 default = []
 parallel = ["rayon"]
 metal = ["helix-prover/metal"]
+on-chain = ["ethers", "hex"]
 
 [dependencies.rayon]
 version = "1.10"

@@ -12,6 +12,9 @@ pub mod mocks;
 pub mod metrics;
 pub mod assertions;
 
+#[cfg(feature = "on-chain")]
+pub mod anvil;
+
 pub use fixtures::*;
 pub use harness::*;
 pub use mocks::*;

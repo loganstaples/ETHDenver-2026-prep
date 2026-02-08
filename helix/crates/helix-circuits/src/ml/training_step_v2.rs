@@ -1521,7 +1521,12 @@ pub fn compute_witness_v2(
     for j in 0..d_hid {
         let repr = h_pre[j].to_repr();
         let bytes = repr.as_ref();
-        let is_negative = bytes[31] > 0x30;
+        // For BN254, the field modulus p has MSB (byte[31] in LE) = 0x30.
+        // Values > p/2 represent "negative" numbers. p/2 has MSB = 0x18.
+        // So any value with MSB >= 0x19 is definitely > p/2 (negative).
+        // The previous check `> 0x30` was always false since no valid Fr
+        // element can have MSB > 0x30.
+        let is_negative = bytes[31] >= 0x19;
         if is_negative || h_pre[j] == Fr::ZERO {
             h[j] = Fr::ZERO;
             h_err[j] = Fr::ZERO;
