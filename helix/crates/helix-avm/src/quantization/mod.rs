@@ -40,6 +40,7 @@
 //! ```
 
 pub mod calibration;
+pub mod circuit_quantizer;
 pub mod dequantize;
 pub mod dynamic;
 pub mod int4_ops;
@@ -51,6 +52,9 @@ pub mod ops;
 pub mod quantize;
 pub mod schemes;
 pub mod static_quant;
+
+// Re-export circuit quantizer
+pub use circuit_quantizer::CircuitQuantizer;
 
 // Re-export commonly used types
 pub use calibration::{CalibrationData, Calibrator, Observer};

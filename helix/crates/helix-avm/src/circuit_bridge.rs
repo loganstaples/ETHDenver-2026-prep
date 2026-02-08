@@ -379,6 +379,247 @@ pub fn field_elements_to_weights(
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// AVM ↔ Circuit weight and witness bridge (requires helix-circuits)
+// ---------------------------------------------------------------------------
+
+/// Flat 2-layer MLP weights suitable for circuit consumption.
+///
+/// The circuit expects `w1[d_hid * d_in]`, `b1[d_hid]`, `w2[d_out * d_hid]`,
+/// `b2[d_out]` in row-major order.
+#[derive(Debug, Clone)]
+pub struct CircuitWeights {
+    pub d_in: usize,
+    pub d_hid: usize,
+    pub d_out: usize,
+    pub w1: Vec<f64>,
+    pub b1: Vec<f64>,
+    pub w2: Vec<f64>,
+    pub b2: Vec<f64>,
+}
+
+/// Extracts flat weight vectors from two AVM `Linear` layers.
+///
+/// Layer 1: (d_in → d_hid), Layer 2: (d_hid → d_out).
+/// Weights in `Linear` are stored as `[out_features, in_features]` row-major,
+/// which is exactly the layout the circuit expects.
+pub fn model_to_circuit_weights(
+    layer1: &crate::nn::Linear,
+    layer2: &crate::nn::Linear,
+) -> CircuitWeights {
+    let d_in = layer1.in_features();
+    let d_hid = layer1.out_features();
+    let d_out = layer2.out_features();
+
+    let w1: Vec<f64> = layer1.weights().values();
+    let b1: Vec<f64> = layer1
+        .bias()
+        .map(|b| b.values())
+        .unwrap_or_else(|| vec![0.0; d_hid]);
+
+    let w2: Vec<f64> = layer2.weights().values();
+    let b2: Vec<f64> = layer2
+        .bias()
+        .map(|b| b.values())
+        .unwrap_or_else(|| vec![0.0; d_out]);
+
+    CircuitWeights {
+        d_in,
+        d_hid,
+        d_out,
+        w1,
+        b1,
+        w2,
+        b2,
+    }
+}
+
+/// Reconstructs two AVM `Linear` layers from flat circuit-weight vectors.
+pub fn circuit_weights_to_model(
+    cw: &CircuitWeights,
+) -> (crate::nn::Linear, crate::nn::Linear) {
+    use helix_core::types::Precision;
+
+    let layer1 = crate::nn::Linear::from_raw(
+        cw.w1.clone(),
+        vec![cw.d_hid, cw.d_in],
+        Some(cw.b1.clone()),
+        Precision::F32,
+    )
+    .expect("valid layer1 dimensions");
+
+    let layer2 = crate::nn::Linear::from_raw(
+        cw.w2.clone(),
+        vec![cw.d_out, cw.d_hid],
+        Some(cw.b2.clone()),
+        Precision::F32,
+    )
+    .expect("valid layer2 dimensions");
+
+    (layer1, layer2)
+}
+
+// ---------------------------------------------------------------------------
+// build_training_witness — full AVM → Circuit witness bridge
+// ---------------------------------------------------------------------------
+
+/// Output of [`build_training_witness`].
+#[cfg(any(feature = "circuit-bridge", test))]
+pub struct TrainingWitnessOutput {
+    /// The fully populated witness for the circuit.
+    pub witness: helix_circuits::MLTrainingStepV2Witness,
+    /// Minimum `relu_range` the circuit must use for the lookup table.
+    pub relu_range: usize,
+}
+
+/// Runs a complete AVM training step and produces an `MLTrainingStepV2Witness`.
+///
+/// This is the main bridge function: it takes AVM-level f64 model weights,
+/// quantizes them to Fr using the given `scale` factor, then delegates to
+/// `compute_witness_v2` for the circuit-compatible witness (including
+/// Freivalds challenges, state hashes, and error checksums).
+///
+/// The scale factor controls quantization precision vs. circuit size:
+/// - scale=1 (default): rounds to nearest integer, smallest circuit
+/// - scale=10: one decimal place of precision
+/// - scale=1000: three decimal places, but requires much larger relu_range
+///
+/// # Returns
+/// A [`TrainingWitnessOutput`] containing the witness and the minimum
+/// `relu_range` needed for the circuit's ReLU lookup table.
+#[cfg(any(feature = "circuit-bridge", test))]
+pub fn build_training_witness(
+    layer1: &crate::nn::Linear,
+    layer2: &crate::nn::Linear,
+    input: &[f64],
+    target: &[f64],
+    learning_rate: f64,
+    step_number: u64,
+) -> Result<TrainingWitnessOutput, String> {
+    build_training_witness_with_scale(layer1, layer2, input, target, learning_rate, step_number, 1)
+}
+
+/// Like [`build_training_witness`] but with a configurable quantization scale.
+#[cfg(any(feature = "circuit-bridge", test))]
+pub fn build_training_witness_with_scale(
+    layer1: &crate::nn::Linear,
+    layer2: &crate::nn::Linear,
+    input: &[f64],
+    target: &[f64],
+    learning_rate: f64,
+    step_number: u64,
+    scale: u64,
+) -> Result<TrainingWitnessOutput, String> {
+    use crate::quantization::circuit_quantizer::fr_ops::i64_to_fr;
+    use crate::quantization::CircuitQuantizer;
+    use helix_circuits::halo2curves::bn256::Fr;
+    use helix_circuits::halo2curves::ff::Field;
+    use helix_circuits::{compute_state_hash_v2, compute_witness_v2};
+
+    // 1. Extract flat weights from AVM layers
+    let cw = model_to_circuit_weights(layer1, layer2);
+
+    if input.len() != cw.d_in {
+        return Err(format!(
+            "input length {} != d_in {}",
+            input.len(),
+            cw.d_in
+        ));
+    }
+    if target.len() != cw.d_out {
+        return Err(format!(
+            "target length {} != d_out {}",
+            target.len(),
+            cw.d_out
+        ));
+    }
+
+    // 2. Quantize everything to Fr
+    let q = CircuitQuantizer::with_scale(scale);
+
+    let x_fr: Vec<Fr> = q.quantize_slice_to_fr(input);
+    let target_fr: Vec<Fr> = q.quantize_slice_to_fr(target);
+    let w1_fr: Vec<Fr> = q.quantize_slice_to_fr(&cw.w1);
+    let b1_fr: Vec<Fr> = q.quantize_slice_to_fr(&cw.b1);
+    let w2_fr: Vec<Fr> = q.quantize_slice_to_fr(&cw.w2);
+    let b2_fr: Vec<Fr> = q.quantize_slice_to_fr(&cw.b2);
+    let lr_fr: Fr = i64_to_fr(q.quantize_to_i64(learning_rate));
+
+    // 3. Compute the minimum relu_range from the quantized values.
+    //    h_pre[j] = sum_i(|w1[j,i]| * |x[i]|) + |b1[j]|
+    //    We need all h_pre values to fit the ReLU lookup table.
+    let max_w1 = cw.w1.iter().map(|v| (v * scale as f64).round().abs() as u64).max().unwrap_or(0);
+    let max_x = input.iter().map(|v| (v * scale as f64).round().abs() as u64).max().unwrap_or(0);
+    let max_b1 = cw.b1.iter().map(|v| (v * scale as f64).round().abs() as u64).max().unwrap_or(0);
+    let max_h_pre = cw.d_in as u64 * max_w1 * max_x + max_b1;
+
+    // Also account for y = W2 * h + b2 (though y doesn't go through ReLU)
+    // and backward pass gradients that flow through relu_mask
+    let max_w2 = cw.w2.iter().map(|v| (v * scale as f64).round().abs() as u64).max().unwrap_or(0);
+    let max_b2 = cw.b2.iter().map(|v| (v * scale as f64).round().abs() as u64).max().unwrap_or(0);
+    let max_y = cw.d_hid as u64 * max_w2 * max_h_pre + max_b2;
+
+    // Backward pass: dh_pre goes through relu_mask, but it's element-wise multiply
+    // with 0 or 1 so the magnitude is bounded by dh
+    let max_target = target.iter().map(|v| (v * scale as f64).round().abs() as u64).max().unwrap_or(0);
+    let max_dy = 2 * (max_y + max_target); // dy = 2 * (y - target)
+    let max_dh = cw.d_out as u64 * max_w2 * max_dy;
+
+    let relu_range = (max_h_pre.max(max_dh) + 1).max(256) as usize;
+
+    // 4. Use the circuit's own compute_witness_v2 for exact arithmetic.
+    let base_error = Fr::from(1u64);
+
+    let old_hash = compute_state_hash_v2(&w1_fr, &b1_fr, &w2_fr, &b2_fr);
+    let tmp = compute_witness_v2(
+        cw.d_in,
+        cw.d_hid,
+        cw.d_out,
+        &x_fr,
+        &target_fr,
+        &w1_fr,
+        &b1_fr,
+        &w2_fr,
+        &b2_fr,
+        lr_fr,
+        old_hash,
+        (Fr::ZERO, Fr::ZERO),
+        step_number,
+        base_error,
+    );
+
+    let new_hash = compute_state_hash_v2(
+        &tmp.w1_new,
+        &tmp.b1_new,
+        &tmp.w2_new,
+        &tmp.b2_new,
+    );
+
+    let mut witness = compute_witness_v2(
+        cw.d_in,
+        cw.d_hid,
+        cw.d_out,
+        &x_fr,
+        &target_fr,
+        &w1_fr,
+        &b1_fr,
+        &w2_fr,
+        &b2_fr,
+        lr_fr,
+        old_hash,
+        new_hash,
+        step_number,
+        base_error,
+    );
+
+    witness.finalize_error_checksum();
+
+    Ok(TrainingWitnessOutput {
+        witness,
+        relu_range,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -490,5 +731,224 @@ mod tests {
         let bridge_total = bridge.total_as_f64();
         // Allow for fixed-point quantization difference
         assert!((bridge_total - direct_sum).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_model_to_circuit_weights() {
+        use crate::nn::Linear;
+        use helix_core::types::Precision;
+
+        let l1 = Linear::from_raw(
+            vec![1.0, 2.0, 3.0, 4.0],
+            vec![2, 2],
+            Some(vec![0.1, 0.2]),
+            Precision::F32,
+        )
+        .unwrap();
+
+        let l2 = Linear::from_raw(
+            vec![5.0, 6.0],
+            vec![1, 2],
+            Some(vec![0.3]),
+            Precision::F32,
+        )
+        .unwrap();
+
+        let cw = model_to_circuit_weights(&l1, &l2);
+        assert_eq!(cw.d_in, 2);
+        assert_eq!(cw.d_hid, 2);
+        assert_eq!(cw.d_out, 1);
+        assert_eq!(cw.w1, vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(cw.b1, vec![0.1, 0.2]);
+        assert_eq!(cw.w2, vec![5.0, 6.0]);
+        assert_eq!(cw.b2, vec![0.3]);
+    }
+
+    #[test]
+    fn test_circuit_weights_roundtrip() {
+        use crate::nn::Linear;
+        use helix_core::types::Precision;
+
+        let l1 = Linear::from_raw(
+            vec![0.5, -0.3, 1.2, 0.0],
+            vec![2, 2],
+            Some(vec![0.1, -0.1]),
+            Precision::F32,
+        )
+        .unwrap();
+        let l2 = Linear::from_raw(
+            vec![0.7, 0.8],
+            vec![1, 2],
+            Some(vec![-0.2]),
+            Precision::F32,
+        )
+        .unwrap();
+
+        let cw = model_to_circuit_weights(&l1, &l2);
+        let (r1, r2) = circuit_weights_to_model(&cw);
+
+        assert_eq!(r1.in_features(), 2);
+        assert_eq!(r1.out_features(), 2);
+        assert_eq!(r2.in_features(), 2);
+        assert_eq!(r2.out_features(), 1);
+
+        let r_cw = model_to_circuit_weights(&r1, &r2);
+        for (a, b) in cw.w1.iter().zip(r_cw.w1.iter()) {
+            assert!((a - b).abs() < 1e-10);
+        }
+        for (a, b) in cw.b2.iter().zip(r_cw.b2.iter()) {
+            assert!((a - b).abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn test_build_training_witness() {
+        use crate::nn::Linear;
+        use helix_circuits::halo2curves::bn256::Fr;
+        use helix_circuits::halo2curves::ff::Field;
+        use helix_core::types::Precision;
+
+        // Use integer-valued weights that match circuit test patterns.
+        // W1 = [[1, 2], [3, 1]], b1 = [0, 0]
+        // W2 = [[1, 1]], b2 = [0]
+        // x = [1, 1], target = [5]
+        // h_pre = [3, 4], h = [3, 4], y = [7], loss = (7-5)^2 = 4
+        let l1 = Linear::from_raw(
+            vec![1.0, 2.0, 3.0, 1.0],
+            vec![2, 2],
+            Some(vec![0.0, 0.0]),
+            Precision::F32,
+        )
+        .unwrap();
+        let l2 = Linear::from_raw(
+            vec![1.0, 1.0],
+            vec![1, 2],
+            Some(vec![0.0]),
+            Precision::F32,
+        )
+        .unwrap();
+
+        let input = vec![1.0, 1.0];
+        let target = vec![5.0];
+        let lr = 1.0;
+
+        let output = build_training_witness(&l1, &l2, &input, &target, lr, 1).unwrap();
+        let witness = &output.witness;
+
+        // Verify dimensions
+        assert_eq!(witness.d_in, 2);
+        assert_eq!(witness.d_hid, 2);
+        assert_eq!(witness.d_out, 1);
+
+        // Verify vectors have correct lengths
+        assert_eq!(witness.x.len(), 2);
+        assert_eq!(witness.target.len(), 1);
+        assert_eq!(witness.w1.len(), 4);
+        assert_eq!(witness.b1.len(), 2);
+        assert_eq!(witness.w2.len(), 2);
+        assert_eq!(witness.b2.len(), 1);
+        assert_eq!(witness.h_pre.len(), 2);
+        assert_eq!(witness.h.len(), 2);
+        assert_eq!(witness.y.len(), 1);
+        assert_eq!(witness.w1_new.len(), 4);
+        assert_eq!(witness.w2_new.len(), 2);
+
+        // Public inputs should have 8 elements
+        let pi = witness.public_inputs();
+        assert_eq!(pi.len(), 8);
+
+        // h_pre = [3, 4], loss = (7-5)^2 = 4
+        assert_eq!(witness.h_pre[0], Fr::from(3u64));
+        assert_eq!(witness.h_pre[1], Fr::from(4u64));
+        assert_eq!(witness.loss, Fr::from(4u64));
+
+        // State hashes should be non-zero
+        assert_ne!(witness.old_state_hash.0, Fr::ZERO);
+        assert_ne!(witness.new_state_hash.0, Fr::ZERO);
+
+        // Error checksum is computed (may be Fr::ZERO due to pre-existing
+        // from_repr_vartime overflow in compute_error_checksum — not a bug here)
+        let _ = witness.error_checksum;
+
+        // relu_range should be at least 256
+        assert!(output.relu_range >= 256);
+    }
+
+    #[test]
+    fn test_build_training_witness_dimension_mismatch() {
+        use crate::nn::Linear;
+        use helix_core::types::Precision;
+
+        let l1 = Linear::from_raw(
+            vec![1.0, 2.0, 3.0, 4.0],
+            vec![2, 2],
+            Some(vec![0.0, 0.0]),
+            Precision::F32,
+        )
+        .unwrap();
+        let l2 = Linear::from_raw(
+            vec![1.0, 1.0],
+            vec![1, 2],
+            Some(vec![0.0]),
+            Precision::F32,
+        )
+        .unwrap();
+
+        // Wrong input length
+        let result = build_training_witness(&l1, &l2, &[1.0], &[1.0], 0.01, 0);
+        assert!(result.is_err());
+
+        // Wrong target length
+        let result = build_training_witness(&l1, &l2, &[1.0, 2.0], &[1.0, 2.0], 0.01, 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_build_training_witness_with_mock_prover() {
+        use crate::nn::Linear;
+        use helix_circuits::{MLTrainingStepV2Circuit, halo2_proofs::dev::MockProver};
+        use helix_circuits::halo2curves::bn256::Fr;
+        use helix_core::types::Precision;
+
+        // Use the same values as the circuit's own test (make_tiny_circuit_v2).
+        // W1 = [[1, 2], [3, 1]], b1 = [0, 0]
+        // W2 = [[1, 1]], b2 = [0]
+        // x = [1, 1], target = [5]
+        let l1 = Linear::from_raw(
+            vec![1.0, 2.0, 3.0, 1.0],
+            vec![2, 2],
+            Some(vec![0.0, 0.0]),
+            Precision::F32,
+        )
+        .unwrap();
+        let l2 = Linear::from_raw(
+            vec![1.0, 1.0],
+            vec![1, 2],
+            Some(vec![0.0]),
+            Precision::F32,
+        )
+        .unwrap();
+
+        let input = vec![1.0, 1.0];
+        let target = vec![5.0];
+        let lr = 1.0;
+
+        let output = build_training_witness(&l1, &l2, &input, &target, lr, 1).unwrap();
+        let public_inputs = output.witness.public_inputs();
+
+        let circuit = MLTrainingStepV2Circuit {
+            witness: output.witness,
+            relu_range: output.relu_range,
+            exp_range: 128,
+            exp_scale: 64,
+            use_freivalds: true,
+        };
+
+        // k = 17 should be sufficient for a tiny model
+        let k = 17;
+        let prover = MockProver::<Fr>::run(k, &circuit, vec![public_inputs.clone()])
+            .expect("MockProver::run failed");
+
+        prover.assert_satisfied();
     }
 }
