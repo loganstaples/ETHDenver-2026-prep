@@ -278,13 +278,14 @@ mod tests {
 
     #[test]
     fn test_prover_init() {
-        let _prover = MLTrainingProver::new(14, 2, 2, 1);
+        // Use k=12 instead of k=14 to avoid 40-120s SRS generation.
+        let _prover = MLTrainingProver::new(12, 2, 2, 1);
     }
 
     #[test]
     fn test_prove_and_verify() {
         // small_model_witness has dims 2×2×1
-        let prover = MLTrainingProver::new(14, 2, 2, 1);
+        let prover = MLTrainingProver::new(12, 2, 2, 1);
         let witness = small_model_witness();
         let result = prover.prove(&witness);
 
@@ -295,7 +296,7 @@ mod tests {
 
     #[test]
     fn test_wrong_public_inputs_rejected() {
-        let prover = MLTrainingProver::new(14, 2, 2, 1);
+        let prover = MLTrainingProver::new(12, 2, 2, 1);
         let witness = small_model_witness();
         let result = prover.prove(&witness);
 
@@ -322,7 +323,7 @@ mod tests {
         let x: Vec<Fr> = (0..d_in).map(|i| Fr::from((i + 1) as u64)).collect();
         let target: Vec<Fr> = (0..d_out).map(|_| Fr::from(10u64)).collect();
 
-        let prover = MLTrainingProver::new(14, d_in, d_hid, d_out);
+        let prover = MLTrainingProver::new(12, d_in, d_hid, d_out);
         let witness =
             MLTrainingProver::build_witness(d_in, d_hid, d_out, &x, &target, &w1, &b1, &w2, &b2, Fr::from(1), 1);
         let result = prover.prove(&witness);

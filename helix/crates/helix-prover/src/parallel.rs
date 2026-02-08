@@ -580,20 +580,12 @@ impl ParallelProver {
     }
 
     /// Waits for all submitted proofs to complete.
+    ///
+    /// Returns once every submitted task has reached `Complete` or `Failed` status.
+    /// Uses a default timeout of 5 minutes to prevent infinite hangs.
     pub fn wait_all(&self) -> Vec<ChunkProof> {
-        loop {
-            let status = self.status.read().unwrap();
-            let all_done = status
-                .values()
-                .all(|s| matches!(s, ProofStatus::Complete | ProofStatus::Failed(_)));
-            drop(status);
-
-            if all_done {
-                return self.get_all_proofs();
-            }
-
-            thread::sleep(Duration::from_millis(10));
-        }
+        let (proofs, _timed_out) = self.wait_all_timeout(Duration::from_secs(300));
+        proofs
     }
 
     /// Waits for all proofs with timeout.

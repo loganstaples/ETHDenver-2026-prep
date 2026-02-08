@@ -104,7 +104,7 @@ pub use chunking::{ChunkId, ChunkingConfig, ComputationChunk, ComputationChunker
 pub use ivc::{IVCConfig, IVCProver, IVCState, IVCStep};
 
 // Re-export key management types
-pub use keys::{CircuitKeys, FileKeyStore, InMemoryKeyStore, KeyId, KeyMetadata};
+pub use keys::{CircuitKeys, FileKeyStore, InMemoryKeyStore, KeyId, KeyMetadata, HELIX_SRS_SEED};
 
 // Re-export parallel proving types
 pub use parallel::{BatchProofResult, ChunkProof, ParallelConfig, ParallelProver, ProofStatus};
@@ -127,9 +127,10 @@ pub use provers::training_prover::{MLTrainingProver, TrainingProofResult};
 
 // Re-export training prover V2 types (enhanced with reliability features)
 pub use provers::training_prover_v2::{
-    BatchProofResult as BatchProofResultV2, BatchTrainingProverV2, MLTrainingProverV2,
-    TrainingProofResultV2, TrainingProverError, TrainingProverResult, TrainingWeights,
-    V2ProverConfig, WitnessValidationError, WitnessValidationResult, validate_witness,
+    BatchProofResult as BatchProofResultV2, BatchTrainingProverV2, EvmProofBundle,
+    MLTrainingProverV2, TrainingProofResultV2, TrainingProverError, TrainingProverResult,
+    TrainingWeights, V2ProverConfig, WitnessValidationError, WitnessValidationResult,
+    validate_witness,
 };
 
 // Re-export cache types

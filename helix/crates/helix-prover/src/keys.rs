@@ -410,24 +410,49 @@ pub struct CircuitKeys {
     pub vk: helix_circuits::halo2_proofs::plonk::VerifyingKey<helix_circuits::halo2curves::bn256::G1Affine>,
 }
 
+/// Default deterministic seed for the HELIX SRS.
+///
+/// All provers MUST use this seed (or one explicitly agreed upon) so that they
+/// share the same SRS and can verify each other's proofs. Using `OsRng` for
+/// `ParamsKZG::setup()` produces a different SRS every time, which makes
+/// cross-prover verification impossible.
+pub const HELIX_SRS_SEED: [u8; 32] = *b"HELIX_DETERMINISTIC_SRS_SEED_v1!";
+
 /// Generates real Halo2 proving/verification keys for a concrete circuit.
 ///
-/// Runs trusted setup and returns the raw key objects for use with the prover pipeline.
-/// Uses KZG commitment scheme (PSE fork of halo2) for EVM-compatible proofs.
+/// Uses a deterministic SRS derived from [`HELIX_SRS_SEED`] so that all
+/// provers in the network generate compatible keys for the same circuit.
 pub fn generate_keys_for_circuit<C: helix_circuits::halo2_proofs::plonk::Circuit<helix_circuits::halo2curves::bn256::Fr>>(
     circuit: &C,
     circuit_name: &str,
     version: u32,
     k: u32,
 ) -> CircuitKeys {
+    generate_keys_for_circuit_with_seed(circuit, circuit_name, version, k, HELIX_SRS_SEED)
+}
+
+/// Generates real Halo2 proving/verification keys with a custom SRS seed.
+///
+/// Use this when you need a different SRS than the default (e.g., for testing
+/// or for per-model SRS isolation).
+pub fn generate_keys_for_circuit_with_seed<C: helix_circuits::halo2_proofs::plonk::Circuit<helix_circuits::halo2curves::bn256::Fr>>(
+    circuit: &C,
+    circuit_name: &str,
+    version: u32,
+    k: u32,
+    srs_seed: [u8; 32],
+) -> CircuitKeys {
     use helix_circuits::halo2_proofs::poly::kzg::commitment::ParamsKZG;
     use helix_circuits::halo2_proofs::plonk::{keygen_pk, keygen_vk};
     use helix_circuits::halo2curves::bn256::Bn256;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
 
     let id = KeyId::new(circuit_name, version);
 
-    // Trusted setup (KZG)
-    let params = ParamsKZG::<Bn256>::setup(k, rand_core::OsRng);
+    // Deterministic trusted setup (KZG) — same seed → same SRS
+    let rng = StdRng::from_seed(srs_seed);
+    let params = ParamsKZG::<Bn256>::setup(k, rng);
 
     // Generate verification key then proving key
     let vk = keygen_vk(&params, circuit).expect("keygen_vk failed");

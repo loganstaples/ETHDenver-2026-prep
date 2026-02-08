@@ -25,7 +25,7 @@ use helix_circuits::halo2_proofs::{
     transcript::{Blake2bRead, Blake2bWrite, Challenge255, TranscriptReadBuffer, TranscriptWriterBuffer},
 };
 use helix_circuits::halo2curves::{
-    bn256::{Bn256, Fr, G1Affine},
+    bn256::{Bn256, Fq, Fq2, Fr, G1Affine, G2Affine},
     ff::PrimeField,
     CurveAffine,
 };
@@ -523,8 +523,18 @@ impl<C: Circuit<Fr> + Clone> ProverPipeline<C> {
     }
 
     /// Creates a new pipeline with custom configuration.
+    ///
+    /// Uses the deterministic HELIX SRS seed so all provers generate
+    /// compatible parameters. Override with [`PipelineConfig::deterministic`]
+    /// to use a custom seed.
     pub fn with_config(config: PipelineConfig) -> Self {
-        let params = ParamsKZG::<Bn256>::setup(config.k, OsRng);
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+
+        let srs_seed = config.deterministic_seed
+            .unwrap_or(crate::keys::HELIX_SRS_SEED);
+        let rng = StdRng::from_seed(srs_seed);
+        let params = ParamsKZG::<Bn256>::setup(config.k, rng);
         Self {
             params,
             pk: None,
@@ -878,6 +888,10 @@ impl<C: Circuit<Fr> + Clone> ProverPipeline<C> {
     }
 
     /// Extracts verification key data for EVM verifier generation.
+    ///
+    /// Reads the real `[s]₂` point from the SRS (`ParamsKZG::s_g2()`) and the
+    /// G2 generator from `ParamsKZG::g2()`, then computes `-G2` by negating.
+    /// These are the pairing-check parameters the on-chain Halo2Verifier needs.
     pub fn extract_vk_data(&self, num_instances: usize) -> Option<ExtractedVkData> {
         let _vk = self.vk.as_ref()?;
 
@@ -886,31 +900,17 @@ impl<C: Circuit<Fr> + Clone> ProverPipeline<C> {
         let g1_x = field_to_u256(*g1_coords.x());
         let g1_y = field_to_u256(*g1_coords.y());
 
-        // Standard trusted setup values for s·G2
-        let s_g2 = (
-            "11559732032986387107991004021392285783925812861821192530917403151452391805634"
-                .to_string(),
-            "10857046999023057135944570762232829481370756359578518086990519993285655852781"
-                .to_string(),
-            "4082367875863433681332203403145435568316851327593401208105741076214120093531"
-                .to_string(),
-            "8495653923123431417604973247489272438418190587263600148770280649306958101930"
-                .to_string(),
-        );
+        // Extract real s·G2 from the SRS
+        let s_g2_point = self.params.s_g2();
+        let s_g2 = g2_to_evm_decimal_tuple(&s_g2_point);
 
-        // Negative G2 generator
-        let neg_g2 = (
-            "11559732032986387107991004021392285783925812861821192530917403151452391805634"
-                .to_string(),
-            "10857046999023057135944570762232829481370756359578518086990519993285655852781"
-                .to_string(),
-            "17805874995975841540914202342111839520379459829704422454583296818431106115052"
-                .to_string(),
-            "13392588948715843804641432497768002650278120570034223513918757245338268106653"
-                .to_string(),
-        );
+        // Compute -G2 (negation of the G2 generator from the SRS)
+        let g2_point = self.params.g2();
+        use std::ops::Neg;
+        let neg_g2_point = g2_point.neg();
+        let neg_g2 = g2_to_evm_decimal_tuple(&neg_g2_point);
 
-        // Default number of advice columns (can be overridden)
+        // Number of advice columns for MLTrainingStepV2
         let num_advices = 3;
 
         Some(ExtractedVkData {
@@ -1115,6 +1115,29 @@ fn field_to_u256<F: PrimeField>(f: F) -> String {
     let bytes = repr.as_ref();
     let value = num_bigint::BigUint::from_bytes_le(bytes);
     value.to_string()
+}
+
+/// Extracts the c0 (real) component from an Fq2 via byte serialization.
+fn fq2_c0(f: &Fq2) -> Fq {
+    let bytes = f.to_bytes();
+    Fq::from_bytes(bytes[..32].try_into().unwrap()).unwrap()
+}
+
+/// Extracts the c1 (imaginary) component from an Fq2.
+fn fq2_c1(f: &Fq2) -> Fq {
+    let bytes = f.to_bytes();
+    Fq::from_bytes(bytes[32..].try_into().unwrap()).unwrap()
+}
+
+/// Converts a G2Affine point to EIP-197 pairing precompile format:
+/// (x_imaginary, x_real, y_imaginary, y_real) as decimal strings.
+fn g2_to_evm_decimal_tuple(point: &G2Affine) -> (String, String, String, String) {
+    (
+        field_to_u256(fq2_c1(&point.x)),
+        field_to_u256(fq2_c0(&point.x)),
+        field_to_u256(fq2_c1(&point.y)),
+        field_to_u256(fq2_c0(&point.y)),
+    )
 }
 
 #[cfg(test)]

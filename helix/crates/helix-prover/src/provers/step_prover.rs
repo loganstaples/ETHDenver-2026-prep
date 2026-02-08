@@ -400,7 +400,7 @@ mod tests {
         };
 
         let mut prover = TrainingStepProver::new([0u8; 32]);
-        let result = prover.prove_ml_training_step(&data, 14);
+        let result = prover.prove_ml_training_step(&data, 12);
         assert!(result.is_ok(), "ML training step failed: {:?}", result.err());
 
         let proof = result.unwrap();
@@ -427,7 +427,7 @@ mod tests {
 
         let mut prover = TrainingStepProver::new([0u8; 32]);
         let result = prover
-            .prove_ml_training_step(&data, 14)
+            .prove_ml_training_step(&data, 12)
             .expect("prove failed");
 
         // IVC state reflects the step.
@@ -460,7 +460,7 @@ mod tests {
 
         let mut prover = TrainingStepProver::new([0u8; 32]);
         let result = prover
-            .prove_ml_training_step(&data, 14)
+            .prove_ml_training_step(&data, 12)
             .expect("prove failed");
 
         // Verify using the step prover's own ML prover (same SRS/VK).

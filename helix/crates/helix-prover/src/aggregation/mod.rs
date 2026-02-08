@@ -174,23 +174,92 @@ impl ProofAggregator {
         self.aggregations.values().collect()
     }
 
-    /// Verifies an aggregated proof.
-    ///
-    /// # WARNING: DEMO ONLY
-    /// This verification is a placeholder and does not provide cryptographic security guarantees.
+    /// Verifies an aggregated proof by checking:
+    /// 1. The proof is non-empty and has the correct format header.
+    /// 2. The embedded Merkle root matches the `root_commitment`.
+    /// 3. Each chunk's Merkle path is valid against the root.
+    /// 4. The independently computed root from `public_inputs` matches.
     pub fn verify(&self, agg: &AggregatedProof) -> bool {
-        tracing::warn!("verify: WARNING DEMO ONLY — not cryptographically sound");
-        // Placeholder verification
-        // Actual implementation would verify the aggregated proof
-        // against the root commitment and public inputs
-
         if agg.proof.is_empty() {
+            tracing::warn!("verify: empty aggregated proof");
             return false;
         }
 
-        // Check root commitment matches chunk commitments
+        // --- Parse the aggregated proof format ---
+        // Layout: [version:1] [num_proofs:4 LE] [merkle_root:32] [paths...]
+        let proof = &agg.proof;
+        if proof.len() < 37 {
+            tracing::warn!("verify: aggregated proof too short ({} bytes)", proof.len());
+            return false;
+        }
+
+        let version = proof[0];
+        if version != 2 {
+            tracing::warn!("verify: unexpected aggregation version {version}");
+            return false;
+        }
+
+        let num_proofs = u32::from_le_bytes(proof[1..5].try_into().unwrap()) as usize;
+        if num_proofs != agg.chunk_ids.len() {
+            tracing::warn!(
+                "verify: proof claims {} chunks but aggregation has {}",
+                num_proofs,
+                agg.chunk_ids.len()
+            );
+            return false;
+        }
+
+        let embedded_root: [u8; 32] = proof[5..37].try_into().unwrap();
+        if embedded_root != agg.root_commitment {
+            tracing::warn!("verify: embedded Merkle root does not match root_commitment");
+            return false;
+        }
+
+        // --- Verify each public input's Merkle path ---
+        let mut offset = 37;
+        let num_leaves = agg.public_inputs.len();
+        for leaf_idx in 0..num_leaves {
+            if offset + 4 > proof.len() {
+                tracing::warn!("verify: proof truncated at leaf {leaf_idx} path length");
+                return false;
+            }
+            let path_len = u32::from_le_bytes(
+                proof[offset..offset + 4].try_into().unwrap(),
+            ) as usize;
+            offset += 4;
+
+            let path_bytes_needed = path_len * 32;
+            if offset + path_bytes_needed > proof.len() {
+                tracing::warn!(
+                    "verify: proof truncated at leaf {leaf_idx} path data (need {path_bytes_needed}, have {})",
+                    proof.len() - offset,
+                );
+                return false;
+            }
+
+            let mut path: Vec<[u8; 32]> = Vec::with_capacity(path_len);
+            for i in 0..path_len {
+                let start = offset + i * 32;
+                let node: [u8; 32] = proof[start..start + 32].try_into().unwrap();
+                path.push(node);
+            }
+            offset += path_bytes_needed;
+
+            let leaf = agg.public_inputs[leaf_idx];
+            if !verify_merkle_path(&leaf, leaf_idx, &path, &embedded_root) {
+                tracing::warn!("verify: Merkle path verification failed for leaf {leaf_idx}");
+                return false;
+            }
+        }
+
+        // --- Cross-check: independently computed root from public_inputs ---
         let computed_root = self.compute_root(&agg.public_inputs);
-        computed_root == agg.root_commitment
+        if computed_root != agg.root_commitment {
+            tracing::warn!("verify: recomputed root from public_inputs does not match root_commitment");
+            return false;
+        }
+
+        true
     }
 
     /// Computes the final root for the entire training step.
@@ -296,13 +365,13 @@ impl ProofAggregator {
     }
 
     fn generate_aggregated_proof(&self, proofs: &[ChunkProof]) -> Vec<u8> {
-        use sha2::{Sha256, Digest};
-
-        // Build Merkle tree over proof commitments.
+        // Build Merkle tree over chunk public inputs (matching compute_root).
+        // Each chunk contributes its public_inputs entries as leaves.
         let mut tree = CommitmentTree::new();
         for proof in proofs {
-            let hash: [u8; 32] = Sha256::digest(&proof.proof).into();
-            tree.add_leaf(hash);
+            for pi in &proof.public_inputs {
+                tree.add_leaf(*pi);
+            }
         }
         let root = tree.build();
 
@@ -312,18 +381,22 @@ impl ProofAggregator {
         aggregated.push(2u8);
         aggregated.extend_from_slice(&(proofs.len() as u32).to_le_bytes());
 
-        // Merkle root
+        // Merkle root (matches root_commitment computed from public_inputs)
         aggregated.extend_from_slice(&root);
 
-        // Each proof's Merkle path
-        for (i, _proof) in proofs.iter().enumerate() {
-            if let Some(path) = tree.proof(i) {
-                aggregated.extend_from_slice(&(path.len() as u32).to_le_bytes());
-                for node in &path {
-                    aggregated.extend_from_slice(node);
+        // Each leaf's Merkle path (one path per public_input entry)
+        let mut leaf_idx = 0;
+        for proof in proofs {
+            for _pi in &proof.public_inputs {
+                if let Some(path) = tree.proof(leaf_idx) {
+                    aggregated.extend_from_slice(&(path.len() as u32).to_le_bytes());
+                    for node in &path {
+                        aggregated.extend_from_slice(node);
+                    }
+                } else {
+                    aggregated.extend_from_slice(&0u32.to_le_bytes());
                 }
-            } else {
-                aggregated.extend_from_slice(&0u32.to_le_bytes());
+                leaf_idx += 1;
             }
         }
 
@@ -418,7 +491,7 @@ impl CommitmentTree {
         Some(proof)
     }
 
-    fn hash_pair(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+    pub fn hash_pair(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
         use sha2::{Sha256, Digest};
         let mut hasher = Sha256::new();
         hasher.update(a);
@@ -431,6 +504,31 @@ impl Default for CommitmentTree {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Verifies a Merkle proof path from leaf to root.
+///
+/// `leaf_index` determines which side of each hash the accumulator is placed on
+/// (left if even, right if odd), walking up the tree level-by-level.
+pub fn verify_merkle_path(
+    leaf: &[u8; 32],
+    leaf_index: usize,
+    path: &[[u8; 32]],
+    expected_root: &[u8; 32],
+) -> bool {
+    let mut current = *leaf;
+    let mut index = leaf_index;
+
+    for sibling in path {
+        current = if index % 2 == 0 {
+            CommitmentTree::hash_pair(&current, sibling)
+        } else {
+            CommitmentTree::hash_pair(sibling, &current)
+        };
+        index /= 2;
+    }
+
+    current == *expected_root
 }
 
 #[cfg(test)]

@@ -275,6 +275,42 @@ impl TrainingProofResultV2 {
 }
 
 // ============================================================================
+// EVM Proof Bundle
+// ============================================================================
+
+/// Complete bundle for on-chain proof submission.
+///
+/// Contains everything needed to verify a training proof on-chain via
+/// `Halo2Verifier.sol`: the serialized proof, public inputs, and the
+/// verification key parameters for contract deployment.
+#[derive(Debug, Clone)]
+pub struct EvmProofBundle {
+    /// 320-byte EVM-compatible proof (3 advice commitments + SHPLONK opening).
+    pub evm_proof: Vec<u8>,
+    /// 8 x 32-byte big-endian public inputs for Solidity `uint256[]`.
+    pub evm_public_inputs: Vec<[u8; 32]>,
+    /// VK data for Halo2Verifier constructor: G1 generator, s·G2, -G2.
+    pub vk_deployment_args: VkData,
+    /// The full proof result including metadata (loss, step number, etc).
+    pub result: TrainingProofResultV2,
+}
+
+impl EvmProofBundle {
+    /// Returns the EVM proof as a hex-encoded string (no `0x` prefix).
+    pub fn evm_proof_hex(&self) -> String {
+        self.evm_proof.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+
+    /// Returns public inputs as hex-encoded strings (no `0x` prefix).
+    pub fn evm_public_inputs_hex(&self) -> Vec<String> {
+        self.evm_public_inputs
+            .iter()
+            .map(|pi| pi.iter().map(|b| format!("{:02x}", b)).collect())
+            .collect()
+    }
+}
+
+// ============================================================================
 // Witness Validation
 // ============================================================================
 
@@ -893,6 +929,33 @@ impl MLTrainingProverV2 {
         })
     }
 
+    /// Generates a proof and exports everything needed for on-chain verification
+    /// in a single call: EVM proof bytes, public inputs, and VK deployment args.
+    ///
+    /// Returns an [`EvmProofBundle`] containing:
+    /// - `evm_proof`: 320-byte EVM-compatible proof
+    /// - `evm_public_inputs`: 8 x 32-byte big-endian public inputs
+    /// - `vk_deployment_args`: VK data for Halo2Verifier constructor
+    /// - The underlying `TrainingProofResultV2` for metadata
+    pub fn prove_and_export_evm(
+        &self,
+        witness: &MLTrainingStepV2Witness,
+    ) -> TrainingProverResult<EvmProofBundle> {
+        let result = self.prove(witness)?;
+
+        let evm_proof = result.to_evm_proof()
+            .map_err(TrainingProverError::EvmSerializationFailed)?;
+        let evm_public_inputs = result.to_evm_public_inputs();
+        let vk_deployment_args = self.export_vk_data()?;
+
+        Ok(EvmProofBundle {
+            evm_proof,
+            evm_public_inputs,
+            vk_deployment_args,
+            result,
+        })
+    }
+
     /// Clears the witness cache.
     pub fn clear_cache(&self) {
         if let Some(ref cache) = self.cache {
@@ -1004,7 +1067,108 @@ impl BatchTrainingProverV2 {
         )
     }
 
+    /// Proves a batch of training steps, failing immediately on the first error.
+    ///
+    /// Unlike [`prove_batch`] which tolerates failures and records them in
+    /// `failed_steps`, this method returns an error as soon as any step fails.
+    /// Use this when you require all proofs to succeed (e.g., on-chain submission).
+    pub fn prove_batch_strict(
+        &self,
+        initial_weights: TrainingWeights,
+        training_samples: &[(Vec<Fr>, Vec<Fr>)],
+        lr: Fr,
+    ) -> TrainingProverResult<BatchProofResult> {
+        self.prove_batch_strict_with_options(
+            initial_weights,
+            training_samples,
+            lr,
+            no_progress_callback(),
+            None,
+        )
+    }
+
+    /// Strict batch proving with progress callbacks and cancellation support.
+    ///
+    /// Returns `Err` on the first step failure instead of accumulating failures.
+    pub fn prove_batch_strict_with_options(
+        &self,
+        initial_weights: TrainingWeights,
+        training_samples: &[(Vec<Fr>, Vec<Fr>)],
+        lr: Fr,
+        progress: ProgressCallback,
+        cancel_token: Option<&CancellationToken>,
+    ) -> TrainingProverResult<BatchProofResult> {
+        if training_samples.is_empty() {
+            return Err(TrainingProverError::WitnessValidation {
+                message: "No training samples provided".to_string(),
+                field: "training_samples".to_string(),
+            });
+        }
+
+        let start = Instant::now();
+        let mut current_weights = initial_weights;
+        let mut proofs = Vec::with_capacity(training_samples.len());
+        let mut total_loss = Fr::zero();
+        let total_steps = training_samples.len();
+
+        for (step, (x, target)) in training_samples.iter().enumerate() {
+            if let Some(token) = cancel_token {
+                if token.is_cancelled() {
+                    return Err(TrainingProverError::Cancelled);
+                }
+            }
+
+            progress(ProofProgress {
+                phase: ProofPhase::Setup,
+                phase_progress: 0.0,
+                overall_progress: step as f64 / total_steps as f64,
+                elapsed: start.elapsed(),
+                estimated_remaining: None,
+                attempt: 0,
+                message: Some(format!("Training step {}/{}", step + 1, total_steps)),
+            });
+
+            let witness = MLTrainingProverV2::build_witness(
+                current_weights.d_in,
+                current_weights.d_hid,
+                current_weights.d_out,
+                x,
+                target,
+                &current_weights.w1,
+                &current_weights.b1,
+                &current_weights.w2,
+                &current_weights.b2,
+                lr,
+                (step + 1) as u64,
+                self.prover.config.base_error,
+            );
+
+            let result = self.prover.prove_with_options(&witness, progress.clone(), cancel_token)?;
+            total_loss = total_loss + result.loss;
+
+            current_weights.w1 = witness.w1_new.clone();
+            current_weights.b1 = witness.b1_new.clone();
+            current_weights.w2 = witness.w2_new.clone();
+            current_weights.b2 = witness.b2_new.clone();
+
+            proofs.push(result);
+        }
+
+        Ok(BatchProofResult {
+            proofs,
+            final_weights: current_weights,
+            total_loss,
+            num_steps: training_samples.len(),
+            failed_steps: Vec::new(),
+            total_time: start.elapsed(),
+        })
+    }
+
     /// Proves a batch with progress callbacks and cancellation support.
+    ///
+    /// Tolerates individual step failures and records them in `failed_steps`.
+    /// Always advances weights through each step (even failed ones) so that
+    /// subsequent steps compute correct state.
     pub fn prove_batch_with_options(
         &self,
         initial_weights: TrainingWeights,
@@ -1054,16 +1218,16 @@ impl BatchTrainingProverV2 {
                 self.prover.config.base_error,
             );
 
+            // Always advance weights through the witness computation so subsequent
+            // steps use the correct state, regardless of whether proving succeeds.
+            current_weights.w1 = witness.w1_new.clone();
+            current_weights.b1 = witness.b1_new.clone();
+            current_weights.w2 = witness.w2_new.clone();
+            current_weights.b2 = witness.b2_new.clone();
+
             match self.prover.prove_with_options(&witness, progress.clone(), cancel_token) {
                 Ok(result) => {
                     total_loss = total_loss + result.loss;
-
-                    // Update weights for next iteration
-                    current_weights.w1 = witness.w1_new.clone();
-                    current_weights.b1 = witness.b1_new.clone();
-                    current_weights.w2 = witness.w2_new.clone();
-                    current_weights.b2 = witness.b2_new.clone();
-
                     proofs.push(result);
                 }
                 Err(e) => {
@@ -1240,12 +1404,15 @@ mod tests {
 
     #[test]
     fn test_v2_prover_init() {
-        let _prover = MLTrainingProverV2::new(2, 2, 1);
+        // Use minimal config (k=12) instead of default (k=14) to avoid
+        // a 40-120s SRS generation that makes tests appear stuck.
+        let config = V2ProverConfig::minimal();
+        let _prover = MLTrainingProverV2::with_config(2, 2, 1, config);
     }
 
     #[test]
     fn test_witness_validation() {
-        let prover = MLTrainingProverV2::new(2, 2, 1);
+        // validate_witness is a pure function — no prover needed.
         let weights = small_model_weights();
 
         let witness = MLTrainingProverV2::build_witness(
