@@ -8,6 +8,8 @@ pub mod tensor;
 // Coordination and attestation types
 pub mod coordination;
 pub mod attestation;
+pub mod training_session;
+pub mod proof_chain;
 
 // Advanced error algebra modules
 pub mod probabilistic_error;
@@ -116,3 +118,14 @@ pub use coordination::{
 
 // Re-export attestation types
 pub use attestation::{AttestationChain, TrainingAttestation};
+
+// Re-export training session types
+pub use training_session::{
+    SessionPhase, TrainingSession, SessionConfig, SessionSummary,
+    ParticipantState, RoundSummary,
+};
+
+// Re-export proof chain types
+pub use proof_chain::{
+    ProofChain, ProofEntry, ChainVerification, ContinuityGap, SequenceError,
+};

@@ -183,6 +183,100 @@ impl ErrorCommitment {
     pub fn budget_limit_scaled(&self) -> u64 {
         Self::scale_to_u64(self.budget_limit)
     }
+
+    // ================================================================
+    // Contract-aligned methods
+    //
+    // The Solidity _computeErrorChecksum() function in HelixCoordinatorV2
+    // computes: SHA256(errorBound_LE64 || stepNumber_LE64 || modelId_32 || errorBudget_LE64)
+    // and returns the first 8 bytes interpreted as a little-endian u64.
+    //
+    // This is the CANONICAL format for public input PI[7] in ZK proofs.
+    // The circuit must produce this exact u64 value as its error checksum
+    // public input, NOT a 32-byte Fr representation.
+    //
+    // Use `to_contract_u64()` when:
+    //   - Building ZK circuit public inputs (PI[7])
+    //   - Verifying against on-chain state
+    //   - Comparing checksums across Rust and Solidity
+    // ================================================================
+
+    /// Returns the error checksum in the exact format expected by the
+    /// Solidity `_computeErrorChecksum()` function.
+    ///
+    /// This is an 8-byte little-endian u64 derived from the first 8 bytes
+    /// of SHA256(errorBound_LE64 || stepNumber_LE64 || modelId_32 || errorBudget_LE64).
+    ///
+    /// This is the canonical representation for ZK circuit public inputs (PI[7])
+    /// and on-chain verification. It is identical to `checksum_compact()` but
+    /// carries explicit documentation about contract compatibility.
+    ///
+    /// # Contract alignment
+    ///
+    /// The preimage layout (56 bytes) matches Solidity assembly exactly:
+    /// - Bytes 0..8: `errorBound` as LE u64 (Solidity byte-swaps from BE)
+    /// - Bytes 8..16: `stepNumber` as LE u64 (Solidity byte-swaps from BE)
+    /// - Bytes 16..48: `modelId` as raw 32 bytes (Solidity stores as BE uint256)
+    /// - Bytes 48..56: `errorBudget` as LE u64 (Solidity byte-swaps from BE)
+    ///
+    /// The output is: first 8 bytes of SHA256 hash, read as `u64::from_le_bytes`.
+    /// Solidity extracts these same bytes via `shr(192, hash)` then byte-swaps to LE.
+    pub fn to_contract_u64(&self) -> u64 {
+        self.checksum_compact()
+    }
+
+    /// Builds the 8 public inputs array matching the contract's `submitProof()` format.
+    ///
+    /// Returns `[oldHashLo, oldHashHi, newHashLo, newHashHi, loss, errorBound, stepNumber, errorChecksum]`
+    /// as u64 values suitable for ZK circuit public inputs.
+    ///
+    /// # Arguments
+    /// * `old_weight_hash` - Hash of weights before this step (split into lo/hi u128)
+    /// * `new_weight_hash` - Hash of weights after this step (split into lo/hi u128)
+    /// * `loss` - Training loss value (scaled to u64)
+    pub fn to_public_inputs(
+        &self,
+        old_hash_lo: u64,
+        old_hash_hi: u64,
+        new_hash_lo: u64,
+        new_hash_hi: u64,
+        loss_scaled: u64,
+    ) -> [u64; 8] {
+        [
+            old_hash_lo,
+            old_hash_hi,
+            new_hash_lo,
+            new_hash_hi,
+            loss_scaled,
+            self.accumulated_error_scaled(),
+            self.step_number,
+            self.to_contract_u64(),
+        ]
+    }
+
+    /// Verifies that a given u64 checksum matches what the contract would compute
+    /// for the same parameters.
+    ///
+    /// Use this to validate public inputs received from other participants or
+    /// to verify proof public inputs before on-chain submission.
+    pub fn verify_contract_checksum(&self, candidate: u64) -> bool {
+        self.to_contract_u64() == candidate
+    }
+
+    /// Converts a Solidity `uint256` model ID to the `[u8; 32]` format used in Rust.
+    ///
+    /// Solidity stores `uint256` in big-endian (MSB first), which maps directly to
+    /// `[u8; 32]` in Rust. For example:
+    /// - Solidity `uint256(1)` -> Rust `[0,0,...,0,1]` (value at index 31)
+    /// - Solidity `uint256(256)` -> Rust `[0,0,...,1,0]` (value at index 30)
+    ///
+    /// This helper exists to document the convention and prevent byte-order mistakes.
+    pub fn model_id_from_uint256(value: u64) -> [u8; 32] {
+        let mut bytes = [0u8; 32];
+        // uint256 is big-endian: least significant byte at index 31
+        bytes[24..32].copy_from_slice(&value.to_be_bytes());
+        bytes
+    }
 }
 
 /// Builder for creating ErrorCommitment instances.
@@ -720,5 +814,81 @@ mod tests {
         let expected_hash: [u8; 32] = hasher.finalize().into();
 
         assert_eq!(commitment.compute_checksum(), expected_hash);
+    }
+
+    // === Contract-aligned method tests ===
+
+    #[test]
+    fn test_to_contract_u64_matches_checksum_compact() {
+        let commitment = ErrorCommitment::new(0.001, 42, [1u8; 32], 0.01);
+        assert_eq!(commitment.to_contract_u64(), commitment.checksum_compact());
+    }
+
+    #[test]
+    fn test_verify_contract_checksum() {
+        let commitment = ErrorCommitment::new(0.001, 42, [1u8; 32], 0.01);
+        let correct = commitment.to_contract_u64();
+        assert!(commitment.verify_contract_checksum(correct));
+        assert!(!commitment.verify_contract_checksum(correct + 1));
+    }
+
+    #[test]
+    fn test_to_public_inputs() {
+        let commitment = ErrorCommitment::new(0.001, 42, [1u8; 32], 0.01);
+        let pi = commitment.to_public_inputs(100, 200, 300, 400, 500);
+
+        assert_eq!(pi[0], 100); // old_hash_lo
+        assert_eq!(pi[1], 200); // old_hash_hi
+        assert_eq!(pi[2], 300); // new_hash_lo
+        assert_eq!(pi[3], 400); // new_hash_hi
+        assert_eq!(pi[4], 500); // loss
+        assert_eq!(pi[5], commitment.accumulated_error_scaled()); // errorBound
+        assert_eq!(pi[6], 42);  // stepNumber
+        assert_eq!(pi[7], commitment.to_contract_u64()); // errorChecksum
+    }
+
+    #[test]
+    fn test_model_id_from_uint256() {
+        // Solidity uint256(1) = big-endian [0,0,...,0,1]
+        let id = ErrorCommitment::model_id_from_uint256(1);
+        assert_eq!(id[31], 1);
+        assert_eq!(id[30], 0);
+        for i in 0..24 {
+            assert_eq!(id[i], 0);
+        }
+
+        // Solidity uint256(256) = [0,0,...,1,0]
+        let id = ErrorCommitment::model_id_from_uint256(256);
+        assert_eq!(id[30], 1);
+        assert_eq!(id[31], 0);
+
+        // Verify consistency with cross-language test (modelId=1)
+        let mut expected = [0u8; 32];
+        expected[31] = 1;
+        assert_eq!(ErrorCommitment::model_id_from_uint256(1), expected);
+    }
+
+    #[test]
+    fn test_contract_u64_cross_language_alignment() {
+        // This test verifies that to_contract_u64() produces the exact same value
+        // as Solidity _computeErrorChecksum() for known inputs.
+        use sha2::{Digest, Sha256};
+
+        let model_id = ErrorCommitment::model_id_from_uint256(1);
+        let commitment = ErrorCommitment::new(0.001, 42, model_id, 0.01);
+
+        // Manually compute what Solidity would produce
+        let mut preimage = Vec::with_capacity(56);
+        preimage.extend_from_slice(&1_000_000_000u64.to_le_bytes()); // 0.001 * 1e12
+        preimage.extend_from_slice(&42u64.to_le_bytes());
+        preimage.extend_from_slice(&model_id);
+        preimage.extend_from_slice(&10_000_000_000u64.to_le_bytes()); // 0.01 * 1e12
+
+        let mut hasher = Sha256::new();
+        hasher.update(&preimage);
+        let hash = hasher.finalize();
+        let solidity_result = u64::from_le_bytes(hash[0..8].try_into().unwrap());
+
+        assert_eq!(commitment.to_contract_u64(), solidity_result);
     }
 }

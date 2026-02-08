@@ -71,3 +71,19 @@ pub use types::{
     AttestationChain, GradientCommitment, NodeId, RoundDescriptor, SessionId,
     TrainingAttestation, TrainingParams, TrainingStepReceipt,
 };
+
+// Training session orchestration
+pub use types::{
+    SessionConfig, SessionPhase, SessionSummary, TrainingSession,
+};
+
+// Proof chain for state hash continuity
+pub use types::{
+    ChainVerification, ProofChain, ProofEntry,
+};
+
+// CSV/binary data loading
+pub use data::{CsvDataLoader, CsvLoaderConfig, Normalization};
+
+// Model checkpoints
+pub use data::{CheckpointErrorState, CheckpointLayer, CheckpointTensor, ModelCheckpoint};

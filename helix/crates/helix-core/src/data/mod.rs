@@ -11,7 +11,9 @@
 //! - Data provenance tracking
 //! - Multi-source data fetching (IPFS, Filecoin, S3)
 
+pub mod checkpoint;
 pub mod commitment;
+pub mod csv_loader;
 pub mod dataset;
 pub mod dataset_registry;
 pub mod ipfs;
@@ -114,6 +116,16 @@ pub use dataset_registry::{
     DatasetCommitment as DatasetCommitmentEntry, DatasetCommitmentRegistry,
     DatasetEntry, DatasetId, DatasetMetadata as DatasetRegistryMetadata,
     DatasetStatus, RegistryConfig, RegistryError, RegistryResult, RegistryStats,
+};
+
+// Re-export CSV/binary data loader types
+pub use csv_loader::{
+    CsvDataLoader, CsvLoaderConfig, Normalization,
+};
+
+// Re-export model checkpoint types
+pub use checkpoint::{
+    CheckpointErrorState, CheckpointLayer, CheckpointTensor, ModelCheckpoint,
 };
 
 // ============================================================================
