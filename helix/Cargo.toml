@@ -8,5 +8,14 @@ members = [
     "crates/helix-node",
     "crates/helix-client",
     "crates/helix-mpc",
+    "crates/helix-demo",
     "tests",
 ]
+
+[workspace.metadata.demo]
+# Shared SRS parameter: k=14 (2^14 = 16K rows) for demo-sized models
+srs_k = 14
+# Model dimensions for the demo: 2-layer MLP (d_in=2, d_hid=4, d_out=1)
+model_d_in = 2
+model_d_hid = 4
+model_d_out = 1

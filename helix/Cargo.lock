@@ -2804,6 +2804,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "helix-demo"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "ethers",
+ "halo2curves",
+ "helix-avm",
+ "helix-circuits",
+ "helix-core",
+ "helix-mpc",
+ "helix-node",
+ "helix-prover",
+ "hex",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "helix-integration-tests"
 version = "0.1.0"
 dependencies = [
