@@ -22,7 +22,7 @@
 use halo2_proofs::{
     arithmetic::Field,
     circuit::{AssignedCell, Layouter, Region, Value},
-    plonk::{Advice, Column, ConstraintSystem, Error, Selector, TableColumn},
+    plonk::{Advice, Column, ConstraintSystem, Error, ErrorFront, Selector, TableColumn},
     poly::Rotation,
 };
 use halo2curves::ff::PrimeField;
@@ -138,13 +138,13 @@ impl<F: PrimeField, const RANGE: usize> ReLUChip<F, RANGE> {
     }
 
     /// Loads the ReLU lookup table.
-    pub fn load(&self, layouter: &mut impl Layouter<F>) -> Result<(), Error> {
+    pub fn load(&self, layouter: &mut impl Layouter<F>) -> Result<(), ErrorFront> {
         let chip = PlookupChip::new(self.config.inner.clone());
         chip.load_table(layouter, &self.lookup.table)
     }
 
     /// Loads the ReLU lookup table with padding.
-    pub fn load_padded(&self, layouter: &mut impl Layouter<F>, min_rows: usize) -> Result<(), Error> {
+    pub fn load_padded(&self, layouter: &mut impl Layouter<F>, min_rows: usize) -> Result<(), ErrorFront> {
         let chip = PlookupChip::new(self.config.inner.clone());
         chip.load_table_padded(layouter, &self.lookup.table, min_rows)
     }
@@ -156,7 +156,7 @@ impl<F: PrimeField, const RANGE: usize> ReLUChip<F, RANGE> {
         row: usize,
         input: Value<F>,
         output: Value<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let chip = PlookupChip::new(self.config.inner.clone());
         chip.lookup_single(region, row, input, output)
     }
@@ -167,7 +167,7 @@ impl<F: PrimeField, const RANGE: usize> ReLUChip<F, RANGE> {
         region: &mut Region<'_, F>,
         row: usize,
         input: Value<F>,
-    ) -> Result<AssignedCell<F, F>, Error> {
+    ) -> Result<AssignedCell<F, F>, ErrorFront> {
         self.config.s_relu.enable(region, row)?;
 
         region.assign_advice(
@@ -655,7 +655,7 @@ mod tests {
             &self,
             config: Self::Config,
             mut layouter: impl Layouter<Fr>,
-        ) -> Result<(), Error> {
+        ) -> Result<(), ErrorFront> {
             let chip = ReLUChip::<Fr, 256>::new(config);
             chip.load_padded(&mut layouter, 1024)?;
 

@@ -21,7 +21,7 @@
 
 use halo2_proofs::{
     dev::MockProver,
-    plonk::{Circuit, ConstraintSystem, Error},
+    plonk::{Circuit, ConstraintSystem, Error, ErrorFront},
 };
 use halo2curves::bn256::Fr;
 use std::collections::HashMap;

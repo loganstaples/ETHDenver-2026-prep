@@ -35,7 +35,7 @@
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
     plonk::{
-        Advice, Circuit, Column, ConstraintSystem, Error, Expression, Instance, Selector,
+        Advice, Circuit, Column, ConstraintSystem, Error, ErrorFront, Expression, Instance, Selector,
         TableColumn,
     },
     poly::Rotation,
@@ -215,7 +215,7 @@ impl<F: PrimeField> TransformerBlockChip<F> {
         });
 
         // GELU lookup
-        meta.lookup(|meta| {
+        meta.lookup("transformer_activation", |meta| {
             let s = meta.query_selector(s_gelu);
             let input = meta.query_advice(advice[0], Rotation::cur());
             let output = meta.query_advice(advice[1], Rotation::cur());
@@ -251,7 +251,7 @@ impl<F: PrimeField> TransformerBlockChip<F> {
         layouter: &mut impl Layouter<F>,
         range: usize,
         scale: u64,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let scale_f = scale as f64;
         layouter.assign_table(
             || "gelu_table",
@@ -302,7 +302,7 @@ impl<F: PrimeField> TransformerBlockChip<F> {
         &self,
         mut layouter: impl Layouter<F>,
         witness: &TransformerBlockWitness<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let seq_len = witness.seq_len;
         let d_model = witness.d_model;
 
@@ -422,7 +422,7 @@ impl<F: PrimeField> TransformerBlockChip<F> {
         beta: &[F],
         seq_len: usize,
         d_model: usize,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         // Simplified layer norm verification - just verify output matches expected
         // In production, this would verify each step in detail
         for s in 0..seq_len {
@@ -463,7 +463,7 @@ impl<F: PrimeField> TransformerBlockChip<F> {
         d_k: usize,
         d_v: usize,
         d_model: usize,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         // Simplified attention verification - verify key relationships
         // In production, this would use Freivalds for matrix multiplication
 
@@ -534,7 +534,7 @@ impl<F: PrimeField> TransformerBlockChip<F> {
         output: &[Vec<F>],
         seq_len: usize,
         d_model: usize,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         for s in 0..seq_len {
             for d in 0..d_model {
                 let expected = input[s][d] + main[s][d];
@@ -581,7 +581,7 @@ impl<F: PrimeField> TransformerBlockChip<F> {
         seq_len: usize,
         d_model: usize,
         d_ff: usize,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         // FFN: output = W2 * GELU(W1 * input + b1) + b2
 
         // Verify first linear layer + activation for representative positions
@@ -1293,7 +1293,7 @@ impl<F: PrimeField> Circuit<F> for TransformerBlockCircuit<F> {
         &self,
         config: Self::Config,
         mut layouter: impl Layouter<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let chip = TransformerBlockChip::new(config.clone());
 
         // Load GELU table
@@ -1364,7 +1364,7 @@ impl<F: PrimeField> Circuit<F> for TransformerCircuit<F> {
         &self,
         config: Self::Config,
         mut layouter: impl Layouter<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let chip = TransformerBlockChip::new(config.clone());
 
         // Load GELU table once

@@ -12,7 +12,7 @@ use crate::gadgets::arithmetic::{ArithmeticChip, ArithmeticConfig};
 use crate::gadgets::range::{RangeChip, RangeConfig};
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
-    plonk::{Circuit, Column, Advice, ConstraintSystem, Error, Selector, Instance},
+    plonk::{Circuit, Column, Advice, ConstraintSystem, Error, ErrorFront, Selector, Instance},
     poly::Rotation,
 };
 use halo2curves::ff::PrimeField;
@@ -146,7 +146,7 @@ impl<F: PrimeField, const RANGE: usize> ErrorAccumulationChip<F, RANGE> {
         err_a: Value<F>,
         err_b: Value<F>,
         err_result: Value<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         layouter.assign_region(
             || "add error propagation",
             |mut region| {
@@ -169,7 +169,7 @@ impl<F: PrimeField, const RANGE: usize> ErrorAccumulationChip<F, RANGE> {
         val_b: Value<F>,
         err_b: Value<F>,
         err_result: Value<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         // Compute intermediate terms
         let term1 = val_a * err_b;  // |a| * err_b
         let term2 = val_b * err_a;  // |b| * err_a
@@ -244,7 +244,7 @@ impl<F: PrimeField, const RANGE: usize> ErrorAccumulationChip<F, RANGE> {
         mut layouter: impl Layouter<F>,
         operations: &[OperationWitness<F>],
         max_allowed_error: Value<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         if operations.is_empty() {
             return Ok(());
         }
@@ -439,7 +439,7 @@ impl<F: PrimeField, const RANGE: usize> Circuit<F> for ErrorAccumulationCircuit<
         &self,
         config: Self::Config,
         mut layouter: impl Layouter<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let range_chip = RangeChip::<F, RANGE>::new(config.range.clone());
         range_chip.load(&mut layouter)?;
         

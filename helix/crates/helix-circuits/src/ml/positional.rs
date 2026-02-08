@@ -23,7 +23,7 @@
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
     plonk::{
-        Advice, Circuit, Column, ConstraintSystem, Error, Expression, Fixed, Instance, Selector,
+        Advice, Circuit, Column, ConstraintSystem, Error, ErrorFront, Expression, Fixed, Instance, Selector,
         TableColumn,
     },
     poly::Rotation,
@@ -122,7 +122,7 @@ impl<F: PrimeField> PositionalChip<F> {
         });
 
         // Sin lookup
-        meta.lookup(|meta| {
+        meta.lookup("positional_sin", |meta| {
             let s = meta.query_selector(s_sin);
             let input = meta.query_advice(advice[0], Rotation::cur());
             let output = meta.query_advice(advice[1], Rotation::cur());
@@ -133,7 +133,7 @@ impl<F: PrimeField> PositionalChip<F> {
         });
 
         // Cos lookup
-        meta.lookup(|meta| {
+        meta.lookup("positional_cos", |meta| {
             let s = meta.query_selector(s_cos);
             let input = meta.query_advice(advice[0], Rotation::cur());
             let output = meta.query_advice(advice[1], Rotation::cur());
@@ -163,7 +163,7 @@ impl<F: PrimeField> PositionalChip<F> {
         &self,
         layouter: &mut impl Layouter<F>,
         table_size: usize,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let scale = TRIG_SCALE as f64;
 
         // Load sin table
@@ -257,7 +257,7 @@ impl<F: PrimeField> PositionalChip<F> {
         &self,
         mut layouter: impl Layouter<F>,
         witness: &PositionalWitness<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let seq_len = witness.positions.len();
         let d_model = witness.pos_encodings.get(0).map(|e| e.len()).unwrap_or(0);
 
@@ -612,7 +612,7 @@ impl<F: PrimeField> Circuit<F> for PositionalCircuit<F> {
         &self,
         config: Self::Config,
         mut layouter: impl Layouter<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let chip = PositionalChip::new(config.clone());
 
         // Load trig tables if using sinusoidal

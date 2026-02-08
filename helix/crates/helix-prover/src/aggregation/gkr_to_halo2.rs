@@ -24,7 +24,7 @@ use crate::backends::{BackendError, BackendResult, ProofData, BackendId};
 use helix_circuits::halo2curves::bn256::Fr;
 use helix_circuits::halo2_proofs::arithmetic::Field;
 use helix_circuits::halo2curves::ff::PrimeField;
-use helix_circuits::halo2_proofs::plonk::{Circuit, ConstraintSystem, Error as PlonkError};
+use helix_circuits::halo2_proofs::plonk::{Circuit, ConstraintSystem, ErrorFront};
 use helix_circuits::halo2_proofs::circuit::{Layouter, SimpleFloorPlanner, Value};
 use sha2::{Sha256, Digest};
 use std::marker::PhantomData;
@@ -76,16 +76,16 @@ impl GKRProofCommitment {
         // Hash the output
         let mut output_bytes = Vec::new();
         for v in &proof.claimed_output {
-            output_bytes.extend_from_slice(&v.to_repr());
+            output_bytes.extend_from_slice(v.to_repr().as_ref());
         }
         let output_commitment = Self::hash(&output_bytes);
 
         // Hash public inputs
         let mut pi_bytes = Vec::new();
         for v in &proof.input_claim.0 {
-            pi_bytes.extend_from_slice(&v.to_repr());
+            pi_bytes.extend_from_slice(v.to_repr().as_ref());
         }
-        pi_bytes.extend_from_slice(&proof.input_claim.1.to_repr());
+        pi_bytes.extend_from_slice(proof.input_claim.1.to_repr().as_ref());
         let public_inputs_hash = Self::hash(&pi_bytes);
 
         // Hash metadata
@@ -251,7 +251,7 @@ impl Circuit<Fr> for GKRVerificationCircuit {
         &self,
         _config: Self::Config,
         _layouter: impl Layouter<Fr>,
-    ) -> Result<(), PlonkError> {
+    ) -> Result<(), ErrorFront> {
         // Placeholder synthesis
         // A full implementation would:
         // 1. Load commitments as witnesses
@@ -403,7 +403,7 @@ impl GKRToHalo2Aggregator {
         proof_bytes.extend_from_slice(&proof.aggregation_proof);
 
         // Serialize total error
-        proof_bytes.extend_from_slice(&proof.total_error.to_repr());
+        proof_bytes.extend_from_slice(proof.total_error.to_repr().as_ref());
 
         ProofData {
             backend: BackendId::Hybrid,

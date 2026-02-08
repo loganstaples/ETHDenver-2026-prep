@@ -24,7 +24,7 @@ use halo2_proofs::{
     arithmetic::Field,
     circuit::{AssignedCell, Layouter, Region, SimpleFloorPlanner, Value},
     plonk::{
-        Advice, Circuit, Column, ConstraintSystem, Error, Expression, Fixed,
+        Advice, Circuit, Column, ConstraintSystem, Error, ErrorFront, Expression, Fixed,
         Instance, Selector, TableColumn,
     },
     poly::Rotation,
@@ -496,7 +496,7 @@ impl<F: PrimeField> CalibrationChip<F> {
         region: &mut Region<'_, F>,
         row: usize,
         witness: &CalibrationWitness<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         self.config.s_minmax.enable(region, row)?;
 
         region.assign_advice(|| "data_min", self.config.data_min, row, || Value::known(witness.data_min))?;
@@ -516,7 +516,7 @@ impl<F: PrimeField> CalibrationChip<F> {
         value: Value<F>,
         min: Value<F>,
         max: Value<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         self.config.s_range_check.enable(region, row)?;
 
         region.assign_advice(|| "value", self.config.aux[0], row, || value)?;
@@ -588,7 +588,7 @@ impl<F: PrimeField> Circuit<F> for CalibrationCircuit<F> {
         &self,
         config: Self::Config,
         mut layouter: impl Layouter<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let chip = CalibrationChip::new(config.clone());
 
         layouter.assign_region(

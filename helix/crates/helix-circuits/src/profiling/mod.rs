@@ -39,7 +39,7 @@ pub use timing::{
     WitnessGenerationTiming, SynthesisTiming, ProvingTiming,
 };
 
-use halo2_proofs::plonk::{Circuit, Error};
+use halo2_proofs::plonk::{Circuit, Error, ErrorFront};
 use halo2curves::bn256::Fr;
 use std::time::{Duration, Instant};
 use std::collections::HashMap;

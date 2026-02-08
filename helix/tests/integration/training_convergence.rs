@@ -93,7 +93,7 @@ fn test_convergence_gradients_nonzero() {
     assert!(weights_changed, "Weights should change during training");
 
     // Proof should still verify
-    let proof = prover.prove(&witness);
+    let proof = prover.prove(&witness).unwrap();
     assert!(prover.verify_result(&proof), "Proof should verify");
 }
 
@@ -123,7 +123,7 @@ fn test_convergence_state_transitions() {
         Fr::from(1u64),
     );
 
-    let proof = prover.prove(&witness);
+    let proof = prover.prove(&witness).unwrap();
 
     // State should change
     assert_ne!(
@@ -373,8 +373,8 @@ fn test_convergence_learning_rate_effect() {
     // Both should produce valid proofs
     let prover = MLTrainingProverV2::new(dims.d_in, dims.d_hid, dims.d_out);
 
-    let proof_small = prover.prove(&witness_small_lr);
-    let proof_large = prover.prove(&witness_large_lr);
+    let proof_small = prover.prove(&witness_small_lr).unwrap();
+    let proof_large = prover.prove(&witness_large_lr).unwrap();
 
     assert!(prover.verify_result(&proof_small), "Small LR proof should verify");
     assert!(prover.verify_result(&proof_large), "Large LR proof should verify");
@@ -503,7 +503,7 @@ fn test_convergence_zero_inputs() {
     );
 
     // Should still produce valid proof
-    let proof = prover.prove(&witness);
+    let proof = prover.prove(&witness).unwrap();
     assert!(prover.verify_result(&proof), "Zero input should produce valid proof");
 }
 
@@ -533,7 +533,7 @@ fn test_convergence_zero_targets() {
         Fr::from(1u64),
     );
 
-    let proof = prover.prove(&witness);
+    let proof = prover.prove(&witness).unwrap();
     assert!(prover.verify_result(&proof), "Zero target should produce valid proof");
 }
 

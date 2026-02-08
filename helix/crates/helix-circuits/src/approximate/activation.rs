@@ -6,7 +6,7 @@
 use crate::gadgets::range::{RangeChip, RangeConfig};
 use halo2_proofs::{
     circuit::{Layouter, Value},
-    plonk::{Error, Selector},
+    plonk::{Error, ErrorFront, Selector},
 };
 use halo2curves::ff::PrimeField;
 
@@ -32,7 +32,7 @@ impl<F: PrimeField, const RANGE: usize> ReLUChip<F, RANGE> {
         Self { config, range_chip, arithmetic_chip }
     }
     
-    fn enforce_sum(&self, mut layouter: impl Layouter<F>, a: Value<F>, b: Value<F>, c: Value<F>) -> Result<(), Error> {
+    fn enforce_sum(&self, mut layouter: impl Layouter<F>, a: Value<F>, b: Value<F>, c: Value<F>) -> Result<(), ErrorFront> {
         layouter.assign_region(
             || "enforce sum",
             |mut region| {
@@ -45,7 +45,7 @@ impl<F: PrimeField, const RANGE: usize> ReLUChip<F, RANGE> {
         )
     }
 
-    fn enforce_product(&self, mut layouter: impl Layouter<F>, a: Value<F>, b: Value<F>, c: Value<F>) -> Result<(), Error> {
+    fn enforce_product(&self, mut layouter: impl Layouter<F>, a: Value<F>, b: Value<F>, c: Value<F>) -> Result<(), ErrorFront> {
         layouter.assign_region(
             || "enforce product",
             |mut region| {
@@ -65,7 +65,7 @@ impl<F: PrimeField, const RANGE: usize> ReLUChip<F, RANGE> {
         err_x: Value<F>,
         val_y: Value<F>,
         err_y: Value<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         // Logic:
         // if x > 0: y = x, err_y = err_x
         // else:     y = 0, err_y = 0

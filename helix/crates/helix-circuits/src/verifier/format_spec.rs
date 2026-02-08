@@ -538,21 +538,21 @@ pub fn verify_commitment(
 /// Serializes raw Halo2 transcript bytes into the EVM-compatible proof format.
 ///
 /// Halo2's `create_proof` writes a transcript containing G1 commitments and
-/// scalar evaluations in little-endian (Fq/Fr repr) order. This function
-/// extracts the key proof elements and repacks them in the big-endian 320-byte
-/// format that `Halo2Verifier.sol`'s `_readPoint` / `_parseProofOptimized` expects.
+/// scalar evaluations. G1 points are written in **compressed** format (32 bytes
+/// each via `GroupEncoding::to_bytes()`), and scalars are 32 bytes (LE `Fr::to_repr()`).
 ///
-/// # Halo2 KZG Transcript Layout (approximate)
+/// This function extracts the key proof elements and repacks them in the
+/// big-endian 320-byte format that `Halo2Verifier.sol` expects.
 ///
-/// The transcript written by `create_proof` with KZG contains:
-/// 1. Advice commitments: one G1 point per advice column (32+32 bytes each, LE)
-/// 2. Challenge scalars (squeezed, not written to transcript bytes)
-/// 3. Auxiliary commitments (permutation, lookup, vanishing)
-/// 4. Evaluation scalars (advice evals, fixed evals, etc.)
-/// 5. Opening proof: W point (32+32 bytes, LE) and W' point (32+32 bytes, LE)
+/// # Halo2 KZG Transcript Layout
 ///
-/// Since the exact transcript length depends on the circuit configuration,
-/// this function accepts explicit point indices for flexibility.
+/// The transcript written by `create_proof` with SHPLONK contains:
+/// 1. Advice commitments: one compressed G1 point per advice column (32 bytes each)
+/// 2. Intermediate commitments (lookup, permutation, vanishing — variable)
+/// 3. Evaluation scalars (32 bytes each)
+/// 4. Opening proof: H point (32 bytes) and H' point (32 bytes)
+///
+/// Advice commitments are always first; SHPLONK opening proof points are always last.
 ///
 /// # Arguments
 /// * `transcript_bytes` - Raw bytes from Halo2's `TranscriptWriterBuffer`
@@ -567,12 +567,11 @@ pub fn serialize_proof_for_evm(
     transcript_bytes: &[u8],
     num_advice_columns: usize,
 ) -> Result<Vec<u8>, ProofFormatError> {
-    // Each G1 point in Halo2's LE transcript is 32 bytes x + 32 bytes y = 64 bytes
-    const HALO2_POINT_SIZE: usize = 64;
+    // Each G1 point in Halo2's transcript is 32 bytes (compressed via GroupEncoding)
+    const HALO2_COMPRESSED_POINT_SIZE: usize = 32;
 
-    // We need at least num_advice_columns advice commits.
-    // The opening proof W and W' are the last two G1 points in the transcript.
-    let min_size = num_advice_columns * HALO2_POINT_SIZE + 2 * HALO2_POINT_SIZE;
+    // We need at least num_advice_columns advice commits + 2 opening proof points.
+    let min_size = (num_advice_columns + 2) * HALO2_COMPRESSED_POINT_SIZE;
     if transcript_bytes.len() < min_size {
         return Err(ProofFormatError::TooShort {
             got: transcript_bytes.len(),
@@ -582,14 +581,13 @@ pub fn serialize_proof_for_evm(
 
     let mut evm_proof = Vec::with_capacity(MIN_PROOF_SIZE);
 
-    // Extract advice commitments (first num_advice_columns G1 points)
-    // Halo2 writes them in little-endian Fq coordinates
+    // Extract advice commitments (first num_advice_columns compressed G1 points)
     let advice_count = std::cmp::min(num_advice_columns, NUM_ADVICE_COMMITS);
     for i in 0..NUM_ADVICE_COMMITS {
         if i < advice_count {
-            let offset = i * HALO2_POINT_SIZE;
-            let point = read_halo2_g1_point(
-                &transcript_bytes[offset..offset + HALO2_POINT_SIZE],
+            let offset = i * HALO2_COMPRESSED_POINT_SIZE;
+            let point = read_halo2_compressed_g1(
+                &transcript_bytes[offset..offset + HALO2_COMPRESSED_POINT_SIZE],
                 i,
             )?;
             evm_proof.extend_from_slice(&g1_to_evm_bytes(&point));
@@ -599,85 +597,61 @@ pub fn serialize_proof_for_evm(
         }
     }
 
-    // Extract opening proof points W and W' (last two G1 points in transcript)
-    let w_offset = transcript_bytes.len() - 2 * HALO2_POINT_SIZE;
-    let wp_offset = transcript_bytes.len() - HALO2_POINT_SIZE;
+    // Extract SHPLONK opening proof points H and H' (last two compressed G1 points)
+    let hp_offset = transcript_bytes.len() - HALO2_COMPRESSED_POINT_SIZE;
+    let h_offset = hp_offset - HALO2_COMPRESSED_POINT_SIZE;
 
-    let w = read_halo2_g1_point(
-        &transcript_bytes[w_offset..w_offset + HALO2_POINT_SIZE],
+    let h = read_halo2_compressed_g1(
+        &transcript_bytes[h_offset..h_offset + HALO2_COMPRESSED_POINT_SIZE],
         NUM_ADVICE_COMMITS,
     )?;
-    let w_prime = read_halo2_g1_point(
-        &transcript_bytes[wp_offset..wp_offset + HALO2_POINT_SIZE],
+    let h_prime = read_halo2_compressed_g1(
+        &transcript_bytes[hp_offset..hp_offset + HALO2_COMPRESSED_POINT_SIZE],
         NUM_ADVICE_COMMITS + 1,
     )?;
 
-    evm_proof.extend_from_slice(&g1_to_evm_bytes(&w));
-    evm_proof.extend_from_slice(&g1_to_evm_bytes(&w_prime));
+    evm_proof.extend_from_slice(&g1_to_evm_bytes(&h));
+    evm_proof.extend_from_slice(&g1_to_evm_bytes(&h_prime));
 
     debug_assert_eq!(evm_proof.len(), MIN_PROOF_SIZE);
     Ok(evm_proof)
 }
 
-/// Reads a G1 point from Halo2's little-endian transcript format.
+/// Reads a G1 point from Halo2's compressed transcript format.
 ///
-/// Halo2 writes Fq coordinates in their `to_repr()` format (32-byte little-endian).
-/// This converts to G1Affine, validating curve membership.
-fn read_halo2_g1_point(bytes: &[u8], point_index: usize) -> Result<G1Affine, ProofFormatError> {
-    if bytes.len() < 64 {
+/// Halo2 writes G1 points via `GroupEncoding::to_bytes()` which produces a
+/// 32-byte compressed representation (x-coordinate with sign flag in the
+/// highest bits for BN254's `TwoSpare` encoding).
+fn read_halo2_compressed_g1(bytes: &[u8], point_index: usize) -> Result<G1Affine, ProofFormatError> {
+    use halo2curves::group::GroupEncoding;
+
+    if bytes.len() < 32 {
         return Err(ProofFormatError::TooShort {
             got: bytes.len(),
-            min: 64,
+            min: 32,
         });
     }
 
-    let x_le: [u8; 32] = bytes[..32].try_into().unwrap();
-    let y_le: [u8; 32] = bytes[32..64].try_into().unwrap();
+    let compressed: [u8; 32] = bytes[..32].try_into().unwrap();
 
-    // Check for point at infinity
-    if x_le == [0u8; 32] && y_le == [0u8; 32] {
+    // Check for point at infinity (all zeros)
+    if compressed == [0u8; 32] {
         return Ok(G1Affine::identity());
     }
 
-    // Parse as Fq (little-endian is the native repr for halo2curves)
-    let x = Fq::from_repr(x_le.into());
-    let y = Fq::from_repr(y_le.into());
-
-    let x: Fq = if bool::from(x.is_some()) {
-        x.unwrap()
-    } else {
-        // Convert LE bytes to BE for error reporting
-        let mut x_be = x_le;
-        x_be.reverse();
-        return Err(ProofFormatError::FieldOverflow {
-            index: point_index * 2,
-            value: x_be,
-        });
-    };
-
-    let y: Fq = if bool::from(y.is_some()) {
-        y.unwrap()
-    } else {
-        let mut y_be = y_le;
-        y_be.reverse();
-        return Err(ProofFormatError::FieldOverflow {
-            index: point_index * 2 + 1,
-            value: y_be,
-        });
-    };
-
-    let ct_point = G1Affine::from_xy(x, y);
+    // Decompress using GroupEncoding (handles flag bits and curve membership check)
+    let repr = <G1Affine as GroupEncoding>::Repr::from(compressed);
+    let ct_point = G1Affine::from_bytes(&repr);
     if bool::from(ct_point.is_some()) {
         Ok(ct_point.unwrap())
     } else {
-        let mut x_be = x_le;
-        let mut y_be = y_le;
-        x_be.reverse();
-        y_be.reverse();
+        // Report as PointNotOnCurve — decompression failed
+        let mut be_bytes = compressed;
+        be_bytes.reverse();
         Err(ProofFormatError::PointNotOnCurve {
             point_index,
-            x: x_be,
-            y: y_be,
+            x: be_bytes,
+            y: [0u8; 32], // compressed format doesn't expose y directly
         })
     }
 }
@@ -794,27 +768,25 @@ mod tests {
 
     #[test]
     fn test_serialize_proof_for_evm_roundtrip() {
-        use halo2curves::group::Curve;
+        use halo2curves::group::{Curve, GroupEncoding};
 
-        // Create synthetic Halo2-style transcript (little-endian G1 points)
+        // Create synthetic Halo2-style transcript (compressed G1 points, 32 bytes each)
         let g1 = G1Affine::generator();
         let points: Vec<G1Affine> = (1..=5u64)
             .map(|i| (g1 * Fr::from(i * 1000)).to_affine())
             .collect();
 
-        // Build a mock transcript: 3 advice commits + some intermediate data + W + W'
+        // Build a mock transcript: 3 advice commits + some intermediate data + H + H'
         let mut transcript = Vec::new();
-        // Advice commits (LE)
+        // Advice commits (compressed, 32 bytes each)
         for p in &points[..3] {
-            transcript.extend_from_slice(p.x.to_repr().as_ref());
-            transcript.extend_from_slice(p.y.to_repr().as_ref());
+            transcript.extend_from_slice(p.to_bytes().as_ref());
         }
         // Some intermediate evaluations (mimicking real transcript)
         transcript.extend_from_slice(&[0x42u8; 64]);
-        // W and W' (last two points)
+        // H and H' (last two compressed points, SHPLONK opening proof)
         for p in &points[3..5] {
-            transcript.extend_from_slice(p.x.to_repr().as_ref());
-            transcript.extend_from_slice(p.y.to_repr().as_ref());
+            transcript.extend_from_slice(p.to_bytes().as_ref());
         }
 
         let evm_proof = serialize_proof_for_evm(&transcript, 3).unwrap();
@@ -833,7 +805,7 @@ mod tests {
             assert_eq!(recovered, points[i], "Advice commit {} mismatch", i);
         }
 
-        // Verify W and W'
+        // Verify H and H'
         let w_offset = 3 * G1_POINT_SIZE;
         let w_bytes: [u8; G1_POINT_SIZE] = evm_proof[w_offset..w_offset + G1_POINT_SIZE]
             .try_into()
@@ -856,7 +828,7 @@ mod tests {
 
     #[test]
     fn test_serialize_proof_for_evm_pads_fewer_advice() {
-        use halo2curves::group::Curve;
+        use halo2curves::group::{Curve, GroupEncoding};
 
         let g1 = G1Affine::generator();
         // Only 2 advice columns but format needs 3
@@ -865,15 +837,13 @@ mod tests {
             .collect();
 
         let mut transcript = Vec::new();
-        // 2 advice commits
+        // 2 advice commits (compressed, 32 bytes each)
         for p in &points[..2] {
-            transcript.extend_from_slice(p.x.to_repr().as_ref());
-            transcript.extend_from_slice(p.y.to_repr().as_ref());
+            transcript.extend_from_slice(p.to_bytes().as_ref());
         }
-        // W and W'
+        // H and H' (compressed)
         for p in &points[2..4] {
-            transcript.extend_from_slice(p.x.to_repr().as_ref());
-            transcript.extend_from_slice(p.y.to_repr().as_ref());
+            transcript.extend_from_slice(p.to_bytes().as_ref());
         }
 
         let evm_proof = serialize_proof_for_evm(&transcript, 2).unwrap();

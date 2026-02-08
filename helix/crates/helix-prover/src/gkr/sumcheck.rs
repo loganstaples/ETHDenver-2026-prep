@@ -76,7 +76,7 @@ impl SumcheckRound {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(self.coefficients.len() * 32);
         for coeff in &self.coefficients {
-            bytes.extend_from_slice(&coeff.to_repr());
+            bytes.extend_from_slice(coeff.to_repr().as_ref());
         }
         bytes
     }
@@ -134,11 +134,11 @@ impl SumcheckProof {
 
         // Final point
         for p in &self.final_point {
-            bytes.extend_from_slice(&p.to_repr());
+            bytes.extend_from_slice(p.to_repr().as_ref());
         }
 
         // Final evaluation
-        bytes.extend_from_slice(&self.final_eval.to_repr());
+        bytes.extend_from_slice(self.final_eval.to_repr().as_ref());
 
         bytes
     }
@@ -441,7 +441,7 @@ impl Blake3Transcript {
 impl Transcript for Blake3Transcript {
     fn append_scalar(&mut self, label: &[u8], scalar: FieldElement) {
         self.hasher.update(label);
-        self.hasher.update(&scalar.to_repr());
+        self.hasher.update(scalar.to_repr().as_ref());
     }
 
     fn append_bytes(&mut self, label: &[u8], bytes: &[u8]) {

@@ -14,7 +14,7 @@
 use helix_circuits::halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
     dev::MockProver,
-    plonk::{Advice, Circuit, Column, ConstraintSystem, Error, Instance, Selector},
+    plonk::{Advice, Circuit, Column, ConstraintSystem, ErrorFront, Instance, Selector},
     poly::Rotation,
 };
 use helix_circuits::halo2curves::bn256::Fr;
@@ -87,7 +87,7 @@ impl Circuit<Fr> for Halo2BenchCircuit {
         &self,
         config: Self::Config,
         mut layouter: impl Layouter<Fr>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         layouter.assign_region(
             || "benchmark region",
             |mut region| {

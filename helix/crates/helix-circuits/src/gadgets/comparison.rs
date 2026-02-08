@@ -5,7 +5,7 @@
 use crate::gadgets::range::{RangeChip, RangeConfig};
 use halo2_proofs::{
     circuit::{Layouter, Value},
-    plonk::Error,
+    plonk::{Error, ErrorFront},
 };
 use halo2curves::ff::PrimeField;
 
@@ -33,7 +33,7 @@ impl<F: PrimeField, const RANGE: usize> ComparisonChip<F, RANGE> {
         mut layouter: impl Layouter<F>,
         val_a: Value<F>,
         val_b: Value<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let diff = val_b - val_a;
 
         layouter.assign_region(

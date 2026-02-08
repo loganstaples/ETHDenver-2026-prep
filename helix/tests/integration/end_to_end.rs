@@ -70,7 +70,7 @@ fn test_e2e_single_training_step() {
 
     // Phase 4: Generate proof
     let phase_start = Instant::now();
-    let proof_result = prover.prove(&witness);
+    let proof_result = prover.prove(&witness).unwrap();
     harness.record_duration("proof_generation", phase_start.elapsed());
     harness.record_metric("proof_size_bytes", proof_result.proof.len() as f64, "bytes");
     result.add_phase(PhaseResult::success("proof_generation", phase_start.elapsed()));
@@ -210,7 +210,7 @@ fn test_e2e_invalid_proof_rejected() {
         Fr::from(1u64),
     );
 
-    let proof_result = prover.prove(&witness);
+    let proof_result = prover.prove(&witness).unwrap();
 
     // Corrupt public inputs
     let mut corrupted_inputs = proof_result.public_inputs.clone();
@@ -314,7 +314,7 @@ fn test_e2e_freivalds_verification() {
     assert!(!witness.freivalds_r2.is_empty(), "Freivalds r2 should be generated");
 
     // Proof should still verify
-    let proof_result = prover.prove(&witness);
+    let proof_result = prover.prove(&witness).unwrap();
     assert!(prover.verify_result(&proof_result), "Freivalds proof should verify");
 }
 
@@ -397,7 +397,7 @@ fn test_e2e_proof_serialization() {
         Fr::from(1u64),
     );
 
-    let proof_result = prover.prove(&witness);
+    let proof_result = prover.prove(&witness).unwrap();
 
     // Serialize to bytes
     let serialized = proof_result.proof.clone();
@@ -509,7 +509,7 @@ fn test_e2e_mock_evm_verification() {
         Fr::from(1u64),
     );
 
-    let proof_result = prover.prove(&witness);
+    let proof_result = prover.prove(&witness).unwrap();
 
     // Use mock EVM verifier
     let mock_verifier = MockEVMVerifier::new();

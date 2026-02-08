@@ -40,7 +40,7 @@ use halo2_proofs::{
     arithmetic::Field,
     circuit::{AssignedCell, Layouter, SimpleFloorPlanner, Value},
     plonk::{
-        Advice, Circuit, Column, ConstraintSystem, Error, Expression, Fixed, Instance, Selector,
+        Advice, Circuit, Column, ConstraintSystem, Error, ErrorFront, Expression, Fixed, Instance, Selector,
         TableColumn,
     },
     poly::Rotation,
@@ -461,7 +461,7 @@ impl MLTrainingStepV2Witness {
         // Convert first 31 bytes to Fr (to ensure it's in the field)
         let mut repr = [0u8; 32];
         repr[1..32].copy_from_slice(&hash[0..31]);
-        Fr::from_repr_vartime(repr).unwrap_or(Fr::ZERO)
+        Fr::from_repr_vartime(repr.into()).unwrap_or(Fr::ZERO)
     }
 
     /// Sets the error checksum by computing it from current state.
@@ -882,7 +882,7 @@ impl Circuit<Fr> for MLTrainingStepV2Circuit {
         });
 
         // ReLU lookup: (advice[0], advice[1]) must be in (relu_table_in, relu_table_out)
-        meta.lookup(|meta| {
+        meta.lookup("relu_lookup", |meta| {
             let s = meta.query_selector(s_relu);
             let input = meta.query_advice(advice[0], Rotation::cur());
             let output = meta.query_advice(advice[1], Rotation::cur());
@@ -913,7 +913,7 @@ impl Circuit<Fr> for MLTrainingStepV2Circuit {
         &self,
         config: Self::Config,
         mut layouter: impl Layouter<Fr>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let w = &self.witness;
 
         // ================================================================
@@ -1179,7 +1179,7 @@ fn verify_matmul_freivalds(
     n: usize,
     r: &[Fr],       // Random vector of length n
     label: &str,
-) -> Result<(), Error> {
+) -> Result<(), ErrorFront> {
     // For the common case of matrix-vector multiplication (n=1),
     // b is the vector and we verify A * b = c directly
     if n == 1 {
@@ -1255,7 +1255,7 @@ fn verify_error_bound(
     layouter: &mut impl Layouter<Fr>,
     total_error: Fr,
     label: &str,
-) -> Result<(), Error> {
+) -> Result<(), ErrorFront> {
     layouter.assign_region(
         || label.to_string(),
         |mut region| {
@@ -1274,7 +1274,7 @@ fn load_relu_table(
     config: &MLTrainingStepV2Config,
     layouter: &mut impl Layouter<Fr>,
     half_range: usize,
-) -> Result<(), Error> {
+) -> Result<(), ErrorFront> {
     layouter.assign_table(
         || "relu_table",
         |mut table| {
@@ -1311,7 +1311,7 @@ fn load_exp_table(
     layouter: &mut impl Layouter<Fr>,
     range: usize,
     scale: u64,
-) -> Result<(), Error> {
+) -> Result<(), ErrorFront> {
     let scale_f = scale as f64;
     layouter.assign_table(
         || "exp_table",
@@ -1340,7 +1340,7 @@ fn verify_dot_product(
     b: &[Fr],
     expected: Fr,
     label: &str,
-) -> Result<(), Error> {
+) -> Result<(), ErrorFront> {
     assert_eq!(a.len(), b.len(), "dot product dimension mismatch");
     let n = a.len();
     if n == 0 {
@@ -1370,7 +1370,7 @@ fn assign_mul(
     b: Fr,
     c: Fr,
     label: &str,
-) -> Result<(), Error> {
+) -> Result<(), ErrorFront> {
     layouter.assign_region(
         || label.to_string(),
         |mut region| {
@@ -1390,7 +1390,7 @@ fn assign_add(
     b: Fr,
     c: Fr,
     label: &str,
-) -> Result<(), Error> {
+) -> Result<(), ErrorFront> {
     layouter.assign_region(
         || label.to_string(),
         |mut region| {
@@ -1410,7 +1410,7 @@ fn assign_sub(
     b: Fr,
     c: Fr,
     label: &str,
-) -> Result<(), Error> {
+) -> Result<(), ErrorFront> {
     layouter.assign_region(
         || label.to_string(),
         |mut region| {
@@ -1429,7 +1429,7 @@ fn assign_eq(
     a: Fr,
     b: Fr,
     label: &str,
-) -> Result<(), Error> {
+) -> Result<(), ErrorFront> {
     layouter.assign_region(
         || label.to_string(),
         |mut region| {
@@ -1447,7 +1447,7 @@ fn assign_relu(
     input: Fr,
     output: Fr,
     label: &str,
-) -> Result<(), Error> {
+) -> Result<(), ErrorFront> {
     layouter.assign_region(
         || label.to_string(),
         |mut region| {

@@ -760,7 +760,7 @@ mod full_pipeline_extended {
 
         // Phase 4: Generate proof
         let phase_start = Instant::now();
-        let proof_result = prover.prove(&witness);
+        let proof_result = prover.prove(&witness).unwrap();
         let proof_time = phase_start.elapsed();
 
         if proof_result.proof.is_empty() {
@@ -801,7 +801,7 @@ mod full_pipeline_extended {
             Fr::from(1u64),
         );
 
-        let proof_result = prover.prove(&witness);
+        let proof_result = prover.prove(&witness).unwrap();
 
         // Verify with native verifier
         let verified = prover.verify_result(&proof_result);
@@ -835,7 +835,7 @@ mod full_pipeline_extended {
             Fr::from(1u64),
         );
 
-        let proof_result = prover.prove(&witness);
+        let proof_result = prover.prove(&witness).unwrap();
 
         // Check public inputs count
         assert_eq!(
@@ -889,7 +889,7 @@ mod full_pipeline_extended {
             Fr::from(1u64),
         );
 
-        let proof_result = prover.prove(&witness);
+        let proof_result = prover.prove(&witness).unwrap();
 
         // Proof bytes should meet minimum size for Halo2 KZG proof
         assert!(
@@ -1012,7 +1012,7 @@ mod full_pipeline_extended {
             Fr::from(1u64),
         );
 
-        let proof_result = prover.prove(&witness);
+        let proof_result = prover.prove(&witness).unwrap();
 
         // Test 1: Corrupted loss value should fail
         let mut corrupted_pi = proof_result.public_inputs.clone();
@@ -1073,7 +1073,7 @@ mod full_pipeline_extended {
             Fr::from(1u64),
         );
 
-        let proof_result = prover.prove(&witness);
+        let proof_result = prover.prove(&witness).unwrap();
 
         // Verify old hash matches expected
         assert_eq!(
@@ -1137,7 +1137,7 @@ mod full_pipeline_extended {
 
         // Run proof and verify error is preserved
         let prover = MLTrainingProverV2::new(dims.d_in, dims.d_hid, dims.d_out);
-        let proof_result = prover.prove(&witness);
+        let proof_result = prover.prove(&witness).unwrap();
 
         assert!(
             proof_result.total_error != Fr::zero(),
@@ -1244,7 +1244,7 @@ mod full_pipeline_extended {
             1,
             Fr::from(1u64),
         );
-        let proof_result = prover.prove(&witness);
+        let proof_result = prover.prove(&witness).unwrap();
         if prover.verify_result(&proof_result) {
             pass_count += 1;
             println!("[PASS] Basic pipeline verification");

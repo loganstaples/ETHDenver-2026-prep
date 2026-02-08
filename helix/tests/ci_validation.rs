@@ -101,7 +101,7 @@ fn ci_smoke_single_proof() {
         Fr::from(1u64),
     );
 
-    let proof_result = prover.prove(&witness);
+    let proof_result = prover.prove(&witness).unwrap();
 
     assert!(!proof_result.proof.is_empty(), "Proof should not be empty");
     assert!(
@@ -149,7 +149,7 @@ fn ci_regression_public_inputs_format() {
         Fr::from(1u64),
     );
 
-    let proof_result = prover.prove(&witness);
+    let proof_result = prover.prove(&witness).unwrap();
     let pi = &proof_result.public_inputs;
 
     // Verify exact count
@@ -204,7 +204,7 @@ fn ci_regression_invalid_witness_rejected() {
         Fr::from(1u64),
     );
 
-    let proof_result = prover.prove(&witness);
+    let proof_result = prover.prove(&witness).unwrap();
 
     // Corrupt the public inputs (change the loss value)
     let mut corrupted_pi = proof_result.public_inputs.clone();
@@ -241,7 +241,7 @@ fn ci_regression_state_hash_transition() {
         Fr::from(1u64),
     );
 
-    let proof_result = prover.prove(&witness);
+    let proof_result = prover.prove(&witness).unwrap();
 
     // Compute expected initial hash
     let expected_old_hash =
@@ -375,7 +375,7 @@ fn ci_integration_complete_pipeline() {
     );
 
     // 4. Generate proof
-    let proof_result = prover.prove(&witness);
+    let proof_result = prover.prove(&witness).unwrap();
 
     // 5. Verify with native verifier
     let native_verified = prover.verify_result(&proof_result);
@@ -471,7 +471,7 @@ fn ci_integration_solidity_compatible_proof() {
         Fr::from(1u64),
     );
 
-    let proof_result = prover.prove(&witness);
+    let proof_result = prover.prove(&witness).unwrap();
 
     // Proof bytes should be valid for contract
     assert!(
@@ -575,7 +575,7 @@ fn ci_performance_verification_time() {
         Fr::from(1u64),
     );
 
-    let proof_result = prover.prove(&witness);
+    let proof_result = prover.prove(&witness).unwrap();
 
     // Measure verification time (average over multiple runs)
     let num_runs = 5;

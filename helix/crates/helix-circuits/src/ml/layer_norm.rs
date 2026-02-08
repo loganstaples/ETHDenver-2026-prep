@@ -24,7 +24,7 @@
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
     plonk::{
-        Advice, Circuit, Column, ConstraintSystem, Error, Expression, Instance, Selector,
+        Advice, Circuit, Column, ConstraintSystem, Error, ErrorFront, Expression, Instance, Selector,
         TableColumn,
     },
     poly::Rotation,
@@ -203,7 +203,7 @@ impl<F: PrimeField> LayerNormChip<F> {
         &self,
         mut layouter: impl Layouter<F>,
         witness: &LayerNormWitness<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let n = witness.input.len();
         assert_eq!(witness.output.len(), n);
         assert_eq!(witness.gamma.len(), n);
@@ -542,7 +542,7 @@ impl<F: PrimeField> Circuit<F> for LayerNormCircuit<F> {
         &self,
         config: Self::Config,
         mut layouter: impl Layouter<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let chip = LayerNormChip::new(config);
         chip.verify_layer_norm(layouter.namespace(|| "layer_norm"), &self.witness)?;
         Ok(())

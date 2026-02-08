@@ -14,7 +14,7 @@ use crate::gadgets::arithmetic::{ArithmeticChip, ArithmeticConfig};
 use crate::gadgets::range::{RangeChip, RangeConfig};
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
-    plonk::{Circuit, Column, Advice, ConstraintSystem, Error, Selector, Instance},
+    plonk::{Circuit, Column, Advice, ConstraintSystem, Error, ErrorFront, Selector, Instance},
     poly::Rotation,
 };
 use halo2curves::ff::PrimeField;
@@ -138,16 +138,16 @@ impl<F: PrimeField, const RANGE: usize> BoundedLinearChip<F, RANGE> {
         bias_errs: &[Value<F>],
         output_vals: &[Value<F>],
         output_errs: &[Value<F>],
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let in_features = input_vals.len();
         let out_features = weight_vals.len();
         
         // Verify dimensions
         if weight_vals.iter().any(|w| w.len() != in_features) {
-            return Err(Error::Synthesis);
+            return Err(ErrorFront::Synthesis);
         }
         if bias_vals.len() != out_features || output_vals.len() != out_features {
-            return Err(Error::Synthesis);
+            return Err(ErrorFront::Synthesis);
         }
         
         // For each output neuron, we compute: o_j = sum_i(w_ji * x_i) + b_j
@@ -350,7 +350,7 @@ impl<F: PrimeField, const RANGE: usize> Circuit<F> for BoundedLinearCircuit<F, R
         &self,
         config: Self::Config,
         mut layouter: impl Layouter<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         // Load range table
         let range_chip = RangeChip::<F, RANGE>::new(config.range.clone());
         range_chip.load(&mut layouter)?;

@@ -316,6 +316,18 @@ impl TrainingStepProver {
     pub fn step_count(&self) -> u64 {
         self.step_count
     }
+
+    /// Verifies an ML training proof using this prover's own pipeline (same SRS/VK).
+    ///
+    /// KZG verification requires the same SRS and verification key that was
+    /// used for proof generation. This method uses the internal ML prover's
+    /// pipeline, which guarantees matching keys.
+    pub fn verify_ml_proof(&self, result: &TrainingProofResult) -> bool {
+        match &self.ml_prover {
+            Some(prover) => prover.verify_result(result),
+            None => false,
+        }
+    }
 }
 
 /// Converts a pair of `Fr` elements (lo, hi) into a 32-byte commitment.
@@ -430,7 +442,9 @@ mod tests {
 
     #[test]
     fn test_ml_proof_independent_verification() {
-        // Generate an ML proof and verify it using a standalone MLTrainingProver.
+        // Generate an ML proof and verify it using the prover's own pipeline.
+        // KZG verification requires the same SRS/VK, so we verify through the
+        // step prover rather than creating a separate prover instance.
         let data = TrainingStepData {
             d_in: 2,
             d_hid: 2,
@@ -449,14 +463,12 @@ mod tests {
             .prove_ml_training_step(&data, 14)
             .expect("prove failed");
 
-        // Create a fresh verifier (separate from the prover) and verify.
-        // Dimensions must match the data: 2×2×1
-        let verifier = MLTrainingProver::new(14, 2, 2, 1);
-        assert!(verifier.verify_result(&result.ml_proof));
+        // Verify using the step prover's own ML prover (same SRS/VK).
+        assert!(prover.verify_ml_proof(&result.ml_proof));
 
         // Tamper with proof and confirm rejection.
         let mut bad = result.ml_proof.clone();
         bad.public_inputs[4] = Fr::from(9999u64); // corrupt loss
-        assert!(!verifier.verify(&bad.proof, &bad.public_inputs));
+        assert!(!prover.verify_ml_proof(&bad));
     }
 }

@@ -14,7 +14,7 @@
 
 use halo2_proofs::{
     dev::MockProver,
-    plonk::{Circuit, ConstraintSystem, Error},
+    plonk::{Circuit, ConstraintSystem, Error, ErrorFront},
 };
 use halo2curves::bn256::Fr;
 use std::time::{Duration, Instant};
@@ -114,7 +114,7 @@ pub fn benchmark_mock<C: Circuit<Fr> + Clone>(
     circuit: &C,
     k: u32,
     public_inputs: Vec<Vec<Fr>>,
-) -> Result<BenchmarkResult, Error> {
+) -> Result<BenchmarkResult, ErrorFront> {
     // Run MockProver to get constraint info
     let start = Instant::now();
     let prover = MockProver::run(k, circuit, public_inputs.clone())?;
@@ -122,7 +122,7 @@ pub fn benchmark_mock<C: Circuit<Fr> + Clone>(
 
     // Verify
     let verify_start = Instant::now();
-    prover.verify().map_err(|_e| Error::Synthesis)?;
+    prover.verify().map_err(|_e| ErrorFront::Synthesis)?;
     let verify_time = verify_start.elapsed();
 
     // Estimate circuit stats based on K parameter

@@ -6,7 +6,7 @@ use crate::gadgets::arithmetic::{ArithmeticChip, ArithmeticConfig};
 use crate::gadgets::range::{RangeChip, RangeConfig};
 use halo2_proofs::{
     circuit::{Layouter, Value},
-    plonk::Error,
+    plonk::{Error, ErrorFront},
 };
 use halo2curves::ff::PrimeField;
 
@@ -48,9 +48,9 @@ impl<F: PrimeField, const RANGE: usize> BoundedMatMulChip<F, RANGE> {
         col_b_errs: &[Value<F>],
         res_val: Value<F>,
         res_err: Value<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         if row_a_vals.len() != col_b_vals.len() {
-             return Err(Error::Synthesis);
+             return Err(ErrorFront::Synthesis);
         }
 
         // 1. Calculate and accumulate values

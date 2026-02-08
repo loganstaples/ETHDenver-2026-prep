@@ -5,9 +5,8 @@ edition = "2021"
 
 [dependencies]
 helix-core = { path = "../helix-core" }
-halo2_proofs = { version = "0.3.0", features = ["dev-graph"] }
-halo2curves = { version = "0.1.0" }
-halo2_gadgets = "0.4.0"
+halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2", branch = "main" }
+halo2curves = "0.7.0"
 sha2 = "0.10"
 sha3 = "0.10"    # Keccak256 for EVM compatibility
 hex = "0.4"     # Hex encoding for EVM proof format

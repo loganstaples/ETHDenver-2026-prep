@@ -9,7 +9,7 @@ use halo2curves::bn256::Fr;
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
     dev::MockProver,
-    plonk::{Circuit, ConstraintSystem, Error},
+    plonk::{Circuit, ConstraintSystem, Error, ErrorFront},
 };
 
 #[derive(Clone)]
@@ -81,7 +81,7 @@ impl Circuit<Fr> for TestCircuit {
         &self,
         config: Self::Config,
         mut layouter: impl Layouter<Fr>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let add_chip = BoundedAddChip::new(config.add.clone());
         let mul_chip = BoundedMulChip::new(config.mul.clone());
         let matmul_chip = BoundedMatMulChip::new(config.matmul.clone());

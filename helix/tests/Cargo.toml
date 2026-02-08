@@ -34,8 +34,8 @@ rand = "0.8"
 rand_chacha = "0.3"
 
 # Halo2 re-exports
-halo2_proofs = { version = "0.3.0", features = ["dev-graph"] }
-halo2curves = "0.1.0"
+halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2", branch = "main" }
+halo2curves = "0.7.0"
 
 # Metrics and benchmarking
 criterion = { version = "0.5", features = ["html_reports"] }

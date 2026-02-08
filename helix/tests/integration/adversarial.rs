@@ -323,7 +323,7 @@ fn test_adversarial_corrupted_public_inputs() {
         Fr::from(1u64),
     );
 
-    let proof_result = prover.prove(&witness);
+    let proof_result = prover.prove(&witness).unwrap();
 
     // Valid verification should pass
     assert!(prover.verify_result(&proof_result), "Valid proof should verify");
@@ -377,7 +377,7 @@ fn test_adversarial_corrupted_proof_bytes() {
         Fr::from(1u64),
     );
 
-    let proof_result = prover.prove(&witness);
+    let proof_result = prover.prove(&witness).unwrap();
 
     // Corrupt various parts of the proof
     let mut corrupted_proof = proof_result.proof.clone();
@@ -415,7 +415,7 @@ fn test_adversarial_empty_proof() {
         Fr::from(1u64),
     );
 
-    let proof_result = prover.prove(&witness);
+    let proof_result = prover.prove(&witness).unwrap();
 
     // Empty proof should fail
     let empty_proof: Vec<u8> = vec![];
@@ -447,7 +447,7 @@ fn test_adversarial_wrong_pi_count() {
         Fr::from(1u64),
     );
 
-    let proof_result = prover.prove(&witness);
+    let proof_result = prover.prove(&witness).unwrap();
 
     // Too few public inputs
     let few_pi: Vec<Fr> = proof_result.public_inputs[..3].to_vec();

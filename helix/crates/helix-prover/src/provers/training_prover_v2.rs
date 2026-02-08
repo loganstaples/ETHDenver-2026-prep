@@ -20,6 +20,7 @@
 use crate::cache::witness_cache::{
     SharedWitnessCache, WitnessCachedProof, WitnessHash, WitnessHashBuilder, shared_witness_cache,
 };
+use crate::keys::generate_keys_for_circuit;
 use crate::pipeline::{
     CancellationToken, PipelineConfig, PipelineError, ProofPhase, ProofProgress, ProgressCallback,
     ProverPipeline, RetryConfig, no_progress_callback,
@@ -30,7 +31,11 @@ use helix_circuits::ml::training_step_v2::{
     compute_state_hash_v2, compute_witness_v2, MLTrainingStepV2Circuit, MLTrainingStepV2Witness,
     NUM_PUBLIC_INPUTS,
 };
-use helix_circuits::verifier::{SolidityGenerator, VkData};
+use helix_circuits::verifier::{
+    SolidityGenerator, VkData,
+    fr_to_evm_bytes, serialize_proof_for_evm, validate_proof_format,
+    ProofFormatError, NUM_ADVICE_COMMITS,
+};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -65,6 +70,10 @@ pub enum TrainingProverError {
     /// Self-verification failed.
     #[error("Self-verification failed: generated proof does not verify")]
     SelfVerificationFailed,
+
+    /// EVM proof serialization failed.
+    #[error("EVM proof serialization failed: {0}")]
+    EvmSerializationFailed(#[from] ProofFormatError),
 
     /// Operation timed out.
     #[error("Operation timed out after {elapsed_ms}ms")]
@@ -236,6 +245,33 @@ pub struct TrainingProofResultV2 {
     pub from_cache: bool,
     /// Witness hash (for caching).
     pub witness_hash: Option<WitnessHash>,
+}
+
+impl TrainingProofResultV2 {
+    /// Converts the raw Halo2 transcript proof to EVM-compatible format.
+    ///
+    /// Returns 320 bytes structured as:
+    /// - 192 bytes: 3 x G1 advice commitments (big-endian coordinates)
+    /// - 64 bytes: Opening proof W point
+    /// - 64 bytes: Opening proof W' point
+    ///
+    /// All coordinates are 32-byte big-endian for Solidity `uint256`.
+    pub fn to_evm_proof(&self) -> Result<Vec<u8>, ProofFormatError> {
+        serialize_proof_for_evm(&self.proof, NUM_ADVICE_COMMITS)
+    }
+
+    /// Converts public inputs to big-endian `uint256` byte arrays for Solidity.
+    ///
+    /// Returns `Vec<[u8; 32]>` where each element is a 32-byte big-endian
+    /// representation suitable for passing as `uint256[]` to the on-chain verifier.
+    ///
+    /// Layout: `[old_hash_lo, old_hash_hi, new_hash_lo, new_hash_hi, loss, error_bound, step_number, error_checksum]`
+    pub fn to_evm_public_inputs(&self) -> Vec<[u8; 32]> {
+        self.public_inputs
+            .iter()
+            .map(|fr| fr_to_evm_bytes(fr))
+            .collect()
+    }
 }
 
 // ============================================================================
@@ -435,6 +471,10 @@ impl MLTrainingProverV2 {
     }
 
     /// Creates a V2 prover with custom configuration.
+    ///
+    /// Uses [`generate_keys_for_circuit`] to produce real Halo2 KZG keys
+    /// (params, proving key, verification key) and threads them through
+    /// the pipeline for production-grade proof generation.
     pub fn with_config(
         d_in: usize,
         d_hid: usize,
@@ -444,7 +484,7 @@ impl MLTrainingProverV2 {
         // Build pipeline config from prover config
         let pipeline_config = PipelineConfig {
             k: config.k,
-            self_verify: false, // We handle this ourselves
+            self_verify: false, // We handle this ourselves (including EVM format verification)
             retry: config.retry.clone(),
             proof_timeout: config.proof_timeout,
             verify_timeout: config.verify_timeout,
@@ -452,9 +492,7 @@ impl MLTrainingProverV2 {
             enable_tracing: config.enable_tracing,
         };
 
-        let mut pipeline = ProverPipeline::with_config(pipeline_config);
-
-        // Create a dummy witness for setup
+        // Create a dummy witness for key generation
         let dummy_witness = create_zero_witness(d_in, d_hid, d_out);
         let setup_circuit = MLTrainingStepV2Circuit {
             witness: dummy_witness,
@@ -464,8 +502,21 @@ impl MLTrainingProverV2 {
             use_freivalds: config.use_freivalds,
         };
 
-        // Setup can fail, but we handle it in prove()
-        let _ = pipeline.setup(&setup_circuit);
+        // Generate real Halo2 keys via generate_keys_for_circuit()
+        let circuit_keys = generate_keys_for_circuit(
+            &setup_circuit,
+            "ml_training_step_v2",
+            1,
+            config.k,
+        );
+
+        // Create pipeline from real CircuitKeys (params, pk, vk)
+        let pipeline = ProverPipeline::from_keys(
+            pipeline_config,
+            circuit_keys.params,
+            circuit_keys.pk,
+            circuit_keys.vk,
+        );
 
         // Create cache if enabled
         let cache = if config.use_witness_cache {
@@ -695,7 +746,7 @@ impl MLTrainingProverV2 {
         let proof = proof_result.proof;
         let attempts = proof_result.attempts;
 
-        // Self-verification
+        // Self-verification (native Halo2 + EVM format)
         let (verified, verify_time) = if self.config.self_verify {
             progress(ProofProgress {
                 phase: ProofPhase::Verification,
@@ -708,10 +759,26 @@ impl MLTrainingProverV2 {
             });
 
             let verify_start = Instant::now();
-            let is_valid = self.pipeline.verify(&proof, &pi_refs)?;
 
+            // 1. Native Halo2 verification
+            let is_valid = self.pipeline.verify(&proof, &pi_refs)?;
             if !is_valid {
                 return Err(TrainingProverError::SelfVerificationFailed);
+            }
+
+            // 2. EVM format verification — serialize to EVM format and validate
+            //    structure before returning, catching serialization bugs early.
+            //    Now using KZG commitment scheme (PSE fork), EVM serialization must succeed.
+            let evm_proof = serialize_proof_for_evm(&proof, NUM_ADVICE_COMMITS)
+                .map_err(TrainingProverError::EvmSerializationFailed)?;
+            validate_proof_format(&evm_proof)
+                .map_err(TrainingProverError::EvmSerializationFailed)?;
+
+            if self.config.enable_tracing {
+                tracing::debug!(
+                    evm_proof_size = evm_proof.len(),
+                    "EVM proof format validated successfully"
+                );
             }
 
             (true, Some(verify_start.elapsed()))
@@ -803,6 +870,27 @@ impl MLTrainingProverV2 {
             .with_vk_data(evm_vk)
             .with_batch(true)
             .generate()
+    }
+
+    /// Exports verification key data needed for contract deployment.
+    ///
+    /// Returns [`VkData`] containing the pairing-check points (G1 generator,
+    /// s·G2 from SRS, -G2) that the on-chain `Halo2Verifier` contract needs.
+    /// This must be called after key generation (which happens in [`new`]/[`with_config`]).
+    pub fn export_vk_data(&self) -> Result<VkData, TrainingProverError> {
+        let extracted = self
+            .pipeline
+            .extract_vk_data(NUM_PUBLIC_INPUTS)
+            .ok_or_else(|| TrainingProverError::NotInitialized {
+                message: "Pipeline VK not initialized — cannot export VK data".to_string(),
+            })?;
+
+        Ok(VkData {
+            g1: extracted.g1,
+            s_g2: extracted.s_g2,
+            neg_g2: extracted.neg_g2,
+            num_advices: extracted.num_advices,
+        })
     }
 
     /// Clears the witness cache.
@@ -1311,5 +1399,114 @@ mod tests {
         let config = V2ProverConfig::minimal();
         assert!(!config.self_verify);
         assert!(!config.use_witness_cache);
+    }
+
+    #[test]
+    fn test_to_evm_proof() {
+        let config = V2ProverConfig::minimal();
+        let prover = MLTrainingProverV2::with_config(2, 2, 1, config);
+        let weights = small_model_weights();
+
+        let witness = MLTrainingProverV2::build_witness(
+            2, 2, 1,
+            &[Fr::from(1), Fr::from(1)],
+            &[Fr::from(5)],
+            &weights.w1, &weights.b1, &weights.w2, &weights.b2,
+            Fr::from(1), 1, Fr::from(1),
+        );
+
+        let result = prover.prove(&witness).expect("prove should succeed");
+        assert!(!result.proof.is_empty());
+
+        // With KZG commitment scheme, EVM proof serialization must succeed
+        let evm_proof = result.to_evm_proof().expect("EVM proof serialization should succeed with KZG");
+        assert_eq!(evm_proof.len(), 320, "EVM proof must be exactly 320 bytes");
+        validate_proof_format(&evm_proof).expect("EVM proof should be valid format");
+        assert!(prover.verify_result(&result));
+    }
+
+    #[test]
+    fn test_to_evm_public_inputs() {
+        let config = V2ProverConfig::minimal();
+        let prover = MLTrainingProverV2::with_config(2, 2, 1, config);
+        let weights = small_model_weights();
+
+        let witness = MLTrainingProverV2::build_witness(
+            2, 2, 1,
+            &[Fr::from(1), Fr::from(1)],
+            &[Fr::from(5)],
+            &weights.w1, &weights.b1, &weights.w2, &weights.b2,
+            Fr::from(1), 1, Fr::from(1),
+        );
+
+        let result = prover.prove(&witness).expect("prove should succeed");
+        let evm_pi = result.to_evm_public_inputs();
+
+        // Should have 8 public inputs (NUM_PUBLIC_INPUTS)
+        assert_eq!(evm_pi.len(), 8);
+
+        // Each element is 32 bytes big-endian
+        for pi in &evm_pi {
+            assert_eq!(pi.len(), 32);
+        }
+    }
+
+    #[test]
+    fn test_export_vk_data() {
+        let config = V2ProverConfig::minimal();
+        let prover = MLTrainingProverV2::with_config(2, 2, 1, config);
+
+        let vk_data = prover.export_vk_data().expect("VK export should succeed");
+        assert_eq!(vk_data.num_advices, 3);
+        // G1 generator coordinates should be non-empty decimal strings
+        assert!(!vk_data.g1.0.is_empty());
+        assert!(!vk_data.g1.1.is_empty());
+    }
+
+    #[test]
+    fn test_evm_self_verification() {
+        // With self_verify=true and KZG commitment scheme, prove performs:
+        // 1. Native Halo2 verification
+        // 2. Hard-fail EVM proof serialization and format validation
+        let mut config = V2ProverConfig::minimal();
+        config.self_verify = true;
+        let prover = MLTrainingProverV2::with_config(2, 2, 1, config);
+        let weights = small_model_weights();
+
+        let witness = MLTrainingProverV2::build_witness(
+            2, 2, 1,
+            &[Fr::from(1), Fr::from(1)],
+            &[Fr::from(5)],
+            &weights.w1, &weights.b1, &weights.w2, &weights.b2,
+            Fr::from(1), 1, Fr::from(1),
+        );
+
+        let result = prover.prove(&witness).expect("prove with self-verify should succeed (KZG)");
+        assert!(result.verified);
+        assert!(prover.verify_result(&result));
+
+        // Verify EVM proof format independently
+        let evm_proof = result.to_evm_proof().expect("EVM serialization should succeed");
+        assert_eq!(evm_proof.len(), 320, "KZG EVM proof must be exactly 320 bytes");
+    }
+
+    #[test]
+    fn test_deterministic_seed_produces_consistent_proofs() {
+        let seed = [42u8; 32];
+        let config = V2ProverConfig::minimal().deterministic(seed);
+        let prover = MLTrainingProverV2::with_config(2, 2, 1, config);
+        let weights = small_model_weights();
+
+        let witness = MLTrainingProverV2::build_witness(
+            2, 2, 1,
+            &[Fr::from(1), Fr::from(1)],
+            &[Fr::from(5)],
+            &weights.w1, &weights.b1, &weights.w2, &weights.b2,
+            Fr::from(1), 1, Fr::from(1),
+        );
+
+        let r1 = prover.prove(&witness).expect("prove should succeed");
+        assert!(!r1.proof.is_empty());
+        assert!(prover.verify_result(&r1));
     }
 }

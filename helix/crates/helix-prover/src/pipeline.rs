@@ -11,18 +11,26 @@
 
 use helix_circuits::halo2_proofs::{
     plonk::{
-        create_proof, keygen_pk, keygen_vk, verify_proof, Circuit, ProvingKey, SingleVerifier,
+        create_proof, keygen_pk, keygen_vk, verify_proof_multi, Circuit, ProvingKey,
         VerifyingKey,
     },
-    poly::commitment::Params,
-    transcript::{Blake2bRead, Blake2bWrite, Challenge255},
+    poly::{
+        commitment::Params,
+        kzg::{
+            commitment::{KZGCommitmentScheme, ParamsKZG},
+            multiopen::{ProverSHPLONK, VerifierSHPLONK},
+            strategy::SingleStrategy,
+        },
+    },
+    transcript::{Blake2bRead, Blake2bWrite, Challenge255, TranscriptReadBuffer, TranscriptWriterBuffer},
 };
 use helix_circuits::halo2curves::{
-    bn256::{Fr, G1Affine},
+    bn256::{Bn256, Fr, G1Affine},
     ff::PrimeField,
     CurveAffine,
 };
 use rand::{rngs::StdRng, SeedableRng};
+use rand_core::OsRng;
 use sha2::Digest;
 use std::fmt;
 use std::marker::PhantomData;
@@ -495,7 +503,7 @@ pub struct ProofResult {
 /// Thread-safe proving pipeline with comprehensive error handling.
 pub struct ProverPipeline<C: Circuit<Fr>> {
     /// SRS parameters.
-    pub params: Params<G1Affine>,
+    pub params: ParamsKZG<Bn256>,
     /// Proving key.
     pub pk: Option<ProvingKey<G1Affine>>,
     /// Verification key.
@@ -516,11 +524,31 @@ impl<C: Circuit<Fr> + Clone> ProverPipeline<C> {
 
     /// Creates a new pipeline with custom configuration.
     pub fn with_config(config: PipelineConfig) -> Self {
-        let params = Params::<G1Affine>::new(config.k);
+        let params = ParamsKZG::<Bn256>::setup(config.k, OsRng);
         Self {
             params,
             pk: None,
             vk: None,
+            config,
+            proof_count: AtomicU64::new(0),
+            _marker: PhantomData,
+        }
+    }
+
+    /// Creates a pipeline from pre-generated keys.
+    ///
+    /// Use this when keys have been generated via [`generate_keys_for_circuit`]
+    /// and you want to inject them directly instead of calling [`setup`].
+    pub fn from_keys(
+        config: PipelineConfig,
+        params: ParamsKZG<Bn256>,
+        pk: ProvingKey<G1Affine>,
+        vk: VerifyingKey<G1Affine>,
+    ) -> Self {
+        Self {
+            params,
+            pk: Some(pk),
+            vk: Some(vk),
             config,
             proof_count: AtomicU64::new(0),
             _marker: PhantomData,
@@ -735,8 +763,17 @@ impl<C: Circuit<Fr> + Clone> ProverPipeline<C> {
         // Create transcript
         let mut transcript = Blake2bWrite::<_, _, Challenge255<_>>::init(vec![]);
 
-        // Get RNG based on configuration
-        let rng = if let Some(seed) = self.config.deterministic_seed {
+        // Get RNG based on configuration: StdRng::from_seed() always (never OsRng).
+        // When deterministic_seed is set, derive a per-proof seed by XORing
+        // the base seed with the proof counter so each call gets unique but
+        // reproducible randomness.
+        let rng = if let Some(base_seed) = self.config.deterministic_seed {
+            let mut seed = base_seed;
+            let count = self.proof_count.load(Ordering::Relaxed);
+            let count_bytes = count.to_le_bytes();
+            for (i, &b) in count_bytes.iter().enumerate() {
+                seed[24 + i] ^= b;
+            }
             StdRng::from_seed(seed)
         } else {
             // Use a seed derived from timestamp for some randomness
@@ -764,12 +801,20 @@ impl<C: Circuit<Fr> + Clone> ProverPipeline<C> {
             message: None,
         });
 
-        // Generate proof
-        create_proof(
+        // Generate proof (KZG commitment scheme, SHPLONK multiopen)
+        let instances: Vec<Vec<Fr>> = public_inputs.iter().map(|s| s.to_vec()).collect();
+        create_proof::<
+            KZGCommitmentScheme<Bn256>,
+            ProverSHPLONK<'_, Bn256>,
+            _,
+            _,
+            _,
+            _,
+        >(
             &self.params,
             pk,
             &[circuit.clone()],
-            &[public_inputs],
+            &[instances],
             rng,
             &mut transcript,
         )
@@ -813,19 +858,23 @@ impl<C: Circuit<Fr> + Clone> ProverPipeline<C> {
             }
         }
 
-        let strategy = SingleVerifier::new(&self.params);
-        let mut transcript = Blake2bRead::<_, _, Challenge255<_>>::init(proof);
+        let mut transcript = Blake2bRead::<_, G1Affine, Challenge255<_>>::init(proof);
 
-        let result = verify_proof(&self.params, vk, strategy, &[public_inputs], &mut transcript);
+        let instances: Vec<Vec<Fr>> = public_inputs.iter().map(|s| s.to_vec()).collect();
+        let verifier_params = self.params.verifier_params();
+        let result = verify_proof_multi::<
+            KZGCommitmentScheme<Bn256>,
+            VerifierSHPLONK<Bn256>,
+            _,
+            _,
+            SingleStrategy<Bn256>,
+        >(&verifier_params, vk, &[instances], &mut transcript);
 
-        if self.config.enable_tracing && result.is_err() {
-            tracing::warn!(
-                error = ?result.as_ref().err(),
-                "Proof verification failed"
-            );
+        if self.config.enable_tracing && !result {
+            tracing::warn!("Proof verification failed");
         }
 
-        Ok(result.is_ok())
+        Ok(result)
     }
 
     /// Extracts verification key data for EVM verifier generation.
@@ -880,7 +929,7 @@ impl<C: Circuit<Fr> + Clone> ProverPipeline<C> {
     }
 
     /// Returns a reference to the SRS params.
-    pub fn params(&self) -> &Params<G1Affine> {
+    pub fn params(&self) -> &ParamsKZG<Bn256> {
         &self.params
     }
 

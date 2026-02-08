@@ -9,11 +9,24 @@
 //! enabling seamless Rust proof → Solidity verification.
 
 use std::fmt::Write;
-use halo2curves::bn256::{Fr, G1Affine, G2Affine, Fq};
+use halo2curves::bn256::{Fr, Fq2, G1Affine, G2Affine, Fq};
 use halo2curves::ff::PrimeField;
 use halo2curves::group::Curve;
 use halo2curves::group::prime::PrimeCurveAffine;
 use std::ops::Neg;
+
+/// Extracts the c0 (real) component from an Fq2 via byte serialization.
+/// In halo2curves 0.7, QuadExtField fields are pub(crate), so we use to_bytes().
+fn fq2_c0(f: &Fq2) -> Fq {
+    let bytes = f.to_bytes();
+    Fq::from_bytes(bytes[..32].try_into().unwrap()).unwrap()
+}
+
+/// Extracts the c1 (imaginary) component from an Fq2 via byte serialization.
+fn fq2_c1(f: &Fq2) -> Fq {
+    let bytes = f.to_bytes();
+    Fq::from_bytes(bytes[32..].try_into().unwrap()).unwrap()
+}
 
 use super::format_spec::{
     MIN_PROOF_SIZE, NUM_ADVICE_COMMITS, G1_POINT_SIZE, SCALAR_SIZE, NUM_PUBLIC_INPUTS,
@@ -96,9 +109,9 @@ fn fq_to_decimal_string(fq: &Fq) -> String {
 /// KZG Structured Reference String (SRS) data.
 ///
 /// Holds the `s·G2` point from a trusted setup ceremony. In a real deployment,
-/// this would come from `ParamsKZG::s_g2()` of a PSE/halo2 KZG setup.
-/// We define this wrapper because the crates.io `halo2_proofs` is IPA-only;
-/// real KZG SRS data is injected at a higher layer (helix-prover).
+/// this would come from `ParamsKZG::s_g2()` of the PSE/halo2 KZG setup.
+/// This wrapper provides a convenient typed representation of the SRS data
+/// from the KZG trusted setup (now available via PSE fork of halo2).
 #[derive(Debug, Clone)]
 pub struct KzgSrs {
     /// The s·G2 point from the trusted setup.
@@ -126,10 +139,10 @@ fn g2_to_evm_decimal_tuple(point: &G2Affine) -> (String, String, String, String)
     //   x_imaginary || x_real || y_imaginary || y_real
     // In halo2curves, Fq2 = c0 + c1*u, so c1 is imaginary, c0 is real.
     (
-        fq_to_decimal_string(&point.x.c1), // x_imaginary
-        fq_to_decimal_string(&point.x.c0), // x_real
-        fq_to_decimal_string(&point.y.c1), // y_imaginary
-        fq_to_decimal_string(&point.y.c0), // y_real
+        fq_to_decimal_string(&fq2_c1(&point.x)), // x_imaginary
+        fq_to_decimal_string(&fq2_c0(&point.x)), // x_real
+        fq_to_decimal_string(&fq2_c1(&point.y)), // y_imaginary
+        fq_to_decimal_string(&fq2_c0(&point.y)), // y_real
     )
 }
 

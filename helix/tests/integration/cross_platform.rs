@@ -173,7 +173,7 @@ fn test_proof_serialization_platform_independent() {
         Fr::from(1u64),
     );
 
-    let proof_result = prover.prove(&witness);
+    let proof_result = prover.prove(&witness).unwrap();
 
     // Proof should be non-empty
     assert!(!proof_result.proof.is_empty());
@@ -324,7 +324,7 @@ fn test_circuit_determinism() {
                 1,
                 Fr::from(1u64),
             );
-            prover.prove(&witness)
+            prover.prove(&witness).unwrap()
         })
         .collect();
 
@@ -503,7 +503,7 @@ fn test_comprehensive_compatibility() {
         Fr::from(1u64),
     );
 
-    let proof = prover.prove(&witness);
+    let proof = prover.prove(&witness).unwrap();
     let verified = prover.verify_result(&proof);
     result.add_phase(if verified {
         PhaseResult::success("proof_roundtrip", phase_start.elapsed())

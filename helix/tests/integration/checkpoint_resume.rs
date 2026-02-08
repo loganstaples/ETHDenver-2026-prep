@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use helix_circuits::halo2_proofs::arithmetic::Field;
 use helix_circuits::halo2curves::bn256::Fr;
+use helix_circuits::halo2curves::ff::PrimeField;
 use helix_circuits::ml::training_step_v2::compute_state_hash_v2;
 use helix_prover::{BatchTrainingProverV2, MLTrainingProverV2, TrainingWeights};
 use serde::{Deserialize, Serialize};
@@ -464,7 +465,7 @@ fn test_training_consistency_after_restore() {
         1,
         Fr::from(1u64),
     );
-    let proof1 = prover.prove(&witness1);
+    let proof1 = prover.prove(&witness1).unwrap();
 
     // Serialize and restore weights
     let serialized = SerializableWeights::from_training_weights(&training_weights);
@@ -485,7 +486,7 @@ fn test_training_consistency_after_restore() {
         1,
         Fr::from(1u64),
     );
-    let proof2 = prover.prove(&witness2);
+    let proof2 = prover.prove(&witness2).unwrap();
 
     // Results should be identical
     assert_eq!(proof1.loss, proof2.loss, "Loss should match");

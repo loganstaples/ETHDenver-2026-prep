@@ -19,7 +19,7 @@ use halo2_proofs::{
     arithmetic::Field,
     circuit::{Layouter, SimpleFloorPlanner, Value},
     plonk::{
-        Advice, Circuit, Column, ConstraintSystem, Error, Expression, Fixed, Instance, Selector,
+        Advice, Circuit, Column, ConstraintSystem, Error, ErrorFront, Expression, Fixed, Instance, Selector,
     },
     poly::Rotation,
 };
@@ -379,7 +379,7 @@ impl Circuit<Fr> for IVCStepCircuit {
         &self,
         config: Self::Config,
         mut layouter: impl Layouter<Fr>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let w = &self.witness;
         let result_acc = w.resulting_accumulator();
         let pi = result_acc.to_public_inputs();

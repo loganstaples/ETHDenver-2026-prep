@@ -13,7 +13,7 @@
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
     plonk::{
-        Advice, Circuit, Column, ConstraintSystem, Error, Expression, Instance, Selector,
+        Advice, Circuit, Column, ConstraintSystem, Error, ErrorFront, Expression, Instance, Selector,
         TableColumn,
     },
     poly::Rotation,
@@ -138,7 +138,7 @@ impl<F: PrimeField, const RANGE: usize, const SCALE: u64> SoftmaxChip<F, RANGE, 
         });
 
         // Exp lookup
-        meta.lookup(|meta| {
+        meta.lookup("softmax_exp", |meta| {
             let s = meta.query_selector(s_exp);
             let input = meta.query_advice(advice[0], Rotation::cur());
             let output = meta.query_advice(advice[1], Rotation::cur());
@@ -164,7 +164,7 @@ impl<F: PrimeField, const RANGE: usize, const SCALE: u64> SoftmaxChip<F, RANGE, 
     }
 
     /// Loads the exponential lookup table.
-    pub fn load_exp_table(&self, layouter: &mut impl Layouter<F>) -> Result<(), Error> {
+    pub fn load_exp_table(&self, layouter: &mut impl Layouter<F>) -> Result<(), ErrorFront> {
         let scale_f = SCALE as f64;
         layouter.assign_table(
             || "softmax_exp_table",
@@ -210,7 +210,7 @@ impl<F: PrimeField, const RANGE: usize, const SCALE: u64> SoftmaxChip<F, RANGE, 
         sum_exp: F,
         weights: &[F],
         max_score: F,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let n = scores.len();
         assert_eq!(exp_scores.len(), n);
         assert_eq!(weights.len(), n);
@@ -430,7 +430,7 @@ impl<F: PrimeField, const RANGE: usize, const SCALE: u64> Circuit<F> for Softmax
         &self,
         config: Self::Config,
         mut layouter: impl Layouter<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let chip = SoftmaxChip::<F, RANGE, SCALE>::new(config);
         chip.load_exp_table(&mut layouter)?;
 

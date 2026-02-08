@@ -13,7 +13,7 @@ use crate::gadgets::arithmetic::{ArithmeticChip, ArithmeticConfig};
 use crate::gadgets::range::{RangeChip, RangeConfig};
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
-    plonk::{Circuit, Column, Advice, ConstraintSystem, Error, Selector, Instance},
+    plonk::{Circuit, Column, Advice, ConstraintSystem, Error, ErrorFront, Selector, Instance},
     poly::Rotation,
 };
 use halo2curves::ff::PrimeField;
@@ -153,7 +153,7 @@ impl<F: PrimeField, const RANGE: usize> GradientVerificationChip<F, RANGE> {
         local_grad_vals: &[Value<F>],
         local_grad_errs: &[Value<F>],
         masks: &[Value<F>], // 1 if forward > 0, else 0
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         for i in 0..forward_vals.len() {
             // Verify: local_grad = upstream_grad * mask
             layouter.assign_region(
@@ -242,7 +242,7 @@ impl<F: PrimeField, const RANGE: usize> GradientVerificationChip<F, RANGE> {
         upstream_grad_errs: &[Vec<Value<F>>],
         weight_grad_vals: &[Vec<Value<F>>],   // dW: [in_features, out_features]
         weight_grad_errs: &[Vec<Value<F>>],
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let batch_size = input_vals.len();
         let in_features = input_vals.first().map(|v| v.len()).unwrap_or(0);
         let out_features = upstream_grad_vals.first().map(|v| v.len()).unwrap_or(0);
@@ -290,7 +290,7 @@ impl<F: PrimeField, const RANGE: usize> GradientVerificationChip<F, RANGE> {
         upstream_grad_errs: &[Vec<Value<F>>],
         input_grad_vals: &[Vec<Value<F>>],    // dX: [batch, in_features]
         input_grad_errs: &[Vec<Value<F>>],
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let batch_size = upstream_grad_vals.len();
         let out_features = upstream_grad_vals.first().map(|v| v.len()).unwrap_or(0);
         let in_features = weight_vals.len();
@@ -333,7 +333,7 @@ impl<F: PrimeField, const RANGE: usize> GradientVerificationChip<F, RANGE> {
         gradient_errs: &[Value<F>],
         new_weight_vals: &[Value<F>],
         new_weight_errs: &[Value<F>],
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         for i in 0..old_weight_vals.len() {
             // new_weight = old_weight - gradient
             // Using addition gate with negated gradient
@@ -455,7 +455,7 @@ impl<F: PrimeField, const RANGE: usize> Circuit<F> for TrainingStepCircuit<F, RA
         &self,
         config: Self::Config,
         mut layouter: impl Layouter<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let range_chip = RangeChip::<F, RANGE>::new(config.range.clone());
         range_chip.load(&mut layouter)?;
         

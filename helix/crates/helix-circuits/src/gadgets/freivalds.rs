@@ -5,7 +5,7 @@
 
 use halo2_proofs::{
     circuit::{Layouter, Value, AssignedCell},
-    plonk::{Column, Advice, Selector, ConstraintSystem, Error, Expression},
+    plonk::{Column, Advice, Selector, ConstraintSystem, Error, ErrorFront, Expression},
     poly::Rotation,
 };
 use halo2curves::ff::PrimeField;
@@ -138,7 +138,7 @@ impl<F: PrimeField> FreivaldsChip<F> {
         k: usize,
         n: usize,
         challenge_seed: u64,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         // Generate random vector r of length n
         let r = Self::generate_challenge_vector(challenge_seed, n);
         let r_values: Vec<Value<F>> = r.iter().map(|&v| Value::known(v)).collect();
@@ -214,7 +214,7 @@ impl<F: PrimeField> FreivaldsChip<F> {
         m: usize,
         k: usize,
         n: usize,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         // For small matrices, directly verify each output element
         layouter.assign_region(
             || "direct matmul verification",
@@ -316,7 +316,7 @@ mod tests {
             &self,
             config: Self::Config,
             mut layouter: impl Layouter<Fr>,
-        ) -> Result<(), Error> {
+        ) -> Result<(), ErrorFront> {
             let chip = FreivaldsChip::new(config);
 
             let a_values: Vec<Value<Fr>> = self.a.iter().map(|&v| Value::known(v)).collect();

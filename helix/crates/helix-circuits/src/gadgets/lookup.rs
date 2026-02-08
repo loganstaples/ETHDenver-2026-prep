@@ -13,7 +13,7 @@ use halo2_proofs::{
     arithmetic::Field,
     circuit::{Layouter, Value},
     plonk::{
-        Advice, Column, ConstraintSystem, Error, Expression, Selector, TableColumn,
+        Advice, Column, ConstraintSystem, Error, ErrorFront, Expression, Selector, TableColumn,
     },
     poly::Rotation,
 };
@@ -64,7 +64,7 @@ impl<F: PrimeField> LookupTableChip<F> {
         let table_output = meta.lookup_table_column();
         let s_lookup = meta.complex_selector();
 
-        meta.lookup(|meta| {
+        meta.lookup("gadget_lookup", |meta| {
             let s = meta.query_selector(s_lookup);
             let input = meta.query_advice(advice_input, Rotation::cur());
             let output = meta.query_advice(advice_output, Rotation::cur());
@@ -94,7 +94,7 @@ impl<F: PrimeField> LookupTableChip<F> {
         &self,
         layouter: &mut impl Layouter<F>,
         entries: &[(F, F)],
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         layouter.assign_table(
             || "generic lookup table",
             |mut table| {
@@ -126,7 +126,7 @@ impl<F: PrimeField> LookupTableChip<F> {
         layouter: &mut impl Layouter<F>,
         entries: &[(F, F)],
         min_rows: usize,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         layouter.assign_table(
             || "generic lookup table (padded)",
             |mut table| {
@@ -162,7 +162,7 @@ impl<F: PrimeField> LookupTableChip<F> {
         row: usize,
         input: Value<F>,
         output: Value<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         self.config.s_lookup.enable(region, row)?;
 
         region.assign_advice(
@@ -234,7 +234,7 @@ impl<F: PrimeField, const RANGE: usize> ReLUTableChip<F, RANGE> {
     ///
     /// Entries cover `[0, HALF_RANGE)` (positive) and their negative
     /// counterparts `(p - x, 0)` for `x in [1, HALF_RANGE)`.
-    pub fn load(&self, layouter: &mut impl Layouter<F>) -> Result<(), Error> {
+    pub fn load(&self, layouter: &mut impl Layouter<F>) -> Result<(), ErrorFront> {
         let half = RANGE / 2;
         let entries = relu_entries::<F>(half);
         self.inner.load(layouter, &entries)
@@ -245,7 +245,7 @@ impl<F: PrimeField, const RANGE: usize> ReLUTableChip<F, RANGE> {
         &self,
         layouter: &mut impl Layouter<F>,
         min_rows: usize,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let half = RANGE / 2;
         let entries = relu_entries::<F>(half);
         self.inner.load_padded(layouter, &entries, min_rows)
@@ -258,7 +258,7 @@ impl<F: PrimeField, const RANGE: usize> ReLUTableChip<F, RANGE> {
         row: usize,
         input: Value<F>,
         output: Value<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         self.inner.lookup(region, row, input, output)
     }
 }
@@ -304,7 +304,7 @@ impl<F: PrimeField, const RANGE: usize, const SCALE: u64> ExpTableChip<F, RANGE,
     /// Loads the exp approximation table.
     ///
     /// Entry `i` maps `i → round(SCALE * exp(i / SCALE))`.
-    pub fn load(&self, layouter: &mut impl Layouter<F>) -> Result<(), Error> {
+    pub fn load(&self, layouter: &mut impl Layouter<F>) -> Result<(), ErrorFront> {
         let entries = exp_entries::<F>(RANGE, SCALE);
         self.inner.load(layouter, &entries)
     }
@@ -314,7 +314,7 @@ impl<F: PrimeField, const RANGE: usize, const SCALE: u64> ExpTableChip<F, RANGE,
         &self,
         layouter: &mut impl Layouter<F>,
         min_rows: usize,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let entries = exp_entries::<F>(RANGE, SCALE);
         self.inner.load_padded(layouter, &entries, min_rows)
     }
@@ -326,7 +326,7 @@ impl<F: PrimeField, const RANGE: usize, const SCALE: u64> ExpTableChip<F, RANGE,
         row: usize,
         input: Value<F>,
         output: Value<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         self.inner.lookup(region, row, input, output)
     }
 }
@@ -411,7 +411,7 @@ mod tests {
             &self,
             config: Self::Config,
             mut layouter: impl Layouter<Fr>,
-        ) -> Result<(), Error> {
+        ) -> Result<(), ErrorFront> {
             let chip = LookupTableChip::new(config.clone());
 
             // Pad table to fill circuit rows (avoids lookup failures on unused rows).
@@ -508,7 +508,7 @@ mod tests {
             &self,
             config: Self::Config,
             mut layouter: impl Layouter<Fr>,
-        ) -> Result<(), Error> {
+        ) -> Result<(), ErrorFront> {
             let chip = ReLUTableChip::<Fr, 256>::new(config.clone());
             chip.load_padded(&mut layouter, 1024)?;
 
@@ -600,7 +600,7 @@ mod tests {
             &self,
             config: Self::Config,
             mut layouter: impl Layouter<Fr>,
-        ) -> Result<(), Error> {
+        ) -> Result<(), ErrorFront> {
             let chip = ExpTableChip::<Fr, 128, 64>::new(config.clone());
             chip.load_padded(&mut layouter, 1024)?;
 

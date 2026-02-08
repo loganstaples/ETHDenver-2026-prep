@@ -25,7 +25,7 @@ use halo2_proofs::{
     arithmetic::Field,
     circuit::{AssignedCell, Layouter, SimpleFloorPlanner, Value},
     plonk::{
-        Advice, Circuit, Column, ConstraintSystem, Error, Expression, Fixed, Instance, Selector,
+        Advice, Circuit, Column, ConstraintSystem, Error, ErrorFront, Expression, Fixed, Instance, Selector,
         TableColumn,
     },
     poly::Rotation,
@@ -295,7 +295,7 @@ impl Circuit<Fr> for MLTrainingStepCircuit {
         });
 
         // ReLU lookup: (advice[0], advice[1]) must be in (relu_table_in, relu_table_out)
-        meta.lookup(|meta| {
+        meta.lookup("training_relu", |meta| {
             let s = meta.query_selector(s_relu);
             let input = meta.query_advice(advice[0], Rotation::cur());
             let output = meta.query_advice(advice[1], Rotation::cur());
@@ -322,7 +322,7 @@ impl Circuit<Fr> for MLTrainingStepCircuit {
         &self,
         config: Self::Config,
         mut layouter: impl Layouter<Fr>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let w = &self.witness;
 
         // ================================================================
@@ -698,7 +698,7 @@ fn load_relu_table(
     config: &MLTrainingStepConfig,
     layouter: &mut impl Layouter<Fr>,
     half_range: usize,
-) -> Result<(), Error> {
+) -> Result<(), ErrorFront> {
     layouter.assign_table(
         || "relu_table",
         |mut table| {
@@ -766,7 +766,7 @@ fn verify_dot_product(
     b: &[Fr],
     expected: Fr,
     label: &str,
-) -> Result<(), Error> {
+) -> Result<(), ErrorFront> {
     assert_eq!(a.len(), b.len(), "dot product dimension mismatch");
     let n = a.len();
     if n == 0 {
@@ -820,7 +820,7 @@ fn assign_mul(
     b: Fr,
     c: Fr,
     label: &str,
-) -> Result<(), Error> {
+) -> Result<(), ErrorFront> {
     layouter.assign_region(
         || label.to_string(),
         |mut region| {
@@ -840,7 +840,7 @@ fn assign_add(
     b: Fr,
     c: Fr,
     label: &str,
-) -> Result<(), Error> {
+) -> Result<(), ErrorFront> {
     layouter.assign_region(
         || label.to_string(),
         |mut region| {
@@ -860,7 +860,7 @@ fn assign_sub(
     b: Fr,
     c: Fr,
     label: &str,
-) -> Result<(), Error> {
+) -> Result<(), ErrorFront> {
     layouter.assign_region(
         || label.to_string(),
         |mut region| {
@@ -879,7 +879,7 @@ fn assign_eq(
     a: Fr,
     b: Fr,
     label: &str,
-) -> Result<(), Error> {
+) -> Result<(), ErrorFront> {
     layouter.assign_region(
         || label.to_string(),
         |mut region| {
@@ -897,7 +897,7 @@ fn assign_relu(
     input: Fr,
     output: Fr,
     label: &str,
-) -> Result<(), Error> {
+) -> Result<(), ErrorFront> {
     layouter.assign_region(
         || label.to_string(),
         |mut region| {

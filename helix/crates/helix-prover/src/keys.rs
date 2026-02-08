@@ -402,8 +402,8 @@ pub fn generate_keys<C>(
 pub struct CircuitKeys {
     /// Key identifier.
     pub id: KeyId,
-    /// KZG parameters.
-    pub params: helix_circuits::halo2_proofs::poly::commitment::Params<helix_circuits::halo2curves::bn256::G1Affine>,
+    /// SRS parameters (KZG commitment scheme on BN254).
+    pub params: helix_circuits::halo2_proofs::poly::kzg::commitment::ParamsKZG<helix_circuits::halo2curves::bn256::Bn256>,
     /// Proving key.
     pub pk: helix_circuits::halo2_proofs::plonk::ProvingKey<helix_circuits::halo2curves::bn256::G1Affine>,
     /// Verification key.
@@ -413,20 +413,21 @@ pub struct CircuitKeys {
 /// Generates real Halo2 proving/verification keys for a concrete circuit.
 ///
 /// Runs trusted setup and returns the raw key objects for use with the prover pipeline.
+/// Uses KZG commitment scheme (PSE fork of halo2) for EVM-compatible proofs.
 pub fn generate_keys_for_circuit<C: helix_circuits::halo2_proofs::plonk::Circuit<helix_circuits::halo2curves::bn256::Fr>>(
     circuit: &C,
     circuit_name: &str,
     version: u32,
     k: u32,
 ) -> CircuitKeys {
-    use helix_circuits::halo2_proofs::poly::commitment::Params;
+    use helix_circuits::halo2_proofs::poly::kzg::commitment::ParamsKZG;
     use helix_circuits::halo2_proofs::plonk::{keygen_pk, keygen_vk};
-    use helix_circuits::halo2curves::bn256::G1Affine;
+    use helix_circuits::halo2curves::bn256::Bn256;
 
     let id = KeyId::new(circuit_name, version);
 
-    // Trusted setup
-    let params = Params::<G1Affine>::new(k);
+    // Trusted setup (KZG)
+    let params = ParamsKZG::<Bn256>::setup(k, rand_core::OsRng);
 
     // Generate verification key then proving key
     let vk = keygen_vk(&params, circuit).expect("keygen_vk failed");

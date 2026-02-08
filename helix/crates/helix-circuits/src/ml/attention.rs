@@ -30,7 +30,7 @@
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
     plonk::{
-        Advice, Circuit, Column, ConstraintSystem, Error, Expression, Instance, Selector,
+        Advice, Circuit, Column, ConstraintSystem, Error, ErrorFront, Expression, Instance, Selector,
         TableColumn,
     },
     poly::Rotation,
@@ -185,7 +185,7 @@ impl<F: PrimeField> MultiHeadAttentionChip<F> {
         });
 
         // Exp lookup for softmax
-        meta.lookup(|meta| {
+        meta.lookup("attention_activation", |meta| {
             let s = meta.query_selector(s_exp);
             let input = meta.query_advice(advice[0], Rotation::cur());
             let output = meta.query_advice(advice[1], Rotation::cur());
@@ -218,7 +218,7 @@ impl<F: PrimeField> MultiHeadAttentionChip<F> {
         layouter: &mut impl Layouter<F>,
         range: usize,
         scale: u64,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let scale_f = scale as f64;
         layouter.assign_table(
             || "exp_table",
@@ -268,7 +268,7 @@ impl<F: PrimeField> MultiHeadAttentionChip<F> {
         &self,
         mut layouter: impl Layouter<F>,
         witness: &MultiHeadAttentionWitness<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let n_heads = witness.n_heads;
         let seq_len = witness.seq_len;
         let d_k = witness.d_k;
@@ -359,7 +359,7 @@ impl<F: PrimeField> MultiHeadAttentionChip<F> {
         seq_len: usize,
         d_in: usize,
         d_out: usize,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         // For each output position, verify dot product
         for s in 0..seq_len {
             for d in 0..d_out {
@@ -427,7 +427,7 @@ impl<F: PrimeField> MultiHeadAttentionChip<F> {
         seq_len: usize,
         d_k: usize,
         d_v: usize,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         // Step 1: Verify attention scores = Q @ K^T / sqrt(d_k)
         for i in 0..seq_len {
             for j in 0..seq_len {
@@ -540,7 +540,7 @@ impl<F: PrimeField> MultiHeadAttentionChip<F> {
         seq_len: usize,
         d_v: usize,
         d_model: usize,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let concat_dim = n_heads * d_v;
 
         for s in 0..seq_len {
@@ -972,7 +972,7 @@ impl<F: PrimeField> Circuit<F> for MultiHeadAttentionCircuit<F> {
         &self,
         config: Self::Config,
         mut layouter: impl Layouter<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let chip = MultiHeadAttentionChip::new(config.clone());
 
         // Load exp table

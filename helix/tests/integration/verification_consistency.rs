@@ -54,7 +54,7 @@ fn test_native_verification_deterministic() {
         Fr::from(1u64),
     );
 
-    let proof_result = prover.prove(&witness);
+    let proof_result = prover.prove(&witness).unwrap();
 
     // Verify multiple times - should always get same result
     let results: Vec<bool> = (0..10)
@@ -100,7 +100,7 @@ fn test_native_verification_multiple_proofs() {
                 Fr::from(1u64),
             );
 
-            prover.prove(&witness)
+            prover.prove(&witness).unwrap()
         })
         .collect();
 
@@ -215,7 +215,7 @@ fn test_native_vs_evm_consistency() {
         Fr::from(1u64),
     );
 
-    let proof_result = prover.prove(&witness);
+    let proof_result = prover.prove(&witness).unwrap();
 
     // Native verification
     let native_result = prover.verify_result(&proof_result);
@@ -253,7 +253,7 @@ fn test_invalid_proof_consistency() {
         Fr::from(1u64),
     );
 
-    let proof_result = prover.prove(&witness);
+    let proof_result = prover.prove(&witness).unwrap();
 
     // Corrupt public inputs
     let mut corrupted_pi = proof_result.public_inputs.clone();
@@ -297,7 +297,7 @@ fn test_proof_structure_validity() {
         Fr::from(1u64),
     );
 
-    let proof_result = prover.prove(&witness);
+    let proof_result = prover.prove(&witness).unwrap();
 
     // Check proof is non-empty
     assert!(!proof_result.proof.is_empty(), "Proof should not be empty");
@@ -468,7 +468,7 @@ fn test_consistency_different_k_values() {
             Fr::from(1u64),
         );
 
-        let proof_result = prover.prove(&witness);
+        let proof_result = prover.prove(&witness).unwrap();
         let verified = prover.verify_result(&proof_result);
 
         if !verified {
@@ -513,7 +513,7 @@ fn test_consistency_freivalds_toggle() {
         Fr::from(1u64),
     );
 
-    let proof_with = prover_with.prove(&witness_with);
+    let proof_with = prover_with.prove(&witness_with).unwrap();
     let verified_with = prover_with.verify_result(&proof_with);
 
     // Without Freivalds
@@ -543,7 +543,7 @@ fn test_consistency_freivalds_toggle() {
         Fr::from(1u64),
     );
 
-    let proof_without = prover_without.prove(&witness_without);
+    let proof_without = prover_without.prove(&witness_without).unwrap();
     let verified_without = prover_without.verify_result(&proof_without);
 
     // Both should verify
@@ -586,7 +586,7 @@ fn test_verification_time_consistency() {
         Fr::from(1u64),
     );
 
-    let proof_result = prover.prove(&witness);
+    let proof_result = prover.prove(&witness).unwrap();
 
     // Measure verification times
     let times: Vec<Duration> = (0..5)
@@ -637,7 +637,7 @@ fn test_evm_gas_consistency() {
         Fr::from(1u64),
     );
 
-    let proof_result = prover.prove(&witness);
+    let proof_result = prover.prove(&witness).unwrap();
 
     let mock_evm = MockEVMVerifier::new();
 
@@ -724,7 +724,7 @@ fn test_verification_consistency_corrupted_proofs() {
         Fr::from(1u64),
     );
 
-    let proof_result = prover.prove(&witness);
+    let proof_result = prover.prove(&witness).unwrap();
     let mock_evm = MockEVMVerifier::new();
 
     // Test various corruptions
@@ -782,7 +782,7 @@ fn test_verification_consistency_model_sizes() {
             Fr::from(1u64),
         );
 
-        let proof_result = prover.prove(&witness);
+        let proof_result = prover.prove(&witness).unwrap();
 
         // Native verification
         let native_verified = prover.verify_result(&proof_result);
@@ -826,7 +826,7 @@ fn test_proof_solidity_format_compatibility() {
         Fr::from(1u64),
     );
 
-    let proof_result = prover.prove(&witness);
+    let proof_result = prover.prove(&witness).unwrap();
 
     // Generate Solidity contract
     let contract = prover.generate_solidity_verifier("ConsistencyVerifier");
@@ -879,7 +879,7 @@ fn test_verification_stability() {
         Fr::from(1u64),
     );
 
-    let proof_result = prover.prove(&witness);
+    let proof_result = prover.prove(&witness).unwrap();
 
     // Verify 20 times - all should succeed
     let results: Vec<bool> = (0..20)
@@ -936,7 +936,7 @@ fn test_truncated_proof_fails() {
         Fr::from(1u64),
     );
 
-    let proof_result = prover.prove(&witness);
+    let proof_result = prover.prove(&witness).unwrap();
 
     // Truncate proof to half its size
     let truncated: Vec<u8> = proof_result.proof[..proof_result.proof.len() / 2].to_vec();
@@ -969,7 +969,7 @@ fn test_swapped_public_inputs_fail() {
         Fr::from(1u64),
     );
 
-    let proof_result = prover.prove(&witness);
+    let proof_result = prover.prove(&witness).unwrap();
 
     // Swap old and new hashes
     let mut swapped_pi = proof_result.public_inputs.clone();

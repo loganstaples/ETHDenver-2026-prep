@@ -362,7 +362,7 @@ impl VerificationKeyMetadata {
             generated_at: now,
             pk_hash: [0u8; 32],
             content_hash: [0u8; 32],
-            commitment_scheme: CommitmentScheme::IPA,
+            commitment_scheme: CommitmentScheme::KZG,
         }
     }
 
@@ -437,7 +437,7 @@ impl VerificationKeyMetadata {
         let commitment_scheme = if data.len() > offset + 88 {
             CommitmentScheme::from_id(data[offset + 88])
         } else {
-            CommitmentScheme::IPA
+            CommitmentScheme::KZG
         };
 
         Ok(Self {

@@ -3,13 +3,7 @@
 //! Provides verification of Halo2 proofs using the halo2_proofs API.
 //! Supports both single proof verification and batch verification.
 
-use halo2_proofs::{
-    plonk::{verify_proof as halo2_verify, Error as PlonkError, VerifyingKey},
-    transcript::{Blake2bRead, Challenge255},
-    poly::commitment::Params,
-};
-use halo2curves::bn256::{Bn256, G1Affine, Fr};
-use std::io::Cursor;
+use halo2curves::bn256::Fr;
 
 /// A serialized Halo2 proof.
 #[derive(Debug, Clone)]

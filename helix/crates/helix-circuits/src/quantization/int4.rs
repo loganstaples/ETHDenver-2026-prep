@@ -30,7 +30,7 @@ use halo2_proofs::{
     arithmetic::Field,
     circuit::{AssignedCell, Layouter, Region, SimpleFloorPlanner, Value},
     plonk::{
-        Advice, Circuit, Column, ConstraintSystem, Error, Expression, Fixed,
+        Advice, Circuit, Column, ConstraintSystem, Error, ErrorFront, Expression, Fixed,
         Instance, Selector, TableColumn,
     },
     poly::Rotation,
@@ -219,7 +219,7 @@ impl<F: PrimeField> Int4QuantChip<F> {
         let s_mixed_mul = meta.selector();
 
         // INT4 range check: quantized + 8 ∈ [0, 15]
-        meta.lookup(|meta| {
+        meta.lookup("int4_range_check", |meta| {
             let s = meta.query_selector(s_int4_range);
             let q = meta.query_advice(quantized, Rotation::cur());
             let shifted = q + Expression::Constant(F::from(8u64));
@@ -305,7 +305,7 @@ impl<F: PrimeField> Int4QuantChip<F> {
     }
 
     /// Loads the INT4 range lookup table.
-    pub fn load_int4_table(&self, layouter: &mut impl Layouter<F>) -> Result<(), Error> {
+    pub fn load_int4_table(&self, layouter: &mut impl Layouter<F>) -> Result<(), ErrorFront> {
         layouter.assign_table(
             || "INT4 range table",
             |mut table| {
@@ -323,7 +323,7 @@ impl<F: PrimeField> Int4QuantChip<F> {
     }
 
     /// Loads the packed INT4 lookup table (0-255).
-    pub fn load_packed_table(&self, layouter: &mut impl Layouter<F>) -> Result<(), Error> {
+    pub fn load_packed_table(&self, layouter: &mut impl Layouter<F>) -> Result<(), ErrorFront> {
         layouter.assign_table(
             || "Packed INT4 table",
             |mut table| {
@@ -349,7 +349,7 @@ impl<F: PrimeField> Int4QuantChip<F> {
         quantized: Value<F>,
         scale: Value<F>,
         error: Value<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         self.config.s_quantize.enable(region, row)?;
         self.config.s_int4_range.enable(region, row)?;
 
@@ -369,7 +369,7 @@ impl<F: PrimeField> Int4QuantChip<F> {
         high: Value<F>,
         low: Value<F>,
         packed: Value<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         self.config.s_pack.enable(region, row)?;
 
         region.assign_advice(|| "high", self.config.aux[0], row, || high)?;
@@ -387,7 +387,7 @@ impl<F: PrimeField> Int4QuantChip<F> {
         packed: Value<F>,
         high: Value<F>,
         low: Value<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         self.config.s_unpack.enable(region, row)?;
         // Also verify both values are in INT4 range
         // (This would require two range checks, but simplified here)
@@ -407,7 +407,7 @@ impl<F: PrimeField> Int4QuantChip<F> {
         weight_int4: Value<F>,
         activation_int8: Value<F>,
         result: Value<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         self.config.s_mixed_mul.enable(region, row)?;
 
         region.assign_advice(|| "weight", self.config.aux[0], row, || weight_int4)?;
@@ -476,7 +476,7 @@ impl<F: PrimeField> Circuit<F> for Int4PackedCircuit<F> {
         &self,
         config: Self::Config,
         mut layouter: impl Layouter<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let chip = Int4QuantChip::new(config.clone());
         chip.load_int4_table(&mut layouter)?;
         chip.load_packed_table(&mut layouter)?;
@@ -578,7 +578,7 @@ impl<F: PrimeField> Circuit<F> for Int4MixedPrecisionCircuit<F> {
         &self,
         config: Self::Config,
         mut layouter: impl Layouter<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let chip = Int4QuantChip::new(config.clone());
         chip.load_int4_table(&mut layouter)?;
 
@@ -687,7 +687,7 @@ impl<F: PrimeField> Circuit<F> for Int4QuantCircuit<F> {
         &self,
         config: Self::Config,
         mut layouter: impl Layouter<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let chip = Int4QuantChip::new(config.clone());
         chip.load_int4_table(&mut layouter)?;
 

@@ -244,7 +244,7 @@ fn test_mpc_zkp_integration_flow() {
         Fr::from(1u64),
     );
 
-    let proof_result = prover.prove(&witness);
+    let proof_result = prover.prove(&witness).unwrap();
     result.add_phase(PhaseResult::success("proof_generation", phase_start.elapsed()));
 
     // Phase 4: Verify proof
@@ -298,7 +298,7 @@ fn test_mpc_three_party_proved_computation() {
             Fr::from(1u64),
         );
 
-        let proof = prover.prove(&witness);
+        let proof = prover.prove(&witness).unwrap();
         party_proofs.push((party.clone(), proof));
     }
 
@@ -610,7 +610,7 @@ fn test_full_mpc_zkp_pipeline() {
         Fr::from(1u64),
     );
 
-    let proof = prover.prove(&witness);
+    let proof = prover.prove(&witness).unwrap();
     harness.record_metric("proof_size", proof.proof.len() as f64, "bytes");
 
     result.add_phase(PhaseResult::success("proof_generation", phase_start.elapsed()));

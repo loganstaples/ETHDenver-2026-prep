@@ -10,7 +10,7 @@ use crate::gadgets::arithmetic::{ArithmeticChip, ArithmeticConfig};
 use crate::gadgets::range::{RangeChip, RangeConfig};
 use halo2_proofs::{
     circuit::{Layouter, Value},
-    plonk::Error,
+    plonk::{Error, ErrorFront},
 };
 use halo2curves::ff::PrimeField;
 
@@ -47,7 +47,7 @@ impl<F: PrimeField, const RANGE: usize> BoundedMulChip<F, RANGE> {
         err_b: Value<F>,
         val_c: Value<F>,
         err_c: Value<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         // 1. Constrain value multiplication: val_a * val_b = val_c
         layouter.assign_region(
             || "bounded mul values",

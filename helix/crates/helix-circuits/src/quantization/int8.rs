@@ -25,7 +25,7 @@ use halo2_proofs::{
     arithmetic::Field,
     circuit::{AssignedCell, Layouter, Region, SimpleFloorPlanner, Value},
     plonk::{
-        Advice, Circuit, Column, ConstraintSystem, Error, Expression, Fixed,
+        Advice, Circuit, Column, ConstraintSystem, Error, ErrorFront, Expression, Fixed,
         Instance, Selector, TableColumn,
     },
     poly::Rotation,
@@ -318,7 +318,7 @@ impl<F: PrimeField> Int8QuantChip<F> {
 
         // INT8 range check via lookup
         // The quantized value (shifted to unsigned) must be in [0, 255]
-        meta.lookup(|meta| {
+        meta.lookup("int8_range_check", |meta| {
             let s = meta.query_selector(s_int8_range);
             let q = meta.query_advice(quantized, Rotation::cur());
             // Shift signed to unsigned: q + 128
@@ -402,7 +402,7 @@ impl<F: PrimeField> Int8QuantChip<F> {
     }
 
     /// Loads the INT8 range lookup table.
-    pub fn load_int8_table(&self, layouter: &mut impl Layouter<F>) -> Result<(), Error> {
+    pub fn load_int8_table(&self, layouter: &mut impl Layouter<F>) -> Result<(), ErrorFront> {
         layouter.assign_table(
             || "INT8 range table",
             |mut table| {
@@ -425,7 +425,7 @@ impl<F: PrimeField> Int8QuantChip<F> {
         region: &mut Region<'_, F>,
         row: usize,
         witness: &Int8QuantWitness<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         self.config.s_quantize.enable(region, row)?;
         self.config.s_int8_range.enable(region, row)?;
 
@@ -444,7 +444,7 @@ impl<F: PrimeField> Int8QuantChip<F> {
         region: &mut Region<'_, F>,
         row: usize,
         witness: &Int8QuantWitness<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         self.config.s_quantize.enable(region, row)?;
         self.config.s_int8_range.enable(region, row)?;
 
@@ -465,7 +465,7 @@ impl<F: PrimeField> Int8QuantChip<F> {
         a: Value<F>,
         b: Value<F>,
         result: Value<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         self.config.s_mul.enable(region, row)?;
 
         region.assign_advice(|| "a", self.config.aux[0], row, || a)?;
@@ -484,7 +484,7 @@ impl<F: PrimeField> Int8QuantChip<F> {
         output_scale: Value<F>,
         output: Value<F>,
         error: Value<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         self.config.s_requantize.enable(region, row)?;
         self.config.s_int8_range.enable(region, row)?;
 
@@ -602,7 +602,7 @@ impl<F: PrimeField> Circuit<F> for Int8MatMulCircuit<F> {
         &self,
         config: Self::Config,
         mut layouter: impl Layouter<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let chip = Int8QuantChip::new(config.clone());
         chip.load_int8_table(&mut layouter)?;
 
@@ -639,7 +639,7 @@ impl<F: PrimeField> Circuit<F> for Int8MatMulCircuit<F> {
 
                         // Verify accumulator matches
                         if acc != self.accumulators[i][j] {
-                            return Err(Error::Synthesis);
+                            return Err(ErrorFront::Synthesis);
                         }
 
                         // Verify requantization
@@ -754,7 +754,7 @@ impl<F: PrimeField> Circuit<F> for Int8DotProductCircuit<F> {
         &self,
         config: Self::Config,
         mut layouter: impl Layouter<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let chip = Int8QuantChip::new(config.clone());
         chip.load_int8_table(&mut layouter)?;
 
@@ -780,7 +780,7 @@ impl<F: PrimeField> Circuit<F> for Int8DotProductCircuit<F> {
                 }
 
                 if acc != self.result {
-                    return Err(Error::Synthesis);
+                    return Err(ErrorFront::Synthesis);
                 }
 
                 Ok(())
@@ -881,7 +881,7 @@ impl<F: PrimeField> Circuit<F> for Int8QuantCircuit<F> {
         &self,
         config: Self::Config,
         mut layouter: impl Layouter<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let chip = Int8QuantChip::new(config.clone());
         chip.load_int8_table(&mut layouter)?;
 

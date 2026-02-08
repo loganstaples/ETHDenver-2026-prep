@@ -155,7 +155,7 @@ impl GKRProof {
         // Claimed output
         bytes.extend_from_slice(&(self.claimed_output.len() as u32).to_le_bytes());
         for v in &self.claimed_output {
-            bytes.extend_from_slice(&v.to_repr());
+            bytes.extend_from_slice(v.to_repr().as_ref());
         }
 
         // Layer proofs
@@ -165,12 +165,12 @@ impl GKRProof {
             bytes.extend_from_slice(&layer_proof.sumcheck_proof.to_bytes());
             bytes.extend_from_slice(&(layer_proof.final_evals.len() as u32).to_le_bytes());
             for v in &layer_proof.final_evals {
-                bytes.extend_from_slice(&v.to_repr());
+                bytes.extend_from_slice(v.to_repr().as_ref());
             }
             match &layer_proof.mask_opening {
                 Some(m) => {
                     bytes.push(1);
-                    bytes.extend_from_slice(&m.to_repr());
+                    bytes.extend_from_slice(m.to_repr().as_ref());
                 }
                 None => bytes.push(0),
             }
@@ -179,9 +179,9 @@ impl GKRProof {
         // Input claim
         bytes.extend_from_slice(&(self.input_claim.0.len() as u32).to_le_bytes());
         for v in &self.input_claim.0 {
-            bytes.extend_from_slice(&v.to_repr());
+            bytes.extend_from_slice(v.to_repr().as_ref());
         }
-        bytes.extend_from_slice(&self.input_claim.1.to_repr());
+        bytes.extend_from_slice(self.input_claim.1.to_repr().as_ref());
 
         // Commitments
         bytes.extend_from_slice(&(self.commitments.len() as u32).to_le_bytes());

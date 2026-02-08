@@ -2,7 +2,7 @@
 
 use halo2_proofs::{
     circuit::{Layouter, Value},
-    plonk::{ConstraintSystem, Error},
+    plonk::{ConstraintSystem, Error, ErrorFront},
 };
 use halo2curves::ff::PrimeField;
 use crate::gadgets::arithmetic::{ArithmeticChip, ArithmeticConfig};
@@ -34,7 +34,7 @@ impl<F: PrimeField, const RANGE: usize> StateTransitionChip<F, RANGE> {
         lr: Value<F>,
         new_w: Value<F>,
         new_err: Value<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let add_chip = BoundedAddChip::new(self.config.add.clone());
         let mul_chip = BoundedMulChip::new(self.config.mul.clone());
 

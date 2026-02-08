@@ -1,19 +1,15 @@
 //! Commitment to gradient update vector.
+//!
+//! Uses SHA-256 hashing for gradient commitments (same as model_commit).
+//! The Poseidon circuit gadget has been removed due to halo2_gadgets
+//! incompatibility with the PSE fork of halo2.
 
-use halo2_proofs::{
-    circuit::{Layouter, Value},
-    plonk::{ConstraintSystem, Error},
-};
-use halo2curves::ff::PrimeField;
 use crate::commitment::model_commit::{ModelCommitChip, ModelCommitConfig};
 
-// Re-use ModelCommitChip logic since generic hashing is similar.
-// Gradient commitment might just be the hash of the vector components.
-// For large vectors, we typically merkleize them too to avoid huge public inputs.
-// So GradientCommitChip is effectively a Merkle Tree chip too.
+// Re-use ModelCommitChip logic since SHA-256 hashing is the same for both.
+// Gradient commitment is just the hash of the gradient vector components.
+// For large vectors, we merkleize them to avoid huge public inputs.
 
-pub type GradientCommitChip<F, S, const WIDTH: usize, const RATE: usize, const L: usize> = 
-    ModelCommitChip<F, S, WIDTH, RATE, L>;
+pub type GradientCommitChip<F> = ModelCommitChip<F>;
 
-pub type GradientCommitConfig<F, const WIDTH: usize, const RATE: usize> = 
-    ModelCommitConfig<F, WIDTH, RATE>;
+pub type GradientCommitConfig<F> = ModelCommitConfig<F>;

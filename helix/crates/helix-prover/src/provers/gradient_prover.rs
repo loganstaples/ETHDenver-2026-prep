@@ -568,7 +568,7 @@ fn fr_to_bytes(f: &Fr) -> [u8; 32] {
 
 fn bytes_to_fr(bytes: &[u8; 32]) -> Fr {
     use helix_circuits::halo2curves::ff::PrimeField;
-    Fr::from_repr_vartime(*bytes).unwrap_or(Fr::zero())
+    Fr::from_repr_vartime((*bytes).into()).unwrap_or(Fr::zero())
 }
 
 fn fr_to_f64(f: &Fr) -> f64 {

@@ -31,7 +31,7 @@ use halo2_proofs::{
         commitment::Params,
         kzg::{
             commitment::{KZGCommitmentScheme, ParamsKZG},
-            multiopen::{ProverGWC, VerifierGWC},
+            multiopen::{ProverSHPLONK, VerifierSHPLONK},
             strategy::SingleStrategy,
         },
     },
@@ -376,7 +376,7 @@ fn bench_proof_generation(c: &mut Criterion) {
                         );
                         create_proof::<
                             KZGCommitmentScheme<Bn256>,
-                            ProverGWC<'_, Bn256>,
+                            ProverSHPLONK<'_, Bn256>,
                             Challenge255<G1Affine>,
                             _,
                             Blake2bWrite<Vec<u8>, G1Affine, Challenge255<G1Affine>>,
@@ -416,7 +416,7 @@ fn bench_verification(c: &mut Criterion) {
             Blake2bWrite::<_, G1Affine, Challenge255<_>>::init(Vec::new());
         create_proof::<
             KZGCommitmentScheme<Bn256>,
-            ProverGWC<'_, Bn256>,
+            ProverSHPLONK<'_, Bn256>,
             Challenge255<G1Affine>,
             _,
             Blake2bWrite<Vec<u8>, G1Affine, Challenge255<G1Affine>>,
@@ -438,7 +438,7 @@ fn bench_verification(c: &mut Criterion) {
                     let strategy = SingleStrategy::new(*params);
                     let result = verify_proof::<
                         KZGCommitmentScheme<Bn256>,
-                        VerifierGWC<'_, Bn256>,
+                        VerifierSHPLONK<'_, Bn256>,
                         Challenge255<G1Affine>,
                         Blake2bRead<&[u8], G1Affine, Challenge255<G1Affine>>,
                         SingleStrategy<'_, Bn256>,

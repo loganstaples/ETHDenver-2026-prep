@@ -21,7 +21,7 @@ use halo2_proofs::{
     arithmetic::Field,
     circuit::{AssignedCell, Layouter, Region, Value},
     plonk::{
-        Advice, Column, ConstraintSystem, Error, Expression, Fixed, Selector, TableColumn,
+        Advice, Column, ConstraintSystem, Error, ErrorFront, Expression, Fixed, Selector, TableColumn,
     },
     poly::Rotation,
 };
@@ -319,7 +319,7 @@ impl<F: PrimeField> PlookupChip<F> {
         let table_output = meta.lookup_table_column();
         let s_lookup = meta.complex_selector();
 
-        meta.lookup(|meta| {
+        meta.lookup("table_lookup", |meta| {
             let s = meta.query_selector(s_lookup);
             let input = meta.query_advice(advice_input, Rotation::cur());
             let output = meta.query_advice(advice_output, Rotation::cur());
@@ -367,7 +367,7 @@ impl<F: PrimeField> PlookupChip<F> {
         let advice_inputs: Vec<_> = advice_columns[..num_inputs].to_vec();
         let advice_outputs: Vec<_> = advice_columns[num_inputs..num_inputs + num_outputs].to_vec();
 
-        meta.lookup(|meta| {
+        meta.lookup("table_range_check", |meta| {
             let s = meta.query_selector(s_lookup);
             let mut lookup_pairs = Vec::with_capacity(num_inputs + num_outputs);
 
@@ -400,7 +400,7 @@ impl<F: PrimeField> PlookupChip<F> {
         &self,
         layouter: &mut impl Layouter<F>,
         table: &PlookupTable<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         layouter.assign_table(
             || "plookup table",
             |mut table_layouter| {
@@ -462,7 +462,7 @@ impl<F: PrimeField> PlookupChip<F> {
         layouter: &mut impl Layouter<F>,
         table: &PlookupTable<F>,
         min_rows: usize,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         layouter.assign_table(
             || "plookup table (padded)",
             |mut table_layouter| {
@@ -519,7 +519,7 @@ impl<F: PrimeField> PlookupChip<F> {
         row: usize,
         input: Value<F>,
         output: Value<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         self.config.s_lookup.enable(region, row)?;
 
         region.assign_advice(
@@ -546,7 +546,7 @@ impl<F: PrimeField> PlookupChip<F> {
         row: usize,
         inputs: &[Value<F>],
         outputs: &[Value<F>],
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         self.config.s_lookup.enable(region, row)?;
 
         for (i, (col, val)) in self.config.advice_inputs.iter().zip(inputs.iter()).enumerate() {

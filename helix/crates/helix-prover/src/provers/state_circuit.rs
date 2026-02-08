@@ -1,6 +1,6 @@
 use helix_circuits::halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
-    plonk::{Circuit, ConstraintSystem, Error},
+    plonk::{Circuit, ConstraintSystem, Error, ErrorFront},
 };
 use helix_circuits::halo2curves::bn256::Fr;
 use helix_circuits::commitment::state_transition::{
@@ -62,7 +62,7 @@ impl Circuit<Fr> for StateTransitionCircuit {
         &self,
         config: Self::Config,
         mut layouter: impl Layouter<Fr>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let chip = StateTransitionChip::new(config.st_config);
         
         // Load table (hacky access via internal chips, ideally exposed)

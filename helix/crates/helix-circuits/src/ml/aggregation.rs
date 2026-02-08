@@ -13,7 +13,7 @@ use crate::gadgets::arithmetic::{ArithmeticChip, ArithmeticConfig};
 use crate::gadgets::range::{RangeChip, RangeConfig};
 use halo2_proofs::{
     circuit::{AssignedCell, Layouter, SimpleFloorPlanner, Value},
-    plonk::{Circuit, Column, Advice, ConstraintSystem, Error, Selector, Instance},
+    plonk::{Circuit, Column, Advice, ConstraintSystem, Error, ErrorFront, Selector, Instance},
     poly::Rotation,
 };
 use halo2curves::ff::PrimeField;
@@ -125,10 +125,10 @@ impl<F: PrimeField, const RANGE: usize> GradientAggregationChip<F, RANGE> {
         weight_errs: &[Value<F>],
         aggregated_val: Value<F>,
         aggregated_err: Value<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let num_participants = gradients.len();
         if num_participants == 0 {
-            return Err(Error::Synthesis);
+            return Err(ErrorFront::Synthesis);
         }
         
         // Step 1: Compute weighted gradients
@@ -361,7 +361,7 @@ impl<F: PrimeField, const RANGE: usize> GradientAggregationChip<F, RANGE> {
         weight_errs: &[Value<F>],
         aggregated_val: Value<F>,
         aggregated_err: Value<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         // First verify that weights are correctly computed from stakes
         for i in 0..stakes.len() {
             // Verify: weight_i * total_stake = stake_i
@@ -448,7 +448,7 @@ impl<F: PrimeField, const RANGE: usize> Circuit<F> for GradientAggregationCircui
         &self,
         config: Self::Config,
         mut layouter: impl Layouter<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let range_chip = RangeChip::<F, RANGE>::new(config.range.clone());
         range_chip.load(&mut layouter)?;
         

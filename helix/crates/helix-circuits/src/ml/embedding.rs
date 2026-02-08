@@ -29,7 +29,7 @@
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
     plonk::{
-        Advice, Circuit, Column, ConstraintSystem, Error, Expression, Fixed, Instance, Selector,
+        Advice, Circuit, Column, ConstraintSystem, Error, ErrorFront, Expression, Fixed, Instance, Selector,
         TableColumn,
     },
     poly::Rotation,
@@ -103,7 +103,7 @@ impl<F: PrimeField> EmbeddingChip<F> {
         let s_hash = meta.selector();
 
         // Vocabulary range check lookup
-        meta.lookup(|meta| {
+        meta.lookup("embedding_lookup", |meta| {
             let s = meta.query_selector(s_range);
             let token_id = meta.query_advice(advice[0], Rotation::cur());
             vec![(s * token_id, vocab_table)]
@@ -156,7 +156,7 @@ impl<F: PrimeField> EmbeddingChip<F> {
         &self,
         layouter: &mut impl Layouter<F>,
         vocab_size: usize,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         layouter.assign_table(
             || "vocab_table",
             |mut table| {
@@ -178,7 +178,7 @@ impl<F: PrimeField> EmbeddingChip<F> {
         &self,
         mut layouter: impl Layouter<F>,
         witness: &EmbeddingWitness<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let seq_len = witness.token_ids.len();
         let embed_dim = witness.embeddings.get(0).map(|e| e.len()).unwrap_or(0);
 
@@ -248,7 +248,7 @@ impl<F: PrimeField> EmbeddingChip<F> {
         leaf_hash: &F,
         root: F,
         path: &[(F, bool)], // (sibling_hash, is_left)
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         if path.is_empty() {
             // Just verify leaf equals root
             layouter.assign_region(
@@ -591,7 +591,7 @@ impl<F: PrimeField> Circuit<F> for EmbeddingCircuit<F> {
         &self,
         config: Self::Config,
         mut layouter: impl Layouter<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let chip = EmbeddingChip::new(config.clone());
 
         // Load vocabulary table

@@ -104,7 +104,7 @@ pub use chunking::{ChunkId, ChunkingConfig, ComputationChunk, ComputationChunker
 pub use ivc::{IVCConfig, IVCProver, IVCState, IVCStep};
 
 // Re-export key management types
-pub use keys::{FileKeyStore, InMemoryKeyStore, KeyId, KeyMetadata};
+pub use keys::{CircuitKeys, FileKeyStore, InMemoryKeyStore, KeyId, KeyMetadata};
 
 // Re-export parallel proving types
 pub use parallel::{BatchProofResult, ChunkProof, ParallelConfig, ParallelProver, ProofStatus};

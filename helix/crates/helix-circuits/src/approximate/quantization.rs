@@ -52,7 +52,7 @@ use halo2_proofs::{
     arithmetic::Field,
     circuit::{AssignedCell, Layouter, Region, SimpleFloorPlanner, Value},
     plonk::{
-        Advice, Circuit, Column, ConstraintSystem, Error, Expression, Fixed,
+        Advice, Circuit, Column, ConstraintSystem, Error, ErrorFront, Expression, Fixed,
         Instance, Selector, TableColumn,
     },
     poly::Rotation,
@@ -295,14 +295,14 @@ impl<F: PrimeField> QuantizationChip<F> {
         let arithmetic = ArithmeticChip::<F>::configure(meta, a, b, c);
 
         // INT8 range lookup: quantized ∈ [0, 255] (shifted for signed)
-        meta.lookup(|meta| {
+        meta.lookup("quant_range_check", |meta| {
             let s = meta.query_selector(s_int8_range);
             let q = meta.query_advice(quantized, Rotation::cur());
             vec![(s * q, int8_table)]
         });
 
         // INT4 range lookup: quantized ∈ [0, 15] (shifted for signed)
-        meta.lookup(|meta| {
+        meta.lookup("quant_overflow_check", |meta| {
             let s = meta.query_selector(s_int4_range);
             let q = meta.query_advice(quantized, Rotation::cur());
             vec![(s * q, int4_table)]
@@ -377,7 +377,7 @@ impl<F: PrimeField> QuantizationChip<F> {
     }
 
     /// Loads the INT8 lookup table.
-    pub fn load_int8_table(&self, layouter: &mut impl Layouter<F>) -> Result<(), Error> {
+    pub fn load_int8_table(&self, layouter: &mut impl Layouter<F>) -> Result<(), ErrorFront> {
         layouter.assign_table(
             || "INT8 range table",
             |mut table| {
@@ -395,7 +395,7 @@ impl<F: PrimeField> QuantizationChip<F> {
     }
 
     /// Loads the INT4 lookup table.
-    pub fn load_int4_table(&self, layouter: &mut impl Layouter<F>) -> Result<(), Error> {
+    pub fn load_int4_table(&self, layouter: &mut impl Layouter<F>) -> Result<(), ErrorFront> {
         layouter.assign_table(
             || "INT4 range table",
             |mut table| {
@@ -418,7 +418,7 @@ impl<F: PrimeField> QuantizationChip<F> {
         region: &mut Region<'_, F>,
         row: usize,
         value: Value<F>,
-    ) -> Result<AssignedCell<F, F>, Error> {
+    ) -> Result<AssignedCell<F, F>, ErrorFront> {
         self.config.s_int8_range.enable(region, row)?;
         region.assign_advice(|| "int8_value", self.config.quantized, row, || value)
     }
@@ -429,7 +429,7 @@ impl<F: PrimeField> QuantizationChip<F> {
         region: &mut Region<'_, F>,
         row: usize,
         value: Value<F>,
-    ) -> Result<AssignedCell<F, F>, Error> {
+    ) -> Result<AssignedCell<F, F>, ErrorFront> {
         self.config.s_int4_range.enable(region, row)?;
         region.assign_advice(|| "int4_value", self.config.quantized, row, || value)
     }
@@ -443,7 +443,7 @@ impl<F: PrimeField> QuantizationChip<F> {
         quantized_value: Value<F>,
         scale: Value<F>,
         error: Value<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         self.config.s_quantize.enable(region, row)?;
 
         region.assign_advice(|| "fp_value", self.config.value, row, || fp_value)?;
@@ -462,7 +462,7 @@ impl<F: PrimeField> QuantizationChip<F> {
         a: Value<F>,
         b: Value<F>,
         result: Value<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         self.config.s_quant_mul.enable(region, row)?;
 
         region.assign_advice(|| "a", self.config.arithmetic.a, row, || a)?;
@@ -480,7 +480,7 @@ impl<F: PrimeField> QuantizationChip<F> {
         a: Value<F>,
         b: Value<F>,
         result: Value<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         self.config.s_quant_add.enable(region, row)?;
 
         region.assign_advice(|| "a", self.config.arithmetic.a, row, || a)?;
@@ -499,7 +499,7 @@ impl<F: PrimeField> QuantizationChip<F> {
         output_scale: Value<F>,
         output: Value<F>,
         error: Value<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         self.config.s_requant.enable(region, row)?;
 
         region.assign_advice(|| "accum", self.config.arithmetic.a, row, || accumulator)?;
@@ -616,7 +616,7 @@ impl<F: PrimeField> Circuit<F> for QuantizedMatMulCircuit<F> {
         &self,
         config: Self::Config,
         mut layouter: impl Layouter<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let chip = QuantizationChip::new(config.clone());
 
         // Load lookup tables
@@ -701,7 +701,7 @@ impl<F: PrimeField> Circuit<F> for QuantizedMatMulCircuit<F> {
                         let expected = self.c[i][j];
                         if accum != expected {
                             // This would cause verification to fail
-                            return Err(Error::Synthesis);
+                            return Err(ErrorFront::Synthesis);
                         }
                     }
                 }

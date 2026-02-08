@@ -4,7 +4,7 @@
 
 use halo2_proofs::{
     circuit::{Layouter, Region, Value},
-    plonk::{ConstraintSystem, Error, Expression, TableColumn, Selector},
+    plonk::{ConstraintSystem, Error, ErrorFront, Expression, TableColumn, Selector},
     poly::Rotation,
 };
 use std::marker::PhantomData;
@@ -33,7 +33,7 @@ impl<F: PrimeField, const RANGE: usize> RangeConfig<F, RANGE> {
     ) -> Self {
         let s_range = meta.complex_selector();
         
-        meta.lookup(|meta| {
+        meta.lookup("range_check", |meta| {
             let s = meta.query_selector(s_range);
             let value = meta.query_advice(input_column, Rotation::cur());
             // If selector is enabled, check value. If disabled, check 0 (which is in table).
@@ -61,7 +61,7 @@ impl<F: PrimeField, const RANGE: usize> RangeChip<F, RANGE> {
     }
 
     /// Loads the lookup table with values [0, RANGE).
-    pub fn load(&self, layouter: &mut impl Layouter<F>) -> Result<(), Error> {
+    pub fn load(&self, layouter: &mut impl Layouter<F>) -> Result<(), ErrorFront> {
         layouter.assign_table(
             || "range table",
             |mut table| {

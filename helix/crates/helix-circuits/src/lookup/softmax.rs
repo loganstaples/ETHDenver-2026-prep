@@ -22,7 +22,7 @@
 use halo2_proofs::{
     arithmetic::Field,
     circuit::{AssignedCell, Layouter, Region, Value},
-    plonk::{Advice, Column, ConstraintSystem, Error, Selector, TableColumn},
+    plonk::{Advice, Column, ConstraintSystem, Error, ErrorFront, Selector, TableColumn},
     poly::Rotation,
 };
 use halo2curves::ff::PrimeField;
@@ -187,13 +187,13 @@ impl<F: PrimeField, const RANGE: usize, const SCALE: u64> SigmoidChip<F, RANGE, 
     }
 
     /// Loads the Sigmoid lookup table.
-    pub fn load(&self, layouter: &mut impl Layouter<F>) -> Result<(), Error> {
+    pub fn load(&self, layouter: &mut impl Layouter<F>) -> Result<(), ErrorFront> {
         let chip = PlookupChip::new(self.config.inner.clone());
         chip.load_table(layouter, &self.lookup.table)
     }
 
     /// Loads the Sigmoid lookup table with padding.
-    pub fn load_padded(&self, layouter: &mut impl Layouter<F>, min_rows: usize) -> Result<(), Error> {
+    pub fn load_padded(&self, layouter: &mut impl Layouter<F>, min_rows: usize) -> Result<(), ErrorFront> {
         let chip = PlookupChip::new(self.config.inner.clone());
         chip.load_table_padded(layouter, &self.lookup.table, min_rows)
     }
@@ -205,7 +205,7 @@ impl<F: PrimeField, const RANGE: usize, const SCALE: u64> SigmoidChip<F, RANGE, 
         row: usize,
         input: Value<F>,
         output: Value<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let chip = PlookupChip::new(self.config.inner.clone());
         chip.lookup_single(region, row, input, output)
     }
@@ -658,13 +658,13 @@ impl<F: PrimeField, const RANGE: usize, const SCALE: u64> SoftmaxChipFull<F, RAN
     }
 
     /// Loads the exp lookup table.
-    pub fn load(&self, layouter: &mut impl Layouter<F>) -> Result<(), Error> {
+    pub fn load(&self, layouter: &mut impl Layouter<F>) -> Result<(), ErrorFront> {
         let chip = PlookupChip::new(self.config.exp_config.clone());
         chip.load_table(layouter, self.exp_lookup.table())
     }
 
     /// Loads the exp lookup table with padding.
-    pub fn load_padded(&self, layouter: &mut impl Layouter<F>, min_rows: usize) -> Result<(), Error> {
+    pub fn load_padded(&self, layouter: &mut impl Layouter<F>, min_rows: usize) -> Result<(), ErrorFront> {
         let chip = PlookupChip::new(self.config.exp_config.clone());
         chip.load_table_padded(layouter, self.exp_lookup.table(), min_rows)
     }
@@ -845,7 +845,7 @@ mod tests {
             &self,
             config: Self::Config,
             mut layouter: impl Layouter<Fr>,
-        ) -> Result<(), Error> {
+        ) -> Result<(), ErrorFront> {
             let chip = SigmoidChip::<Fr, 256, 64>::new(config);
             chip.load_padded(&mut layouter, 1024)?;
 

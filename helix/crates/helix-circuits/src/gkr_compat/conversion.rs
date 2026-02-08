@@ -29,7 +29,7 @@ use halo2_proofs::{
     arithmetic::Field,
     circuit::{AssignedCell, Layouter, Region, SimpleFloorPlanner, Value},
     plonk::{
-        Advice, Circuit, Column, ConstraintSystem, Error, Expression, Fixed,
+        Advice, Circuit, Column, ConstraintSystem, Error, ErrorFront, Expression, Fixed,
         Instance, Selector, TableColumn,
     },
     poly::Rotation,
@@ -424,7 +424,7 @@ impl<F: PrimeField> Circuit<F> for GkrProofVerifierCircuit<F> {
         &self,
         config: Self::Config,
         mut layouter: impl Layouter<F>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ErrorFront> {
         let pi = self.public_inputs();
 
         // Assign public inputs
