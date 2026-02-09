@@ -2,6 +2,7 @@
 
 pub mod bounded_value;
 pub mod error_margin;
+pub mod grad;
 pub mod precision;
 pub mod tensor;
 
@@ -30,6 +31,7 @@ pub use bounded_value::{
 };
 pub use error_margin::ErrorMargin;
 pub use precision::Precision;
+pub use grad::GradTensor;
 pub use tensor::{BoundedTensor, Shape, TensorBuilder, MAX_TENSOR_ELEMENTS, MAX_TENSOR_DIMS};
 
 // Re-export probabilistic error types

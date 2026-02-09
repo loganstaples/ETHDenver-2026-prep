@@ -61,6 +61,44 @@ pub trait BinarySerializable: Sized {
         let mut cursor = std::io::Cursor::new(bytes);
         Self::deserialize(&mut cursor)
     }
+
+    /// Serializes with zstd compression.
+    ///
+    /// Requires the `compression` feature. Wraps the binary output in a zstd stream
+    /// for reduced storage size.
+    #[cfg(feature = "compression")]
+    fn serialize_compressed<W: Write>(&self, writer: &mut W) -> Result<(), SerializeError> {
+        let mut encoder = zstd::Encoder::new(writer, 3)
+            .map_err(|e| SerializeError::Io(e))?;
+        self.serialize(&mut encoder)?;
+        encoder.finish().map_err(|e| SerializeError::Io(e))?;
+        Ok(())
+    }
+
+    /// Deserializes from a zstd-compressed stream.
+    ///
+    /// Requires the `compression` feature.
+    #[cfg(feature = "compression")]
+    fn deserialize_compressed<R: Read>(reader: &mut R) -> Result<Self, SerializeError> {
+        let mut decoder = zstd::Decoder::new(reader)
+            .map_err(|e| SerializeError::Io(e))?;
+        Self::deserialize(&mut decoder)
+    }
+
+    /// Serializes to a compressed byte vector.
+    #[cfg(feature = "compression")]
+    fn to_compressed_bytes(&self) -> Result<Vec<u8>, SerializeError> {
+        let mut buf = Vec::new();
+        self.serialize_compressed(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Deserializes from a compressed byte slice.
+    #[cfg(feature = "compression")]
+    fn from_compressed_bytes(bytes: &[u8]) -> Result<Self, SerializeError> {
+        let mut cursor = std::io::Cursor::new(bytes);
+        Self::deserialize_compressed(&mut cursor)
+    }
 }
 
 /// Implement BinarySerializable for primitive types.
@@ -149,6 +187,24 @@ mod tests {
         let val: u64 = 0xDEADBEEF_CAFEBABE;
         let bytes = val.to_bytes();
         let restored = u64::from_bytes(&bytes).unwrap();
+        assert_eq!(val, restored);
+    }
+
+    #[cfg(feature = "compression")]
+    #[test]
+    fn test_compressed_f64_roundtrip() {
+        let val: f64 = 3.14159;
+        let compressed = val.to_compressed_bytes().unwrap();
+        let restored = f64::from_compressed_bytes(&compressed).unwrap();
+        assert_eq!(val, restored);
+    }
+
+    #[cfg(feature = "compression")]
+    #[test]
+    fn test_compressed_u64_roundtrip() {
+        let val: u64 = 0xDEADBEEF_CAFEBABE;
+        let compressed = val.to_compressed_bytes().unwrap();
+        let restored = u64::from_compressed_bytes(&compressed).unwrap();
         assert_eq!(val, restored);
     }
 }

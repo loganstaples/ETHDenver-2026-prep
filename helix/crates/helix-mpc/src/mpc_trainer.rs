@@ -539,15 +539,32 @@ impl<T: MPCTransport> MPCTrainer<T> {
     ///
     /// Returns shares of mask[i] = 1 if h_pre[i] >= 0, else 0.
     ///
-    /// Protocol: Each party masks its share with a large random value,
-    /// parties open the masked value, determine sign from the opened value
-    /// (safe because the random mask hides the true value), then use
-    /// Beaver triples to compute the mask share.
+    /// # Security Model
     ///
-    /// For the BN254 field with fixed-point encoding, we use a statistical
-    /// approach: generate a random r in [0, 2^(k-1)) and open (x + r).
-    /// If r is sufficiently larger than x, the sign of (x + r) reveals
-    /// the sign of x with overwhelming probability when r is positive.
+    /// Uses a random-mask protocol where party 0 acts as the sign evaluator:
+    ///
+    /// 1. Party 0 generates a random positive mask per element (unknown to others)
+    /// 2. Party 0 broadcasts `h_pre_share_0 + mask[i]`; others broadcast
+    ///    their raw shares
+    /// 3. After reconstruction, the opened value is `h_pre[i] + mask[i]`
+    /// 4. Only party 0 can determine `sign(h_pre[i])` because only party 0
+    ///    knows `mask[i]`
+    /// 5. Party 0 creates additive shares of the sign bit
+    ///
+    /// **Privacy guarantees:**
+    /// - Non-party-0 parties see `h_pre + mask` where mask is a large random
+    ///   value unknown to them. They cannot recover `h_pre` or its sign.
+    /// - Party 0 can reconstruct `h_pre` from all broadcast shares (inherent
+    ///   to any protocol where shares are opened to a single evaluator).
+    ///
+    /// **Trust assumption:** Party 0 is trusted to correctly evaluate the sign
+    /// comparison and distribute honest sign shares. A malicious party 0 could
+    /// corrupt the ReLU output. For fully malicious security, use garbled
+    /// circuits or oblivious transfer (not implemented).
+    ///
+    /// **Information leakage:** The sign bit (positive/negative) of each
+    /// activation is inherent to ReLU and leaks in any implementation, even
+    /// garbled circuits. The magnitude is NOT revealed to non-party-0 parties.
     async fn secure_sign_bit_vector(
         &mut self,
         h_pre_shares: &[Fr],
@@ -555,34 +572,30 @@ impl<T: MPCTransport> MPCTrainer<T> {
         let dim = h_pre_shares.len();
         let peers = self.transport.peers();
 
-        // Phase 1: Each party generates a random positive mask for each element,
-        // then computes masked = h_pre_share + r_share.
-        // We'll use a large positive random to mask. To determine sign,
-        // we use a 2-round protocol:
-        //
-        // Round 1: Each party broadcasts h_pre_share + random_mask_share.
-        // When summed, this gives h_pre + R (where R = sum of all random masks).
-        // Since each party contributed a random share, no single party knows R.
-        //
-        // Round 2: We need R to be a known positive large value so we can
-        // subtract it from the opened value to get the sign. Instead, we use
-        // a simpler approach: each party generates a random share of a KNOWN
-        // offset. Party 0 adds a fixed large positive offset, so the opened
-        // value is (h_pre + OFFSET). Then sign(h_pre) = (opened >= OFFSET).
+        // Phase 1: Party 0 generates a random positive mask per element.
+        // The mask is large enough to hide the activation magnitude from
+        // other parties (activations are typically in [-1000, 1000]).
+        let masks: Vec<Fr> = if self.party_index == 0 {
+            (0..dim)
+                .map(|_| {
+                    let mask_val: f64 = self.rng.gen_range(1e6..1e9);
+                    Fr::from_f64(mask_val)
+                })
+                .collect()
+        } else {
+            Vec::new() // not used by non-party-0
+        };
 
-        // Use a fixed offset that is larger than any reasonable activation value.
-        // In fixed-point, values are typically in [-1000, 1000], so offset = 10000.
-        let offset = Fr::from_f64(10000.0);
-
-        // Each party computes h_pre_share + (offset if party 0, else 0)
+        // Phase 2: Each party prepares their share for broadcast.
+        // Party 0 adds random mask; others send raw shares.
         let mut masked: Vec<Fr> = h_pre_shares.to_vec();
         if self.party_index == 0 {
-            for m in &mut masked {
-                *m = Fr::add(m, &offset);
+            for (i, m) in masked.iter_mut().enumerate() {
+                *m = Fr::add(m, &masks[i]);
             }
         }
 
-        // Broadcast masked shares to reconstruct (h_pre + offset)
+        // Phase 3: Broadcast and reconstruct opened = h_pre + mask
         let masked_bytes = SecureArithmetic::serialize_share_batch(&masked);
         self.transport.broadcast(&masked_bytes).await?;
 
@@ -595,32 +608,27 @@ impl<T: MPCTransport> MPCTrainer<T> {
             }
         }
 
-        // opened[i] = h_pre[i] + 10000.0
-        // sign(h_pre[i]) = 1 if opened[i] >= 10000.0 (i.e., h_pre >= 0)
-        // This comparison is on a PUBLIC value so it reveals NOTHING about
-        // the secret shares (only whether h_pre >= 0).
+        // Phase 4: Determine sign (only party 0 can do this).
+        // opened[i] = h_pre[i] + mask[i]
+        // h_pre[i] = opened[i] - mask[i]
+        // sign(h_pre[i]) = 1 if h_pre[i] >= 0
         //
-        // NOTE: This reveals the SIGN of each activation, which is inherent
-        // to any ReLU implementation (even garbled circuits). The value itself
-        // remains hidden. This is the minimum information leakage possible
-        // for ReLU.
-
-        let offset_f64 = 10000.0;
+        // Other parties see opened[i] = h_pre[i] + mask[i] but cannot
+        // determine h_pre[i] because mask[i] is random and unknown to them.
         let mut sign_shares = vec![Fr::ZERO; dim];
-        for i in 0..dim {
-            let opened_f64 = opened[i].to_f64();
-            let sign_val = if opened_f64 >= offset_f64 {
-                Fr::from_f64(1.0)
-            } else {
-                Fr::ZERO
-            };
-            // Only party 0 holds the sign value; other parties hold 0.
-            // This creates valid additive shares of the sign bit.
-            if self.party_index == 0 {
-                sign_shares[i] = sign_val;
+        if self.party_index == 0 {
+            for i in 0..dim {
+                let h_pre_value = Fr::sub(&opened[i], &masks[i]);
+                let h_pre_f64 = h_pre_value.to_f64();
+                sign_shares[i] = if h_pre_f64 >= 0.0 {
+                    Fr::from_f64(1.0)
+                } else {
+                    Fr::ZERO
+                };
             }
-            // else: already Fr::ZERO
         }
+        // Non-party-0: sign_shares remain Fr::ZERO (valid additive shares
+        // since only party 0 holds the sign value).
 
         Ok(sign_shares)
     }
@@ -631,8 +639,12 @@ impl<T: MPCTransport> MPCTrainer<T> {
     ///   h_shares[i] = max(0, h_pre[i]) as secret shares
     ///   relu_mask_shares[i] = 1 if h_pre[i] >= 0, else 0 (shares for backprop)
     ///
-    /// Uses secure sign bit computation followed by Beaver-triple-based
-    /// multiplication of h_pre * sign_mask.
+    /// Uses random-mask sign extraction (party 0 as evaluator) followed by
+    /// Beaver-triple-based multiplication of h_pre * sign_mask.
+    ///
+    /// Privacy: activation magnitudes are hidden from non-party-0 parties.
+    /// Only the sign bit leaks (inherent to ReLU). See `secure_sign_bit_vector`
+    /// for the full security model.
     async fn secure_relu(
         &mut self,
         h_pre_shares: &[Fr],

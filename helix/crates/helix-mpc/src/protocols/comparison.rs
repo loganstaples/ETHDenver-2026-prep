@@ -63,6 +63,14 @@ impl SecureComparison {
     /// Computes [x < 0] using bit decomposition simulation.
     ///
     /// Returns shares of 1 if x < 0, shares of 0 otherwise.
+    ///
+    /// # WARNING: SIMULATION ONLY — NOT SECURE
+    ///
+    /// This implementation reconstructs the secret value in the clear to
+    /// determine the sign. It is suitable only for correctness testing,
+    /// NOT for production MPC. For secure sign computation in the training
+    /// pipeline, use `MPCTrainer::secure_sign_bit_vector()` which uses
+    /// random masking to protect activation privacy.
     pub fn sign_bit(
         &self,
         x_shares: &[Fr],
@@ -70,8 +78,9 @@ impl SecureComparison {
     ) -> MPCResult<Vec<Fr>> {
         let num_parties = x_shares.len();
 
-        // Reconstruct x to determine sign (simulation mode)
-        // In production, this would use bit decomposition + carry propagation
+        // WARNING: Reconstructs secret value — breaks privacy!
+        // This is simulation-only code for testing correctness.
+        // Production code uses MPCTrainer::secure_sign_bit_vector().
         let mut x = Fr::ZERO;
         for share in x_shares {
             x = Fr::add(&x, share);
@@ -359,6 +368,11 @@ impl GarbledComparison {
     }
 
     /// Securely computes x < y using garbled circuits (simulation).
+    ///
+    /// # WARNING: SIMULATION ONLY — NOT SECURE
+    ///
+    /// This implementation reconstructs both secret values in the clear.
+    /// It is suitable only for correctness testing, NOT for production MPC.
     pub fn secure_less_than(
         &self,
         x_shares: &[Fr],
@@ -367,7 +381,7 @@ impl GarbledComparison {
     ) -> MPCResult<Vec<Fr>> {
         let num_parties = x_shares.len();
 
-        // Reconstruct x and y (simulation mode)
+        // WARNING: Reconstructs secret values — breaks privacy!
         let mut x = Fr::ZERO;
         let mut y = Fr::ZERO;
         for (xs, ys) in x_shares.iter().zip(y_shares) {
@@ -433,11 +447,15 @@ impl BitDecomposition {
 
     /// Decomposes a value into bit shares (simulation).
     ///
-    /// In production, this would use secure bit decomposition protocol.
+    /// # WARNING: SIMULATION ONLY — NOT SECURE
+    ///
+    /// Reconstructs the secret value in the clear for bit decomposition.
+    /// In production, this would use a secure bit decomposition protocol
+    /// (e.g., ABY-style arithmetic-to-boolean conversion).
     pub fn decompose(&self, x_shares: &[Fr], _pools: &mut [BeaverPool]) -> MPCResult<Vec<Vec<Fr>>> {
         let num_parties = x_shares.len();
 
-        // Reconstruct x (simulation mode)
+        // WARNING: Reconstructs secret value — breaks privacy!
         let mut x = Fr::ZERO;
         for share in x_shares {
             x = Fr::add(&x, share);

@@ -50,8 +50,8 @@ pub use traits::{ApproximateOp, BinarySerializable, Provable, Witness};
 
 // Core bounded arithmetic types
 pub use types::{
-    BoundedTensor, BoundedValue, BoundedValueResult, ErrorMargin, IntoBounded, Precision, Shape,
-    TensorBuilder, MAX_ERROR_BOUND, MIN_POSITIVE_VALUE, DIVISION_THRESHOLD,
+    BoundedTensor, BoundedValue, BoundedValueResult, ErrorMargin, GradTensor, IntoBounded,
+    Precision, Shape, TensorBuilder, MAX_ERROR_BOUND, MIN_POSITIVE_VALUE, DIVISION_THRESHOLD,
     MAX_TENSOR_ELEMENTS, MAX_TENSOR_DIMS,
 };
 

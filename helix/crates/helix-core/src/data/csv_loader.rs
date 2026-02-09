@@ -742,7 +742,11 @@ impl CsvDataLoader {
         }
 
         // Verify version
-        let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        let version = u32::from_le_bytes(
+            data[4..8].try_into().map_err(|_| HelixError::Data(DataError::InvalidFormat(
+                "failed to read version bytes".to_string()
+            )))?
+        );
         if version != BINARY_VERSION {
             return Err(HelixError::Data(DataError::InvalidFormat(
                 format!("unsupported binary version: {}", version)
@@ -762,9 +766,21 @@ impl CsvDataLoader {
             }));
         }
 
-        let num_samples = u64::from_le_bytes(data[8..16].try_into().unwrap()) as usize;
-        let features_per_sample = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
-        let labels_per_sample = u32::from_le_bytes(data[20..24].try_into().unwrap()) as usize;
+        let num_samples = u64::from_le_bytes(
+            data[8..16].try_into().map_err(|_| HelixError::Data(DataError::InvalidFormat(
+                "failed to read num_samples bytes".to_string()
+            )))?
+        ) as usize;
+        let features_per_sample = u32::from_le_bytes(
+            data[16..20].try_into().map_err(|_| HelixError::Data(DataError::InvalidFormat(
+                "failed to read features_per_sample bytes".to_string()
+            )))?
+        ) as usize;
+        let labels_per_sample = u32::from_le_bytes(
+            data[20..24].try_into().map_err(|_| HelixError::Data(DataError::InvalidFormat(
+                "failed to read labels_per_sample bytes".to_string()
+            )))?
+        ) as usize;
         let dtype = data[24];
 
         let header_size = 28; // 4 + 4 + 8 + 4 + 4 + 1 + 3
@@ -932,7 +948,8 @@ fn read_value(data: &[u8], offset: &mut usize, dtype: u8) -> HelixResult<f64> {
             if *offset + 4 > data.len() {
                 return Err(HelixError::Data(DataError::InvalidFormat("truncated f32".to_string())));
             }
-            let bytes: [u8; 4] = data[*offset..*offset + 4].try_into().unwrap();
+            let bytes: [u8; 4] = data[*offset..*offset + 4].try_into()
+                .map_err(|_| HelixError::Data(DataError::InvalidFormat("invalid f32 bytes".to_string())))?;
             *offset += 4;
             Ok(f32::from_le_bytes(bytes) as f64)
         }
@@ -941,7 +958,8 @@ fn read_value(data: &[u8], offset: &mut usize, dtype: u8) -> HelixResult<f64> {
             if *offset + 8 > data.len() {
                 return Err(HelixError::Data(DataError::InvalidFormat("truncated f64".to_string())));
             }
-            let bytes: [u8; 8] = data[*offset..*offset + 8].try_into().unwrap();
+            let bytes: [u8; 8] = data[*offset..*offset + 8].try_into()
+                .map_err(|_| HelixError::Data(DataError::InvalidFormat("invalid f64 bytes".to_string())))?;
             *offset += 8;
             Ok(f64::from_le_bytes(bytes))
         }

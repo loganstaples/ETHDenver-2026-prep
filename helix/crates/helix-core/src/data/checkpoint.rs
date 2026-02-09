@@ -376,6 +376,33 @@ impl ModelCheckpoint {
         let bytes = std::fs::read(path).map_err(HelixError::Io)?;
         Self::from_bytes(&bytes)
     }
+
+    /// Saves the checkpoint to a file with zstd compression.
+    ///
+    /// Requires the `compression` feature. Typically achieves 2-5x compression
+    /// on model weight data.
+    #[cfg(feature = "compression")]
+    pub fn save_compressed(&self, path: &str) -> HelixResult<()> {
+        let bytes = self.to_bytes()?;
+        let compressed = zstd::bulk::compress(&bytes, 3)
+            .map_err(|e| HelixError::Serialization(SerializationError::BinaryError(
+                format!("zstd compression failed: {}", e)
+            )))?;
+        std::fs::write(path, &compressed).map_err(HelixError::Io)
+    }
+
+    /// Loads a checkpoint from a zstd-compressed file.
+    ///
+    /// Requires the `compression` feature.
+    #[cfg(feature = "compression")]
+    pub fn load_compressed(path: &str) -> HelixResult<Self> {
+        let compressed = std::fs::read(path).map_err(HelixError::Io)?;
+        let bytes = zstd::bulk::decompress(&compressed, 256 * 1024 * 1024) // 256MB max
+            .map_err(|e| HelixError::Serialization(SerializationError::BinaryError(
+                format!("zstd decompression failed: {}", e)
+            )))?;
+        Self::from_bytes(&bytes)
+    }
 }
 
 // === Binary read helpers ===
@@ -386,7 +413,10 @@ fn read_u32(data: &[u8], offset: &mut usize) -> HelixResult<u32> {
             "unexpected end of data reading u32".to_string()
         )));
     }
-    let v = u32::from_le_bytes(data[*offset..*offset + 4].try_into().unwrap());
+    let v = u32::from_le_bytes(data[*offset..*offset + 4].try_into()
+        .map_err(|_| HelixError::Serialization(SerializationError::BinaryError(
+            "invalid u32 bytes in checkpoint".to_string()
+        )))?);
     *offset += 4;
     Ok(v)
 }
@@ -397,7 +427,10 @@ fn read_u64(data: &[u8], offset: &mut usize) -> HelixResult<u64> {
             "unexpected end of data reading u64".to_string()
         )));
     }
-    let v = u64::from_le_bytes(data[*offset..*offset + 8].try_into().unwrap());
+    let v = u64::from_le_bytes(data[*offset..*offset + 8].try_into()
+        .map_err(|_| HelixError::Serialization(SerializationError::BinaryError(
+            "invalid u64 bytes in checkpoint".to_string()
+        )))?);
     *offset += 8;
     Ok(v)
 }
@@ -408,7 +441,10 @@ fn read_f32(data: &[u8], offset: &mut usize) -> HelixResult<f32> {
             "unexpected end of data reading f32".to_string()
         )));
     }
-    let v = f32::from_le_bytes(data[*offset..*offset + 4].try_into().unwrap());
+    let v = f32::from_le_bytes(data[*offset..*offset + 4].try_into()
+        .map_err(|_| HelixError::Serialization(SerializationError::BinaryError(
+            "invalid f32 bytes in checkpoint".to_string()
+        )))?);
     *offset += 4;
     Ok(v)
 }
@@ -419,7 +455,10 @@ fn read_f64(data: &[u8], offset: &mut usize) -> HelixResult<f64> {
             "unexpected end of data reading f64".to_string()
         )));
     }
-    let v = f64::from_le_bytes(data[*offset..*offset + 8].try_into().unwrap());
+    let v = f64::from_le_bytes(data[*offset..*offset + 8].try_into()
+        .map_err(|_| HelixError::Serialization(SerializationError::BinaryError(
+            "invalid f64 bytes in checkpoint".to_string()
+        )))?);
     *offset += 8;
     Ok(v)
 }
@@ -642,5 +681,53 @@ mod tests {
         let bytes = ckpt.to_bytes().unwrap();
         let restored = ModelCheckpoint::from_bytes(&bytes).unwrap();
         assert_eq!(restored.total_params(), 0);
+    }
+
+    #[cfg(feature = "compression")]
+    #[test]
+    fn test_checkpoint_compressed_file_roundtrip() {
+        let original = make_test_checkpoint();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.hxck.zst");
+        let path_str = path.to_str().unwrap();
+
+        original.save_compressed(path_str).unwrap();
+
+        // Compressed file should be smaller than uncompressed
+        let uncompressed_bytes = original.to_bytes().unwrap();
+        let compressed_size = std::fs::metadata(path_str).unwrap().len();
+        // For small data, compression overhead may make it larger, but it should still roundtrip
+        assert!(compressed_size > 0);
+
+        let restored = ModelCheckpoint::load_compressed(path_str).unwrap();
+        assert_eq!(original.model_id, restored.model_id);
+        assert_eq!(original.step_number, restored.step_number);
+        assert_eq!(original.weight_hash, restored.weight_hash);
+        assert!(restored.verify_integrity());
+
+        // For a larger checkpoint, compression should save space
+        let mut big_layers = Vec::new();
+        for i in 0..10 {
+            big_layers.push(CheckpointLayer {
+                name: format!("layer_{}", i),
+                tensors: vec![CheckpointTensor {
+                    name: "weight".to_string(),
+                    shape: vec![100, 100],
+                    data: vec![0.1f32; 10000],
+                }],
+            });
+        }
+        let big_ckpt = ModelCheckpoint::new([2u8; 32], 100, 1700000000, big_layers);
+        let big_uncompressed = big_ckpt.to_bytes().unwrap();
+        let big_path = dir.path().join("big_model.hxck.zst");
+        let big_path_str = big_path.to_str().unwrap();
+        big_ckpt.save_compressed(big_path_str).unwrap();
+        let big_compressed_size = std::fs::metadata(big_path_str).unwrap().len();
+        assert!(
+            big_compressed_size < big_uncompressed.len() as u64,
+            "compressed {} should be less than uncompressed {}",
+            big_compressed_size,
+            big_uncompressed.len()
+        );
     }
 }

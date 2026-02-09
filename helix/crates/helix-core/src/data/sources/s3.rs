@@ -1023,7 +1023,8 @@ impl S3DataSource {
         };
 
         // Now get mutable borrow
-        let state = self.active_uploads.get_mut(upload_id).unwrap();
+        let state = self.active_uploads.get_mut(upload_id)
+            .ok_or_else(|| DataSourceError::NotFound(format!("upload {}", upload_id)))?;
         state.uploaded_parts.push(part.clone());
         state.bytes_uploaded += size as u64;
         self.stats.bytes_uploaded += size as u64;

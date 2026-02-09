@@ -762,18 +762,11 @@ impl BoundedTensor {
     }
 
     /// Transposes a 2D matrix.
+    ///
+    /// # Panics
+    /// Panics if tensor is not 2D. Use `try_transpose()` for a non-panicking version.
     pub fn transpose(&self) -> Self {
-        assert!(self.is_matrix(), "Transpose requires 2D tensor");
-        let (rows, cols) = (self.shape[0], self.shape[1]);
-        let mut data = vec![BoundedValue::exact(0.0); self.len()];
-
-        for i in 0..rows {
-            for j in 0..cols {
-                data[j * rows + i] = *self.get(&[i, j]).unwrap();
-            }
-        }
-
-        Self::new(data, vec![cols, rows])
+        self.try_transpose().expect("Transpose requires 2D tensor")
     }
 
     /// Transposes a 2D matrix with validation.
@@ -1669,6 +1662,140 @@ impl BoundedTensor {
             let error = v.absolute_error() * MAX_DERIVATIVE;
             BoundedValue::new(result, ErrorMargin::absolute(error))
         })
+    }
+
+    /// Applies softmax normalization using the log-sum-exp trick for numerical stability.
+    ///
+    /// For 1D tensors, softmax is applied across all elements.
+    /// For 2D tensors, softmax is applied independently over each row (last axis).
+    ///
+    /// Uses the numerically stable formulation:
+    ///   softmax(x_i) = exp(x_i - max(x)) / sum_j(exp(x_j - max(x)))
+    ///
+    /// This prevents overflow for large logits that would cause exp() to return infinity.
+    ///
+    /// Error propagation: The Jacobian of softmax has entries
+    ///   ∂s_i/∂x_j = s_i(δ_ij - s_j), with ||J||_∞ ≤ 1.
+    ///   Element error is bounded by: ε_i ≤ s_i * (sum_j ε_j + ε_i).
+    ///   We use the simpler bound: ε_out ≤ exp(ε_in) * max(ε_in) for each row.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use helix_core::types::BoundedTensor;
+    ///
+    /// // Large logits that would overflow naive exp()
+    /// let x = BoundedTensor::from_exact(vec![1000.0, 1001.0, 999.0], vec![3]);
+    /// let s = x.softmax().unwrap();
+    /// let sum: f64 = s.data().iter().map(|v| v.value()).sum();
+    /// assert!((sum - 1.0).abs() < 1e-10, "softmax sum = {}", sum);
+    /// assert!(s.is_finite());
+    /// ```
+    pub fn softmax(&self) -> HelixResult<Self> {
+        match self.ndim() {
+            1 => self.softmax_1d(),
+            2 => self.softmax_2d(),
+            _ => Err(ValidationError::invalid_shape(
+                "softmax input",
+                self.shape.clone(),
+                "softmax requires 1D or 2D tensor",
+            ).into()),
+        }
+    }
+
+    /// Softmax over a 1D tensor.
+    fn softmax_1d(&self) -> HelixResult<Self> {
+        let len = self.shape[0];
+        if len == 0 {
+            return Self::try_new(vec![], vec![0]);
+        }
+
+        // Find max for numerical stability (log-sum-exp trick)
+        let max_val = self.data.iter()
+            .map(|v| v.value())
+            .fold(f64::NEG_INFINITY, f64::max);
+
+        // Compute exp(x_i - max) and track max input error
+        let mut exp_vals = Vec::with_capacity(len);
+        let mut sum_exp = 0.0;
+        let mut max_err = 0.0f64;
+
+        for v in &self.data {
+            let shifted = v.value() - max_val;
+            let e = shifted.exp();
+            let err = v.absolute_error();
+            if err > max_err {
+                max_err = err;
+            }
+            exp_vals.push((e, err));
+            sum_exp += e;
+        }
+
+        if sum_exp == 0.0 {
+            // All values are -inf after shifting; return uniform
+            let uniform = BoundedValue::new(1.0 / len as f64, ErrorMargin::absolute(max_err));
+            return Self::try_new(vec![uniform; len], vec![len]);
+        }
+
+        // Normalize: s_i = exp(x_i - max) / sum_exp
+        // Error bound: each output error ≤ (exp_err / sum_exp) capped at 1.0
+        let mut data = Vec::with_capacity(len);
+        for (e, input_err) in exp_vals {
+            let prob = e / sum_exp;
+            // Error propagation through exp: d/dx exp(x) = exp(x), so exp_err = e * input_err
+            // Error through division: (exp_err * sum_exp - e * sum_exp_err) / sum_exp^2
+            // Simplified upper bound: prob * (input_err + max_err)
+            let prob_err = (prob * (input_err + max_err)).min(1.0);
+            data.push(BoundedValue::new(prob, ErrorMargin::absolute(prob_err)));
+        }
+
+        Self::try_new(data, vec![len])
+    }
+
+    /// Softmax over each row of a 2D tensor.
+    fn softmax_2d(&self) -> HelixResult<Self> {
+        let (rows, cols) = (self.shape[0], self.shape[1]);
+        let mut data = Vec::with_capacity(rows * cols);
+
+        for i in 0..rows {
+            let row_start = i * cols;
+
+            // Find max in this row
+            let max_val = (0..cols)
+                .map(|j| self.data[row_start + j].value())
+                .fold(f64::NEG_INFINITY, f64::max);
+
+            // Compute exp(x_j - max) and sum
+            let mut exp_vals = Vec::with_capacity(cols);
+            let mut sum_exp = 0.0;
+            let mut max_err = 0.0f64;
+
+            for j in 0..cols {
+                let v = &self.data[row_start + j];
+                let shifted = v.value() - max_val;
+                let e = shifted.exp();
+                let err = v.absolute_error();
+                if err > max_err {
+                    max_err = err;
+                }
+                exp_vals.push((e, err));
+                sum_exp += e;
+            }
+
+            if sum_exp == 0.0 {
+                let uniform = BoundedValue::new(1.0 / cols as f64, ErrorMargin::absolute(max_err));
+                data.extend(std::iter::repeat(uniform).take(cols));
+                continue;
+            }
+
+            for (e, input_err) in exp_vals {
+                let prob = e / sum_exp;
+                let prob_err = (prob * (input_err + max_err)).min(1.0);
+                data.push(BoundedValue::new(prob, ErrorMargin::absolute(prob_err)));
+            }
+        }
+
+        Self::try_new(data, vec![rows, cols])
     }
 
     // =========================================================================
@@ -3301,5 +3428,95 @@ mod tests {
         assert!(max_pool_out.max_error() > 0.0);
         // Avg pool should have error related to mean of input errors
         assert!(avg_pool_out.max_error() > 0.0);
+    }
+
+    // =========================================================================
+    // SOFTMAX TESTS
+    // =========================================================================
+
+    #[test]
+    fn test_softmax_1d_basic() {
+        let x = BoundedTensor::from_exact(vec![1.0, 2.0, 3.0], vec![3]);
+        let s = x.softmax().unwrap();
+        assert_eq!(s.shape(), &vec![3]);
+
+        let sum: f64 = s.data().iter().map(|v| v.value()).sum();
+        assert!((sum - 1.0).abs() < 1e-10, "softmax sum = {}", sum);
+
+        // Values should be ordered: s[0] < s[1] < s[2]
+        assert!(s.get(&[0]).unwrap().value() < s.get(&[1]).unwrap().value());
+        assert!(s.get(&[1]).unwrap().value() < s.get(&[2]).unwrap().value());
+    }
+
+    #[test]
+    fn test_softmax_large_logits_no_overflow() {
+        // These values would cause exp(1001) = Inf in naive softmax
+        let x = BoundedTensor::from_exact(vec![1000.0, 1001.0, 999.0], vec![3]);
+        let s = x.softmax().unwrap();
+
+        // Should not produce NaN or Inf
+        assert!(s.is_finite(), "softmax produced non-finite values");
+
+        let sum: f64 = s.data().iter().map(|v| v.value()).sum();
+        assert!((sum - 1.0).abs() < 1e-10, "softmax sum = {}", sum);
+
+        // exp(1001-1001) / (exp(-1) + exp(0) + exp(-2)) ≈ 0.6652
+        let p1 = s.get(&[1]).unwrap().value();
+        assert!((p1 - 1.0 / (1.0 + (-1.0f64).exp() + (-2.0f64).exp())).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_softmax_negative_large_logits() {
+        let x = BoundedTensor::from_exact(vec![-1000.0, -1001.0, -999.0], vec![3]);
+        let s = x.softmax().unwrap();
+
+        assert!(s.is_finite());
+        let sum: f64 = s.data().iter().map(|v| v.value()).sum();
+        assert!((sum - 1.0).abs() < 1e-10, "softmax sum = {}", sum);
+    }
+
+    #[test]
+    fn test_softmax_2d() {
+        let x = BoundedTensor::from_exact(
+            vec![1.0, 2.0, 3.0, 100.0, 101.0, 99.0],
+            vec![2, 3],
+        );
+        let s = x.softmax().unwrap();
+        assert_eq!(s.shape(), &vec![2, 3]);
+
+        // Each row should sum to 1
+        let row0_sum: f64 = (0..3).map(|j| s.get(&[0, j]).unwrap().value()).sum();
+        let row1_sum: f64 = (0..3).map(|j| s.get(&[1, j]).unwrap().value()).sum();
+        assert!((row0_sum - 1.0).abs() < 1e-10, "row 0 sum = {}", row0_sum);
+        assert!((row1_sum - 1.0).abs() < 1e-10, "row 1 sum = {}", row1_sum);
+    }
+
+    #[test]
+    fn test_softmax_error_propagation() {
+        let x = BoundedTensor::from_approximate(vec![1.0, 2.0, 3.0], vec![3], 0.01);
+        let s = x.softmax().unwrap();
+
+        // All outputs should have tracked error
+        for v in s.data() {
+            assert!(v.absolute_error() > 0.0, "softmax should propagate error");
+            assert!(v.absolute_error() <= 1.0, "softmax error should be bounded");
+        }
+    }
+
+    #[test]
+    fn test_softmax_uniform() {
+        // Equal inputs should give uniform distribution
+        let x = BoundedTensor::from_exact(vec![5.0, 5.0, 5.0, 5.0], vec![4]);
+        let s = x.softmax().unwrap();
+
+        for v in s.data() {
+            assert!((v.value() - 0.25).abs() < 1e-10, "expected 0.25, got {}", v.value());
+        }
+    }
+
+    #[test]
+    fn test_softmax_rejects_3d() {
+        let x = BoundedTensor::from_exact(vec![1.0; 8], vec![2, 2, 2]);
+        assert!(x.softmax().is_err());
     }
 }

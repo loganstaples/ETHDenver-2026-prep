@@ -11,6 +11,16 @@
 //! - Retrieval market integration
 //! - Piece CID computation
 //! - CAR file handling
+//!
+//! **Note:** Real Lotus JSON-RPC network access requires the `filecoin-fetch` feature.
+//! Without it, only local/mock storage operations are available.
+
+#[cfg(feature = "filecoin-fetch")]
+compile_error!(
+    "The filecoin-fetch feature is not yet implemented. \
+     Filecoin data source currently only supports local/mock storage. \
+     Real Lotus JSON-RPC integration is planned for a future release."
+);
 
 use std::collections::HashMap;
 use std::time::SystemTime;
