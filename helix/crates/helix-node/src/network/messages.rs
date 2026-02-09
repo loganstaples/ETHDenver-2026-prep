@@ -112,9 +112,92 @@ impl NetworkMessage {
     }
 
     /// Stub verify when crypto-sign is disabled (always true).
+    ///
+    /// # Security trade-off
+    ///
+    /// When the `crypto-sign` feature is disabled, **all messages are accepted
+    /// without signature verification**. This means any peer can impersonate
+    /// any other peer by forging the `sender` field. This mode is only suitable
+    /// for development/testing or trusted private networks. In production, the
+    /// `crypto-sign` feature MUST be enabled to enforce message authentication.
     #[cfg(not(feature = "crypto-sign"))]
     pub fn verify_signature_noop(&self) -> bool {
         true
+    }
+}
+
+/// Registry mapping peer IDs to their public verification keys.
+///
+/// When `crypto-sign` is enabled, every incoming message is verified against
+/// the sender's registered public key. When disabled, verification is a no-op
+/// (see `verify_signature_noop` above for the security implications).
+pub struct PeerKeyRegistry {
+    #[cfg(feature = "crypto-sign")]
+    keys: std::collections::HashMap<PeerId, ed25519_dalek::VerifyingKey>,
+    #[cfg(not(feature = "crypto-sign"))]
+    _phantom: (),
+}
+
+impl PeerKeyRegistry {
+    /// Creates a new empty peer key registry.
+    pub fn new() -> Self {
+        Self {
+            #[cfg(feature = "crypto-sign")]
+            keys: std::collections::HashMap::new(),
+            #[cfg(not(feature = "crypto-sign"))]
+            _phantom: (),
+        }
+    }
+
+    /// Registers a peer's public verification key.
+    #[cfg(feature = "crypto-sign")]
+    pub fn register(&mut self, peer_id: PeerId, key: ed25519_dalek::VerifyingKey) {
+        self.keys.insert(peer_id, key);
+    }
+
+    /// Registers a peer's public verification key (no-op without crypto-sign).
+    #[cfg(not(feature = "crypto-sign"))]
+    pub fn register(&mut self, _peer_id: PeerId, _key_bytes: &[u8]) {
+        // No-op: signing not available without crypto-sign feature
+    }
+
+    /// Verifies a message's signature against the sender's registered key.
+    ///
+    /// Returns `true` if the signature is valid, or if `crypto-sign` is
+    /// disabled (all messages pass in that case — see security note above).
+    /// Returns `false` if the sender has no registered key or the signature
+    /// is missing/invalid.
+    #[cfg(feature = "crypto-sign")]
+    pub fn verify_message(&self, message: &NetworkMessage) -> bool {
+        match self.keys.get(&message.sender) {
+            Some(vk) => message.verify_signature(vk),
+            // If we don't have the key yet (e.g. first JoinRequest), allow it
+            // only if it has no signature (unsigned discovery messages are OK)
+            None => message.signature.is_none(),
+        }
+    }
+
+    /// Verifies a message's signature (no-op without crypto-sign: always true).
+    ///
+    /// # Security trade-off
+    ///
+    /// Without the `crypto-sign` feature, this always returns `true`. This
+    /// means that **no message authentication is performed**, and any peer can
+    /// forge messages from any other peer. Enable `crypto-sign` for production.
+    #[cfg(not(feature = "crypto-sign"))]
+    pub fn verify_message(&self, _message: &NetworkMessage) -> bool {
+        true
+    }
+
+    /// Returns whether any keys are registered (always false without crypto-sign).
+    #[cfg(feature = "crypto-sign")]
+    pub fn has_key(&self, peer_id: &PeerId) -> bool {
+        self.keys.contains_key(peer_id)
+    }
+
+    #[cfg(not(feature = "crypto-sign"))]
+    pub fn has_key(&self, _peer_id: &PeerId) -> bool {
+        false
     }
 }
 
@@ -457,5 +540,55 @@ mod tests {
 
         msg.sign_noop();
         assert!(msg.verify_signature_noop());
+    }
+
+    #[test]
+    fn test_peer_key_registry_without_crypto() {
+        let registry = PeerKeyRegistry::new();
+        let msg = NetworkMessage::new(
+            PeerId::random(),
+            MessagePayload::Heartbeat(HeartbeatMessage {
+                seq: 1,
+                is_pong: false,
+                load: 50,
+            }),
+        );
+
+        // Without crypto-sign, all messages pass
+        assert!(registry.verify_message(&msg));
+    }
+
+    #[cfg(feature = "crypto-sign")]
+    #[test]
+    fn test_peer_key_registry_verify() {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let verifying_key = signing_key.verifying_key();
+
+        let peer_id = PeerId::random();
+        let mut registry = PeerKeyRegistry::new();
+        registry.register(peer_id.clone(), verifying_key);
+
+        let mut msg = NetworkMessage::new(
+            peer_id.clone(),
+            MessagePayload::Heartbeat(HeartbeatMessage {
+                seq: 1,
+                is_pong: false,
+                load: 50,
+            }),
+        );
+
+        msg.sign(&signing_key);
+        assert!(registry.verify_message(&msg));
+
+        // Tamper
+        msg.payload = MessagePayload::Heartbeat(HeartbeatMessage {
+            seq: 999,
+            is_pong: true,
+            load: 0,
+        });
+        assert!(!registry.verify_message(&msg));
     }
 }

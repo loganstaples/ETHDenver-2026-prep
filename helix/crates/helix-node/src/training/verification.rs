@@ -41,11 +41,36 @@ pub enum ProofType {
     StateTransition,
 }
 
+/// Configurable verification policy controlling when Halo2 proofs are
+/// checked vs. when a cheaper structural check suffices.
+#[derive(Debug, Clone)]
+pub enum VerificationPolicy {
+    /// Verify every submitted proof with full Halo2 KZG verification.
+    /// Most secure, but highest latency per gradient.
+    VerifyAll,
+    /// Verify a random fraction of proofs (0.0 – 1.0).
+    /// E.g. `Sample(0.1)` verifies ~10% of proofs.
+    /// Unverified proofs still pass structural checks (size, error bounds).
+    Sample(f64),
+    /// Perform only structural checks (proof size, error bound range) without
+    /// invoking the Halo2 verifier. Fastest, but provides no cryptographic
+    /// guarantee. Suitable for development/testing only.
+    StructuralOnly,
+}
+
+impl Default for VerificationPolicy {
+    fn default() -> Self {
+        Self::VerifyAll
+    }
+}
+
 /// Configuration for proof verification.
 #[derive(Debug, Clone)]
 pub struct VerificationConfig {
     /// Enable proof verification.
     pub enabled: bool,
+    /// Verification policy controlling when full Halo2 verification is performed.
+    pub policy: VerificationPolicy,
     /// Maximum time allowed for verification.
     pub timeout: Duration,
     /// Cache verified proofs.
@@ -66,6 +91,7 @@ impl Default for VerificationConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            policy: VerificationPolicy::default(),
             timeout: Duration::from_secs(30),
             enable_cache: true,
             cache_ttl_secs: 3600,
@@ -164,6 +190,13 @@ impl ProofVerifier {
     }
 
     /// Verifies a gradient proof using real Halo2 KZG verification.
+    ///
+    /// Respects the configured [`VerificationPolicy`]:
+    /// - `VerifyAll`: every proof goes through full Halo2 KZG verification.
+    /// - `Sample(fraction)`: randomly selects a fraction of proofs for full
+    ///   verification; the rest pass with structural checks only.
+    /// - `StructuralOnly`: only checks proof size and error bounds, skips
+    ///   Halo2 entirely (development mode).
     pub async fn verify_gradient_proof(
         &self,
         participant: &PeerId,
@@ -183,7 +216,7 @@ impl ProofVerifier {
 
         let start = std::time::Instant::now();
 
-        // Check error bound
+        // Check error bound (always, regardless of policy)
         if error_bound < self.config.min_error_bound || error_bound > self.config.max_error_bound {
             let mut stats = self.stats.write();
             stats.total_verified += 1;
@@ -200,6 +233,41 @@ impl ProofVerifier {
             };
         }
 
+        // Determine whether to perform full Halo2 verification based on policy
+        let do_full_verification = match &self.config.policy {
+            VerificationPolicy::VerifyAll => true,
+            VerificationPolicy::Sample(fraction) => {
+                use rand::Rng;
+                rand::thread_rng().gen::<f64>() < *fraction
+            }
+            VerificationPolicy::StructuralOnly => false,
+        };
+
+        if !do_full_verification {
+            // Structural checks only: proof size and error bound already checked
+            let structural_ok = !proof.is_empty() && proof.len() >= 64;
+            let mut stats = self.stats.write();
+            stats.total_verified += 1;
+            if structural_ok {
+                stats.proofs_valid += 1;
+            } else {
+                stats.proofs_invalid += 1;
+            }
+            return VerificationResult {
+                is_valid: structural_ok,
+                verification_time_ms: start.elapsed().as_millis() as u64,
+                error: if structural_ok {
+                    None
+                } else {
+                    Some(format!(
+                        "Structural check failed: proof size {} bytes (minimum 64)",
+                        proof.len()
+                    ))
+                },
+                public_inputs: None,
+            };
+        }
+
         // Check cache
         let proof_hash = self.hash_proof(proof);
         if self.config.enable_cache {
@@ -210,7 +278,7 @@ impl ProofVerifier {
             }
         }
 
-        // Perform verification
+        // Perform full Halo2 KZG verification
         let result = self.verify_proof_internal(
             participant,
             round_id,

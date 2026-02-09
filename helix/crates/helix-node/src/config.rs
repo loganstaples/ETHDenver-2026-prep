@@ -44,6 +44,59 @@ impl Default for RateLimitConfig {
     }
 }
 
+/// HTTP API configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiConfig {
+    /// Bearer token for authenticating mutating API requests.
+    /// If None, one is generated automatically on startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+
+    /// Maximum requests per second per IP address (token bucket).
+    #[serde(default = "default_api_rate_limit")]
+    pub rate_limit_per_sec: u32,
+
+    /// Address to bind the HTTP API server.
+    #[serde(default = "default_api_listen_addr")]
+    pub listen_addr: String,
+}
+
+fn default_api_rate_limit() -> u32 {
+    100
+}
+
+fn default_api_listen_addr() -> String {
+    "0.0.0.0:8080".to_string()
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            api_key: None,
+            rate_limit_per_sec: default_api_rate_limit(),
+            listen_addr: default_api_listen_addr(),
+        }
+    }
+}
+
+impl ApiConfig {
+    /// Returns the API key, generating one if not already set.
+    pub fn api_key_or_generate(&mut self) -> String {
+        if let Some(ref key) = self.api_key {
+            key.clone()
+        } else {
+            use rand::Rng;
+            let key: String = rand::thread_rng()
+                .sample_iter(&rand::distributions::Alphanumeric)
+                .take(48)
+                .map(char::from)
+                .collect();
+            self.api_key = Some(key.clone());
+            key
+        }
+    }
+}
+
 /// Full node configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
@@ -83,6 +136,10 @@ pub struct NodeConfig {
     /// Rate limiting configuration.
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
+
+    /// HTTP API configuration.
+    #[serde(default)]
+    pub api: ApiConfig,
 }
 
 fn default_listen_addr() -> String {
@@ -130,6 +187,7 @@ impl Default for NodeConfig {
             gossip_send_interval_ms: default_gossip_interval(),
             max_outbound_per_tick: default_max_outbound(),
             rate_limit: RateLimitConfig::default(),
+            api: ApiConfig::default(),
         }
     }
 }

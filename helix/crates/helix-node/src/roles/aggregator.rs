@@ -8,10 +8,23 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::sync::RwLock;
 
+use sha2::{Digest, Sha256};
+
 use crate::network::messages::{
     GradientMessage, MessagePayload, NetworkMessage, NodeCapabilities, PeerId, TrainingMessage,
     TrainingParams,
 };
+
+/// Strategy for combining gradient commitments during aggregation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitmentAggregation {
+    /// SHA-256 hash of sorted commitments (deterministic, collision-resistant).
+    HashBased,
+    /// Pedersen commitment addition (homomorphic, from helix-mpc).
+    /// Requires that individual commitments are valid Pedersen commitments
+    /// on the BN254 G1 curve.
+    Pedersen,
+}
 
 /// Aggregator state.
 #[derive(Debug, Clone, PartialEq)]
@@ -43,6 +56,8 @@ pub struct AggregatorConfig {
     pub generate_proof: bool,
     /// Maximum error bound for aggregated result.
     pub max_error_bound: f64,
+    /// How to combine gradient commitments during aggregation.
+    pub commitment_aggregation: CommitmentAggregation,
 }
 
 impl Default for AggregatorConfig {
@@ -53,6 +68,7 @@ impl Default for AggregatorConfig {
             collection_timeout_secs: 300,
             generate_proof: true,
             max_error_bound: 0.1,
+            commitment_aggregation: CommitmentAggregation::HashBased,
         }
     }
 }
@@ -303,6 +319,13 @@ impl AggregatorNode {
     }
 
     /// Aggregates collected gradients.
+    ///
+    /// Combines individual gradient commitments using the configured
+    /// [`CommitmentAggregation`] strategy:
+    /// - **HashBased**: SHA-256 of sorted commitments (deterministic,
+    ///   collision-resistant, matches the orchestrator's aggregation).
+    /// - **Pedersen**: Homomorphic addition of commitments on BN254 G1.
+    ///   Requires that each commitment is a serialized Pedersen point.
     pub async fn aggregate(&self) -> Option<AggregatedResult> {
         let round_id = *self.current_round.read().await;
 
@@ -317,14 +340,78 @@ impl AggregatorNode {
             return None;
         }
 
-        // Compute aggregated commitment (simplified)
-        let mut combined_commitment = [0u8; 32];
-        let mut total_error = 0.0;
+        // Collect and sort commitments for deterministic aggregation
+        let mut commitments: Vec<[u8; 32]> = gradients.values()
+            .map(|g| g.commitment)
+            .collect();
+        commitments.sort();
 
-        for (i, grad) in gradients.values().enumerate() {
-            for (j, byte) in grad.commitment.iter().enumerate() {
-                combined_commitment[j] ^= byte;
+        let combined_commitment = match self.config.commitment_aggregation {
+            CommitmentAggregation::HashBased => {
+                // SHA-256 hash of sorted, validated commitments
+                let mut hasher = Sha256::new();
+                for commitment in &commitments {
+                    hasher.update(commitment);
+                }
+                let result: [u8; 32] = hasher.finalize().into();
+                result
             }
+            CommitmentAggregation::Pedersen => {
+                // Homomorphic addition of Pedersen commitments on BN254 G1.
+                //
+                // Each 32-byte commitment is interpreted as a compressed G1Affine
+                // point. If any commitment fails to deserialize (e.g. because the
+                // wire protocol currently sends SHA-256 hashes rather than EC
+                // points), we fall back to hash-based aggregation with a warning.
+                use helix_mpc::security::commitment::PedersenCommitment;
+                use halo2curves::bn256::G1Affine;
+                use halo2curves::serde::SerdeObject;
+
+                let mut acc: Option<PedersenCommitment> = None;
+                let mut pedersen_ok = true;
+
+                for grad in gradients.values() {
+                    // G1Affine compressed is 32 bytes on BN254
+                    match G1Affine::from_raw_bytes(&grad.commitment) {
+                        Some(point) => {
+                            let pc = PedersenCommitment { point };
+                            acc = Some(match acc {
+                                Some(a) => a.add(&pc),
+                                None => pc,
+                            });
+                        }
+                        None => {
+                            log::warn!(
+                                "Failed to parse Pedersen commitment from {}, falling back to hash-based",
+                                grad.participant,
+                            );
+                            pedersen_ok = false;
+                            break;
+                        }
+                    }
+                }
+
+                if !pedersen_ok || acc.is_none() {
+                    // Fallback: SHA-256 hash of sorted commitments
+                    let mut hasher = Sha256::new();
+                    for c in &commitments {
+                        hasher.update(c);
+                    }
+                    hasher.finalize().into()
+                } else {
+                    // Serialize the aggregated G1 point back to 32 bytes
+                    let agg = acc.unwrap();
+                    let mut bytes = [0u8; 32];
+                    let raw = agg.point.to_raw_bytes();
+                    let len = raw.len().min(32);
+                    bytes[..len].copy_from_slice(&raw[..len]);
+                    bytes
+                }
+            }
+        };
+
+        let mut total_error = 0.0;
+        for grad in gradients.values() {
             total_error += grad.error_bound;
         }
 
@@ -364,6 +451,52 @@ impl AggregatorNode {
         }
 
         Some(result)
+    }
+
+    /// Helper: builds an AggregatedResult, stores it, and updates stats.
+    async fn build_result(
+        &self,
+        round_id: u64,
+        commitment: [u8; 32],
+        gradients: &HashMap<PeerId, CollectedGradient>,
+    ) -> AggregatedResult {
+        let mut total_error = 0.0;
+        for grad in gradients.values() {
+            total_error += grad.error_bound;
+        }
+        total_error /= gradients.len() as f64;
+
+        let result = AggregatedResult {
+            round_id,
+            commitment,
+            total_error_bound: total_error,
+            num_participants: gradients.len(),
+            proof: vec![],
+        };
+
+        // Update stats
+        {
+            let mut stats = self.stats.write().await;
+            stats.rounds_successful += 1;
+            stats.gradients_aggregated += gradients.len() as u64;
+            let total_rounds = stats.rounds_successful as f64;
+            stats.avg_participants = (stats.avg_participants * (total_rounds - 1.0)
+                + gradients.len() as f64) / total_rounds;
+        }
+
+        // Store result
+        {
+            let mut completed = self.completed_rounds.write().await;
+            completed.insert(round_id, result.clone());
+        }
+
+        // Update state
+        {
+            let mut state = self.state.write().await;
+            *state = AggregatorState::Complete { round_id };
+        }
+
+        result
     }
 
     /// Creates an aggregated gradient message.
@@ -462,7 +595,7 @@ mod tests {
     async fn test_handle_participate() {
         let local_id = PeerId::random();
         let node = AggregatorNode::new(local_id, AggregatorConfig::default());
-        
+
         let params = TrainingParams {
             learning_rate: 0.001,
             batch_size: 32,
@@ -473,12 +606,60 @@ mod tests {
             d_out: 2,
             model_seed: 42,
         };
-        
+
         node.start_round([1; 32], params).await;
-        
+
         let participant = PeerId::random();
         let response = node.handle_participate_request(participant, 1).await;
-        
+
         assert!(response.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_hash_based_aggregation_is_deterministic() {
+        let local_id = PeerId::random();
+        let config = AggregatorConfig {
+            min_participants: 1,
+            commitment_aggregation: CommitmentAggregation::HashBased,
+            ..Default::default()
+        };
+        let node = AggregatorNode::new(local_id, config);
+
+        let params = TrainingParams {
+            learning_rate: 0.001,
+            batch_size: 32,
+            local_epochs: 5,
+            max_error_bound: 0.1,
+            d_in: 4,
+            d_hid: 8,
+            d_out: 2,
+            model_seed: 42,
+        };
+
+        node.start_round([1; 32], params).await;
+
+        let p1 = PeerId::random();
+        let p2 = PeerId::random();
+        node.handle_participate_request(p1.clone(), 1).await;
+        node.handle_participate_request(p2.clone(), 1).await;
+        node.start_collection().await;
+
+        node.handle_gradient_share(p1, 1, [0xAA; 32], 0.01, vec![1, 2, 3]).await;
+        node.handle_gradient_share(p2, 1, [0xBB; 32], 0.02, vec![4, 5, 6]).await;
+
+        let result = node.aggregate().await.expect("aggregation should succeed");
+
+        // Recompute expected: SHA-256 of sorted commitments
+        use sha2::{Digest, Sha256};
+        let mut commitments = vec![[0xAA; 32], [0xBB; 32]];
+        commitments.sort();
+        let mut hasher = Sha256::new();
+        for c in &commitments {
+            hasher.update(c);
+        }
+        let expected: [u8; 32] = hasher.finalize().into();
+
+        assert_eq!(result.commitment, expected);
+        assert_eq!(result.num_participants, 2);
     }
 }

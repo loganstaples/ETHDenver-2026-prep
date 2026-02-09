@@ -1,7 +1,7 @@
 mod sc_client;
 
 use helix_node::sc_client::SCClient;
-use helix_node::api::http::{ApiState, MetricsSnapshot, OrchestratorSnapshot, PeerSnapshot, RoundInfo};
+use helix_node::api::http::{ApiRateLimiter, ApiState, MetricsSnapshot, OrchestratorSnapshot, PeerSnapshot, RoundInfo};
 use helix_node::api::rpc::{
     ProofStatusEntry, RpcState, start_rpc_server,
     NodeConfigSnapshot, MPCStatusSnapshot,
@@ -491,11 +491,15 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
     let proof_status = Arc::new(RwLock::new(Vec::<ProofStatusEntry>::new()));
     let api_peers = Arc::new(RwLock::new(PeerSnapshot::default()));
     let api_metrics = Arc::new(RwLock::new(MetricsSnapshot::default()));
+    let api_key = helix_node::config::ApiConfig::default().api_key_or_generate();
+    log::info!("API key: {}", api_key);
     let api_state = Arc::new(ApiState {
         orchestrator_workers: api_snapshot.clone(),
         round_trigger_tx: round_trigger_tx.clone(),
         peers: api_peers.clone(),
         metrics: api_metrics.clone(),
+        api_key,
+        rate_limiter: Arc::new(ApiRateLimiter::new(100)),
     });
 
     // Start HTTP API
