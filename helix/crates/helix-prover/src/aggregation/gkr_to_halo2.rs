@@ -334,14 +334,16 @@ impl GKRToHalo2Aggregator {
                     })
                     .collect();
 
-                pipeline.prove(&circuit, &[&pi]).unwrap_or_else(|e| {
+                pipeline.prove(&circuit, &[&pi]).map_err(|e| {
                     tracing::error!("GKR-to-Halo2 aggregation proof generation failed: {e}");
-                    vec![]
-                })
+                    BackendError::ProvingFailed(format!(
+                        "GKR-to-Halo2 aggregation proof failed: {e}"
+                    ))
+                })?
             }
             None => {
-                // Return placeholder if not set up
-                vec![]
+                tracing::error!("GKR-to-Halo2 pipeline not set up; call setup() first");
+                return Err(BackendError::NotInitialized);
             }
         };
 
@@ -535,77 +537,65 @@ mod tests {
     }
 
     #[test]
-    fn test_aggregation() {
-        let config = AggregationConfig::default();
-        let aggregator = GKRToHalo2Aggregator::new(config);
-
-        let proofs: Vec<GKRProof> = (0..5).map(|_| generate_test_proof()).collect();
-
-        let aggregated = aggregator.aggregate(&proofs).unwrap();
-
-        assert_eq!(aggregated.num_proofs, 5);
-        assert_eq!(aggregated.commitments.len(), 5);
-        assert_ne!(aggregated.merkle_root, [0u8; 32]);
-    }
-
-    #[test]
-    fn test_aggregation_verify() {
-        let config = AggregationConfig::default();
-        let aggregator = GKRToHalo2Aggregator::new(config);
-
-        let proofs: Vec<GKRProof> = (0..3).map(|_| generate_test_proof()).collect();
-        let aggregated = aggregator.aggregate(&proofs).unwrap();
-
-        let verified = aggregator.verify(&aggregated).unwrap();
-        assert!(verified);
-    }
-
-    #[test]
-    fn test_batch_aggregator() {
-        let config = AggregationConfig::default();
-        let mut batch = BatchAggregator::new(config, 3);
-
-        // Add proofs one by one
-        let result1 = batch.add_proof(generate_test_proof()).unwrap();
-        assert!(result1.is_none()); // Not enough yet
-
-        let result2 = batch.add_proof(generate_test_proof()).unwrap();
-        assert!(result2.is_none());
-
-        let result3 = batch.add_proof(generate_test_proof()).unwrap();
-        assert!(result3.is_some()); // Batch complete
-
-        assert_eq!(batch.num_completed(), 1);
-        assert_eq!(batch.num_pending(), 0);
-    }
-
-    #[test]
-    fn test_batch_flush() {
-        let config = AggregationConfig::default();
-        let mut batch = BatchAggregator::new(config, 10);
-
-        batch.add_proof(generate_test_proof()).unwrap();
-        batch.add_proof(generate_test_proof()).unwrap();
-
-        assert_eq!(batch.num_pending(), 2);
-
-        let flushed = batch.flush().unwrap();
-        assert!(flushed.is_some());
-        assert_eq!(flushed.unwrap().num_proofs, 2);
-        assert_eq!(batch.num_pending(), 0);
-    }
-
-    #[test]
-    fn test_to_proof_data() {
+    fn test_aggregation_without_setup_fails() {
+        // aggregate() must fail when setup() hasn't been called.
         let config = AggregationConfig::default();
         let aggregator = GKRToHalo2Aggregator::new(config);
 
         let proofs: Vec<GKRProof> = (0..2).map(|_| generate_test_proof()).collect();
-        let aggregated = aggregator.aggregate(&proofs).unwrap();
+        let result = aggregator.aggregate(&proofs);
+        assert!(result.is_err(), "aggregate() should fail without setup()");
+    }
 
-        let proof_data = aggregator.to_proof_data(&aggregated);
+    #[test]
+    fn test_aggregation_with_placeholder_circuit_propagates_error() {
+        // GKRVerificationCircuit is a placeholder — prove() fails for real.
+        // Verify that the error is propagated (not silently swallowed).
+        let config = AggregationConfig::default();
+        let mut aggregator = GKRToHalo2Aggregator::new(config);
+        aggregator.setup().unwrap();
 
-        assert_eq!(proof_data.backend, BackendId::Hybrid);
-        assert!(!proof_data.proof_bytes.is_empty());
+        let proofs: Vec<GKRProof> = (0..2).map(|_| generate_test_proof()).collect();
+        let result = aggregator.aggregate(&proofs);
+        // Placeholder circuit cannot produce valid proofs; error should be propagated.
+        assert!(result.is_err(), "Placeholder circuit proof should propagate error");
+    }
+
+    #[test]
+    fn test_verify_structural_without_pipeline() {
+        // Verify that structural verification works when no pipeline is set up.
+        let config = AggregationConfig::default();
+        let aggregator = GKRToHalo2Aggregator::new(config);
+
+        let proofs: Vec<GKRProof> = (0..3).map(|_| generate_test_proof()).collect();
+        let commitments: Vec<GKRProofCommitment> = proofs
+            .iter()
+            .map(GKRProofCommitment::from_proof)
+            .collect();
+        let merkle_root = AggregatedGKRProof::compute_merkle_root(&commitments);
+
+        // Manually construct aggregated proof for structural verification
+        let agg = AggregatedGKRProof {
+            commitments: commitments.clone(),
+            merkle_root,
+            aggregation_proof: vec![], // No Halo2 proof
+            num_proofs: proofs.len(),
+            total_error: Fr::zero(),
+        };
+
+        // Without pipeline, verify() checks structure only
+        let verified = aggregator.verify(&agg).unwrap();
+        assert!(verified, "Structural verification should pass");
+    }
+
+    #[test]
+    fn test_batch_aggregator_without_setup_propagates_error() {
+        let config = AggregationConfig::default();
+        let mut batch = BatchAggregator::new(config, 2);
+        // Intentionally skip setup()
+
+        batch.add_proof(generate_test_proof()).unwrap(); // 1st proof, no aggregation yet
+        let result = batch.add_proof(generate_test_proof()); // Triggers aggregation
+        assert!(result.is_err(), "Batch aggregation should fail without setup()");
     }
 }
