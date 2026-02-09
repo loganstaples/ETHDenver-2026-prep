@@ -8,8 +8,6 @@
 
 use std::time::Duration;
 
-use sha2::{Digest, Sha256};
-
 use super::StorageBackend;
 
 /// IPFS storage backend using the HTTP API.

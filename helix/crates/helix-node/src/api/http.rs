@@ -243,7 +243,9 @@ async fn auth_middleware(
         .and_then(|v| v.strip_prefix("Bearer "));
 
     match token {
-        Some(t) if t == state.api_key => next.run(request).await,
+        Some(t) if constant_time_eq(t.as_bytes(), state.api_key.as_bytes()) => {
+            next.run(request).await
+        }
         _ => (
             StatusCode::UNAUTHORIZED,
             Json(ErrorResponse {
@@ -252,6 +254,13 @@ async fn auth_middleware(
         )
             .into_response(),
     }
+}
+
+/// Constant-time byte comparison to prevent timing side-channel attacks
+/// on API key validation.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    use subtle::ConstantTimeEq;
+    a.ct_eq(b).into()
 }
 
 // ---------------------------------------------------------------------------

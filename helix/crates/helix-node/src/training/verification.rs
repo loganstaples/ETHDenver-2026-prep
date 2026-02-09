@@ -690,10 +690,12 @@ pub struct ByzantineGradientFilter {
     strategy: ByzantineStrategy,
     /// Maximum number of Byzantine workers to tolerate.
     max_byzantine: usize,
-    /// Historical gradient norms for statistical detection.
+    /// Historical gradient norms for statistical detection (bounded ring buffer).
     historical_norms: Vec<f64>,
     /// Z-score threshold for statistical outlier detection.
     zscore_threshold: f64,
+    /// Maximum number of historical norms to retain.
+    max_historical_norms: usize,
 }
 
 /// Strategy for Byzantine gradient filtering.
@@ -730,6 +732,7 @@ impl ByzantineGradientFilter {
             max_byzantine,
             historical_norms: Vec::new(),
             zscore_threshold: 3.0,
+            max_historical_norms: 10_000,
         }
     }
 
@@ -881,9 +884,14 @@ impl ByzantineGradientFilter {
         // Then apply statistical Z-score filtering on norms
         let norms: Vec<f64> = submissions.iter().map(|(_, n, _)| *n).collect();
 
-        // Add to historical norms for running statistics
+        // Add to historical norms for running statistics (bounded)
         for &norm in &norms {
             self.historical_norms.push(norm);
+        }
+        // Evict oldest entries to prevent unbounded memory growth
+        if self.historical_norms.len() > self.max_historical_norms {
+            let excess = self.historical_norms.len() - self.max_historical_norms;
+            self.historical_norms.drain(..excess);
         }
 
         if self.historical_norms.len() >= 10 {

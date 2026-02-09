@@ -453,52 +453,6 @@ impl AggregatorNode {
         Some(result)
     }
 
-    /// Helper: builds an AggregatedResult, stores it, and updates stats.
-    async fn build_result(
-        &self,
-        round_id: u64,
-        commitment: [u8; 32],
-        gradients: &HashMap<PeerId, CollectedGradient>,
-    ) -> AggregatedResult {
-        let mut total_error = 0.0;
-        for grad in gradients.values() {
-            total_error += grad.error_bound;
-        }
-        total_error /= gradients.len() as f64;
-
-        let result = AggregatedResult {
-            round_id,
-            commitment,
-            total_error_bound: total_error,
-            num_participants: gradients.len(),
-            proof: vec![],
-        };
-
-        // Update stats
-        {
-            let mut stats = self.stats.write().await;
-            stats.rounds_successful += 1;
-            stats.gradients_aggregated += gradients.len() as u64;
-            let total_rounds = stats.rounds_successful as f64;
-            stats.avg_participants = (stats.avg_participants * (total_rounds - 1.0)
-                + gradients.len() as f64) / total_rounds;
-        }
-
-        // Store result
-        {
-            let mut completed = self.completed_rounds.write().await;
-            completed.insert(round_id, result.clone());
-        }
-
-        // Update state
-        {
-            let mut state = self.state.write().await;
-            *state = AggregatorState::Complete { round_id };
-        }
-
-        result
-    }
-
     /// Creates an aggregated gradient message.
     pub async fn create_aggregated_message(&self, round_id: u64) -> Option<NetworkMessage> {
         let completed = self.completed_rounds.read().await;
