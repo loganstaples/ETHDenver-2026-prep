@@ -887,6 +887,218 @@ fn hex_decode(hex: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
+// ============================================================================
+// Verified Data Loader
+// ============================================================================
+
+use super::DataLoader;
+use crate::error::{DataError, HelixError, HelixResult};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Statistics for verified data loading operations.
+#[derive(Debug, Clone)]
+pub struct VerifiedLoaderStats {
+    /// Number of batches that passed hash verification.
+    pub batches_verified: u64,
+    /// Number of batches rejected due to hash mismatch.
+    pub batches_rejected: u64,
+    /// Number of batches loaded without a known expected hash.
+    pub batches_unverified: u64,
+    /// Whether the provenance transformation chain is valid.
+    pub provenance_valid: bool,
+}
+
+/// Computes a SHA-256 hash of a batch's data (inputs concatenated with labels).
+///
+/// Each f64 value is serialized as 8 little-endian bytes. The inputs are written
+/// first, followed by the labels, and the concatenated bytes are hashed using
+/// `Sha256Hasher::hash_leaf()` (which applies domain-separated leaf hashing).
+pub fn compute_batch_hash(inputs: &[f64], labels: &[f64]) -> Hash {
+    let mut data = Vec::with_capacity((inputs.len() + labels.len()) * 8);
+    for &v in inputs {
+        data.extend_from_slice(&v.to_le_bytes());
+    }
+    for &v in labels {
+        data.extend_from_slice(&v.to_le_bytes());
+    }
+    Sha256Hasher.hash_leaf(&data)
+}
+
+/// Pre-computes batch hashes for all batches in a data loader.
+///
+/// Iterates through every batch (0..num_batches), loads each one, and computes
+/// its hash via `compute_batch_hash`. Batches that fail to load are skipped.
+pub fn build_batch_hashes(loader: &dyn DataLoader) -> HashMap<u64, Hash> {
+    let mut hashes = HashMap::new();
+    for batch_id in 0..loader.num_batches() {
+        if let Ok((inputs, labels)) = loader.load_batch(batch_id) {
+            hashes.insert(batch_id, compute_batch_hash(&inputs, &labels));
+        }
+    }
+    hashes
+}
+
+/// A data loader wrapper that validates batch integrity via hash verification
+/// and dataset provenance before returning data.
+///
+/// `VerifiedDataLoader` wraps any `DataLoader` implementation and adds:
+/// - Per-batch SHA-256 hash verification against pre-computed expected hashes
+/// - Provenance chain validation (transformation chain integrity)
+/// - Configurable rejection of unverified batches
+/// - Atomic statistics tracking (thread-safe)
+///
+/// # Example
+/// ```ignore
+/// let inner = Box::new(my_loader);
+/// let provenance = ProvenanceRecord::new(origin, data_hash);
+/// let dataset_root = Hash::from_slice(b"root");
+/// let hashes = build_batch_hashes(&*inner);
+///
+/// let loader = VerifiedDataLoader::new(inner, provenance, dataset_root)
+///     .with_batch_hashes(hashes);
+///
+/// let batch = loader.load_batch(0)?; // verified automatically
+/// ```
+pub struct VerifiedDataLoader {
+    /// The underlying data loader.
+    inner: Box<dyn DataLoader>,
+    /// Provenance record for the dataset.
+    provenance: ProvenanceRecord,
+    /// Merkle root of the dataset for integrity checks.
+    dataset_root: Hash,
+    /// Pre-computed expected hashes for each batch, keyed by batch ID.
+    batch_hashes: HashMap<u64, Hash>,
+    /// Whether to reject batches that have no expected hash for verification.
+    reject_unverified: bool,
+    /// Counter: batches that passed hash verification.
+    verified_count: AtomicU64,
+    /// Counter: batches rejected due to hash mismatch.
+    rejected_count: AtomicU64,
+    /// Counter: batches loaded without a known expected hash.
+    unverified_count: AtomicU64,
+}
+
+impl VerifiedDataLoader {
+    /// Creates a new verified data loader.
+    ///
+    /// By default, `reject_unverified` is `true`, meaning batches without a
+    /// pre-computed expected hash will be rejected. Use `set_reject_unverified(false)`
+    /// or provide batch hashes via `with_batch_hashes` to control this behavior.
+    pub fn new(
+        inner: Box<dyn DataLoader>,
+        provenance: ProvenanceRecord,
+        dataset_root: Hash,
+    ) -> Self {
+        Self {
+            inner,
+            provenance,
+            dataset_root,
+            batch_hashes: HashMap::new(),
+            reject_unverified: true,
+            verified_count: AtomicU64::new(0),
+            rejected_count: AtomicU64::new(0),
+            unverified_count: AtomicU64::new(0),
+        }
+    }
+
+    /// Registers pre-computed batch hashes for fast validation.
+    ///
+    /// Each entry maps a batch ID to its expected SHA-256 hash. When `load_batch`
+    /// is called, the loaded data's hash is compared against the expected hash.
+    pub fn with_batch_hashes(mut self, hashes: HashMap<u64, Hash>) -> Self {
+        self.batch_hashes = hashes;
+        self
+    }
+
+    /// Sets whether to reject batches that have no expected hash available.
+    ///
+    /// When `true` (default), loading a batch without a pre-registered hash
+    /// returns an error. When `false`, such batches are loaded but counted
+    /// as "unverified" in the stats.
+    pub fn set_reject_unverified(&mut self, reject: bool) {
+        self.reject_unverified = reject;
+    }
+
+    /// Verifies that the provenance transformation chain is valid.
+    ///
+    /// Checks that the sequence of transformations forms an unbroken chain
+    /// from the original data hash to the current hash.
+    pub fn verify_provenance(&self) -> Result<bool, ProvenanceError> {
+        Ok(self.provenance.verify_transformation_chain())
+    }
+
+    /// Verifies a batch's data against its expected hash.
+    ///
+    /// Computes the SHA-256 hash of the batch data (inputs ++ labels) and
+    /// compares it to the expected hash stored in `batch_hashes`. Returns
+    /// `false` if no expected hash is registered for the given batch ID.
+    pub fn verify_batch_hash(&self, batch_id: u64, data: &(Vec<f64>, Vec<f64>)) -> bool {
+        match self.batch_hashes.get(&batch_id) {
+            Some(expected) => {
+                let actual = compute_batch_hash(&data.0, &data.1);
+                actual == *expected
+            }
+            None => false,
+        }
+    }
+
+    /// Returns verification statistics.
+    ///
+    /// The stats are accumulated across all `load_batch` calls and reflect
+    /// the current state of the atomic counters.
+    pub fn verification_stats(&self) -> VerifiedLoaderStats {
+        let provenance_valid = self.provenance.verify_transformation_chain();
+        VerifiedLoaderStats {
+            batches_verified: self.verified_count.load(Ordering::Relaxed),
+            batches_rejected: self.rejected_count.load(Ordering::Relaxed),
+            batches_unverified: self.unverified_count.load(Ordering::Relaxed),
+            provenance_valid,
+        }
+    }
+
+    /// Returns a reference to the dataset Merkle root.
+    pub fn dataset_root(&self) -> &Hash {
+        &self.dataset_root
+    }
+
+    /// Returns a reference to the provenance record.
+    pub fn provenance(&self) -> &ProvenanceRecord {
+        &self.provenance
+    }
+}
+
+impl DataLoader for VerifiedDataLoader {
+    fn load_batch(&self, batch_id: u64) -> HelixResult<(Vec<f64>, Vec<f64>)> {
+        let batch = self.inner.load_batch(batch_id)?;
+
+        if let Some(expected) = self.batch_hashes.get(&batch_id) {
+            let actual = compute_batch_hash(&batch.0, &batch.1);
+            if actual == *expected {
+                self.verified_count.fetch_add(1, Ordering::Relaxed);
+                Ok(batch)
+            } else {
+                self.rejected_count.fetch_add(1, Ordering::Relaxed);
+                Err(HelixError::Data(DataError::IntegrityError {
+                    expected: expected.to_hex(),
+                    actual: actual.to_hex(),
+                }))
+            }
+        } else if self.reject_unverified {
+            self.rejected_count.fetch_add(1, Ordering::Relaxed);
+            Err(HelixError::Data(DataError::CommitmentVerificationFailed(
+                format!("No expected hash for batch {}", batch_id),
+            )))
+        } else {
+            self.unverified_count.fetch_add(1, Ordering::Relaxed);
+            Ok(batch)
+        }
+    }
+
+    fn num_batches(&self) -> u64 {
+        self.inner.num_batches()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1140,6 +1352,279 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert!(loaded.get(&record_id).is_some());
         assert_eq!(loaded.find_by_original(&hash1).len(), 1);
+    }
+
+    // ========================================================================
+    // VerifiedDataLoader tests
+    // ========================================================================
+
+    use super::super::InMemoryDataLoader;
+
+    fn make_test_loader() -> InMemoryDataLoader {
+        InMemoryDataLoader::new(vec![
+            (vec![1.0, 2.0, 3.0], vec![0.0]),
+            (vec![4.0, 5.0, 6.0], vec![1.0]),
+            (vec![7.0, 8.0, 9.0], vec![0.0]),
+        ])
+    }
+
+    fn make_test_provenance() -> ProvenanceRecord {
+        let origin = DataOrigin::Synthetic {
+            generator: "test".to_string(),
+            seed: Some(42),
+            parameters: HashMap::new(),
+        };
+        ProvenanceRecord::new(origin, Hash::from_slice(b"test_data"))
+    }
+
+    #[test]
+    fn test_compute_batch_hash_deterministic() {
+        let inputs = vec![1.0, 2.0, 3.0];
+        let labels = vec![0.0];
+
+        let hash1 = compute_batch_hash(&inputs, &labels);
+        let hash2 = compute_batch_hash(&inputs, &labels);
+
+        assert_eq!(hash1, hash2);
+        assert!(!hash1.is_zero());
+    }
+
+    #[test]
+    fn test_compute_batch_hash_different_data() {
+        let hash1 = compute_batch_hash(&[1.0, 2.0], &[0.0]);
+        let hash2 = compute_batch_hash(&[1.0, 3.0], &[0.0]);
+        let hash3 = compute_batch_hash(&[1.0, 2.0], &[1.0]);
+
+        assert_ne!(hash1, hash2);
+        assert_ne!(hash1, hash3);
+        assert_ne!(hash2, hash3);
+    }
+
+    #[test]
+    fn test_build_batch_hashes() {
+        let loader = make_test_loader();
+        let hashes = build_batch_hashes(&loader);
+
+        assert_eq!(hashes.len(), 3);
+        assert!(hashes.contains_key(&0));
+        assert!(hashes.contains_key(&1));
+        assert!(hashes.contains_key(&2));
+
+        // Verify each hash matches a direct computation
+        for batch_id in 0..3 {
+            let (inputs, labels) = loader.load_batch(batch_id).unwrap();
+            let expected = compute_batch_hash(&inputs, &labels);
+            assert_eq!(hashes[&batch_id], expected);
+        }
+    }
+
+    #[test]
+    fn test_verified_loader_passes_valid_batches() {
+        let inner = make_test_loader();
+        let hashes = build_batch_hashes(&inner);
+        let provenance = make_test_provenance();
+        let root = Hash::from_slice(b"root");
+
+        let loader = VerifiedDataLoader::new(Box::new(inner), provenance, root)
+            .with_batch_hashes(hashes);
+
+        for batch_id in 0..3 {
+            let result = loader.load_batch(batch_id);
+            assert!(result.is_ok(), "Batch {} should load successfully", batch_id);
+        }
+
+        let stats = loader.verification_stats();
+        assert_eq!(stats.batches_verified, 3);
+        assert_eq!(stats.batches_rejected, 0);
+        assert_eq!(stats.batches_unverified, 0);
+    }
+
+    #[test]
+    fn test_verified_loader_rejects_tampered_batch() {
+        let inner = make_test_loader();
+        let mut hashes = build_batch_hashes(&inner);
+        // Tamper with the expected hash for batch 1
+        hashes.insert(1, Hash::from_slice(b"wrong_hash"));
+
+        let provenance = make_test_provenance();
+        let root = Hash::from_slice(b"root");
+
+        let loader = VerifiedDataLoader::new(Box::new(inner), provenance, root)
+            .with_batch_hashes(hashes);
+
+        assert!(loader.load_batch(0).is_ok());
+        assert!(loader.load_batch(1).is_err()); // tampered
+        assert!(loader.load_batch(2).is_ok());
+
+        let stats = loader.verification_stats();
+        assert_eq!(stats.batches_verified, 2);
+        assert_eq!(stats.batches_rejected, 1);
+    }
+
+    #[test]
+    fn test_verified_loader_rejects_unverified_by_default() {
+        let inner = make_test_loader();
+        // No batch hashes provided
+        let provenance = make_test_provenance();
+        let root = Hash::from_slice(b"root");
+
+        let loader = VerifiedDataLoader::new(Box::new(inner), provenance, root);
+
+        let result = loader.load_batch(0);
+        assert!(result.is_err());
+
+        let stats = loader.verification_stats();
+        assert_eq!(stats.batches_rejected, 1);
+        assert_eq!(stats.batches_unverified, 0);
+    }
+
+    #[test]
+    fn test_verified_loader_allows_unverified_when_configured() {
+        let inner = make_test_loader();
+        let provenance = make_test_provenance();
+        let root = Hash::from_slice(b"root");
+
+        let mut loader = VerifiedDataLoader::new(Box::new(inner), provenance, root);
+        loader.set_reject_unverified(false);
+
+        let result = loader.load_batch(0);
+        assert!(result.is_ok());
+
+        let stats = loader.verification_stats();
+        assert_eq!(stats.batches_verified, 0);
+        assert_eq!(stats.batches_rejected, 0);
+        assert_eq!(stats.batches_unverified, 1);
+    }
+
+    #[test]
+    fn test_verified_loader_verify_provenance_valid() {
+        let inner = make_test_loader();
+        let provenance = make_test_provenance();
+        let root = Hash::from_slice(b"root");
+
+        let loader = VerifiedDataLoader::new(Box::new(inner), provenance, root);
+
+        // No transformations, original == current, so chain is valid
+        let result = loader.verify_provenance();
+        assert!(result.is_ok());
+        assert!(result.unwrap());
+    }
+
+    #[test]
+    fn test_verified_loader_verify_provenance_with_transformations() {
+        let inner = make_test_loader();
+        let original = Hash::from_slice(b"original");
+        let transformed = Hash::from_slice(b"transformed");
+
+        let origin = DataOrigin::Synthetic {
+            generator: "test".to_string(),
+            seed: Some(42),
+            parameters: HashMap::new(),
+        };
+        let mut provenance = ProvenanceRecord::new(origin, original);
+        provenance.add_transformation(DataTransformation::new(
+            TransformationType::Normalization {
+                method: "minmax".to_string(),
+            },
+            original,
+            transformed,
+            HashMap::new(),
+        ));
+        let root = Hash::from_slice(b"root");
+
+        let loader = VerifiedDataLoader::new(Box::new(inner), provenance, root);
+
+        assert!(loader.verify_provenance().unwrap());
+    }
+
+    #[test]
+    fn test_verified_loader_verify_batch_hash() {
+        let inner = make_test_loader();
+        let hashes = build_batch_hashes(&inner);
+        let provenance = make_test_provenance();
+        let root = Hash::from_slice(b"root");
+
+        let loader = VerifiedDataLoader::new(Box::new(inner), provenance, root)
+            .with_batch_hashes(hashes);
+
+        // Valid batch data
+        let data = (vec![1.0, 2.0, 3.0], vec![0.0]);
+        assert!(loader.verify_batch_hash(0, &data));
+
+        // Tampered batch data
+        let bad_data = (vec![99.0, 2.0, 3.0], vec![0.0]);
+        assert!(!loader.verify_batch_hash(0, &bad_data));
+
+        // Unknown batch ID
+        assert!(!loader.verify_batch_hash(999, &data));
+    }
+
+    #[test]
+    fn test_verified_loader_num_batches_delegates() {
+        let inner = make_test_loader();
+        let provenance = make_test_provenance();
+        let root = Hash::from_slice(b"root");
+
+        let loader = VerifiedDataLoader::new(Box::new(inner), provenance, root);
+        assert_eq!(loader.num_batches(), 3);
+    }
+
+    #[test]
+    fn test_verified_loader_dataset_root() {
+        let inner = make_test_loader();
+        let provenance = make_test_provenance();
+        let root = Hash::from_slice(b"my_root");
+
+        let loader = VerifiedDataLoader::new(Box::new(inner), provenance, root);
+        assert_eq!(*loader.dataset_root(), Hash::from_slice(b"my_root"));
+    }
+
+    #[test]
+    fn test_verified_loader_stats_provenance_valid_flag() {
+        let inner = make_test_loader();
+        let provenance = make_test_provenance();
+        let root = Hash::from_slice(b"root");
+
+        let loader = VerifiedDataLoader::new(Box::new(inner), provenance, root);
+        let stats = loader.verification_stats();
+        assert!(stats.provenance_valid);
+    }
+
+    #[test]
+    fn test_verified_loader_out_of_range_batch() {
+        let inner = make_test_loader();
+        let hashes = build_batch_hashes(&inner);
+        let provenance = make_test_provenance();
+        let root = Hash::from_slice(b"root");
+
+        let loader = VerifiedDataLoader::new(Box::new(inner), provenance, root)
+            .with_batch_hashes(hashes);
+
+        // Batch 99 does not exist in the inner loader
+        let result = loader.load_batch(99);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verified_loader_partial_hashes() {
+        let inner = make_test_loader();
+        // Only register hash for batch 0
+        let mut hashes = HashMap::new();
+        let (inputs, labels) = inner.load_batch(0).unwrap();
+        hashes.insert(0, compute_batch_hash(&inputs, &labels));
+
+        let provenance = make_test_provenance();
+        let root = Hash::from_slice(b"root");
+
+        let loader = VerifiedDataLoader::new(Box::new(inner), provenance, root)
+            .with_batch_hashes(hashes);
+
+        assert!(loader.load_batch(0).is_ok()); // verified
+        assert!(loader.load_batch(1).is_err()); // no hash, reject_unverified=true
+
+        let stats = loader.verification_stats();
+        assert_eq!(stats.batches_verified, 1);
+        assert_eq!(stats.batches_rejected, 1);
     }
 
     #[cfg(feature = "crypto-verify")]

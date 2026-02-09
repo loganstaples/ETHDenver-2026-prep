@@ -565,6 +565,16 @@ impl ShardRegistry {
         self.workers.remove(worker_id)
     }
 
+    /// Sets a worker's status.
+    pub fn set_worker_status(&mut self, worker_id: &WorkerId, status: WorkerStatus) -> bool {
+        if let Some(worker) = self.workers.get_mut(worker_id) {
+            worker.status = status;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Marks stale workers as failed.
     pub fn check_worker_health(&mut self) -> Vec<WorkerId> {
         let timeout = self.config.heartbeat_timeout_secs;
@@ -1369,6 +1379,247 @@ impl ShardAssignment {
     }
 }
 
+// ============================================================================
+// WORKER DATA ASSIGNER — Full pipeline: dataset → shards → worker assignment → DataLoaders
+// ============================================================================
+
+use crate::error::{HelixError, DataError, HelixResult};
+use super::DataLoader;
+
+/// An assignment plan mapping workers to their shards and sample counts.
+#[derive(Debug, Clone)]
+pub struct AssignmentPlan {
+    /// Maps WorkerId to list of ShardIds assigned to that worker.
+    pub worker_shards: HashMap<WorkerId, Vec<ShardId>>,
+    /// Per-worker sample counts.
+    pub worker_sample_counts: HashMap<WorkerId, usize>,
+    /// Total samples assigned across all workers.
+    pub total_assigned: usize,
+    /// Whether any samples were unassigned (e.g., remainder from uneven division).
+    pub has_remainder: bool,
+}
+
+/// Orchestrates the full pipeline: dataset -> shards -> worker assignment -> per-worker DataLoaders.
+pub struct WorkerDataAssigner {
+    /// Sharding configuration used to partition the dataset.
+    sharding_config: ShardingConfig,
+    /// Registry configuration for worker/shard management.
+    #[allow(dead_code)]
+    registry_config: ShardRegistryConfig,
+    /// Internal shard registry tracking workers, shards, and assignments.
+    registry: ShardRegistry,
+    /// Cached shards from the most recent `assign_dataset` call.
+    /// Needed because `ShardMetadata` only stores an index range,
+    /// but non-contiguous strategies (e.g., RoundRobin) produce
+    /// non-contiguous sample index lists.
+    cached_shards: HashMap<ShardId, DataShard>,
+}
+
+impl WorkerDataAssigner {
+    /// Creates a new `WorkerDataAssigner` with the given sharding and registry configurations.
+    pub fn new(sharding_config: ShardingConfig, registry_config: ShardRegistryConfig) -> Self {
+        let registry = ShardRegistry::new(registry_config.clone());
+        Self {
+            sharding_config,
+            registry_config,
+            registry,
+            cached_shards: HashMap::new(),
+        }
+    }
+
+    /// Registers a list of workers as available for shard assignment.
+    pub fn register_workers(&mut self, workers: Vec<WorkerInfo>) {
+        for worker in workers {
+            self.registry.register_worker(worker);
+        }
+    }
+
+    /// Shards the dataset and assigns shards to registered workers.
+    ///
+    /// The `epochs` parameter is used to initialize progress tracking for each shard.
+    /// Returns an `AssignmentPlan` summarizing the mapping.
+    pub fn assign_dataset(&mut self, samples: &[Sample], epochs: u32) -> AssignmentPlan {
+        // Step 1: Create shards from samples using the configured strategy.
+        let sharder = DataSharder::new(self.sharding_config.clone());
+        let shards = sharder.shard(samples);
+
+        // Step 2: Register each shard in the registry with metadata and cache the shard.
+        self.cached_shards.clear();
+        for shard in shards {
+            let metadata = ShardMetadata::new(
+                shard.id,
+                shard.len(),
+                (shard.len() * std::mem::size_of::<f32>()) as u64,
+            );
+            self.registry.register_shard(metadata);
+            self.registry.init_progress(shard.id, shard.len(), epochs);
+            self.cached_shards.insert(shard.id, shard);
+        }
+
+        // Step 3: Auto-assign shards to workers (load-balanced).
+        self.registry.auto_assign_shards();
+
+        // Step 4: Build the assignment plan.
+        let active_workers: Vec<WorkerId> = self
+            .registry
+            .list_active_workers()
+            .iter()
+            .map(|w| w.id.clone())
+            .collect();
+
+        let mut worker_shard_map: HashMap<WorkerId, Vec<ShardId>> = HashMap::new();
+        let mut worker_sample_counts: HashMap<WorkerId, usize> = HashMap::new();
+        let mut total_assigned: usize = 0;
+
+        for worker_id in &active_workers {
+            let assigned_shards = self.registry.get_worker_shards(worker_id);
+            let shard_ids: Vec<ShardId> = assigned_shards.iter().map(|s| s.shard_id).collect();
+            let sample_count: usize = assigned_shards.iter().map(|s| s.num_samples).sum();
+
+            worker_shard_map.insert(worker_id.clone(), shard_ids);
+            worker_sample_counts.insert(worker_id.clone(), sample_count);
+            total_assigned += sample_count;
+        }
+
+        let has_remainder = total_assigned < samples.len();
+
+        AssignmentPlan {
+            worker_shards: worker_shard_map,
+            worker_sample_counts,
+            total_assigned,
+            has_remainder,
+        }
+    }
+
+    /// Builds a `WorkerDataLoader` for a specific worker based on its assigned shards.
+    ///
+    /// `features_per_sample` indicates the number of f64 feature values per sample,
+    /// used to partition the flattened features into batches. Each sample becomes one
+    /// batch entry.
+    ///
+    /// Returns `None` if the worker has no shard assignments.
+    pub fn build_worker_loader(
+        &self,
+        worker_id: &WorkerId,
+        samples: &[Sample],
+        _features_per_sample: usize,
+    ) -> Option<WorkerDataLoader> {
+        let assigned_shards = self.registry.get_worker_shards(worker_id);
+        if assigned_shards.is_empty() {
+            return None;
+        }
+
+        // Collect all sample indices from the worker's cached shards.
+        let shard_ids: Vec<ShardId> = assigned_shards.iter().map(|s| s.shard_id).collect();
+        let all_indices: Vec<usize> = shard_ids
+            .iter()
+            .flat_map(|sid| {
+                self.cached_shards
+                    .get(sid)
+                    .map(|shard| shard.sample_indices.as_slice())
+                    .unwrap_or(&[])
+            })
+            .copied()
+            .filter(|&idx| idx < samples.len())
+            .collect();
+
+        if all_indices.is_empty() {
+            return None;
+        }
+
+        // Convert each sample to (inputs_f64, labels_f64) forming one batch entry.
+        let mut batches: Vec<(Vec<f64>, Vec<f64>)> = Vec::new();
+        // Group samples into batches of `features_per_sample`-sized chunks.
+        // Each batch contains one sample (granular batching).
+        for &idx in &all_indices {
+            let sample = &samples[idx];
+            let features_f64: Vec<f64> = sample
+                .features_as_f32()
+                .into_iter()
+                .map(|f| f as f64)
+                .collect();
+            let labels_f64: Vec<f64> = sample
+                .labels_as_f32()
+                .into_iter()
+                .map(|f| f as f64)
+                .collect();
+            batches.push((features_f64, labels_f64));
+        }
+
+        Some(WorkerDataLoader {
+            worker_id: worker_id.clone(),
+            batches,
+        })
+    }
+
+    /// Reassigns shards from a failed worker to other active workers.
+    ///
+    /// Marks the failed worker as `Failed`, collects its shards, unassigns them,
+    /// then redistributes to the remaining active workers using load balancing.
+    ///
+    /// Returns a list of `(ShardId, WorkerId)` pairs describing the new assignments.
+    pub fn reassign_on_failure(&mut self, failed_worker: &WorkerId) -> Vec<(ShardId, WorkerId)> {
+        // Mark the worker as failed.
+        self.registry.set_worker_status(failed_worker, WorkerStatus::Failed);
+
+        // Collect the shards that were assigned to the failed worker.
+        let orphaned_shards: Vec<ShardId> = self
+            .registry
+            .get_worker_shards(failed_worker)
+            .iter()
+            .map(|s| s.shard_id)
+            .collect();
+
+        // Unassign all shards from the failed worker.
+        for shard_id in &orphaned_shards {
+            self.registry.unassign_shard(*shard_id, failed_worker);
+        }
+
+        // Re-assign orphaned shards using auto_assign (they are now unassigned).
+        let new_assignments = self.registry.auto_assign_shards();
+
+        // Filter to only the shards that were orphaned (auto_assign may pick up others too).
+        new_assignments
+            .into_iter()
+            .filter(|(sid, _)| orphaned_shards.contains(sid))
+            .collect()
+    }
+
+    /// Returns a reference to the inner `ShardRegistry`.
+    pub fn registry(&self) -> &ShardRegistry {
+        &self.registry
+    }
+
+    /// Returns a mutable reference to the inner `ShardRegistry`.
+    pub fn registry_mut(&mut self) -> &mut ShardRegistry {
+        &mut self.registry
+    }
+}
+
+/// A per-worker data loader that implements the `DataLoader` trait.
+///
+/// Contains the subset of training data assigned to a single worker,
+/// pre-converted to `(Vec<f64>, Vec<f64>)` batches.
+pub struct WorkerDataLoader {
+    /// The worker this loader serves.
+    pub worker_id: WorkerId,
+    /// Pre-built batches of (inputs, labels).
+    batches: Vec<(Vec<f64>, Vec<f64>)>,
+}
+
+impl DataLoader for WorkerDataLoader {
+    fn load_batch(&self, batch_id: u64) -> HelixResult<(Vec<f64>, Vec<f64>)> {
+        let idx = batch_id as usize;
+        self.batches.get(idx).cloned().ok_or_else(|| {
+            HelixError::Data(DataError::BatchNotFound(idx))
+        })
+    }
+
+    fn num_batches(&self) -> u64 {
+        self.batches.len() as u64
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1825,5 +2076,230 @@ mod tests {
         assert_eq!(loaded.get_shard(ShardId(1)).unwrap().num_samples, 200);
         assert!(loaded.get_worker(&WorkerId::new("w1")).is_some());
         assert!(loaded.get_worker(&WorkerId::new("w2")).is_some());
+    }
+
+    // ========== WorkerDataAssigner Tests ==========
+
+    fn make_workers(n: usize) -> Vec<WorkerInfo> {
+        (0..n)
+            .map(|i| WorkerInfo::new(WorkerId::new(format!("worker-{}", i))))
+            .collect()
+    }
+
+    #[test]
+    fn test_worker_data_assigner_assign_and_verify_coverage() {
+        let (_, samples) = create_synthetic(100, 10, 5);
+        let workers = make_workers(3);
+
+        let mut assigner = WorkerDataAssigner::new(
+            ShardingConfig {
+                num_shards: 6,
+                strategy: ShardingStrategy::RoundRobin,
+                ..Default::default()
+            },
+            ShardRegistryConfig::default(),
+        );
+
+        assigner.register_workers(workers);
+        let plan = assigner.assign_dataset(&samples, 1);
+
+        // Every worker should have at least one shard.
+        assert_eq!(plan.worker_shards.len(), 3);
+        for (_, shards) in &plan.worker_shards {
+            assert!(!shards.is_empty(), "every worker must have at least one shard");
+        }
+
+        // Total assigned samples should equal the full dataset.
+        assert_eq!(plan.total_assigned, 100);
+        assert!(!plan.has_remainder);
+
+        // Sum of per-worker sample counts must equal total.
+        let sum: usize = plan.worker_sample_counts.values().sum();
+        assert_eq!(sum, plan.total_assigned);
+    }
+
+    #[test]
+    fn test_worker_data_assigner_each_worker_gets_data() {
+        let (_, samples) = create_synthetic(60, 4, 2);
+        let workers = make_workers(3);
+
+        let mut assigner = WorkerDataAssigner::new(
+            ShardingConfig {
+                num_shards: 3,
+                strategy: ShardingStrategy::RoundRobin,
+                ..Default::default()
+            },
+            ShardRegistryConfig::default(),
+        );
+
+        assigner.register_workers(workers.clone());
+        let plan = assigner.assign_dataset(&samples, 2);
+
+        // Each worker should have a non-zero sample count.
+        for worker in &workers {
+            let count = plan.worker_sample_counts.get(&worker.id).copied().unwrap_or(0);
+            assert!(count > 0, "worker {} must have samples", worker.id);
+        }
+    }
+
+    #[test]
+    fn test_worker_data_loader_returns_correct_data() {
+        let (_, samples) = create_synthetic(20, 4, 2);
+        let workers = make_workers(2);
+
+        let mut assigner = WorkerDataAssigner::new(
+            ShardingConfig {
+                num_shards: 2,
+                strategy: ShardingStrategy::RoundRobin,
+                ..Default::default()
+            },
+            ShardRegistryConfig::default(),
+        );
+
+        assigner.register_workers(workers.clone());
+        let _plan = assigner.assign_dataset(&samples, 1);
+
+        // Build loaders for each worker.
+        let features_per_sample = 4;
+        let mut total_batches = 0u64;
+
+        for worker in &workers {
+            let loader = assigner
+                .build_worker_loader(&worker.id, &samples, features_per_sample)
+                .expect("loader should be Some for assigned worker");
+
+            assert!(loader.num_batches() > 0, "loader must have batches");
+            total_batches += loader.num_batches();
+
+            // Verify each batch is loadable and has the right feature dimension.
+            for batch_id in 0..loader.num_batches() {
+                let (inputs, labels) = loader.load_batch(batch_id).unwrap();
+                assert_eq!(inputs.len(), features_per_sample, "features length mismatch");
+                assert!(!labels.is_empty(), "labels must not be empty");
+            }
+
+            // Out-of-range batch should error.
+            assert!(loader.load_batch(loader.num_batches()).is_err());
+        }
+
+        // Combined batches should cover all samples.
+        assert_eq!(total_batches, 20);
+    }
+
+    #[test]
+    fn test_reassign_on_failure() {
+        let (_, samples) = create_synthetic(30, 4, 2);
+        let workers = make_workers(3);
+
+        let mut assigner = WorkerDataAssigner::new(
+            ShardingConfig {
+                num_shards: 6,
+                strategy: ShardingStrategy::RoundRobin,
+                ..Default::default()
+            },
+            ShardRegistryConfig::default(),
+        );
+
+        assigner.register_workers(workers.clone());
+        let plan_before = assigner.assign_dataset(&samples, 1);
+
+        // Pick the first worker and record how many shards it had.
+        let failed_id = &workers[0].id;
+        let failed_shard_count = plan_before.worker_shards[failed_id].len();
+        assert!(failed_shard_count > 0, "worker must have shards to fail");
+
+        // Simulate failure and reassignment.
+        let reassigned = assigner.reassign_on_failure(failed_id);
+
+        // All orphaned shards should have been reassigned.
+        assert_eq!(
+            reassigned.len(),
+            failed_shard_count,
+            "all orphaned shards must be reassigned"
+        );
+
+        // None of the reassigned shards should go back to the failed worker.
+        for (_, new_worker) in &reassigned {
+            assert_ne!(new_worker, failed_id, "shard must not be reassigned to failed worker");
+        }
+
+        // The failed worker should now have no shards.
+        let remaining = assigner.registry().get_worker_shards(failed_id);
+        assert!(remaining.is_empty(), "failed worker must have 0 shards");
+    }
+
+    #[test]
+    fn test_worker_data_loader_trait_impl() {
+        // Verify WorkerDataLoader satisfies the DataLoader trait.
+        let (_, samples) = create_synthetic(10, 3, 2);
+        let workers = make_workers(1);
+
+        let mut assigner = WorkerDataAssigner::new(
+            ShardingConfig {
+                num_shards: 1,
+                strategy: ShardingStrategy::RoundRobin,
+                ..Default::default()
+            },
+            ShardRegistryConfig::default(),
+        );
+
+        assigner.register_workers(workers.clone());
+        assigner.assign_dataset(&samples, 1);
+
+        let loader = assigner
+            .build_worker_loader(&workers[0].id, &samples, 3)
+            .unwrap();
+
+        // Use the loader through the trait interface.
+        let dl: &dyn DataLoader = &loader;
+        assert_eq!(dl.num_batches(), 10);
+        let (inputs, labels) = dl.load_batch(0).unwrap();
+        assert_eq!(inputs.len(), 3);
+        assert!(!labels.is_empty());
+    }
+
+    #[test]
+    fn test_worker_data_assigner_registry_access() {
+        let workers = make_workers(2);
+
+        let mut assigner = WorkerDataAssigner::new(
+            ShardingConfig::default(),
+            ShardRegistryConfig::default(),
+        );
+
+        assigner.register_workers(workers.clone());
+
+        // Immutable access.
+        assert_eq!(assigner.registry().list_workers().len(), 2);
+
+        // Mutable access.
+        assigner
+            .registry_mut()
+            .set_worker_status(&workers[0].id, WorkerStatus::Paused);
+
+        let w = assigner.registry().get_worker(&workers[0].id).unwrap();
+        assert_eq!(w.status, WorkerStatus::Paused);
+    }
+
+    #[test]
+    fn test_build_loader_for_unknown_worker_returns_none() {
+        let (_, samples) = create_synthetic(10, 4, 2);
+        let workers = make_workers(1);
+
+        let mut assigner = WorkerDataAssigner::new(
+            ShardingConfig {
+                num_shards: 1,
+                strategy: ShardingStrategy::RoundRobin,
+                ..Default::default()
+            },
+            ShardRegistryConfig::default(),
+        );
+
+        assigner.register_workers(workers);
+        assigner.assign_dataset(&samples, 1);
+
+        // Worker that was never registered should return None.
+        let unknown = WorkerId::new("unknown-worker");
+        assert!(assigner.build_worker_loader(&unknown, &samples, 4).is_none());
     }
 }

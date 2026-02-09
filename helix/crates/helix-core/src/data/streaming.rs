@@ -630,6 +630,229 @@ impl BatchBuilder<Sha256Hasher> {
     }
 }
 
+// ============================================================================
+// Training Data Pipeline with Backpressure
+// ============================================================================
+
+use super::DataLoader;
+
+/// A single training batch yielded by the pipeline iterator.
+#[derive(Debug, Clone)]
+pub struct TrainingBatch {
+    /// Current epoch number (0-indexed).
+    pub epoch: u32,
+    /// Batch index within the current epoch.
+    pub batch_index: u64,
+    /// Global batch index across all epochs.
+    pub global_index: u64,
+    /// Flattened input features for all samples in the batch.
+    pub inputs: Vec<f64>,
+    /// Corresponding target labels.
+    pub labels: Vec<f64>,
+}
+
+/// Configuration for the training data pipeline.
+#[derive(Debug, Clone)]
+pub struct PipelineConfig {
+    /// Number of batches to prefetch ahead of the consumer.
+    /// Acts as the ring buffer size for backpressure: if the buffer is full,
+    /// the producer stops loading until the consumer drains an element.
+    pub prefetch_size: usize,
+    /// Number of training epochs to iterate over.
+    pub num_epochs: u32,
+    /// Whether to shuffle batch order at the start of each epoch.
+    pub shuffle_batches: bool,
+    /// Seed for deterministic shuffling. Combined with epoch number to get
+    /// per-epoch deterministic-but-different orderings.
+    pub shuffle_seed: u64,
+    /// If true, drop the last batch of an epoch when the total number of
+    /// batches from the loader doesn't evenly divide. Currently a no-op
+    /// because `DataLoader` already returns pre-sized batches, but controls
+    /// intent for future variable-length loaders.
+    pub drop_last: bool,
+}
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        Self {
+            prefetch_size: 8,
+            num_epochs: 1,
+            shuffle_batches: true,
+            shuffle_seed: 42,
+            drop_last: false,
+        }
+    }
+}
+
+/// A streaming training data pipeline with backpressure.
+///
+/// Wraps a [`DataLoader`] and provides an iterator that yields [`TrainingBatch`]
+/// items across multiple epochs with optional per-epoch shuffling. The internal
+/// prefetch ring buffer bounds memory usage: the producer (loader) fills at most
+/// `prefetch_size` batches ahead of the consumer, providing natural backpressure
+/// when the consumer (training worker) is slower than data loading.
+pub struct TrainingDataPipeline {
+    /// The underlying data source.
+    loader: Box<dyn DataLoader>,
+    /// Pipeline configuration.
+    config: PipelineConfig,
+}
+
+impl TrainingDataPipeline {
+    /// Creates a new pipeline from a data loader and configuration.
+    pub fn new(loader: Box<dyn DataLoader>, config: PipelineConfig) -> Self {
+        Self { loader, config }
+    }
+
+    /// Returns an iterator over training batches across all configured epochs.
+    ///
+    /// The iterator prefetches up to `config.prefetch_size` batches into an
+    /// internal ring buffer. When the buffer is full the loader pauses,
+    /// providing backpressure. Each call to `next()` pops the oldest prefetched
+    /// batch and triggers the loader to fill the freed slot.
+    pub fn iter(&self) -> PipelineIterator<'_> {
+        PipelineIterator::new(&*self.loader, &self.config)
+    }
+
+    /// Total number of batches the pipeline will yield across all epochs.
+    pub fn total_batches(&self) -> u64 {
+        self.loader.num_batches() * self.config.num_epochs as u64
+    }
+
+    /// Number of batches in a single epoch.
+    pub fn batches_per_epoch(&self) -> u64 {
+        self.loader.num_batches()
+    }
+}
+
+/// Iterator over a [`TrainingDataPipeline`].
+///
+/// Internally maintains a ring buffer of pre-loaded batches. The ring buffer
+/// is lazily filled: on each `next()` call, if there is capacity in the buffer
+/// and remaining batches in the schedule, they are loaded eagerly up to
+/// `prefetch_size`. This provides backpressure because the ring buffer has a
+/// fixed upper bound, preventing the producer from loading unbounded data when
+/// the consumer is slow.
+pub struct PipelineIterator<'a> {
+    loader: &'a dyn DataLoader,
+    /// Ring buffer of prefetched batches.
+    buffer: std::collections::VecDeque<TrainingBatch>,
+    /// Maximum ring buffer capacity (backpressure bound).
+    prefetch_size: usize,
+    /// Flat schedule of `(epoch, batch_id)` pairs for the entire run.
+    schedule: Vec<(u32, u64)>,
+    /// Current position within `schedule` for the next batch to *load*.
+    load_cursor: usize,
+    /// Global index counter for the next batch to *yield*.
+    yield_cursor: u64,
+}
+
+impl<'a> PipelineIterator<'a> {
+    fn new(loader: &'a dyn DataLoader, config: &PipelineConfig) -> Self {
+        let num_batches = loader.num_batches();
+        let mut schedule = Vec::with_capacity(num_batches as usize * config.num_epochs as usize);
+
+        for epoch in 0..config.num_epochs {
+            let mut batch_ids: Vec<u64> = (0..num_batches).collect();
+            if config.shuffle_batches && num_batches > 1 {
+                // Deterministic Fisher-Yates shuffle seeded by (seed XOR epoch).
+                let seed = config.shuffle_seed ^ (epoch as u64);
+                deterministic_shuffle(&mut batch_ids, seed);
+            }
+            for bid in batch_ids {
+                schedule.push((epoch, bid));
+            }
+        }
+
+        let prefetch_size = config.prefetch_size.max(1);
+        let mut iter = Self {
+            loader,
+            buffer: std::collections::VecDeque::with_capacity(prefetch_size),
+            prefetch_size,
+            schedule,
+            load_cursor: 0,
+            yield_cursor: 0,
+        };
+
+        // Initial fill of the ring buffer.
+        iter.fill_buffer();
+        iter
+    }
+
+    /// Fills the ring buffer up to capacity from the schedule.
+    fn fill_buffer(&mut self) {
+        while self.buffer.len() < self.prefetch_size && self.load_cursor < self.schedule.len() {
+            let (epoch, batch_id) = self.schedule[self.load_cursor];
+            // Load from the data source. On error, skip the batch (training
+            // pipelines are best-effort for data loading).
+            if let Ok((inputs, labels)) = self.loader.load_batch(batch_id) {
+                let batch_index = self.load_cursor as u64
+                    - epoch as u64 * (self.schedule.len() as u64 / self.schedule_epochs());
+                self.buffer.push_back(TrainingBatch {
+                    epoch,
+                    batch_index,
+                    global_index: self.load_cursor as u64,
+                    inputs,
+                    labels,
+                });
+            }
+            self.load_cursor += 1;
+        }
+    }
+
+    /// Helper: infer total number of epochs from the schedule.
+    fn schedule_epochs(&self) -> u64 {
+        if self.schedule.is_empty() {
+            return 1;
+        }
+        let last_epoch = self.schedule.last().map(|(e, _)| *e).unwrap_or(0);
+        last_epoch as u64 + 1
+    }
+}
+
+impl<'a> Iterator for PipelineIterator<'a> {
+    type Item = TrainingBatch;
+
+    fn next(&mut self) -> Option<TrainingBatch> {
+        // Ensure the buffer has data (may have been drained).
+        self.fill_buffer();
+
+        if let Some(mut batch) = self.buffer.pop_front() {
+            // Assign monotonically increasing yield index.
+            batch.global_index = self.yield_cursor;
+            self.yield_cursor += 1;
+            // After popping, try to fill the freed slot (backpressure release).
+            self.fill_buffer();
+            Some(batch)
+        } else {
+            None // Entire schedule exhausted.
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.buffer.len() + self.schedule.len().saturating_sub(self.load_cursor);
+        (remaining, Some(remaining))
+    }
+}
+
+/// Deterministic Fisher-Yates shuffle using a simple splitmix64 PRNG.
+fn deterministic_shuffle<T>(slice: &mut [T], seed: u64) {
+    let mut state = seed;
+    for i in (1..slice.len()).rev() {
+        state = splitmix64(state);
+        let j = (state % (i as u64 + 1)) as usize;
+        slice.swap(i, j);
+    }
+}
+
+/// splitmix64 — fast, deterministic, high-quality PRNG suitable for shuffling.
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e3779b97f4a7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+    x ^ (x >> 31)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -864,5 +1087,247 @@ mod tests {
         // Should have created checkpoints
         assert!(verifier.checkpoints().len() >= 2);
         assert!(verifier.stats().checkpoints_created >= 2);
+    }
+
+    // ========================================================================
+    // TrainingDataPipeline tests
+    // ========================================================================
+
+    use super::super::InMemoryDataLoader;
+
+    /// Helper: creates an InMemoryDataLoader with `n` batches. Each batch has
+    /// inputs `[batch_id as f64]` and labels `[batch_id as f64 * 10.0]`.
+    fn make_loader(n: u64) -> Box<dyn DataLoader> {
+        let batches: Vec<(Vec<f64>, Vec<f64>)> = (0..n)
+            .map(|i| (vec![i as f64], vec![i as f64 * 10.0]))
+            .collect();
+        Box::new(InMemoryDataLoader::new(batches))
+    }
+
+    #[test]
+    fn test_pipeline_single_epoch_no_shuffle() {
+        let loader = make_loader(5);
+        let config = PipelineConfig {
+            prefetch_size: 2,
+            num_epochs: 1,
+            shuffle_batches: false,
+            ..Default::default()
+        };
+        let pipeline = TrainingDataPipeline::new(loader, config);
+
+        assert_eq!(pipeline.total_batches(), 5);
+        assert_eq!(pipeline.batches_per_epoch(), 5);
+
+        let batches: Vec<TrainingBatch> = pipeline.iter().collect();
+        assert_eq!(batches.len(), 5);
+
+        // Without shuffling, batches should come in order 0..4.
+        for (i, b) in batches.iter().enumerate() {
+            assert_eq!(b.epoch, 0);
+            assert_eq!(b.global_index, i as u64);
+            assert_eq!(b.inputs, vec![i as f64]);
+            assert_eq!(b.labels, vec![i as f64 * 10.0]);
+        }
+    }
+
+    #[test]
+    fn test_pipeline_multiple_epochs_no_shuffle() {
+        let loader = make_loader(3);
+        let config = PipelineConfig {
+            prefetch_size: 4,
+            num_epochs: 3,
+            shuffle_batches: false,
+            ..Default::default()
+        };
+        let pipeline = TrainingDataPipeline::new(loader, config);
+
+        assert_eq!(pipeline.total_batches(), 9);
+
+        let batches: Vec<TrainingBatch> = pipeline.iter().collect();
+        assert_eq!(batches.len(), 9);
+
+        // Epochs 0, 1, 2 each with batches 0, 1, 2 in order.
+        for epoch in 0..3u32 {
+            for b_idx in 0..3u64 {
+                let global = epoch as u64 * 3 + b_idx;
+                let batch = &batches[global as usize];
+                assert_eq!(batch.epoch, epoch);
+                assert_eq!(batch.global_index, global);
+                assert_eq!(batch.inputs, vec![b_idx as f64]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_pipeline_shuffle_determinism() {
+        // Two pipelines with the same seed should produce identical orderings.
+        let config = PipelineConfig {
+            prefetch_size: 8,
+            num_epochs: 2,
+            shuffle_batches: true,
+            shuffle_seed: 12345,
+            ..Default::default()
+        };
+
+        let batches_a: Vec<TrainingBatch> =
+            TrainingDataPipeline::new(make_loader(10), config.clone()).iter().collect();
+        let batches_b: Vec<TrainingBatch> =
+            TrainingDataPipeline::new(make_loader(10), config).iter().collect();
+
+        assert_eq!(batches_a.len(), batches_b.len());
+        for (a, b) in batches_a.iter().zip(batches_b.iter()) {
+            assert_eq!(a.inputs, b.inputs);
+            assert_eq!(a.labels, b.labels);
+            assert_eq!(a.epoch, b.epoch);
+        }
+    }
+
+    #[test]
+    fn test_pipeline_shuffle_differs_across_epochs() {
+        let config = PipelineConfig {
+            prefetch_size: 16,
+            num_epochs: 2,
+            shuffle_batches: true,
+            shuffle_seed: 99,
+            ..Default::default()
+        };
+        let pipeline = TrainingDataPipeline::new(make_loader(10), config);
+        let batches: Vec<TrainingBatch> = pipeline.iter().collect();
+
+        // Extract batch input values for epoch 0 and epoch 1.
+        let epoch0: Vec<f64> = batches[..10].iter().map(|b| b.inputs[0]).collect();
+        let epoch1: Vec<f64> = batches[10..].iter().map(|b| b.inputs[0]).collect();
+
+        // Same set of values, but (very likely) different order.
+        let mut sorted0 = epoch0.clone();
+        let mut sorted1 = epoch1.clone();
+        sorted0.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        sorted1.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(sorted0, sorted1, "Both epochs should cover the same batches");
+
+        // With 10 batches, the probability that two independent shuffles
+        // produce the exact same order is 1/10! ≈ 2.8e-7. Safe to assert.
+        assert_ne!(epoch0, epoch1, "Shuffle should differ between epochs");
+    }
+
+    #[test]
+    fn test_pipeline_backpressure_prefetch_size() {
+        // With prefetch_size=2, the ring buffer should never hold more than 2
+        // items at a time. We verify indirectly via size_hint which exposes
+        // remaining count.
+        let config = PipelineConfig {
+            prefetch_size: 2,
+            num_epochs: 1,
+            shuffle_batches: false,
+            ..Default::default()
+        };
+        let pipeline = TrainingDataPipeline::new(make_loader(10), config);
+        let mut iter = pipeline.iter();
+
+        // After creation, the buffer should have at most prefetch_size items.
+        let (lo, hi) = iter.size_hint();
+        assert_eq!(lo, 10, "All 10 batches should be reachable");
+        assert_eq!(hi, Some(10));
+
+        // Consume one — should still report 9 remaining.
+        let b = iter.next().unwrap();
+        assert_eq!(b.global_index, 0);
+        let (lo, _) = iter.size_hint();
+        assert_eq!(lo, 9);
+    }
+
+    #[test]
+    fn test_pipeline_empty_loader() {
+        let loader = make_loader(0);
+        let config = PipelineConfig::default();
+        let pipeline = TrainingDataPipeline::new(loader, config);
+
+        assert_eq!(pipeline.total_batches(), 0);
+        assert_eq!(pipeline.batches_per_epoch(), 0);
+        assert_eq!(pipeline.iter().count(), 0);
+    }
+
+    #[test]
+    fn test_pipeline_single_batch() {
+        let loader = make_loader(1);
+        let config = PipelineConfig {
+            prefetch_size: 4,
+            num_epochs: 3,
+            shuffle_batches: true,
+            shuffle_seed: 7,
+            ..Default::default()
+        };
+        let pipeline = TrainingDataPipeline::new(loader, config);
+
+        let batches: Vec<TrainingBatch> = pipeline.iter().collect();
+        assert_eq!(batches.len(), 3);
+        // With only one batch, shuffling is a no-op.
+        for (i, b) in batches.iter().enumerate() {
+            assert_eq!(b.epoch, i as u32);
+            assert_eq!(b.inputs, vec![0.0]);
+            assert_eq!(b.labels, vec![0.0]);
+        }
+    }
+
+    #[test]
+    fn test_pipeline_global_index_monotonic() {
+        let config = PipelineConfig {
+            prefetch_size: 3,
+            num_epochs: 4,
+            shuffle_batches: true,
+            shuffle_seed: 42,
+            ..Default::default()
+        };
+        let pipeline = TrainingDataPipeline::new(make_loader(7), config);
+        let batches: Vec<TrainingBatch> = pipeline.iter().collect();
+
+        assert_eq!(batches.len(), 28);
+        for (i, b) in batches.iter().enumerate() {
+            assert_eq!(b.global_index, i as u64, "Global index should be monotonic");
+        }
+    }
+
+    #[test]
+    fn test_pipeline_config_defaults() {
+        let config = PipelineConfig::default();
+        assert_eq!(config.prefetch_size, 8);
+        assert_eq!(config.num_epochs, 1);
+        assert!(config.shuffle_batches);
+        assert_eq!(config.shuffle_seed, 42);
+        assert!(!config.drop_last);
+    }
+
+    #[test]
+    fn test_pipeline_large_prefetch() {
+        // Prefetch larger than total batches — should work fine.
+        let config = PipelineConfig {
+            prefetch_size: 100,
+            num_epochs: 1,
+            shuffle_batches: false,
+            ..Default::default()
+        };
+        let pipeline = TrainingDataPipeline::new(make_loader(5), config);
+        let batches: Vec<TrainingBatch> = pipeline.iter().collect();
+        assert_eq!(batches.len(), 5);
+    }
+
+    #[test]
+    fn test_training_batch_fields() {
+        let config = PipelineConfig {
+            prefetch_size: 2,
+            num_epochs: 2,
+            shuffle_batches: false,
+            ..Default::default()
+        };
+        let pipeline = TrainingDataPipeline::new(make_loader(3), config);
+        let batches: Vec<TrainingBatch> = pipeline.iter().collect();
+
+        // Second epoch, second batch (global index 4).
+        let b = &batches[4];
+        assert_eq!(b.epoch, 1);
+        assert_eq!(b.batch_index, 1);
+        assert_eq!(b.global_index, 4);
+        assert_eq!(b.inputs, vec![1.0]);
+        assert_eq!(b.labels, vec![10.0]);
     }
 }

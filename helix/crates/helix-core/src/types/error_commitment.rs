@@ -373,6 +373,15 @@ pub struct ErrorCommitmentTracker {
     /// Cached checksum (invalidated on state changes).
     #[serde(skip)]
     cached_checksum: Option<[u8; 32]>,
+    /// Incremental Merkle state: stack of partial subtree roots at each level.
+    /// Level 0 = individual step hashes, level 1 = pairs, etc.
+    /// Uses the same algorithm as `IncrementalRootComputer` but keeps state
+    /// so new steps can be appended in O(log n) time without rehashing all leaves.
+    #[serde(skip)]
+    merkle_stack: Vec<Option<[u8; 32]>>,
+    /// Cached Merkle root of all step error leaves.
+    #[serde(skip)]
+    cached_merkle_root: Option<[u8; 32]>,
 }
 
 impl ErrorCommitmentTracker {
@@ -386,6 +395,8 @@ impl ErrorCommitmentTracker {
             error_history: Vec::new(),
             track_history: false,
             cached_checksum: None,
+            merkle_stack: Vec::new(),
+            cached_merkle_root: None,
         }
     }
 
@@ -399,17 +410,80 @@ impl ErrorCommitmentTracker {
             error_history: Vec::new(),
             track_history: true,
             cached_checksum: None,
+            merkle_stack: Vec::new(),
+            cached_merkle_root: None,
         }
     }
 
+    /// Hashes a step error into a 32-byte leaf for the Merkle tree.
+    /// Includes the step number for domain separation.
+    fn hash_step_leaf(step: u64, error: f64) -> [u8; 32] {
+        let error_scaled = (error.abs() * ERROR_SCALE).min(u64::MAX as f64) as u64;
+        let mut hasher = Sha256::new();
+        hasher.update(b"\x00"); // leaf domain separator
+        hasher.update(step.to_le_bytes());
+        hasher.update(error_scaled.to_le_bytes());
+        let result = hasher.finalize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&result);
+        out
+    }
+
+    /// Hashes two child nodes into a parent node.
+    fn hash_merkle_nodes(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"\x01"); // internal node domain separator
+        hasher.update(left);
+        hasher.update(right);
+        let result = hasher.finalize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&result);
+        out
+    }
+
+    /// Pushes a new leaf hash into the incremental Merkle stack.
+    /// This is O(log n) amortized — each leaf causes at most O(log n) hashes.
+    fn merkle_push(&mut self, leaf: [u8; 32]) {
+        let mut current = leaf;
+        let mut level = 0;
+
+        loop {
+            while self.merkle_stack.len() <= level {
+                self.merkle_stack.push(None);
+            }
+
+            match self.merkle_stack[level].take() {
+                Some(sibling) => {
+                    current = Self::hash_merkle_nodes(&sibling, &current);
+                    level += 1;
+                }
+                None => {
+                    self.merkle_stack[level] = Some(current);
+                    break;
+                }
+            }
+        }
+
+        self.cached_merkle_root = None;
+    }
+
     /// Records error for the current step and advances to the next step.
+    ///
+    /// The step error is incrementally added to a Merkle tree in O(log n) time.
+    /// The final commitment checksum is still computed lazily via `checksum()`,
+    /// but the Merkle root is maintained incrementally — no full rehash needed.
     pub fn record_step(&mut self, step_error: f64) {
         self.accumulated_error += step_error;
         if self.track_history {
             self.error_history.push(step_error);
         }
+
+        // Incrementally insert this step as a Merkle leaf
+        let leaf = Self::hash_step_leaf(self.current_step, step_error);
+        self.merkle_push(leaf);
+
         self.current_step += 1;
-        self.cached_checksum = None; // Invalidate cache
+        self.cached_checksum = None; // Invalidate commitment cache
     }
 
     /// Returns the current commitment.
@@ -436,6 +510,40 @@ impl ErrorCommitmentTracker {
     pub fn checksum_compact(&mut self) -> u64 {
         let checksum = self.checksum();
         u64::from_le_bytes(checksum[0..8].try_into().unwrap())
+    }
+
+    /// Returns the incremental Merkle root of all recorded step errors.
+    ///
+    /// This root commits to every individual step error in sequence, not just the
+    /// accumulated total. It enables proofs that specific steps contributed specific
+    /// error amounts. Computed in O(log n) from the internal stack.
+    pub fn merkle_root(&mut self) -> [u8; 32] {
+        if let Some(cached) = self.cached_merkle_root {
+            return cached;
+        }
+
+        if self.current_step == 0 {
+            return [0u8; 32];
+        }
+
+        // Combine remaining partial roots with zero padding
+        let zero = [0u8; 32];
+        let mut result: Option<[u8; 32]> = None;
+
+        for level in 0..self.merkle_stack.len() {
+            if let Some(hash) = self.merkle_stack[level] {
+                result = Some(match result {
+                    Some(existing) => Self::hash_merkle_nodes(&hash, &existing),
+                    None => hash,
+                });
+            } else if result.is_some() {
+                result = Some(Self::hash_merkle_nodes(&result.unwrap(), &zero));
+            }
+        }
+
+        let root = result.unwrap_or([0u8; 32]);
+        self.cached_merkle_root = Some(root);
+        root
     }
 
     /// Checks if still within budget.
@@ -472,6 +580,8 @@ impl ErrorCommitmentTracker {
         self.current_step = 0;
         self.error_history.clear();
         self.cached_checksum = None;
+        self.merkle_stack.clear();
+        self.cached_merkle_root = None;
     }
 }
 

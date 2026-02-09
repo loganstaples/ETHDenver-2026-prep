@@ -52,6 +52,8 @@ pub use sharding::{
     WorkerId, WorkerInfo, WorkerStatus, ShardStats, ShardRegistry, ShardRegistryConfig,
     LocalityAwareAssigner, ShardStreamer, ShardStreamConfig, ShardChunk, ShardProgress,
     OverallProgress, ShardMetadata, ShardVerification,
+    // Worker data assignment pipeline
+    WorkerDataAssigner, AssignmentPlan, WorkerDataLoader,
 };
 
 // Re-export Merkle tree types
@@ -82,6 +84,8 @@ pub use provenance::{
     Attestation, AttestationType, CustodyRecord, Custodian, CustodianType, DataOrigin,
     DataTransformation, ProvenanceBuilder, ProvenanceChainSummary, ProvenanceError,
     ProvenanceId, ProvenanceRecord, ProvenanceRegistry, TransformationType,
+    // Verified data loader types
+    VerifiedDataLoader, VerifiedLoaderStats, compute_batch_hash, build_batch_hashes,
 };
 
 // Re-export data source types
@@ -102,6 +106,8 @@ pub use streaming::{
     BatchBuilder, BatchVerificationResult, StreamingBatchVerifier,
     StreamingVerificationConfig, VerificationBatch, VerificationCheckpoint,
     VerificationStats as StreamingVerificationStats,
+    // Training data pipeline types
+    PipelineConfig, TrainingBatch, TrainingDataPipeline,
 };
 
 // Re-export deterministic shuffling types
@@ -118,9 +124,9 @@ pub use dataset_registry::{
     DatasetStatus, RegistryConfig, RegistryError, RegistryResult, RegistryStats,
 };
 
-// Re-export CSV/binary data loader types
+// Re-export CSV/binary/JSON/LibSVM data loader types
 pub use csv_loader::{
-    CsvDataLoader, CsvLoaderConfig, Normalization,
+    CsvDataLoader, CsvLoaderConfig, JsonLoaderConfig, LibSvmLoaderConfig, Normalization,
 };
 
 // Re-export model checkpoint types
