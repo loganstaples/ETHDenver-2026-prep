@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
+pragma solidity ^0.8.24;
 
 import "forge-std/Test.sol";
 import "../src/core/HelixCoordinatorV2.sol";
@@ -153,7 +153,7 @@ contract ByzantineWorkerTest is Test {
 
         // Byzantine worker tries to submit same round
         vm.prank(byzantineWorkers[0]);
-        vm.expectRevert("Round completed");
+        vm.expectRevert(HelixCoordinatorV2.RoundAlreadyCompleted.selector);
         coordinator.submitProof(modelId, 1, proof, inputs);
 
         // Honest worker should have completed the round
@@ -214,7 +214,7 @@ contract ByzantineWorkerTest is Test {
         bytes memory proof = new bytes(320);
 
         vm.prank(byzantineWorkers[0]);
-        vm.expectRevert("Old commitment mismatch");
+        vm.expectRevert(HelixCoordinatorV2.OldCommitmentMismatch.selector);
         coordinator.submitProof(modelId, 1, proof, inputs);
     }
 
@@ -260,7 +260,7 @@ contract ByzantineWorkerTest is Test {
         bytes memory proof = new bytes(320);
 
         vm.prank(byzantineWorkers[0]);
-        vm.expectRevert("Error bound exceeds maximum");
+        vm.expectRevert(HelixCoordinatorV2.ErrorBoundExceeded.selector);
         coordinator.submitProof(modelId, 1, proof, inputs);
     }
 
@@ -354,7 +354,7 @@ contract ByzantineWorkerTest is Test {
 
         // Other Sybils can't submit to same round
         vm.prank(sybilCluster[1]);
-        vm.expectRevert("Round completed");
+        vm.expectRevert(HelixCoordinatorV2.RoundAlreadyCompleted.selector);
         coordinator.submitProof(modelId, 1, proof, inputs);
     }
 
@@ -375,7 +375,7 @@ contract ByzantineWorkerTest is Test {
 
         // Byzantine tries to submit after deadline
         vm.prank(byzantineWorkers[0]);
-        vm.expectRevert("Round expired");
+        vm.expectRevert(HelixCoordinatorV2.RoundExpired.selector);
         coordinator.submitProof(modelId, 1, proof, inputs);
     }
 
@@ -484,16 +484,16 @@ contract ByzantineWorkerTest is Test {
 
         // Byzantine cannot pause model
         vm.prank(byzantineWorkers[0]);
-        vm.expectRevert("Not authorized");
+        vm.expectRevert(HelixCoordinatorV2.NotAuthorized.selector);
         coordinator.pauseModel(modelId);
 
         // Byzantine cannot change parameters
         vm.prank(byzantineWorkers[0]);
-        vm.expectRevert("Only owner");
+        vm.expectRevert(HelixCoordinatorV2.OnlyOwner.selector);
         coordinator.setSlashPercentage(10000);
 
         vm.prank(byzantineWorkers[0]);
-        vm.expectRevert("Only owner");
+        vm.expectRevert(HelixCoordinatorV2.OnlyOwner.selector);
         coordinator.setMaxErrorBound(0);
     }
 
@@ -513,7 +513,7 @@ contract ByzantineWorkerTest is Test {
 
         // Byzantine cannot start next round
         vm.prank(byzantineWorkers[0]);
-        vm.expectRevert("Only model owner");
+        vm.expectRevert(HelixCoordinatorV2.NotModelOwner.selector);
         coordinator.startRound(modelId, ROUND_DURATION);
     }
 
@@ -616,7 +616,7 @@ contract ByzantineWorkerTest is Test {
 
         // Byzantine tries to replay old proof
         vm.prank(byzantineWorkers[0]);
-        vm.expectRevert("Old commitment mismatch");
+        vm.expectRevert(HelixCoordinatorV2.OldCommitmentMismatch.selector);
         coordinator.submitProof(modelId, 2, proof, inputs);
     }
 
@@ -714,7 +714,7 @@ contract ByzantineWorkerTest is Test {
 
         // Try to restake
         vm.prank(byzantineWorkers[0]);
-        vm.expectRevert("Previous stake was slashed");
+        vm.expectRevert(HelixCoordinatorV2.PreviousStakeSlashed.selector);
         coordinator.stake{value: STANDARD_STAKE}(modelId);
     }
 }

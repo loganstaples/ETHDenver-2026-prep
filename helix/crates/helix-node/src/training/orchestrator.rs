@@ -225,6 +225,10 @@ pub struct TrainingOrchestrator {
     is_leader: Arc<RwLock<bool>>,
     /// Round commit manager for proof aggregation + on-chain submission.
     round_commit: Arc<RwLock<Option<RoundCommitManager>>>,
+    /// Smart contract client for on-chain slashing.
+    sc_client: Arc<RwLock<Option<Arc<SCClient>>>>,
+    /// On-chain model ID for slashing calls.
+    model_id: Arc<RwLock<u64>>,
     /// Byzantine gradient filter for outlier detection.
     byzantine_filter: Arc<RwLock<ByzantineGradientFilter>>,
     /// Aggregation strategy.
@@ -263,6 +267,8 @@ impl TrainingOrchestrator {
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             is_leader: Arc::new(RwLock::new(false)),
             round_commit: Arc::new(RwLock::new(None)),
+            sc_client: Arc::new(RwLock::new(None)),
+            model_id: Arc::new(RwLock::new(0)),
             byzantine_filter,
             aggregation_strategy: Arc::new(RwLock::new(AggregationStrategy::FedAvg)),
         }
@@ -281,6 +287,12 @@ impl TrainingOrchestrator {
     /// Sets up the round commit manager with an on-chain client.
     pub fn set_round_commit_manager(&self, manager: RoundCommitManager) {
         *self.round_commit.write() = Some(manager);
+    }
+
+    /// Sets the smart contract client for on-chain slashing.
+    pub fn set_sc_client(&self, client: Arc<SCClient>, model_id: u64) {
+        *self.sc_client.write() = Some(client);
+        *self.model_id.write() = model_id;
     }
 
     /// Starts the orchestrator.
@@ -477,8 +489,40 @@ impl TrainingOrchestrator {
             }
 
             if validation.should_slash {
-                // In production, would trigger slashing
                 log::warn!("Worker {} should be slashed: {}", from, validation.reason);
+                // Trigger on-chain slashing via challenge_proof
+                let sc_client = self.sc_client.read().clone();
+                let model_id = *self.model_id.read();
+                let proof_clone = proof.clone();
+                let from_clone = from.clone();
+                let reason = validation.reason.clone();
+                if let Some(client) = sc_client {
+                    tokio::spawn(async move {
+                        log::info!(
+                            "Submitting challenge_proof for worker {} on model {} round {}",
+                            from_clone, model_id, round_id,
+                        );
+                        match client.challenge_proof(
+                            model_id,
+                            round_id,
+                            proof_clone,
+                            vec![], // public inputs not available in rejection path
+                        ).await {
+                            Ok(receipt) => {
+                                log::info!(
+                                    "Slashing tx submitted for worker {}: tx={:?}",
+                                    from_clone, receipt.transaction_hash,
+                                );
+                            }
+                            Err(e) => {
+                                log::error!(
+                                    "Failed to submit slashing tx for worker {}: {}",
+                                    from_clone, e,
+                                );
+                            }
+                        }
+                    });
+                }
             }
 
             return Err(OrchestratorError::ValidationFailed(validation.reason));
@@ -1094,6 +1138,8 @@ impl TrainingOrchestrator {
         let event_tx_clone = self.event_tx.clone();
         let validator_clone = self.validator.clone();
         let max_failures = self.config.max_failures;
+        let sc_client_clone = self.sc_client.clone();
+        let model_id_clone = self.model_id.clone();
 
         tokio::spawn(async move {
             while let Some((from, round_id, commitment, error_bound, proof)) = gradient_rx.recv().await {
@@ -1137,6 +1183,30 @@ impl TrainingOrchestrator {
                                 worker.failures += 1;
                                 if worker.failures >= max_failures {
                                     worker.status = WorkerStatus::Excluded;
+                                }
+                            }
+
+                            // Trigger on-chain slashing if warranted
+                            if validation.should_slash {
+                                let sc_client = sc_client_clone.read().clone();
+                                let model_id = *model_id_clone.read();
+                                let from_slash = from.clone();
+                                let proof_slash = proof.clone();
+                                if let Some(client) = sc_client {
+                                    tokio::spawn(async move {
+                                        log::info!(
+                                            "Submitting challenge_proof for worker {} (round {})",
+                                            from_slash, round_id,
+                                        );
+                                        if let Err(e) = client.challenge_proof(
+                                            model_id, round_id, proof_slash, vec![],
+                                        ).await {
+                                            log::error!(
+                                                "Failed to submit slashing tx for {}: {}",
+                                                from_slash, e,
+                                            );
+                                        }
+                                    });
                                 }
                             }
 

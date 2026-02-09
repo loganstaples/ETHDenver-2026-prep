@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
+pragma solidity ^0.8.24;
 
 import "forge-std/Test.sol";
 import "../src/core/HelixCoordinatorV2.sol";
@@ -122,7 +122,7 @@ contract HelixCoordinatorV2Test is Test {
 
         // Try to unstake immediately
         vm.prank(prover1);
-        vm.expectRevert("Still locked");
+        vm.expectRevert(HelixCoordinatorV2.StillLocked.selector);
         coordinator.unstake(modelId);
     }
 
@@ -143,7 +143,7 @@ contract HelixCoordinatorV2Test is Test {
         uint256 modelId = coordinator.registerModel("hash", 100, MIN_STAKE);
 
         vm.prank(prover1);
-        vm.expectRevert("Only model owner");
+        vm.expectRevert(HelixCoordinatorV2.NotModelOwner.selector);
         coordinator.startRound(modelId, ROUND_DURATION);
     }
 
@@ -200,7 +200,7 @@ contract HelixCoordinatorV2Test is Test {
         uint256[] memory publicInputs = new uint256[](8);
 
         vm.prank(prover1);
-        vm.expectRevert("Insufficient stake");
+        vm.expectRevert(HelixCoordinatorV2.InsufficientStake.selector);
         coordinator.submitProof(modelId, 1, proof, publicInputs);
     }
 
@@ -215,7 +215,7 @@ contract HelixCoordinatorV2Test is Test {
         uint256[] memory publicInputs = new uint256[](8);
 
         vm.prank(prover1);
-        vm.expectRevert("Invalid round");
+        vm.expectRevert(HelixCoordinatorV2.InvalidRound.selector);
         coordinator.submitProof(modelId, 999, proof, publicInputs); // Wrong round
     }
 
@@ -233,7 +233,7 @@ contract HelixCoordinatorV2Test is Test {
         uint256[] memory publicInputs = new uint256[](8);
 
         vm.prank(prover1);
-        vm.expectRevert("Round expired");
+        vm.expectRevert(HelixCoordinatorV2.RoundExpired.selector);
         coordinator.submitProof(modelId, 1, proof, publicInputs);
     }
 
@@ -242,7 +242,9 @@ contract HelixCoordinatorV2Test is Test {
     function test_SlashPercentage() public {
         assertEq(coordinator.slashPercentage(), 5000); // 50%
 
+        coordinator.emergencyPause();
         coordinator.setSlashPercentage(2500); // 25%
+        coordinator.unpause();
         assertEq(coordinator.slashPercentage(), 2500);
     }
 
@@ -279,7 +281,7 @@ contract HelixCoordinatorV2Test is Test {
 
         // Try to stake again - should fail
         vm.prank(prover1);
-        vm.expectRevert("Previous stake was slashed");
+        vm.expectRevert(HelixCoordinatorV2.PreviousStakeSlashed.selector);
         coordinator.stake{value: 1 ether}(modelId);
     }
 
@@ -299,13 +301,17 @@ contract HelixCoordinatorV2Test is Test {
 
     function test_SetVerifier() public {
         Halo2Verifier newVerifier = new Halo2Verifier(Halo2VKDefaults.g2Generator());
+        coordinator.emergencyPause();
         coordinator.setVerifier(address(newVerifier));
+        coordinator.unpause();
         assertEq(address(coordinator.verifier()), address(newVerifier));
     }
 
     function test_SetTreasury() public {
         address newTreasury = makeAddr("newTreasury");
+        coordinator.emergencyPause();
         coordinator.setTreasury(newTreasury);
+        coordinator.unpause();
         assertEq(coordinator.treasury(), newTreasury);
     }
 

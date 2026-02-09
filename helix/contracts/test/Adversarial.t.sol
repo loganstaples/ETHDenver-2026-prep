@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
+pragma solidity ^0.8.24;
 
 import "forge-std/Test.sol";
 import "../src/core/HelixCoordinatorV2.sol";
@@ -64,6 +64,19 @@ contract AdversarialTest is Test {
 
     // ============ Helper Functions ============
 
+    /// @dev Wraps legacy setter calls with pause/unpause (emergency-only since B4 hardening)
+    function _emergencySetVerifier(address _verifier) internal {
+        coordinator.emergencyPause();
+        coordinator.setVerifier(_verifier);
+        coordinator.unpause();
+    }
+
+    function _emergencySetSlashPercentage(uint256 _percentage) internal {
+        coordinator.emergencyPause();
+        coordinator.setSlashPercentage(_percentage);
+        coordinator.unpause();
+    }
+
     function _setupModelAndRound() internal returns (uint256 modelId, uint256 hashLo, uint256 hashHi) {
         hashLo = 12345;
         hashHi = 67890;
@@ -125,7 +138,7 @@ contract AdversarialTest is Test {
 
     /// @notice Test submitting malformed proof (too short)
     function test_MalformedProofTooShort() public {
-        coordinator.setVerifier(address(realVerifier));
+        _emergencySetVerifier(address(realVerifier));
         (uint256 modelId, uint256 hashLo, uint256 hashHi) = _setupModelAndRound();
 
         vm.prank(attacker1);
@@ -155,13 +168,13 @@ contract AdversarialTest is Test {
         bytes memory proof = new bytes(320);
 
         vm.prank(attacker1);
-        vm.expectRevert("Invalid public inputs count");
+        vm.expectRevert(HelixCoordinatorV2.InvalidPublicInputsCount.selector);
         coordinator.submitProof(modelId, 1, proof, wrongInputs);
     }
 
     /// @notice Test submitting proof with invalid field elements (exceeding scalar field)
     function test_InvalidFieldElements() public {
-        coordinator.setVerifier(address(realVerifier));
+        _emergencySetVerifier(address(realVerifier));
         (uint256 modelId, uint256 hashLo, uint256 hashHi) = _setupModelAndRound();
 
         vm.prank(attacker1);
@@ -201,7 +214,7 @@ contract AdversarialTest is Test {
 
         // Second submission fails (round completed)
         vm.prank(honestProver);
-        vm.expectRevert("Round completed");
+        vm.expectRevert(HelixCoordinatorV2.RoundAlreadyCompleted.selector);
         coordinator.submitProof(modelId, 1, proof, inputs);
     }
 
@@ -226,7 +239,7 @@ contract AdversarialTest is Test {
 
         // Attacker tries to submit same round
         vm.prank(attacker1);
-        vm.expectRevert("Round completed");
+        vm.expectRevert(HelixCoordinatorV2.RoundAlreadyCompleted.selector);
         coordinator.submitProof(modelId, 1, proof, inputs);
     }
 
@@ -246,7 +259,7 @@ contract AdversarialTest is Test {
         bytes memory proof = new bytes(320);
 
         vm.prank(attacker1);
-        vm.expectRevert("Old commitment mismatch");
+        vm.expectRevert(HelixCoordinatorV2.OldCommitmentMismatch.selector);
         coordinator.submitProof(modelId, 1, proof, inputs);
     }
 
@@ -297,7 +310,7 @@ contract AdversarialTest is Test {
 
         // Honest prover's transaction now fails
         vm.prank(honestProver);
-        vm.expectRevert("Round completed");
+        vm.expectRevert(HelixCoordinatorV2.RoundAlreadyCompleted.selector);
         coordinator.submitProof(modelId, 1, proof, inputs);
 
         // Frontrunner got credit for the round
@@ -331,7 +344,7 @@ contract AdversarialTest is Test {
         // Try to replay the same proof to round 2
         // This should fail because the commitment changed
         vm.prank(honestProver);
-        vm.expectRevert("Old commitment mismatch");
+        vm.expectRevert(HelixCoordinatorV2.OldCommitmentMismatch.selector);
         coordinator.submitProof(modelId, 2, proof, inputs);
 
         // Even with correct old commitment, replaying same new commitment would be suspicious
@@ -376,7 +389,7 @@ contract AdversarialTest is Test {
 
         // Try to stake again
         vm.prank(attacker1);
-        vm.expectRevert("Previous stake was slashed");
+        vm.expectRevert(HelixCoordinatorV2.PreviousStakeSlashed.selector);
         coordinator.stake{value: LARGE_STAKE}(modelId);
     }
 
@@ -400,40 +413,15 @@ contract AdversarialTest is Test {
         // Round is still not completed (invalid proof doesn't complete round)
         // But prover now has insufficient stake
         vm.prank(attacker1);
-        vm.expectRevert("Stake has been slashed");
+        vm.expectRevert(HelixCoordinatorV2.StakeSlashed.selector);
         coordinator.submitProof(modelId, 1, proof, inputs);
     }
 
-    /// @notice Test slashing with zero treasury address
+    /// @notice Test that deploying coordinator with zero treasury reverts
     function test_SlashingWithZeroTreasury() public {
-        // Deploy coordinator with zero treasury
-        HelixCoordinatorV2 coordNoTreasury = new HelixCoordinatorV2(address(mockVerifier), address(0));
-
-        uint256 hashLo = 12345;
-        uint256 hashHi = 67890;
-        uint256 commitment = uint256(keccak256(abi.encodePacked(hashLo, hashHi)));
-
-        vm.prank(modelOwner);
-        uint256 modelId = coordNoTreasury.registerModel("Test", commitment, MIN_STAKE);
-
-        vm.prank(modelOwner);
-        coordNoTreasury.startRound(modelId, ROUND_DURATION);
-
-        vm.prank(attacker1);
-        coordNoTreasury.stake{value: LARGE_STAKE}(modelId);
-
-        mockVerifier.setShouldPass(false);
-
-        uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
-        bytes memory proof = new bytes(320);
-
-        // Slashing should still work, funds stay in contract
-        vm.prank(attacker1);
-        coordNoTreasury.submitProof(modelId, 1, proof, inputs);
-
-        (uint256 stake,, bool slashed) = coordNoTreasury.getStake(attacker1, modelId);
-        assertTrue(slashed);
-        assertEq(stake, LARGE_STAKE / 2);
+        // Deploy coordinator with zero treasury should now revert
+        vm.expectRevert(HelixCoordinatorV2.InvalidTreasury.selector);
+        new HelixCoordinatorV2(address(mockVerifier), address(0));
     }
 
     // ============ Challenge Mechanism Tests ============
@@ -475,7 +463,7 @@ contract AdversarialTest is Test {
         inputs[7] = 0;
 
         // Try to challenge round that doesn't exist
-        vm.expectRevert("Round not completed");
+        vm.expectRevert(HelixCoordinatorV2.RoundNotCompleted.selector);
         coordinator.challengeProof(modelId, 999, proof, inputs);
     }
 
@@ -503,7 +491,7 @@ contract AdversarialTest is Test {
         bytes memory proof = new bytes(320);
 
         vm.prank(attacker1);
-        vm.expectRevert("Error bound exceeds maximum");
+        vm.expectRevert(HelixCoordinatorV2.ErrorBoundExceeded.selector);
         coordinator.submitProof(modelId, 1, proof, inputs);
     }
 
@@ -563,7 +551,7 @@ contract AdversarialTest is Test {
         (uint256 modelId,,) = _setupModelAndRound();
 
         vm.prank(attacker1);
-        vm.expectRevert("Only model owner");
+        vm.expectRevert(HelixCoordinatorV2.NotModelOwner.selector);
         coordinator.startRound(modelId, ROUND_DURATION);
     }
 
@@ -575,22 +563,22 @@ contract AdversarialTest is Test {
         uint256 modelId = coordinator.registerModel("Test", commitment, MIN_STAKE);
 
         vm.prank(attacker1);
-        vm.expectRevert("Not authorized");
+        vm.expectRevert(HelixCoordinatorV2.NotAuthorized.selector);
         coordinator.pauseModel(modelId);
     }
 
     /// @notice Test non-owner cannot change admin parameters
     function test_NonOwnerCannotChangeParams() public {
         vm.prank(attacker1);
-        vm.expectRevert("Only owner");
+        vm.expectRevert(HelixCoordinatorV2.OnlyOwner.selector);
         coordinator.setSlashPercentage(10000);
 
         vm.prank(attacker1);
-        vm.expectRevert("Only owner");
+        vm.expectRevert(HelixCoordinatorV2.OnlyOwner.selector);
         coordinator.setVerifier(address(0));
 
         vm.prank(attacker1);
-        vm.expectRevert("Only owner");
+        vm.expectRevert(HelixCoordinatorV2.OnlyOwner.selector);
         coordinator.setTreasury(attacker1);
     }
 
@@ -783,7 +771,7 @@ contract AdversarialTest is Test {
 
     /// @notice Test that large proof doesn't cause excessive gas
     function test_LargeProofGasLimit() public {
-        coordinator.setVerifier(address(realVerifier));
+        _emergencySetVerifier(address(realVerifier));
         (uint256 modelId, uint256 hashLo, uint256 hashHi) = _setupModelAndRound();
 
         vm.prank(attacker1);
@@ -883,7 +871,7 @@ contract AdversarialTest is Test {
 
         // Lock period prevents withdrawal
         vm.prank(attacker1);
-        vm.expectRevert("Still locked");
+        vm.expectRevert(HelixCoordinatorV2.StillLocked.selector);
         coordinator.unstake(modelId);
 
         // Attacker cannot withdraw before being slashed
@@ -896,7 +884,7 @@ contract AdversarialTest is Test {
 
         // After slashing, withdrawal should fail due to slashed status
         vm.prank(attacker1);
-        vm.expectRevert("Stake was slashed");
+        vm.expectRevert(HelixCoordinatorV2.StakeWasSlashed.selector);
         coordinator.unstake(modelId);
     }
 
@@ -985,7 +973,7 @@ contract AdversarialTest is Test {
 
     /// @notice Test with boundary value public inputs
     function test_BoundaryValuePublicInputs() public {
-        coordinator.setVerifier(address(realVerifier));
+        _emergencySetVerifier(address(realVerifier));
         (uint256 modelId, uint256 hashLo, uint256 hashHi) = _setupModelAndRound();
 
         vm.prank(attacker1);
@@ -1081,7 +1069,7 @@ contract AdversarialTest is Test {
         // Other attackers can't submit (round completed)
         for (uint256 i = 2; i < 5; i++) {
             vm.prank(attackers[i]);
-            vm.expectRevert("Round completed");
+            vm.expectRevert(HelixCoordinatorV2.RoundAlreadyCompleted.selector);
             coordinator.submitProof(modelId, 1, proof, inputs);
         }
     }
@@ -1127,7 +1115,7 @@ contract AdversarialTest is Test {
         vm.warp(block.timestamp + ROUND_DURATION + 1);
 
         vm.prank(attacker1);
-        vm.expectRevert("Round expired");
+        vm.expectRevert(HelixCoordinatorV2.RoundExpired.selector);
         coordinator.submitProof(modelId, 1, proof, inputs);
     }
 
@@ -1141,7 +1129,7 @@ contract AdversarialTest is Test {
         coordinator.stake{value: LARGE_STAKE}(modelId);
 
         // Change slash percentage to 75%
-        coordinator.setSlashPercentage(7500);
+        _emergencySetSlashPercentage(7500);
 
         mockVerifier.setShouldPass(false);
 
@@ -1165,7 +1153,7 @@ contract AdversarialTest is Test {
         coordinator.stake{value: LARGE_STAKE}(modelId);
 
         // Change slash percentage to 100%
-        coordinator.setSlashPercentage(10000);
+        _emergencySetSlashPercentage(10000);
 
         mockVerifier.setShouldPass(false);
 
@@ -1189,7 +1177,7 @@ contract AdversarialTest is Test {
         coordinator.stake{value: LARGE_STAKE}(modelId);
 
         // Change slash percentage to 0%
-        coordinator.setSlashPercentage(0);
+        _emergencySetSlashPercentage(0);
 
         mockVerifier.setShouldPass(false);
 
@@ -1232,7 +1220,7 @@ contract AdversarialTest is Test {
         coordinator.emergencyPause();
 
         vm.prank(modelOwner);
-        vm.expectRevert("Contract is paused");
+        vm.expectRevert(HelixCoordinatorV2.ContractPaused.selector);
         coordinator.registerModel("Test", 12345, MIN_STAKE);
     }
 
@@ -1251,7 +1239,7 @@ contract AdversarialTest is Test {
 
         // Try to start new round on inactive model
         vm.prank(modelOwner);
-        vm.expectRevert("Model not active");
+        vm.expectRevert(HelixCoordinatorV2.ModelNotActive.selector);
         coordinator.startRound(modelId, ROUND_DURATION);
     }
 

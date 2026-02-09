@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
+pragma solidity ^0.8.24;
 
 import "forge-std/Test.sol";
 import "../src/core/HelixCoordinatorV2.sol";
@@ -243,7 +243,7 @@ contract SlashingFlowTest is Test {
 
         // Cannot submit again after being slashed
         vm.prank(byzantineWorker);
-        vm.expectRevert("Stake has been slashed");
+        vm.expectRevert(HelixCoordinatorV2.StakeSlashed.selector);
         coordinator.submitProof(modelId, 1, proof, inputs);
     }
 
@@ -789,40 +789,12 @@ contract SlashingFlowTest is Test {
         assertTrue(timestamp > 0);
     }
 
-    /// @notice Test zero treasury slashing
-    function test_ZeroTreasurySlashing() public {
-        // Deploy coordinator with zero treasury
-        HelixCoordinatorV2 coordNoTreasury = new HelixCoordinatorV2(
+    /// @notice Test that deploying with zero treasury reverts
+    function test_ZeroTreasuryReverts() public {
+        vm.expectRevert(HelixCoordinatorV2.InvalidTreasury.selector);
+        new HelixCoordinatorV2(
             address(mockVerifier),
             address(0)
         );
-
-        uint256 commitment = uint256(keccak256(abi.encodePacked(uint256(12345), uint256(67890))));
-
-        vm.prank(modelOwner);
-        uint256 modelId = coordNoTreasury.registerModel("Test", commitment, MIN_STAKE);
-
-        vm.prank(modelOwner);
-        coordNoTreasury.startRound(modelId, ROUND_DURATION);
-
-        vm.prank(byzantineWorker);
-        coordNoTreasury.stake{value: LARGE_STAKE}(modelId);
-
-        mockVerifier.setShouldPass(false);
-
-        uint256[] memory inputs = _createValidPublicInputs(12345, 67890, 1111, 2222, modelId);
-        bytes memory proof = new bytes(320);
-
-        uint256 contractBalanceBefore = address(coordNoTreasury).balance;
-
-        vm.prank(byzantineWorker);
-        coordNoTreasury.submitProof(modelId, 1, proof, inputs);
-
-        // Slashed amount should stay in contract since treasury is zero
-        (uint256 stake,, bool slashed) = coordNoTreasury.getStake(byzantineWorker, modelId);
-        assertTrue(slashed);
-        assertEq(stake, LARGE_STAKE / 2);
-        // Contract balance should remain (slashed funds not transferred anywhere)
-        assertEq(address(coordNoTreasury).balance, contractBalanceBefore);
     }
 }

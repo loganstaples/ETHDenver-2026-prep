@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
+pragma solidity ^0.8.24;
 
 import "forge-std/Test.sol";
 import "../src/core/HelixCoordinatorV2.sol";
@@ -161,7 +161,7 @@ contract FuzzTest is Test {
         vm.warp(block.timestamp + waitTime);
 
         vm.prank(prover);
-        vm.expectRevert("Still locked");
+        vm.expectRevert(HelixCoordinatorV2.StillLocked.selector);
         coordinator.unstake(modelId);
     }
 
@@ -224,7 +224,9 @@ contract FuzzTest is Test {
         // Bound percentage to valid range (0-100%)
         percentage = uint96(bound(percentage, 0, 10000));
 
+        coordinator.emergencyPause();
         coordinator.setSlashPercentage(percentage);
+        coordinator.unpause();
         assertEq(coordinator.slashPercentage(), percentage);
 
         // Test slashing with this percentage
@@ -335,7 +337,7 @@ contract FuzzTest is Test {
 
         if (errorBound > coordinator.maxErrorBound()) {
             vm.prank(prover);
-            vm.expectRevert("Error bound exceeds maximum");
+            vm.expectRevert(HelixCoordinatorV2.ErrorBoundExceeded.selector);
             coordinator.submitProof(modelId, 1, proof, inputs);
         } else {
             vm.prank(prover);
@@ -370,7 +372,9 @@ contract FuzzTest is Test {
         // Bound to reasonable range
         defaultMin = uint96(bound(defaultMin, 0.001 ether, 10 ether));
 
+        coordinator.emergencyPause();
         coordinator.setDefaultMinStake(defaultMin);
+        coordinator.unpause();
         assertEq(coordinator.defaultMinStake(), defaultMin);
 
         // Register with zero min stake should use default

@@ -1,9 +1,22 @@
-//! Minimal HTTP API for aggregator node monitoring and control.
+//! HTTP API for aggregator node monitoring and control.
+//!
+//! Endpoints:
+//! - `GET /health` — public, no auth required
+//! - `GET /metrics` — public, no auth required
+//! - `POST /round/start` — requires Bearer token
+//! - `GET /round/status` — requires Bearer token
+//! - `GET /workers` — requires Bearer token
+//! - `GET /peers` — requires Bearer token
 
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Instant;
 
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
+use axum::http::{HeaderMap, Method, Request, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use parking_lot::RwLock;
@@ -12,6 +25,82 @@ use tokio::sync::broadcast;
 
 use crate::round_commit::RoundCommitManager;
 use crate::training::orchestrator::{RoundPhase, TrainingOrchestrator};
+
+// ---------------------------------------------------------------------------
+// Token bucket rate limiter (per-IP)
+// ---------------------------------------------------------------------------
+
+/// Simple token-bucket rate limiter keyed by IP address.
+struct TokenBucket {
+    tokens: f64,
+    last_refill: Instant,
+    capacity: f64,
+    refill_rate: f64, // tokens per second
+}
+
+impl TokenBucket {
+    fn new(capacity: f64, refill_rate: f64) -> Self {
+        Self {
+            tokens: capacity,
+            last_refill: Instant::now(),
+            capacity,
+            refill_rate,
+        }
+    }
+
+    /// Attempts to consume one token. Returns true if allowed.
+    fn try_consume(&mut self) -> bool {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.refill_rate).min(self.capacity);
+        self.last_refill = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Thread-safe per-IP rate limiter.
+pub struct ApiRateLimiter {
+    buckets: parking_lot::Mutex<HashMap<IpAddr, TokenBucket>>,
+    capacity: f64,
+    refill_rate: f64,
+}
+
+impl ApiRateLimiter {
+    pub fn new(requests_per_sec: u32) -> Self {
+        let rate = requests_per_sec as f64;
+        Self {
+            buckets: parking_lot::Mutex::new(HashMap::new()),
+            // Allow small burst (2x rate), refill at configured rate
+            capacity: rate * 2.0,
+            refill_rate: rate,
+        }
+    }
+
+    /// Returns true if the request from `ip` is allowed.
+    pub fn check(&self, ip: IpAddr) -> bool {
+        let mut buckets = self.buckets.lock();
+        let bucket = buckets
+            .entry(ip)
+            .or_insert_with(|| TokenBucket::new(self.capacity, self.refill_rate));
+        bucket.try_consume()
+    }
+
+    /// Removes expired buckets that haven't been used recently.
+    pub fn cleanup(&self) {
+        let mut buckets = self.buckets.lock();
+        let cutoff = Instant::now() - std::time::Duration::from_secs(300);
+        buckets.retain(|_, b| b.last_refill > cutoff);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared API state
+// ---------------------------------------------------------------------------
 
 /// Shared state for the HTTP API.
 pub struct ApiState {
@@ -23,26 +112,28 @@ pub struct ApiState {
     pub peers: Arc<RwLock<PeerSnapshot>>,
     /// Snapshot of aggregate metrics (updated periodically).
     pub metrics: Arc<RwLock<MetricsSnapshot>>,
+    /// Bearer token required for authenticated endpoints.
+    /// Must match the `Authorization: Bearer <token>` header.
+    pub api_key: String,
+    /// Per-IP rate limiter.
+    pub rate_limiter: Arc<ApiRateLimiter>,
 }
+
+// ---------------------------------------------------------------------------
+// Response types
+// ---------------------------------------------------------------------------
 
 /// Snapshot of orchestrator state (updated periodically).
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct OrchestratorSnapshot {
-    /// Number of connected workers.
     pub worker_count: usize,
-    /// Number of available workers.
     pub available_workers: usize,
-    /// Number of computing workers.
     pub computing_workers: usize,
-    /// Current round info.
     pub current_round: Option<RoundInfo>,
-    /// Completed round count.
     pub completed_rounds: u64,
-    /// Worker list.
     pub workers: Vec<WorkerInfo>,
 }
 
-/// Round info for API response.
 #[derive(Debug, Clone, Serialize)]
 pub struct RoundInfo {
     pub round_id: u64,
@@ -51,7 +142,6 @@ pub struct RoundInfo {
     pub workers_assigned: usize,
 }
 
-/// Worker info for API response.
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkerInfo {
     pub id: String,
@@ -59,7 +149,6 @@ pub struct WorkerInfo {
     pub rounds_completed: u64,
 }
 
-/// A single peer entry for the peers endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerEntry {
     pub id: String,
@@ -68,13 +157,11 @@ pub struct PeerEntry {
     pub reputation: i64,
 }
 
-/// Snapshot of connected peers (returned by `/peers`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PeerSnapshot {
     pub peers: Vec<PeerEntry>,
 }
 
-/// Aggregate node metrics (returned by `/metrics`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricsSnapshot {
     pub total_rounds: u64,
@@ -98,7 +185,6 @@ impl Default for MetricsSnapshot {
     }
 }
 
-/// Health response.
 #[derive(Serialize)]
 struct HealthResponse {
     status: String,
@@ -107,33 +193,125 @@ struct HealthResponse {
     current_round: Option<u64>,
 }
 
-/// Round start response.
 #[derive(Serialize)]
 struct RoundStartResponse {
     triggered: bool,
     message: String,
 }
 
+#[derive(Serialize)]
+struct ErrorResponse {
+    error: String,
+}
+
+// ---------------------------------------------------------------------------
+// Middleware: per-IP rate limiting
+// ---------------------------------------------------------------------------
+
+async fn rate_limit_middleware(
+    State(state): State<Arc<ApiState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    if !state.rate_limiter.check(addr.ip()) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorResponse {
+                error: "Rate limit exceeded".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+// ---------------------------------------------------------------------------
+// Middleware: Bearer token authentication (mutating endpoints only)
+// ---------------------------------------------------------------------------
+
+async fn auth_middleware(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    // Extract Bearer token
+    let token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+
+    match token {
+        Some(t) if constant_time_eq(t.as_bytes(), state.api_key.as_bytes()) => {
+            next.run(request).await
+        }
+        _ => (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "Missing or invalid Bearer token".to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// Constant-time byte comparison to prevent timing side-channel attacks
+/// on API key validation.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    use subtle::ConstantTimeEq;
+    a.ct_eq(b).into()
+}
+
+// ---------------------------------------------------------------------------
+// Server setup
+// ---------------------------------------------------------------------------
+
 /// Starts the HTTP API server on the given address.
+///
+/// Public endpoints (`/health`, `/metrics`) require no authentication.
+/// All other endpoints require a `Bearer <api_key>` token in the
+/// `Authorization` header.
+///
+/// All endpoints are subject to per-IP token-bucket rate limiting.
 pub async fn start_api_server(
     addr: SocketAddr,
     state: Arc<ApiState>,
 ) -> anyhow::Result<()> {
-    let app = Router::new()
+    // Public routes (no auth)
+    let public_routes = Router::new()
         .route("/health", get(health_handler))
+        .route("/metrics", get(metrics_handler));
+
+    // Authenticated routes (require Bearer token)
+    let auth_routes = Router::new()
         .route("/round/start", post(round_start_handler))
         .route("/round/status", get(round_status_handler))
         .route("/workers", get(workers_handler))
         .route("/peers", get(peers_handler))
-        .route("/metrics", get(metrics_handler))
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+
+    // Combine and add rate limiting to everything
+    let app = Router::new()
+        .merge(public_routes)
+        .merge(auth_routes)
+        .layer(middleware::from_fn_with_state(state.clone(), rate_limit_middleware))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     log::info!("HTTP API listening on {}", addr);
 
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
 
 async fn health_handler(State(state): State<Arc<ApiState>>) -> Json<HealthResponse> {
     let snapshot = state.orchestrator_workers.read();

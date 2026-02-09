@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
+pragma solidity ^0.8.24;
 
 import "forge-std/Test.sol";
 import "../src/core/HelixCoordinatorV2.sol";
@@ -248,7 +248,7 @@ contract IntegrationTest is Test {
 
         // Other provers cannot submit to completed round
         vm.prank(prover1);
-        vm.expectRevert("Round completed");
+        vm.expectRevert(HelixCoordinatorV2.RoundAlreadyCompleted.selector);
         coordinator.submitProof(modelId, 1, proof, inputs);
     }
 
@@ -329,7 +329,7 @@ contract IntegrationTest is Test {
 
         // Cannot start round while paused
         vm.prank(modelOwner);
-        vm.expectRevert("Model not active");
+        vm.expectRevert(HelixCoordinatorV2.ModelNotActive.selector);
         coordinator.startRound(modelId, ROUND_DURATION);
 
         // Resume model
@@ -378,7 +378,7 @@ contract IntegrationTest is Test {
         bytes memory proof = new bytes(320);
 
         vm.prank(prover1);
-        vm.expectRevert("Error bound exceeds maximum");
+        vm.expectRevert(HelixCoordinatorV2.ErrorBoundExceeded.selector);
         coordinator.submitProof(modelId, 1, proof, inputs);
     }
 
@@ -476,7 +476,7 @@ contract IntegrationTest is Test {
         bytes memory proof = new bytes(320);
 
         vm.prank(prover1);
-        vm.expectRevert("Round expired");
+        vm.expectRevert(HelixCoordinatorV2.RoundExpired.selector);
         coordinator.submitProof(modelId, 1, proof, inputs);
     }
 
@@ -492,13 +492,13 @@ contract IntegrationTest is Test {
 
         // Cannot unstake immediately
         vm.prank(prover1);
-        vm.expectRevert("Still locked");
+        vm.expectRevert(HelixCoordinatorV2.StillLocked.selector);
         coordinator.unstake(modelId);
 
         // After 6 days, still locked
         vm.warp(block.timestamp + 6 days);
         vm.prank(prover1);
-        vm.expectRevert("Still locked");
+        vm.expectRevert(HelixCoordinatorV2.StillLocked.selector);
         coordinator.unstake(modelId);
 
         // After 7 days, can unstake
@@ -684,12 +684,15 @@ contract IntegrationTest is Test {
 
     /// @notice Test admin parameter changes
     function test_AdminParameterChanges() public {
-        // Only owner can change parameters
+        // Only owner can change parameters (onlyOwner checked before whenPaused)
         vm.prank(attacker);
-        vm.expectRevert("Only owner");
+        vm.expectRevert(HelixCoordinatorV2.OnlyOwner.selector);
         coordinator.setSlashPercentage(2500);
 
-        // Owner can change
+        // Legacy setters require emergency pause
+        coordinator.emergencyPause();
+
+        // Owner can change when paused
         coordinator.setSlashPercentage(2500);
         assertEq(coordinator.slashPercentage(), 2500);
 
@@ -700,8 +703,10 @@ contract IntegrationTest is Test {
         assertEq(coordinator.maxErrorBound(), 5e17);
 
         // Cannot set slash percentage over 100%
-        vm.expectRevert("Max 100%");
+        vm.expectRevert(HelixCoordinatorV2.MaxPercentage.selector);
         coordinator.setSlashPercentage(10001);
+
+        coordinator.unpause();
     }
 
     /// @notice Test verifier swap
@@ -722,10 +727,12 @@ contract IntegrationTest is Test {
         // Proof fails with current mock
         mockVerifier.setShouldPass(false);
 
-        // Swap to new mock that passes
+        // Swap to new mock that passes (requires emergency pause for legacy setter)
         MockVerifier newVerifier = new MockVerifier();
         newVerifier.setShouldPass(true);
+        coordinator.emergencyPause();
         coordinator.setVerifier(address(newVerifier));
+        coordinator.unpause();
 
         // Now proof succeeds
         uint256[] memory inputs = new uint256[](8);
@@ -758,7 +765,7 @@ contract IntegrationTest is Test {
         uint256 modelId = coordinator.registerModel("ZeroStake", commitment, MIN_STAKE);
 
         vm.prank(prover1);
-        vm.expectRevert("Must stake non-zero amount");
+        vm.expectRevert(HelixCoordinatorV2.ZeroStake.selector);
         coordinator.stake{value: 0}(modelId);
     }
 

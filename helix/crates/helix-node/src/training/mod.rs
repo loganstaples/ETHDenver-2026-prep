@@ -91,7 +91,7 @@ pub use orchestrator::{
 
 pub use verification::{
     GradientValidator, ProofType, ProofVerifier, ValidationResult,
-    VerificationConfig, VerificationResult, VerificationStats,
+    VerificationConfig, VerificationPolicy, VerificationResult, VerificationStats,
     ByzantineGradientFilter, ByzantineStrategy, FilterResult,
 };
 

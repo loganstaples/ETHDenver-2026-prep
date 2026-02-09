@@ -1,4 +1,8 @@
 //! On-chain infrastructure: Anvil, contract deployment, proof submission.
+//!
+//! Deploys the **real** `Halo2Verifier.sol` with VK parameters extracted from
+//! the prover's SRS, plus `HelixCoordinatorV2`. Proofs are verified on-chain
+//! through actual BN254 pairing checks — no mock verifier.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11,6 +15,8 @@ use ethers::providers::{Http, Provider};
 use ethers::signers::{LocalWallet, Signer};
 use ethers::types::{Address, Bytes, TransactionReceipt, U256};
 use ethers::utils::Anvil;
+use helix_circuits::verifier::VkData;
+
 use crate::worker::EvmBundle;
 
 type SignedClient = Arc<SignerMiddleware<Provider<Http>, LocalWallet>>;
@@ -25,12 +31,10 @@ pub struct ChainEnv {
     client: SignedClient,
     /// Anvil HTTP endpoint.
     pub anvil_endpoint: String,
-    /// MockVerifier address.
-    pub mock_verifier_addr: Address,
+    /// Halo2Verifier address (real pairing-based verifier).
+    pub verifier_addr: Address,
     /// HelixCoordinatorV2 address.
     pub coordinator_addr: Address,
-    /// MockVerifier contract.
-    mock_verifier: Contract<SignerMiddleware<Provider<Http>, LocalWallet>>,
     /// Coordinator contract.
     coordinator: Contract<SignerMiddleware<Provider<Http>, LocalWallet>>,
     /// Deployer address.
@@ -107,8 +111,21 @@ fn load_artifact(out_dir: &Path, sol_file: &str, contract_name: &str) -> Result<
     Ok((abi, bytecode))
 }
 
-/// Spawns Anvil, deploys MockVerifier + HelixCoordinatorV2.
-pub async fn setup_chain() -> Result<ChainEnv> {
+/// Parses VkData s_g2 decimal strings into ethers U256 values.
+fn parse_s_g2(vk: &VkData) -> Result<[U256; 4]> {
+    Ok([
+        U256::from_dec_str(&vk.s_g2.0).context("Invalid s_g2.0")?,
+        U256::from_dec_str(&vk.s_g2.1).context("Invalid s_g2.1")?,
+        U256::from_dec_str(&vk.s_g2.2).context("Invalid s_g2.2")?,
+        U256::from_dec_str(&vk.s_g2.3).context("Invalid s_g2.3")?,
+    ])
+}
+
+/// Spawns Anvil, deploys real Halo2Verifier + HelixCoordinatorV2.
+///
+/// The `vk_data` must come from `MLTrainingProverV2::export_vk_data()` so that
+/// the on-chain verifier uses the same SRS as the prover.
+pub async fn setup_chain(vk_data: &VkData) -> Result<ChainEnv> {
     let out_dir = ensure_compiled()?;
 
     // Spawn Anvil
@@ -122,25 +139,32 @@ pub async fn setup_chain() -> Result<ChainEnv> {
     let deployer = wallet.address();
     let client = Arc::new(SignerMiddleware::new(provider, wallet));
 
-    // Deploy MockVerifier
-    let (mock_abi, mock_bytecode) =
-        load_artifact(&out_dir, "Deploy.s.sol", "MockVerifierForDeploy")?;
-    let mock_factory = ContractFactory::new(mock_abi.clone(), mock_bytecode, client.clone());
-    let mock_contract = mock_factory
-        .deploy(())
-        .context("MockVerifier deploy args")?
+    // Deploy real Halo2Verifier with SRS s·G2 from the prover's VK
+    let (verifier_abi, verifier_bytecode) =
+        load_artifact(&out_dir, "Halo2Verifier.sol", "Halo2Verifier")?;
+
+    let s_g2 = parse_s_g2(vk_data)?;
+    let s_g2_token = Token::FixedArray(
+        s_g2.iter().map(|v| Token::Uint(*v)).collect(),
+    );
+
+    let verifier_factory =
+        ContractFactory::new(verifier_abi.clone(), verifier_bytecode, client.clone());
+    let verifier_contract = verifier_factory
+        .deploy(s_g2_token)
+        .context("Halo2Verifier deploy args")?
         .send()
         .await
-        .context("MockVerifier deploy failed")?;
-    let mock_verifier_addr = mock_contract.address();
+        .context("Halo2Verifier deploy failed")?;
+    let verifier_addr = verifier_contract.address();
 
-    // Deploy HelixCoordinatorV2
+    // Deploy HelixCoordinatorV2 with the real verifier
     let (coord_abi, coord_bytecode) =
         load_artifact(&out_dir, "HelixCoordinatorV2.sol", "HelixCoordinatorV2")?;
     let coord_factory = ContractFactory::new(coord_abi.clone(), coord_bytecode, client.clone());
     let coord_contract = coord_factory
         .deploy((
-            Token::Address(mock_verifier_addr),
+            Token::Address(verifier_addr),
             Token::Address(deployer),
         ))
         .context("Coordinator deploy args")?
@@ -149,7 +173,6 @@ pub async fn setup_chain() -> Result<ChainEnv> {
         .context("Coordinator deploy failed")?;
     let coordinator_addr = coord_contract.address();
 
-    let mock_verifier = Contract::new(mock_verifier_addr, mock_abi, client.clone());
     let coordinator = Contract::new(coordinator_addr, coord_abi, client.clone());
 
     let max_error_bound: U256 = coordinator
@@ -163,9 +186,8 @@ pub async fn setup_chain() -> Result<ChainEnv> {
         anvil,
         client,
         anvil_endpoint: endpoint,
-        mock_verifier_addr,
+        verifier_addr,
         coordinator_addr,
-        mock_verifier,
         coordinator,
         deployer,
         model_id: None,
@@ -272,23 +294,15 @@ pub async fn submit_proof(env: &ChainEnv, bundle: &EvmBundle) -> Result<u64> {
     Ok(receipt.gas_used.map(|g| g.as_u64()).unwrap_or(0))
 }
 
-/// Demonstrates slashing by submitting a bad proof.
+/// Demonstrates slashing by submitting a garbage proof.
+///
+/// With the real Halo2Verifier, the BN254 pairing check fails on random bytes,
+/// causing the contract to revert. No mock toggle needed.
 pub async fn demonstrate_slashing(env: &ChainEnv) -> Result<()> {
     crate::display::info("Injecting adversarial worker with fake gradient proof...");
 
-    // Set mock verifier to reject
-    let _: TransactionReceipt = env
-        .mock_verifier
-        .method::<_, ()>("setAccept", false)
-        .context("setAccept method")?
-        .send()
-        .await
-        .context("setAccept send failed")?
-        .await
-        .context("setAccept confirm failed")?
-        .context("setAccept receipt missing")?;
-
-    // Submit a garbage proof
+    // Submit a garbage proof — the real Halo2Verifier will reject it
+    // because the pairing check e(A, -G2) · e(B, sG2) != 1.
     let fake_proof = Bytes::from(vec![0xDE; 320]);
     let fake_pi = vec![U256::from(1u64); 8];
     let model_id = U256::zero();
@@ -306,36 +320,27 @@ pub async fn demonstrate_slashing(env: &ChainEnv) -> Result<()> {
     match call.send().await {
         Err(_) => {
             crate::display::alert("Proof verification FAILED (reverted on-chain)");
-            crate::display::success("Contract correctly rejected invalid proof");
+            crate::display::success("Real Halo2Verifier correctly rejected invalid proof");
         }
         Ok(pending_tx) => {
             let result = pending_tx.await;
             match result {
                 Ok(Some(receipt)) => {
                     if receipt.status == Some(ethers::types::U64::from(0)) {
-                        crate::display::alert("Transaction reverted - invalid proof rejected");
+                        crate::display::alert("Transaction reverted - BN254 pairing check failed");
+                        crate::display::success("Real verifier correctly rejected invalid proof");
                     } else {
-                        crate::display::warn("Transaction succeeded (mock verifier may have accepted)");
+                        crate::display::warn(
+                            "Transaction succeeded unexpectedly — check verifier deployment",
+                        );
                     }
                 }
                 _ => {
-                    crate::display::alert("Proof submission reverted");
+                    crate::display::alert("Proof submission reverted (pairing check failed)");
                 }
             }
         }
     }
-
-    // Reset mock verifier
-    let _: TransactionReceipt = env
-        .mock_verifier
-        .method::<_, ()>("setAccept", true)
-        .context("setAccept method")?
-        .send()
-        .await
-        .context("setAccept send failed")?
-        .await
-        .context("setAccept confirm failed")?
-        .context("setAccept receipt missing")?;
 
     Ok(())
 }

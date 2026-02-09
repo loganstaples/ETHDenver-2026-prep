@@ -19,10 +19,10 @@ use super::eclipse::{
 use super::gossip::{GossipConfig, GossipProtocol};
 use super::messages::{
     DiscoveryMessage, GradientMessage, HeartbeatMessage, MessagePayload, NetworkMessage,
-    NodeCapabilities, PeerId, PeerInfo, SyncMessage, TrainingMessage,
+    NodeCapabilities, PeerId, PeerInfo, PeerKeyRegistry, SyncMessage, TrainingMessage,
 };
 use super::partition_detect::{PartitionAction, PartitionDetectionConfig, PartitionDetector};
-use super::rate_limit::{MessageType, RateLimitConfig, RateLimitResult, RateLimiter};
+use super::rate_limit::{BlacklistReason, MessageType, RateLimitConfig, RateLimitResult, RateLimiter};
 use super::sync::{StateSync, SyncConfig};
 use super::transport::{ConnectionPool, TcpTransport, Transport, TransportConfig, TransportError};
 
@@ -87,6 +87,35 @@ impl Default for NetworkRunnerConfig {
     }
 }
 
+/// Tracks per-peer invalid signature counts for auto-blacklisting.
+struct SignatureStats {
+    /// Invalid signature count per peer.
+    invalid_counts: HashMap<PeerId, u32>,
+    /// Total invalid signatures across all peers.
+    total_invalid: u64,
+    /// Threshold: peers exceeding this many invalid signatures are auto-blacklisted.
+    auto_blacklist_threshold: u32,
+}
+
+impl SignatureStats {
+    fn new(auto_blacklist_threshold: u32) -> Self {
+        Self {
+            invalid_counts: HashMap::new(),
+            total_invalid: 0,
+            auto_blacklist_threshold,
+        }
+    }
+
+    /// Records an invalid signature from a peer. Returns true if the peer
+    /// should be auto-blacklisted (exceeded threshold).
+    fn record_invalid(&mut self, peer_id: &PeerId) -> bool {
+        self.total_invalid += 1;
+        let count = self.invalid_counts.entry(peer_id.clone()).or_insert(0);
+        *count += 1;
+        *count > self.auto_blacklist_threshold
+    }
+}
+
 /// The network runner manages the complete network stack.
 pub struct NetworkRunner {
     /// Our peer ID.
@@ -109,6 +138,10 @@ pub struct NetworkRunner {
     eclipse_manager: Arc<parking_lot::Mutex<EclipseResistantPeerManager>>,
     /// Network partition detector.
     partition_detector: Arc<PartitionDetector>,
+    /// Peer key registry for signature verification.
+    peer_keys: Arc<parking_lot::Mutex<PeerKeyRegistry>>,
+    /// Signature validation statistics and auto-blacklist tracking.
+    sig_stats: Arc<parking_lot::Mutex<SignatureStats>>,
     /// Event channel sender.
     event_tx: mpsc::Sender<NetworkEvent>,
     /// Event channel receiver (for external consumption).
@@ -161,6 +194,8 @@ impl NetworkRunner {
             rate_limiter,
             eclipse_manager,
             partition_detector,
+            peer_keys: Arc::new(parking_lot::Mutex::new(PeerKeyRegistry::new())),
+            sig_stats: Arc::new(parking_lot::Mutex::new(SignatureStats::new(10))),
             event_tx,
             event_rx: Arc::new(tokio::sync::Mutex::new(event_rx)),
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -187,9 +222,11 @@ impl NetworkRunner {
         let pool = self.pool.clone();
         let rate_limiter = self.rate_limiter.clone();
         let eclipse_manager = self.eclipse_manager.clone();
+        let peer_keys = self.peer_keys.clone();
+        let sig_stats = self.sig_stats.clone();
 
         tokio::spawn(async move {
-            Self::receive_loop(running, transport, gossip, discovery, sync, event_tx, pool, rate_limiter, eclipse_manager).await;
+            Self::receive_loop(running, transport, gossip, discovery, sync, event_tx, pool, rate_limiter, eclipse_manager, peer_keys, sig_stats).await;
         });
 
         // Spawn gossip send loop
@@ -353,6 +390,17 @@ impl NetworkRunner {
         self.training_paused.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Returns the peer key registry (for registering peer public keys).
+    pub fn peer_keys(&self) -> &Arc<parking_lot::Mutex<PeerKeyRegistry>> {
+        &self.peer_keys
+    }
+
+    /// Returns the signature validation statistics.
+    pub fn signature_stats(&self) -> (u64, HashMap<PeerId, u32>) {
+        let stats = self.sig_stats.lock();
+        (stats.total_invalid, stats.invalid_counts.clone())
+    }
+
     async fn get_connected_peer_ids(&self) -> Vec<PeerId> {
         self.discovery.get_all_peers().await
             .into_iter()
@@ -381,10 +429,43 @@ impl NetworkRunner {
         pool: Arc<ConnectionPool>,
         rate_limiter: Arc<parking_lot::Mutex<RateLimiter>>,
         eclipse_manager: Arc<parking_lot::Mutex<EclipseResistantPeerManager>>,
+        peer_keys: Arc<parking_lot::Mutex<PeerKeyRegistry>>,
+        sig_stats: Arc<parking_lot::Mutex<SignatureStats>>,
     ) {
         while running.load(std::sync::atomic::Ordering::SeqCst) {
             match transport.recv().await {
                 Ok((from, message)) => {
+                    // === Signature verification ===
+                    // Verify message signature against the sender's registered
+                    // public key. When the `crypto-sign` feature is disabled,
+                    // this is a no-op that always passes (see PeerKeyRegistry
+                    // docs for the security trade-off).
+                    {
+                        let keys = peer_keys.lock();
+                        if !keys.verify_message(&message) {
+                            let mut stats = sig_stats.lock();
+                            let should_blacklist = stats.record_invalid(&message.sender);
+                            log::warn!(
+                                "Invalid signature from peer {} (total invalid: {})",
+                                message.sender, stats.total_invalid,
+                            );
+                            if should_blacklist {
+                                log::warn!(
+                                    "Auto-blacklisting peer {} after {} invalid signatures",
+                                    message.sender, stats.auto_blacklist_threshold,
+                                );
+                                // Blacklist via rate limiter to reuse existing infra
+                                rate_limiter.lock().blacklist_peer(
+                                    &message.sender,
+                                    BlacklistReason::MaliciousBehavior {
+                                        details: "Repeated invalid signatures".to_string(),
+                                    },
+                                );
+                            }
+                            continue;
+                        }
+                    }
+
                     // === Rate limiting (Task B3.4) ===
                     let msg_type = Self::payload_to_message_type(&message.payload);
                     {
