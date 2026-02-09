@@ -1306,6 +1306,8 @@ async fn cmd_demo_live(args: &DemoArgs, mut shutdown: broadcast::Receiver<()>) -
         anvil_port: 8545,
         worker_timeout: Duration::from_secs(30),
         round_timeout: Duration::from_secs(120),
+        health_check_interval: Duration::from_secs(5),
+        max_restarts: 3,
     };
 
     // Print banner
@@ -1633,7 +1635,7 @@ async fn cmd_benchmark(args: &BenchmarkArgs, _cli: &Cli) -> Result<()> {
     let max = times.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let sorted = {
         let mut t = times.clone();
-        t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        t.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         t
     };
     let p50 = sorted[sorted.len() / 2];
@@ -1859,7 +1861,7 @@ async fn cmd_visualize(args: &VisualizeArgs, _cli: &Cli, shutdown: broadcast::Re
 /// then submits them to the `HelixCoordinatorV2` contract via `ChainClient`.
 #[cfg(feature = "chain")]
 async fn cmd_train_chain(args: &TrainArgs) -> Result<()> {
-    use rpc::chain::{ChainClient, TrainingProofInputs};
+    use rpc::chain::ChainClient;
 
     let model_id = args.model_id.ok_or_else(|| {
         anyhow::anyhow!("--model-id is required in --chain mode")
@@ -1924,49 +1926,105 @@ async fn cmd_train_chain(args: &TrainArgs) -> Result<()> {
         );
     }
 
+    // Initialize ZK prover for real proof generation
+    progress.start_spinner("Initializing ZK prover...");
+    let (d_in, d_hid, d_out) = (4, 8, 2); // Default model dims
+    let prover_config = helix_prover::V2ProverConfig {
+        k: 14,
+        relu_range: 128,
+        exp_range: 256,
+        exp_scale: 1000,
+        use_freivalds: true,
+        base_error: helix_prover::halo2curves::bn256::Fr::from(1u64),
+        self_verify: true,
+        ..helix_prover::V2ProverConfig::default()
+    };
+    let prover = helix_prover::MLTrainingProverV2::with_config(
+        d_in, d_hid, d_out, prover_config,
+    );
+    let mut training_state = demo::real_training::TrainingState::new_random(d_in, d_hid, d_out);
+    progress.finish_spinner("ZK prover initialized");
+
     println!();
     println!("{}", "═".repeat(60).cyan());
-    println!("{}", " Training + Proof Submission".cyan().bold());
+    println!("{}", " Training + Real Proof Submission".cyan().bold());
     println!("{}", "═".repeat(60).cyan());
     println!();
 
     for step in 1..=steps {
-        progress.start_spinner(&format!("Step {}/{} — generating proof...", step, steps));
+        progress.start_spinner(&format!("Step {}/{} — generating real ZK proof...", step, steps));
 
-        // Build synthetic witness data for the proof.
-        // In production, the data path would feed real training batches into
-        // helix-prover::MLTrainingProverV2.  For now we create placeholder
-        // public inputs that match the 7-element contract ABI.
-        let inputs = TrainingProofInputs {
-            old_hash_lo: ethers::types::U256::from(state.current_commitment.low_u128()),
-            old_hash_hi: ethers::types::U256::from(
-                (state.current_commitment >> 128).low_u128(),
-            ),
-            new_hash_lo: ethers::types::U256::from(step as u64 * 1000 + 1),
-            new_hash_hi: ethers::types::U256::from(step as u64 * 1000 + 2),
-            loss: ethers::types::U256::from(1000u64 - step as u64 * 10),
-            error_bound: ethers::types::U256::from(step as u64),
-            step_number: ethers::types::U256::from(state.current_round + step as u64),
+        // Generate training data and build witness from current weights
+        let (x, target) = {
+            use helix_prover::halo2curves::bn256::Fr;
+            use rand::Rng;
+            let mut rng = rand::thread_rng();
+            let x: Vec<Fr> = (0..d_in)
+                .map(|_| {
+                    let v: f64 = rng.gen_range(-0.5..0.5);
+                    let scaled = (v * 65536.0) as i64;
+                    if scaled >= 0 { Fr::from(scaled as u64) } else { -Fr::from((-scaled) as u64) }
+                })
+                .collect();
+            let target_idx = rng.gen_range(0..d_out);
+            let target: Vec<Fr> = (0..d_out)
+                .map(|i| if i == target_idx { Fr::ONE } else { Fr::ZERO })
+                .collect();
+            (x, target)
         };
 
-        // Placeholder proof bytes (in production, comes from helix-prover)
-        let proof_bytes: Vec<u8> = vec![0u8; 256];
+        let lr = helix_prover::halo2curves::bn256::Fr::from((0.01_f64 * 65536.0) as u64);
+        let step_number = state.current_round + step as u64;
 
-        progress.finish_spinner(&format!("Step {}/{} — proof ready", step, steps));
+        let witness = helix_prover::MLTrainingProverV2::build_witness(
+            d_in, d_hid, d_out,
+            &x, &target,
+            &training_state.w1, &training_state.b1,
+            &training_state.w2, &training_state.b2,
+            lr,
+            step_number,
+            helix_prover::halo2curves::bn256::Fr::from(1u64),
+        );
 
-        // Submit to chain
+        // Generate real ZK proof
+        let proof_result = prover.prove(&witness).map_err(|e| {
+            anyhow::anyhow!("Proof generation failed at step {}: {:?}", step, e)
+        })?;
+
+        // Update training state
+        training_state.w1 = witness.w1_new.clone();
+        training_state.b1 = witness.b1_new.clone();
+        training_state.w2 = witness.w2_new.clone();
+        training_state.b2 = witness.b2_new.clone();
+        training_state.step += 1;
+
+        // Convert to EVM format
+        let proof_bytes = proof_result.to_evm_proof().map_err(|e| {
+            anyhow::anyhow!("EVM proof formatting failed: {:?}", e)
+        })?;
+        let evm_public_inputs = proof_result.to_evm_public_inputs();
+        let public_inputs_u256: Vec<ethers::types::U256> = evm_public_inputs
+            .iter()
+            .map(|bytes| ethers::types::U256::from_big_endian(bytes))
+            .collect();
+
+        progress.finish_spinner(&format!(
+            "Step {}/{} — real proof ready ({} bytes, verified={})",
+            step, steps, proof_bytes.len(), proof_result.verified
+        ));
+
+        // Submit real proof to chain
         progress.start_spinner(&format!(
-            "Step {}/{} — submitting proof on-chain...",
+            "Step {}/{} — submitting real proof on-chain...",
             step, steps
         ));
-        let round_id = state.current_round + step as u64;
+        let round_id = step_number;
         match chain
-            .submit_proof(model_id, round_id, proof_bytes, &inputs)
+            .submit_proof_raw(model_id, round_id, proof_bytes, public_inputs_u256)
             .await
         {
             Ok(receipt) => {
-                let tx = receipt
-                    .transaction_hash;
+                let tx = receipt.transaction_hash;
                 progress.finish_spinner(&format!(
                     "Step {}/{} — tx 0x{:x} (block {})",
                     step,

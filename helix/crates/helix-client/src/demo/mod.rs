@@ -697,7 +697,8 @@ impl DemoRunner {
     /// Try to connect to a real node, falling back to mock mode if unavailable
     pub async fn connect(&self) -> Result<bool> {
         let config = self.rpc_config.clone().unwrap_or_default();
-        let client = UnifiedRpcClient::new(config).await;
+        // Demo code: use mock fallback so demos work without a real node
+        let client = UnifiedRpcClient::connect_or_mock(config).await;
         let connected = client.is_connected();
 
         *self.rpc_client.write().await = client;
@@ -999,7 +1000,7 @@ impl DemoRunner {
         pb.set_style(
             ProgressStyle::default_bar()
                 .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} rounds ({eta}) {msg}")
-                .unwrap()
+                .expect("static progress template")
                 .progress_chars("#>-"),
         );
         pb
@@ -1876,7 +1877,7 @@ impl DemoRunner {
             pb.set_style(
                 ProgressStyle::default_bar()
                     .template(&format!("  {{spinner:.green}} {} [{{bar:30.cyan/blue}}] {{pos}}/{{len}} ({{eta}})", name))
-                    .unwrap()
+                    .expect("dynamic progress template")
                     .progress_chars("#>-"),
             );
             pb.set_position(0);

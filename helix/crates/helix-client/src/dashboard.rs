@@ -196,9 +196,9 @@ impl DashboardState {
 
         let arc = Arc::new(state);
         // Use try_write to populate synchronously (no contention at init time)
-        *arc.nodes.try_write().unwrap() = demo_nodes();
-        *arc.metrics.try_write().unwrap() = demo_metrics();
-        *arc.events.try_write().unwrap() = demo_events();
+        *arc.nodes.try_write().expect("no contention at init") = demo_nodes();
+        *arc.metrics.try_write().expect("no contention at init") = demo_metrics();
+        *arc.events.try_write().expect("no contention at init") = demo_events();
         arc
     }
 

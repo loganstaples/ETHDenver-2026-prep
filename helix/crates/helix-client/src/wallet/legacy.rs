@@ -113,7 +113,7 @@ impl PrivateKey {
         // Use a combination of time and random bytes for entropy
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("system clock before UNIX epoch")
             .as_nanos();
 
         let mut key = [0u8; 32];

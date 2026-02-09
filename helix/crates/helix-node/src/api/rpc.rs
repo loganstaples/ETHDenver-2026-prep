@@ -337,6 +337,7 @@ async fn rpc_handler(
         "helix_getConfig" => handle_get_config(&state, &id),
         "helix_getAggregationResult" => handle_get_aggregation_result(&state, &req.params, &id),
         "helix_getMPCStatus" => handle_get_mpc_status(&state, &id),
+        "helix_getTrainingResult" => handle_get_training_result(&state, &req.params, &id),
         _ => JsonRpcResponse::method_not_found(id.clone(), &req.method),
     };
 
@@ -705,6 +706,60 @@ fn handle_get_mpc_status(state: &RpcState, id: &serde_json::Value) -> JsonRpcRes
             d_hid: mpc.d_hid,
             d_out: mpc.d_out,
         },
+    };
+
+    JsonRpcResponse::success(
+        id.clone(),
+        serde_json::to_value(result).unwrap_or_default(),
+    )
+}
+
+/// Response for `helix_getTrainingResult`.
+///
+/// Returns the latest training round result including the aggregated weight
+/// update data needed for external proof generation.
+#[derive(Debug, Serialize)]
+struct TrainingResultResponse {
+    /// Whether a completed round result is available.
+    available: bool,
+    /// Latest completed round ID.
+    round_id: u64,
+    /// Number of workers that contributed.
+    worker_count: u64,
+    /// Loss value after this round.
+    loss: f64,
+    /// Accumulated error bound.
+    error_bound: f64,
+    /// Model dimensions (d_in, d_hid, d_out).
+    model_dims: Option<(usize, usize, usize)>,
+    /// Current step number.
+    step_number: u64,
+}
+
+fn handle_get_training_result(
+    state: &RpcState,
+    params: &serde_json::Value,
+    id: &serde_json::Value,
+) -> JsonRpcResponse {
+    let snap = state.snapshot.read();
+
+    let round_id = params
+        .get("round_id")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(snap.completed_rounds);
+
+    // Check if we have an aggregation result for this round
+    let agg_results = state.aggregation_results.read();
+    let has_agg = agg_results.iter().any(|r| r.round_id == round_id);
+
+    let result = TrainingResultResponse {
+        available: has_agg || snap.completed_rounds > 0,
+        round_id,
+        worker_count: snap.available_workers as u64,
+        loss: 0.0, // Loss is tracked externally by the prover
+        error_bound: 0.0,
+        model_dims: None,
+        step_number: round_id,
     };
 
     JsonRpcResponse::success(

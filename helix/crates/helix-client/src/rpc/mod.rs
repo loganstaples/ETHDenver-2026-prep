@@ -28,7 +28,7 @@ pub use client::{
     TrainingStatus, TrainingPhase, ProofStatus, ProofPhase,
     NetworkStatus, WorkerInfo, WorkerStatus,
     ModelInfo, RoundInfo, StakingInfo, SlashingEvent,
-    ProofSubmission, TrainingProgress,
+    ProofSubmission, TrainingProgress, TrainingResultData,
     NodeCapabilities, HealthStatus, ComponentHealth,
     // Snapshot type
     DemoSnapshot,

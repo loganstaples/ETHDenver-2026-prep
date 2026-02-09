@@ -57,10 +57,23 @@ impl HelixClient {
 
     /// Attempt to connect the RPC layer to a real HELIX node.
     ///
-    /// On failure the client falls back to mock mode automatically.
+    /// Returns an error if the connection fails. Use [`connect_or_mock`] for
+    /// development scenarios where falling back to mock mode is acceptable.
     pub async fn connect(&mut self) -> Result<()> {
         let rpc_cfg = rpc_config_from_helix(&self.config.rpc);
-        self.rpc = UnifiedRpcClient::new(rpc_cfg).await;
+        self.rpc = UnifiedRpcClient::connect(rpc_cfg).await?;
+        Ok(())
+    }
+
+    /// Attempt to connect to a real HELIX node, falling back to mock mode on
+    /// failure.
+    ///
+    /// This is intended for development and demo use only. In production, use
+    /// [`connect`](Self::connect) which returns an error on failure.
+    #[cfg(any(debug_assertions, feature = "mock-fallback"))]
+    pub async fn connect_or_mock(&mut self) -> Result<()> {
+        let rpc_cfg = rpc_config_from_helix(&self.config.rpc);
+        self.rpc = UnifiedRpcClient::connect_or_mock(rpc_cfg).await;
         Ok(())
     }
 

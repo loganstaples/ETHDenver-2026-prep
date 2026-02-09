@@ -342,6 +342,25 @@ pub struct RoundInfo {
     pub error_delta: Option<f64>,
 }
 
+/// Training result data from a completed round (used for proof generation).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrainingResultData {
+    /// Whether a completed round result is available.
+    pub available: bool,
+    /// The round that completed.
+    pub round_id: u64,
+    /// Number of contributing workers.
+    pub worker_count: u64,
+    /// Computed loss value.
+    pub loss: f64,
+    /// Accumulated error bound.
+    pub error_bound: f64,
+    /// Model dimensions (d_in, d_hid, d_out), if known.
+    pub model_dims: Option<(usize, usize, usize)>,
+    /// Training step number.
+    pub step_number: u64,
+}
+
 /// Staking information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StakingInfo {
@@ -760,6 +779,16 @@ impl HelixRpcClient {
     /// Get current training status
     pub async fn get_training_status(&self) -> Result<TrainingStatus, RpcError> {
         self.send_request("training_status", ()).await
+    }
+
+    /// Get training result for a completed round (for proof generation).
+    pub async fn get_training_result(&self, round_id: u64) -> Result<TrainingResultData, RpcError> {
+        #[derive(Serialize)]
+        struct Params {
+            round_id: u64,
+        }
+
+        self.send_request("helix_getTrainingResult", Params { round_id }).await
     }
 
     /// Start training for a model
@@ -1282,8 +1311,32 @@ pub struct UnifiedRpcClient {
 }
 
 impl UnifiedRpcClient {
-    /// Create unified client that will try real connection first
-    pub async fn new(config: HelixRpcConfig) -> Self {
+    /// Connect to a real HELIX node. Returns an error on connection failure.
+    ///
+    /// In production code, always use this method so misconfigurations are
+    /// caught immediately instead of silently running in mock mode.
+    pub async fn connect(config: HelixRpcConfig) -> Result<Self, RpcError> {
+        let client = HelixRpcClient::new(config.clone())?;
+        client.connect().await?;
+
+        tracing::info!("Connected to HELIX node at {}", config.endpoint);
+        Ok(Self {
+            real_client: Some(client),
+            mock_client: MockRpcClient::new(),
+            use_mock: false,
+            connected: true,
+            #[cfg(feature = "chain")]
+            chain_client: None,
+        })
+    }
+
+    /// Try to connect to a real HELIX node, falling back to mock mode on
+    /// failure.
+    ///
+    /// Intended for development / demo use only. In production prefer
+    /// [`connect`](Self::connect) which surfaces connection errors.
+    #[cfg(any(debug_assertions, feature = "mock-fallback"))]
+    pub async fn connect_or_mock(config: HelixRpcConfig) -> Self {
         let mock_client = MockRpcClient::new();
 
         // Try to connect to real node
@@ -1329,7 +1382,7 @@ impl UnifiedRpcClient {
         }
     }
 
-    /// Create in mock-only mode
+    /// Create in mock-only mode (for demos and tests).
     pub fn mock_only() -> Self {
         Self {
             real_client: None,
@@ -1389,6 +1442,25 @@ impl UnifiedRpcClient {
             Ok(self.mock_client.get_training_status().await)
         } else if let Some(ref client) = self.real_client {
             client.get_training_status().await
+        } else {
+            Err(RpcError::NodeUnavailable("No client available".into()))
+        }
+    }
+
+    /// Get training result for a completed round (for proof generation).
+    pub async fn get_training_result(&self, round_id: u64) -> Result<TrainingResultData, RpcError> {
+        if self.use_mock {
+            Ok(TrainingResultData {
+                available: true,
+                round_id,
+                worker_count: 1,
+                loss: 0.0,
+                error_bound: 0.0,
+                model_dims: None,
+                step_number: round_id,
+            })
+        } else if let Some(ref client) = self.real_client {
+            client.get_training_result(round_id).await
         } else {
             Err(RpcError::NodeUnavailable("No client available".into()))
         }

@@ -975,7 +975,7 @@ impl ProfileManager {
             self.configs.insert(profile, config);
         }
 
-        Ok(self.configs.get(&profile).unwrap())
+        Ok(self.configs.get(&profile).expect("profile was just inserted"))
     }
 
     /// Save current configuration to disk

@@ -8,6 +8,7 @@
 //! aggregator) and real contract interaction when the `chain` feature is enabled.
 
 use std::collections::HashMap;
+use std::io::Read as IoRead;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -66,6 +67,12 @@ pub struct OrchestratorConfig {
     pub worker_timeout: Duration,
     /// Maximum time per training round.
     pub round_timeout: Duration,
+
+    // -- Health monitoring --
+    /// Interval between health checks on spawned processes.
+    pub health_check_interval: Duration,
+    /// Maximum number of automatic restarts per node before giving up.
+    pub max_restarts: u32,
 }
 
 impl Default for OrchestratorConfig {
@@ -89,6 +96,8 @@ impl Default for OrchestratorConfig {
             anvil_port: 8545,
             worker_timeout: Duration::from_secs(30),
             round_timeout: Duration::from_secs(120),
+            health_check_interval: Duration::from_secs(5),
+            max_restarts: 3,
         }
     }
 }
@@ -151,14 +160,29 @@ pub struct RoundProgress {
 /// Manages process lifecycle (Anvil, helix-node workers/aggregator),
 /// contract deployment, model registration, training execution, and
 /// on-chain proof submission.
+/// Tracks a managed node process with restart metadata.
+struct ManagedProcess {
+    name: String,
+    role: String,
+    port: u16,
+    child: Child,
+    restart_count: u32,
+    last_stderr: String,
+}
+
 pub struct TrainingOrchestrator {
     config: OrchestratorConfig,
     anvil_process: Option<Child>,
     node_processes: Vec<(String, Child)>,
+    managed_processes: Vec<ManagedProcess>,
     deployment: Option<DeploymentResult>,
     model_id: Option<u64>,
     /// Callback for progress reporting.
     progress_callback: Option<Box<dyn Fn(RoundProgress) + Send + Sync>>,
+    /// ZK prover for generating real training proofs.
+    prover: Option<helix_prover::MLTrainingProverV2>,
+    /// Current training state (weights) used to build witnesses.
+    training_state: Option<crate::demo::real_training::TrainingState>,
 }
 
 impl TrainingOrchestrator {
@@ -168,9 +192,12 @@ impl TrainingOrchestrator {
             config,
             anvil_process: None,
             node_processes: Vec::new(),
+            managed_processes: Vec::new(),
             deployment: None,
             model_id: None,
             progress_callback: None,
+            prover: None,
+            training_state: None,
         }
     }
 
@@ -217,6 +244,10 @@ impl TrainingOrchestrator {
                     .context("Failed to register model / stake")?;
             }
         }
+
+        // Phase 3.5: Initialize ZK prover for real proof generation
+        self.initialize_prover()
+            .context("Failed to initialize ZK prover")?;
 
         // Phase 4: Start network
         self.start_network().await
@@ -585,7 +616,7 @@ impl TrainingOrchestrator {
     // Phase 4: Start Network
     // =======================================================================
 
-    /// Spawn aggregator + worker nodes as child processes.
+    /// Spawn aggregator + worker nodes as child processes with health tracking.
     pub async fn start_network(&mut self) -> Result<()> {
         let (d_in, d_hid, d_out) = self.config.model_dims;
 
@@ -596,7 +627,14 @@ impl TrainingOrchestrator {
             "aggregator",
             self.config.base_port,
         )?;
-        self.node_processes.push(("aggregator".into(), agg_child));
+        self.managed_processes.push(ManagedProcess {
+            name: "aggregator".into(),
+            role: "aggregator".into(),
+            port: self.config.base_port,
+            child: agg_child,
+            restart_count: 0,
+            last_stderr: String::new(),
+        });
 
         // Brief pause to let aggregator bind its port
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -608,7 +646,14 @@ impl TrainingOrchestrator {
             info!("Starting {} on port {}...", name, port);
 
             let child = self.spawn_node(&name, "worker", port)?;
-            self.node_processes.push((name, child));
+            self.managed_processes.push(ManagedProcess {
+                name: name.clone(),
+                role: "worker".into(),
+                port,
+                child,
+                restart_count: 0,
+                last_stderr: String::new(),
+            });
         }
 
         info!(
@@ -683,8 +728,11 @@ impl TrainingOrchestrator {
     // Phase 5: Wait for Workers
     // =======================================================================
 
-    /// Wait for all workers to connect to the aggregator.
-    pub async fn wait_for_workers(&self) -> Result<()> {
+    /// Wait for workers to connect to the aggregator.
+    ///
+    /// Returns once all requested workers have connected, or on timeout returns
+    /// a partial success if at least one worker is available.
+    pub async fn wait_for_workers(&mut self) -> Result<()> {
         info!("Waiting for {} workers to connect...", self.config.workers);
 
         let deadline = Instant::now() + self.config.worker_timeout;
@@ -692,13 +740,32 @@ impl TrainingOrchestrator {
             .timeout(Duration::from_secs(5))
             .build()?;
 
+        let mut last_worker_count = 0u64;
+
         loop {
             if Instant::now() > deadline {
+                // Check for crashed processes before reporting timeout
+                let _ = self.check_process_health();
+
+                if last_worker_count > 0 {
+                    warn!(
+                        "Timeout: only {}/{} workers connected after {}s — proceeding with partial set",
+                        last_worker_count,
+                        self.config.workers,
+                        self.config.worker_timeout.as_secs()
+                    );
+                    return Ok(());
+                }
+
                 return Err(anyhow!(
-                    "Timeout waiting for workers ({} seconds). Check helix-node logs.",
-                    self.config.worker_timeout.as_secs()
+                    "Timeout waiting for workers ({} seconds, 0/{} connected). Check helix-node logs.",
+                    self.config.worker_timeout.as_secs(),
+                    self.config.workers
                 ));
             }
+
+            // Periodic health check on managed processes
+            let _ = self.check_process_health();
 
             let url = format!("http://127.0.0.1:{}/health", self.config.http_port);
             match client.get(&url).send().await {
@@ -707,6 +774,7 @@ impl TrainingOrchestrator {
                         let workers = json.get("workers")
                             .and_then(|v| v.as_u64())
                             .unwrap_or(0);
+                        last_worker_count = workers;
                         if workers >= self.config.workers as u64 {
                             info!("{} workers connected", workers);
                             return Ok(());
@@ -777,16 +845,139 @@ impl TrainingOrchestrator {
         }
     }
 
-    /// Submit a proof on-chain for the completed round.
+    /// Initialize the ZK prover and training state for real proof generation.
+    fn initialize_prover(&mut self) -> Result<()> {
+        use helix_prover::{MLTrainingProverV2, V2ProverConfig};
+        use crate::demo::real_training::TrainingState;
+
+        let (d_in, d_hid, d_out) = self.config.model_dims;
+
+        info!(
+            "Initializing ZK prover (model={}x{}x{})...",
+            d_in, d_hid, d_out
+        );
+        let init_start = Instant::now();
+
+        let prover_config = V2ProverConfig {
+            k: 14,
+            relu_range: 128,
+            exp_range: 256,
+            exp_scale: 1000,
+            use_freivalds: true,
+            base_error: helix_prover::halo2curves::bn256::Fr::from(1u64),
+            self_verify: true,
+            ..V2ProverConfig::default()
+        };
+
+        let prover = MLTrainingProverV2::with_config(d_in, d_hid, d_out, prover_config);
+        let state = TrainingState::new_random(d_in, d_hid, d_out);
+
+        let elapsed = init_start.elapsed();
+        info!("ZK prover initialized in {:.1}s", elapsed.as_secs_f64());
+
+        self.prover = Some(prover);
+        self.training_state = Some(state);
+
+        Ok(())
+    }
+
+    /// Generate a real ZK proof for a training round using the current weights.
+    ///
+    /// Builds a witness from the current training state, generates a KZG proof
+    /// via `MLTrainingProverV2::prove()`, updates weights, and returns the
+    /// EVM-formatted proof bytes and public inputs.
     #[cfg(feature = "chain")]
-    async fn submit_round_proof_onchain(&self, round: u32) -> Result<Option<String>> {
-        use crate::rpc::chain::{ChainClient, TrainingProofInputs};
-        use ethers::types::U256;
+    fn generate_real_proof(
+        &mut self,
+        round: u32,
+    ) -> Result<(Vec<u8>, Vec<ethers::types::U256>)> {
+        use helix_prover::halo2curves::bn256::Fr;
+        use helix_prover::MLTrainingProverV2;
+
+        let prover = self
+            .prover
+            .as_ref()
+            .ok_or_else(|| anyhow!("Prover not initialized — call initialize_prover() first"))?;
+
+        let state = self
+            .training_state
+            .as_ref()
+            .ok_or_else(|| anyhow!("Training state not initialized"))?;
+
+        let (d_in, d_hid, d_out) = self.config.model_dims;
+
+        // Generate training data for this round
+        let (x, target) = generate_training_data(d_in, d_out);
+
+        // Learning rate as Fr (fixed-point scaled by 2^16)
+        let lr = Fr::from((self.config.learning_rate * 65536.0) as u64);
+
+        // Build witness from current weights
+        let witness = MLTrainingProverV2::build_witness(
+            d_in,
+            d_hid,
+            d_out,
+            &x,
+            &target,
+            &state.w1,
+            &state.b1,
+            &state.w2,
+            &state.b2,
+            lr,
+            round as u64,
+            Fr::from(1u64),
+        );
+
+        // Generate the real ZK proof
+        info!("Generating ZK proof for round {}...", round);
+        let proof_start = Instant::now();
+
+        let result = prover
+            .prove(&witness)
+            .map_err(|e| anyhow!("Proof generation failed for round {}: {:?}", round, e))?;
+
+        let proof_time = proof_start.elapsed();
+        info!(
+            "Round {} proof generated in {:.1}s (verified={})",
+            round,
+            proof_time.as_secs_f64(),
+            result.verified
+        );
+
+        // Update training state with new weights from the witness
+        if let Some(ref mut s) = self.training_state {
+            s.w1 = witness.w1_new.clone();
+            s.b1 = witness.b1_new.clone();
+            s.w2 = witness.w2_new.clone();
+            s.b2 = witness.b2_new.clone();
+            s.step += 1;
+        }
+
+        // Convert to EVM format
+        let evm_proof = result
+            .to_evm_proof()
+            .map_err(|e| anyhow!("EVM proof serialization failed: {:?}", e))?;
+
+        let evm_public_inputs = result.to_evm_public_inputs();
+
+        // Convert [u8; 32] big-endian public inputs to U256
+        let public_inputs_u256: Vec<ethers::types::U256> = evm_public_inputs
+            .iter()
+            .map(|bytes| ethers::types::U256::from_big_endian(bytes))
+            .collect();
+
+        Ok((evm_proof, public_inputs_u256))
+    }
+
+    /// Submit a real ZK proof on-chain for the completed round.
+    #[cfg(feature = "chain")]
+    async fn submit_round_proof_onchain(&mut self, round: u32) -> Result<Option<String>> {
+        use crate::rpc::chain::ChainClient;
 
         let coordinator_addr = if let Some(ref d) = self.deployment {
-            &d.coordinator
+            d.coordinator.clone()
         } else {
-            &self.config.coordinator_address
+            self.config.coordinator_address.clone()
         };
 
         if coordinator_addr.is_empty() {
@@ -795,37 +986,31 @@ impl TrainingOrchestrator {
 
         let model_id = self.model_id.unwrap_or(0);
 
+        // Generate real ZK proof from current training state
+        let (proof_bytes, public_inputs) = self.generate_real_proof(round)?;
+
+        info!(
+            "Submitting real proof on-chain: {} bytes, {} public inputs",
+            proof_bytes.len(),
+            public_inputs.len()
+        );
+
         let chain = ChainClient::new(
             &self.config.eth_rpc_url,
             &self.config.private_key,
-            coordinator_addr,
+            &coordinator_addr,
             None,
         )
         .await?;
 
-        // Build proof inputs from round data
-        // In a production system, these would come from the prover.
-        // For the demo, we construct valid-looking public inputs.
-        let inputs = TrainingProofInputs {
-            old_hash_lo: U256::from(round as u64 * 1000),
-            old_hash_hi: U256::from(round as u64 * 1000 + 1),
-            new_hash_lo: U256::from(round as u64 * 1000 + 2),
-            new_hash_hi: U256::from(round as u64 * 1000 + 3),
-            loss: U256::from(1000u64.saturating_sub(round as u64 * 50)),
-            error_bound: U256::from(round as u64 * 5),
-            step_number: U256::from(round as u64),
-        };
-
-        // Placeholder proof bytes (MockVerifier accepts any proof)
-        let proof_bytes = vec![0u8; 256];
-
+        // Submit real proof with real public inputs via submit_proof_raw
         match chain
-            .submit_proof(model_id, round as u64, proof_bytes, &inputs)
+            .submit_proof_raw(model_id, round as u64, proof_bytes, public_inputs)
             .await
         {
             Ok(receipt) => {
                 let tx_hash = format!("0x{:x}", receipt.transaction_hash);
-                info!("Round {} proof submitted: {}", round, tx_hash);
+                info!("Round {} real proof submitted: {}", round, tx_hash);
                 Ok(Some(tx_hash))
             }
             Err(e) => {
@@ -836,8 +1021,140 @@ impl TrainingOrchestrator {
     }
 
     #[cfg(not(feature = "chain"))]
-    async fn submit_round_proof_onchain(&self, _round: u32) -> Result<Option<String>> {
+    async fn submit_round_proof_onchain(&mut self, _round: u32) -> Result<Option<String>> {
         Ok(None)
+    }
+
+    // =======================================================================
+    // Health Monitoring (Task 5)
+    // =======================================================================
+
+    /// Check health of all managed node processes.
+    ///
+    /// For each process:
+    /// - Checks if the OS process is still running (`try_wait()`)
+    /// - Pings the aggregator's `/health` endpoint when applicable
+    /// - Automatically restarts crashed processes (up to `max_restarts`)
+    /// - Captures stderr output from crashed processes for diagnostics
+    pub fn check_process_health(&mut self) -> Result<Vec<ProcessHealthReport>> {
+        let mut reports = Vec::new();
+        let mut to_restart: Vec<(String, String, u16, u32)> = Vec::new();
+
+        for proc in &mut self.managed_processes {
+            match proc.child.try_wait() {
+                Ok(Some(exit_status)) => {
+                    // Process has exited
+                    let mut stderr_output = String::new();
+                    if let Some(ref mut stderr) = proc.child.stderr {
+                        let _ = stderr.read_to_string(&mut stderr_output);
+                    }
+                    if !stderr_output.is_empty() {
+                        proc.last_stderr = stderr_output.clone();
+                    }
+
+                    warn!(
+                        "Process {} exited with {} (restarts: {}/{})",
+                        proc.name, exit_status, proc.restart_count, self.config.max_restarts
+                    );
+
+                    reports.push(ProcessHealthReport {
+                        name: proc.name.clone(),
+                        alive: false,
+                        exit_status: Some(format!("{}", exit_status)),
+                        restart_count: proc.restart_count,
+                        last_stderr: if proc.last_stderr.is_empty() {
+                            None
+                        } else {
+                            Some(proc.last_stderr.clone())
+                        },
+                    });
+
+                    if proc.restart_count < self.config.max_restarts {
+                        to_restart.push((
+                            proc.name.clone(),
+                            proc.role.clone(),
+                            proc.port,
+                            proc.restart_count + 1,
+                        ));
+                    } else {
+                        error!(
+                            "Process {} exceeded max restarts ({}), not restarting",
+                            proc.name, self.config.max_restarts
+                        );
+                    }
+                }
+                Ok(None) => {
+                    // Process still running
+                    reports.push(ProcessHealthReport {
+                        name: proc.name.clone(),
+                        alive: true,
+                        exit_status: None,
+                        restart_count: proc.restart_count,
+                        last_stderr: None,
+                    });
+                }
+                Err(e) => {
+                    warn!("Failed to check process {}: {}", proc.name, e);
+                    reports.push(ProcessHealthReport {
+                        name: proc.name.clone(),
+                        alive: false,
+                        exit_status: Some(format!("check failed: {}", e)),
+                        restart_count: proc.restart_count,
+                        last_stderr: None,
+                    });
+                }
+            }
+        }
+
+        // Remove dead processes and restart
+        self.managed_processes.retain(|p| {
+            !to_restart.iter().any(|(name, _, _, _)| name == &p.name)
+        });
+
+        for (name, role, port, restart_count) in to_restart {
+            info!("Restarting {} (attempt {})...", name, restart_count);
+            match self.spawn_node(&name, &role, port) {
+                Ok(child) => {
+                    self.managed_processes.push(ManagedProcess {
+                        name: name.clone(),
+                        role,
+                        port,
+                        child,
+                        restart_count,
+                        last_stderr: String::new(),
+                    });
+                    info!("Successfully restarted {}", name);
+                }
+                Err(e) => {
+                    error!("Failed to restart {}: {}", name, e);
+                }
+            }
+        }
+
+        Ok(reports)
+    }
+
+    /// Check aggregator health via HTTP endpoint.
+    pub async fn check_aggregator_health(&self) -> Result<bool> {
+        let url = format!("http://127.0.0.1:{}/health", self.config.http_port);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()?;
+
+        match client.get(&url).send().await {
+            Ok(resp) => {
+                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                    let status = json
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    Ok(status == "healthy")
+                } else {
+                    Ok(false)
+                }
+            }
+            Err(_) => Ok(false),
+        }
     }
 
     // =======================================================================
@@ -848,7 +1165,15 @@ impl TrainingOrchestrator {
     pub async fn shutdown(&mut self) -> Result<()> {
         info!("Shutting down orchestrator...");
 
-        // Stop nodes (in reverse order: workers first, then aggregator)
+        // Stop managed processes (in reverse order: workers first, then aggregator)
+        for proc in self.managed_processes.drain(..).rev() {
+            debug!("Stopping {} (managed)...", proc.name);
+            let mut child = proc.child;
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
+        // Stop legacy node_processes
         for (name, mut child) in self.node_processes.drain(..).rev() {
             debug!("Stopping {}...", name);
             let _ = child.kill();
@@ -894,6 +1219,12 @@ impl TrainingOrchestrator {
 impl Drop for TrainingOrchestrator {
     fn drop(&mut self) {
         // Best-effort cleanup: kill all child processes
+        for proc in self.managed_processes.drain(..) {
+            debug!("Drop: killing {}", proc.name);
+            let mut child = proc.child;
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         for (name, mut child) in self.node_processes.drain(..) {
             debug!("Drop: killing {}", name);
             let _ = child.kill();
@@ -905,6 +1236,49 @@ impl Drop for TrainingOrchestrator {
             let _ = anvil.wait();
         }
     }
+}
+
+/// Health report for a managed process.
+#[derive(Debug, Clone)]
+pub struct ProcessHealthReport {
+    pub name: String,
+    pub alive: bool,
+    pub exit_status: Option<String>,
+    pub restart_count: u32,
+    pub last_stderr: Option<String>,
+}
+
+/// Generate random training data (input features + one-hot target).
+fn generate_training_data(d_in: usize, d_out: usize) -> (Vec<helix_prover::halo2curves::bn256::Fr>, Vec<helix_prover::halo2curves::bn256::Fr>) {
+    use helix_prover::halo2curves::bn256::Fr;
+    use rand::Rng;
+
+    let mut rng = rand::thread_rng();
+
+    // Small values to stay within ReLU lookup range (±128)
+    let x: Vec<Fr> = (0..d_in)
+        .map(|_| {
+            let v: f64 = rng.gen_range(-0.5..0.5);
+            let scaled = (v * 65536.0) as i64;
+            if scaled >= 0 {
+                Fr::from(scaled as u64)
+            } else {
+                use ff::Field;
+                -Fr::from((-scaled) as u64)
+            }
+        })
+        .collect();
+
+    // One-hot target for classification
+    let target_idx = rng.gen_range(0..d_out);
+    let target: Vec<Fr> = (0..d_out)
+        .map(|i| {
+            use ff::Field;
+            if i == target_idx { Fr::ONE } else { Fr::ZERO }
+        })
+        .collect();
+
+    (x, target)
 }
 
 // ---------------------------------------------------------------------------

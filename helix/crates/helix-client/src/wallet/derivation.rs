@@ -142,9 +142,16 @@ impl ExtendedPrivateKey {
         use k256::elliptic_curve::scalar::ScalarPrimitive;
         use k256::Scalar;
 
-        let parent_scalar =
-            Scalar::from(ScalarPrimitive::from_bytes(&self.signing_key.to_bytes()).unwrap());
-        let il_scalar = Scalar::from(ScalarPrimitive::from_bytes(&il.into()).unwrap());
+        let parent_scalar = Scalar::from(
+            ScalarPrimitive::from_bytes(&self.signing_key.to_bytes())
+                .into_option()
+                .ok_or_else(|| anyhow!("Invalid parent scalar bytes"))?,
+        );
+        let il_scalar = Scalar::from(
+            ScalarPrimitive::from_bytes(&il.into())
+                .into_option()
+                .ok_or_else(|| anyhow!("Invalid IL scalar bytes"))?,
+        );
         let child_scalar = parent_scalar + il_scalar;
 
         let child_bytes = child_scalar.to_bytes();
@@ -289,7 +296,11 @@ impl ExtendedPublicKey {
         use k256::elliptic_curve::scalar::ScalarPrimitive;
         use k256::{ProjectivePoint, Scalar};
 
-        let il_scalar = Scalar::from(ScalarPrimitive::from_bytes(&il.into()).unwrap());
+        let il_scalar = Scalar::from(
+            ScalarPrimitive::from_bytes(&il.into())
+                .into_option()
+                .ok_or_else(|| anyhow!("Invalid IL scalar bytes"))?,
+        );
         let il_point = ProjectivePoint::GENERATOR * il_scalar;
         let parent_point: ProjectivePoint = self.verifying_key.as_affine().into();
         let child_point = parent_point + il_point;

@@ -212,7 +212,9 @@ impl LedgerWallet {
                 let data_len = std::cmp::min(len, HID_FRAME_SIZE - 7);
                 response.extend_from_slice(&frame[7..7 + data_len]);
             } else {
-                let remaining = expected_len.unwrap() - response.len();
+                let remaining = expected_len
+                    .ok_or_else(|| HardwareWalletError::InvalidResponse("continuation frame before length frame".into()))?
+                    - response.len();
                 let data_len = std::cmp::min(remaining, HID_FRAME_SIZE - 5);
                 response.extend_from_slice(&frame[5..5 + data_len]);
             }

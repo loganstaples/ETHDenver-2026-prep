@@ -191,7 +191,7 @@ impl BenchmarkRunner {
         pb.set_style(
             ProgressStyle::default_bar()
                 .template("{spinner:.blue} Warmup [{bar:40.blue/cyan}] {pos}/{len}")
-                .unwrap()
+                .expect("static progress template")
                 .progress_chars("#>-"),
         );
 
@@ -210,7 +210,7 @@ impl BenchmarkRunner {
         pb.set_style(
             ProgressStyle::default_bar()
                 .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
-                .unwrap()
+                .expect("static progress template")
                 .progress_chars("#>-"),
         );
 

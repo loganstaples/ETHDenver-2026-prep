@@ -65,7 +65,7 @@ impl LinuxSecretService {
 
         // Create new collection
         let collection = ss
-            .create_collection(&self.collection, ObjectPath::from_static_str("/org/freedesktop/secrets/aliases/default").unwrap())
+            .create_collection(&self.collection, ObjectPath::from_static_str("/org/freedesktop/secrets/aliases/default").expect("valid static D-Bus path"))
             .await
             .map_err(Self::convert_error)?;
 
@@ -271,7 +271,7 @@ impl LinuxSecretService {
             .await
             .map_err(Self::convert_error)?;
 
-        ss.create_collection(label, ObjectPath::from_static_str("/org/freedesktop/secrets/aliases/default").unwrap())
+        ss.create_collection(label, ObjectPath::from_static_str("/org/freedesktop/secrets/aliases/default").expect("valid static D-Bus path"))
             .await
             .map_err(Self::convert_error)?;
 

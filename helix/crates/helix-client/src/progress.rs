@@ -36,7 +36,7 @@ impl ProgressDisplay {
             ProgressStyle::default_spinner()
                 .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
                 .template("{spinner:.cyan} {msg}")
-                .unwrap(),
+                .expect("static progress template"),
         );
         spinner.set_message(message.to_string());
         spinner.enable_steady_tick(Duration::from_millis(80));
@@ -75,7 +75,7 @@ impl ProgressDisplay {
             .template(template.unwrap_or(
                 "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
             ))
-            .unwrap()
+            .expect("static progress template")
             .progress_chars("#>-");
         pb.set_style(style);
         pb
@@ -137,7 +137,7 @@ impl StepProgress {
                 ProgressStyle::default_spinner()
                     .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
                     .template("{spinner:.cyan} {msg}")
-                    .unwrap(),
+                    .expect("static progress template"),
             );
             spinner.set_message(step_msg);
             spinner.enable_steady_tick(Duration::from_millis(80));

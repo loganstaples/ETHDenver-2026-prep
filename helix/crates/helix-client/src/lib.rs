@@ -15,5 +15,5 @@ pub mod wallet;
 pub use client::HelixClient;
 pub use dashboard::{DashboardConfig, DashboardState};
 pub use orchestration::{
-    DeploymentResult, OrchestratorConfig, TrainingOrchestrator, TrainingResult,
+    DeploymentResult, OrchestratorConfig, ProcessHealthReport, TrainingOrchestrator, TrainingResult,
 };
