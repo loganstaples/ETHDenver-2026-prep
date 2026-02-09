@@ -20,6 +20,37 @@ use crate::memory::gradient_checkpoint::{
     CheckpointError, CheckpointStrategy, GradientCheckpointer,
 };
 
+/// Errors that can occur during training.
+#[derive(Debug, Clone)]
+pub enum TrainingError {
+    /// Loss became NaN or Inf for too many consecutive steps.
+    DivergentLoss {
+        consecutive_nan_steps: usize,
+        last_loss: f64,
+    },
+    /// Gradient norm exceeded the threshold.
+    ExplodingGradients {
+        grad_norm: f64,
+        threshold: f64,
+    },
+    /// Backward pass failed.
+    BackwardError(String),
+}
+
+impl std::fmt::Display for TrainingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TrainingError::DivergentLoss { consecutive_nan_steps, last_loss } =>
+                write!(f, "Divergent loss: {} consecutive NaN/Inf steps, last loss: {}", consecutive_nan_steps, last_loss),
+            TrainingError::ExplodingGradients { grad_norm, threshold } =>
+                write!(f, "Exploding gradients: norm {} exceeds threshold {}", grad_norm, threshold),
+            TrainingError::BackwardError(msg) => write!(f, "Backward error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for TrainingError {}
+
 /// Training configuration.
 #[derive(Debug, Clone)]
 pub struct TrainingConfig {
@@ -39,6 +70,10 @@ pub struct TrainingConfig {
     pub log_frequency: usize,
     /// Optional gradient checkpointing strategy.
     pub checkpoint_strategy: Option<CheckpointStrategy>,
+    /// Maximum allowed consecutive NaN/Inf loss steps before halting (default: 3).
+    pub max_divergent_steps: usize,
+    /// Maximum gradient norm before halting (0.0 = no limit).
+    pub max_grad_norm: f64,
 }
 
 impl Default for TrainingConfig {
@@ -52,6 +87,8 @@ impl Default for TrainingConfig {
             verbose: true,
             log_frequency: 100,
             checkpoint_strategy: None,
+            max_divergent_steps: 3,
+            max_grad_norm: 1e6,
         }
     }
 }
@@ -136,6 +173,10 @@ pub struct TrainingState {
     running_grad_norm: f64,
     /// Steps in current epoch.
     epoch_steps: usize,
+    /// Accumulated error from BoundedValue operations.
+    running_error: f64,
+    /// Count of consecutive NaN/Inf loss steps.
+    consecutive_divergent_steps: usize,
 }
 
 impl TrainingState {
@@ -147,15 +188,29 @@ impl TrainingState {
             running_loss: 0.0,
             running_grad_norm: 0.0,
             epoch_steps: 0,
+            running_error: 0.0,
+            consecutive_divergent_steps: 0,
         }
     }
 
-    /// Records metrics for a step.
-    pub fn record_step(&mut self, loss: f64, grad_norm: f64) {
-        self.running_loss += loss;
+    /// Records metrics for a step. Returns the number of consecutive divergent steps.
+    pub fn record_step(&mut self, loss: f64, grad_norm: f64, loss_error: f64) -> usize {
+        if loss.is_finite() {
+            self.running_loss += loss;
+            self.consecutive_divergent_steps = 0;
+        } else {
+            self.consecutive_divergent_steps += 1;
+        }
         self.running_grad_norm += grad_norm;
+        self.running_error += loss_error;
         self.epoch_steps += 1;
         self.global_step += 1;
+        self.consecutive_divergent_steps
+    }
+
+    /// Returns the number of consecutive divergent (NaN/Inf) loss steps.
+    pub fn consecutive_divergent_steps(&self) -> usize {
+        self.consecutive_divergent_steps
     }
 
     /// Finalizes epoch and returns metrics.
@@ -165,7 +220,7 @@ impl TrainingState {
             avg_loss: if self.epoch_steps > 0 { self.running_loss / self.epoch_steps as f64 } else { 0.0 },
             avg_grad_norm: if self.epoch_steps > 0 { self.running_grad_norm / self.epoch_steps as f64 } else { 0.0 },
             num_steps: self.epoch_steps,
-            total_error: 0.0, // Placeholder
+            total_error: self.running_error,
         };
 
         // Reset for next epoch
@@ -173,6 +228,7 @@ impl TrainingState {
         self.running_loss = 0.0;
         self.running_grad_norm = 0.0;
         self.epoch_steps = 0;
+        self.running_error = 0.0;
 
         metrics
     }
@@ -299,16 +355,24 @@ impl<O: Optimizer> Trainer<O> {
 
     /// Performs a single training step.
     ///
-    /// Returns the step metrics.
+    /// Returns the step metrics, or a TrainingError if training should halt.
     pub fn step(
         &mut self,
         loss_var: &Variable,
-    ) -> Result<StepMetrics, String> {
+    ) -> Result<StepMetrics, TrainingError> {
         // Compute gradients
-        let mut grads = backward(loss_var)?;
+        let mut grads = backward(loss_var).map_err(TrainingError::BackwardError)?;
 
         // Apply gradient clipping
         let grad_norm = self.config.grad_clip.apply(&mut grads);
+
+        // Check for exploding gradients
+        if self.config.max_grad_norm > 0.0 && grad_norm > self.config.max_grad_norm {
+            return Err(TrainingError::ExplodingGradients {
+                grad_norm,
+                threshold: self.config.max_grad_norm,
+            });
+        }
 
         // Accumulate gradients
         self.accumulator.accumulate(grads);
@@ -350,8 +414,16 @@ impl<O: Optimizer> Trainer<O> {
             0.0
         };
 
-        // Update state
-        self.state.record_step(loss_value, grad_norm);
+        // Update state with error tracking
+        let divergent_count = self.state.record_step(loss_value, grad_norm, loss_error);
+
+        // Check for divergent loss (NaN/Inf for consecutive steps)
+        if divergent_count >= self.config.max_divergent_steps {
+            return Err(TrainingError::DivergentLoss {
+                consecutive_nan_steps: divergent_count,
+                last_loss: loss_value,
+            });
+        }
 
         Ok(StepMetrics {
             loss: loss_value,
@@ -384,9 +456,18 @@ pub fn train_step(
     params: &mut HashMap<NodeIndex, BoundedTensor>,
     optimizer: &mut dyn Optimizer,
     grad_clip: &GradientClipConfig,
-) -> Result<f64, String> {
-    let mut grads = backward(loss)?;
-    grad_clip.apply(&mut grads);
+) -> Result<f64, TrainingError> {
+    let mut grads = backward(loss).map_err(TrainingError::BackwardError)?;
+    let grad_norm = grad_clip.apply(&mut grads);
+
+    // Check for NaN/Inf gradients
+    if !grad_norm.is_finite() {
+        return Err(TrainingError::ExplodingGradients {
+            grad_norm,
+            threshold: 0.0,
+        });
+    }
+
     optimizer.step(params, &grads);
 
     let loss_value = if !loss.tensor.is_empty() {
@@ -394,6 +475,13 @@ pub fn train_step(
     } else {
         0.0
     };
+
+    if !loss_value.is_finite() {
+        return Err(TrainingError::DivergentLoss {
+            consecutive_nan_steps: 1,
+            last_loss: loss_value,
+        });
+    }
 
     Ok(loss_value)
 }
@@ -427,15 +515,37 @@ mod tests {
     fn test_training_state() {
         let mut state = TrainingState::new();
 
-        state.record_step(0.5, 1.0);
-        state.record_step(0.4, 0.8);
-        state.record_step(0.3, 0.6);
+        state.record_step(0.5, 1.0, 0.01);
+        state.record_step(0.4, 0.8, 0.02);
+        state.record_step(0.3, 0.6, 0.01);
 
         let metrics = state.finalize_epoch();
 
         assert_eq!(metrics.epoch, 0);
         assert_eq!(metrics.num_steps, 3);
         assert!((metrics.avg_loss - 0.4).abs() < 1e-10);
+        assert!((metrics.total_error - 0.04).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_divergent_loss_detection() {
+        let mut state = TrainingState::new();
+
+        // Normal step
+        let div = state.record_step(0.5, 1.0, 0.01);
+        assert_eq!(div, 0);
+
+        // NaN steps
+        let div = state.record_step(f64::NAN, 1.0, 0.0);
+        assert_eq!(div, 1);
+        let div = state.record_step(f64::INFINITY, 1.0, 0.0);
+        assert_eq!(div, 2);
+        let div = state.record_step(f64::NAN, 1.0, 0.0);
+        assert_eq!(div, 3);
+
+        // Recovery
+        let div = state.record_step(0.3, 0.5, 0.01);
+        assert_eq!(div, 0);
     }
 
     #[test]

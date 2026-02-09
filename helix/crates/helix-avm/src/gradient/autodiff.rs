@@ -90,6 +90,10 @@ pub enum Operation {
         indices: Vec<usize>,
         embedding_dim: usize,
     },
+    /// Tanh activation: tanh(x)
+    Tanh(NodeIndex),
+    /// Leaky ReLU activation: max(alpha * x, x)
+    LeakyRelu(NodeIndex, f64),
     /// GELU activation: x * sigmoid(1.702 * x) (approximate form).
     Gelu(NodeIndex),
     /// Multi-head attention: Attention(Q, K, V).
@@ -454,6 +458,127 @@ impl Variable {
         };
 
         Self::with_op(result, op, tape)
+    }
+
+    /// Sigmoid activation.
+    pub fn sigmoid(&self) -> Variable {
+        let precision = helix_core::types::Precision::F32;
+        let result = crate::ops::sigmoid(&self.tensor, precision);
+        let op = if let (Some(idx), Some(_)) = (self.node_index, &self.tape) {
+            Operation::Sigmoid(idx)
+        } else {
+            Operation::Input
+        };
+        Self::with_op(result, op, self.tape.clone())
+    }
+
+    /// Softmax activation.
+    pub fn softmax(&self) -> Variable {
+        let precision = helix_core::types::Precision::F32;
+        let result = crate::ops::softmax::softmax(&self.tensor, precision)
+            .unwrap_or_else(|_| self.tensor.clone());
+        let op = if let (Some(idx), Some(_)) = (self.node_index, &self.tape) {
+            Operation::Softmax(idx)
+        } else {
+            Operation::Input
+        };
+        Self::with_op(result, op, self.tape.clone())
+    }
+
+    /// Tanh activation.
+    pub fn tanh(&self) -> Variable {
+        let precision = helix_core::types::Precision::F32;
+        let result = crate::ops::tanh(&self.tensor, precision);
+        let op = if let (Some(idx), Some(_)) = (self.node_index, &self.tape) {
+            Operation::Tanh(idx)
+        } else {
+            Operation::Input
+        };
+        Self::with_op(result, op, self.tape.clone())
+    }
+
+    /// Leaky ReLU activation.
+    pub fn leaky_relu(&self, alpha: f64) -> Variable {
+        let result = crate::ops::leaky_relu(&self.tensor, alpha);
+        let op = if let (Some(idx), Some(_)) = (self.node_index, &self.tape) {
+            Operation::LeakyRelu(idx, alpha)
+        } else {
+            Operation::Input
+        };
+        Self::with_op(result, op, self.tape.clone())
+    }
+
+    /// Element-wise subtraction.
+    pub fn sub(&self, other: &Variable) -> Variable {
+        let result = self.tensor.sub(&other.tensor);
+        let tape = merge_tapes(&self.tape, &other.tape);
+        let op = if let (Some(lhs), Some(rhs), Some(_)) = (self.node_index, other.node_index, &tape) {
+            Operation::Sub(lhs, rhs)
+        } else {
+            Operation::Input
+        };
+        Self::with_op(result, op, tape)
+    }
+
+    /// Element-wise multiplication.
+    pub fn mul(&self, other: &Variable) -> Variable {
+        let result = self.tensor.hadamard(&other.tensor);
+        let tape = merge_tapes(&self.tape, &other.tape);
+        let op = if let (Some(lhs), Some(rhs), Some(_)) = (self.node_index, other.node_index, &tape) {
+            Operation::Mul(lhs, rhs)
+        } else {
+            Operation::Input
+        };
+        Self::with_op(result, op, tape)
+    }
+
+    /// Element-wise division.
+    pub fn div(&self, other: &Variable) -> Variable {
+        let result_data: Vec<_> = self.tensor.data().iter()
+            .zip(other.tensor.data().iter())
+            .map(|(a, b)| {
+                let denom = b.value();
+                let clamped = if denom.abs() < 1e-12 {
+                    if denom >= 0.0 { 1e-12 } else { -1e-12 }
+                } else { denom };
+                let val = a.value() / clamped;
+                let err = a.absolute_error() / clamped.abs()
+                    + a.value().abs() * b.absolute_error() / (clamped * clamped);
+                helix_core::types::BoundedValue::new(val, helix_core::types::ErrorMargin::absolute(err))
+            })
+            .collect();
+        let result = helix_core::types::BoundedTensor::new(result_data, self.tensor.shape().clone());
+        let tape = merge_tapes(&self.tape, &other.tape);
+        let op = if let (Some(lhs), Some(rhs), Some(_)) = (self.node_index, other.node_index, &tape) {
+            Operation::Div(lhs, rhs)
+        } else {
+            Operation::Input
+        };
+        Self::with_op(result, op, tape)
+    }
+
+    /// Sum reduction to scalar.
+    pub fn sum(&self) -> Variable {
+        let result_val = crate::ops::reduction::sum(&self.tensor);
+        let result = helix_core::types::BoundedTensor::new(vec![result_val], vec![1]);
+        let op = if let (Some(idx), Some(_)) = (self.node_index, &self.tape) {
+            Operation::Sum(idx)
+        } else {
+            Operation::Input
+        };
+        Self::with_op(result, op, self.tape.clone())
+    }
+
+    /// Mean reduction to scalar.
+    pub fn mean(&self) -> Variable {
+        let result_val = crate::ops::reduction::mean(&self.tensor);
+        let result = helix_core::types::BoundedTensor::new(vec![result_val], vec![1]);
+        let op = if let (Some(idx), Some(_)) = (self.node_index, &self.tape) {
+            Operation::Mean(idx)
+        } else {
+            Operation::Input
+        };
+        Self::with_op(result, op, self.tape.clone())
     }
 
     /// GELU activation: x * sigmoid(1.702 * x) (approximate form).

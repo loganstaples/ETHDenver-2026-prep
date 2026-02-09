@@ -9,7 +9,7 @@ pub mod reduction;
 pub mod softmax;
 
 pub use activation::{gelu, leaky_relu, relu, sigmoid, tanh};
-pub use basic::{add, mul, neg, scale, sub, BasicOpError};
+pub use basic::{add, div, mul, neg, scale, sub, BasicOpError};
 pub use conv::{
     // Core convolution
     conv1d, conv2d, conv2d_with_config, conv2d_transpose, conv2d_transpose_with_config,

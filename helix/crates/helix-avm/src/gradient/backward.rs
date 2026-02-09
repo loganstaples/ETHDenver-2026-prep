@@ -543,6 +543,48 @@ pub fn backward(loss: &Variable) -> Result<HashMap<NodeIndex, BoundedTensor>, St
                     accumulate_grad(&mut grads, *table, &grad_table);
                 }
             }
+            Operation::Tanh(input_idx) => {
+                // y = tanh(x)
+                // dL/dx = dL/dy * (1 - tanh^2(x)) = dL/dy * (1 - y^2)
+                let current_node = &tape.nodes[idx];
+                if let Some(output_val) = &current_node.cached_value {
+                    let grad_input_data: Vec<BoundedValue<f64>> = output_val.data()
+                        .iter()
+                        .zip(grad_output.data().iter())
+                        .map(|(y, g)| {
+                            let y_val = y.value();
+                            let derivative = 1.0 - y_val * y_val;
+                            let grad_val = g.value() * derivative;
+                            let error = g.absolute_error() * derivative.abs()
+                                + g.value().abs() * 2.0 * y_val.abs() * y.absolute_error();
+                            BoundedValue::new(grad_val, helix_core::types::ErrorMargin::absolute(error))
+                        })
+                        .collect();
+
+                    let grad_input = BoundedTensor::new(grad_input_data, output_val.shape().clone());
+                    accumulate_grad(&mut grads, *input_idx, &grad_input);
+                }
+            }
+            Operation::LeakyRelu(input_idx, alpha) => {
+                // y = x if x > 0, alpha * x if x <= 0
+                // dL/dx = dL/dy * (1 if x > 0, alpha if x <= 0)
+                let input_node = &tape.nodes[*input_idx];
+                if let Some(input_val) = &input_node.cached_value {
+                    let grad_input_data: Vec<BoundedValue<f64>> = input_val.data()
+                        .iter()
+                        .zip(grad_output.data().iter())
+                        .map(|(x, g)| {
+                            let slope = if x.value() > 0.0 { 1.0 } else { *alpha };
+                            let grad_val = g.value() * slope;
+                            let error = g.absolute_error() * slope.abs();
+                            BoundedValue::new(grad_val, helix_core::types::ErrorMargin::absolute(error))
+                        })
+                        .collect();
+
+                    let grad_input = BoundedTensor::new(grad_input_data, input_val.shape().clone());
+                    accumulate_grad(&mut grads, *input_idx, &grad_input);
+                }
+            }
             Operation::Gelu(input_idx) => {
                 // GELU(x) ~ x * sigmoid(1.702 * x)
                 // d/dx GELU(x) ~ sigmoid(1.702*x) + x * 1.702 * sigmoid(1.702*x) * (1 - sigmoid(1.702*x))

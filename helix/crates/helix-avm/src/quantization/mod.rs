@@ -74,7 +74,7 @@ pub use int8_ops::{
     compute_quantization_error, int8_add, int8_batched_matmul, int8_concat, int8_gelu,
     int8_layer_norm, int8_leaky_relu, int8_linear, int8_matmul, int8_matvec, int8_mean,
     int8_mul, int8_relu, int8_requantize, int8_rms_norm, int8_scale, int8_sigmoid, int8_silu,
-    int8_softmax, int8_sub, int8_sum, int8_tanh, QuantizationErrorMetrics,
+    int8_softmax, int8_sub, int8_sum, int8_tanh, QuantizationErrorMetrics, QuantizedOpError,
 };
 pub use int8_tensor::{Int8Tensor, Int8TensorBuilder, Int8TensorStats};
 pub use mixed_precision::{

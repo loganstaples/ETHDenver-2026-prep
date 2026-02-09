@@ -1,6 +1,6 @@
 //! Basic element-wise tensor operations.
 
-use helix_core::types::{BoundedTensor, BoundedValue};
+use helix_core::types::{BoundedTensor, BoundedValue, ErrorMargin};
 use thiserror::Error;
 
 /// Errors from basic operations.
@@ -54,6 +54,37 @@ pub fn neg(a: &BoundedTensor) -> BoundedTensor {
         .map(|v| BoundedValue::new(-v.value(), v.error()))
         .collect();
     BoundedTensor::new(data, a.shape().clone())
+}
+
+/// Element-wise division with near-zero clamping.
+pub fn div(a: &BoundedTensor, b: &BoundedTensor) -> Result<BoundedTensor, BasicOpError> {
+    if a.shape() != b.shape() {
+        return Err(BasicOpError::ShapeMismatch(
+            a.shape().clone(),
+            b.shape().clone(),
+        ));
+    }
+
+    const NEAR_ZERO: f64 = 1e-12;
+    let data: Vec<_> = a
+        .data()
+        .iter()
+        .zip(b.data().iter())
+        .map(|(av, bv)| {
+            let denom = bv.value();
+            let clamped_denom = if denom.abs() < NEAR_ZERO {
+                if denom >= 0.0 { NEAR_ZERO } else { -NEAR_ZERO }
+            } else {
+                denom
+            };
+            let val = av.value() / clamped_denom;
+            // Error: |a_err/b| + |a * b_err / b^2|
+            let error = av.absolute_error() / clamped_denom.abs()
+                + av.value().abs() * bv.absolute_error() / (clamped_denom * clamped_denom);
+            BoundedValue::new(val, ErrorMargin::absolute(error))
+        })
+        .collect();
+    Ok(BoundedTensor::new(data, a.shape().clone()))
 }
 
 /// Scalar multiplication.

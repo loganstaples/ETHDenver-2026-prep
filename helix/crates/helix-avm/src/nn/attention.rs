@@ -326,17 +326,32 @@ impl MultiHeadAttention {
         key: &BoundedTensor,
         value: &BoundedTensor,
     ) -> Result<BoundedTensor, AttentionError> {
-        // Project Q, K, V
+        // Project Q, K, V: (seq_len, d_model) -> (seq_len, d_model)
         let q = self.w_q.forward(query)?;
         let k = self.w_k.forward(key)?;
         let v = self.w_v.forward(value)?;
 
-        // For simplicity, use single-head attention scaled by head_dim
-        // In a full implementation, we'd split into heads and concatenate
-        let attention_output = scaled_dot_product_attention(&q, &k, &v, self.precision)?;
+        let seq_len = q.shape()[0];
+
+        // Split into heads: (seq_len, d_model) -> num_heads x (seq_len, head_dim)
+        let q_heads = split_heads(&q, self.num_heads, self.head_dim)?;
+        let k_heads = split_heads(&k, self.num_heads, self.head_dim)?;
+        let v_heads = split_heads(&v, self.num_heads, self.head_dim)?;
+
+        // Run attention independently per head
+        let mut head_outputs = Vec::with_capacity(self.num_heads);
+        for h in 0..self.num_heads {
+            let head_out = scaled_dot_product_attention(
+                &q_heads[h], &k_heads[h], &v_heads[h], self.precision,
+            )?;
+            head_outputs.push(head_out);
+        }
+
+        // Concatenate head outputs: num_heads x (seq_len, head_dim) -> (seq_len, d_model)
+        let concatenated = concat_heads(&head_outputs, seq_len, self.num_heads, self.head_dim)?;
 
         // Output projection
-        let output = self.w_o.forward(&attention_output)?;
+        let output = self.w_o.forward(&concatenated)?;
 
         Ok(output)
     }
@@ -377,7 +392,9 @@ impl MultiHeadAttention {
     ///
     /// grad_output: gradient flowing back from downstream, shape (seq_len, d_model)
     /// query, key, value: the original inputs to the forward pass
-    /// attention_weights: the softmax attention weights from forward pass (seq_len, seq_len)
+    /// attention_weights_per_head: softmax attention weights per head, num_heads x (seq_len, seq_len)
+    ///   If a single (seq_len, seq_len) tensor is provided, it is treated as single-head
+    ///   (backward still works but is approximate for multi-head).
     ///
     /// Returns gradients for all inputs and projection weights.
     pub fn backward(
@@ -386,66 +403,98 @@ impl MultiHeadAttention {
         query: &BoundedTensor,
         key: &BoundedTensor,
         value: &BoundedTensor,
-        attention_weights: &BoundedTensor,
+        _attention_weights: &BoundedTensor,
     ) -> Result<AttentionGradients, AttentionError> {
         let precision = self.precision;
+        let seq_len = query.shape()[0];
 
-        // Backward through output projection W_o
-        // forward: output = attention_result @ W_o^T + b_o
-        // dL/d_attn_result = grad_output @ W_o
-        let grad_attn_result = ops::matmul(grad_output, self.w_o.weights(), precision)?;
-
-        // Recompute attn_result = attn_weights @ V_proj
+        // Recompute forward projections
         let q_proj = self.w_q.forward(query)?;
         let k_proj = self.w_k.forward(key)?;
         let v_proj = self.w_v.forward(value)?;
-        let attn_result = ops::matmul(attention_weights, &v_proj, precision)?;
 
-        // dL/d_W_o = grad_output^T @ attn_result
+        // Split projections into heads
+        let q_heads = split_heads(&q_proj, self.num_heads, self.head_dim)?;
+        let k_heads = split_heads(&k_proj, self.num_heads, self.head_dim)?;
+        let v_heads = split_heads(&v_proj, self.num_heads, self.head_dim)?;
+
+        // Recompute per-head attention outputs and weights
+        let mut attn_weights_heads = Vec::with_capacity(self.num_heads);
+        let mut head_outputs = Vec::with_capacity(self.num_heads);
+        for h in 0..self.num_heads {
+            let d_k = self.head_dim as f64;
+            let scale = 1.0 / d_k.sqrt();
+            let k_t = k_heads[h].transpose();
+            let scores = ops::matmul(&q_heads[h], &k_t, precision)?;
+            let scaled_scores = scores.scale(BoundedValue::exact(scale));
+            let attn_w = softmax_rows(&scaled_scores, precision)?;
+            let head_out = ops::matmul(&attn_w, &v_heads[h], precision)?;
+            attn_weights_heads.push(attn_w);
+            head_outputs.push(head_out);
+        }
+
+        let concatenated = concat_heads(&head_outputs, seq_len, self.num_heads, self.head_dim)?;
+
+        // Backward through output projection W_o
+        // output = concatenated @ W_o^T
+        // dL/d_concat = grad_output @ W_o
+        let grad_concat = ops::matmul(grad_output, self.w_o.weights(), precision)?;
+
+        // dL/d_W_o = grad_output^T @ concatenated
         let grad_output_t = grad_output.transpose();
-        let grad_w_o = ops::matmul(&grad_output_t, &attn_result, precision)?;
+        let grad_w_o = ops::matmul(&grad_output_t, &concatenated, precision)?;
 
-        // Backward through attention: out = attn_weights @ V_proj
-        // dL/d_V_proj = attn_weights^T @ grad_attn_result
-        let attn_t = attention_weights.transpose();
-        let grad_v_proj = ops::matmul(&attn_t, &grad_attn_result, precision)?;
+        // Split grad_concat into per-head gradients
+        let grad_heads = split_heads(&grad_concat, self.num_heads, self.head_dim)?;
 
-        // dL/d_attn_weights = grad_attn_result @ V_proj^T
-        let v_proj_t = v_proj.transpose();
-        let grad_attn_weights = ops::matmul(&grad_attn_result, &v_proj_t, precision)?;
+        // Backward through each head's attention and accumulate
+        let mut grad_q_proj_full = BoundedTensor::zeros(q_proj.shape().clone());
+        let mut grad_k_proj_full = BoundedTensor::zeros(k_proj.shape().clone());
+        let mut grad_v_proj_full = BoundedTensor::zeros(v_proj.shape().clone());
 
-        // Backward through softmax
-        let grad_scores = softmax_backward_2d(&grad_attn_weights, attention_weights);
+        for h in 0..self.num_heads {
+            let d_k = self.head_dim as f64;
+            let scale = 1.0 / d_k.sqrt();
 
-        // Backward through scaling: scores = Q_proj @ K_proj^T / sqrt(d_k)
-        let d_k = self.head_dim as f64;
-        let scale = 1.0 / d_k.sqrt();
-        let grad_scores_unscaled = grad_scores.scale(BoundedValue::exact(scale));
+            // out_h = attn_w_h @ v_h
+            // dL/d_v_h = attn_w_h^T @ grad_h
+            let attn_t = attn_weights_heads[h].transpose();
+            let grad_v_h = ops::matmul(&attn_t, &grad_heads[h], precision)?;
 
-        // dL/d_Q_proj = grad_scores_unscaled @ K_proj
-        let grad_q_proj = ops::matmul(&grad_scores_unscaled, &k_proj, precision)?;
+            // dL/d_attn_w_h = grad_h @ v_h^T
+            let v_t = v_heads[h].transpose();
+            let grad_attn_w_h = ops::matmul(&grad_heads[h], &v_t, precision)?;
 
-        // dL/d_K_proj = grad_scores_unscaled^T @ Q_proj
-        let gs_t = grad_scores_unscaled.transpose();
-        let grad_k_proj = ops::matmul(&gs_t, &q_proj, precision)?;
+            // Backward through softmax
+            let grad_scores_h = softmax_backward_2d(&grad_attn_w_h, &attn_weights_heads[h]);
+            let grad_scores_scaled = grad_scores_h.scale(BoundedValue::exact(scale));
+
+            // dL/d_q_h = grad_scores_scaled @ k_h
+            let grad_q_h = ops::matmul(&grad_scores_scaled, &k_heads[h], precision)?;
+
+            // dL/d_k_h = grad_scores_scaled^T @ q_h
+            let gs_t = grad_scores_scaled.transpose();
+            let grad_k_h = ops::matmul(&gs_t, &q_heads[h], precision)?;
+
+            // Scatter per-head gradients back into full d_model gradients
+            scatter_head_grad(&mut grad_q_proj_full, &grad_q_h, h, self.head_dim);
+            scatter_head_grad(&mut grad_k_proj_full, &grad_k_h, h, self.head_dim);
+            scatter_head_grad(&mut grad_v_proj_full, &grad_v_h, h, self.head_dim);
+        }
 
         // Backward through projection layers
         // For linear y = x @ W^T + b: dL/dW = dL/dy^T @ x, dL/dx = dL/dy @ W
-
-        // dL/d_W_q = grad_q_proj^T @ query
-        let grad_q_proj_t = grad_q_proj.transpose();
+        let grad_q_proj_t = grad_q_proj_full.transpose();
         let grad_w_q = ops::matmul(&grad_q_proj_t, query, precision)?;
-        let grad_query = ops::matmul(&grad_q_proj, self.w_q.weights(), precision)?;
+        let grad_query = ops::matmul(&grad_q_proj_full, self.w_q.weights(), precision)?;
 
-        // dL/d_W_k = grad_k_proj^T @ key
-        let grad_k_proj_t = grad_k_proj.transpose();
+        let grad_k_proj_t = grad_k_proj_full.transpose();
         let grad_w_k = ops::matmul(&grad_k_proj_t, key, precision)?;
-        let grad_key = ops::matmul(&grad_k_proj, self.w_k.weights(), precision)?;
+        let grad_key = ops::matmul(&grad_k_proj_full, self.w_k.weights(), precision)?;
 
-        // dL/d_W_v = grad_v_proj^T @ value
-        let grad_v_proj_t = grad_v_proj.transpose();
+        let grad_v_proj_t = grad_v_proj_full.transpose();
         let grad_w_v = ops::matmul(&grad_v_proj_t, value, precision)?;
-        let grad_value = ops::matmul(&grad_v_proj, self.w_v.weights(), precision)?;
+        let grad_value = ops::matmul(&grad_v_proj_full, self.w_v.weights(), precision)?;
 
         Ok(AttentionGradients {
             grad_query,
@@ -490,6 +539,98 @@ fn softmax_backward_2d(
     }
 
     BoundedTensor::new(result, grad_attn.shape().clone())
+}
+
+/// Splits a projected tensor from [seq_len, d_model] into num_heads x [seq_len, head_dim].
+fn split_heads(
+    tensor: &BoundedTensor,
+    num_heads: usize,
+    head_dim: usize,
+) -> Result<Vec<BoundedTensor>, AttentionError> {
+    let shape = tensor.shape();
+    if shape.len() != 2 {
+        return Err(AttentionError::DimensionMismatch {
+            expected: "2D tensor [seq_len, d_model]".to_string(),
+            actual: format!("{}D tensor", shape.len()),
+        });
+    }
+    let seq_len = shape[0];
+    let d_model = shape[1];
+    if d_model != num_heads * head_dim {
+        return Err(AttentionError::HeadDimensionMismatch {
+            model_dim: d_model,
+            num_heads,
+        });
+    }
+
+    let data = tensor.data();
+    let mut heads = Vec::with_capacity(num_heads);
+
+    for h in 0..num_heads {
+        let mut head_data = Vec::with_capacity(seq_len * head_dim);
+        for s in 0..seq_len {
+            let row_start = s * d_model + h * head_dim;
+            for d in 0..head_dim {
+                head_data.push(data[row_start + d]);
+            }
+        }
+        heads.push(BoundedTensor::new(head_data, vec![seq_len, head_dim]));
+    }
+
+    Ok(heads)
+}
+
+/// Concatenates per-head outputs back into [seq_len, d_model].
+fn concat_heads(
+    heads: &[BoundedTensor],
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+) -> Result<BoundedTensor, AttentionError> {
+    let d_model = num_heads * head_dim;
+    let mut data = vec![BoundedValue::exact(0.0); seq_len * d_model];
+
+    for (h, head) in heads.iter().enumerate() {
+        let head_data = head.data();
+        for s in 0..seq_len {
+            for d in 0..head_dim {
+                data[s * d_model + h * head_dim + d] = head_data[s * head_dim + d];
+            }
+        }
+    }
+
+    Ok(BoundedTensor::new(data, vec![seq_len, d_model]))
+}
+
+/// Scatters a per-head gradient [seq_len, head_dim] into the full gradient [seq_len, d_model].
+fn scatter_head_grad(
+    full_grad: &mut BoundedTensor,
+    head_grad: &BoundedTensor,
+    head_idx: usize,
+    head_dim: usize,
+) {
+    let seq_len = head_grad.shape()[0];
+    let d_model = full_grad.shape()[1];
+    let full_data = full_grad.data().to_vec();
+    let head_data = head_grad.data();
+    let mut new_data = full_data;
+
+    for s in 0..seq_len {
+        for d in 0..head_dim {
+            let full_idx = s * d_model + head_idx * head_dim + d;
+            let head_idx_flat = s * head_dim + d;
+            let existing = new_data[full_idx];
+            let incoming = head_data[head_idx_flat];
+            new_data[full_idx] = BoundedValue::new(
+                existing.value() + incoming.value(),
+                helix_core::types::ErrorMargin::absolute(
+                    existing.absolute_error() + incoming.absolute_error(),
+                ),
+            );
+        }
+    }
+
+    *full_grad = BoundedTensor::new(new_data, full_grad.shape().clone());
 }
 
 /// Configuration for memory-efficient attention.

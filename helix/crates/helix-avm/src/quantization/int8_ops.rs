@@ -10,8 +10,19 @@
 //! 3. Requantize to INT8 for storage
 
 use helix_core::types::BoundedTensor;
+use thiserror::Error;
 
 use super::int8_tensor::Int8Tensor;
+
+/// Errors from quantized operations.
+#[derive(Error, Debug)]
+pub enum QuantizedOpError {
+    #[error("Unsupported tensor shape combination for batched matmul: {a_shape:?} @ {b_shape:?}")]
+    UnsupportedShape {
+        a_shape: Vec<usize>,
+        b_shape: Vec<usize>,
+    },
+}
 
 // ============================================================================
 // Matrix Operations
@@ -78,7 +89,7 @@ pub fn int8_batched_matmul(
     a: &Int8Tensor,
     b: &Int8Tensor,
     output_scale: f64,
-) -> Int8Tensor {
+) -> Result<Int8Tensor, QuantizedOpError> {
     let a_shape = a.shape();
     let b_shape = b.shape();
 
@@ -122,7 +133,7 @@ pub fn int8_batched_matmul(
             }
 
             let error = k as f64 * a.quantization_error() * b.quantization_error() + output_scale / 2.0;
-            Int8Tensor::new(output, vec![batch, m, n], output_scale, 0, true).with_error(error)
+            Ok(Int8Tensor::new(output, vec![batch, m, n], output_scale, 0, true).with_error(error))
         }
         (3, 2) => {
             // Broadcast: [batch, M, K] @ [K, N]
@@ -161,16 +172,16 @@ pub fn int8_batched_matmul(
             }
 
             let error = k as f64 * a.quantization_error() * b.quantization_error() + output_scale / 2.0;
-            Int8Tensor::new(output, vec![batch, m, n], output_scale, 0, true).with_error(error)
+            Ok(Int8Tensor::new(output, vec![batch, m, n], output_scale, 0, true).with_error(error))
         }
         (2, 2) => {
             // Standard 2D matmul
-            int8_matmul(a, b, output_scale)
+            Ok(int8_matmul(a, b, output_scale))
         }
-        _ => panic!(
-            "Unsupported tensor shapes for batched matmul: {:?} @ {:?}",
-            a_shape, b_shape
-        ),
+        _ => Err(QuantizedOpError::UnsupportedShape {
+            a_shape: a_shape.to_vec(),
+            b_shape: b_shape.to_vec(),
+        }),
     }
 }
 

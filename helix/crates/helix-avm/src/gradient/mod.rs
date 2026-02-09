@@ -39,7 +39,7 @@ pub use optimizer::{
     Adam, CosineAnnealingLR, ExponentialLR, LRScheduler, LinearWarmupCosineDecay, OneCycleLR,
     Optimizer, PolynomialLR, SGD, StepLR, WarmupScheduler,
 };
-pub use training::{EpochMetrics, StepMetrics, Trainer, TrainingConfig, TrainingState};
+pub use training::{EpochMetrics, StepMetrics, Trainer, TrainingConfig, TrainingError, TrainingState, train_step};
 
 /// Prelude for convenient imports.
 pub mod prelude {
