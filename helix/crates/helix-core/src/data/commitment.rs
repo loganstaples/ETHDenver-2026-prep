@@ -319,7 +319,6 @@ impl BatchCommitment {
         bytes.extend_from_slice(&(self.batch_index as u64).to_le_bytes());
         bytes.extend_from_slice(&(self.sample_count as u64).to_le_bytes());
         bytes.extend_from_slice(self.dataset_commitment_id.as_bytes());
-        Ok::<(), ()>(()).unwrap();
         bytes
     }
 
