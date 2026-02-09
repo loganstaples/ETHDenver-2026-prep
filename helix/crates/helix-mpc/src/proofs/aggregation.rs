@@ -279,6 +279,7 @@ impl MPCProof for AggregationProof {
         for commit in &self.weight_proof.weight_commitments {
             bytes.extend_from_slice(&commit.to_bytes_le());
         }
+        bytes.extend_from_slice(&self.weight_proof.application_proof.to_bytes_le());
 
         // Metadata.
         bytes.extend_from_slice(&self.round.to_le_bytes());
@@ -348,9 +349,12 @@ impl MPCProof for AggregationProof {
             offset += 32;
             weight_commitments.push(Fr::from_bytes_le(&commit_bytes));
         }
+        let mut app_proof_bytes = [0u8; 32];
+        app_proof_bytes.copy_from_slice(&bytes[offset..offset + 32]);
+        offset += 32;
         let weight_proof = WeightProof {
             weight_commitments,
-            application_proof: Fr::ZERO,
+            application_proof: Fr::from_bytes_le(&app_proof_bytes),
         };
 
         // Metadata.
