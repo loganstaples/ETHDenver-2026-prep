@@ -134,11 +134,11 @@ impl TrainingStepProver {
         d_in: usize,
         d_hid: usize,
         d_out: usize,
-    ) -> &MLTrainingProver {
+    ) -> Result<&MLTrainingProver, String> {
         if self.ml_prover.is_none() {
             self.ml_prover = Some(MLTrainingProver::new(k, d_in, d_hid, d_out));
         }
-        self.ml_prover.as_ref().unwrap()
+        self.ml_prover.as_ref().ok_or_else(|| "ML prover initialization failed".to_string())
     }
 
     /// Proves a single training step (forward + backward + weight update).
@@ -169,7 +169,8 @@ impl TrainingStepProver {
         let parallel_prover = ParallelProver::with_config(self.config.parallel.clone());
         parallel_prover.submit_batch(all_chunks);
         parallel_prover.start();
-        let chunk_proofs = parallel_prover.wait_all();
+        let chunk_proofs = parallel_prover.wait_all()
+            .map_err(|e| format!("Batch proving failed: {e}"))?;
         parallel_prover.stop();
 
         // 3. Aggregate proofs
@@ -234,10 +235,10 @@ impl TrainingStepProver {
         k: u32,
     ) -> Result<MLTrainingStepProof, String> {
         self.step_count += 1;
+        let current_step = self.step_count;
 
         // 1. Build witness and generate ML proof.
-        self.ensure_ml_prover(k, data.d_in, data.d_hid, data.d_out);
-        let ml_prover = self.ml_prover.as_ref().unwrap();
+        let ml_prover = self.ensure_ml_prover(k, data.d_in, data.d_hid, data.d_out)?;
 
         let witness = MLTrainingProver::build_witness(
             data.d_in,
@@ -250,7 +251,7 @@ impl TrainingStepProver {
             &data.w2,
             &data.b2,
             data.lr,
-            self.step_count,
+            current_step,
         );
         let ml_result = ml_prover.prove(&witness);
 

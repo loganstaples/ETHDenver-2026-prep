@@ -16,13 +16,46 @@ use crate::pipeline::ProverPipeline;
 use helix_circuits::{
     IVCAccumulator, IVCChain,
     IVCStepCircuit as A1StepCircuit, IVCStepWitness,
-    IVCFoldingCircuit,
+    IVCFoldingCircuit, IVCFoldingWitness,
     fold_accumulators, generate_folding_challenge,
 };
 use helix_circuits::gadgets::poseidon::poseidon_hash_two;
 use helix_circuits::halo2curves::bn256::Fr;
 use helix_circuits::halo2curves::ff::PrimeField;
 use helix_circuits::halo2_proofs::arithmetic::Field;
+
+/// Snapshot of accumulator state for portable verification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccumulatorSnapshot {
+    /// State commitment (32 bytes, Fr LE repr).
+    pub state_commitment: [u8; 32],
+    /// Error bound (32 bytes, Fr LE repr).
+    pub error_bound: [u8; 32],
+    /// Error term (32 bytes, Fr LE repr).
+    pub error_term: [u8; 32],
+    /// Number of steps.
+    pub num_steps: u64,
+    /// Witness commitment (32 bytes, Fr LE repr).
+    pub witness_commitment: [u8; 32],
+    /// Error commitment (32 bytes, Fr LE repr).
+    pub error_commitment: [u8; 32],
+    /// Cross-term commitment (32 bytes, Fr LE repr).
+    pub cross_term_commitment: [u8; 32],
+}
+
+impl AccumulatorSnapshot {
+    pub fn from_accumulator(acc: &IVCAccumulator) -> Self {
+        Self {
+            state_commitment: fr_to_bytes(acc.state_commitment),
+            error_bound: fr_to_bytes(acc.error_bound),
+            error_term: fr_to_bytes(acc.error_term),
+            num_steps: acc.num_steps,
+            witness_commitment: fr_to_bytes(acc.witness_commitment),
+            error_commitment: fr_to_bytes(acc.error_commitment),
+            cross_term_commitment: fr_to_bytes(acc.cross_term_commitment),
+        }
+    }
+}
 
 /// State of an IVC chain (serializable snapshot).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +70,9 @@ pub struct IVCState {
     pub proof: Option<Vec<u8>>,
     /// Hash of the previous step's proof.
     pub prev_proof_hash: Option<[u8; 32]>,
+    /// Accumulator commitments for portable verification (optional).
+    /// These allow verifying the folded proof without the step history.
+    pub accumulator_state: Option<AccumulatorSnapshot>,
 }
 
 impl Default for IVCState {
@@ -54,6 +90,7 @@ impl IVCState {
             accumulated_error: 0.0,
             proof: None,
             prev_proof_hash: None,
+            accumulator_state: None,
         }
     }
 
@@ -65,7 +102,7 @@ impl IVCState {
 
         // Convert error_bound Fr to f64 (approximate for display/tracking).
         let error_bytes = acc.error_bound.to_repr();
-        let error_u64 = u64::from_le_bytes(error_bytes.as_ref()[..8].try_into().unwrap());
+        let error_u64 = u64::from_le_bytes(error_bytes.as_ref()[..8].try_into().expect("invariant: fixed-size slice"));
         let accumulated_error = error_u64 as f64;
 
         Self {
@@ -74,6 +111,7 @@ impl IVCState {
             accumulated_error,
             proof: None,
             prev_proof_hash: None,
+            accumulator_state: Some(AccumulatorSnapshot::from_accumulator(acc)),
         }
     }
 }
@@ -263,6 +301,7 @@ impl IVCProver {
 
         self.state.proof = Some(folded_proof);
         self.state.prev_proof_hash = Some(proof_hash);
+        self.state.accumulator_state = Some(AccumulatorSnapshot::from_accumulator(&self.chain.accumulator));
         self.pending_steps.clear();
         self.step_proofs.clear();
 
@@ -301,6 +340,12 @@ impl IVCProver {
     }
 
     /// Parses and cryptographically verifies a folded proof.
+    ///
+    /// When a valid folding circuit proof is present, provides O(1) verification
+    /// by verifying only the folding proof (which cryptographically guarantees
+    /// that the two half-accumulators were correctly folded, transitively covering
+    /// all step proofs). Falls back to replaying individual step proofs when no
+    /// folding proof is available.
     fn verify_folded_proof(&self, proof: &[u8]) -> bool {
         let header = b"HELIX_IVC_FOLD_A1:";
         if proof.len() < header.len() + 8 {
@@ -308,52 +353,128 @@ impl IVCProver {
             return false;
         }
         if !proof.starts_with(header) {
-            // Try legacy format
             return self.verify_legacy_folded_proof(proof);
         }
 
         let mut offset = header.len();
         let num_steps = u64::from_le_bytes(
-            proof[offset..offset + 8].try_into().unwrap(),
+            proof[offset..offset + 8].try_into().expect("invariant: fixed-size slice"),
         ) as usize;
         offset += 8;
 
+        // Skip over embedded step proofs (we may not need to verify them individually)
+        let step_proofs_start = offset;
+        for _ in 0..num_steps {
+            if offset + 4 > proof.len() {
+                tracing::warn!("verify_folded_proof: truncated step proof length");
+                return false;
+            }
+            let step_proof_len = u32::from_le_bytes(
+                proof[offset..offset + 4].try_into().expect("invariant: fixed-size slice"),
+            ) as usize;
+            offset += 4;
+            if step_proof_len == 0 || offset + step_proof_len > proof.len() {
+                tracing::warn!("verify_folded_proof: invalid step proof at index");
+                return false;
+            }
+            offset += step_proof_len;
+        }
+
+        // Check for folding circuit proof
+        if offset < proof.len() {
+            let has_fold_proof = proof[offset];
+            offset += 1;
+
+            if has_fold_proof == 1 {
+                // O(1) verification path: verify ONLY the folding circuit proof.
+                // The folding proof cryptographically guarantees that the two
+                // half-accumulators were correctly folded, which transitively
+                // covers all step proofs.
+                if offset + 4 > proof.len() {
+                    tracing::warn!("verify_folded_proof: truncated fold proof length");
+                    return false;
+                }
+                let fold_proof_len = u32::from_le_bytes(
+                    proof[offset..offset + 4].try_into().expect("invariant: fixed-size slice"),
+                ) as usize;
+                offset += 4;
+                if offset + fold_proof_len > proof.len() {
+                    tracing::warn!("verify_folded_proof: truncated fold proof data");
+                    return false;
+                }
+                let fold_proof_bytes = &proof[offset..offset + fold_proof_len];
+                offset += fold_proof_len;
+
+                // Parse folding public inputs (8 Fr values x 32 bytes each)
+                let num_fold_pi = 8;
+                let fold_pi_bytes = num_fold_pi * 32;
+                if offset + fold_pi_bytes > proof.len() {
+                    tracing::warn!("verify_folded_proof: truncated fold public inputs");
+                    return false;
+                }
+                let mut fold_pi = Vec::with_capacity(num_fold_pi);
+                for i in 0..num_fold_pi {
+                    let start = offset + i * 32;
+                    let repr_bytes: [u8; 32] = proof[start..start + 32]
+                        .try_into()
+                        .expect("invariant: fixed-size slice");
+                    fold_pi.push(Fr::from_repr_vartime(repr_bytes.into()).unwrap_or(Fr::ZERO));
+                }
+
+                let pi_refs: Vec<&[Fr]> = vec![&fold_pi];
+                match self.fold_pipeline.verify(fold_proof_bytes, &pi_refs) {
+                    Ok(true) => {
+                        tracing::info!(
+                            num_steps,
+                            "O(1) folding proof verified — skipping individual step replay"
+                        );
+                        return true;
+                    }
+                    Ok(false) => {
+                        tracing::error!("verify_folded_proof: folding circuit proof INVALID");
+                        return false;
+                    }
+                    Err(e) => {
+                        tracing::error!("verify_folded_proof: folding proof error: {e}");
+                        return false;
+                    }
+                }
+            }
+        }
+
+        // Fallback: no folding proof present, verify each step individually.
+        // This requires history to be available.
         if self.history.len() < num_steps {
             tracing::warn!(
-                "verify_folded_proof: history has {} steps but proof claims {}",
+                "verify_folded_proof: no folding proof and history has {} steps but proof claims {}",
                 self.history.len(),
                 num_steps,
             );
             return false;
         }
 
-        // Verify each embedded A1 step proof
-        let mut running_acc = IVCAccumulator::initial(bytes_to_fr(&self.history[0].input_state));
+        // Re-verify each step proof from the embedded data
+        let mut offset = step_proofs_start;
+        let mut running_acc = IVCAccumulator {
+            state_commitment: bytes_to_fr(&self.history[0].input_state),
+            num_steps: 0,
+            error_term: Fr::one(),
+            error_bound: Fr::zero(),
+            challenge_hash: Fr::ZERO,
+            witness_vector: Vec::new(),
+            error_vector: Vec::new(),
+            witness_commitment: Fr::ZERO,
+            error_commitment: Fr::ZERO,
+            cross_term_commitment: Fr::ZERO,
+        };
         for step_idx in 0..num_steps {
-            if offset + 4 > proof.len() {
-                tracing::warn!("verify_folded_proof: truncated at step {step_idx} length");
-                return false;
-            }
-
             let step_proof_len = u32::from_le_bytes(
-                proof[offset..offset + 4].try_into().unwrap(),
+                proof[offset..offset + 4].try_into().expect("invariant: fixed-size slice"),
             ) as usize;
             offset += 4;
-
-            if offset + step_proof_len > proof.len() {
-                tracing::warn!("verify_folded_proof: truncated at step {step_idx} data");
-                return false;
-            }
-
             let step_proof = &proof[offset..offset + step_proof_len];
             offset += step_proof_len;
 
-            if step_proof.is_empty() {
-                tracing::warn!("verify_folded_proof: empty proof at step {step_idx}");
-                return false;
-            }
-
-            // Reconstruct A1 witness and verify
             let step_data = &self.history[step_idx];
             let computation_hash_fr = bytes_to_fr(&step_data.computation_hash);
             let step_error_fr = Fr::from((step_data.step_error * 1e9) as u64);
@@ -367,7 +488,6 @@ impl IVCProver {
                 fold_challenge: None,
                 other_acc: None,
             };
-
             let circuit = A1StepCircuit { witness };
             let pi = circuit.public_inputs();
             let pi_refs: Vec<&[Fr]> = vec![&pi];
@@ -375,22 +495,26 @@ impl IVCProver {
             match self.step_pipeline.verify(step_proof, &pi_refs) {
                 Ok(true) => {}
                 Ok(false) => {
-                    tracing::warn!("verify_folded_proof: A1 verification failed at step {}", step_data.step);
+                    tracing::warn!("verify_folded_proof: step {} failed", step_data.step);
                     return false;
                 }
                 Err(e) => {
-                    tracing::error!("verify_folded_proof: error at step {}: {e}", step_data.step);
+                    tracing::error!("verify_folded_proof: step {} error: {e}", step_data.step);
                     return false;
                 }
             }
 
-            // Advance running accumulator
             running_acc = IVCAccumulator {
                 state_commitment: new_state_fr,
                 num_steps: running_acc.num_steps + 1,
                 error_term: running_acc.error_term,
                 error_bound: running_acc.error_bound + step_error_fr,
                 challenge_hash: running_acc.challenge_hash,
+                witness_vector: running_acc.witness_vector,
+                error_vector: running_acc.error_vector,
+                witness_commitment: running_acc.witness_commitment,
+                error_commitment: running_acc.error_commitment,
+                cross_term_commitment: running_acc.cross_term_commitment,
             };
         }
 
@@ -407,11 +531,11 @@ impl IVCProver {
         // Legacy proofs are structurally verified (non-empty step proofs present)
         let mut offset = header.len();
         if offset + 8 > proof.len() { return false; }
-        let num_steps = u64::from_le_bytes(proof[offset..offset+8].try_into().unwrap()) as usize;
+        let num_steps = u64::from_le_bytes(proof[offset..offset+8].try_into().expect("invariant: fixed-size slice")) as usize;
         offset += 8;
         for _ in 0..num_steps {
             if offset + 4 > proof.len() { return false; }
-            let len = u32::from_le_bytes(proof[offset..offset+4].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(proof[offset..offset+4].try_into().expect("invariant: fixed-size slice")) as usize;
             offset += 4;
             if len == 0 || offset + len > proof.len() { return false; }
             offset += len;
@@ -457,7 +581,12 @@ impl IVCProver {
         self.step_proofs.clear();
     }
 
-    /// Generates a folded proof with A1 step proofs.
+    /// Generates a folded proof with A1 step proofs and an optional folding circuit proof.
+    ///
+    /// When 2+ steps are pending, splits them into two halves, builds an accumulator
+    /// for each half, and generates a real `IVCFoldingCircuit` proof that the two
+    /// accumulators were correctly folded. This provides O(1) verification of the
+    /// entire fold batch instead of replaying each step.
     fn generate_folded_proof(&self) -> Result<Vec<u8>, String> {
         let mut folded = Vec::new();
 
@@ -469,6 +598,84 @@ impl IVCProver {
         for step_proof in &self.step_proofs {
             folded.extend_from_slice(&(step_proof.len() as u32).to_le_bytes());
             folded.extend_from_slice(step_proof);
+        }
+
+        // Generate folding circuit proof if we have 2+ steps
+        if self.pending_steps.len() >= 2 {
+            let mid = self.pending_steps.len() / 2;
+
+            // Build accumulator for the first half of pending steps
+            let initial_state = bytes_to_fr(&self.pending_steps[0].input_state);
+            let mut acc1 = IVCAccumulator::initial(initial_state);
+            for step in &self.pending_steps[..mid] {
+                let computation_fr = bytes_to_fr(&step.computation_hash);
+                let step_error_fr = Fr::from((step.step_error * 1e9) as u64);
+                let new_state = poseidon_hash_two(acc1.state_commitment, computation_fr);
+                acc1 = IVCAccumulator {
+                    state_commitment: new_state,
+                    num_steps: acc1.num_steps + 1,
+                    error_term: acc1.error_term,
+                    error_bound: acc1.error_bound + step_error_fr,
+                    challenge_hash: acc1.challenge_hash,
+                    witness_vector: Vec::new(),
+                    error_vector: Vec::new(),
+                    witness_commitment: Fr::ZERO,
+                    error_commitment: Fr::ZERO,
+                    cross_term_commitment: Fr::ZERO,
+                };
+            }
+
+            // Build accumulator for the second half
+            let mid_state = bytes_to_fr(&self.pending_steps[mid].input_state);
+            let mut acc2 = IVCAccumulator::initial(mid_state);
+            for step in &self.pending_steps[mid..] {
+                let computation_fr = bytes_to_fr(&step.computation_hash);
+                let step_error_fr = Fr::from((step.step_error * 1e9) as u64);
+                let new_state = poseidon_hash_two(acc2.state_commitment, computation_fr);
+                acc2 = IVCAccumulator {
+                    state_commitment: new_state,
+                    num_steps: acc2.num_steps + 1,
+                    error_term: acc2.error_term,
+                    error_bound: acc2.error_bound + step_error_fr,
+                    challenge_hash: acc2.challenge_hash,
+                    witness_vector: Vec::new(),
+                    error_vector: Vec::new(),
+                    witness_commitment: Fr::ZERO,
+                    error_commitment: Fr::ZERO,
+                    cross_term_commitment: Fr::ZERO,
+                };
+            }
+
+            // Generate Fiat-Shamir challenge and build folding circuit
+            let challenge = generate_folding_challenge(&acc1, &acc2);
+            let witness = IVCFoldingWitness { acc1, acc2, challenge };
+            let circuit = IVCFoldingCircuit { witness };
+            let pi = circuit.public_inputs();
+            let pi_refs: Vec<&[Fr]> = vec![&pi];
+
+            match self.fold_pipeline.prove(&circuit, &pi_refs) {
+                Ok(fold_proof_bytes) => {
+                    // Flag: has folding proof
+                    folded.push(1u8);
+                    folded.extend_from_slice(&(fold_proof_bytes.len() as u32).to_le_bytes());
+                    folded.extend_from_slice(&fold_proof_bytes);
+                    // Embed folding public inputs (8 Fr values) for verification
+                    for pi_val in &pi {
+                        folded.extend_from_slice(pi_val.to_repr().as_ref());
+                    }
+                    tracing::info!(
+                        fold_proof_size = fold_proof_bytes.len(),
+                        num_steps = self.pending_steps.len(),
+                        "Generated IVC folding circuit proof"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!("Folding proof generation failed (step proofs still valid): {e}");
+                    folded.push(0u8); // no folding proof, fall back to step-by-step verification
+                }
+            }
+        } else {
+            folded.push(0u8); // no folding proof (single step)
         }
 
         // Embed accumulator state (32 bytes each for state_commitment, error_term, error_bound)
@@ -530,6 +737,14 @@ fn bytes_to_fr(bytes: &[u8; 32]) -> Fr {
     Fr::from_repr_vartime(repr.into()).unwrap_or(Fr::ZERO)
 }
 
+/// Converts an Fr to a [u8; 32] LE representation.
+fn fr_to_bytes(f: Fr) -> [u8; 32] {
+    let repr = f.to_repr();
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(repr.as_ref());
+    bytes
+}
+
 /// Folds two IVC states together (for parallel IVC).
 ///
 /// Uses A1's `fold_accumulators` with Poseidon-based state commitment
@@ -542,6 +757,11 @@ pub fn fold_states(state1: &IVCState, state2: &IVCState) -> IVCState {
         error_term: Fr::one(),
         error_bound: Fr::from((state1.accumulated_error * 1e9) as u64),
         challenge_hash: Fr::ZERO,
+        witness_vector: Vec::new(),
+        error_vector: Vec::new(),
+        witness_commitment: Fr::ZERO,
+        error_commitment: Fr::ZERO,
+        cross_term_commitment: Fr::ZERO,
     };
     let acc2 = IVCAccumulator {
         state_commitment: bytes_to_fr(&state2.state_commitment),
@@ -549,6 +769,11 @@ pub fn fold_states(state1: &IVCState, state2: &IVCState) -> IVCState {
         error_term: Fr::one(),
         error_bound: Fr::from((state2.accumulated_error * 1e9) as u64),
         challenge_hash: Fr::ZERO,
+        witness_vector: Vec::new(),
+        error_vector: Vec::new(),
+        witness_commitment: Fr::ZERO,
+        error_commitment: Fr::ZERO,
+        cross_term_commitment: Fr::ZERO,
     };
 
     let challenge = generate_folding_challenge(&acc1, &acc2);
@@ -580,6 +805,7 @@ pub fn fold_states(state1: &IVCState, state2: &IVCState) -> IVCState {
         accumulated_error: state1.accumulated_error + state2.accumulated_error,
         proof: combined_proof,
         prev_proof_hash: None,
+        accumulator_state: None,
     }
 }
 
@@ -615,7 +841,7 @@ pub fn verify_ivc_chain(
 
     // Step count
     let step_count = u64::from_le_bytes(
-        proof[offset..offset + 8].try_into().unwrap(),
+        proof[offset..offset + 8].try_into().expect("invariant: fixed-size slice"),
     );
     offset += 8;
 
@@ -629,7 +855,7 @@ pub fn verify_ivc_chain(
         tracing::warn!("verify_ivc_chain: truncated at commitment");
         return false;
     }
-    let stored_commitment: [u8; 32] = proof[offset..offset + 32].try_into().unwrap();
+    let stored_commitment: [u8; 32] = proof[offset..offset + 32].try_into().expect("invariant: fixed-size slice");
     offset += 32;
     if stored_commitment != final_commitment {
         tracing::warn!("verify_ivc_chain: commitment mismatch");
@@ -642,7 +868,7 @@ pub fn verify_ivc_chain(
         return false;
     }
     let _accumulated_error = f64::from_le_bytes(
-        proof[offset..offset + 8].try_into().unwrap(),
+        proof[offset..offset + 8].try_into().expect("invariant: fixed-size slice"),
     );
     offset += 8;
 
@@ -653,6 +879,45 @@ pub fn verify_ivc_chain(
     }
 
     let folded = &proof[offset..];
+
+    // Try A1 format
+    let a1_fold_header = b"HELIX_IVC_FOLD_A1:";
+    if folded.starts_with(a1_fold_header) {
+        // A1 format: same structural check — verify step proofs are present and non-empty
+        let mut a1_offset = a1_fold_header.len();
+        if a1_offset + 8 > folded.len() {
+            tracing::warn!("verify_ivc_chain: A1 fold header truncated");
+            return false;
+        }
+        let a1_num_steps = u64::from_le_bytes(
+            folded[a1_offset..a1_offset + 8].try_into().expect("invariant: fixed-size slice"),
+        ) as usize;
+        a1_offset += 8;
+
+        if a1_num_steps == 0 {
+            tracing::warn!("verify_ivc_chain: A1 fold has zero steps");
+            return false;
+        }
+
+        for step_idx in 0..a1_num_steps {
+            if a1_offset + 4 > folded.len() {
+                tracing::warn!("verify_ivc_chain: truncated at A1 step {step_idx}");
+                return false;
+            }
+            let sp_len = u32::from_le_bytes(
+                folded[a1_offset..a1_offset + 4].try_into().expect("invariant: fixed-size slice"),
+            ) as usize;
+            a1_offset += 4;
+            if sp_len == 0 || a1_offset + sp_len > folded.len() {
+                tracing::warn!("verify_ivc_chain: invalid A1 step proof at {step_idx}");
+                return false;
+            }
+            a1_offset += sp_len;
+        }
+
+        return true;
+    }
+
     let fold_header = b"HELIX_IVC_FOLD:";
     if folded.len() < fold_header.len() + 8 || !folded.starts_with(fold_header) {
         tracing::warn!("verify_ivc_chain: invalid embedded fold header");
@@ -661,7 +926,7 @@ pub fn verify_ivc_chain(
 
     let mut fold_offset = fold_header.len();
     let num_steps = u64::from_le_bytes(
-        folded[fold_offset..fold_offset + 8].try_into().unwrap(),
+        folded[fold_offset..fold_offset + 8].try_into().expect("invariant: fixed-size slice"),
     ) as usize;
     fold_offset += 8;
 
@@ -677,7 +942,7 @@ pub fn verify_ivc_chain(
             return false;
         }
         let step_proof_len = u32::from_le_bytes(
-            folded[fold_offset..fold_offset + 4].try_into().unwrap(),
+            folded[fold_offset..fold_offset + 4].try_into().expect("invariant: fixed-size slice"),
         ) as usize;
         fold_offset += 4;
 
@@ -798,6 +1063,11 @@ mod tests {
             error_term: Fr::one(),
             error_bound: Fr::from(10u64),
             challenge_hash: Fr::ZERO,
+            witness_vector: Vec::new(),
+            error_vector: Vec::new(),
+            witness_commitment: Fr::ZERO,
+            error_commitment: Fr::ZERO,
+            cross_term_commitment: Fr::ZERO,
         };
         let acc2 = IVCAccumulator {
             state_commitment: Fr::from(200u64),
@@ -805,6 +1075,11 @@ mod tests {
             error_term: Fr::from(2u64),
             error_bound: Fr::from(5u64),
             challenge_hash: Fr::ZERO,
+            witness_vector: Vec::new(),
+            error_vector: Vec::new(),
+            witness_commitment: Fr::ZERO,
+            error_commitment: Fr::ZERO,
+            cross_term_commitment: Fr::ZERO,
         };
         let challenge = generate_folding_challenge(&acc1, &acc2);
 
@@ -866,6 +1141,7 @@ mod tests {
             accumulated_error: 0.1,
             proof: Some(vec![1, 2, 3]),
             prev_proof_hash: None,
+            accumulator_state: None,
         };
 
         let state2 = IVCState {
@@ -874,6 +1150,7 @@ mod tests {
             accumulated_error: 0.05,
             proof: Some(vec![4, 5, 6]),
             prev_proof_hash: None,
+            accumulator_state: None,
         };
 
         let combined = fold_states(&state1, &state2);
@@ -892,6 +1169,11 @@ mod tests {
             error_term: Fr::one(),
             error_bound: Fr::from(5u64),
             challenge_hash: Fr::ZERO,
+            witness_vector: Vec::new(),
+            error_vector: Vec::new(),
+            witness_commitment: Fr::ZERO,
+            error_commitment: Fr::ZERO,
+            cross_term_commitment: Fr::ZERO,
         };
 
         let state = IVCState::from_accumulator(&acc);

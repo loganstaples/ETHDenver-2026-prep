@@ -1118,18 +1118,21 @@ impl GpuProver {
 
     /// Returns the active backend type.
     pub fn backend_type(&self) -> GpuDeviceType {
-        self.backend.read().unwrap().backend_type()
+        self.backend.read().ok().map(|b| b.backend_type()).unwrap_or(GpuDeviceType::Cpu)
     }
 
     /// Returns whether GPU acceleration is available.
     pub fn is_gpu_available(&self) -> bool {
-        let backend = self.backend.read().unwrap();
-        backend.backend_type() != GpuDeviceType::Cpu && backend.is_available()
+        if let Ok(backend) = self.backend.read() {
+            backend.backend_type() != GpuDeviceType::Cpu && backend.is_available()
+        } else {
+            false
+        }
     }
 
     /// Initializes the prover.
     pub fn init(&self) -> GpuResult<()> {
-        let mut backend = self.backend.write().unwrap();
+        let mut backend = self.backend.write().map_err(|_| GpuError::InitializationFailed("Failed to acquire write lock".to_string()))?;
         let device_index = if self.config.device_index < 0 {
             0
         } else {
@@ -1140,13 +1143,13 @@ impl GpuProver {
 
     /// Shuts down the prover.
     pub fn shutdown(&self) -> GpuResult<()> {
-        let mut backend = self.backend.write().unwrap();
+        let mut backend = self.backend.write().map_err(|_| GpuError::InitializationFailed("Failed to acquire write lock".to_string()))?;
         backend.shutdown()
     }
 
     /// Performs MSM operation with automatic fallback.
     pub fn msm(&self, points: &[u8], scalars: &[u8], result: &mut [u8]) -> GpuResult<()> {
-        let backend = self.backend.read().unwrap();
+        let backend = self.backend.read().map_err(|_| GpuError::BackendError("Failed to acquire read lock".to_string()))?;
 
         // Check if batch is too small for GPU
         let num_points = points.len() / 64; // Assuming 64 bytes per point
@@ -1174,7 +1177,7 @@ impl GpuProver {
 
     /// Performs NTT operation with automatic fallback.
     pub fn ntt(&self, data: &mut [u8], inverse: bool) -> GpuResult<()> {
-        let backend = self.backend.read().unwrap();
+        let backend = self.backend.read().map_err(|_| GpuError::BackendError("Failed to acquire read lock".to_string()))?;
 
         let num_elements = data.len() / 32; // Assuming 32 bytes per element
         if num_elements < self.config.min_gpu_batch_size && self.config.cpu_fallback {
@@ -1200,7 +1203,7 @@ impl GpuProver {
 
     /// Performs pairing operation with automatic fallback.
     pub fn pairing(&self, g1: &[u8], g2: &[u8], result: &mut [u8]) -> GpuResult<()> {
-        let backend = self.backend.read().unwrap();
+        let backend = self.backend.read().map_err(|_| GpuError::BackendError("Failed to acquire read lock".to_string()))?;
 
         match backend.pairing(g1, g2, result) {
             Ok(()) => Ok(()),
@@ -1221,23 +1224,38 @@ impl GpuProver {
 
     /// Returns statistics.
     pub fn stats(&self) -> GpuStatsSnapshot {
-        let backend = self.backend.read().unwrap();
-        backend.stats()
+        if let Ok(backend) = self.backend.read() {
+            backend.stats()
+        } else {
+            GpuStatsSnapshot {
+                operations: 0,
+                bytes_to_gpu: 0,
+                bytes_from_gpu: 0,
+                kernel_time_us: 0,
+                transfer_time_us: 0,
+                msm_operations: 0,
+                ntt_operations: 0,
+                pairing_operations: 0,
+                cpu_fallback_operations: 0,
+            }
+        }
     }
 
     /// Returns device info.
     pub fn device_info(&self) -> Option<GpuDeviceInfo> {
-        self.device_info.read().unwrap().clone()
+        self.device_info.read().ok().and_then(|d| d.clone())
     }
 
     /// Returns profiling information.
     pub fn profiling(&self) -> Vec<ProfilingInfo> {
-        self.profiling.read().unwrap().clone()
+        self.profiling.read().ok().map(|p| p.clone()).unwrap_or_default()
     }
 
     /// Clears profiling information.
     pub fn clear_profiling(&self) {
-        self.profiling.write().unwrap().clear();
+        if let Ok(mut profiling) = self.profiling.write() {
+            profiling.clear();
+        }
     }
 }
 
@@ -1307,18 +1325,20 @@ impl GpuMemoryPoolLegacy {
     /// Allocates from the pool.
     pub fn allocate(&self, size: u64) -> GpuResult<GpuBuffer> {
         {
-            let mut free = self.free_list.write().unwrap();
-            if let Some(idx) = free.iter().position(|b| b.size >= size) {
-                return Ok(free.remove(idx));
+            if let Ok(mut free) = self.free_list.write() {
+                if let Some(idx) = free.iter().position(|b| b.size >= size) {
+                    return Ok(free.remove(idx));
+                }
             }
         }
 
-        let backend = self.backend.read().unwrap();
+        let backend = self.backend.read().map_err(|_| GpuError::BackendError("Failed to acquire read lock".to_string()))?;
         let buffer = backend.allocate(size)?;
 
         {
-            let mut buffers = self.buffers.write().unwrap();
-            buffers.push(buffer.clone());
+            if let Ok(mut buffers) = self.buffers.write() {
+                buffers.push(buffer.clone());
+            }
         }
 
         Ok(buffer)
@@ -1326,18 +1346,19 @@ impl GpuMemoryPoolLegacy {
 
     /// Returns a buffer to the pool.
     pub fn free(&self, buffer: GpuBuffer) {
-        let mut free = self.free_list.write().unwrap();
-        free.push(buffer);
+        if let Ok(mut free) = self.free_list.write() {
+            free.push(buffer);
+        }
     }
 
     /// Returns the number of allocated buffers.
     pub fn allocated_count(&self) -> usize {
-        self.buffers.read().unwrap().len()
+        self.buffers.read().ok().map(|b| b.len()).unwrap_or(0)
     }
 
     /// Returns the number of free buffers.
     pub fn free_count(&self) -> usize {
-        self.free_list.read().unwrap().len()
+        self.free_list.read().ok().map(|f| f.len()).unwrap_or(0)
     }
 }
 

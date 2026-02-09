@@ -130,14 +130,14 @@ impl GKRProofCommitment {
 
     fn hash_to_field(&self, hash: &[u8; 32]) -> [Fr; 2] {
         let lo = Fr::from_raw([
-            u64::from_le_bytes(hash[0..8].try_into().unwrap()),
-            u64::from_le_bytes(hash[8..16].try_into().unwrap()),
+            u64::from_le_bytes(hash[0..8].try_into().expect("invariant: fixed-size slice")),
+            u64::from_le_bytes(hash[8..16].try_into().expect("invariant: fixed-size slice")),
             0,
             0,
         ]);
         let hi = Fr::from_raw([
-            u64::from_le_bytes(hash[16..24].try_into().unwrap()),
-            u64::from_le_bytes(hash[24..32].try_into().unwrap()),
+            u64::from_le_bytes(hash[16..24].try_into().expect("invariant: fixed-size slice")),
+            u64::from_le_bytes(hash[24..32].try_into().expect("invariant: fixed-size slice")),
             0,
             0,
         ]);
@@ -326,8 +326,8 @@ impl GKRToHalo2Aggregator {
                         let mut bytes = [0u8; 32];
                         bytes[..chunk.len()].copy_from_slice(chunk);
                         Fr::from_raw([
-                            u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
-                            u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+                            u64::from_le_bytes(bytes[0..8].try_into().expect("invariant: fixed-size slice")),
+                            u64::from_le_bytes(bytes[8..16].try_into().expect("invariant: fixed-size slice")),
                             0,
                             0,
                         ])
@@ -373,8 +373,8 @@ impl GKRToHalo2Aggregator {
                     let mut bytes = [0u8; 32];
                     bytes[..chunk.len()].copy_from_slice(chunk);
                     Fr::from_raw([
-                        u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
-                        u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+                        u64::from_le_bytes(bytes[0..8].try_into().expect("invariant: fixed-size slice")),
+                        u64::from_le_bytes(bytes[8..16].try_into().expect("invariant: fixed-size slice")),
                         0,
                         0,
                     ])

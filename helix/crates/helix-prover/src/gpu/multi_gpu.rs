@@ -125,7 +125,7 @@ impl DeviceSelector {
 
     /// Selects device weighted by performance.
     fn select_weighted(&self) -> usize {
-        let loads = self.device_loads.read().unwrap();
+        let loads = self.device_loads.read().unwrap_or_else(|e| e.into_inner());
         let total_score: f32 = self.devices.iter().map(|d| d.performance_score).sum();
 
         let mut best_device = 0;
@@ -152,7 +152,7 @@ impl DeviceSelector {
 
     /// Selects least loaded device.
     fn select_least_loaded(&self) -> usize {
-        let loads = self.device_loads.read().unwrap();
+        let loads = self.device_loads.read().unwrap_or_else(|e| e.into_inner());
         loads.iter()
             .enumerate()
             .min_by_key(|(_, load)| *load)
@@ -162,7 +162,7 @@ impl DeviceSelector {
 
     /// Selects device with most available memory.
     fn select_memory_aware(&self) -> usize {
-        let usage = self.memory_usage.read().unwrap();
+        let usage = self.memory_usage.read().unwrap_or_else(|e| e.into_inner());
 
         self.devices.iter()
             .enumerate()
@@ -215,7 +215,7 @@ impl DeviceSelector {
 
     /// Returns current loads.
     pub fn loads(&self) -> Vec<u64> {
-        self.device_loads.read().unwrap().clone()
+        self.device_loads.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
@@ -322,7 +322,7 @@ impl WorkDistributor {
     /// Memory-aware partitioning.
     fn partition_memory_aware(&self, total_elements: usize, element_size: usize) -> Vec<WorkPartition> {
         let devices = self.selector.devices();
-        let memory_usage = self.selector.memory_usage.read().unwrap();
+        let memory_usage = self.selector.memory_usage.read().unwrap_or_else(|e| e.into_inner());
 
         // Calculate available memory per device
         let available: Vec<u64> = devices.iter()
@@ -492,7 +492,10 @@ impl MultiGpuManager {
         }
 
         // Sort by performance (highest first)
-        devices.sort_by(|a, b| b.performance_score.partial_cmp(&a.performance_score).unwrap());
+        devices.sort_by(|a, b| {
+            b.performance_score.partial_cmp(&a.performance_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         devices
     }
@@ -556,7 +559,7 @@ impl MultiGpuManager {
 
     /// Returns statistics.
     pub fn stats(&self) -> MultiGpuStats {
-        self.stats.read().map(|s| s.clone()).unwrap_or_default()
+        self.stats.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Returns best backend type available.

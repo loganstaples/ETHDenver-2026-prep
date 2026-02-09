@@ -297,8 +297,8 @@ impl ProofSerializer {
         // Sizes
         let mut sizes = [0u8; 16];
         reader.read_exact(&mut sizes)?;
-        let data_len = u64::from_le_bytes(sizes[..8].try_into().unwrap()) as usize;
-        let uncompressed_size = u64::from_le_bytes(sizes[8..].try_into().unwrap()) as usize;
+        let data_len = u64::from_le_bytes(sizes[..8].try_into().expect("invariant: fixed-size slice [..8] is 8 bytes")) as usize;
+        let uncompressed_size = u64::from_le_bytes(sizes[8..].try_into().expect("invariant: fixed-size slice [8..] is 8 bytes")) as usize;
         
         // Checksum
         let mut checksum = [0u8; 32];

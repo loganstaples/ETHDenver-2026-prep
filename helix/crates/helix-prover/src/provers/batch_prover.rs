@@ -350,7 +350,7 @@ impl BatchProver {
 
     /// Gets current status.
     pub fn status(&self) -> BatchStatus {
-        self.status.read().unwrap().clone()
+        self.status.read().ok().map(|s| s.clone()).unwrap_or(BatchStatus::Pending)
     }
 
     /// Gets statistics snapshot.
@@ -379,11 +379,12 @@ impl BatchProver {
 
         // Update status.
         {
-            let mut status = self.status.write().unwrap();
-            *status = BatchStatus::InProgress {
-                completed: 0,
-                total: total_steps,
-            };
+            if let Ok(mut status) = self.status.write() {
+                *status = BatchStatus::InProgress {
+                    completed: 0,
+                    total: total_steps,
+                };
+            }
         }
 
         let first_step = steps.iter().map(|s| s.step_index).min().unwrap_or(0);
@@ -429,8 +430,9 @@ impl BatchProver {
 
         // Update status.
         {
-            let mut status = self.status.write().unwrap();
-            *status = BatchStatus::Complete;
+            if let Ok(mut status) = self.status.write() {
+                *status = BatchStatus::Complete;
+            }
         }
 
         BatchResult {
@@ -512,9 +514,10 @@ impl BatchProver {
     pub fn resume_from_checkpoint(&self, checkpoint: &BatchCheckpoint) -> BatchResult {
         // Load existing proofs.
         {
-            let mut proofs = self.proofs.write().unwrap();
-            for proof in &checkpoint.proofs {
-                proofs.insert(proof.step_index, proof.clone());
+            if let Ok(mut proofs) = self.proofs.write() {
+                for proof in &checkpoint.proofs {
+                    proofs.insert(proof.step_index, proof.clone());
+                }
             }
         }
 
@@ -573,7 +576,7 @@ impl BatchProver {
 
         let path = dir.join(format!("{}.json", checkpoint_id));
         if let Err(e) = checkpoint.save(&path) {
-            eprintln!("Failed to save checkpoint: {}", e);
+            tracing::error!("Failed to save batch checkpoint to {}: {e}", path.display());
         } else {
             self.stats.checkpoints_created.fetch_add(1, Ordering::Relaxed);
         }
@@ -585,8 +588,9 @@ impl BatchProver {
 
             // Update status.
             {
-                let mut status = self.status.write().unwrap();
-                *status = BatchStatus::InProgress { completed, total };
+                if let Ok(mut status) = self.status.write() {
+                    *status = BatchStatus::InProgress { completed, total };
+                }
             }
 
             if completed >= total {
@@ -808,14 +812,18 @@ impl BatchProvingPipeline {
 
     /// Submits a step to the pipeline.
     pub fn submit(&self, step: TrainingStep) {
-        let mut queue = self.input_queue.lock().unwrap();
-        queue.push(step);
+        if let Ok(mut queue) = self.input_queue.lock() {
+            queue.push(step);
+        }
     }
 
     /// Gets completed proofs.
     pub fn drain_proofs(&self) -> Vec<StepProof> {
-        let mut queue = self.output_queue.lock().unwrap();
-        std::mem::take(&mut *queue)
+        if let Ok(mut queue) = self.output_queue.lock() {
+            std::mem::take(&mut *queue)
+        } else {
+            Vec::new()
+        }
     }
 
     /// Starts the pipeline.
@@ -839,8 +847,11 @@ impl BatchProvingPipeline {
             while running.load(std::sync::atomic::Ordering::SeqCst) {
                 // Drain input queue.
                 let steps: Vec<TrainingStep> = {
-                    let mut queue = input_queue.lock().unwrap();
-                    std::mem::take(&mut *queue)
+                    if let Ok(mut queue) = input_queue.lock() {
+                        std::mem::take(&mut *queue)
+                    } else {
+                        Vec::new()
+                    }
                 };
 
                 if !steps.is_empty() {
@@ -848,8 +859,9 @@ impl BatchProvingPipeline {
 
                     // Push to output.
                     {
-                        let mut queue = output_queue.lock().unwrap();
-                        queue.extend(result.proofs);
+                        if let Ok(mut queue) = output_queue.lock() {
+                            queue.extend(result.proofs);
+                        }
                     }
 
                     stats

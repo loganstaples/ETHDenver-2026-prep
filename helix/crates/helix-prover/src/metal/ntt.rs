@@ -993,7 +993,11 @@ impl NttEngine {
         let log_n = n.trailing_zeros() as usize;
 
         // Ensure twiddles
-        if self.twiddles.is_none() || self.twiddles.as_ref().unwrap().size < n {
+        let needs_init = match &self.twiddles {
+            None => true,
+            Some(tw) => tw.size < n,
+        };
+        if needs_init {
             self.twiddles = Some(TwiddleFactors::new(log_n));
         }
 
@@ -1006,7 +1010,7 @@ impl NttEngine {
         }
 
         // Cooley-Tukey
-        let twiddles = self.twiddles.as_ref().unwrap();
+        let twiddles = self.twiddles.as_ref().expect("invariant: twiddles initialized above");
 
         for stage in 0..log_n {
             let block_size = 1 << (stage + 1);
@@ -1043,7 +1047,11 @@ impl NttEngine {
         let log_n = n.trailing_zeros() as usize;
 
         // Ensure twiddles
-        if self.twiddles.is_none() || self.twiddles.as_ref().unwrap().size < n {
+        let needs_init = match &self.twiddles {
+            None => true,
+            Some(tw) => tw.size < n,
+        };
+        if needs_init {
             self.twiddles = Some(TwiddleFactors::new(log_n));
         }
 
@@ -1056,7 +1064,7 @@ impl NttEngine {
         }
 
         // Cooley-Tukey with inverse twiddles
-        let twiddles = self.twiddles.as_ref().unwrap();
+        let twiddles = self.twiddles.as_ref().expect("invariant: twiddles initialized above");
 
         for stage in 0..log_n {
             let block_size = 1 << (stage + 1);

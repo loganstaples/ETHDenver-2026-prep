@@ -61,7 +61,7 @@ pub use helix_circuits::halo2_proofs;
 pub use helix_circuits::halo2curves;
 
 // Re-export commonly used types
-pub use aggregation::{AggregatedProof, AggregationId, CommitmentTree, ProofAggregator};
+pub use aggregation::{AggregatedProof, AggregationId, CommitmentTree, KZGAggregatedProof, KZGBatchAggregator, ProofAggregator, SmartAggregationResult};
 
 // Re-export GKR prover types
 pub use gkr::{
@@ -101,13 +101,13 @@ pub use benchmarks::{
 pub use chunking::{ChunkId, ChunkingConfig, ComputationChunk, ComputationChunker};
 
 // Re-export IVC types
-pub use ivc::{IVCConfig, IVCProver, IVCState, IVCStep};
+pub use ivc::{AccumulatorSnapshot, IVCConfig, IVCProver, IVCState, IVCStep};
 
 // Re-export key management types
 pub use keys::{CircuitKeys, FileKeyStore, InMemoryKeyStore, KeyId, KeyMetadata, HELIX_SRS_SEED};
 
 // Re-export parallel proving types
-pub use parallel::{BatchProofResult, ChunkProof, ParallelConfig, ParallelProver, ProofStatus};
+pub use parallel::{BatchError, BatchProofResult, ChunkProof, ParallelConfig, ParallelProver, ProofStatus};
 
 // Re-export pipeline types
 pub use pipeline::{
@@ -149,10 +149,10 @@ pub use cache::{
 // Re-export health check types
 pub use health::{
     ComponentHealth, HealthCheckConfig, HealthChecker, HealthIssue, HealthReport, HealthStatus,
-    IssueSeverity, PerformanceBaseline, ReadinessResult, SystemInfo,
+    IssueSeverity, PerformanceBaseline, ProofHealthCheck, ReadinessResult, StartupResult, SystemInfo,
     // Global functions
-    full_health_check, global_health_checker, is_prover_ready, liveness_probe, quick_health_check,
-    readiness_probe,
+    full_health_check, global_health_checker, initialize_prover_system, is_prover_ready,
+    liveness_probe, quick_health_check, readiness_probe,
 };
 
 /// Prelude for convenient imports.
@@ -177,8 +177,8 @@ pub mod prelude {
         // Cache types
         SharedWitnessCache, WitnessCache, WitnessHash, WitnessHashBuilder, shared_witness_cache,
         // Health check types
-        HealthChecker, HealthReport, HealthStatus, full_health_check, is_prover_ready,
-        quick_health_check, readiness_probe,
+        HealthChecker, HealthReport, HealthStatus, StartupResult, full_health_check,
+        initialize_prover_system, is_prover_ready, quick_health_check, readiness_probe,
         // Benchmark and profiling types
         BenchmarkResult, BenchmarkSuite, GpuProfiler, global_profiler,
     };
@@ -227,7 +227,7 @@ mod pipeline_integration_tests {
         });
         prover.submit_batch(chunks.clone());
         prover.start();
-        let chunk_proofs = prover.wait_all();
+        let chunk_proofs = prover.wait_all().expect("parallel prove should succeed");
         prover.stop();
 
         assert_eq!(chunk_proofs.len(), 4, "All 4 chunks must produce proofs");

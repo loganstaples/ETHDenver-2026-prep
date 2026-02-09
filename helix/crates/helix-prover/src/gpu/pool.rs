@@ -237,9 +237,9 @@ impl PoolInner {
             GpuBackendType::Cpu => {
                 // For CPU backend, free the heap memory
                 if ptr != 0 {
-                    let layout = std::alloc::Layout::from_size_align(size as usize, 64)
-                        .expect("Invalid layout");
-                    unsafe { std::alloc::dealloc(ptr as *mut u8, layout); }
+                    if let Ok(layout) = std::alloc::Layout::from_size_align(size as usize, 64) {
+                        unsafe { std::alloc::dealloc(ptr as *mut u8, layout); }
+                    }
                 }
             }
             #[allow(unreachable_patterns)]

@@ -539,7 +539,7 @@ fn dictionary_encode(data: &[u8]) -> Vec<u8> {
 
     for chunk in data.chunks(4) {
         if chunk.len() == 4 {
-            let key: [u8; 4] = chunk.try_into().unwrap();
+            let key: [u8; 4] = chunk.try_into().expect("invariant: chunk.len() == 4");
             *freq.entry(key).or_insert(0) += 1;
         }
     }
@@ -570,7 +570,7 @@ fn dictionary_encode(data: &[u8]) -> Vec<u8> {
     let mut i = 0;
     while i < data.len() {
         if i + 4 <= data.len() {
-            let chunk: [u8; 4] = data[i..i + 4].try_into().unwrap();
+            let chunk: [u8; 4] = data[i..i + 4].try_into().expect("invariant: slice length is 4");
             if let Some(&idx) = dict_map.get(&chunk) {
                 result.push(0xFF); // Dictionary marker
                 result.push(idx);
@@ -702,7 +702,7 @@ fn hash_inputs(inputs: &[[u8; 32]]) -> [u8; 32] {
 fn timestamp_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs()
 }
 

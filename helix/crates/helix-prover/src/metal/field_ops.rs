@@ -161,21 +161,21 @@ impl MetalFieldOps {
     fn execute_cpu_sequential(&self, op: &BatchFieldOperation) -> Vec<FieldElement> {
         match op.op_type {
             FieldOpType::Add => {
-                let b = op.operands_b.as_ref().unwrap();
+                let b = op.operands_b.as_ref().expect("invariant: binary op requires operands_b");
                 op.operands_a.iter()
                     .zip(b.iter())
                     .map(|(&a, &b)| a + b)
                     .collect()
             }
             FieldOpType::Sub => {
-                let b = op.operands_b.as_ref().unwrap();
+                let b = op.operands_b.as_ref().expect("invariant: binary op requires operands_b");
                 op.operands_a.iter()
                     .zip(b.iter())
                     .map(|(&a, &b)| a - b)
                     .collect()
             }
             FieldOpType::Mul => {
-                let b = op.operands_b.as_ref().unwrap();
+                let b = op.operands_b.as_ref().expect("invariant: binary op requires operands_b");
                 op.operands_a.iter()
                     .zip(b.iter())
                     .map(|(&a, &b)| a * b)
@@ -198,21 +198,21 @@ impl MetalFieldOps {
     fn execute_cpu_parallel(&self, op: &BatchFieldOperation) -> Vec<FieldElement> {
         match op.op_type {
             FieldOpType::Add => {
-                let b = op.operands_b.as_ref().unwrap();
+                let b = op.operands_b.as_ref().expect("invariant: binary op requires operands_b");
                 op.operands_a.par_iter()
                     .zip(b.par_iter())
                     .map(|(&a, &b)| a + b)
                     .collect()
             }
             FieldOpType::Sub => {
-                let b = op.operands_b.as_ref().unwrap();
+                let b = op.operands_b.as_ref().expect("invariant: binary op requires operands_b");
                 op.operands_a.par_iter()
                     .zip(b.par_iter())
                     .map(|(&a, &b)| a - b)
                     .collect()
             }
             FieldOpType::Mul => {
-                let b = op.operands_b.as_ref().unwrap();
+                let b = op.operands_b.as_ref().expect("invariant: binary op requires operands_b");
                 op.operands_a.par_iter()
                     .zip(b.par_iter())
                     .map(|(&a, &b)| a * b)

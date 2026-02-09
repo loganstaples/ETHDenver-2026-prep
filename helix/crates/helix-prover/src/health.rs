@@ -485,7 +485,7 @@ impl HealthChecker {
             .swap(true, Ordering::SeqCst)
         {
             // Return last report if available
-            if let Some(report) = self.last_report.read().unwrap().as_ref() {
+            if let Some(report) = self.last_report.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
                 return report.clone();
             }
         }
@@ -527,6 +527,31 @@ impl HealthChecker {
         }
         components.push(crypto_check);
 
+        // Check proof pipeline (generates and verifies a real proof)
+        if self.config.run_performance_test {
+            let proof_check = ProofHealthCheck::run();
+            let proof_component = if proof_check.passed {
+                ComponentHealth::healthy(
+                    "proof_pipeline",
+                    &format!("Proof generated and verified ({} bytes)",
+                        proof_check.proof_size.unwrap_or(0)),
+                    proof_check.duration_ms,
+                )
+            } else {
+                issues.push(HealthIssue::error(
+                    "PROOF_PIPELINE_FAILURE",
+                    proof_check.error.as_deref().unwrap_or("Unknown"),
+                    "proof_pipeline",
+                ));
+                ComponentHealth::unhealthy(
+                    "proof_pipeline",
+                    proof_check.error.as_deref().unwrap_or("Proof pipeline check failed"),
+                    proof_check.duration_ms,
+                )
+            };
+            components.push(proof_component);
+        }
+
         // Gather system info
         let system_info = SystemInfo::gather();
 
@@ -541,7 +566,7 @@ impl HealthChecker {
         }
 
         // Store the report
-        *self.last_report.write().unwrap() = Some(report.clone());
+        *self.last_report.write().unwrap_or_else(|e| e.into_inner()) = Some(report.clone());
         self.check_in_progress.store(false, Ordering::SeqCst);
         self.check_count.fetch_add(1, Ordering::Relaxed);
 
@@ -551,7 +576,7 @@ impl HealthChecker {
     /// Quick health check (cached or minimal).
     pub fn quick_check(&self) -> HealthStatus {
         // Return cached status if recent
-        if let Some(report) = self.last_report.read().unwrap().as_ref() {
+        if let Some(report) = self.last_report.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
             let age = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -582,7 +607,7 @@ impl HealthChecker {
 
     /// Returns the last health report.
     pub fn last_report(&self) -> Option<HealthReport> {
-        self.last_report.read().unwrap().clone()
+        self.last_report.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Returns the number of health checks performed.
@@ -696,6 +721,152 @@ impl Default for HealthChecker {
 }
 
 // ============================================================================
+// Proof Health Check (Startup Sanity)
+// ============================================================================
+
+/// Runs a known-good proof generation + verification on startup to ensure
+/// the proving pipeline is functional. This catches issues like:
+/// - Corrupt SRS parameters
+/// - Incompatible curve libraries
+/// - Memory/thread pool problems
+/// - GPU driver issues
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProofHealthCheck {
+    /// Whether the check passed.
+    pub passed: bool,
+    /// Duration of the check in milliseconds.
+    pub duration_ms: u64,
+    /// Proof size generated (bytes), if successful.
+    pub proof_size: Option<usize>,
+    /// Error message if the check failed.
+    pub error: Option<String>,
+    /// When the check was run.
+    pub checked_at: u64,
+}
+
+impl ProofHealthCheck {
+    /// Runs a minimal proof generation + verification cycle.
+    ///
+    /// Uses IVCStepCircuit at k=12 (the smallest circuit in the system) to
+    /// generate a single proof and self-verify it. If this fails, the prover
+    /// cannot generate valid proofs.
+    pub fn run() -> Self {
+        use crate::pipeline::ProverPipeline;
+        use helix_circuits::{IVCStepCircuit, IVCStepWitness, IVCAccumulator};
+        use helix_circuits::gadgets::poseidon::poseidon_hash_two;
+        use helix_circuits::halo2_proofs::arithmetic::Field;
+        use std::time::Instant;
+
+        let start = Instant::now();
+
+        // Build a known-good witness
+        let prev_acc = IVCAccumulator::initial(Fr::ZERO);
+        let computation = Fr::from(42u64);
+        let new_state = poseidon_hash_two(prev_acc.state_commitment, computation);
+
+        let witness = IVCStepWitness {
+            prev_acc,
+            new_state,
+            computation_hash: computation,
+            step_error: Fr::from(1u64),
+            fold_challenge: None,
+            other_acc: None,
+        };
+        let circuit = IVCStepCircuit { witness };
+        let pi = circuit.public_inputs();
+        let pi_refs: Vec<&[Fr]> = vec![&pi];
+
+        // Setup pipeline (k=12, self_verify=true)
+        let config = PipelineConfig {
+            k: 12,
+            self_verify: true,
+            enable_tracing: false,
+            ..Default::default()
+        };
+        let mut pipeline = ProverPipeline::<IVCStepCircuit>::with_config(config);
+
+        if let Err(e) = pipeline.setup(&IVCStepCircuit::default()) {
+            let duration_ms = start.elapsed().as_millis() as u64;
+            tracing::error!("ProofHealthCheck: pipeline setup failed: {e}");
+            return Self {
+                passed: false,
+                duration_ms,
+                proof_size: None,
+                error: Some(format!("Pipeline setup failed: {e}")),
+                checked_at: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            };
+        }
+
+        // Generate proof
+        let proof_bytes = match pipeline.prove(&circuit, &pi_refs) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                let duration_ms = start.elapsed().as_millis() as u64;
+                tracing::error!("ProofHealthCheck: proof generation failed: {e}");
+                return Self {
+                    passed: false,
+                    duration_ms,
+                    proof_size: None,
+                    error: Some(format!("Proof generation failed: {e}")),
+                    checked_at: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                };
+            }
+        };
+
+        // Verify proof
+        match pipeline.verify(&proof_bytes, &pi_refs) {
+            Ok(true) => {
+                let duration_ms = start.elapsed().as_millis() as u64;
+                Self {
+                    passed: true,
+                    duration_ms,
+                    proof_size: Some(proof_bytes.len()),
+                    error: None,
+                    checked_at: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                }
+            }
+            Ok(false) => {
+                let duration_ms = start.elapsed().as_millis() as u64;
+                tracing::error!("ProofHealthCheck: proof verification returned false");
+                Self {
+                    passed: false,
+                    duration_ms,
+                    proof_size: Some(proof_bytes.len()),
+                    error: Some("Proof verified as invalid".to_string()),
+                    checked_at: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                }
+            }
+            Err(e) => {
+                let duration_ms = start.elapsed().as_millis() as u64;
+                tracing::error!("ProofHealthCheck: verification error: {e}");
+                Self {
+                    passed: false,
+                    duration_ms,
+                    proof_size: Some(proof_bytes.len()),
+                    error: Some(format!("Verification error: {e}")),
+                    checked_at: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
 // Global Health Check
 // ============================================================================
 
@@ -800,6 +971,109 @@ pub fn liveness_probe() -> bool {
 }
 
 // ============================================================================
+// Startup Initialization
+// ============================================================================
+
+/// Result of prover system initialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartupResult {
+    /// Whether initialization succeeded.
+    pub success: bool,
+    /// Health report from startup check.
+    pub health_report: HealthReport,
+    /// Proof pipeline sanity check result.
+    pub proof_check: Option<ProofHealthCheck>,
+    /// Initialization time in milliseconds.
+    pub init_time_ms: u64,
+    /// Warnings (non-fatal issues).
+    pub warnings: Vec<String>,
+}
+
+/// Initializes the prover system and runs startup health checks.
+///
+/// This should be called once at application startup. It:
+/// 1. Runs a full health check (system resources, crypto, config)
+/// 2. Generates and verifies a known-good proof to sanity-check the pipeline
+/// 3. Returns a `StartupResult` indicating readiness
+///
+/// If the proof pipeline check fails, the system is still started (returns
+/// `success: true` with a warning) since the pipeline may work for different
+/// circuit configurations. Only crypto primitive failures cause `success: false`.
+pub fn initialize_prover_system() -> StartupResult {
+    let start = Instant::now();
+    tracing::info!("Initializing prover system...");
+
+    // Run full health check with performance test
+    let checker = HealthChecker::with_config(HealthCheckConfig {
+        run_performance_test: true,
+        detailed_diagnostics: true,
+        ..Default::default()
+    });
+    let health_report = checker.check();
+    let mut warnings = Vec::new();
+
+    // Check for critical issues
+    let has_crypto_failure = health_report.issues.iter().any(|i| {
+        i.severity == IssueSeverity::Error && i.code == "CRYPTO_FAILURE"
+    });
+
+    if has_crypto_failure {
+        let init_time_ms = start.elapsed().as_millis() as u64;
+        tracing::error!("Prover system initialization FAILED: cryptographic primitives broken");
+        return StartupResult {
+            success: false,
+            health_report,
+            proof_check: None,
+            init_time_ms,
+            warnings,
+        };
+    }
+
+    // Run proof pipeline sanity check
+    tracing::info!("Running proof pipeline sanity check...");
+    let proof_check = ProofHealthCheck::run();
+
+    if !proof_check.passed {
+        let msg = format!(
+            "Proof pipeline sanity check failed: {}",
+            proof_check.error.as_deref().unwrap_or("unknown")
+        );
+        tracing::warn!("{msg}");
+        warnings.push(msg);
+    } else {
+        tracing::info!(
+            proof_size = proof_check.proof_size.unwrap_or(0),
+            duration_ms = proof_check.duration_ms,
+            "Proof pipeline sanity check passed"
+        );
+    }
+
+    let init_time_ms = start.elapsed().as_millis() as u64;
+
+    // Collect non-critical warnings
+    for issue in &health_report.issues {
+        if issue.severity == IssueSeverity::Warning {
+            warnings.push(format!("{}: {}", issue.code, issue.message));
+        }
+    }
+
+    tracing::info!(
+        status = %health_report.status,
+        init_time_ms,
+        num_warnings = warnings.len(),
+        "Prover system initialized"
+    );
+
+    StartupResult {
+        success: true,
+        health_report,
+        proof_check: Some(proof_check),
+        init_time_ms,
+        warnings,
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -883,5 +1157,15 @@ mod tests {
     #[test]
     fn test_liveness_probe() {
         assert!(liveness_probe());
+    }
+
+    #[test]
+    fn test_proof_health_check() {
+        let check = ProofHealthCheck::run();
+        assert!(check.passed, "ProofHealthCheck should pass: {:?}", check.error);
+        assert!(check.proof_size.is_some());
+        assert!(check.proof_size.unwrap() > 0);
+        assert!(check.duration_ms > 0);
+        assert!(check.error.is_none());
     }
 }

@@ -14,6 +14,7 @@
 //! - **Adaptive batching**: Dynamically adjusts batch sizes based on workload
 
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
@@ -21,10 +22,60 @@ use std::time::{Duration, Instant};
 
 use super::chunking::{ChunkId, ComputationChunk};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use crate::pipeline::ProverPipeline;
 use crate::provers::ivc_circuit::IVCStepCircuit;
 use helix_circuits::halo2curves::bn256::Fr;
+
+/// Errors from batch proving operations.
+#[derive(Error, Debug)]
+pub enum BatchError {
+    /// All proofs in the batch failed.
+    #[error("All {count} proofs failed: {}", format_failures(.failures))]
+    AllProofsFailed {
+        count: usize,
+        failures: Vec<(ChunkId, String)>,
+    },
+
+    /// Batch timed out with some proofs incomplete.
+    #[error("Batch timed out after {elapsed_ms}ms: {completed} of {total} proofs completed, {failed} failed")]
+    Timeout {
+        elapsed_ms: u64,
+        completed: usize,
+        failed: usize,
+        total: usize,
+        partial_results: BatchProofResult,
+    },
+
+    /// Batch completed but too few proofs succeeded to meet the minimum success rate.
+    #[error("Insufficient success rate: {succeeded}/{total} ({rate:.1}%) < required {required:.1}%")]
+    InsufficientSuccessRate {
+        succeeded: usize,
+        total: usize,
+        rate: f64,
+        required: f64,
+        failures: Vec<(ChunkId, String)>,
+        partial_results: BatchProofResult,
+    },
+
+    /// No chunks were submitted to prove.
+    #[error("No chunks submitted for batch proving")]
+    EmptyBatch,
+
+    /// Internal error during batch proving.
+    #[error("Internal batch prover error: {0}")]
+    Internal(String),
+}
+
+fn format_failures(failures: &[(ChunkId, String)]) -> String {
+    failures
+        .iter()
+        .take(5)
+        .map(|(id, e)| format!("chunk {}: {}", id.0, e))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
 
 /// Result of proving a chunk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +122,12 @@ pub struct ParallelConfig {
     pub steal_batch_size: usize,
     /// Minimum tasks before allowing stealing.
     pub steal_threshold: usize,
+    /// Maximum retries per individual proof (0 = no retries).
+    pub max_retries_per_proof: u32,
+    /// Minimum fraction of proofs that must succeed (0.0-1.0).
+    /// If the success rate falls below this threshold, the batch fails.
+    /// Default 0.0 means any number of successes is acceptable.
+    pub min_success_rate: f64,
 }
 
 impl Default for ParallelConfig {
@@ -83,6 +140,8 @@ impl Default for ParallelConfig {
             task_affinity: true,
             steal_batch_size: 2,
             steal_threshold: 4,
+            max_retries_per_proof: 2,
+            min_success_rate: 0.0,
         }
     }
 }
@@ -153,14 +212,17 @@ impl WorkerDeque {
 
     /// Push a task to the local end (LIFO).
     fn push(&self, task: ProofTask) {
-        let mut tasks = self.tasks.lock().unwrap();
+        let Ok(mut tasks) = self.tasks.lock() else {
+            tracing::error!("Worker {} deque lock poisoned on push", self.worker_id);
+            return;
+        };
         tasks.push(task);
         self.len.store(tasks.len(), Ordering::Release);
     }
 
     /// Pop a task from the local end (LIFO).
     fn pop(&self) -> Option<ProofTask> {
-        let mut tasks = self.tasks.lock().unwrap();
+        let mut tasks = self.tasks.lock().ok()?;
         let task = tasks.pop();
         self.len.store(tasks.len(), Ordering::Release);
         task
@@ -168,7 +230,9 @@ impl WorkerDeque {
 
     /// Steal tasks from the remote end (FIFO).
     fn steal(&self, count: usize) -> Vec<ProofTask> {
-        let mut tasks = self.tasks.lock().unwrap();
+        let Ok(mut tasks) = self.tasks.lock() else {
+            return Vec::new();
+        };
         let steal_count = count.min(tasks.len() / 2);
         if steal_count == 0 {
             return Vec::new();
@@ -423,7 +487,7 @@ impl ParallelProver {
         let task = ProofTask::new(chunk.clone(), priority);
 
         {
-            let mut status = self.status.write().unwrap();
+            let mut status = self.status.write().unwrap_or_else(|e| e.into_inner());
             status.insert(chunk.id, ProofStatus::Pending);
         }
 
@@ -437,7 +501,7 @@ impl ParallelProver {
         let task = ProofTask::new(chunk.clone(), priority).with_affinity(worker_id);
 
         {
-            let mut status = self.status.write().unwrap();
+            let mut status = self.status.write().unwrap_or_else(|e| e.into_inner());
             status.insert(chunk.id, ProofStatus::Pending);
         }
 
@@ -475,9 +539,10 @@ impl ParallelProver {
 
     fn notify_work_available(&self) {
         let (lock, cvar) = &*self.work_available;
-        let mut available = lock.lock().unwrap();
-        *available = true;
-        cvar.notify_all();
+        if let Ok(mut available) = lock.lock() {
+            *available = true;
+            cvar.notify_all();
+        }
     }
 
     /// Starts the worker threads.
@@ -488,7 +553,10 @@ impl ParallelProver {
 
         self.shutdown.store(false, Ordering::SeqCst);
 
-        let mut workers = self.workers.lock().unwrap();
+        let Ok(mut workers) = self.workers.lock() else {
+            tracing::error!("Workers lock poisoned, cannot start");
+            return;
+        };
         workers.clear();
 
         for worker_id in 0..self.config.num_threads {
@@ -502,6 +570,7 @@ impl ParallelProver {
             let global_stats = Arc::clone(&self.stats);
             let work_available = Arc::clone(&self.work_available);
             let timeout = self.config.proof_timeout_secs;
+            let max_retries = self.config.max_retries_per_proof;
             let shared_pipeline = Arc::clone(&self.shared_pipeline);
 
             let handle = thread::Builder::new()
@@ -520,6 +589,7 @@ impl ParallelProver {
                         work_available,
                         timeout,
                         shared_pipeline,
+                        max_retries,
                     );
                 })
                 .expect("Failed to spawn worker thread");
@@ -534,27 +604,28 @@ impl ParallelProver {
         self.running.store(false, Ordering::SeqCst);
         self.notify_work_available();
 
-        let mut workers = self.workers.lock().unwrap();
-        for handle in workers.drain(..) {
-            let _ = handle.join();
+        if let Ok(mut workers) = self.workers.lock() {
+            for handle in workers.drain(..) {
+                let _ = handle.join();
+            }
         }
     }
 
     /// Gets the status of a proof.
     pub fn get_status(&self, chunk_id: ChunkId) -> Option<ProofStatus> {
-        let status = self.status.read().unwrap();
+        let status = self.status.read().unwrap_or_else(|e| e.into_inner());
         status.get(&chunk_id).cloned()
     }
 
     /// Gets a completed proof.
     pub fn get_proof(&self, chunk_id: ChunkId) -> Option<ChunkProof> {
-        let proofs = self.completed_proofs.read().unwrap();
+        let proofs = self.completed_proofs.read().unwrap_or_else(|e| e.into_inner());
         proofs.get(&chunk_id).cloned()
     }
 
     /// Gets all completed proofs.
     pub fn get_all_proofs(&self) -> Vec<ChunkProof> {
-        let proofs = self.completed_proofs.read().unwrap();
+        let proofs = self.completed_proofs.read().unwrap_or_else(|e| e.into_inner());
         proofs.values().cloned().collect()
     }
 
@@ -595,36 +666,145 @@ impl ParallelProver {
     ///
     /// Returns once every submitted task has reached `Complete` or `Failed` status.
     /// Uses a default timeout of 5 minutes to prevent infinite hangs.
-    pub fn wait_all(&self) -> Vec<ChunkProof> {
-        let (proofs, _timed_out) = self.wait_all_timeout(Duration::from_secs(300));
-        proofs
+    ///
+    /// Returns `Err(BatchError::AllProofsFailed)` if every proof failed,
+    /// `Err(BatchError::Timeout)` if proofs are still pending after 5 minutes.
+    pub fn wait_all(&self) -> Result<Vec<ChunkProof>, BatchError> {
+        self.wait_all_timeout(Duration::from_secs(300))
     }
 
     /// Waits for all proofs with timeout.
-    pub fn wait_all_timeout(&self, timeout: Duration) -> (Vec<ChunkProof>, bool) {
+    ///
+    /// Returns `Ok(proofs)` if at least one proof succeeded (and min_success_rate is met).
+    /// Returns `Err(BatchError::AllProofsFailed)` if all proofs failed.
+    /// Returns `Err(BatchError::InsufficientSuccessRate)` if success rate is below threshold.
+    /// Returns `Err(BatchError::Timeout)` if proofs are still pending after timeout.
+    pub fn wait_all_timeout(&self, timeout: Duration) -> Result<Vec<ChunkProof>, BatchError> {
         let start = Instant::now();
         loop {
             if start.elapsed() > timeout {
-                return (self.get_all_proofs(), false);
+                let proofs = self.get_all_proofs();
+                let (completed, failed, total) = self.completion_summary();
+
+                tracing::error!(
+                    completed,
+                    failed,
+                    total,
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    "Batch proving timed out"
+                );
+
+                let failures = self.collect_failures();
+                return Err(BatchError::Timeout {
+                    elapsed_ms: start.elapsed().as_millis() as u64,
+                    completed,
+                    failed,
+                    total,
+                    partial_results: BatchProofResult {
+                        proofs,
+                        failures,
+                        total_time_ms: start.elapsed().as_millis() as u64,
+                        stats: self.stats(),
+                    },
+                });
             }
 
-            let status = self.status.read().unwrap();
+            let status = self.status.read().unwrap_or_else(|e| {
+                tracing::error!("Status lock poisoned: {e}");
+                e.into_inner()
+            });
             let all_done = status
                 .values()
                 .all(|s| matches!(s, ProofStatus::Complete | ProofStatus::Failed(_)));
             drop(status);
 
             if all_done {
-                return (self.get_all_proofs(), true);
+                let proofs = self.get_all_proofs();
+                let failures = self.collect_failures();
+                let total = proofs.len() + failures.len();
+
+                if proofs.is_empty() && !failures.is_empty() {
+                    tracing::error!(
+                        num_failures = failures.len(),
+                        "All proofs in batch failed"
+                    );
+                    return Err(BatchError::AllProofsFailed {
+                        count: failures.len(),
+                        failures,
+                    });
+                }
+
+                // Check minimum success rate
+                if total > 0 && self.config.min_success_rate > 0.0 {
+                    let success_rate = proofs.len() as f64 / total as f64;
+                    if success_rate < self.config.min_success_rate {
+                        let required_pct = self.config.min_success_rate * 100.0;
+                        let actual_pct = success_rate * 100.0;
+                        tracing::error!(
+                            succeeded = proofs.len(),
+                            failed = failures.len(),
+                            success_rate = %format!("{actual_pct:.1}%"),
+                            required = %format!("{required_pct:.1}%"),
+                            "Batch success rate below threshold"
+                        );
+                        return Err(BatchError::InsufficientSuccessRate {
+                            succeeded: proofs.len(),
+                            total,
+                            rate: actual_pct,
+                            required: required_pct,
+                            failures: failures.clone(),
+                            partial_results: BatchProofResult {
+                                proofs,
+                                failures,
+                                total_time_ms: start.elapsed().as_millis() as u64,
+                                stats: self.stats(),
+                            },
+                        });
+                    }
+                }
+
+                if !failures.is_empty() {
+                    tracing::warn!(
+                        succeeded = proofs.len(),
+                        failed = failures.len(),
+                        "Batch completed with partial failures"
+                    );
+                }
+
+                return Ok(proofs);
             }
 
             thread::sleep(Duration::from_millis(10));
         }
     }
 
+    /// Returns (completed, failed, total) counts.
+    fn completion_summary(&self) -> (usize, usize, usize) {
+        let status = self.status.read().unwrap_or_else(|e| e.into_inner());
+        let total = status.len();
+        let completed = status.values().filter(|s| matches!(s, ProofStatus::Complete)).count();
+        let failed = status.values().filter(|s| matches!(s, ProofStatus::Failed(_))).count();
+        (completed, failed, total)
+    }
+
+    /// Collects all failure details from the status map.
+    fn collect_failures(&self) -> Vec<(ChunkId, String)> {
+        let status = self.status.read().unwrap_or_else(|e| e.into_inner());
+        status
+            .iter()
+            .filter_map(|(id, s)| {
+                if let ProofStatus::Failed(e) = s {
+                    Some((*id, e.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     /// Progress as (completed, total).
     pub fn progress(&self) -> (usize, usize) {
-        let status = self.status.read().unwrap();
+        let status = self.status.read().unwrap_or_else(|e| e.into_inner());
         let total = status.len();
         let completed = status
             .values()
@@ -654,8 +834,9 @@ impl ParallelProver {
         shutdown: Arc<AtomicBool>,
         global_stats: Arc<ParallelProverStats>,
         work_available: Arc<(Mutex<bool>, Condvar)>,
-        _timeout: u64,
+        proof_timeout_secs: u64,
         shared_pipeline: Arc<RwLock<Option<ProverPipeline<IVCStepCircuit>>>>,
+        max_retries_per_proof: u32,
     ) {
         let mut idle_start: Option<Instant> = None;
 
@@ -707,8 +888,11 @@ impl ParallelProver {
 
                     // Wait for work with a timeout.
                     let (lock, cvar) = &*work_available;
-                    let available = lock.lock().unwrap();
-                    let _ = cvar.wait_timeout(available, Duration::from_millis(50));
+                    if let Ok(available) = lock.lock() {
+                        let _ = cvar.wait_timeout(available, Duration::from_millis(50));
+                    } else {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
 
                     // Check if we should stop.
                     if !running.load(Ordering::SeqCst) {
@@ -720,50 +904,111 @@ impl ParallelProver {
 
             // Update status to in-progress.
             {
-                let mut s = status.write().unwrap();
+                let mut s = status.write().unwrap_or_else(|e| e.into_inner());
                 s.insert(task.chunk.id, ProofStatus::InProgress);
             }
 
-            // Generate the proof using shared pipeline.
+            // Generate the proof using shared pipeline, with configurable retry for transient failures.
+            let max_retries = if task.retries > 0 { 0 } else { max_retries_per_proof };
+            let per_proof_timeout = Duration::from_secs(proof_timeout_secs);
+            let mut last_error = String::new();
+            let mut succeeded = false;
             let start_time = Instant::now();
-            let proof_result = Self::generate_proof(&task.chunk, &shared_pipeline);
-            let elapsed_us = start_time.elapsed().as_micros() as u64;
-            let elapsed_ms = elapsed_us / 1000;
 
-            worker_stats
-                .total_prove_time_us
-                .fetch_add(elapsed_us, Ordering::Relaxed);
-
-            match proof_result {
-                Ok(proof_bytes) => {
-                    let chunk_proof = ChunkProof {
-                        chunk_id: task.chunk.id,
-                        proof: proof_bytes,
-                        public_inputs: vec![
-                            task.chunk.input_commitment,
-                            task.chunk.output_commitment,
-                        ],
-                        error_bound: task.chunk.error_bound,
-                        generation_time_ms: elapsed_ms,
-                    };
-
-                    {
-                        let mut c = completed.write().unwrap();
-                        c.insert(task.chunk.id, chunk_proof);
-                    }
-                    {
-                        let mut s = status.write().unwrap();
-                        s.insert(task.chunk.id, ProofStatus::Complete);
-                    }
-
-                    worker_stats.tasks_completed.fetch_add(1, Ordering::Relaxed);
-                    global_stats.tasks_completed.fetch_add(1, Ordering::Relaxed);
+            for attempt in 0..=max_retries {
+                // Enforce per-proof timeout across all attempts
+                if start_time.elapsed() > per_proof_timeout {
+                    last_error = format!(
+                        "Per-proof timeout ({}s) exceeded after {} attempts",
+                        proof_timeout_secs, attempt
+                    );
+                    tracing::error!(
+                        chunk_id = task.chunk.id.0,
+                        timeout_secs = proof_timeout_secs,
+                        attempts = attempt,
+                        "Per-proof timeout exceeded"
+                    );
+                    break;
                 }
-                Err(e) => {
-                    let mut s = status.write().unwrap();
-                    s.insert(task.chunk.id, ProofStatus::Failed(e));
-                    global_stats.tasks_failed.fetch_add(1, Ordering::Relaxed);
+
+                if attempt > 0 {
+                    tracing::info!(
+                        chunk_id = task.chunk.id.0,
+                        attempt,
+                        max_retries,
+                        "Retrying proof generation"
+                    );
+                    // Exponential backoff before retry
+                    std::thread::sleep(Duration::from_millis(50 * (1 << attempt.min(6))));
                 }
+
+                let proof_result = Self::generate_proof(&task.chunk, &shared_pipeline);
+                let elapsed_us = start_time.elapsed().as_micros() as u64;
+                let elapsed_ms = elapsed_us / 1000;
+
+                worker_stats
+                    .total_prove_time_us
+                    .fetch_add(elapsed_us, Ordering::Relaxed);
+
+                match proof_result {
+                    Ok(proof_bytes) => {
+                        let chunk_proof = ChunkProof {
+                            chunk_id: task.chunk.id,
+                            proof: proof_bytes,
+                            public_inputs: vec![
+                                task.chunk.input_commitment,
+                                task.chunk.output_commitment,
+                            ],
+                            error_bound: task.chunk.error_bound,
+                            generation_time_ms: elapsed_ms,
+                        };
+
+                        {
+                            let mut c = completed.write().unwrap_or_else(|e| e.into_inner());
+                            c.insert(task.chunk.id, chunk_proof);
+                        }
+                        {
+                            let mut s = status.write().unwrap_or_else(|e| e.into_inner());
+                            s.insert(task.chunk.id, ProofStatus::Complete);
+                        }
+
+                        worker_stats.tasks_completed.fetch_add(1, Ordering::Relaxed);
+                        global_stats.tasks_completed.fetch_add(1, Ordering::Relaxed);
+                        succeeded = true;
+
+                        if attempt > 0 {
+                            tracing::info!(
+                                chunk_id = task.chunk.id.0,
+                                attempt,
+                                elapsed_ms,
+                                "Proof succeeded after retry"
+                            );
+                        }
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            chunk_id = task.chunk.id.0,
+                            attempt,
+                            max_retries,
+                            error = %e,
+                            "Proof generation failed"
+                        );
+                        last_error = e;
+                    }
+                }
+            }
+
+            if !succeeded {
+                tracing::error!(
+                    chunk_id = task.chunk.id.0,
+                    error = %last_error,
+                    attempts = max_retries + 1,
+                    "Proof permanently failed after all retries"
+                );
+                let mut s = status.write().unwrap_or_else(|e| e.into_inner());
+                s.insert(task.chunk.id, ProofStatus::Failed(last_error));
+                global_stats.tasks_failed.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -826,72 +1071,85 @@ pub struct BatchProofResult {
 }
 
 /// Proves a batch of chunks in parallel.
-pub fn prove_batch(chunks: Vec<ComputationChunk>, config: ParallelConfig) -> BatchProofResult {
+///
+/// Returns `Err(BatchError::AllProofsFailed)` if every proof failed,
+/// `Err(BatchError::EmptyBatch)` if no chunks were provided.
+/// Otherwise returns `Ok(BatchProofResult)` with successful proofs and any failures.
+pub fn prove_batch(chunks: Vec<ComputationChunk>, config: ParallelConfig) -> Result<BatchProofResult, BatchError> {
+    if chunks.is_empty() {
+        return Err(BatchError::EmptyBatch);
+    }
+
     let prover = ParallelProver::with_config(config);
     prover.submit_batch(chunks);
     prover.start();
 
     let start = Instant::now();
-    let proofs = prover.wait_all();
+    let proofs = match prover.wait_all() {
+        Ok(p) => p,
+        Err(e) => {
+            prover.stop();
+            return Err(e);
+        }
+    };
     let total_time_ms = start.elapsed().as_millis() as u64;
 
     let stats = prover.stats();
+    let failures = prover.collect_failures();
     prover.stop();
 
-    let status = prover.status.read().unwrap();
-    let failures: Vec<_> = status
-        .iter()
-        .filter_map(|(id, s)| {
-            if let ProofStatus::Failed(e) = s {
-                Some((*id, e.clone()))
-            } else {
-                None
-            }
-        })
-        .collect();
+    tracing::info!(
+        succeeded = proofs.len(),
+        failed = failures.len(),
+        total_time_ms,
+        "Batch proving completed"
+    );
 
-    BatchProofResult {
+    Ok(BatchProofResult {
         proofs,
         failures,
         total_time_ms,
         stats,
-    }
+    })
 }
 
 /// Proves a batch with dependency-aware scheduling.
+///
+/// Returns `Err(BatchError::AllProofsFailed)` if every proof failed,
+/// `Err(BatchError::EmptyBatch)` if no chunks were provided.
 pub fn prove_batch_with_dependencies(
     chunks: Vec<ComputationChunk>,
     config: ParallelConfig,
-) -> BatchProofResult {
+) -> Result<BatchProofResult, BatchError> {
+    if chunks.is_empty() {
+        return Err(BatchError::EmptyBatch);
+    }
+
     let prover = ParallelProver::with_config(config);
     prover.submit_batch_with_dependencies(chunks);
     prover.start();
 
     let start = Instant::now();
-    let proofs = prover.wait_all();
+    let proofs = match prover.wait_all() {
+        Ok(p) => p,
+        Err(e) => {
+            prover.stop();
+            return Err(e);
+        }
+    };
     let total_time_ms = start.elapsed().as_millis() as u64;
 
     let stats = prover.stats();
     prover.stop();
 
-    let status = prover.status.read().unwrap();
-    let failures: Vec<_> = status
-        .iter()
-        .filter_map(|(id, s)| {
-            if let ProofStatus::Failed(e) = s {
-                Some((*id, e.clone()))
-            } else {
-                None
-            }
-        })
-        .collect();
+    let failures = prover.collect_failures();
 
-    BatchProofResult {
+    Ok(BatchProofResult {
         proofs,
         failures,
         total_time_ms,
         stats,
-    }
+    })
 }
 
 /// Adaptive parallel prover that adjusts thread count based on workload.
@@ -951,7 +1209,7 @@ impl AdaptiveParallelProver {
     }
 
     /// Waits for all proofs.
-    pub fn wait_all(&self) -> Vec<ChunkProof> {
+    pub fn wait_all(&self) -> Result<Vec<ChunkProof>, BatchError> {
         self.inner.wait_all()
     }
 
@@ -1015,7 +1273,7 @@ impl PriorityTaskQueue {
     /// Pushes a task with priority.
     pub fn push(&self, task: ProofTask, deadline: Option<Instant>) {
         let pt = PriorityTask::new(task, deadline);
-        let mut tasks = self.tasks.lock().unwrap();
+        let Ok(mut tasks) = self.tasks.lock() else { return };
         tasks.push(pt);
         // Sort ascending so pop() returns highest priority (from end of vec)
         tasks.sort_by(|a, b| a.effective_priority.cmp(&b.effective_priority));
@@ -1023,13 +1281,13 @@ impl PriorityTaskQueue {
 
     /// Pops the highest priority task.
     pub fn pop(&self) -> Option<ProofTask> {
-        let mut tasks = self.tasks.lock().unwrap();
+        let mut tasks = self.tasks.lock().ok()?;
         tasks.pop().map(|pt| pt.task)
     }
 
     /// Returns the number of tasks.
     pub fn len(&self) -> usize {
-        self.tasks.lock().unwrap().len()
+        self.tasks.lock().map(|t| t.len()).unwrap_or(0)
     }
 
     /// Checks if empty.
@@ -1039,7 +1297,7 @@ impl PriorityTaskQueue {
 
     /// Updates priorities for deadline-based tasks.
     pub fn refresh_priorities(&self) {
-        let mut tasks = self.tasks.lock().unwrap();
+        let Ok(mut tasks) = self.tasks.lock() else { return };
         for task in tasks.iter_mut() {
             task.compute_priority();
         }
@@ -1093,7 +1351,7 @@ mod tests {
         }
 
         prover.start();
-        let proofs = prover.wait_all();
+        let proofs = prover.wait_all().expect("batch should succeed");
         prover.stop();
 
         assert_eq!(proofs.len(), 4);
@@ -1172,7 +1430,7 @@ mod tests {
 
         prover.submit_batch_with_dependencies(chunks);
         prover.start();
-        let proofs = prover.wait_all();
+        let proofs = prover.wait_all().expect("batch should succeed");
         prover.stop();
 
         assert_eq!(proofs.len(), 4);
@@ -1188,7 +1446,7 @@ mod tests {
                 num_threads: 2,
                 ..Default::default()
             },
-        );
+        ).expect("batch should succeed");
 
         assert_eq!(result.proofs.len(), 4);
         assert!(result.failures.is_empty());
@@ -1251,7 +1509,7 @@ mod tests {
             prover.submit(make_test_chunk(i), 100);
         }
         prover.start();
-        let proofs = prover.wait_all();
+        let proofs = prover.wait_all().expect("batch should succeed");
         prover.stop();
 
         assert_eq!(proofs.len(), 6, "All 6 proofs should succeed");
@@ -1301,7 +1559,7 @@ mod tests {
         }
 
         prover.start();
-        let proofs = prover.wait_all();
+        let proofs = prover.wait_all().expect("batch should succeed");
         prover.stop();
 
         assert_eq!(proofs.len(), 8);
@@ -1344,7 +1602,7 @@ mod tests {
         assert_eq!(completed, 0);
 
         prover.start();
-        prover.wait_all();
+        let _ = prover.wait_all().expect("batch should succeed");
         prover.stop();
 
         let (completed, total) = prover.progress();
@@ -1358,7 +1616,7 @@ mod tests {
         let result = prove_batch(chunks, ParallelConfig {
             num_threads: 2,
             ..Default::default()
-        });
+        }).expect("batch should succeed");
 
         assert_eq!(result.proofs.len(), 3);
         assert!(result.failures.is_empty());

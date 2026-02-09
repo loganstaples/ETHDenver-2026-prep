@@ -196,8 +196,8 @@ pub fn bytes_lo_to_fr(hash: &[u8; 32]) -> Fr {
     let mut buf = [0u8; 32];
     buf[..16].copy_from_slice(&hash[..16]);
     Fr::from_raw([
-        u64::from_le_bytes(buf[0..8].try_into().unwrap()),
-        u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+        u64::from_le_bytes(buf[0..8].try_into().expect("invariant: fixed-size slice")),
+        u64::from_le_bytes(buf[8..16].try_into().expect("invariant: fixed-size slice")),
         0,
         0,
     ])
@@ -208,8 +208,8 @@ pub fn bytes_hi_to_fr(hash: &[u8; 32]) -> Fr {
     let mut buf = [0u8; 32];
     buf[..16].copy_from_slice(&hash[16..32]);
     Fr::from_raw([
-        u64::from_le_bytes(buf[0..8].try_into().unwrap()),
-        u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+        u64::from_le_bytes(buf[0..8].try_into().expect("invariant: fixed-size slice")),
+        u64::from_le_bytes(buf[8..16].try_into().expect("invariant: fixed-size slice")),
         0,
         0,
     ])

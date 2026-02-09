@@ -757,7 +757,7 @@ impl<C: Circuit<Fr> + Clone> ProverPipeline<C> {
         progress: &ProgressCallback,
         attempt: u32,
     ) -> PipelineResult<Vec<u8>> {
-        let pk = self.pk.as_ref().unwrap();
+        let pk = self.pk.as_ref().expect("invariant: pk checked in prove_with_options");
         let start = Instant::now();
 
         progress(ProofProgress {
@@ -896,7 +896,7 @@ impl<C: Circuit<Fr> + Clone> ProverPipeline<C> {
         let _vk = self.vk.as_ref()?;
 
         // BN254 G1 generator
-        let g1_coords = G1Affine::generator().coordinates().unwrap();
+        let g1_coords = G1Affine::generator().coordinates().expect("G1 generator always has coordinates");
         let g1_x = field_to_u256(*g1_coords.x());
         let g1_y = field_to_u256(*g1_coords.y());
 
@@ -1120,13 +1120,13 @@ fn field_to_u256<F: PrimeField>(f: F) -> String {
 /// Extracts the c0 (real) component from an Fq2 via byte serialization.
 fn fq2_c0(f: &Fq2) -> Fq {
     let bytes = f.to_bytes();
-    Fq::from_bytes(bytes[..32].try_into().unwrap()).unwrap()
+    Fq::from_bytes(bytes[..32].try_into().expect("invariant: Fq2 bytes[..32] is 32 bytes")).expect("invariant: valid Fq bytes from Fq2")
 }
 
 /// Extracts the c1 (imaginary) component from an Fq2.
 fn fq2_c1(f: &Fq2) -> Fq {
     let bytes = f.to_bytes();
-    Fq::from_bytes(bytes[32..].try_into().unwrap()).unwrap()
+    Fq::from_bytes(bytes[32..].try_into().expect("invariant: Fq2 bytes[32..] is 32 bytes")).expect("invariant: valid Fq bytes from Fq2")
 }
 
 /// Converts a G2Affine point to EIP-197 pairing precompile format:

@@ -698,7 +698,11 @@ impl MLTrainingProverV2 {
 
         let validation = validate_witness(witness);
         if !validation.valid {
-            let first_error = validation.errors.first().unwrap();
+            let first_error = validation.errors.first()
+                .ok_or_else(|| TrainingProverError::WitnessValidation {
+                    message: "Validation failed but no errors recorded".to_string(),
+                    field: "unknown".to_string(),
+                })?;
             return Err(TrainingProverError::validation(
                 &first_error.message,
                 &first_error.field,

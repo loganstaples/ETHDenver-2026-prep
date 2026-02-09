@@ -214,7 +214,7 @@ impl HybridExecutor {
     fn cpu_worker(rx: Arc<Mutex<mpsc::Receiver<WorkItem>>>, stats: Arc<Mutex<HybridStats>>) {
         loop {
             let item = {
-                let rx = rx.lock().unwrap();
+                let rx = rx.lock().unwrap_or_else(|e| e.into_inner());
                 rx.recv()
             };
 
@@ -311,12 +311,12 @@ impl HybridExecutor {
 
     /// Get current statistics
     pub fn stats(&self) -> HybridStats {
-        self.stats.lock().unwrap().clone()
+        self.stats.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Reset statistics
     pub fn reset_stats(&self) {
-        *self.stats.lock().unwrap() = HybridStats::default();
+        *self.stats.lock().unwrap_or_else(|e| e.into_inner()) = HybridStats::default();
     }
 
     // ========================================================================

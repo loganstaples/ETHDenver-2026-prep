@@ -120,10 +120,10 @@ impl ZKRandomness {
             repr.copy_from_slice(&hash[..32]);
 
             let elem = FieldElement::from_raw([
-                u64::from_le_bytes(repr[0..8].try_into().unwrap()),
-                u64::from_le_bytes(repr[8..16].try_into().unwrap()),
-                u64::from_le_bytes(repr[16..24].try_into().unwrap()),
-                u64::from_le_bytes(repr[24..32].try_into().unwrap()) & 0x0FFFFFFFFFFFFFFF,
+                u64::from_le_bytes(repr[0..8].try_into().expect("invariant: fixed-size slice")),
+                u64::from_le_bytes(repr[8..16].try_into().expect("invariant: fixed-size slice")),
+                u64::from_le_bytes(repr[16..24].try_into().expect("invariant: fixed-size slice")),
+                u64::from_le_bytes(repr[24..32].try_into().expect("invariant: fixed-size slice")) & 0x0FFFFFFFFFFFFFFF,
             ]);
 
             if i < num_masks {
@@ -213,10 +213,10 @@ impl ZKMask {
             repr.copy_from_slice(&hash[..32]);
 
             let elem = FieldElement::from_raw([
-                u64::from_le_bytes(repr[0..8].try_into().unwrap()),
-                u64::from_le_bytes(repr[8..16].try_into().unwrap()),
-                u64::from_le_bytes(repr[16..24].try_into().unwrap()),
-                u64::from_le_bytes(repr[24..32].try_into().unwrap()) & 0x0FFFFFFFFFFFFFFF,
+                u64::from_le_bytes(repr[0..8].try_into().expect("invariant: fixed-size slice")),
+                u64::from_le_bytes(repr[8..16].try_into().expect("invariant: fixed-size slice")),
+                u64::from_le_bytes(repr[16..24].try_into().expect("invariant: fixed-size slice")),
+                u64::from_le_bytes(repr[24..32].try_into().expect("invariant: fixed-size slice")) & 0x0FFFFFFFFFFFFFFF,
             ]);
 
             evaluations.push(elem);

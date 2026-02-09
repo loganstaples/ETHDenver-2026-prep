@@ -173,7 +173,9 @@ impl GradientProver {
     /// Creates a gradient prover with custom configuration.
     pub fn with_config(config: GradientProverConfig) -> Self {
         let mut pipeline = ProverPipeline::new(config.k);
-        pipeline.setup(&IVCStepCircuit::default());
+        if let Err(e) = pipeline.setup(&IVCStepCircuit::default()) {
+            tracing::error!("GradientProver pipeline setup failed: {e}");
+        }
 
         Self {
             config,
@@ -184,7 +186,7 @@ impl GradientProver {
     }
 
     /// Proves a gradient computation.
-    pub fn prove(&self, data: &GradientData) -> GradientProofResult {
+    pub fn prove(&self, data: &GradientData) -> Result<GradientProofResult, String> {
         let start = Instant::now();
 
         // Build circuit for gradient computation
@@ -193,10 +195,10 @@ impl GradientProver {
         // Generate proof
         let pi_refs: Vec<&[Fr]> = vec![&public_inputs];
         let proof = self.pipeline.prove(&circuit, &pi_refs)
-            .unwrap_or_else(|e| {
+            .map_err(|e| {
                 tracing::error!("Gradient proof generation failed for layer {}: {e}", data.layer_index);
-                Vec::new()
-            });
+                format!("Gradient proof generation failed: {e}")
+            })?;
 
         let elapsed_ms = start.elapsed().as_millis() as u64;
 
@@ -220,25 +222,35 @@ impl GradientProver {
 
         // Update stats
         {
-            let mut stats = self.stats.lock().unwrap();
-            stats.proofs_generated += 1;
-            stats.total_proof_time_ms += elapsed_ms;
-            stats.avg_proof_time_ms = stats.total_proof_time_ms as f64 / stats.proofs_generated as f64;
-            stats.total_error += error_bound;
+            if let Ok(mut stats) = self.stats.lock() {
+                stats.proofs_generated += 1;
+                stats.total_proof_time_ms += elapsed_ms;
+                stats.avg_proof_time_ms = stats.total_proof_time_ms as f64 / stats.proofs_generated as f64;
+                stats.total_error += error_bound;
+            }
         }
 
         // Cache the result
         {
-            let mut cache = self.cache.lock().unwrap();
-            cache.insert(data.layer_index, result.clone());
+            if let Ok(mut cache) = self.cache.lock() {
+                cache.insert(data.layer_index, result.clone());
+            }
         }
 
-        result
+        Ok(result)
     }
 
     /// Proves a batch of gradient computations.
     pub fn prove_batch(&self, batch: &[GradientData]) -> Vec<GradientProofResult> {
-        batch.iter().map(|data| self.prove(data)).collect()
+        batch.iter().filter_map(|data| {
+            match self.prove(data) {
+                Ok(result) => Some(result),
+                Err(e) => {
+                    tracing::error!("Batch gradient proof failed for layer {}: {e}", data.layer_index);
+                    None
+                }
+            }
+        }).collect()
     }
 
     /// Verifies a gradient proof.
@@ -255,8 +267,8 @@ impl GradientProver {
 
     /// Gets a cached proof for a layer.
     pub fn get_cached(&self, layer_index: usize) -> Option<GradientProofResult> {
-        let mut stats = self.stats.lock().unwrap();
-        let cache = self.cache.lock().unwrap();
+        let mut stats = self.stats.lock().ok()?;
+        let cache = self.cache.lock().ok()?;
 
         if let Some(result) = cache.get(&layer_index) {
             stats.cache_hits += 1;
@@ -269,12 +281,14 @@ impl GradientProver {
 
     /// Clears the proof cache.
     pub fn clear_cache(&self) {
-        self.cache.lock().unwrap().clear();
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.clear();
+        }
     }
 
     /// Returns prover statistics.
     pub fn stats(&self) -> GradientProverStats {
-        self.stats.lock().unwrap().clone()
+        self.stats.lock().ok().map(|s| s.clone()).unwrap_or_default()
     }
 
     /// Aggregates multiple gradient proofs.
@@ -430,8 +444,8 @@ impl DistributedGradientProver {
     }
 
     /// Proves a gradient share (for MPC).
-    pub fn prove_share(&self, data: &GradientData) -> GradientShareProof {
-        let proof = self.prover.prove(data);
+    pub fn prove_share(&self, data: &GradientData) -> Result<GradientShareProof, String> {
+        let proof = self.prover.prove(data)?;
 
         // Generate share-specific commitment
         let share_commitment = {
@@ -441,27 +455,31 @@ impl DistributedGradientProver {
             hasher.finalize().into()
         };
 
-        GradientShareProof {
+        Ok(GradientShareProof {
             worker_id: self.worker_id,
             share_commitment,
             gradient_proof: proof,
-        }
+        })
     }
 
     /// Records a share commitment from another worker.
     pub fn record_share_commitment(&self, worker_id: u32, commitment: [u8; 32], layer: usize) {
-        let mut commitments = self.share_commitments.lock().unwrap();
-        let worker_commits = commitments.entry(worker_id).or_insert_with(Vec::new);
+        if let Ok(mut commitments) = self.share_commitments.lock() {
+            let worker_commits = commitments.entry(worker_id).or_insert_with(Vec::new);
 
-        while worker_commits.len() <= layer {
-            worker_commits.push([0u8; 32]);
+            while worker_commits.len() <= layer {
+                worker_commits.push([0u8; 32]);
+            }
+            worker_commits[layer] = commitment;
         }
-        worker_commits[layer] = commitment;
     }
 
     /// Verifies that all workers contributed valid shares.
     pub fn verify_all_shares(&self, layer: usize) -> bool {
-        let commitments = self.share_commitments.lock().unwrap();
+        let commitments = match self.share_commitments.lock() {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
 
         // Check we have commitments from all workers
         for worker_id in 0..self.num_workers {
@@ -484,7 +502,7 @@ impl DistributedGradientProver {
 
     /// Generates a combined commitment for the aggregated gradient.
     pub fn combined_commitment(&self, layer: usize) -> Option<[u8; 32]> {
-        let commitments = self.share_commitments.lock().unwrap();
+        let commitments = self.share_commitments.lock().ok()?;
 
         let mut hasher = Sha256::new();
         hasher.update(b"COMBINED_GRADIENT:");
@@ -574,7 +592,7 @@ fn bytes_to_fr(bytes: &[u8; 32]) -> Fr {
 fn fr_to_f64(f: &Fr) -> f64 {
     // Convert Fr to f64 (lossy, for error bound calculations only)
     let bytes = fr_to_bytes(f);
-    let value = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    let value = u64::from_le_bytes(bytes[0..8].try_into().expect("invariant: fixed-size slice"));
     value as f64 / 1e18
 }
 
@@ -599,7 +617,7 @@ mod tests {
         let prover = GradientProver::new();
         let data = make_test_gradient_data(0);
 
-        let result = prover.prove(&data);
+        let result = prover.prove(&data).expect("proof should succeed");
 
         assert!(!result.proof.is_empty());
         assert!(result.error_bound >= 0.0);
@@ -611,7 +629,7 @@ mod tests {
         let prover = GradientProver::new();
         let data = make_test_gradient_data(0);
 
-        let result = prover.prove(&data);
+        let result = prover.prove(&data).expect("proof should succeed");
         assert!(prover.verify(&result));
     }
 
@@ -634,7 +652,7 @@ mod tests {
         let data = make_test_gradient_data(5);
 
         // First prove
-        let _ = prover.prove(&data);
+        let _ = prover.prove(&data).expect("proof should succeed");
 
         // Should be cached
         let cached = prover.get_cached(5);
@@ -691,7 +709,7 @@ mod tests {
         let prover = DistributedGradientProver::new(0, 3);
         let data = make_test_gradient_data(0);
 
-        let share_proof = prover.prove_share(&data);
+        let share_proof = prover.prove_share(&data).expect("proof should succeed");
 
         assert_eq!(share_proof.worker_id, 0);
         assert_ne!(share_proof.share_commitment, [0u8; 32]);
@@ -702,8 +720,8 @@ mod tests {
         let prover = GradientProver::new();
         let data = make_test_gradient_data(0);
 
-        prover.prove(&data);
-        prover.prove(&data);
+        prover.prove(&data).expect("proof should succeed");
+        prover.prove(&data).expect("proof should succeed");
 
         let stats = prover.stats();
         assert_eq!(stats.proofs_generated, 2);
@@ -715,7 +733,7 @@ mod tests {
         let prover = GradientProver::new();
         let data = make_test_gradient_data(0);
 
-        let result = prover.prove(&data);
+        let result = prover.prove(&data).expect("proof should succeed");
 
         // Error bound should be reasonable
         assert!(result.error_bound >= 0.0);

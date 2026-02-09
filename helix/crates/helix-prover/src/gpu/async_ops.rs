@@ -102,28 +102,28 @@ impl OpState {
     }
 
     fn status(&self) -> OpStatus {
-        *self.status.read().unwrap()
+        *self.status.read().unwrap_or_else(|e| e.into_inner())
     }
 
     fn set_status(&self, status: OpStatus) {
-        *self.status.write().unwrap() = status;
+        *self.status.write().unwrap_or_else(|e| e.into_inner()) = status;
         if matches!(status, OpStatus::Completed | OpStatus::Failed | OpStatus::Cancelled) {
-            let mut completed = self.completed.lock().unwrap();
+            let mut completed = self.completed.lock().unwrap_or_else(|e| e.into_inner());
             *completed = true;
             self.cond.notify_all();
         }
     }
 
     fn wait(&self) -> OpStatus {
-        let mut completed = self.completed.lock().unwrap();
+        let mut completed = self.completed.lock().unwrap_or_else(|e| e.into_inner());
         while !*completed {
-            completed = self.cond.wait(completed).unwrap();
+            completed = self.cond.wait(completed).unwrap_or_else(|e| e.into_inner());
         }
         self.status()
     }
 
     fn wait_timeout(&self, timeout: Duration) -> Option<OpStatus> {
-        let mut completed = self.completed.lock().unwrap();
+        let mut completed = self.completed.lock().unwrap_or_else(|e| e.into_inner());
         let result = self.cond.wait_timeout_while(completed, timeout, |c| !*c);
         match result {
             Ok(_) => Some(self.status()),
@@ -631,7 +631,7 @@ impl AsyncOpQueue {
 
     /// Returns statistics.
     pub fn stats(&self) -> QueueStats {
-        self.stats.read().map(|s| s.clone()).unwrap_or_default()
+        self.stats.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Returns number of streams.
@@ -643,8 +643,8 @@ impl AsyncOpQueue {
     pub fn queue_depth(&self, stream: usize) -> usize {
         self.queues[stream % self.num_streams]
             .read()
-            .map(|q| q.len())
-            .unwrap_or(0)
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 
     /// Stops the queue (no new operations accepted).

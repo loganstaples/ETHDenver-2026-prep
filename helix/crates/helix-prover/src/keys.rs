@@ -215,7 +215,7 @@ impl FileKeyStore {
             version,
             created_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs(),
             k,
             pk_hash,
@@ -386,7 +386,7 @@ pub fn generate_keys<C>(
         version,
         created_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs(),
         k,
         pk_hash,
