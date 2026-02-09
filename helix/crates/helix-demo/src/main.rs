@@ -2,21 +2,29 @@
 //!
 //! Runs the full HELIX trustless ML training pipeline as a single command:
 //! 1. Spawn Anvil (local Ethereum node)
-//! 2. Deploy contracts (MockVerifier + HelixCoordinatorV2)
+//! 2. Deploy real Halo2Verifier + HelixCoordinatorV2
 //! 3. Register model and start training
-//! 4. Run 3 worker threads with real ZK proof generation
-//! 5. Submit proofs on-chain
-//! 6. Show loss curve and training progress
-//! 7. Demonstrate adversarial detection and slashing
+//! 4. Run worker threads with real ZK proof generation
+//! 5. Submit proofs on-chain (verified by real BN254 pairing checks)
+//! 6. Run aggregator to collect and validate proofs
+//! 7. Optionally run MPC mode (--mpc)
+//! 8. Demonstrate adversarial detection and slashing
+//! 9. Show loss curve and training progress
+//! 10. Optionally run comprehensive benchmarks (--bench)
 
+mod aggregator;
+mod bench;
 mod chain;
 mod display;
+mod mpc;
 mod srs;
-mod bench;
 mod worker;
 
-use clap::Parser;
+use std::path::PathBuf;
 use std::time::Instant;
+
+use clap::Parser;
+use helix_prover::provers::training_prover_v2::MLTrainingProverV2;
 use tracing_subscriber::EnvFilter;
 
 /// HELIX End-to-End Demo
@@ -51,6 +59,14 @@ struct Args {
     #[arg(long)]
     bench: bool,
 
+    /// Enable MPC mode (distribute weights across parties)
+    #[arg(long)]
+    mpc: bool,
+
+    /// Number of MPC parties (used with --mpc)
+    #[arg(long, default_value = "3")]
+    mpc_parties: usize,
+
     /// Verbose output
     #[arg(short, long)]
     verbose: bool,
@@ -58,6 +74,14 @@ struct Args {
     /// Skip slashing demo
     #[arg(long)]
     no_slash: bool,
+
+    /// Save benchmark results as JSON to this path
+    #[arg(long)]
+    bench_json: Option<PathBuf>,
+
+    /// Path to benchmark baseline for regression detection
+    #[arg(long)]
+    bench_baseline: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -66,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize tracing
     let filter = if args.verbose {
-        "helix_demo=debug,helix_prover=info,helix_node=info"
+        "helix_demo=debug,helix_prover=info,helix_node=info,helix_mpc=info"
     } else {
         "helix_demo=info"
     };
@@ -89,17 +113,32 @@ async fn main() -> anyhow::Result<()> {
         srs_start.elapsed().as_secs_f64()
     ));
 
+    // ── Phase 1b: Extract VK for on-chain deployment ─────────────────────
+    let vk_data = if !args.offline {
+        display::info("Initializing prover to extract VK for on-chain verifier...");
+        let prover = MLTrainingProverV2::new(2, args.d_hid, 1);
+        let vk = prover.export_vk_data()
+            .map_err(|e| anyhow::anyhow!("Failed to export VK data: {}", e))?;
+        display::success(&format!(
+            "VK extracted: s_g2[0]={:.20}...",
+            &vk.s_g2.0[..vk.s_g2.0.len().min(20)],
+        ));
+        Some(vk)
+    } else {
+        None
+    };
+
     // ── Phase 2: On-Chain Setup ──────────────────────────────────────────
-    let chain_env = if !args.offline {
-        display::phase(2, "ON-CHAIN INFRASTRUCTURE", "Deploying contracts to local Anvil");
-        let env = chain::setup_chain().await?;
+    let chain_env = if let Some(ref vk) = vk_data {
+        display::phase(2, "ON-CHAIN INFRASTRUCTURE", "Deploying real Halo2Verifier to local Anvil");
+        let env = chain::setup_chain(vk).await?;
         display::success(&format!(
             "Anvil running on {}",
             env.anvil_endpoint
         ));
         display::success(&format!(
-            "MockVerifier:    {}",
-            display::short_addr(&env.mock_verifier_addr)
+            "Halo2Verifier:   {}",
+            display::short_addr(&env.verifier_addr)
         ));
         display::success(&format!(
             "Coordinator:     {}",
@@ -158,20 +197,25 @@ async fn main() -> anyhow::Result<()> {
     // Aggregate results
     let mut all_losses: Vec<Vec<f64>> = Vec::new();
     let mut total_proofs = 0usize;
+    let mut total_verified = 0usize;
+    let mut total_cache_hits = 0usize;
     let mut total_prove_time_ms = 0u128;
 
     for (i, result) in worker_results.iter().enumerate() {
         all_losses.push(result.losses.clone());
         total_proofs += result.proofs_generated;
+        total_verified += result.proofs_verified;
+        total_cache_hits += result.cache_hits;
         total_prove_time_ms += result.total_prove_time.as_millis();
 
         display::success(&format!(
-            "Worker {}: {} steps, loss {:.4} -> {:.4}, {} proofs ({:.0}ms avg)",
+            "Worker {}: {} steps, loss {:.4} -> {:.4}, {} proofs ({} verified, {:.0}ms avg)",
             i,
             result.steps_completed,
             result.losses.first().unwrap_or(&0.0),
             result.losses.last().unwrap_or(&0.0),
             result.proofs_generated,
+            result.proofs_verified,
             if result.proofs_generated > 0 {
                 result.total_prove_time.as_millis() as f64 / result.proofs_generated as f64
             } else {
@@ -181,10 +225,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ── Phase 4: On-Chain Proof Submission ────────────────────────────────
+    let mut gas_costs = Vec::new();
     if let Some(ref env) = chain_env {
-        display::phase(4, "ON-CHAIN VERIFICATION", "Submitting proofs to smart contract");
+        display::phase(4, "ON-CHAIN VERIFICATION", "Submitting proofs to real Halo2Verifier");
 
-        let submit_count = std::cmp::min(5, worker_results.iter().map(|r| r.evm_bundles.len()).sum());
+        let submit_count = std::cmp::min(
+            5,
+            worker_results.iter().map(|r| r.evm_bundles.len()).sum(),
+        );
         let mut submitted = 0;
 
         for (worker_idx, result) in worker_results.iter().enumerate() {
@@ -195,9 +243,10 @@ async fn main() -> anyhow::Result<()> {
                 match chain::submit_proof(env, bundle).await {
                     Ok(gas) => {
                         display::success(&format!(
-                            "Proof #{} (worker {}) verified on-chain (gas: {})",
+                            "Proof #{} (worker {}) verified on-chain via BN254 pairing (gas: {})",
                             submitted, worker_idx, gas
                         ));
+                        gas_costs.push(gas);
                         submitted += 1;
                     }
                     Err(e) => {
@@ -209,16 +258,81 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        display::metric(&format!("{}/{} proofs submitted on-chain", submitted, submit_count));
+        display::metric(&format!(
+            "{}/{} proofs submitted and verified on-chain",
+            submitted, submit_count
+        ));
     }
 
-    // ── Phase 5: Slashing Demo ───────────────────────────────────────────
+    // ── Phase 4b: Aggregator Verification ────────────────────────────────
+    if !args.offline {
+        display::phase(
+            5,
+            "AGGREGATOR VERIFICATION",
+            "Collecting proofs, validating, and aggregating commitments",
+        );
+
+        match aggregator::run_aggregator_demo(&worker_results).await {
+            Ok(agg_result) => {
+                display::metric(&format!(
+                    "Aggregator: {}/{} proofs accepted, {} invalid rejected",
+                    agg_result.proofs_accepted,
+                    agg_result.proofs_submitted,
+                    agg_result.invalid_rejected,
+                ));
+            }
+            Err(e) => {
+                display::warn(&format!("Aggregator demo: {}", e));
+            }
+        }
+    }
+
+    // ── Phase 5b: MPC Mode ───────────────────────────────────────────────
+    if args.mpc {
+        display::phase(
+            6,
+            "MPC TRAINING",
+            &format!(
+                "{} parties, {} steps with additive secret sharing",
+                args.mpc_parties, args.steps,
+            ),
+        );
+
+        match mpc::run_mpc_training(
+            args.mpc_parties,
+            args.d_hid,
+            args.lr,
+            args.seed,
+            &dataset,
+            args.steps.min(5), // Limit MPC steps for demo speed
+            false,             // Skip MPC proofs in demo
+        )
+        .await
+        {
+            Ok(mpc_result) => {
+                display::metric(&format!(
+                    "MPC loss trajectory: {:.4} -> {:.4}",
+                    mpc_result.losses.first().unwrap_or(&0.0),
+                    mpc_result.losses.last().unwrap_or(&0.0),
+                ));
+            }
+            Err(e) => {
+                display::warn(&format!("MPC training: {}", e));
+            }
+        }
+    }
+
+    // ── Phase 6: Slashing Demo ───────────────────────────────────────────
     if !args.no_slash {
         if let Some(ref env) = chain_env {
-            display::phase(5, "ADVERSARIAL DETECTION", "Demonstrating Byzantine fault handling");
+            display::phase(
+                7,
+                "ADVERSARIAL DETECTION",
+                "Demonstrating Byzantine fault handling with real verifier",
+            );
             match chain::demonstrate_slashing(env).await {
                 Ok(()) => {
-                    display::success("Malicious proof detected and rejected");
+                    display::success("Malicious proof detected and rejected by real Halo2Verifier");
                     display::success("Worker stake slashed via smart contract");
                 }
                 Err(e) => {
@@ -228,8 +342,8 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // ── Phase 6: Loss Curve & Summary ────────────────────────────────────
-    display::phase(6, "TRAINING RESULTS", "Loss convergence and metrics");
+    // ── Phase 7: Loss Curve & Summary ────────────────────────────────────
+    display::phase(8, "TRAINING RESULTS", "Loss convergence and metrics");
     display::loss_curve(&all_losses);
 
     let avg_loss_start: f64 = all_losses
@@ -254,9 +368,12 @@ async fn main() -> anyhow::Result<()> {
         avg_loss_start, avg_loss_end, reduction_pct,
     ));
     display::metric(&format!(
-        "Total proofs:   {} across {} workers",
-        total_proofs, args.workers
+        "Total proofs:   {} ({} self-verified) across {} workers",
+        total_proofs, total_verified, args.workers
     ));
+    if total_cache_hits > 0 {
+        display::metric(&format!("Cache hits:     {}", total_cache_hits));
+    }
     display::metric(&format!(
         "Avg proof time: {:.0}ms",
         if total_proofs > 0 {
@@ -270,11 +387,37 @@ async fn main() -> anyhow::Result<()> {
         demo_start.elapsed().as_secs_f64()
     ));
 
-    // ── Phase 7: Benchmark (optional) ────────────────────────────────────
+    // ── Phase 8: Benchmark (optional) ────────────────────────────────────
     if args.bench {
-        display::phase(7, "PERFORMANCE BENCHMARK", "Measuring ZK overhead vs native training");
-        let bench_result = bench::run_overhead_benchmark(args.d_hid, &dataset)?;
+        display::phase(
+            9,
+            "PERFORMANCE BENCHMARK",
+            "Comprehensive ZK overhead analysis with regression detection",
+        );
+        let mut bench_result = bench::run_overhead_benchmark(args.d_hid, &dataset)?;
+
+        // Add gas costs from on-chain submissions
+        if !gas_costs.is_empty() {
+            bench::add_gas_costs(&mut bench_result, &gas_costs);
+        }
+
         bench::display_results(&bench_result);
+
+        // Save JSON output if requested
+        if let Some(ref json_path) = args.bench_json {
+            bench::save_json(&bench_result, json_path)?;
+        }
+
+        // Regression detection
+        if let Some(ref baseline_path) = args.bench_baseline {
+            display::info("Checking for performance regressions...");
+            let passed = bench::check_regression(&bench_result, baseline_path);
+            if !passed {
+                display::warn("Performance regression detected! Check baseline.");
+            }
+            // Always save current as new baseline
+            bench::save_baseline(&bench_result, baseline_path)?;
+        }
     }
 
     // ── Summary ──────────────────────────────────────────────────────────

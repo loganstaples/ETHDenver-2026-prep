@@ -27,7 +27,11 @@ hex = "0.4"
 # Cryptography
 sha2 = "0.10"
 rand = "0.8"
+rand_chacha = "0.3"
 halo2curves = "0.7.0"
+
+# System
+libc = "0.2"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
