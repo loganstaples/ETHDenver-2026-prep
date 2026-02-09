@@ -12,11 +12,17 @@ use parking_lot::RwLock;
 use tokio::sync::mpsc;
 
 use super::discovery::{DiscoveryConfig, PeerDiscovery};
+use super::eclipse::{
+    ConnectionType, DiscoverySource, EclipsePreventionConfig, EclipseResistantPeerManager,
+    PeerNetworkInfo,
+};
 use super::gossip::{GossipConfig, GossipProtocol};
 use super::messages::{
     DiscoveryMessage, GradientMessage, HeartbeatMessage, MessagePayload, NetworkMessage,
     NodeCapabilities, PeerId, PeerInfo, SyncMessage, TrainingMessage,
 };
+use super::partition_detect::{PartitionAction, PartitionDetectionConfig, PartitionDetector};
+use super::rate_limit::{MessageType, RateLimitConfig, RateLimitResult, RateLimiter};
 use super::sync::{StateSync, SyncConfig};
 use super::transport::{ConnectionPool, TcpTransport, Transport, TransportConfig, TransportError};
 
@@ -50,6 +56,12 @@ pub struct NetworkRunnerConfig {
     pub discovery: DiscoveryConfig,
     /// Sync configuration.
     pub sync: SyncConfig,
+    /// Rate limiting configuration.
+    pub rate_limit: RateLimitConfig,
+    /// Eclipse prevention configuration.
+    pub eclipse: EclipsePreventionConfig,
+    /// Partition detection configuration.
+    pub partition_detect: PartitionDetectionConfig,
     /// Gossip send interval (ms).
     pub gossip_send_interval_ms: u64,
     /// Cache cleanup interval (seconds).
@@ -65,6 +77,9 @@ impl Default for NetworkRunnerConfig {
             gossip: GossipConfig::default(),
             discovery: DiscoveryConfig::default(),
             sync: SyncConfig::default(),
+            rate_limit: RateLimitConfig::default(),
+            eclipse: EclipsePreventionConfig::default(),
+            partition_detect: PartitionDetectionConfig::default(),
             gossip_send_interval_ms: 100,
             cache_cleanup_interval_secs: 60,
             max_outbound_per_tick: 50,
@@ -88,6 +103,12 @@ pub struct NetworkRunner {
     discovery: Arc<PeerDiscovery>,
     /// State sync.
     sync: Arc<StateSync>,
+    /// Rate limiter for per-peer and global rate limiting.
+    rate_limiter: Arc<parking_lot::Mutex<RateLimiter>>,
+    /// Eclipse-resistant peer manager for diversity enforcement.
+    eclipse_manager: Arc<parking_lot::Mutex<EclipseResistantPeerManager>>,
+    /// Network partition detector.
+    partition_detector: Arc<PartitionDetector>,
     /// Event channel sender.
     event_tx: mpsc::Sender<NetworkEvent>,
     /// Event channel receiver (for external consumption).
@@ -113,6 +134,16 @@ impl NetworkRunner {
         let discovery = Arc::new(PeerDiscovery::new(local_id.clone(), config.discovery.clone()));
         let sync = Arc::new(StateSync::new(local_id.clone(), config.sync.clone()));
 
+        let rate_limiter = Arc::new(parking_lot::Mutex::new(
+            RateLimiter::new(config.rate_limit.clone()),
+        ));
+        let eclipse_manager = Arc::new(parking_lot::Mutex::new(
+            EclipseResistantPeerManager::new(config.eclipse.clone()),
+        ));
+        let mut partition_detector = PartitionDetector::new(config.partition_detect.clone());
+        partition_detector.set_our_addr(config.transport.listen_addr);
+        let partition_detector = Arc::new(partition_detector);
+
         let (event_tx, event_rx) = mpsc::channel(10000);
         let listen_addr = config.transport.listen_addr.to_string();
 
@@ -124,6 +155,9 @@ impl NetworkRunner {
             gossip,
             discovery,
             sync,
+            rate_limiter,
+            eclipse_manager,
+            partition_detector,
             event_tx,
             event_rx: Arc::new(tokio::sync::Mutex::new(event_rx)),
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -147,9 +181,10 @@ impl NetworkRunner {
         let sync = self.sync.clone();
         let event_tx = self.event_tx.clone();
         let pool = self.pool.clone();
+        let rate_limiter = self.rate_limiter.clone();
 
         tokio::spawn(async move {
-            Self::receive_loop(running, transport, gossip, discovery, sync, event_tx, pool).await;
+            Self::receive_loop(running, transport, gossip, discovery, sync, event_tx, pool, rate_limiter).await;
         });
 
         // Spawn gossip send loop
@@ -169,9 +204,15 @@ impl NetworkRunner {
         let gossip = self.gossip.clone();
         let discovery = self.discovery.clone();
         let cleanup_interval = self.config.cache_cleanup_interval_secs;
+        let partition_detector = self.partition_detector.clone();
+        let rate_limiter_cleanup = self.rate_limiter.clone();
+        let event_tx_cleanup = self.event_tx.clone();
 
         tokio::spawn(async move {
-            Self::cleanup_loop(running, gossip, discovery, cleanup_interval).await;
+            Self::cleanup_loop(
+                running, gossip, discovery, cleanup_interval,
+                partition_detector, rate_limiter_cleanup, event_tx_cleanup,
+            ).await;
         });
 
         Ok(())
@@ -201,6 +242,27 @@ impl NetworkRunner {
         let addr: SocketAddr = peer_info.address.parse()
             .map_err(|_| TransportError::PeerNotFound(format!("Invalid address: {}", peer_info.address)))?;
 
+        // Check eclipse diversity before accepting outbound connection
+        {
+            let peer_net_info = PeerNetworkInfo::new(
+                peer_info.id.clone(),
+                Some(addr.ip()),
+                ConnectionType::Outbound,
+                DiscoverySource::Manual,
+            );
+            let mut eclipse = self.eclipse_manager.lock();
+            if let Err(e) = eclipse.try_add_peer(peer_net_info) {
+                log::warn!(
+                    "Eclipse diversity check rejected outbound peer {}: {}",
+                    peer_info.id, e
+                );
+                // Still allow the connection — eclipse is advisory for outbound
+            }
+        }
+
+        // Register peer for partition monitoring
+        self.partition_detector.register_peer(addr);
+
         self.pool.register_peer(peer_info.id.clone(), addr);
         self.discovery.mark_connected(peer_info.clone()).await;
 
@@ -219,6 +281,7 @@ impl NetworkRunner {
     pub async fn disconnect_peer(&self, peer_id: &PeerId) {
         self.pool.unregister_peer(peer_id);
         self.discovery.remove_peer(peer_id).await;
+        self.eclipse_manager.lock().remove_peer(peer_id);
         let _ = self.event_tx.send(NetworkEvent::PeerDisconnected(peer_id.clone())).await;
     }
 
@@ -263,11 +326,37 @@ impl NetworkRunner {
         &self.discovery
     }
 
+    /// Returns the rate limiter.
+    pub fn rate_limiter(&self) -> &Arc<parking_lot::Mutex<RateLimiter>> {
+        &self.rate_limiter
+    }
+
+    /// Returns the eclipse-resistant peer manager.
+    pub fn eclipse_manager(&self) -> &Arc<parking_lot::Mutex<EclipseResistantPeerManager>> {
+        &self.eclipse_manager
+    }
+
+    /// Returns the partition detector.
+    pub fn partition_detector(&self) -> &Arc<PartitionDetector> {
+        &self.partition_detector
+    }
+
     async fn get_connected_peer_ids(&self) -> Vec<PeerId> {
         self.discovery.get_all_peers().await
             .into_iter()
             .map(|p| p.id)
             .collect()
+    }
+
+    /// Maps a message payload to a rate limit message type.
+    fn payload_to_message_type(payload: &MessagePayload) -> MessageType {
+        match payload {
+            MessagePayload::Discovery(_) => MessageType::Discovery,
+            MessagePayload::Training(_) => MessageType::Training,
+            MessagePayload::Gradient(_) => MessageType::Gradient,
+            MessagePayload::Sync(_) => MessageType::Sync,
+            MessagePayload::Heartbeat(_) => MessageType::Heartbeat,
+        }
     }
 
     async fn receive_loop(
@@ -278,10 +367,50 @@ impl NetworkRunner {
         sync: Arc<StateSync>,
         event_tx: mpsc::Sender<NetworkEvent>,
         pool: Arc<ConnectionPool>,
+        rate_limiter: Arc<parking_lot::Mutex<RateLimiter>>,
     ) {
         while running.load(std::sync::atomic::Ordering::SeqCst) {
             match transport.recv().await {
                 Ok((from, message)) => {
+                    // === Rate limiting (Task B3.4) ===
+                    let msg_type = Self::payload_to_message_type(&message.payload);
+                    {
+                        let mut limiter = rate_limiter.lock();
+                        let result = limiter.check_rate_limit(&message.sender, msg_type);
+                        match result {
+                            RateLimitResult::Allowed => {}
+                            RateLimitResult::Blacklisted => {
+                                log::debug!(
+                                    "Dropping message from blacklisted peer {}",
+                                    message.sender
+                                );
+                                continue;
+                            }
+                            RateLimitResult::GlobalLimitExceeded => {
+                                log::warn!("Global rate limit exceeded, dropping message from {}", message.sender);
+                                continue;
+                            }
+                            RateLimitResult::PeerLimitExceeded { violations, .. } => {
+                                log::debug!(
+                                    "Rate limited peer {} (violations: {})",
+                                    message.sender, violations
+                                );
+                                continue;
+                            }
+                            RateLimitResult::AutoBlacklisted => {
+                                log::warn!(
+                                    "Auto-blacklisted peer {} due to repeated violations",
+                                    message.sender
+                                );
+                                continue;
+                            }
+                            RateLimitResult::ConnectionFlood => {
+                                log::warn!("Connection flood from {}", message.sender);
+                                continue;
+                            }
+                        }
+                    }
+
                     // Update peer last seen
                     discovery.update_last_seen(&message.sender).await;
 
@@ -313,15 +442,25 @@ impl NetworkRunner {
                                 let _ = pool.send(&message.sender, response).await;
                             }
 
-                            // Emit event for new peers
+                            // === Inbound peer registration (Task B3.6) ===
+                            // Register inbound peers on JoinRequest so we can route responses
                             if let DiscoveryMessage::JoinRequest { capabilities, listen_addr } = disc_msg {
                                 let peer_info = PeerInfo {
                                     id: message.sender.clone(),
-                                    address: listen_addr,
+                                    address: listen_addr.clone(),
                                     capabilities,
                                     last_seen: message.timestamp,
                                     reputation: 0,
                                 };
+
+                                // Register peer in connection pool for response routing
+                                if let Ok(addr) = listen_addr.parse::<SocketAddr>() {
+                                    pool.register_peer(message.sender.clone(), addr);
+                                }
+
+                                // Mark as connected in discovery
+                                discovery.mark_connected(peer_info.clone()).await;
+
                                 let _ = event_tx.send(NetworkEvent::PeerDiscovered(peer_info)).await;
                             }
                         }
@@ -412,6 +551,9 @@ impl NetworkRunner {
         gossip: Arc<GossipProtocol>,
         discovery: Arc<PeerDiscovery>,
         cleanup_interval_secs: u64,
+        partition_detector: Arc<PartitionDetector>,
+        rate_limiter: Arc<parking_lot::Mutex<RateLimiter>>,
+        event_tx: mpsc::Sender<NetworkEvent>,
     ) {
         let mut interval = tokio::time::interval(Duration::from_secs(cleanup_interval_secs));
 
@@ -423,6 +565,39 @@ impl NetworkRunner {
 
             // Cleanup stale peers
             discovery.cleanup_stale_peers().await;
+
+            // Cleanup expired rate limiter entries
+            rate_limiter.lock().cleanup();
+
+            // === Partition detection (Task B3.5) ===
+            match partition_detector.detect_partition().await {
+                Ok(status) => {
+                    if status.is_partitioned {
+                        log::warn!(
+                            "Network partition detected: {} connected, {} unreachable, action={:?}",
+                            status.connected_peers,
+                            status.unreachable_peers,
+                            status.recommended_action,
+                        );
+                        match status.recommended_action {
+                            PartitionAction::PauseTraining | PartitionAction::Halt => {
+                                let _ = event_tx.send(NetworkEvent::Error {
+                                    peer: None,
+                                    error: format!(
+                                        "Network partition: {} unreachable peers, action={:?}",
+                                        status.unreachable_peers,
+                                        status.recommended_action,
+                                    ),
+                                }).await;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::debug!("Partition detection skipped: {}", e);
+                }
+            }
         }
     }
 }

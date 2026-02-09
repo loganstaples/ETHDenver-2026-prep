@@ -5,12 +5,14 @@
 //! - Worker failure detection and recovery
 //! - Gradient synchronization
 //! - Heartbeat/liveness monitoring
+//! - Byzantine gradient filtering for outlier detection
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
+use sha2::Digest;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::network::messages::{
@@ -25,7 +27,11 @@ use crate::sc_client::{SCClient, TrainingProofInputs};
 use crate::training::DistributedRoundId;
 use ethers::types::U256;
 
-use super::verification::{GradientValidator, ProofVerifier, ValidationResult, VerificationConfig};
+use super::aggregation::AggregationStrategy;
+use super::verification::{
+    ByzantineGradientFilter, ByzantineStrategy, FilterResult,
+    GradientValidator, ProofVerifier, ValidationResult, VerificationConfig,
+};
 
 /// Orchestrator configuration.
 #[derive(Debug, Clone)]
@@ -216,6 +222,10 @@ pub struct TrainingOrchestrator {
     is_leader: Arc<RwLock<bool>>,
     /// Round commit manager for proof aggregation + on-chain submission.
     round_commit: Arc<RwLock<Option<RoundCommitManager>>>,
+    /// Byzantine gradient filter for outlier detection.
+    byzantine_filter: Arc<RwLock<ByzantineGradientFilter>>,
+    /// Aggregation strategy.
+    aggregation_strategy: Arc<RwLock<AggregationStrategy>>,
 }
 
 impl TrainingOrchestrator {
@@ -233,6 +243,11 @@ impl TrainingOrchestrator {
 
         let (event_tx, _) = broadcast::channel(1000);
 
+        let byzantine_filter = Arc::new(RwLock::new(ByzantineGradientFilter::new(
+            ByzantineStrategy::Combined,
+            (config.min_workers / 3).max(1), // Tolerate up to n/3 Byzantine workers
+        )));
+
         Self {
             local_id,
             config,
@@ -245,7 +260,19 @@ impl TrainingOrchestrator {
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             is_leader: Arc::new(RwLock::new(false)),
             round_commit: Arc::new(RwLock::new(None)),
+            byzantine_filter,
+            aggregation_strategy: Arc::new(RwLock::new(AggregationStrategy::FedAvg)),
         }
+    }
+
+    /// Sets the aggregation strategy.
+    pub fn set_aggregation_strategy(&self, strategy: AggregationStrategy) {
+        *self.aggregation_strategy.write() = strategy;
+    }
+
+    /// Returns the current aggregation strategy.
+    pub fn aggregation_strategy(&self) -> AggregationStrategy {
+        self.aggregation_strategy.read().clone()
     }
 
     /// Sets up the round commit manager with an on-chain client.
@@ -675,13 +702,58 @@ impl TrainingOrchestrator {
             }
         }
 
-        // Fallback: local Merkle aggregation (no on-chain submission)
-        let mut combined = [0u8; 32];
-        for (_, gradient) in &gradients {
-            for (i, byte) in gradient.commitment.iter().enumerate() {
-                combined[i] ^= byte;
+        // === Byzantine gradient filtering (Task B3.3) ===
+        // Convert gradients to filter format: (id, norm, gradient_proxy)
+        let submissions: Vec<(String, f64, Vec<f32>)> = gradients.iter().map(|(peer_id, grad)| {
+            // Use commitment bytes as gradient proxy for distance computation
+            let grad_proxy: Vec<f32> = grad.commitment.iter().map(|&b| b as f32).collect();
+            let norm = grad.error_bound;
+            (peer_id.0.clone(), norm, grad_proxy)
+        }).collect();
+
+        let filter_results = self.byzantine_filter.write().filter_gradients(&submissions);
+
+        // Partition into accepted/rejected
+        let mut accepted_commitments = Vec::new();
+        for (peer_id_str, result) in &filter_results {
+            if result.accepted {
+                if let Some((_, grad)) = gradients.iter().find(|(pid, _)| pid.0 == *peer_id_str) {
+                    accepted_commitments.push(grad.commitment);
+                }
+            } else {
+                let _ = self.event_tx.send(OrchestratorEvent::GradientRejected {
+                    round_id,
+                    peer_id: PeerId::from_string(peer_id_str.clone()),
+                    reason: result.reason.clone().unwrap_or_else(|| "Byzantine filter".to_string()),
+                });
+                log::warn!(
+                    "Byzantine filter rejected gradient from {}: {:?}",
+                    peer_id_str,
+                    result.reason
+                );
             }
         }
+
+        if accepted_commitments.is_empty() {
+            // All rejected — fail the round
+            self.fail_round(round_id, "All gradients rejected by Byzantine filter").await;
+            return;
+        }
+
+        log::info!(
+            "Byzantine filter: {}/{} gradients accepted for round {}",
+            accepted_commitments.len(),
+            gradients.len(),
+            round_id,
+        );
+
+        // Compute aggregated commitment via SHA-256 of sorted accepted commitments
+        accepted_commitments.sort();
+        let mut hasher = sha2::Sha256::new();
+        for commitment in &accepted_commitments {
+            sha2::Digest::update(&mut hasher, commitment);
+        }
+        let combined: [u8; 32] = sha2::Digest::finalize(hasher).into();
 
         self.network.broadcast(MessagePayload::Gradient(GradientMessage::AggregatedGradient {
             round_id,
@@ -777,6 +849,36 @@ impl TrainingOrchestrator {
         );
 
         Ok(aggregated.gradient_commitment)
+    }
+
+    /// Fails the current round with the given reason.
+    async fn fail_round(&self, round_id: u64, reason: &str) {
+        {
+            let mut round_guard = self.current_round.write();
+            if let Some(ref mut round) = *round_guard {
+                round.phase = RoundPhase::Failed;
+
+                // Reset worker states
+                let mut workers = self.workers.write();
+                for peer_id in &round.workers {
+                    if let Some(worker) = workers.get_mut(peer_id) {
+                        worker.status = WorkerStatus::Available;
+                        worker.shard_id = None;
+                    }
+                }
+            }
+        }
+
+        // Emit failure event
+        let _ = self.event_tx.send(OrchestratorEvent::RoundFailed {
+            round_id,
+            reason: reason.to_string(),
+        });
+
+        log::error!("Round {} failed: {}", round_id, reason);
+
+        // Clear round
+        *self.current_round.write() = None;
     }
 
     async fn complete_round(&self, result_hash: [u8; 32]) {

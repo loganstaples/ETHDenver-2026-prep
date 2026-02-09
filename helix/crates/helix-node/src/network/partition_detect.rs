@@ -336,78 +336,81 @@ impl PartitionDetector {
 
     /// Run partition detection
     pub async fn detect_partition(&self) -> Result<PartitionStatus, PartitionError> {
-        let peers = self.peers.read();
+        // Build the status inside a sync block so the RwLockReadGuard is dropped
+        // before any .await (parking_lot guards are !Send).
+        let status = {
+            let peers = self.peers.read();
 
-        if peers.len() < self.config.min_peers_for_detection {
-            return Err(PartitionError::InsufficientPeers {
-                have: peers.len(),
-                need: self.config.min_peers_for_detection,
-            });
-        }
-
-        // Count peer statuses
-        let mut connected = 0;
-        let mut degraded = 0;
-        let mut unreachable = 0;
-
-        for info in peers.values() {
-            match info.status {
-                PeerConnectivity::Connected => connected += 1,
-                PeerConnectivity::Degraded => degraded += 1,
-                PeerConnectivity::Unreachable => unreachable += 1,
-                PeerConnectivity::Unknown => {}
+            if peers.len() < self.config.min_peers_for_detection {
+                return Err(PartitionError::InsufficientPeers {
+                    have: peers.len(),
+                    need: self.config.min_peers_for_detection,
+                });
             }
-        }
 
-        let total_known = connected + degraded + unreachable;
-        let unreachable_ratio = if total_known > 0 {
-            unreachable as f64 / total_known as f64
-        } else {
-            0.0
+            // Count peer statuses
+            let mut connected = 0;
+            let mut degraded = 0;
+            let mut unreachable = 0;
+
+            for info in peers.values() {
+                match info.status {
+                    PeerConnectivity::Connected => connected += 1,
+                    PeerConnectivity::Degraded => degraded += 1,
+                    PeerConnectivity::Unreachable => unreachable += 1,
+                    PeerConnectivity::Unknown => {}
+                }
+            }
+
+            let total_known = connected + degraded + unreachable;
+            let unreachable_ratio = if total_known > 0 {
+                unreachable as f64 / total_known as f64
+            } else {
+                0.0
+            };
+
+            // Check consensus agreement
+            let consensus_agreement = self.calculate_consensus_agreement(&peers);
+
+            // Detect partition groups using reported peer views
+            let partition_groups = self.detect_partition_groups(&peers);
+
+            // Determine if partitioned
+            let is_partitioned = unreachable_ratio >= self.config.partition_threshold
+                || consensus_agreement < self.config.min_consensus_agreement
+                || partition_groups.len() > 1;
+
+            // Calculate confidence
+            let confidence = self.calculate_confidence(
+                total_known,
+                unreachable_ratio,
+                consensus_agreement,
+                &partition_groups,
+            );
+
+            // Determine recommended action
+            let recommended_action = self.determine_action(
+                is_partitioned,
+                confidence,
+                unreachable_ratio,
+                consensus_agreement,
+            );
+
+            PartitionStatus {
+                is_partitioned,
+                confidence,
+                connected_peers: connected,
+                degraded_peers: degraded,
+                unreachable_peers: unreachable,
+                partition_groups,
+                consensus_agreement,
+                computed_at: Instant::now(),
+                recommended_action,
+            }
+            // peers guard dropped here
         };
 
-        // Check consensus agreement
-        let consensus_agreement = self.calculate_consensus_agreement(&peers);
-
-        // Detect partition groups using reported peer views
-        let partition_groups = self.detect_partition_groups(&peers);
-
-        // Determine if partitioned
-        let is_partitioned = unreachable_ratio >= self.config.partition_threshold
-            || consensus_agreement < self.config.min_consensus_agreement
-            || partition_groups.len() > 1;
-
-        // Calculate confidence
-        let confidence = self.calculate_confidence(
-            total_known,
-            unreachable_ratio,
-            consensus_agreement,
-            &partition_groups,
-        );
-
-        // Determine recommended action
-        let recommended_action = self.determine_action(
-            is_partitioned,
-            confidence,
-            unreachable_ratio,
-            consensus_agreement,
-        );
-
-        let status = PartitionStatus {
-            is_partitioned,
-            confidence,
-            connected_peers: connected,
-            degraded_peers: degraded,
-            unreachable_peers: unreachable,
-            partition_groups,
-            consensus_agreement,
-            computed_at: Instant::now(),
-            recommended_action,
-        };
-
-        drop(peers);
-
-        // Update state and emit events
+        // Update state and emit events (safe to .await now)
         self.handle_status_change(&status).await;
 
         *self.last_detection.write() = Instant::now();
@@ -588,6 +591,9 @@ impl PartitionDetector {
             return;
         };
 
+        // Collect all events synchronously (no .await while guards are held)
+        let mut events = Vec::new();
+
         match (&previous, new_status.is_partitioned) {
             (None, true) | (Some(PartitionStatus { is_partitioned: false, .. }), true) => {
                 // Partition detected
@@ -597,9 +603,7 @@ impl PartitionDetector {
                     new_status.unreachable_peers,
                     new_status.consensus_agreement * 100.0
                 );
-                let _ = sender
-                    .send(PartitionEvent::PartitionDetected(new_status.clone()))
-                    .await;
+                events.push(PartitionEvent::PartitionDetected(new_status.clone()));
             }
             (Some(PartitionStatus { is_partitioned: true, .. }), false) => {
                 // Partition resolved
@@ -610,7 +614,7 @@ impl PartitionDetector {
                     );
                 }
                 *self.partition_start.write() = None;
-                let _ = sender.send(PartitionEvent::PartitionResolved).await;
+                events.push(PartitionEvent::PartitionResolved);
             }
             _ => {}
         }
@@ -623,11 +627,12 @@ impl PartitionDetector {
                 let is_unreachable = info.status == PeerConnectivity::Unreachable;
 
                 if is_unreachable && !was_unreachable {
-                    let _ = sender.send(PartitionEvent::PeerUnreachable(*addr)).await;
+                    events.push(PartitionEvent::PeerUnreachable(*addr));
                 } else if !is_unreachable && was_unreachable {
-                    let _ = sender.send(PartitionEvent::PeerReconnected(*addr)).await;
+                    events.push(PartitionEvent::PeerReconnected(*addr));
                 }
             }
+            // peers guard dropped here
         }
 
         // Check for consensus divergence
@@ -642,15 +647,19 @@ impl PartitionDetector {
                 })
                 .map(|(addr, _)| *addr)
                 .collect();
+            // peers guard dropped here
 
             if !divergent.is_empty() {
-                let _ = sender
-                    .send(PartitionEvent::ConsensusDivergence {
-                        expected: our_hash,
-                        divergent_peers: divergent,
-                    })
-                    .await;
+                events.push(PartitionEvent::ConsensusDivergence {
+                    expected: our_hash,
+                    divergent_peers: divergent,
+                });
             }
+        }
+
+        // Now send all collected events (no guards held across .await)
+        for event in events {
+            let _ = sender.send(event).await;
         }
     }
 

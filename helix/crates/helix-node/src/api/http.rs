@@ -19,6 +19,10 @@ pub struct ApiState {
     pub orchestrator_workers: Arc<RwLock<OrchestratorSnapshot>>,
     /// Trigger channel for starting rounds.
     pub round_trigger_tx: broadcast::Sender<()>,
+    /// Snapshot of connected peers (updated periodically).
+    pub peers: Arc<RwLock<PeerSnapshot>>,
+    /// Snapshot of aggregate metrics (updated periodically).
+    pub metrics: Arc<RwLock<MetricsSnapshot>>,
 }
 
 /// Snapshot of orchestrator state (updated periodically).
@@ -55,6 +59,45 @@ pub struct WorkerInfo {
     pub rounds_completed: u64,
 }
 
+/// A single peer entry for the peers endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerEntry {
+    pub id: String,
+    pub address: String,
+    pub last_seen: u64,
+    pub reputation: i64,
+}
+
+/// Snapshot of connected peers (returned by `/peers`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PeerSnapshot {
+    pub peers: Vec<PeerEntry>,
+}
+
+/// Aggregate node metrics (returned by `/metrics`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsSnapshot {
+    pub total_rounds: u64,
+    pub total_proofs: u64,
+    pub proofs_valid: u64,
+    pub proofs_invalid: u64,
+    pub avg_round_time_ms: f64,
+    pub uptime_secs: u64,
+}
+
+impl Default for MetricsSnapshot {
+    fn default() -> Self {
+        Self {
+            total_rounds: 0,
+            total_proofs: 0,
+            proofs_valid: 0,
+            proofs_invalid: 0,
+            avg_round_time_ms: 0.0,
+            uptime_secs: 0,
+        }
+    }
+}
+
 /// Health response.
 #[derive(Serialize)]
 struct HealthResponse {
@@ -81,6 +124,8 @@ pub async fn start_api_server(
         .route("/round/start", post(round_start_handler))
         .route("/round/status", get(round_status_handler))
         .route("/workers", get(workers_handler))
+        .route("/peers", get(peers_handler))
+        .route("/metrics", get(metrics_handler))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -121,4 +166,14 @@ async fn round_status_handler(State(state): State<Arc<ApiState>>) -> Json<Orches
 async fn workers_handler(State(state): State<Arc<ApiState>>) -> Json<Vec<WorkerInfo>> {
     let snapshot = state.orchestrator_workers.read();
     Json(snapshot.workers.clone())
+}
+
+async fn peers_handler(State(state): State<Arc<ApiState>>) -> Json<PeerSnapshot> {
+    let snapshot = state.peers.read().clone();
+    Json(snapshot)
+}
+
+async fn metrics_handler(State(state): State<Arc<ApiState>>) -> Json<MetricsSnapshot> {
+    let snapshot = state.metrics.read().clone();
+    Json(snapshot)
 }

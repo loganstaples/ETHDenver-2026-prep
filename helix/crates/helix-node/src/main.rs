@@ -1,7 +1,7 @@
 mod sc_client;
 
 use helix_node::sc_client::SCClient;
-use helix_node::api::http::{ApiState, OrchestratorSnapshot, RoundInfo};
+use helix_node::api::http::{ApiState, MetricsSnapshot, OrchestratorSnapshot, PeerSnapshot, RoundInfo};
 use helix_node::api::rpc::{
     ProofStatusEntry, RpcState, start_rpc_server,
     NodeConfigSnapshot, MPCStatusSnapshot,
@@ -16,6 +16,8 @@ use helix_node::trainer::Trainer;
 use helix_node::training::orchestrator::{
     OrchestratorConfig, OrchestratorEvent, TrainingOrchestrator,
 };
+use helix_node::training::MPCWorkerHandle;
+use helix_node::trainer::MlpModel;
 
 use log::{error, info, warn};
 use parking_lot::RwLock;
@@ -82,6 +84,18 @@ async fn run_worker(listen_addr: SocketAddr) -> anyhow::Result<()> {
         .parse()
         .expect("invalid HELIX_AGGREGATOR_ADDR");
     let rpc_port: u16 = env_or("HELIX_RPC_PORT", "9002").parse().unwrap_or(9002);
+
+    // MPC configuration
+    let mpc_enabled = env_or("HELIX_MPC_ENABLED", "0") == "1";
+    let mpc_party_index: usize = env_or("HELIX_MPC_PARTY_INDEX", "0").parse().unwrap_or(0);
+    let mpc_num_parties: usize = env_or("HELIX_MPC_NUM_PARTIES", "3").parse().unwrap_or(3);
+
+    if mpc_enabled {
+        info!(
+            "MPC training enabled: party {}/{} (index/total)",
+            mpc_party_index, mpc_num_parties,
+        );
+    }
 
     let local_id = PeerId::random();
     info!("Worker {} starting, will connect to aggregator at {}", local_id, aggregator_addr);
@@ -168,6 +182,7 @@ async fn run_worker(listen_addr: SocketAddr) -> anyhow::Result<()> {
 
     // Main event loop: wait for RoundStart, train, send gradient
     let mut trainer: Option<Trainer> = None;
+    let mut mpc_handle: Option<MPCWorkerHandle> = None;
     let mut steps_completed = 0u64;
 
     let result = tokio::select! {
@@ -196,61 +211,141 @@ async fn run_worker(listen_addr: SocketAddr) -> anyhow::Result<()> {
                                     params.model_seed,
                                 );
 
-                                // Initialize trainer if needed (same seed = same initial model)
-                                if trainer.is_none() {
-                                    trainer = Some(Trainer::new(
-                                        params.d_in,
-                                        params.d_hid,
-                                        params.d_out,
-                                        params.learning_rate,
-                                        params.model_seed,
-                                    ));
-                                }
-
-                                let t = trainer.as_mut().unwrap();
-
-                                // Generate synthetic data from seed (deterministic)
-                                let (x, target) = generate_training_data(params.d_in, params.d_out, params.model_seed + round_id);
-
-                                info!("Training step {} (round {})...", t.step_count() + 1, round_id);
-                                match t.train_step(&x, &target) {
-                                    Ok(result) => {
-                                        info!(
-                                            "Proof generated: {} bytes (EVM: {}), loss={:.6}, verified={}, commitment={:?}",
-                                            result.proof.len(),
-                                            result.evm_proof.as_ref().map(|p| p.len()).unwrap_or(0),
-                                            result.loss,
-                                            result.verified,
-                                            hex::encode(&result.commitment[..4]),
+                                if mpc_enabled {
+                                    // ── MPC training path ──────────────────────────
+                                    if mpc_handle.is_none() {
+                                        let model = MlpModel::new_random(
+                                            params.d_in,
+                                            params.d_hid,
+                                            params.d_out,
+                                            params.model_seed,
                                         );
-
-                                        // Use EVM-formatted proof if available, otherwise raw
-                                        let proof_bytes = result.evm_proof.unwrap_or(result.proof);
-
-                                        // Send gradient + proof back to aggregator
-                                        network
-                                            .broadcast(MessagePayload::Gradient(
-                                                GradientMessage::ShareGradient {
-                                                    round_id,
-                                                    gradient_commitment: result.commitment,
-                                                    error_bound: result.loss * 0.01,
-                                                    proof: proof_bytes,
-                                                },
-                                            ))
-                                            .await;
-
-                                        steps_completed += 1;
-                                        info!("Gradient sent for round {} (total steps: {})", round_id, steps_completed);
-
-                                        // Update proof status
-                                        proof_status.write().push(ProofStatusEntry {
-                                            round_id,
-                                            status: "submitted".to_string(),
-                                            proofs_collected: 1,
-                                        });
+                                        mpc_handle = Some(MPCWorkerHandle::new(
+                                            mpc_party_index,
+                                            mpc_num_parties,
+                                            model,
+                                            params.learning_rate,
+                                            100.0, // max gradient norm
+                                        ));
+                                        info!(
+                                            "MPC worker initialized: party {}/{}",
+                                            mpc_party_index, mpc_num_parties,
+                                        );
                                     }
-                                    Err(e) => {
-                                        error!("Training failed for round {}: {}", round_id, e);
+
+                                    let mpc = mpc_handle.as_mut().unwrap();
+                                    let (x, target) = generate_training_data(
+                                        params.d_in,
+                                        params.d_out,
+                                        params.model_seed + round_id,
+                                    );
+
+                                    info!(
+                                        "MPC training step (party {}, round {})...",
+                                        mpc_party_index, round_id,
+                                    );
+                                    match mpc.compute_gradient_share(&x, &target) {
+                                        Ok(computation) => {
+                                            info!(
+                                                "MPC gradient share computed: loss={:.6}, commitment={}",
+                                                computation.local_loss,
+                                                hex::encode(&computation.gradient_commitment[..4]),
+                                            );
+
+                                            network
+                                                .broadcast(MessagePayload::Gradient(
+                                                    GradientMessage::ShareGradient {
+                                                        round_id,
+                                                        gradient_commitment: computation.gradient_commitment,
+                                                        error_bound: computation.local_loss * 0.01,
+                                                        proof: computation.gradient_commitment.to_vec(),
+                                                    },
+                                                ))
+                                                .await;
+
+                                            steps_completed += 1;
+                                            info!(
+                                                "MPC gradient share sent for round {} (total steps: {})",
+                                                round_id, steps_completed,
+                                            );
+
+                                            // Update MPC status
+                                            {
+                                                let mut status = rpc_state.mpc_status.write();
+                                                status.enabled = true;
+                                                status.num_parties = mpc_num_parties;
+                                                status.party_index = Some(mpc_party_index);
+                                                status.current_step = mpc.current_step();
+                                            }
+
+                                            proof_status.write().push(ProofStatusEntry {
+                                                round_id,
+                                                status: "submitted".to_string(),
+                                                proofs_collected: 1,
+                                            });
+                                        }
+                                        Err(e) => {
+                                            error!("MPC training failed for round {}: {}", round_id, e);
+                                        }
+                                    }
+                                } else {
+                                    // ── Regular (non-MPC) training path ────────────
+                                    // Initialize trainer if needed (same seed = same initial model)
+                                    if trainer.is_none() {
+                                        trainer = Some(Trainer::new(
+                                            params.d_in,
+                                            params.d_hid,
+                                            params.d_out,
+                                            params.learning_rate,
+                                            params.model_seed,
+                                        ));
+                                    }
+
+                                    let t = trainer.as_mut().unwrap();
+
+                                    // Generate synthetic data from seed (deterministic)
+                                    let (x, target) = generate_training_data(params.d_in, params.d_out, params.model_seed + round_id);
+
+                                    info!("Training step {} (round {})...", t.step_count() + 1, round_id);
+                                    match t.train_step(&x, &target) {
+                                        Ok(result) => {
+                                            info!(
+                                                "Proof generated: {} bytes (EVM: {}), loss={:.6}, verified={}, commitment={:?}",
+                                                result.proof.len(),
+                                                result.evm_proof.as_ref().map(|p| p.len()).unwrap_or(0),
+                                                result.loss,
+                                                result.verified,
+                                                hex::encode(&result.commitment[..4]),
+                                            );
+
+                                            // Use EVM-formatted proof if available, otherwise raw
+                                            let proof_bytes = result.evm_proof.unwrap_or(result.proof);
+
+                                            // Send gradient + proof back to aggregator
+                                            network
+                                                .broadcast(MessagePayload::Gradient(
+                                                    GradientMessage::ShareGradient {
+                                                        round_id,
+                                                        gradient_commitment: result.commitment,
+                                                        error_bound: result.loss * 0.01,
+                                                        proof: proof_bytes,
+                                                    },
+                                                ))
+                                                .await;
+
+                                            steps_completed += 1;
+                                            info!("Gradient sent for round {} (total steps: {})", round_id, steps_completed);
+
+                                            // Update proof status
+                                            proof_status.write().push(ProofStatusEntry {
+                                                round_id,
+                                                status: "submitted".to_string(),
+                                                proofs_collected: 1,
+                                            });
+                                        }
+                                        Err(e) => {
+                                            error!("Training failed for round {}: {}", round_id, e);
+                                        }
                                     }
                                 }
                             }
@@ -394,9 +489,13 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
     let (round_trigger_tx, mut round_trigger_rx) = broadcast::channel::<()>(16);
     let api_snapshot = Arc::new(RwLock::new(OrchestratorSnapshot::default()));
     let proof_status = Arc::new(RwLock::new(Vec::<ProofStatusEntry>::new()));
+    let api_peers = Arc::new(RwLock::new(PeerSnapshot::default()));
+    let api_metrics = Arc::new(RwLock::new(MetricsSnapshot::default()));
     let api_state = Arc::new(ApiState {
         orchestrator_workers: api_snapshot.clone(),
         round_trigger_tx: round_trigger_tx.clone(),
+        peers: api_peers.clone(),
+        metrics: api_metrics.clone(),
     });
 
     // Start HTTP API
