@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
+pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -198,14 +198,16 @@ contract Rewards is ReentrancyGuard {
     }
     
     /// @notice Claim rewards for specific rounds
+    /// @dev Zeroes pendingRewards entries and caps transfer to what hasn't been
+    ///      claimed via claimRewards() to prevent double-claim vulnerability.
     function claimRoundRewards(
         uint256[] calldata modelIds,
         uint256[] calldata roundIds
     ) external nonReentrant {
         require(modelIds.length == roundIds.length, "Length mismatch");
-        
+
         uint256 totalClaim = 0;
-        
+
         for (uint i = 0; i < modelIds.length; i++) {
             uint256 reward = pendingRewards[modelIds[i]][roundIds[i]][msg.sender];
             if (reward > 0) {
@@ -213,15 +215,26 @@ contract Rewards is ReentrancyGuard {
                 totalClaim += reward;
             }
         }
-        
+
         require(totalClaim > 0, "No rewards to claim");
-        
+
         ClaimInfo storage info = claimInfo[msg.sender];
+
+        // Cap transfer to what hasn't already been claimed via claimRewards()
+        // This prevents the double-claim vulnerability where a user calls
+        // claimRewards() first (which uses totalEarned - totalClaimed) and then
+        // claimRoundRewards() (which would re-transfer from pendingRewards).
+        uint256 actualClaimable = info.totalEarned - info.totalClaimed;
+        if (totalClaim > actualClaimable) {
+            totalClaim = actualClaimable;
+        }
+        require(totalClaim > 0, "Already claimed");
+
         info.totalClaimed += totalClaim;
         info.lastClaimTime = block.timestamp;
-        
+
         helixToken.safeTransfer(msg.sender, totalClaim);
-        
+
         emit RewardsClaimed(msg.sender, totalClaim);
     }
     

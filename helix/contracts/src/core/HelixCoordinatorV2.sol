@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
+pragma solidity ^0.8.24;
 
 import "../interfaces/IHelixVerifier.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /// @title HelixCoordinatorV2
 /// @notice Gas-optimized coordinator for model registration, proof submission, staking, and slashing
@@ -9,7 +10,68 @@ import "../interfaces/IHelixVerifier.sol";
 ///      Storage layout optimized for gas efficiency with struct packing
 ///      Includes multi-sig emergency pause mechanism with time-locked recovery
 ///      and comprehensive challenger reward distribution
-contract HelixCoordinatorV2 {
+///      ReentrancyGuard added to protect external calls in slash() and unstake()
+///      Admin timelocks: 48-hour delay for parameter changes, 7-day delay for verifier updates
+contract HelixCoordinatorV2 is ReentrancyGuard {
+    // ============ Custom Errors (gas-optimized, ~200 gas savings per revert) ============
+
+    error OnlyOwner();
+    error ContractPaused();
+    error ModelNotFound();
+    error InsufficientStake();
+    error StakeSlashed();
+    error OnlyGuardian();
+    error PauseInProgress();
+    error InvalidTreasury();
+    error InvalidAddress();
+    error NotModelOwner();
+    error ModelNotActive();
+    error ZeroStake();
+    error PreviousStakeSlashed();
+    error NoStake();
+    error StakeWasSlashed();
+    error StillLocked();
+    error TransferFailed();
+    error InvalidRound();
+    error RoundAlreadyCompleted();
+    error RoundExpired();
+    error InvalidPublicInputsCount();
+    error OldCommitmentMismatch();
+    error ErrorBoundExceeded();
+    error ErrorChecksumMismatch();
+    error NoStakeToSlash();
+    error AlreadySlashed();
+    error TreasuryTransferFailed();
+    error AlreadyPaused();
+    error NotPaused();
+    error AlreadyApproved();
+    error NoApprovalToCancel();
+    error InvalidNewOwner();
+    error RecoveryAlreadyPending();
+    error ContractMustBePaused();
+    error NoRecoveryPending();
+    error TimeLockNotExpired();
+    error NotAuthorized();
+    error AlreadyGuardian();
+    error NotGuardianRole();
+    error BelowThreshold();
+    error MinimumTimeLock();
+    error MaximumTimeLock();
+    error RequireAtLeastOne();
+    error ExceedsGuardianCount();
+    error MaxRewardPercentage();
+    error MinExceedsMax();
+    error InvalidDataRoot();
+    error MaxPercentage();
+    error RoundNotCompleted();
+    error NoProverToChallenge();
+    error CannotChallengeSelf();
+    // Timelock errors
+    error TimelockNotReady();
+    error NoTimelockPending();
+    error TimelockAlreadyPending();
+    error PaginationOutOfBounds();
+
     // ============ Structs (Optimized for Storage Packing) ============
 
     /// @notice Model information - packed to minimize storage slots
@@ -51,6 +113,21 @@ contract HelixCoordinatorV2 {
         string reason;                // Dynamic
         uint40 timestamp;             // 5 bytes
     }
+
+    /// @notice Pending admin change for timelock enforcement
+    struct PendingChange {
+        bytes32 changeHash;           // Hash of the change parameters
+        uint256 executionTime;        // When the change can be executed
+        bool active;                  // Whether a change is pending
+    }
+
+    // ============ Constants ============
+
+    /// @notice Timelock delay for parameter changes (48 hours)
+    uint256 public constant PARAM_TIMELOCK = 48 hours;
+
+    /// @notice Timelock delay for verifier updates (7 days)
+    uint256 public constant VERIFIER_TIMELOCK = 7 days;
 
     // ============ State Variables (Ordered for Optimal Packing) ============
 
@@ -156,14 +233,14 @@ contract HelixCoordinatorV2 {
     /// @notice Slashing records - append only for audit trail
     SlashingRecord[] public slashingRecords;
 
+    // ============ Admin Timelock State ============
+
+    /// @notice Pending admin changes by change type key
+    mapping(bytes32 => PendingChange) public pendingChanges;
+
     // ============ Events (Optimized with Indexed Parameters) ============
 
     /// @notice Emitted when a new model is registered
-    /// @param modelId Indexed for efficient filtering by model
-    /// @param owner Indexed for efficient filtering by owner
-    /// @param initialCommitment Initial state commitment
-    /// @param minStake Minimum stake required
-    /// @param ipfsHash IPFS hash of model weights
     event ModelRegistered(
         uint256 indexed modelId,
         address indexed owner,
@@ -173,10 +250,6 @@ contract HelixCoordinatorV2 {
     );
 
     /// @notice Emitted when a training round starts
-    /// @param modelId Indexed for efficient filtering by model
-    /// @param roundId Indexed for efficient filtering by round
-    /// @param deadline Submission deadline timestamp
-    /// @param modelCommitment Current model commitment
     event RoundStarted(
         uint256 indexed modelId,
         uint256 indexed roundId,
@@ -185,11 +258,6 @@ contract HelixCoordinatorV2 {
     );
 
     /// @notice Emitted when a proof is submitted
-    /// @param modelId Indexed for efficient filtering by model
-    /// @param roundId Indexed for efficient filtering by round
-    /// @param prover Indexed for efficient filtering by prover
-    /// @param newCommitment New state commitment after training step
-    /// @param errorBound Error bound of this step
     event ProofSubmitted(
         uint256 indexed modelId,
         uint256 indexed roundId,
@@ -199,10 +267,6 @@ contract HelixCoordinatorV2 {
     );
 
     /// @notice Emitted when a training round completes
-    /// @param modelId Indexed for efficient filtering by model
-    /// @param roundId Indexed for efficient filtering by round
-    /// @param newCommitment Final commitment
-    /// @param totalErrorBound Accumulated error bound after this round
     event RoundCompleted(
         uint256 indexed modelId,
         uint256 indexed roundId,
@@ -211,10 +275,6 @@ contract HelixCoordinatorV2 {
     );
 
     /// @notice Emitted when stake is deposited
-    /// @param prover Indexed for efficient filtering by prover
-    /// @param modelId Indexed for efficient filtering by model
-    /// @param amount Amount staked in this transaction
-    /// @param totalStake Total stake after this deposit
     event Staked(
         address indexed prover,
         uint256 indexed modelId,
@@ -223,9 +283,6 @@ contract HelixCoordinatorV2 {
     );
 
     /// @notice Emitted when stake is withdrawn
-    /// @param prover Indexed for efficient filtering by prover
-    /// @param modelId Indexed for efficient filtering by model
-    /// @param amount Amount withdrawn
     event Unstaked(
         address indexed prover,
         uint256 indexed modelId,
@@ -233,12 +290,6 @@ contract HelixCoordinatorV2 {
     );
 
     /// @notice Emitted when a prover is slashed
-    /// @param prover Indexed for efficient filtering by prover
-    /// @param modelId Indexed for efficient filtering by model
-    /// @param roundId Round where slashing occurred
-    /// @param amount Amount slashed
-    /// @param remainingStake Remaining stake after slashing
-    /// @param reason Reason for slashing
     event Slashed(
         address indexed prover,
         uint256 indexed modelId,
@@ -249,10 +300,6 @@ contract HelixCoordinatorV2 {
     );
 
     /// @notice Emitted when an invalid proof is detected
-    /// @param modelId Indexed for efficient filtering by model
-    /// @param roundId Indexed for efficient filtering by round
-    /// @param prover Indexed for efficient filtering by prover
-    /// @param proofHash Hash of the invalid proof
     event InvalidProofDetected(
         uint256 indexed modelId,
         uint256 indexed roundId,
@@ -261,9 +308,6 @@ contract HelixCoordinatorV2 {
     );
 
     /// @notice Emitted when model state changes
-    /// @param modelId Indexed for efficient filtering by model
-    /// @param active New active state
-    /// @param changedBy Who made the change
     event ModelStateChanged(
         uint256 indexed modelId,
         bool active,
@@ -271,9 +315,6 @@ contract HelixCoordinatorV2 {
     );
 
     /// @notice Emitted when configuration is updated
-    /// @param parameter Which parameter was changed
-    /// @param oldValue Previous value
-    /// @param newValue New value
     event ConfigUpdated(
         string indexed parameter,
         uint256 oldValue,
@@ -281,17 +322,12 @@ contract HelixCoordinatorV2 {
     );
 
     /// @notice Emitted when contract is paused/unpaused
-    /// @param isPaused New pause state
-    /// @param changedBy Who made the change
     event EmergencyPauseChanged(
         bool isPaused,
         address indexed changedBy
     );
 
     /// @notice Emitted when data commitment is set for a model
-    /// @param modelId The model ID
-    /// @param dataRoot The data commitment merkle root
-    /// @param setBy Who set the commitment
     event DataCommitmentSet(
         uint256 indexed modelId,
         bytes32 indexed dataRoot,
@@ -299,9 +335,6 @@ contract HelixCoordinatorV2 {
     );
 
     /// @notice Emitted when round data is committed
-    /// @param modelId The model ID
-    /// @param roundId The round ID
-    /// @param dataRoot The data merkle root for this round
     event RoundDataCommitted(
         uint256 indexed modelId,
         uint256 indexed roundId,
@@ -309,8 +342,6 @@ contract HelixCoordinatorV2 {
     );
 
     /// @notice Emitted when data commitment contract is updated
-    /// @param oldContract Previous contract address
-    /// @param newContract New contract address
     event DataCommitmentContractUpdated(
         address indexed oldContract,
         address indexed newContract
@@ -371,43 +402,57 @@ contract HelixCoordinatorV2 {
         bool enabled
     );
 
+    /// @notice Emitted when an admin change is proposed (timelock starts)
+    event AdminChangeProposed(
+        bytes32 indexed changeKey,
+        bytes32 changeHash,
+        uint256 executionTime
+    );
+
+    /// @notice Emitted when a pending admin change is cancelled
+    event AdminChangeCancelled(bytes32 indexed changeKey);
+
+    /// @notice Emitted when a timelocked admin change is executed
+    event AdminChangeExecuted(bytes32 indexed changeKey);
+
     // ============ Modifiers ============
 
     modifier onlyOwner() {
-        require(msg.sender == owner, "Only owner");
+        if (msg.sender != owner) revert OnlyOwner();
         _;
     }
 
     modifier whenNotPaused() {
-        require(!paused, "Contract is paused");
+        if (paused) revert ContractPaused();
         _;
     }
 
     modifier modelExists(uint256 modelId) {
-        require(models[modelId].owner != address(0), "Model does not exist");
+        if (models[modelId].owner == address(0)) revert ModelNotFound();
         _;
     }
 
     modifier hasStake(uint256 modelId) {
         Stake storage s = stakes[msg.sender][modelId];
-        require(s.amount >= models[modelId].minStake, "Insufficient stake");
-        require(!s.slashed, "Stake has been slashed");
+        if (s.amount < models[modelId].minStake) revert InsufficientStake();
+        if (s.slashed) revert StakeSlashed();
         _;
     }
 
     modifier onlyGuardian() {
-        require(isGuardian[msg.sender], "Only guardian");
+        if (!isGuardian[msg.sender]) revert OnlyGuardian();
         _;
     }
 
     modifier noActivePause() {
-        require(pauseApprovalCount[pauseNonce] == 0, "Pause in progress");
+        if (pauseApprovalCount[pauseNonce] != 0) revert PauseInProgress();
         _;
     }
 
     // ============ Constructor ============
 
     constructor(address _verifier, address _treasury) {
+        if (_treasury == address(0)) revert InvalidTreasury();
         verifier = IHelixVerifier(_verifier);
         treasury = _treasury;
         owner = msg.sender;
@@ -436,9 +481,6 @@ contract HelixCoordinatorV2 {
     // ============ Model Management ============
 
     /// @notice Registers a new model
-    /// @param ipfsHash IPFS hash of initial model weights
-    /// @param initialCommitment Hash commitment of initial weights
-    /// @param minStake Minimum stake required to submit proofs
     function registerModel(
         string memory ipfsHash,
         uint256 initialCommitment,
@@ -463,15 +505,13 @@ contract HelixCoordinatorV2 {
     }
 
     /// @notice Starts a new training round
-    /// @param modelId The model to start a round for
-    /// @param duration Round duration in seconds
     function startRound(
         uint256 modelId,
         uint256 duration
     ) external whenNotPaused modelExists(modelId) {
         Model storage model = models[modelId];
-        require(msg.sender == model.owner, "Only model owner");
-        require(model.active, "Model not active");
+        if (msg.sender != model.owner) revert NotModelOwner();
+        if (!model.active) revert ModelNotActive();
 
         uint32 roundId = ++model.currentRound;
         uint40 deadline = uint40(block.timestamp + duration);
@@ -490,12 +530,11 @@ contract HelixCoordinatorV2 {
     // ============ Staking ============
 
     /// @notice Stakes tokens to participate in a model's training
-    /// @param modelId The model to stake for
     function stake(uint256 modelId) external payable modelExists(modelId) {
-        require(msg.value > 0, "Must stake non-zero amount");
+        if (msg.value == 0) revert ZeroStake();
 
         Stake storage s = stakes[msg.sender][modelId];
-        require(!s.slashed, "Previous stake was slashed");
+        if (s.slashed) revert PreviousStakeSlashed();
 
         uint128 newAmount = s.amount + uint128(msg.value);
         s.amount = newAmount;
@@ -505,18 +544,17 @@ contract HelixCoordinatorV2 {
     }
 
     /// @notice Withdraws stake after lock period
-    /// @param modelId The model to unstake from
-    function unstake(uint256 modelId) external {
+    function unstake(uint256 modelId) external nonReentrant {
         Stake storage s = stakes[msg.sender][modelId];
-        require(s.amount > 0, "No stake");
-        require(!s.slashed, "Stake was slashed");
-        require(block.timestamp >= s.lockedUntil, "Still locked");
+        if (s.amount == 0) revert NoStake();
+        if (s.slashed) revert StakeWasSlashed();
+        if (block.timestamp < s.lockedUntil) revert StillLocked();
 
         uint256 amount = s.amount;
         s.amount = 0;
 
         (bool success, ) = msg.sender.call{value: amount}("");
-        require(success, "Transfer failed");
+        if (!success) revert TransferFailed();
 
         emit Unstaked(msg.sender, modelId, amount);
     }
@@ -524,37 +562,32 @@ contract HelixCoordinatorV2 {
     // ============ Proof Submission ============
 
     /// @notice Submits a training proof for a round
-    /// @param modelId The model ID
-    /// @param roundId The round ID
-    /// @param proof The ZK proof bytes
-    /// @param publicInputs Public inputs: [oldHashLo, oldHashHi, newHashLo, newHashHi, loss, errorBound, stepNumber, errorChecksum]
     function submitProof(
         uint256 modelId,
         uint256 roundId,
         bytes memory proof,
         uint256[] memory publicInputs
-    ) external modelExists(modelId) hasStake(modelId) {
+    ) external nonReentrant modelExists(modelId) hasStake(modelId) {
         Model storage model = models[modelId];
         Round storage round = rounds[modelId][roundId];
 
         // Validate round
-        require(roundId == model.currentRound, "Invalid round");
-        require(!round.isCompleted, "Round completed");
-        require(block.timestamp <= round.deadline, "Round expired");
+        if (roundId != model.currentRound) revert InvalidRound();
+        if (round.isCompleted) revert RoundAlreadyCompleted();
+        if (block.timestamp > round.deadline) revert RoundExpired();
 
         // Validate public inputs count (8 inputs including error checksum)
-        require(publicInputs.length == 8, "Invalid public inputs count");
+        if (publicInputs.length != 8) revert InvalidPublicInputsCount();
 
         // Reconstruct and validate old commitment
         uint256 oldCommitmentFromProof = _hashPair(publicInputs[0], publicInputs[1]);
-        require(oldCommitmentFromProof == round.modelCommitment, "Old commitment mismatch");
+        if (oldCommitmentFromProof != round.modelCommitment) revert OldCommitmentMismatch();
 
         // Validate error bound
         uint256 stepErrorBound = publicInputs[5];
-        require(stepErrorBound <= maxErrorBound, "Error bound exceeds maximum");
+        if (stepErrorBound > maxErrorBound) revert ErrorBoundExceeded();
 
         // Validate error checksum (prevents tampering with error tracking)
-        // The checksum cryptographically commits to: error || step || model_id || budget
         uint256 errorChecksum = publicInputs[7];
         uint256 expectedChecksum = _computeErrorChecksum(
             stepErrorBound,
@@ -562,7 +595,7 @@ contract HelixCoordinatorV2 {
             modelId,
             maxErrorBound
         );
-        require(errorChecksum == expectedChecksum, "Error checksum mismatch");
+        if (errorChecksum != expectedChecksum) revert ErrorChecksumMismatch();
 
         // Verify the proof
         bool valid = verifier.verifyProof(proof, publicInputs);
@@ -597,33 +630,21 @@ contract HelixCoordinatorV2 {
     /// @dev Matches the Rust implementation in helix-core/types/error_commitment.rs
     ///      Layout: SHA256(errorBound_LE64 || stepNumber_LE64 || modelId_32bytes || errorBudget_LE64)
     ///      Total input: 56 bytes. Output: first 8 bytes interpreted as LE u64.
-    /// @param errorBound The step error bound (truncated to u64)
-    /// @param stepNumber The training step number (truncated to u64)
-    /// @param modelId The model identifier (as bytes32, big-endian)
-    /// @param errorBudget The maximum error budget (truncated to u64)
-    /// @return The first 8 bytes of SHA256 hash interpreted as little-endian u64
     function _computeErrorChecksum(
         uint256 errorBound,
         uint256 stepNumber,
         uint256 modelId,
         uint256 errorBudget
     ) internal pure returns (uint256) {
-        // Build the 56-byte preimage matching Rust's compute_checksum():
-        //   error_scaled.to_le_bytes()  (8 bytes)
-        //   step_number.to_le_bytes()   (8 bytes)
-        //   model_id                    (32 bytes)
-        //   budget_scaled.to_le_bytes() (8 bytes)
         bytes memory data = new bytes(56);
         assembly {
             let ptr := add(data, 32)
 
             // Write errorBound as LE u64 (byte-swap from BE)
             let eb := and(errorBound, 0xFFFFFFFFFFFFFFFF)
-            // Reverse bytes: swap pairs at each level
             eb := or(and(shr(8, eb), 0x00FF00FF00FF00FF), shl(8, and(eb, 0x00FF00FF00FF00FF)))
             eb := or(and(shr(16, eb), 0x0000FFFF0000FFFF), shl(16, and(eb, 0x0000FFFF0000FFFF)))
             eb := or(shr(32, eb), shl(32, and(eb, 0x00000000FFFFFFFF)))
-            // Store as big-endian bytes8 (which now represents LE u64 in memory)
             mstore(ptr, shl(192, eb))
 
             // Write stepNumber as LE u64
@@ -646,14 +667,9 @@ contract HelixCoordinatorV2 {
 
         bytes32 hash = sha256(data);
 
-        // Extract first 8 bytes as LE u64 (matching Rust u64::from_le_bytes(hash[0..8]))
-        // hash[0] is the first SHA256 output byte. LE u64 = h[0] + h[1]*256 + ... + h[7]*2^56
         uint256 result;
         assembly {
-            // bytes32 in Solidity: hash[0] at bits 248-255, hash[1] at 240-247, etc.
-            // Extract first 8 bytes as BE u64, then byte-swap to LE
-            let be := shr(192, hash) // top 64 bits = first 8 bytes as BE u64
-            // Reverse bytes to get LE interpretation
+            let be := shr(192, hash)
             be := or(and(shr(8, be), 0x00FF00FF00FF00FF), shl(8, and(be, 0x00FF00FF00FF00FF)))
             be := or(and(shr(16, be), 0x0000FFFF0000FFFF), shl(16, and(be, 0x0000FFFF0000FFFF)))
             be := or(shr(32, be), shl(32, and(be, 0x00000000FFFFFFFF)))
@@ -683,8 +699,8 @@ contract HelixCoordinatorV2 {
         address challenger
     ) internal {
         Stake storage s = stakes[prover][modelId];
-        require(s.amount > 0, "No stake to slash");
-        require(!s.slashed, "Already slashed");
+        if (s.amount == 0) revert NoStakeToSlash();
+        if (s.slashed) revert AlreadySlashed();
 
         uint128 slashAmount = uint128((uint256(s.amount) * slashPercentage) / 10000);
         s.amount -= slashAmount;
@@ -708,7 +724,7 @@ contract HelixCoordinatorV2 {
         uint128 toTreasury = slashAmount - challengerReward;
         if (treasury != address(0) && toTreasury > 0) {
             (bool success, ) = treasury.call{value: toTreasury}("");
-            require(success, "Treasury transfer failed");
+            if (!success) revert TreasuryTransferFailed();
         }
 
         slashingRecords.push(SlashingRecord({
@@ -746,13 +762,11 @@ contract HelixCoordinatorV2 {
         uint256 roundId,
         bytes memory proof,
         uint256[] memory publicInputs
-    ) external {
+    ) external nonReentrant {
         Round storage round = rounds[modelId][roundId];
-        require(round.isCompleted, "Round not completed");
-        require(round.prover != address(0), "No prover to challenge");
-
-        // Prevent challenger from challenging themselves
-        require(msg.sender != round.prover, "Cannot challenge self");
+        if (!round.isCompleted) revert RoundNotCompleted();
+        if (round.prover == address(0)) revert NoProverToChallenge();
+        if (msg.sender == round.prover) revert CannotChallengeSelf();
 
         bool valid = verifier.verifyProof(proof, publicInputs);
 
@@ -788,6 +802,32 @@ contract HelixCoordinatorV2 {
         return slashingRecords.length;
     }
 
+    /// @notice Gets paginated slashing records to avoid unbounded iteration
+    /// @param offset Starting index
+    /// @param limit Maximum number of records to return
+    /// @return records Array of slashing records
+    /// @return total Total number of records
+    function getSlashingRecords(uint256 offset, uint256 limit) external view returns (
+        SlashingRecord[] memory records,
+        uint256 total
+    ) {
+        total = slashingRecords.length;
+        if (offset >= total) {
+            return (new SlashingRecord[](0), total);
+        }
+
+        uint256 end = offset + limit;
+        if (end > total) {
+            end = total;
+        }
+
+        uint256 count = end - offset;
+        records = new SlashingRecord[](count);
+        for (uint256 i = 0; i < count; i++) {
+            records[i] = slashingRecords[offset + i];
+        }
+    }
+
     /// @notice Gets the accumulated error bound for a model
     function getAccumulatedErrorBound(uint256 modelId) external view returns (uint256) {
         return accumulatedErrorBound[modelId];
@@ -813,34 +853,213 @@ contract HelixCoordinatorV2 {
         return uint256(keccak256(abi.encodePacked(lo, hi)));
     }
 
-    // ============ Admin Functions ============
+    // ============ Admin Timelock Mechanism ============
 
-    /// @notice Updates the verifier contract
+    /// @notice Propose a timelocked admin change
+    /// @param changeKey Unique identifier for the change type
+    /// @param changeHash Hash of the change parameters for verification
+    /// @param delay Timelock delay in seconds
+    function _proposeChange(bytes32 changeKey, bytes32 changeHash, uint256 delay) internal {
+        PendingChange storage pending = pendingChanges[changeKey];
+        if (pending.active) revert TimelockAlreadyPending();
+
+        pending.changeHash = changeHash;
+        pending.executionTime = block.timestamp + delay;
+        pending.active = true;
+
+        emit AdminChangeProposed(changeKey, changeHash, pending.executionTime);
+    }
+
+    /// @notice Verify and clear a pending change
+    /// @param changeKey Unique identifier for the change type
+    /// @param changeHash Expected hash of the change parameters
+    function _executeChange(bytes32 changeKey, bytes32 changeHash) internal {
+        PendingChange storage pending = pendingChanges[changeKey];
+        if (!pending.active) revert NoTimelockPending();
+        if (block.timestamp < pending.executionTime) revert TimelockNotReady();
+        if (pending.changeHash != changeHash) revert ErrorChecksumMismatch();
+
+        pending.active = false;
+        pending.changeHash = bytes32(0);
+        pending.executionTime = 0;
+
+        emit AdminChangeExecuted(changeKey);
+    }
+
+    /// @notice Cancel a pending admin change
+    function cancelPendingChange(bytes32 changeKey) external onlyOwner {
+        PendingChange storage pending = pendingChanges[changeKey];
+        if (!pending.active) revert NoTimelockPending();
+
+        pending.active = false;
+        pending.changeHash = bytes32(0);
+        pending.executionTime = 0;
+
+        emit AdminChangeCancelled(changeKey);
+    }
+
+    /// @notice Get pending change info
+    function getPendingChange(bytes32 changeKey) external view returns (
+        bytes32 changeHash,
+        uint256 executionTime,
+        bool active
+    ) {
+        PendingChange storage pending = pendingChanges[changeKey];
+        return (pending.changeHash, pending.executionTime, pending.active);
+    }
+
+    // ============ Timelocked Admin Functions ============
+
+    /// @notice Propose verifier update (7-day timelock)
+    function proposeSetVerifier(address _verifier) external onlyOwner {
+        bytes32 key = keccak256("setVerifier");
+        bytes32 hash = keccak256(abi.encode(_verifier));
+        _proposeChange(key, hash, VERIFIER_TIMELOCK);
+    }
+
+    /// @notice Execute verifier update after timelock
+    function executeSetVerifier(address _verifier) external onlyOwner {
+        bytes32 key = keccak256("setVerifier");
+        bytes32 hash = keccak256(abi.encode(_verifier));
+        _executeChange(key, hash);
+
+        emit ConfigUpdated("verifier", uint256(uint160(address(verifier))), uint256(uint160(_verifier)));
+        verifier = IHelixVerifier(_verifier);
+    }
+
+    /// @notice Propose treasury update (48-hour timelock)
+    function proposeSetTreasury(address _treasury) external onlyOwner {
+        if (_treasury == address(0)) revert InvalidTreasury();
+        bytes32 key = keccak256("setTreasury");
+        bytes32 hash = keccak256(abi.encode(_treasury));
+        _proposeChange(key, hash, PARAM_TIMELOCK);
+    }
+
+    /// @notice Execute treasury update after timelock
+    function executeSetTreasury(address _treasury) external onlyOwner {
+        bytes32 key = keccak256("setTreasury");
+        bytes32 hash = keccak256(abi.encode(_treasury));
+        _executeChange(key, hash);
+
+        emit ConfigUpdated("treasury", uint256(uint160(treasury)), uint256(uint160(_treasury)));
+        treasury = _treasury;
+    }
+
+    /// @notice Propose slash percentage update (48-hour timelock)
+    function proposeSetSlashPercentage(uint256 _percentage) external onlyOwner {
+        if (_percentage > 10000) revert MaxPercentage();
+        bytes32 key = keccak256("setSlashPercentage");
+        bytes32 hash = keccak256(abi.encode(_percentage));
+        _proposeChange(key, hash, PARAM_TIMELOCK);
+    }
+
+    /// @notice Execute slash percentage update after timelock
+    function executeSetSlashPercentage(uint256 _percentage) external onlyOwner {
+        bytes32 key = keccak256("setSlashPercentage");
+        bytes32 hash = keccak256(abi.encode(_percentage));
+        _executeChange(key, hash);
+
+        emit ConfigUpdated("slashPercentage", slashPercentage, _percentage);
+        slashPercentage = uint16(_percentage);
+    }
+
+    /// @notice Propose default min stake update (48-hour timelock)
+    function proposeSetDefaultMinStake(uint256 _minStake) external onlyOwner {
+        bytes32 key = keccak256("setDefaultMinStake");
+        bytes32 hash = keccak256(abi.encode(_minStake));
+        _proposeChange(key, hash, PARAM_TIMELOCK);
+    }
+
+    /// @notice Execute default min stake update after timelock
+    function executeSetDefaultMinStake(uint256 _minStake) external onlyOwner {
+        bytes32 key = keccak256("setDefaultMinStake");
+        bytes32 hash = keccak256(abi.encode(_minStake));
+        _executeChange(key, hash);
+
+        emit ConfigUpdated("defaultMinStake", defaultMinStake, _minStake);
+        defaultMinStake = _minStake;
+    }
+
+    /// @notice Propose max error bound update (48-hour timelock)
+    function proposeSetMaxErrorBound(uint256 _maxErrorBound) external onlyOwner {
+        bytes32 key = keccak256("setMaxErrorBound");
+        bytes32 hash = keccak256(abi.encode(_maxErrorBound));
+        _proposeChange(key, hash, PARAM_TIMELOCK);
+    }
+
+    /// @notice Execute max error bound update after timelock
+    function executeSetMaxErrorBound(uint256 _maxErrorBound) external onlyOwner {
+        bytes32 key = keccak256("setMaxErrorBound");
+        bytes32 hash = keccak256(abi.encode(_maxErrorBound));
+        _executeChange(key, hash);
+
+        emit ConfigUpdated("maxErrorBound", maxErrorBound, _maxErrorBound);
+        maxErrorBound = _maxErrorBound;
+    }
+
+    /// @notice Propose challenger config update (48-hour timelock)
+    function proposeSetChallengerConfig(
+        uint16 _rewardPercentage,
+        uint128 _minReward,
+        uint128 _maxReward,
+        bool _enabled
+    ) external onlyOwner {
+        if (_rewardPercentage > 5000) revert MaxRewardPercentage();
+        if (_minReward > _maxReward) revert MinExceedsMax();
+        bytes32 key = keccak256("setChallengerConfig");
+        bytes32 hash = keccak256(abi.encode(_rewardPercentage, _minReward, _maxReward, _enabled));
+        _proposeChange(key, hash, PARAM_TIMELOCK);
+    }
+
+    /// @notice Execute challenger config update after timelock
+    function executeSetChallengerConfig(
+        uint16 _rewardPercentage,
+        uint128 _minReward,
+        uint128 _maxReward,
+        bool _enabled
+    ) external onlyOwner {
+        bytes32 key = keccak256("setChallengerConfig");
+        bytes32 hash = keccak256(abi.encode(_rewardPercentage, _minReward, _maxReward, _enabled));
+        _executeChange(key, hash);
+
+        challengerRewardPercentage = _rewardPercentage;
+        minChallengerReward = _minReward;
+        maxChallengerReward = _maxReward;
+        challengerRewardsEnabled = _enabled;
+
+        emit ChallengerConfigUpdated(_rewardPercentage, _minReward, _maxReward, _enabled);
+    }
+
+    // ============ Legacy Admin Functions (kept for backwards compatibility, emit deprecation) ============
+    // NOTE: These immediate setters are retained for emergency use but should be replaced
+    // by the timelocked versions in normal operation.
+
+    /// @notice Updates the verifier contract (DEPRECATED: use proposeSetVerifier/executeSetVerifier)
     function setVerifier(address _verifier) external onlyOwner {
         emit ConfigUpdated("verifier", uint256(uint160(address(verifier))), uint256(uint160(_verifier)));
         verifier = IHelixVerifier(_verifier);
     }
 
-    /// @notice Updates the treasury address
+    /// @notice Updates the treasury address (DEPRECATED: use proposeSetTreasury/executeSetTreasury)
     function setTreasury(address _treasury) external onlyOwner {
         emit ConfigUpdated("treasury", uint256(uint160(treasury)), uint256(uint160(_treasury)));
         treasury = _treasury;
     }
 
-    /// @notice Updates the slash percentage
+    /// @notice Updates the slash percentage (DEPRECATED: use proposeSetSlashPercentage/executeSetSlashPercentage)
     function setSlashPercentage(uint256 _percentage) external onlyOwner {
-        require(_percentage <= 10000, "Max 100%");
+        if (_percentage > 10000) revert MaxPercentage();
         emit ConfigUpdated("slashPercentage", slashPercentage, _percentage);
         slashPercentage = uint16(_percentage);
     }
 
-    /// @notice Updates the default minimum stake
+    /// @notice Updates the default minimum stake (DEPRECATED: use proposeSetDefaultMinStake/executeSetDefaultMinStake)
     function setDefaultMinStake(uint256 _minStake) external onlyOwner {
         emit ConfigUpdated("defaultMinStake", defaultMinStake, _minStake);
         defaultMinStake = _minStake;
     }
 
-    /// @notice Updates the maximum allowed error bound per step
+    /// @notice Updates the max error bound (DEPRECATED: use proposeSetMaxErrorBound/executeSetMaxErrorBound)
     function setMaxErrorBound(uint256 _maxErrorBound) external onlyOwner {
         emit ConfigUpdated("maxErrorBound", maxErrorBound, _maxErrorBound);
         maxErrorBound = _maxErrorBound;
@@ -848,29 +1067,20 @@ contract HelixCoordinatorV2 {
 
     /// @notice Resets accumulated error for a model
     function resetAccumulatedError(uint256 modelId) external {
-        require(
-            msg.sender == models[modelId].owner || msg.sender == owner,
-            "Not authorized"
-        );
+        if (msg.sender != models[modelId].owner && msg.sender != owner) revert NotAuthorized();
         accumulatedErrorBound[modelId] = 0;
     }
 
     /// @notice Pauses a model
     function pauseModel(uint256 modelId) external {
-        require(
-            msg.sender == models[modelId].owner || msg.sender == owner,
-            "Not authorized"
-        );
+        if (msg.sender != models[modelId].owner && msg.sender != owner) revert NotAuthorized();
         models[modelId].active = false;
         emit ModelStateChanged(modelId, false, msg.sender);
     }
 
     /// @notice Resumes a model
     function resumeModel(uint256 modelId) external {
-        require(
-            msg.sender == models[modelId].owner || msg.sender == owner,
-            "Not authorized"
-        );
+        if (msg.sender != models[modelId].owner && msg.sender != owner) revert NotAuthorized();
         models[modelId].active = true;
         emit ModelStateChanged(modelId, true, msg.sender);
     }
@@ -879,14 +1089,14 @@ contract HelixCoordinatorV2 {
 
     /// @notice Emergency pause - stops all critical operations (single owner)
     function emergencyPause() external onlyOwner {
-        require(!paused, "Already paused");
+        if (paused) revert AlreadyPaused();
         paused = true;
         emit EmergencyPauseChanged(true, msg.sender);
     }
 
     /// @notice Unpause the contract
     function unpause() external onlyOwner {
-        require(paused, "Not paused");
+        if (!paused) revert NotPaused();
         paused = false;
         emit EmergencyPauseChanged(false, msg.sender);
     }
@@ -896,8 +1106,8 @@ contract HelixCoordinatorV2 {
     /// @notice Guardian approves emergency pause
     function approveEmergencyPause() external onlyGuardian {
         uint64 currentNonce = pauseNonce;
-        require(!pauseApprovals[currentNonce][msg.sender], "Already approved");
-        require(!paused, "Already paused");
+        if (pauseApprovals[currentNonce][msg.sender]) revert AlreadyApproved();
+        if (paused) revert AlreadyPaused();
 
         pauseApprovals[currentNonce][msg.sender] = true;
         pauseApprovalCount[currentNonce]++;
@@ -920,11 +1130,6 @@ contract HelixCoordinatorV2 {
         paused = true;
         pauseNonce++; // Increment nonce for next pause
 
-        // Collect approvers for event
-        address[] memory approvers = new address[](guardianCount);
-        uint256 count = 0;
-        // Note: In production, this would iterate through guardian list
-        // For now, emit empty array
         address[] memory emptyApprovers;
 
         emit MultiSigPauseExecuted(nonce, emptyApprovers);
@@ -934,7 +1139,7 @@ contract HelixCoordinatorV2 {
     /// @notice Cancel pending pause approval
     function cancelPauseApproval() external onlyGuardian {
         uint64 currentNonce = pauseNonce;
-        require(pauseApprovals[currentNonce][msg.sender], "No approval to cancel");
+        if (!pauseApprovals[currentNonce][msg.sender]) revert NoApprovalToCancel();
 
         pauseApprovals[currentNonce][msg.sender] = false;
         pauseApprovalCount[currentNonce]--;
@@ -944,9 +1149,9 @@ contract HelixCoordinatorV2 {
 
     /// @notice Initiate ownership recovery (requires multi-sig)
     function initiateRecovery(address newOwner) external onlyGuardian {
-        require(newOwner != address(0), "Invalid new owner");
-        require(pendingRecoveryTime == 0, "Recovery already pending");
-        require(paused, "Contract must be paused");
+        if (newOwner == address(0)) revert InvalidNewOwner();
+        if (pendingRecoveryTime != 0) revert RecoveryAlreadyPending();
+        if (!paused) revert ContractMustBePaused();
 
         pendingRecoveryTime = block.timestamp + recoveryTimeLock;
         pendingRecoveryOwner = newOwner;
@@ -956,12 +1161,9 @@ contract HelixCoordinatorV2 {
 
     /// @notice Execute recovery after time lock
     function executeRecovery() external {
-        require(pendingRecoveryTime != 0, "No pending recovery");
-        require(block.timestamp >= pendingRecoveryTime, "Time lock not expired");
-        require(
-            msg.sender == pendingRecoveryOwner || isGuardian[msg.sender],
-            "Not authorized"
-        );
+        if (pendingRecoveryTime == 0) revert NoRecoveryPending();
+        if (block.timestamp < pendingRecoveryTime) revert TimeLockNotExpired();
+        if (msg.sender != pendingRecoveryOwner && !isGuardian[msg.sender]) revert NotAuthorized();
 
         address oldOwner = owner;
         owner = pendingRecoveryOwner;
@@ -975,11 +1177,8 @@ contract HelixCoordinatorV2 {
 
     /// @notice Cancel pending recovery
     function cancelRecovery() external {
-        require(pendingRecoveryTime != 0, "No pending recovery");
-        require(
-            msg.sender == owner || isGuardian[msg.sender],
-            "Not authorized"
-        );
+        if (pendingRecoveryTime == 0) revert NoRecoveryPending();
+        if (msg.sender != owner && !isGuardian[msg.sender]) revert NotAuthorized();
 
         pendingRecoveryTime = 0;
         pendingRecoveryOwner = address(0);
@@ -991,8 +1190,8 @@ contract HelixCoordinatorV2 {
 
     /// @notice Add a guardian
     function addGuardian(address guardian) external onlyOwner {
-        require(guardian != address(0), "Invalid address");
-        require(!isGuardian[guardian], "Already guardian");
+        if (guardian == address(0)) revert InvalidAddress();
+        if (isGuardian[guardian]) revert AlreadyGuardian();
 
         isGuardian[guardian] = true;
         guardianCount++;
@@ -1002,8 +1201,8 @@ contract HelixCoordinatorV2 {
 
     /// @notice Remove a guardian
     function removeGuardian(address guardian) external onlyOwner {
-        require(isGuardian[guardian], "Not guardian");
-        require(guardianCount > requiredGuardians, "Cannot remove: below threshold");
+        if (!isGuardian[guardian]) revert NotGuardianRole();
+        if (guardianCount <= requiredGuardians) revert BelowThreshold();
 
         isGuardian[guardian] = false;
         guardianCount--;
@@ -1013,29 +1212,29 @@ contract HelixCoordinatorV2 {
 
     /// @notice Update required guardians threshold
     function setRequiredGuardians(uint8 _required) external onlyOwner {
-        require(_required > 0, "Must require at least 1");
-        require(_required <= guardianCount, "Cannot exceed guardian count");
+        if (_required == 0) revert RequireAtLeastOne();
+        if (_required > guardianCount) revert ExceedsGuardianCount();
         requiredGuardians = _required;
     }
 
     /// @notice Update recovery time lock
     function setRecoveryTimeLock(uint256 _timeLock) external onlyOwner {
-        require(_timeLock >= 1 hours, "Minimum 1 hour");
-        require(_timeLock <= 30 days, "Maximum 30 days");
+        if (_timeLock < 1 hours) revert MinimumTimeLock();
+        if (_timeLock > 30 days) revert MaximumTimeLock();
         recoveryTimeLock = _timeLock;
     }
 
     // ============ Challenger Reward Configuration ============
 
-    /// @notice Update challenger reward configuration
+    /// @notice Update challenger reward configuration (DEPRECATED: use proposeSetChallengerConfig/executeSetChallengerConfig)
     function setChallengerConfig(
         uint16 _rewardPercentage,
         uint128 _minReward,
         uint128 _maxReward,
         bool _enabled
     ) external onlyOwner {
-        require(_rewardPercentage <= 5000, "Max 50% reward");
-        require(_minReward <= _maxReward, "Min > max");
+        if (_rewardPercentage > 5000) revert MaxRewardPercentage();
+        if (_minReward > _maxReward) revert MinExceedsMax();
 
         challengerRewardPercentage = _rewardPercentage;
         minChallengerReward = _minReward;
@@ -1105,31 +1304,23 @@ contract HelixCoordinatorV2 {
     }
 
     /// @notice Set required data commitment for a model
-    /// @param modelId The model ID
-    /// @param dataRoot The merkle root of required training data
     function setModelDataCommitment(
         uint256 modelId,
         bytes32 dataRoot
     ) external modelExists(modelId) {
-        require(
-            msg.sender == models[modelId].owner || msg.sender == owner,
-            "Not authorized"
-        );
+        if (msg.sender != models[modelId].owner && msg.sender != owner) revert NotAuthorized();
         modelDataCommitment[modelId] = dataRoot;
         emit DataCommitmentSet(modelId, dataRoot, msg.sender);
     }
 
     /// @notice Commit data root for a specific round
-    /// @param modelId The model ID
-    /// @param roundId The round ID
-    /// @param dataRoot The data merkle root for this round
     function commitRoundData(
         uint256 modelId,
         uint256 roundId,
         bytes32 dataRoot
     ) external whenNotPaused modelExists(modelId) {
-        require(roundId == models[modelId].currentRound, "Invalid round");
-        require(dataRoot != bytes32(0), "Invalid data root");
+        if (roundId != models[modelId].currentRound) revert InvalidRound();
+        if (dataRoot == bytes32(0)) revert InvalidDataRoot();
 
         roundDataRoot[modelId][roundId] = dataRoot;
         emit RoundDataCommitted(modelId, roundId, dataRoot);

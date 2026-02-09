@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
+pragma solidity ^0.8.24;
 
 /// @title ModelRegistry
 /// @notice Registry for ML models and their state commitments
@@ -258,9 +258,65 @@ contract ModelRegistry {
         return checkpoints[modelId][index];
     }
     
-    /// @notice Get models owned by an address
+    /// @notice Get models owned by an address (full list - use paginated version for large lists)
     function getOwnerModels(address _owner) external view returns (uint256[] memory) {
         return ownerModels[_owner];
+    }
+
+    /// @notice Get paginated models owned by an address
+    /// @param _owner Owner address
+    /// @param offset Starting index
+    /// @param limit Maximum number of model IDs to return
+    /// @return modelIds Array of model IDs
+    /// @return total Total number of models owned
+    function getOwnerModelsPaginated(address _owner, uint256 offset, uint256 limit) external view returns (
+        uint256[] memory modelIds,
+        uint256 total
+    ) {
+        uint256[] storage allModels = ownerModels[_owner];
+        total = allModels.length;
+        if (offset >= total) {
+            return (new uint256[](0), total);
+        }
+
+        uint256 end = offset + limit;
+        if (end > total) {
+            end = total;
+        }
+
+        uint256 count = end - offset;
+        modelIds = new uint256[](count);
+        for (uint256 i = 0; i < count; i++) {
+            modelIds[i] = allModels[offset + i];
+        }
+    }
+
+    /// @notice Get paginated checkpoints for a model
+    /// @param modelId Model ID
+    /// @param offset Starting index
+    /// @param limit Maximum number of checkpoints to return
+    /// @return result Array of checkpoints
+    /// @return total Total number of checkpoints
+    function getCheckpointsPaginated(uint256 modelId, uint256 offset, uint256 limit) external view returns (
+        Checkpoint[] memory result,
+        uint256 total
+    ) {
+        Checkpoint[] storage allCheckpoints = checkpoints[modelId];
+        total = allCheckpoints.length;
+        if (offset >= total) {
+            return (new Checkpoint[](0), total);
+        }
+
+        uint256 end = offset + limit;
+        if (end > total) {
+            end = total;
+        }
+
+        uint256 count = end - offset;
+        result = new Checkpoint[](count);
+        for (uint256 i = 0; i < count; i++) {
+            result[i] = allCheckpoints[offset + i];
+        }
     }
     
     /// @notice Set coordinator address

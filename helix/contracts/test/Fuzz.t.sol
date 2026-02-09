@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
+pragma solidity ^0.8.24;
 
 import "forge-std/Test.sol";
 import "../src/core/HelixCoordinatorV2.sol";
@@ -161,7 +161,7 @@ contract FuzzTest is Test {
         vm.warp(block.timestamp + waitTime);
 
         vm.prank(prover);
-        vm.expectRevert("Still locked");
+        vm.expectRevert(HelixCoordinatorV2.StillLocked.selector);
         coordinator.unstake(modelId);
     }
 
@@ -335,7 +335,7 @@ contract FuzzTest is Test {
 
         if (errorBound > coordinator.maxErrorBound()) {
             vm.prank(prover);
-            vm.expectRevert("Error bound exceeds maximum");
+            vm.expectRevert(HelixCoordinatorV2.ErrorBoundExceeded.selector);
             coordinator.submitProof(modelId, 1, proof, inputs);
         } else {
             vm.prank(prover);

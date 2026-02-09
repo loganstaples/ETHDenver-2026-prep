@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
+pragma solidity ^0.8.24;
 
 import "forge-std/Test.sol";
 import "../src/core/HelixCoordinatorV2.sol";
@@ -251,7 +251,7 @@ contract CompleteFlowTest is Test {
         // Cannot register model while paused
         uint256 commitment = uint256(keccak256(abi.encodePacked(uint256(1), uint256(2))));
         vm.prank(modelOwner);
-        vm.expectRevert("Contract is paused");
+        vm.expectRevert(HelixCoordinatorV2.ContractPaused.selector);
         coordinator.registerModel("Test", commitment, MIN_STAKE);
 
         // Unpause
@@ -267,7 +267,7 @@ contract CompleteFlowTest is Test {
     /// @notice Test only owner can pause/unpause
     function test_OnlyOwnerCanPause() public {
         vm.prank(attacker);
-        vm.expectRevert("Only owner");
+        vm.expectRevert(HelixCoordinatorV2.OnlyOwner.selector);
         coordinator.emergencyPause();
     }
 
@@ -477,7 +477,7 @@ contract CompleteFlowTest is Test {
 
         // Cannot start round
         vm.prank(modelOwner);
-        vm.expectRevert("Contract is paused");
+        vm.expectRevert(HelixCoordinatorV2.ContractPaused.selector);
         coordinator.startRound(modelId, ROUND_DURATION);
     }
 }

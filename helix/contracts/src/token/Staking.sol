@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
+pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -340,7 +340,7 @@ contract Staking is ReentrancyGuard {
         // Handle challenger reward
         uint256 challengerReward = 0;
         if (challenger != address(0) && challengerConfig.enabled && slashAmount > 0) {
-            challengerReward = _calculateAndDistributeReward(challenger, slashAmount);
+            challengerReward = _calculateAndDistributeReward(challenger, slashAmount, staker);
         }
 
         // Transfer remaining slashed amount to treasury
@@ -379,7 +379,8 @@ contract Staking is ReentrancyGuard {
     /// @notice Calculate and distribute challenger reward
     function _calculateAndDistributeReward(
         address challenger,
-        uint256 slashAmount
+        uint256 slashAmount,
+        address staker
     ) internal returns (uint256 reward) {
         reward = (slashAmount * challengerConfig.rewardPercentage) / 10000;
 
@@ -398,7 +399,7 @@ contract Staking is ReentrancyGuard {
 
         if (reward > 0) {
             helixToken.safeTransfer(challenger, reward);
-            emit ChallengerRewarded(challenger, reward, msg.sender);
+            emit ChallengerRewarded(challenger, reward, staker);
         }
     }
 
