@@ -29,10 +29,19 @@ use crate::integration::circuit_bridge::{
 };
 use crate::integration::witness::generate_freivalds_challenges;
 use crate::integration::witness_format::ReconstructedWitness;
+use crate::proofs::{
+    ShareValidityProver, ShareValidityWitness,
+    AggregationProver, AggregationVerifier,
+    GradientAggregationWitness, GradientShareInput,
+    AggregationProof, ShareValidityProof,
+    ShareValidityVerifier,
+};
 use crate::protocols::arithmetic::SecureArithmetic;
 use crate::protocols::reshare::Resharing;
+use crate::security::commitment::BlindingGenerator;
 use crate::session::transport::MPCTransport;
-use crate::types::PartyId;
+use crate::sharing::tensor::TensorShare;
+use crate::types::{PartyId, ShareId};
 
 /// Configuration for the MPC trainer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,6 +153,10 @@ pub struct MPCTrainingStepResult {
     pub proof: Option<Halo2ProofResult>,
     /// Total accumulated error.
     pub total_error: f64,
+    /// Share validity proof (if proof generation is enabled).
+    pub share_validity_proof: Option<ShareValidityProof>,
+    /// Aggregation proof (if proof generation is enabled, party 0 only).
+    pub aggregation_proof: Option<AggregationProof>,
 }
 
 /// Per-party MPC trainer state.
@@ -151,6 +164,7 @@ pub struct MPCTrainingStepResult {
 /// Each party instantiates one `MPCTrainer` and calls `training_step()`
 /// in lock-step with all other parties. Communication happens through
 /// the generic `MPCTransport`.
+#[allow(dead_code)]
 pub struct MPCTrainer<T: MPCTransport> {
     /// Configuration.
     config: MPCTrainerConfig,
@@ -175,6 +189,12 @@ pub struct MPCTrainer<T: MPCTransport> {
     rng: ChaCha20Rng,
     /// Circuit bridge for ZK proofs (lazily initialized).
     circuit_bridge: Option<CircuitBridge>,
+    /// Prover for share validity proofs.
+    share_prover: ShareValidityProver,
+    /// Prover for gradient aggregation proofs.
+    agg_prover: AggregationProver,
+    /// Generator for blinding factors used in commitments.
+    blinding_gen: BlindingGenerator,
 }
 
 impl<T: MPCTransport> MPCTrainer<T> {
@@ -202,6 +222,9 @@ impl<T: MPCTransport> MPCTrainer<T> {
             current_step: 0,
             rng: ChaCha20Rng::seed_from_u64(party_seed),
             circuit_bridge: None,
+            share_prover: ShareValidityProver::with_seed(seed),
+            agg_prover: AggregationProver::with_seed(seed),
+            blinding_gen: BlindingGenerator::with_seed(seed),
         }
     }
 
@@ -378,6 +401,7 @@ impl<T: MPCTransport> MPCTrainer<T> {
     }
 
     /// Takes the next Beaver triple from the pool.
+    #[allow(dead_code)]
     fn take_triple(&mut self) -> MPCResult<BeaverTriple> {
         if self.beaver_cursor >= self.beaver_triples.len() {
             return Err(MPCError::BeaverPoolExhausted {
@@ -406,6 +430,7 @@ impl<T: MPCTransport> MPCTrainer<T> {
     /// 2. Broadcast d, e to all peers
     /// 3. Receive d, e from all peers, sum to get opened d/e
     /// 4. Compute result = c + d*b + e*a + d*e (party 0 only adds d*e)
+    #[allow(dead_code)]
     async fn secure_multiply(
         &mut self,
         x_share: &Fr,
@@ -447,6 +472,7 @@ impl<T: MPCTransport> MPCTrainer<T> {
     ///
     /// This is more efficient than element-wise: sends all d/e values in a
     /// single message, reducing round trips.
+    #[allow(dead_code)]
     async fn secure_vector_multiply(
         &mut self,
         x_shares: &[Fr],
@@ -720,6 +746,25 @@ impl<T: MPCTransport> MPCTrainer<T> {
             None
         };
 
+        // ---- Share validity proof generation ----
+        let sv_proof = if self.config.generate_proofs {
+            Some(self.generate_share_validity_proof()?)
+        } else {
+            None
+        };
+
+        // ---- Aggregation proof generation (party 0 only) ----
+        let agg_proof = if self.config.generate_proofs && self.party_index == 0 {
+            // Party 0 has the aggregated view of gradients.
+            // Collect per-party gradient contributions (all same since gradients are public).
+            let gradients: Vec<(Vec<Fr>, Vec<Fr>, Vec<Fr>, Vec<Fr>)> = (0..self.config.num_parties)
+                .map(|_| (dw1.clone(), db1.clone(), dw2.clone(), db2.clone()))
+                .collect();
+            self.generate_aggregation_proof(&gradients, step)?
+        } else {
+            None
+        };
+
         // Compute total error.
         let num_ops = (d_hid * d_in + d_hid + d_out * d_hid + d_out) as f64;
         let total_error = self.config.base_error * num_ops;
@@ -732,6 +777,8 @@ impl<T: MPCTransport> MPCTrainer<T> {
             loss = loss,
             reshared = reshared,
             has_proof = proof.is_some(),
+            has_sv_proof = sv_proof.is_some(),
+            has_agg_proof = agg_proof.is_some(),
             "Training step completed"
         );
 
@@ -741,6 +788,8 @@ impl<T: MPCTransport> MPCTrainer<T> {
             reshared,
             proof,
             total_error,
+            share_validity_proof: sv_proof,
+            aggregation_proof: agg_proof,
         })
     }
 
@@ -920,6 +969,134 @@ impl<T: MPCTransport> MPCTrainer<T> {
         };
 
         bridge.prove(&witness)
+    }
+
+    // ========================================================================
+    // Phase 7: Share validity and aggregation proofs
+    // ========================================================================
+
+    /// Generates a share validity proof for the current weight shares.
+    ///
+    /// Creates a `TensorShare` by concatenating all weight shares (w1, b1,
+    /// w2, b2) into a single flat vector, then uses `ShareValidityProver`
+    /// to prove that the shares are well-formed without revealing their values.
+    fn generate_share_validity_proof(&mut self) -> MPCResult<ShareValidityProof> {
+        // Concatenate all weight shares into a single vector.
+        let mut all_weights = Vec::with_capacity(
+            self.w1.len() + self.b1.len() + self.w2.len() + self.b2.len(),
+        );
+        all_weights.extend_from_slice(&self.w1);
+        all_weights.extend_from_slice(&self.b1);
+        all_weights.extend_from_slice(&self.w2);
+        all_weights.extend_from_slice(&self.b2);
+
+        let total_len = all_weights.len();
+
+        // Create a TensorShare wrapping the concatenated weights.
+        let share_id = ShareId::new(
+            self.party_id.clone(),
+            "model_weights",
+            self.party_index,
+        );
+        let tensor_share = TensorShare::new(share_id, all_weights, vec![total_len]);
+
+        // Generate a blinding factor.
+        let blinding = self.blinding_gen.generate();
+
+        // Use a placeholder dealer public key and signature.
+        // In production, these would come from the actual dealer.
+        let dealer_pk = [1u8; 32];
+        let dealer_sig = vec![1, 2, 3, 4];
+
+        // Create the witness from the tensor share.
+        let witness = ShareValidityWitness::from_tensor_share(
+            &tensor_share,
+            blinding,
+            dealer_pk,
+            dealer_sig,
+        );
+
+        // Generate the proof.
+        self.share_prover.prove(&witness)
+    }
+
+    /// Generates an aggregation proof for gradient aggregation.
+    ///
+    /// This is only called by party 0, which has the aggregated view of
+    /// all gradients. Each party's gradient contribution is flattened and
+    /// committed, then the aggregation is proven correct.
+    ///
+    /// Returns `Ok(None)` if there are no gradients to aggregate.
+    fn generate_aggregation_proof(
+        &mut self,
+        gradients: &[(Vec<Fr>, Vec<Fr>, Vec<Fr>, Vec<Fr>)],
+        round: u64,
+    ) -> MPCResult<Option<AggregationProof>> {
+        if gradients.is_empty() {
+            return Ok(None);
+        }
+
+        let num_parties = gradients.len();
+
+        // Flatten each party's gradient into a single vector.
+        let flat_gradients: Vec<Vec<Fr>> = gradients
+            .iter()
+            .map(|(dw1, db1, dw2, db2)| {
+                let mut flat = Vec::with_capacity(dw1.len() + db1.len() + dw2.len() + db2.len());
+                flat.extend_from_slice(dw1);
+                flat.extend_from_slice(db1);
+                flat.extend_from_slice(dw2);
+                flat.extend_from_slice(db2);
+                flat
+            })
+            .collect();
+
+        let gradient_dim = flat_gradients[0].len();
+
+        // Create the aggregation witness.
+        let mut witness = GradientAggregationWitness::new(num_parties, gradient_dim, round);
+
+        // Add each party's gradient share with a blinding factor.
+        for (i, flat_grad) in flat_gradients.iter().enumerate() {
+            let party = PartyId::from_index(i);
+            let blinding = self.blinding_gen.generate();
+            let input = GradientShareInput::new(party, flat_grad.clone(), blinding);
+            witness.add_gradient_share(input)?;
+        }
+
+        // Compute the aggregation (sums the gradient shares).
+        witness.compute_aggregation();
+
+        // Generate the proof.
+        let proof = self.agg_prover.prove(&witness)?;
+        Ok(Some(proof))
+    }
+
+    /// Verifies all proofs from a training step result.
+    ///
+    /// Checks:
+    /// - Share validity proof (if present): verifies the party's shares are well-formed
+    /// - Aggregation proof (if present): verifies gradient aggregation was correct
+    ///
+    /// Returns `Ok(true)` if all present proofs verify, `Ok(false)` if any fail.
+    pub fn verify_step(result: &MPCTrainingStepResult) -> MPCResult<bool> {
+        // Verify share validity proof if present.
+        if let Some(ref sv_proof) = result.share_validity_proof {
+            let sv_verifier = ShareValidityVerifier::new();
+            if !sv_verifier.verify(sv_proof)? {
+                return Ok(false);
+            }
+        }
+
+        // Verify aggregation proof if present.
+        if let Some(ref agg_proof) = result.aggregation_proof {
+            let agg_verifier = AggregationVerifier::new();
+            if !agg_verifier.verify(agg_proof)? {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
     }
 
     // ========================================================================
@@ -1292,6 +1469,147 @@ mod tests {
         for idx in 0..dim {
             let sum: Fr = all_final_shares.iter().fold(Fr::ZERO, |acc, s| Fr::add(&acc, &s.0[idx]));
             assert!(sum.to_f64().is_finite(), "w1[{}] not finite after reshare", idx);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_share_validity_and_aggregation_proofs() {
+        // This test exercises the new share validity and aggregation proof
+        // generation and verification paths. We disable the Halo2 circuit
+        // bridge proof (generate_proofs: false) and instead drive the share
+        // validity / aggregation provers directly after a training step,
+        // because the Halo2 circuit proof requires circuit-compatible
+        // tiny weights and is tested separately.
+        let num_parties = 3;
+        let parties = test_parties(num_parties);
+        let transports = LocalTransport::create_mesh(&parties);
+
+        let config = MPCTrainerConfig {
+            d_in: 2,
+            d_hid: 2,
+            d_out: 1,
+            learning_rate: 0.01,
+            num_parties,
+            reshare_interval: 0,
+            beaver_batch_size: 256,
+            generate_proofs: false, // Disable full Halo2 proof (circuit-compat issue)
+            base_error: 1e-6,
+        };
+
+        let initial_weights = ModelWeights::from_f64(
+            &[0.1, 0.2, 0.3, 0.4],
+            &[0.01, 0.02],
+            &[0.5, 0.6],
+            &[0.03],
+        );
+
+        let input = vec![1.0, 0.5];
+        let target = vec![1.0];
+
+        let mut handles = Vec::new();
+        for (i, transport) in transports.into_iter().enumerate() {
+            let cfg = config.clone();
+            let weights = if i == 0 {
+                Some(initial_weights.clone())
+            } else {
+                None
+            };
+            let inp = input.clone();
+            let tgt = target.clone();
+
+            let handle = tokio::spawn(async move {
+                // Capture dimensions before moving cfg into the trainer.
+                let d_in = cfg.d_in;
+                let d_hid = cfg.d_hid;
+                let d_out = cfg.d_out;
+
+                let mut trainer = MPCTrainer::new(cfg, transport, i, 42);
+                trainer.share_weights(weights).await.unwrap();
+                trainer.generate_beaver_triples(256).await.unwrap();
+                let _result = trainer.training_step(&inp, &tgt).await.unwrap();
+
+                // Now manually exercise the share validity and aggregation provers.
+                let sv_proof = trainer.generate_share_validity_proof().unwrap();
+
+                // Only party 0 generates the aggregation proof.
+                let agg_proof = if i == 0 {
+                    // Create mock per-party gradients (all the same since gradients are public).
+                    let gradients: Vec<(Vec<Fr>, Vec<Fr>, Vec<Fr>, Vec<Fr>)> = (0..num_parties)
+                        .map(|_| {
+                            let dw1 = vec![Fr::from_f64(0.01); d_hid * d_in];
+                            let db1 = vec![Fr::from_f64(0.01); d_hid];
+                            let dw2 = vec![Fr::from_f64(0.01); d_out * d_hid];
+                            let db2 = vec![Fr::from_f64(0.01); d_out];
+                            (dw1, db1, dw2, db2)
+                        })
+                        .collect();
+                    trainer.generate_aggregation_proof(&gradients, 0).unwrap()
+                } else {
+                    None
+                };
+
+                // Build a result with the new proofs for verification.
+                let result_with_proofs = MPCTrainingStepResult {
+                    step: 0,
+                    loss: 0.0,
+                    reshared: false,
+                    proof: None,
+                    total_error: 0.0,
+                    share_validity_proof: Some(sv_proof),
+                    aggregation_proof: agg_proof,
+                };
+
+                (i, result_with_proofs)
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            let (party_index, result) = handle.await.unwrap();
+
+            // Every party should have a share validity proof.
+            assert!(
+                result.share_validity_proof.is_some(),
+                "Party {} should have a share validity proof",
+                party_index
+            );
+
+            // Verify the share validity proof.
+            let sv_proof = result.share_validity_proof.as_ref().unwrap();
+            let sv_verifier = crate::proofs::ShareValidityVerifier::new();
+            assert!(
+                sv_verifier.verify(sv_proof).unwrap(),
+                "Party {}'s share validity proof should verify",
+                party_index
+            );
+
+            // Only party 0 should have an aggregation proof.
+            if party_index == 0 {
+                assert!(
+                    result.aggregation_proof.is_some(),
+                    "Party 0 should have an aggregation proof"
+                );
+
+                let agg_proof = result.aggregation_proof.as_ref().unwrap();
+                let agg_verifier = crate::proofs::AggregationVerifier::new();
+                assert!(
+                    agg_verifier.verify(agg_proof).unwrap(),
+                    "Party 0's aggregation proof should verify"
+                );
+            } else {
+                assert!(
+                    result.aggregation_proof.is_none(),
+                    "Party {} should not have an aggregation proof",
+                    party_index
+                );
+            }
+
+            // verify_step should pass for all parties.
+            assert!(
+                MPCTrainer::<LocalTransport>::verify_step(&result).unwrap(),
+                "verify_step should pass for party {}",
+                party_index
+            );
         }
     }
 

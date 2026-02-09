@@ -18,9 +18,7 @@
 use rand_chacha::ChaCha20Rng;
 use rand::SeedableRng;
 
-use crate::error::MPCResult;
 use crate::field::Fr;
-use crate::types::PartyId;
 use crate::sharing::tensor::TensorShare;
 use crate::sharing::model::ModelShare;
 
@@ -129,7 +127,7 @@ impl Resharing {
         old_shares: &[ModelShare],
         seed: u64,
     ) -> Vec<ModelShare> {
-        let n = old_shares.len();
+        let _n = old_shares.len();
         let mut new_shares = old_shares.to_vec();
 
         let mut seed_counter: u64 = seed;
@@ -201,6 +199,7 @@ impl Resharing {
 mod tests {
     use super::*;
     use crate::field::ops::sum;
+    use crate::types::PartyId;
 
     fn test_parties(n: usize) -> Vec<PartyId> {
         (0..n).map(PartyId::from_index).collect()

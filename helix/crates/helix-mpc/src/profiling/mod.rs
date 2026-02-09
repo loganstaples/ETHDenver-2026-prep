@@ -736,6 +736,7 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 /// Thread-local profiler for convenience.
+#[allow(unexpected_cfgs)]
 #[cfg(feature = "thread_local")]
 thread_local! {
     static PROFILER: std::cell::RefCell<Option<MPCProfiler>> = std::cell::RefCell::new(None);

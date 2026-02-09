@@ -28,8 +28,19 @@ use rand_chacha::ChaCha20Rng;
 use crate::error::{MPCError, MPCResult};
 use crate::field::Fr;
 use crate::proofs::{MPCProof, ProofType};
-use crate::poseidon::{domains, mac_commitment};
-use crate::types::PartyId;
+
+/// Converts a 32-byte hash to a field element safely.
+///
+/// `Fr::from_bytes_le` uses `from_repr` which requires canonical form (< p).
+/// Since BN254's p ≈ 2^254, ~75% of random 256-bit values exceed p and
+/// silently map to zero. This helper truncates to 248 bits (31 bytes),
+/// guaranteeing the value is < 2^248 < p.
+fn hash_to_fr(hash: &[u8; 32]) -> Fr {
+    let mut safe_bytes = [0u8; 32];
+    safe_bytes[..31].copy_from_slice(&hash[..31]);
+    Fr::from_bytes_le(&safe_bytes)
+}
+use crate::poseidon::mac_commitment;
 
 /// Witness for MAC verification proof.
 #[derive(Debug, Clone)]
@@ -586,7 +597,7 @@ impl MACProver {
         hasher.update(&alpha.to_bytes_le());
         hasher.update(&nonce.to_bytes_le());
         let challenge_bytes: [u8; 32] = hasher.finalize().into();
-        let challenge = Fr::from_bytes_le(&challenge_bytes);
+        let challenge = hash_to_fr(&challenge_bytes);
 
         // Compute response: r = nonce + challenge * alpha.
         let response = Fr::add(&nonce, &Fr::mul(&challenge, &alpha));
@@ -610,7 +621,7 @@ impl MACProver {
         }
 
         let hash: [u8; 32] = hasher.finalize().into();
-        Fr::from_bytes_le(&hash)
+        hash_to_fr(&hash)
     }
 
     /// Generates the combined proof.

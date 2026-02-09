@@ -18,6 +18,8 @@
 //! - `profiling`: Performance profiling and bottleneck identification
 //! - `proofs`: MPC-specific ZK proofs (share validity, aggregation, MAC verification)
 
+#![allow(unexpected_cfgs)]
+
 pub mod beaver;
 pub mod error;
 pub mod field;

@@ -23,7 +23,6 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
@@ -584,7 +583,6 @@ impl KeyRotationManager {
         }
 
         // Combine all randomness deterministically
-        let mut combined_randomness = [0u8; 32];
         let mut sorted_parties: Vec<_> = randomness.iter().collect();
         sorted_parties.sort_by(|a, b| a.0.cmp(b.0));
 
@@ -593,7 +591,7 @@ impl KeyRotationManager {
             hasher.update(party_id.as_bytes());
             hasher.update(party_randomness);
         }
-        combined_randomness = hasher.finalize().into();
+        let combined_randomness: [u8; 32] = hasher.finalize().into();
 
         // Get current key for chain derivation
         let current_version = version - 1;

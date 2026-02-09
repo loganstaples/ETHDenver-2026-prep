@@ -52,6 +52,7 @@ impl Default for BatchMACConfig {
 
 /// A pending MAC verification.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct PendingMAC {
     /// Value share (in Fr).
     value: Fr,

@@ -22,22 +22,18 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use crate::beaver::pool::BeaverPool;
 use crate::error::{MPCError, MPCResult};
 use crate::field::Fr;
-use crate::integration::training::{SecureTrainingConfig, SecureTrainingCoordinator, StepMetrics};
-use crate::integration::witness_format::{MPCTrainingWitness, WitnessBuilder};
 use crate::integration::zk_pipeline::{
     BatchProofGenerator, ProofResult, ZKPipelineConfig, ZKProofPipeline,
 };
 use crate::proofs::{
-    AggregationProof, AggregationProver, AggregationVerifier, BatchedProof, BatchVerifier,
-    GradientAggregationWitness, GradientShareInput, MACProof, MACProver, ZKMACVerifier,
-    MACWitness, ProofStats, ShareValidityProof, ShareValidityProver, ShareValidityVerifier,
+    AggregationProof, AggregationProver, AggregationVerifier,
+    GradientAggregationWitness, GradientShareInput, MACProver, ProofStats, ShareValidityProof, ShareValidityProver, ShareValidityVerifier,
     ShareValidityWitness,
 };
 use crate::security::commitment::BlindingGenerator;
-use crate::sharing::model::{GradientShare, ModelShare, ModelSharing, ReconstructedModel};
+use crate::sharing::model::{GradientShare, ModelShare};
 use crate::sharing::tensor::TensorShare;
 use crate::types::{MPCConfig, PartyId, ShareId};
 
@@ -107,6 +103,7 @@ pub struct ZKTrainingStep {
 }
 
 /// Coordinated ZK training with integrated proofs.
+#[allow(dead_code)]
 pub struct ZKTrainingCoordinator {
     /// Configuration.
     config: ZKTrainingConfig,
@@ -180,7 +177,7 @@ impl ZKTrainingCoordinator {
         rng.fill_bytes(&mut self.dealer_pk);
 
         // Share the model weights.
-        let sharing = crate::sharing::AdditiveSharing::with_seed(0xD0DE1);
+        let _sharing = crate::sharing::AdditiveSharing::with_seed(0xD0DE1);
 
         for i in 0..num_parties {
             let party = parties[i].clone();
@@ -460,7 +457,7 @@ impl ZKTrainingCoordinator {
 
     // Internal helpers.
 
-    fn compute_gradient_shares(&self, input: &[f64], target: &[f64]) -> MPCResult<Vec<GradientShare>> {
+    fn compute_gradient_shares(&self, _input: &[f64], _target: &[f64]) -> MPCResult<Vec<GradientShare>> {
         let num_parties = self.config.mpc.num_parties;
         let mut gradients = Vec::with_capacity(num_parties);
 
@@ -580,7 +577,7 @@ impl ZKTrainingCoordinator {
                 hasher.update(&v.to_bytes_le());
             }
             hasher.update(&blinding);
-            let commitment: [u8; 32] = hasher.finalize().into();
+            let _commitment: [u8; 32] = hasher.finalize().into();
 
             witness.add_gradient_share(GradientShareInput::new(
                 party,
@@ -605,7 +602,7 @@ impl ZKTrainingCoordinator {
                             layer.weights.get_mut("w1"),
                             grad_layer.gradients.get("w1"),
                         ) {
-                            for (j, (w, dw)) in w1.data.iter_mut().zip(dw1.data.iter()).enumerate() {
+                            for (_j, (w, dw)) in w1.data.iter_mut().zip(dw1.data.iter()).enumerate() {
                                 *w = Fr::sub(w, &Fr::mul(&lr, dw));
                             }
                         }
@@ -615,7 +612,7 @@ impl ZKTrainingCoordinator {
                             layer.weights.get_mut("b1"),
                             grad_layer.gradients.get("b1"),
                         ) {
-                            for (j, (b, db)) in b1.data.iter_mut().zip(db1.data.iter()).enumerate() {
+                            for (_j, (b, db)) in b1.data.iter_mut().zip(db1.data.iter()).enumerate() {
                                 *b = Fr::sub(b, &Fr::mul(&lr, db));
                             }
                         }
@@ -625,7 +622,7 @@ impl ZKTrainingCoordinator {
                             layer.weights.get_mut("w2"),
                             grad_layer.gradients.get("w2"),
                         ) {
-                            for (j, (w, dw)) in w2.data.iter_mut().zip(dw2.data.iter()).enumerate() {
+                            for (_j, (w, dw)) in w2.data.iter_mut().zip(dw2.data.iter()).enumerate() {
                                 *w = Fr::sub(w, &Fr::mul(&lr, dw));
                             }
                         }
@@ -635,7 +632,7 @@ impl ZKTrainingCoordinator {
                             layer.weights.get_mut("b2"),
                             grad_layer.gradients.get("b2"),
                         ) {
-                            for (j, (b, db)) in b2.data.iter_mut().zip(db2.data.iter()).enumerate() {
+                            for (_j, (b, db)) in b2.data.iter_mut().zip(db2.data.iter()).enumerate() {
                                 *b = Fr::sub(b, &Fr::mul(&lr, db));
                             }
                         }
@@ -655,7 +652,7 @@ impl ZKTrainingCoordinator {
         for i in 0..self.config.mpc.num_parties {
             if let Some(model_share) = self.model_shares.get(&i) {
                 if let Some(layer) = model_share.layers.first() {
-                    for (name, tensor) in &layer.weights {
+                    for (_name, tensor) in &layer.weights {
                         for v in &tensor.data {
                             hasher.update(&v.to_bytes_le());
                         }

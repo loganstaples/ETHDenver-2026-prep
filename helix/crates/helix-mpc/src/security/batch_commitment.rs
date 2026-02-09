@@ -11,7 +11,6 @@
 //! - **Incremental Hashing**: Reuse hash state across related commitments
 //! - **Deferred Verification**: Accumulate and verify at end of round
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
@@ -105,6 +104,7 @@ enum WorkerRequest {
     Shutdown,
 }
 
+#[allow(dead_code)]
 struct WorkerResult {
     batch_id: u64,
     start_index: usize,

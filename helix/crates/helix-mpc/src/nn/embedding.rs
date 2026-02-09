@@ -10,7 +10,6 @@
 //! ones are public by construction).
 
 use crate::error::{MPCError, MPCResult};
-use crate::protocols::arithmetic::SecureArithmetic;
 
 /// Secure embedding layer.
 pub struct SecureEmbedding;
@@ -32,7 +31,7 @@ impl SecureEmbedding {
         vocab_size: usize,
         d_model: usize,
     ) -> MPCResult<Vec<Vec<f64>>> {
-        let num_parties = embedding_shares.len();
+        let _num_parties = embedding_shares.len();
         let seq_len = token_ids.len();
 
         // Validate token indices.
@@ -94,8 +93,8 @@ impl SecureEmbedding {
         vocab_size: usize,
         d_model: usize,
     ) -> Vec<Vec<f64>> {
-        let num_parties = dy_shares.len();
-        let seq_len = token_ids.len();
+        let _num_parties = dy_shares.len();
+        let _seq_len = token_ids.len();
 
         dy_shares
             .iter()

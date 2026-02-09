@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::properties::{AdversaryModel, SecurityLevel};
 

@@ -3,13 +3,13 @@
 //! Extends the scalar/vector sharing schemes to work with the tensor types
 //! used throughout HELIX. Each element of the tensor is shared independently.
 
-use helix_core::types::{BoundedTensor, BoundedValue, ErrorMargin};
+use helix_core::types::BoundedTensor;
 
 use crate::error::{MPCError, MPCResult};
 use crate::field::Fr;
 use crate::types::PartyId;
 
-use super::{AdditiveSharing, ScalarShare, SecretSharingScheme, ShareId, ShamirSharing, VectorShare};
+use super::{AdditiveSharing, SecretSharingScheme, ShareId, ShamirSharing, VectorShare};
 
 use serde::{Deserialize, Serialize};
 

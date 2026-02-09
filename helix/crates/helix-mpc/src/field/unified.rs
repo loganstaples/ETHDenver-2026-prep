@@ -21,7 +21,7 @@ use std::fmt;
 use std::ops::{Add, AddAssign, Div, Mul, MulAssign, Neg, Sub, SubAssign};
 use zeroize::Zeroize;
 
-use super::constant_time::{CtChoice, ct_eq_array};
+use super::constant_time::CtChoice;
 
 /// Fixed-point scale: 2^64
 pub const FIXED_POINT_SCALE_BITS: u32 = 64;

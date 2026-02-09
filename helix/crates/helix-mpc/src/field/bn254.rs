@@ -19,7 +19,7 @@
 //! with 64 bits of fractional precision.
 
 use super::constant_time::{
-    ct_assign_array, ct_eq_array, ct_ge_array, ct_lt_array, ct_swap_array, CtChoice, SecureBuffer,
+    ct_assign_array, ct_eq_array, ct_ge_array, ct_lt_array, CtChoice,
 };
 use rand::{Rng, RngCore};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -53,6 +53,7 @@ pub const R2: [u64; 4] = [
 ];
 
 /// R^3 mod r (useful for some conversions)
+#[allow(dead_code)]
 pub const R3: [u64; 4] = [
     0x5e94d8e1b4bf0040,
     0x2a489cbe1cfbb6b8,
@@ -233,7 +234,7 @@ impl Fr {
         let mut result = Self::ZERO;
 
         // result = MODULUS - self (in Montgomery form, negation is same)
-        let (diff, borrow) = sub_with_borrow(&MODULUS, &self.limbs);
+        let (diff, _borrow) = sub_with_borrow(&MODULUS, &self.limbs);
         result.limbs = diff;
 
         // If self was zero, keep zero

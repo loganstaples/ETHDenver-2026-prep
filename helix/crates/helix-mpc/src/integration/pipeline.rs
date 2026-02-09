@@ -8,19 +8,13 @@
 //! - Gradient aggregation on shares
 //! - Model reconstruction
 
-use crate::beaver::dealer::TrustedDealer;
-use crate::beaver::pool::BeaverPool;
 use crate::error::{MPCError, MPCResult};
 use crate::integration::training::{SecureTrainingConfig, SecureTrainingCoordinator, ModelWeightsFlat};
-use crate::protocols::activation::{ActivationType, SecureActivation};
-use crate::protocols::arithmetic::SecureArithmetic;
-use crate::protocols::matmul::SecureMatmul;
-use crate::protocols::normalization::SecureNormalization;
 use crate::security::audit::AuditLog;
-use crate::sharing::model::{GradientShare, LayerGradientShare, ModelSharing, ReconstructedModel};
+use crate::sharing::model::{GradientShare, LayerGradientShare, ReconstructedModel};
 use crate::sharing::tensor::TensorShare;
 use crate::sharing::{AdditiveSharing, SecretSharingScheme};
-use crate::types::{MPCConfig, PartyId, ShareId};
+use crate::types::{MPCConfig, PartyId};
 
 /// High-level secure training pipeline.
 ///
@@ -112,7 +106,7 @@ impl SecurePipeline {
             return Err(MPCError::SessionError("Pipeline not initialized".into()));
         }
 
-        let n = self.config.mpc.num_parties;
+        let _n = self.config.mpc.num_parties;
 
         // Generate synthetic gradient shares.
         // In the real system, each party computes on their weight share.

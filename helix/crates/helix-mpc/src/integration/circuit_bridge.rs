@@ -22,13 +22,11 @@
 //! 3. `CircuitBridge` converts to Halo2 circuit format and generates proof
 //! 4. Proof is verified locally, then submitted on-chain
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 use helix_prover::MLTrainingProverV2;
 use helix_circuits::ml::training_step_v2::{
-    MLTrainingStepV2Witness, MLTrainingStepV2Circuit,
     compute_witness_v2, compute_state_hash_v2,
 };
 use sha2::{Digest, Sha256};
@@ -36,7 +34,6 @@ use tracing::{debug, info, warn, instrument};
 
 use crate::error::{MPCError, MPCResult};
 use crate::field::Fr;
-use crate::integration::witness::CircuitWitness;
 use crate::integration::witness_format::ReconstructedWitness;
 use crate::protocols::proved_arithmetic::{WitnessCapture, WitnessSummary};
 
@@ -154,6 +151,7 @@ impl CircuitBridgeConfig {
 ///
 /// This is the main interface for proof generation. It holds the prover
 /// state and can generate multiple proofs efficiently.
+#[allow(dead_code)]
 pub struct CircuitBridge {
     /// Configuration.
     config: CircuitBridgeConfig,
@@ -485,13 +483,13 @@ pub fn witness_capture_to_reconstructed(
 
     // Extract weight shares from captures
     // This assumes each capture contains the party's weight data as inputs
-    let num_parties = captures.len();
+    let _num_parties = captures.len();
 
     // Initialize weight accumulators
     let mut w1 = vec![Fr::ZERO; d_hid * d_in];
-    let mut b1 = vec![Fr::ZERO; d_hid];
-    let mut w2 = vec![Fr::ZERO; d_out * d_hid];
-    let mut b2 = vec![Fr::ZERO; d_out];
+    let b1 = vec![Fr::ZERO; d_hid];
+    let w2 = vec![Fr::ZERO; d_out * d_hid];
+    let b2 = vec![Fr::ZERO; d_out];
 
     // Sum shares from all parties (additive secret sharing reconstruction)
     for capture in captures {

@@ -11,13 +11,11 @@
 //! 3. Computing required intermediate values for the circuit witness
 //! 4. Generating Freivalds verification challenges
 
-use sha2::{Digest, Sha256};
 
 use crate::error::{MPCError, MPCResult};
 use crate::field::Fr;
-use crate::integration::witness_format::{MPCTrainingWitness, ReconstructedWitness};
+use crate::integration::witness_format::ReconstructedWitness;
 use crate::poseidon::{poseidon_state_hash, share_commitment};
-use crate::sharing::model::ModelShare;
 use crate::types::PartyId;
 
 /// Converts reconstructed MPC witness to the format expected by helix-circuits.
@@ -330,7 +328,7 @@ impl CircuitWitness {
         d_hid: usize,
         d_out: usize,
         forward: &ForwardResult,
-        w1: &[Fr],
+        _w1: &[Fr],
         w2: &[Fr],
         x: &[Fr],
         target: &[Fr],
@@ -564,7 +562,7 @@ impl ShareCommitmentData {
 
 /// Generates Freivalds verification challenges deterministically.
 pub fn generate_freivalds_challenges(step_number: u64, d_hid: usize, d_out: usize) -> (Vec<Fr>, Vec<Fr>) {
-    use rand::{RngCore, SeedableRng};
+    use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
 
     // Layer 1 challenges

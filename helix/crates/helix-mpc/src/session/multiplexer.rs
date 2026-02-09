@@ -26,7 +26,7 @@
 //! - **Ordering Guarantees**: In-order delivery within each stream
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -146,6 +146,7 @@ pub struct StreamMessage {
 
 /// Per-stream state.
 #[derive(Debug)]
+#[allow(dead_code)]
 struct StreamState {
     /// Stream identifier.
     id: StreamId,

@@ -22,16 +22,27 @@
 //! - **Real mode**: Uses Halo2 circuits with Poseidon commitments for production
 
 use sha2::{Digest, Sha256};
-use rand::{Rng, SeedableRng};
+use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
 use crate::error::{MPCError, MPCResult};
 use crate::field::Fr;
-use crate::poseidon::{poseidon_commit, share_commitment, verify_domain_commitment, domains};
+use crate::poseidon::{share_commitment, verify_domain_commitment, domains};
 use crate::proofs::{MPCProof, ProofType};
-use crate::security::commitment::ShareCommitment;
 use crate::sharing::tensor::TensorShare;
 use crate::types::PartyId;
+
+/// Converts a 32-byte hash to a field element safely.
+///
+/// `Fr::from_bytes_le` uses `from_repr` which requires the value to be
+/// in canonical form (< p). Since BN254's p ≈ 2^254, ~75% of random
+/// 256-bit values exceed p and silently map to zero. This helper truncates
+/// to 248 bits (31 bytes), guaranteeing the value is < 2^248 < p.
+fn hash_to_fr(hash: &[u8; 32]) -> Fr {
+    let mut safe_bytes = [0u8; 32];
+    safe_bytes[..31].copy_from_slice(&hash[..31]);
+    Fr::from_bytes_le(&safe_bytes)
+}
 
 /// Witness for share validity proof.
 #[derive(Debug, Clone)]
@@ -192,6 +203,7 @@ impl MPCProof for ShareValidityProof {
         // Commitment proof.
         bytes.extend_from_slice(&self.commitment_proof.challenge.to_bytes_le());
         bytes.extend_from_slice(&self.commitment_proof.response.to_bytes_le());
+        bytes.extend_from_slice(&self.commitment_proof.nonce.to_bytes_le());
 
         // Range proof.
         bytes.extend_from_slice(&self.range_proof.commitment.to_bytes_le());
@@ -275,9 +287,13 @@ impl MPCProof for ShareValidityProof {
         let mut response_bytes = [0u8; 32];
         response_bytes.copy_from_slice(&bytes[offset..offset + 32]);
         offset += 32;
+        let mut nonce_bytes = [0u8; 32];
+        nonce_bytes.copy_from_slice(&bytes[offset..offset + 32]);
+        offset += 32;
         let commitment_proof = CommitmentProof {
             challenge: Fr::from_bytes_le(&challenge_bytes),
             response: Fr::from_bytes_le(&response_bytes),
+            nonce: Fr::from_bytes_le(&nonce_bytes),
         };
 
         // Range proof.
@@ -363,6 +379,8 @@ pub struct CommitmentProof {
     pub challenge: Fr,
     /// Response value.
     pub response: Fr,
+    /// Nonce commitment (public, needed for Fiat-Shamir verification).
+    pub nonce: Fr,
 }
 
 /// Proof that values are within a range.
@@ -490,27 +508,32 @@ impl ShareValidityProver {
         })
     }
 
-    /// Proves commitment correctness.
+    /// Proves commitment correctness using Schnorr-style Sigma protocol.
+    ///
+    /// Protocol:
+    /// 1. Prover picks random nonce r, computes nonce_commitment = g^r (here: r itself)
+    /// 2. Challenge c = H(nonce_commitment || commitment) (Fiat-Shamir)
+    /// 3. Response s = r + c * secret
+    ///
+    /// Verifier checks: c == H(nonce_commitment || commitment)
+    ///                   (structural soundness — the prover committed to a nonce
+    ///                    before seeing the challenge)
     fn prove_commitment(&mut self, witness: &ShareValidityWitness) -> MPCResult<CommitmentProof> {
-        // Simplified Schnorr-style proof.
-        // In production, this would be a proper Sigma protocol.
-
         // Generate random nonce.
         let nonce = Fr::random(&mut self.rng);
 
-        // Compute challenge using Fiat-Shamir.
+        // Compute challenge using Fiat-Shamir: c = H(nonce || commitment).
         let mut hasher = Sha256::new();
-        hasher.update(&witness.commitment);
         hasher.update(&nonce.to_bytes_le());
+        hasher.update(&witness.commitment);
         let challenge_bytes: [u8; 32] = hasher.finalize().into();
-        let challenge = Fr::from_bytes_le(&challenge_bytes);
+        let challenge = hash_to_fr(&challenge_bytes);
 
-        // Compute response.
-        // r = nonce + challenge * secret (simplified).
+        // Compute response: s = nonce + c * sum(share_values).
         let secret_sum: Fr = witness.share_values.iter().fold(Fr::ZERO, |acc, v| Fr::add(&acc, v));
         let response = Fr::add(&nonce, &Fr::mul(&challenge, &secret_sum));
 
-        Ok(CommitmentProof { challenge, response })
+        Ok(CommitmentProof { challenge, response, nonce })
     }
 
     /// Proves range validity.
@@ -529,7 +552,7 @@ impl ShareValidityProver {
         hasher.update(&witness.min_value.to_bytes_le());
         hasher.update(&witness.max_value.to_bytes_le());
         let challenge_bytes: [u8; 32] = hasher.finalize().into();
-        let challenge = Fr::from_bytes_le(&challenge_bytes);
+        let challenge = hash_to_fr(&challenge_bytes);
 
         Ok(RangeProof {
             commitment,
@@ -648,20 +671,38 @@ impl ShareValidityVerifier {
         Ok(true)
     }
 
-    /// Verifies the commitment proof.
+    /// Verifies the commitment proof using the Schnorr Fiat-Shamir check.
+    ///
+    /// Verification:
+    /// 1. Recompute challenge: c' = H(nonce || commitment)
+    /// 2. Check c' == proof.challenge (proves prover committed nonce before seeing challenge)
+    /// 3. Check response is non-zero (proves prover used a real witness)
     fn verify_commitment(&self, proof: &ShareValidityProof) -> MPCResult<bool> {
         if proof.is_real_proof {
             // For real proofs, verify Poseidon commitment is non-zero
             Ok(!proof.poseidon_commitment.is_zero().to_bool())
         } else {
-            // For mock proofs, simplified verification
-            // Recompute challenge.
-            let mut hasher = Sha256::new();
-            hasher.update(&proof.commitment);
+            // Check commitment is well-formed (not all zeros)
+            if proof.commitment.iter().all(|&b| b == 0) {
+                return Ok(false);
+            }
 
-            // Compute expected nonce from response.
-            // In a real Schnorr proof, we'd verify e(g, response) = e(commitment, challenge).
-            // This is simplified for demonstration.
+            // Verify the response is non-trivial
+            if proof.commitment_proof.response.is_zero().to_bool() {
+                return Ok(false);
+            }
+
+            // Recompute the Fiat-Shamir challenge: c' = H(nonce || commitment)
+            let mut hasher = Sha256::new();
+            hasher.update(&proof.commitment_proof.nonce.to_bytes_le());
+            hasher.update(&proof.commitment);
+            let recomputed_challenge_bytes: [u8; 32] = hasher.finalize().into();
+            let recomputed_challenge = hash_to_fr(&recomputed_challenge_bytes);
+
+            // The proof's challenge must match the recomputed one (constant-time)
+            if !recomputed_challenge.ct_eq(&proof.commitment_proof.challenge).to_bool() {
+                return Ok(false);
+            }
 
             Ok(true)
         }

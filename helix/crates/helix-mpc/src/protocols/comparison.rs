@@ -21,10 +21,9 @@ use sha2::{Digest, Sha256};
 
 use crate::beaver::pool::BeaverPool;
 use crate::beaver::triple::BeaverTriple;
-use crate::error::{MPCError, MPCResult};
+use crate::error::MPCResult;
 use crate::field::Fr;
 use crate::protocols::arithmetic::SecureArithmetic;
-use crate::types::PartyId;
 
 /// Configuration for comparison protocols.
 #[derive(Debug, Clone)]
@@ -51,6 +50,7 @@ impl Default for ComparisonConfig {
 }
 
 /// Secure comparison protocol implementation.
+#[allow(dead_code)]
 pub struct SecureComparison {
     config: ComparisonConfig,
 }
@@ -98,7 +98,7 @@ impl SecureComparison {
         y_shares: &[Fr],
         pools: &mut [BeaverPool],
     ) -> MPCResult<Vec<Fr>> {
-        let num_parties = x_shares.len();
+        let _num_parties = x_shares.len();
 
         // Compute [x - y]
         let diff_shares: Vec<Fr> = x_shares
@@ -339,7 +339,7 @@ impl GarbledComparison {
     /// Evaluates a garbled circuit given input labels.
     pub fn evaluate(
         &self,
-        circuit: &GarbledCircuit,
+        _circuit: &GarbledCircuit,
         input_labels_a: &[[u8; 16]],
         input_labels_b: &[[u8; 16]],
     ) -> [u8; 16] {

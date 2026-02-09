@@ -5,7 +5,6 @@
 //! while abstracting implementation details.
 
 use std::collections::HashMap;
-use std::marker::PhantomData;
 
 use crate::types::PartyId;
 

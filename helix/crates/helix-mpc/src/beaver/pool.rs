@@ -20,6 +20,7 @@ pub struct MatrixDims {
 
 /// Pool of pre-generated Beaver triples for one party.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct BeaverPool {
     /// Scalar triples available for consumption.
     scalar_triples: Vec<BeaverTriple>,

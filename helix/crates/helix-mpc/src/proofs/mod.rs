@@ -124,7 +124,7 @@ impl BatchedProof {
 
     /// Generates random challenges for batched verification.
     pub fn generate_challenges(&mut self, seed: u64) {
-        use rand::{RngCore, SeedableRng};
+        use rand::SeedableRng;
         use rand_chacha::ChaCha20Rng;
 
         let mut rng = ChaCha20Rng::seed_from_u64(seed);

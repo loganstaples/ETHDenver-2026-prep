@@ -21,15 +21,14 @@
 
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use crate::error::{MPCError, MPCResult};
 use crate::field::Fr;
 use crate::integration::circuit_bridge::{CircuitBridge, CircuitBridgeConfig, Halo2ProofResult};
 use crate::integration::witness_format::{
-    MPCTrainingWitness, ReconstructedWitness, ShareWitness, WitnessAggregator, WitnessBuilder,
+    MPCTrainingWitness, ReconstructedWitness, WitnessAggregator, WitnessBuilder,
 };
-use crate::security::commitment::{BlindingGenerator, ShareCommitment};
+use crate::security::commitment::BlindingGenerator;
 use crate::sharing::model::{GradientShare, ModelShare};
 use crate::types::{MPCConfig, PartyId};
 
@@ -542,7 +541,7 @@ impl ZKProofPipeline {
 
     /// Verifies all party commitments are consistent.
     pub fn verify_commitments(&self) -> MPCResult<bool> {
-        for (party_index, commitment) in &self.commitments {
+        for (_party_index, commitment) in &self.commitments {
             if !commitment.verify_signature() {
                 return Ok(false);
             }

@@ -296,7 +296,7 @@ mod tests {
 // ============================================================================
 
 use halo2curves::bn256::{G1Affine, G1};
-use halo2curves::group::{Group, Curve};
+use halo2curves::group::Curve;
 use halo2curves::bn256::Fr as Halo2Fr;
 use halo2curves::ff::{Field, PrimeField};
 

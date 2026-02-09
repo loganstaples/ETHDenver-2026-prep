@@ -8,21 +8,17 @@
 //! 5. Model shares are updated with aggregated gradient
 //! 6. Periodically re-share to prevent accumulation attacks
 
-use std::collections::HashMap;
 
-use crate::beaver::dealer::TrustedDealer;
 use crate::error::{MPCError, MPCResult};
-use crate::protocols::reshare::Resharing;
 use crate::security::audit::AuditLog;
 use crate::security::commitment::{BlindingGenerator, ModelCommitments, ShareCommitment};
 use crate::session::manager::MPCSession;
 use crate::sharing::model::{
-    GradientShare, LayerGradientShare, ModelShare, ModelSharing,
+    GradientShare, ModelShare, ModelSharing,
     ReconstructedModel,
 };
-use crate::sharing::tensor::TensorShare;
 use crate::sharing::AdditiveSharing;
-use crate::types::{MPCConfig, MPCPhase, PartyId, PartyRole, ShareId};
+use crate::types::{MPCConfig, MPCPhase, PartyId, PartyRole};
 
 /// Configuration for secure training.
 #[derive(Debug, Clone)]
@@ -354,6 +350,9 @@ pub struct LayerWeightsFlat {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sharing::tensor::TensorShare;
+    use crate::sharing::model::LayerGradientShare;
+    use crate::types::ShareId;
 
     fn create_test_model() -> ModelWeightsFlat {
         let layer0_weights = vec![

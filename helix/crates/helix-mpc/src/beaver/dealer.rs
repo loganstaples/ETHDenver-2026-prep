@@ -9,7 +9,6 @@
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
-use crate::error::MPCResult;
 use crate::field::Fr;
 use super::triple::{BeaverTriple, MatrixBeaverTriple, VectorBeaverTriple};
 

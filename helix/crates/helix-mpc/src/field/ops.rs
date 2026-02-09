@@ -5,7 +5,6 @@
 //! operations, and matrix operations.
 
 use super::unified::Fr;
-use super::constant_time::CtChoice;
 use rand::RngCore;
 use zeroize::Zeroize;
 

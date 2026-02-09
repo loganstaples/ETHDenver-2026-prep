@@ -278,6 +278,7 @@ pub struct PipelineStats {
 }
 
 /// Beaver triple pre-generation pipeline.
+#[allow(dead_code)]
 pub struct BeaverPipeline {
     /// Configuration.
     config: PipelineConfig,
@@ -372,7 +373,7 @@ impl BeaverPipeline {
 
     /// Worker thread loop.
     fn worker_loop(
-        worker_id: usize,
+        _worker_id: usize,
         request_rx: Receiver<GenerationRequest>,
         result_tx: Sender<GeneratedTriples>,
         num_parties: usize,

@@ -8,7 +8,7 @@
 //! Pow5Chip implementation. This module provides the off-chain hash computation.
 
 use halo2curves::bn256::Fr as Halo2Fr;
-use halo2curves::ff::{Field, PrimeField};
+use halo2curves::ff::PrimeField;
 use sha2::{Digest, Sha256};
 use std::marker::PhantomData;
 

@@ -4,8 +4,6 @@
 //! with implementations for local (in-memory) and TCP transports.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -167,6 +165,11 @@ impl MPCTransport for LocalTransport {
 // TcpTransport — TCP transport for distributed MPC
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "network-mpc")]
+use std::net::SocketAddr;
+#[cfg(feature = "network-mpc")]
+use std::time::Duration;
+
 /// TCP-based transport for real distributed MPC.
 ///
 /// Each party binds a TCP listener and connects to all peers. Messages are
@@ -200,7 +203,6 @@ impl TcpTransport {
         party: PartyId,
         peer_addrs: &HashMap<PartyId, SocketAddr>,
     ) -> MPCResult<Self> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::{TcpListener, TcpStream};
 
         let listener = TcpListener::bind(bind_addr)
@@ -582,6 +584,214 @@ impl MPCTransport for TcpTransport {
     }
 }
 
+// ---------------------------------------------------------------------------
+// AuthenticatedTransport — HMAC + sequence numbers for replay protection
+// ---------------------------------------------------------------------------
+
+use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+
+/// A message wrapper that includes HMAC authentication and a sequence number
+/// for replay protection.
+///
+/// The HMAC is computed as `SHA256(session_key || sequence || payload)`, which
+/// binds the authentication tag to both the content and the ordering.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthenticatedMessage {
+    /// Monotonically increasing sequence number per sender.
+    pub sequence: u64,
+    /// The raw payload bytes.
+    pub payload: Vec<u8>,
+    /// HMAC tag: SHA256(session_key || sequence_le_bytes || payload).
+    pub hmac: [u8; 32],
+}
+
+impl AuthenticatedMessage {
+    /// Computes the HMAC for the given key, sequence, and payload.
+    fn compute_hmac(session_key: &[u8; 32], sequence: u64, payload: &[u8]) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(session_key);
+        hasher.update(sequence.to_le_bytes());
+        hasher.update(payload);
+        let result = hasher.finalize();
+        let mut tag = [0u8; 32];
+        tag.copy_from_slice(&result);
+        tag
+    }
+
+    /// Creates a new authenticated message with the computed HMAC.
+    pub fn new(session_key: &[u8; 32], sequence: u64, payload: Vec<u8>) -> Self {
+        let hmac = Self::compute_hmac(session_key, sequence, &payload);
+        Self {
+            sequence,
+            payload,
+            hmac,
+        }
+    }
+
+    /// Verifies the HMAC in constant time and returns the payload on success.
+    pub fn verify_and_extract(
+        &self,
+        session_key: &[u8; 32],
+    ) -> Result<&[u8], &'static str> {
+        let expected = Self::compute_hmac(session_key, self.sequence, &self.payload);
+        // Constant-time comparison to prevent timing side-channels.
+        if constant_time_eq(&self.hmac, &expected) {
+            Ok(&self.payload)
+        } else {
+            Err("HMAC verification failed")
+        }
+    }
+}
+
+/// Constant-time byte array comparison. Returns true iff `a == b`.
+///
+/// Uses XOR accumulation so the comparison time is independent of where
+/// the first difference occurs, preventing timing side-channel attacks.
+fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let mut diff: u8 = 0;
+    for i in 0..32 {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+/// A transport wrapper that authenticates every message with HMAC-SHA256
+/// and tracks per-peer sequence numbers for replay protection.
+///
+/// Wraps any [`MPCTransport`] implementation transparently. On `send()`,
+/// the payload is wrapped in an [`AuthenticatedMessage`] with an incrementing
+/// sequence number and HMAC tag. On `recv()`, the HMAC is verified and the
+/// sequence number is checked against the expected minimum for that peer.
+///
+/// # Sequence Number Policy
+///
+/// The receiver accepts any message where `sequence >= expected_seq` to
+/// tolerate out-of-order delivery (common in async channels under load).
+/// After accepting, it updates `expected_seq = sequence + 1`.
+pub struct AuthenticatedTransport<T: MPCTransport> {
+    inner: T,
+    session_key: [u8; 32],
+    /// Per-peer send sequence counters. The key is `(our_party_id, peer_id)`.
+    /// In practice we use a single atomic since sends are serialized per-peer
+    /// by the caller, but an atomic is simpler and correct for concurrent use.
+    send_seq: AtomicU64,
+    /// Per-peer expected receive sequence number.
+    /// Protected by a std::sync::Mutex because the critical section is tiny
+    /// (just a HashMap lookup + u64 compare-and-update).
+    recv_seq: Mutex<HashMap<String, u64>>,
+}
+
+impl<T: MPCTransport> AuthenticatedTransport<T> {
+    /// Creates a new authenticated transport with the given session key.
+    ///
+    /// The session key must be a shared secret known to all parties (e.g.,
+    /// derived from a key exchange during session establishment).
+    pub fn new(inner: T, session_key: [u8; 32]) -> Self {
+        Self {
+            inner,
+            session_key,
+            send_seq: AtomicU64::new(0),
+            recv_seq: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Creates an authenticated transport by deriving a session key from
+    /// the handshake seed contributions of all parties.
+    ///
+    /// The key is computed as `SHA256("helix-mpc-auth" || seed_0 || seed_1 || ...)`
+    /// where seeds are sorted by party ID for determinism.
+    pub fn from_seeds(inner: T, mut seed_contributions: Vec<(String, [u8; 32])>) -> Self {
+        // Sort by party ID for deterministic key derivation regardless of
+        // the order in which handshakes completed.
+        seed_contributions.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"helix-mpc-auth");
+        for (party_id, seed) in &seed_contributions {
+            hasher.update(party_id.as_bytes());
+            hasher.update(seed);
+        }
+        let result = hasher.finalize();
+        let mut session_key = [0u8; 32];
+        session_key.copy_from_slice(&result);
+
+        Self::new(inner, session_key)
+    }
+
+    /// Returns a reference to the session key (for testing/debugging).
+    pub fn session_key(&self) -> &[u8; 32] {
+        &self.session_key
+    }
+}
+
+#[async_trait]
+impl<T: MPCTransport + Send + Sync> MPCTransport for AuthenticatedTransport<T> {
+    async fn send(&self, party: &PartyId, msg: &[u8]) -> MPCResult<()> {
+        let seq = self.send_seq.fetch_add(1, Ordering::SeqCst);
+        let auth_msg = AuthenticatedMessage::new(&self.session_key, seq, msg.to_vec());
+        let envelope = bincode::serialize(&auth_msg).map_err(|e| {
+            MPCError::CommunicationError(format!(
+                "failed to serialize authenticated message: {}",
+                e
+            ))
+        })?;
+        self.inner.send(party, &envelope).await
+    }
+
+    async fn recv(&self, party: &PartyId) -> MPCResult<Vec<u8>> {
+        let envelope = self.inner.recv(party).await?;
+        let auth_msg: AuthenticatedMessage = bincode::deserialize(&envelope).map_err(|e| {
+            MPCError::CommunicationError(format!(
+                "failed to deserialize authenticated message: {}",
+                e
+            ))
+        })?;
+
+        // Verify HMAC before checking sequence to avoid leaking sequence info
+        // on tampered messages.
+        auth_msg.verify_and_extract(&self.session_key).map_err(|_| {
+            MPCError::CommunicationError(format!(
+                "HMAC verification failed for message from {}",
+                party
+            ))
+        })?;
+
+        // Check and update the expected sequence number for this peer.
+        {
+            let mut seq_map = self.recv_seq.lock().map_err(|_| {
+                MPCError::CommunicationError("recv_seq mutex poisoned".into())
+            })?;
+            let expected = seq_map.entry(party.0.clone()).or_insert(0);
+            if auth_msg.sequence < *expected {
+                return Err(MPCError::CommunicationError(format!(
+                    "sequence number regression from {}: got {}, expected >= {}",
+                    party, auth_msg.sequence, *expected
+                )));
+            }
+            *expected = auth_msg.sequence + 1;
+        }
+
+        Ok(auth_msg.payload)
+    }
+
+    async fn broadcast(&self, msg: &[u8]) -> MPCResult<()> {
+        for peer in self.inner.peers() {
+            self.send(&peer, msg).await?;
+        }
+        Ok(())
+    }
+
+    fn party_id(&self) -> &PartyId {
+        self.inner.party_id()
+    }
+
+    fn peers(&self) -> Vec<PartyId> {
+        self.inner.peers()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -649,5 +859,234 @@ mod tests {
         assert_eq!(transports[0].party_id(), &parties[0]);
         assert_eq!(transports[0].peers().len(), 2);
         assert_eq!(transports[1].peers().len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // AuthenticatedTransport tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: wraps each LocalTransport in an AuthenticatedTransport with a
+    /// shared session key.
+    fn wrap_authenticated(
+        transports: Vec<LocalTransport>,
+        session_key: [u8; 32],
+    ) -> Vec<AuthenticatedTransport<LocalTransport>> {
+        transports
+            .into_iter()
+            .map(|t| AuthenticatedTransport::new(t, session_key))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_authenticated_roundtrip() {
+        let parties = test_parties(3);
+        let raw = LocalTransport::create_mesh(&parties);
+        let key = [0xABu8; 32];
+        let transports = wrap_authenticated(raw, key);
+
+        // Party 0 sends to party 1
+        transports[0]
+            .send(&parties[1], b"authenticated hello")
+            .await
+            .unwrap();
+
+        let msg = transports[1].recv(&parties[0]).await.unwrap();
+        assert_eq!(msg, b"authenticated hello");
+
+        // Party 1 sends to party 2
+        transports[1]
+            .send(&parties[2], b"second message")
+            .await
+            .unwrap();
+
+        let msg2 = transports[2].recv(&parties[1]).await.unwrap();
+        assert_eq!(msg2, b"second message");
+
+        // Party 2 sends back to party 0 (full triangle)
+        transports[2]
+            .send(&parties[0], b"closing the loop")
+            .await
+            .unwrap();
+
+        let msg3 = transports[0].recv(&parties[2]).await.unwrap();
+        assert_eq!(msg3, b"closing the loop");
+    }
+
+    #[tokio::test]
+    async fn test_hmac_tamper_detection() {
+        let parties = test_parties(2);
+        let raw = LocalTransport::create_mesh(&parties);
+
+        // We need to manually intervene in the channel to tamper with a
+        // message, so we use raw transports for sending and wrap only the
+        // receiver side with authentication.
+
+        // Create a shared key
+        let key = [0x42u8; 32];
+
+        // Send an authenticated message through the raw channel
+        let auth_msg = AuthenticatedMessage::new(&key, 0, b"secret data".to_vec());
+        let mut envelope = bincode::serialize(&auth_msg).unwrap();
+
+        // Tamper with a byte in the middle of the serialized envelope.
+        // The envelope layout (bincode): sequence(8) + payload_len(8) + payload(N) + hmac(32).
+        // We flip a byte in the payload region to corrupt it.
+        let tamper_offset = 20; // safely inside the payload region
+        if tamper_offset < envelope.len() {
+            envelope[tamper_offset] ^= 0xFF;
+        }
+
+        // Send the tampered envelope through the raw transport
+        raw[0].send(&parties[1], &envelope).await.unwrap();
+
+        // Wrap party 1 in authenticated transport for receiving
+        let auth_recv = AuthenticatedTransport::new(raw.into_iter().nth(1).unwrap(), key);
+
+        // Receiving should fail because the HMAC won't match
+        let result = auth_recv.recv(&parties[0]).await;
+        assert!(
+            result.is_err(),
+            "tampered message should fail HMAC verification"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("HMAC verification failed")
+                || err_msg.contains("failed to deserialize"),
+            "error should mention HMAC failure or deserialization, got: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sequence_number_tracking() {
+        let parties = test_parties(2);
+        let raw = LocalTransport::create_mesh(&parties);
+        let key = [0x99u8; 32];
+        let transports = wrap_authenticated(raw, key);
+
+        // Send 5 messages from party 0 to party 1
+        for i in 0u64..5 {
+            let payload = format!("message {}", i);
+            transports[0]
+                .send(&parties[1], payload.as_bytes())
+                .await
+                .unwrap();
+        }
+
+        // Receive them all — sequence numbers should be 0..5
+        for i in 0u64..5 {
+            let msg = transports[1].recv(&parties[0]).await.unwrap();
+            let expected = format!("message {}", i);
+            assert_eq!(msg, expected.as_bytes());
+        }
+
+        // Verify the send counter has advanced to 5
+        assert_eq!(transports[0].send_seq.load(Ordering::SeqCst), 5);
+
+        // Verify the recv counter for party-0 on party-1's side is 5
+        let recv_map = transports[1].recv_seq.lock().unwrap();
+        assert_eq!(*recv_map.get("party-0").unwrap(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_sequence_regression_rejected() {
+        // Manually craft two messages with regressing sequence numbers
+        // and send them through the raw transport to verify the receiver
+        // rejects the second one.
+        let parties = test_parties(2);
+        let raw = LocalTransport::create_mesh(&parties);
+        let key = [0x77u8; 32];
+
+        // Send message with seq=5 first (out of order but acceptable as first)
+        let msg_high = AuthenticatedMessage::new(&key, 5, b"high seq".to_vec());
+        let envelope_high = bincode::serialize(&msg_high).unwrap();
+        raw[0].send(&parties[1], &envelope_high).await.unwrap();
+
+        // Send message with seq=3 (regression — should be rejected)
+        let msg_low = AuthenticatedMessage::new(&key, 3, b"low seq".to_vec());
+        let envelope_low = bincode::serialize(&msg_low).unwrap();
+        raw[0].send(&parties[1], &envelope_low).await.unwrap();
+
+        let auth_recv = AuthenticatedTransport::new(raw.into_iter().nth(1).unwrap(), key);
+
+        // First recv succeeds (seq=5, expected was 0)
+        let result1 = auth_recv.recv(&parties[0]).await;
+        assert!(result1.is_ok());
+        assert_eq!(result1.unwrap(), b"high seq");
+
+        // Second recv fails (seq=3, but expected >= 6)
+        let result2 = auth_recv.recv(&parties[0]).await;
+        assert!(result2.is_err());
+        let err_msg = format!("{}", result2.unwrap_err());
+        assert!(
+            err_msg.contains("sequence number regression"),
+            "expected sequence regression error, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_constant_time_eq_correctness() {
+        let a = [0xABu8; 32];
+        let b = [0xABu8; 32];
+        let mut c = [0xABu8; 32];
+        c[31] = 0x00;
+
+        assert!(constant_time_eq(&a, &b));
+        assert!(!constant_time_eq(&a, &c));
+        assert!(!constant_time_eq(&[0u8; 32], &[1u8; 32]));
+        assert!(constant_time_eq(&[0u8; 32], &[0u8; 32]));
+    }
+
+    #[test]
+    fn test_authenticated_message_hmac_deterministic() {
+        let key = [0x55u8; 32];
+        let msg1 = AuthenticatedMessage::new(&key, 42, b"payload".to_vec());
+        let msg2 = AuthenticatedMessage::new(&key, 42, b"payload".to_vec());
+        assert_eq!(msg1.hmac, msg2.hmac, "same inputs should produce same HMAC");
+
+        // Different sequence should produce different HMAC
+        let msg3 = AuthenticatedMessage::new(&key, 43, b"payload".to_vec());
+        assert_ne!(msg1.hmac, msg3.hmac, "different seq should produce different HMAC");
+
+        // Different key should produce different HMAC
+        let key2 = [0x66u8; 32];
+        let msg4 = AuthenticatedMessage::new(&key2, 42, b"payload".to_vec());
+        assert_ne!(msg1.hmac, msg4.hmac, "different key should produce different HMAC");
+    }
+
+    #[test]
+    fn test_from_seeds_deterministic() {
+        let seeds = vec![
+            ("party-0".to_string(), [0x11u8; 32]),
+            ("party-1".to_string(), [0x22u8; 32]),
+            ("party-2".to_string(), [0x33u8; 32]),
+        ];
+
+        // Different ordering should produce the same key (sorted internally)
+        let seeds_reversed = vec![
+            ("party-2".to_string(), [0x33u8; 32]),
+            ("party-0".to_string(), [0x11u8; 32]),
+            ("party-1".to_string(), [0x22u8; 32]),
+        ];
+
+        let parties = test_parties(2);
+        let raw1 = LocalTransport::create_mesh(&parties);
+        let raw2 = LocalTransport::create_mesh(&parties);
+
+        let t1 = AuthenticatedTransport::from_seeds(
+            raw1.into_iter().next().unwrap(),
+            seeds,
+        );
+        let t2 = AuthenticatedTransport::from_seeds(
+            raw2.into_iter().next().unwrap(),
+            seeds_reversed,
+        );
+
+        assert_eq!(
+            t1.session_key(),
+            t2.session_key(),
+            "from_seeds should be order-independent"
+        );
     }
 }

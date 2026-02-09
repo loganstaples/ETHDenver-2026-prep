@@ -173,7 +173,7 @@ impl SecretSharingScheme for AdditiveSharing {
             });
         }
 
-        let mut rng = self.rng.clone();
+        let rng = self.rng.clone();
         let mut sharing = AdditiveSharing {
             rng,
             share_range: self.share_range,

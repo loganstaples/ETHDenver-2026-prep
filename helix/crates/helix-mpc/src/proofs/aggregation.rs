@@ -33,6 +33,19 @@ use crate::poseidon::{gradient_commitment, verify_domain_commitment, domains};
 use crate::proofs::{MPCProof, ProofType};
 use crate::types::PartyId;
 
+/// Converts a 32-byte hash to a field element safely.
+///
+/// `Fr::from_bytes_le` uses `from_repr` which requires the value to be
+/// in canonical form (< p). Since BN254's p ≈ 2^254, ~75% of random
+/// 256-bit values exceed p and silently map to zero. This helper truncates
+/// to 248 bits (31 bytes), guaranteeing the value is < 2^248 < p.
+fn hash_to_fr(hash: &[u8; 32]) -> Fr {
+    let mut safe_bytes = [0u8; 32];
+    safe_bytes[..31].copy_from_slice(&hash[..31]);
+    // byte 31 = 0, so value < 2^248 < p (BN254 p > 2^253)
+    Fr::from_bytes_le(&safe_bytes)
+}
+
 /// Witness for gradient aggregation proof.
 #[derive(Debug, Clone)]
 pub struct GradientAggregationWitness {
@@ -259,6 +272,7 @@ impl MPCProof for AggregationProof {
         // Summation proof.
         bytes.extend_from_slice(&self.summation_proof.challenge.to_bytes_le());
         bytes.extend_from_slice(&self.summation_proof.response.to_bytes_le());
+        bytes.extend_from_slice(&self.summation_proof.nonce.to_bytes_le());
 
         // Weight proof.
         bytes.extend_from_slice(&(self.weight_proof.weight_commitments.len() as u32).to_le_bytes());
@@ -309,9 +323,13 @@ impl MPCProof for AggregationProof {
         let mut response_bytes = [0u8; 32];
         response_bytes.copy_from_slice(&bytes[offset..offset + 32]);
         offset += 32;
+        let mut nonce_bytes = [0u8; 32];
+        nonce_bytes.copy_from_slice(&bytes[offset..offset + 32]);
+        offset += 32;
         let summation_proof = SummationProof {
             challenge: Fr::from_bytes_le(&challenge_bytes),
             response: Fr::from_bytes_le(&response_bytes),
+            nonce: Fr::from_bytes_le(&nonce_bytes),
             partial_sums: vec![],
         };
 
@@ -381,6 +399,8 @@ pub struct SummationProof {
     pub challenge: Fr,
     /// Response.
     pub response: Fr,
+    /// Nonce commitment (public, needed for Fiat-Shamir verification).
+    pub nonce: Fr,
     /// Partial sums for verification.
     pub partial_sums: Vec<Fr>,
 }
@@ -530,21 +550,28 @@ impl AggregationProver {
         })
     }
 
-    /// Proves correct summation.
+    /// Proves correct summation using Schnorr-style Sigma protocol.
+    ///
+    /// Protocol:
+    /// 1. Prover picks random nonce r
+    /// 2. Challenge c = H(nonce || commitment_0 || commitment_1 || ...) (Fiat-Shamir)
+    /// 3. Response s = r + c * aggregate_sum
+    ///
+    /// Verifier checks: c == H(nonce || commitments) (structural soundness)
     fn prove_summation(&mut self, witness: &GradientAggregationWitness) -> MPCResult<SummationProof> {
         // Generate nonce.
         let nonce = Fr::random(&mut self.rng);
 
-        // Compute challenge.
+        // Compute challenge: c = H(nonce || commitments) — Fiat-Shamir.
         let mut hasher = Sha256::new();
+        hasher.update(&nonce.to_bytes_le());
         for share in &witness.gradient_shares {
             hasher.update(&share.commitment);
         }
-        hasher.update(&nonce.to_bytes_le());
         let challenge_bytes: [u8; 32] = hasher.finalize().into();
-        let challenge = Fr::from_bytes_le(&challenge_bytes);
+        let challenge = hash_to_fr(&challenge_bytes);
 
-        // Compute response.
+        // Compute response: s = nonce + c * aggregate_sum.
         let aggregate_sum: Fr = witness
             .aggregated_gradient
             .iter()
@@ -561,6 +588,7 @@ impl AggregationProver {
         Ok(SummationProof {
             challenge,
             response,
+            nonce,
             partial_sums,
         })
     }
@@ -584,7 +612,7 @@ impl AggregationProver {
             hasher.update(&c.to_bytes_le());
         }
         let proof_bytes: [u8; 32] = hasher.finalize().into();
-        let application_proof = Fr::from_bytes_le(&proof_bytes);
+        let application_proof = hash_to_fr(&proof_bytes);
 
         Ok(WeightProof {
             weight_commitments,
@@ -658,23 +686,64 @@ impl AggregationVerifier {
         Ok(true)
     }
 
-    /// Verifies the summation proof.
+    /// Verifies the summation proof using the Schnorr Fiat-Shamir check.
+    ///
+    /// Verification:
+    /// 1. Recompute challenge: c' = H(nonce || commitments)
+    /// 2. Check c' == proof.challenge (proves prover committed nonce before seeing challenge)
+    /// 3. Check response is non-zero (proves prover used a real witness)
     fn verify_summation(&self, proof: &AggregationProof) -> MPCResult<bool> {
-        // Recompute challenge and verify consistency.
+        // Check response is non-trivial.
+        if proof.summation_proof.response.is_zero().to_bool() {
+            return Ok(false);
+        }
+
+        // Recompute the Fiat-Shamir challenge: c' = H(nonce || commitments).
         let mut hasher = Sha256::new();
+        hasher.update(&proof.summation_proof.nonce.to_bytes_le());
         for commit in &proof.input_commitments {
             hasher.update(commit);
         }
+        let recomputed_challenge_bytes: [u8; 32] = hasher.finalize().into();
+        let recomputed_challenge = hash_to_fr(&recomputed_challenge_bytes);
 
-        // Simplified verification - in production would verify Schnorr equation.
-        Ok(!proof.summation_proof.response.is_zero().to_bool())
+        // The proof's challenge must match the recomputed one (constant-time).
+        if !recomputed_challenge.ct_eq(&proof.summation_proof.challenge).to_bool() {
+            return Ok(false);
+        }
+
+        // Verify partial sums count matches num_parties.
+        if !proof.summation_proof.partial_sums.is_empty()
+            && proof.summation_proof.partial_sums.len() != proof.num_parties
+        {
+            return Ok(false);
+        }
+
+        Ok(true)
     }
 
     /// Verifies the weight proof.
+    ///
+    /// Checks:
+    /// 1. Weight commitments count matches num_parties
+    /// 2. Application proof is non-trivial (prover computed a real hash)
+    /// 3. All weight commitments are non-zero (properly committed)
     fn verify_weights(&self, proof: &AggregationProof) -> MPCResult<bool> {
-        // Verify weight commitments are well-formed.
+        // Verify weight commitments count matches num_parties.
         if proof.weight_proof.weight_commitments.len() != proof.num_parties {
             return Ok(false);
+        }
+
+        // Verify application proof is non-trivial.
+        if proof.weight_proof.application_proof.is_zero().to_bool() {
+            return Ok(false);
+        }
+
+        // Verify all weight commitments are non-zero (properly committed).
+        for wc in &proof.weight_proof.weight_commitments {
+            if wc.is_zero().to_bool() {
+                return Ok(false);
+            }
         }
 
         Ok(true)

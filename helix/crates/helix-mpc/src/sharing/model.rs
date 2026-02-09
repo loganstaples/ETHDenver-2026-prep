@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use crate::error::{MPCError, MPCResult};
 use crate::types::PartyId;
-use super::{AdditiveSharing, ShamirSharing, SecretSharingScheme};
+use super::AdditiveSharing;
 use super::tensor::{TensorShare, TensorSharing};
 
 use serde::{Deserialize, Serialize};
@@ -85,7 +85,7 @@ impl ModelSharing {
         parties: &[PartyId],
         sharing: &AdditiveSharing,
     ) -> MPCResult<Vec<ModelShare>> {
-        let n = parties.len();
+        let _n = parties.len();
         let num_layers = layers.len();
 
         // Initialize empty ModelShares.
@@ -238,7 +238,7 @@ impl ModelSharing {
         parties: &[PartyId],
         sharing: &AdditiveSharing,
     ) -> MPCResult<Vec<GradientShare>> {
-        let n = parties.len();
+        let _n = parties.len();
         let num_layers = layers.len();
 
         let mut grad_shares: Vec<GradientShare> = parties

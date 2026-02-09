@@ -4,11 +4,8 @@
 //! Properties are specified declaratively and can be checked at runtime or
 //! verified statically using formal methods.
 
-use std::collections::HashSet;
 use std::fmt;
-use std::marker::PhantomData;
 
-use crate::types::PartyId;
 
 /// Security level for adversary capabilities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -347,6 +344,7 @@ impl SecurityProperty {
 }
 
 /// Property verifier for checking properties.
+#[allow(dead_code)]
 pub struct PropertyVerifier {
     /// Registered properties.
     properties: Vec<Box<dyn ProtocolProperty>>,

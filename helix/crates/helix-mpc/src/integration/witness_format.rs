@@ -280,7 +280,7 @@ impl WitnessBuilder {
     pub fn build(
         &self,
         model_share: &ModelShare,
-        gradient_share: &GradientShare,
+        _gradient_share: &GradientShare,
         input: &[f64],
         target: &[f64],
         step_number: u64,
@@ -576,7 +576,7 @@ impl WitnessBuilder {
     fn compute_backward_pass(
         &self,
         forward: &ForwardResult,
-        w1: &[Fr],
+        _w1: &[Fr],
         w2: &[Fr],
         x: &[Fr],
         target: &[Fr],
@@ -707,7 +707,7 @@ impl WitnessBuilder {
 
     /// Generates Freivalds randomness from step number.
     fn generate_freivalds_randomness(&self, size: usize, step: u64, salt: u64) -> Vec<Fr> {
-        use rand::{RngCore, SeedableRng};
+        use rand::SeedableRng;
         use rand_chacha::ChaCha20Rng;
 
         let seed = step.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(salt);

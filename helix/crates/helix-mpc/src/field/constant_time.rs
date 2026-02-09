@@ -11,7 +11,6 @@
 //! information about secret values. These operations use bitwise arithmetic
 //! to ensure constant execution time.
 
-use std::ops::{BitAnd, BitOr, BitXor, Not};
 use zeroize::Zeroize;
 
 /// A constant-time boolean choice.

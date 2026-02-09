@@ -53,39 +53,34 @@
 //! - **Error Bounds**: Approximate computation with tracked error bounds
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use sha2::{Digest, Sha256};
-use tracing::{debug, error, info, instrument, warn, span, Level};
+use tracing::{debug, info, instrument, warn, span, Level};
 
 use crate::beaver::dealer::TrustedDealer;
 use crate::beaver::pool::BeaverPool;
-use crate::beaver::triple::BeaverTriple;
 use crate::error::{MPCError, MPCResult};
 use crate::field::Fr;
 use crate::integration::circuit_bridge::{
-    CircuitBridge, CircuitBridgeConfig, Halo2ProofResult, compute_compatible_state_hash,
+    CircuitBridge, CircuitBridgeConfig, compute_compatible_state_hash,
 };
 use crate::integration::witness_format::{
-    MPCTrainingWitness, ReconstructedWitness, ShareWitness, WitnessAggregator, WitnessBuilder,
+    WitnessAggregator, WitnessBuilder,
 };
 use crate::integration::zk_pipeline::{
-    ProofResult, ShareProofCommitment, ZKPipelineConfig, ZKProofPipeline,
+    ProofResult, ZKPipelineConfig, ZKProofPipeline,
 };
-use crate::poseidon::poseidon_state_hash;
 use crate::protocols::proved_arithmetic::{
-    BeaverWitness, ProvedArithmetic, WitnessCapture, WitnessSummary, WitnessedOperation,
+    ProvedArithmetic, WitnessCapture, WitnessSummary,
 };
 use crate::proofs::{
-    AggregationProof, AggregationProver, AggregationVerifier, BatchVerifier, BatchedProof,
-    GradientAggregationWitness, GradientShareInput, ShareValidityProof, ShareValidityProver,
-    ShareValidityVerifier, ShareValidityWitness,
+    AggregationProof, AggregationProver, BatchVerifier, ShareValidityProof, ShareValidityProver, ShareValidityWitness,
 };
 use crate::security::commitment::BlindingGenerator;
 use crate::sharing::model::{GradientShare, LayerGradientShare, LayerShare, ModelShare};
 use crate::sharing::tensor::TensorShare;
-use crate::types::{MPCConfig, PartyId, ShareId};
+use crate::types::{PartyId, ShareId};
 
 /// Configuration for the integrated MPC-ZK training.
 #[derive(Debug, Clone)]
@@ -262,6 +257,7 @@ pub struct IntegratedTrainingStep {
 ///
 /// This is the main entry point for running training with both
 /// secret sharing (MPC) and zero-knowledge proofs (ZK).
+#[allow(dead_code)]
 pub struct IntegratedTrainingCoordinator {
     /// Configuration.
     config: IntegratedTrainingConfig,
@@ -587,7 +583,7 @@ impl IntegratedTrainingCoordinator {
         let mut aggregator = WitnessAggregator::new(self.config.num_workers);
 
         for worker in &self.workers {
-            if let (Some(capture), Some(gradient)) = (&worker.witness_capture, &worker.gradient_share) {
+            if let (Some(_capture), Some(gradient)) = (&worker.witness_capture, &worker.gradient_share) {
                 let blinding = [worker.index as u8; 32];
 
                 let builder = WitnessBuilder::new(

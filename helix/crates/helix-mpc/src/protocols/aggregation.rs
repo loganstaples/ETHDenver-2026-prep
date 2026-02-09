@@ -13,16 +13,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
-use rand::{Rng, SeedableRng};
-use rand_chacha::ChaCha20Rng;
 use sha2::{Digest, Sha256};
 
 use crate::error::{MPCError, MPCResult};
-use crate::sharing::tensor::TensorShare;
 use crate::types::PartyId;
 
 /// Configuration for secure aggregation.
@@ -385,6 +381,7 @@ pub struct AggregationResult {
 
 /// Tree aggregation node.
 #[derive(Debug)]
+#[allow(dead_code)]
 struct TreeNode {
     /// Node ID.
     id: usize,

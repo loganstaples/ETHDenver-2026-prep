@@ -26,11 +26,11 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use crate::beaver::pool::BeaverPool;
-use crate::beaver::triple::{BeaverTriple, MatrixBeaverTriple, VectorBeaverTriple};
-use crate::error::{MPCError, MPCResult};
+use crate::beaver::triple::BeaverTriple;
+use crate::error::MPCResult;
 use crate::field::Fr;
 use crate::protocols::arithmetic::SecureArithmetic;
 use crate::sharing::tensor::TensorShare;

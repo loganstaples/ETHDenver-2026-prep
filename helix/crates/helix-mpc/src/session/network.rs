@@ -15,17 +15,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use bytes::{Buf, BufMut, BytesMut};
 use dashmap::DashMap;
-use futures::stream::StreamExt;
-use parking_lot::{Mutex, RwLock};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use parking_lot::Mutex;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::oneshot;
-use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::error::{MPCError, MPCResult};
 use crate::types::PartyId;
@@ -273,6 +271,7 @@ impl NetworkChannel {
     }
 
     /// Creates a TLS connector for outgoing connections.
+    #[allow(dead_code)]
     fn create_tls_connector(&self) -> MPCResult<TlsConnector> {
         let mut root_store = rustls::RootCertStore::empty();
 

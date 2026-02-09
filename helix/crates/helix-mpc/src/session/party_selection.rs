@@ -106,6 +106,7 @@ impl SelectionConfig {
 
 /// Latency sample with timestamp.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 struct LatencySample {
     rtt: Duration,
     timestamp: Instant,
@@ -113,6 +114,7 @@ struct LatencySample {
 
 /// Metrics for a single party.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct PartyMetrics {
     /// Party identifier.
     party_id: PartyId,

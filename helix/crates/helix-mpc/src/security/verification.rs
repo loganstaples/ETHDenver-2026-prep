@@ -600,7 +600,7 @@ impl OutputVerifier {
         max_element: f64,
     ) -> MPCResult<()> {
         // Check individual elements
-        for (i, g) in gradients.iter().enumerate() {
+        for (_i, g) in gradients.iter().enumerate() {
             if g.abs() > max_element {
                 return Err(MPCError::ErrorBoundExceeded {
                     computed: g.abs(),

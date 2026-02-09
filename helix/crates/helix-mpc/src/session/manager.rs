@@ -9,13 +9,13 @@ use crate::beaver::pool::BeaverPool;
 use crate::error::{MPCError, MPCResult};
 use crate::protocols::reshare::Resharing;
 use crate::sharing::model::ModelShare;
-use crate::sharing::AdditiveSharing;
 use crate::types::{MPCConfig, MPCPhase, PartyId, PartyRole};
-use super::channel::{LocalChannel, MPCChannel};
+use super::channel::LocalChannel;
 use super::transport::{HandshakeMessage, PROTOCOL_VERSION};
 
 /// An MPC session coordinating multi-party computation.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct MPCSession {
     /// Session configuration.
     pub config: MPCConfig,

@@ -18,8 +18,8 @@ pub use shamir::ShamirSharing;
 pub use tensor::{TensorShare, TensorSharing};
 pub use model::{ModelShare, ModelSharing};
 
-use crate::error::{MPCError, MPCResult};
-use crate::types::{MPCConfig, PartyId, ShareId};
+use crate::error::MPCResult;
+use crate::types::{PartyId, ShareId};
 use serde::{Deserialize, Serialize};
 
 /// A single scalar share held by one party.
