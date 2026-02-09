@@ -344,7 +344,7 @@ impl ProofAggregator {
             .map(|p| p.chunk_id)
             .collect();
 
-        // Generate aggregated proof (placeholder)
+        // Generate aggregated proof with Merkle tree structure
         let aggregated_proof = self.generate_aggregated_proof(&proofs);
 
         AggregatedProof {
