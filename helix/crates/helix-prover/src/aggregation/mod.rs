@@ -194,7 +194,7 @@ impl ProofAggregator {
         }
 
         let version = proof[0];
-        if version != 2 {
+        if version != 2 && version != 3 {
             tracing::warn!("verify: unexpected aggregation version {version}");
             return false;
         }
@@ -215,8 +215,55 @@ impl ProofAggregator {
             return false;
         }
 
-        // --- Verify each public input's Merkle path ---
+        // --- For version 3, skip past embedded chunk proofs section ---
         let mut offset = 37;
+        if version == 3 {
+            for _ in 0..num_proofs {
+                if offset + 8 > proof.len() {
+                    tracing::warn!("verify: v3 proof truncated at chunk id");
+                    return false;
+                }
+                offset += 8; // chunk_id
+
+                if offset + 4 > proof.len() {
+                    tracing::warn!("verify: v3 proof truncated at proof length");
+                    return false;
+                }
+                let proof_len = u32::from_le_bytes(
+                    proof[offset..offset + 4].try_into().unwrap(),
+                ) as usize;
+                offset += 4;
+
+                if offset + proof_len > proof.len() {
+                    tracing::warn!("verify: v3 proof truncated at proof data");
+                    return false;
+                }
+                // Verify embedded proof is non-empty
+                if proof_len == 0 {
+                    tracing::warn!("verify: v3 embedded proof is empty");
+                    return false;
+                }
+                offset += proof_len;
+
+                if offset + 4 > proof.len() {
+                    tracing::warn!("verify: v3 proof truncated at PI count");
+                    return false;
+                }
+                let num_pis = u32::from_le_bytes(
+                    proof[offset..offset + 4].try_into().unwrap(),
+                ) as usize;
+                offset += 4;
+                offset += num_pis * 32;
+
+                if offset + 8 > proof.len() {
+                    tracing::warn!("verify: v3 proof truncated at error bound");
+                    return false;
+                }
+                offset += 8; // error_bound f64
+            }
+        }
+
+        // --- Verify each public input's Merkle path ---
         let num_leaves = agg.public_inputs.len();
         for leaf_idx in 0..num_leaves {
             if offset + 4 > proof.len() {
@@ -366,7 +413,6 @@ impl ProofAggregator {
 
     fn generate_aggregated_proof(&self, proofs: &[ChunkProof]) -> Vec<u8> {
         // Build Merkle tree over chunk public inputs (matching compute_root).
-        // Each chunk contributes its public_inputs entries as leaves.
         let mut tree = CommitmentTree::new();
         for proof in proofs {
             for pi in &proof.public_inputs {
@@ -377,14 +423,30 @@ impl ProofAggregator {
 
         let mut aggregated = Vec::new();
 
-        // Header: version 2 = real aggregation
-        aggregated.push(2u8);
+        // Header: version 3 = self-contained aggregation with embedded proofs
+        aggregated.push(3u8);
         aggregated.extend_from_slice(&(proofs.len() as u32).to_le_bytes());
 
-        // Merkle root (matches root_commitment computed from public_inputs)
+        // Merkle root
         aggregated.extend_from_slice(&root);
 
-        // Each leaf's Merkle path (one path per public_input entry)
+        // Section 1: Embedded chunk proofs (makes the aggregation self-contained)
+        for proof in proofs {
+            // Chunk ID
+            aggregated.extend_from_slice(&proof.chunk_id.0.to_le_bytes());
+            // Proof bytes (length-prefixed)
+            aggregated.extend_from_slice(&(proof.proof.len() as u32).to_le_bytes());
+            aggregated.extend_from_slice(&proof.proof);
+            // Number of public inputs
+            aggregated.extend_from_slice(&(proof.public_inputs.len() as u32).to_le_bytes());
+            for pi in &proof.public_inputs {
+                aggregated.extend_from_slice(pi);
+            }
+            // Error bound (f64)
+            aggregated.extend_from_slice(&proof.error_bound.to_le_bytes());
+        }
+
+        // Section 2: Merkle paths for each public input leaf
         let mut leaf_idx = 0;
         for proof in proofs {
             for _pi in &proof.public_inputs {
@@ -401,6 +463,77 @@ impl ProofAggregator {
         }
 
         aggregated
+    }
+
+    /// Extracts the embedded chunk proofs from an aggregated proof.
+    ///
+    /// Returns `None` if the proof format is invalid or not version 3.
+    pub fn extract_chunk_proofs(agg: &AggregatedProof) -> Option<Vec<ChunkProof>> {
+        let proof = &agg.proof;
+        if proof.len() < 37 {
+            return None;
+        }
+
+        let version = proof[0];
+        if version != 3 {
+            return None;
+        }
+
+        let num_proofs = u32::from_le_bytes(proof[1..5].try_into().ok()?) as usize;
+        let mut offset = 37; // past header + root
+
+        let mut chunk_proofs = Vec::with_capacity(num_proofs);
+        for _ in 0..num_proofs {
+            if offset + 8 > proof.len() {
+                return None;
+            }
+            let chunk_id = u64::from_le_bytes(proof[offset..offset + 8].try_into().ok()?);
+            offset += 8;
+
+            if offset + 4 > proof.len() {
+                return None;
+            }
+            let proof_len = u32::from_le_bytes(proof[offset..offset + 4].try_into().ok()?) as usize;
+            offset += 4;
+
+            if offset + proof_len > proof.len() {
+                return None;
+            }
+            let proof_bytes = proof[offset..offset + proof_len].to_vec();
+            offset += proof_len;
+
+            if offset + 4 > proof.len() {
+                return None;
+            }
+            let num_pis = u32::from_le_bytes(proof[offset..offset + 4].try_into().ok()?) as usize;
+            offset += 4;
+
+            let mut public_inputs = Vec::with_capacity(num_pis);
+            for _ in 0..num_pis {
+                if offset + 32 > proof.len() {
+                    return None;
+                }
+                let pi: [u8; 32] = proof[offset..offset + 32].try_into().ok()?;
+                public_inputs.push(pi);
+                offset += 32;
+            }
+
+            if offset + 8 > proof.len() {
+                return None;
+            }
+            let error_bound = f64::from_le_bytes(proof[offset..offset + 8].try_into().ok()?);
+            offset += 8;
+
+            chunk_proofs.push(ChunkProof {
+                chunk_id: ChunkId(chunk_id),
+                proof: proof_bytes,
+                public_inputs,
+                error_bound,
+                generation_time_ms: 0,
+            });
+        }
+
+        Some(chunk_proofs)
     }
 }
 
@@ -582,5 +715,82 @@ mod tests {
 
         let agg = aggregator.aggregate_single().unwrap();
         assert!(aggregator.verify(&agg));
+    }
+
+    #[test]
+    fn test_aggregated_proof_is_version_3() {
+        let mut aggregator = ProofAggregator::new();
+        for i in 0..3 {
+            aggregator.add_proof(make_test_proof(i));
+        }
+        let agg = aggregator.aggregate_single().unwrap();
+        assert_eq!(agg.proof[0], 3, "aggregated proof should be version 3");
+    }
+
+    #[test]
+    fn test_extract_chunk_proofs() {
+        let mut aggregator = ProofAggregator::new();
+        for i in 0..4 {
+            aggregator.add_proof(make_test_proof(i));
+        }
+        let agg = aggregator.aggregate_single().unwrap();
+
+        let extracted = ProofAggregator::extract_chunk_proofs(&agg).unwrap();
+        assert_eq!(extracted.len(), 4);
+        for (i, cp) in extracted.iter().enumerate() {
+            assert_eq!(cp.chunk_id.0, i as u64);
+            assert_eq!(cp.proof, vec![1, 2, 3, 4]);
+            assert_eq!(cp.public_inputs, vec![[i as u8; 32]]);
+            assert!((cp.error_bound - 0.01).abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn test_recursive_aggregation_v3() {
+        let mut aggregator = ProofAggregator::with_config(super::AggregationConfig {
+            max_proofs_per_aggregation: 2,
+            recursive: true,
+            target_depth: 2,
+            ..Default::default()
+        });
+
+        for i in 0..6 {
+            aggregator.add_proof(make_test_proof(i));
+        }
+
+        let ids = aggregator.aggregate_all();
+        assert!(ids.len() > 1, "recursive aggregation should produce multiple IDs");
+
+        for id in &ids {
+            let agg = aggregator.get_aggregation(*id).unwrap();
+            assert!(aggregator.verify(agg), "each aggregation level should verify");
+        }
+    }
+
+    #[test]
+    fn test_verify_rejects_empty_proof() {
+        let aggregator = ProofAggregator::new();
+        let agg = AggregatedProof {
+            id: AggregationId(0),
+            root_commitment: [0; 32],
+            proof: vec![],
+            public_inputs: vec![],
+            total_error_bound: 0.0,
+            chunk_ids: vec![],
+            num_layers: 0,
+            depth: 0,
+        };
+        assert!(!aggregator.verify(&agg));
+    }
+
+    #[test]
+    fn test_verify_rejects_wrong_root() {
+        let mut aggregator = ProofAggregator::new();
+        for i in 0..2 {
+            aggregator.add_proof(make_test_proof(i));
+        }
+        let mut agg = aggregator.aggregate_single().unwrap();
+        agg.root_commitment = [0xFF; 32]; // corrupt
+        assert!(!aggregator.verify(&agg));
     }
 }

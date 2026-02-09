@@ -327,15 +327,34 @@ impl ProofSerializer {
 
     fn wrap_proof(&self, proof_type: ProofType, data: Vec<u8>) -> SerializeResult<SerializedProof> {
         let uncompressed_size = data.len();
-        
-        // Compress if configured
+
         let compressed_data = match self.config.compression {
             CompressionMode::None => data,
-            _ => data, // Placeholder - actual impl would use compression libs
+            CompressionMode::Gzip => {
+                use flate2::write::GzEncoder;
+                use flate2::Compression;
+                let level = self.config.compression_level.min(9);
+                let mut encoder = GzEncoder::new(Vec::new(), Compression::new(level));
+                encoder.write_all(&data).map_err(|e| {
+                    SerializeError::CompressionError(format!("Gzip compress: {e}"))
+                })?;
+                encoder.finish().map_err(|e| {
+                    SerializeError::CompressionError(format!("Gzip finish: {e}"))
+                })?
+            }
+            CompressionMode::Lz4 => {
+                lz4_flex::compress_prepend_size(&data)
+            }
+            CompressionMode::Zstd => {
+                let level = self.config.compression_level.min(9) as i32;
+                zstd::encode_all(data.as_slice(), level).map_err(|e| {
+                    SerializeError::CompressionError(format!("Zstd compress: {e}"))
+                })?
+            }
         };
-        
+
         let checksum = Self::compute_checksum(&compressed_data);
-        
+
         Ok(SerializedProof {
             format: self.config.format,
             compression: self.config.compression,
@@ -353,13 +372,30 @@ impl ProofSerializer {
         if computed != serialized.checksum {
             return Err(SerializeError::ChecksumMismatch);
         }
-        
-        // Decompress if needed
+
         let data = match serialized.compression {
             CompressionMode::None => serialized.data.clone(),
-            _ => serialized.data.clone(), // Placeholder
+            CompressionMode::Gzip => {
+                use flate2::read::GzDecoder;
+                let mut decoder = GzDecoder::new(serialized.data.as_slice());
+                let mut decompressed = Vec::with_capacity(serialized.uncompressed_size);
+                decoder.read_to_end(&mut decompressed).map_err(|e| {
+                    SerializeError::CompressionError(format!("Gzip decompress: {e}"))
+                })?;
+                decompressed
+            }
+            CompressionMode::Lz4 => {
+                lz4_flex::decompress_size_prepended(&serialized.data).map_err(|e| {
+                    SerializeError::CompressionError(format!("LZ4 decompress: {e}"))
+                })?
+            }
+            CompressionMode::Zstd => {
+                zstd::decode_all(serialized.data.as_slice()).map_err(|e| {
+                    SerializeError::CompressionError(format!("Zstd decompress: {e}"))
+                })?
+            }
         };
-        
+
         Ok(data)
     }
 
@@ -430,15 +466,115 @@ mod tests {
     fn test_write_read_proof() {
         let serializer = ProofSerializer::new();
         let proof = make_test_chunk_proof();
-        
+
         let serialized = serializer.serialize_chunk(&proof).unwrap();
-        
+
         let mut buffer = Vec::new();
         serializer.write_to(&serialized, &mut buffer).unwrap();
-        
+
         let read_back = serializer.read_from(&buffer[..]).unwrap();
-        
+
         assert_eq!(serialized.data, read_back.data);
         assert_eq!(serialized.checksum, read_back.checksum);
+    }
+
+    fn make_large_chunk_proof() -> ChunkProof {
+        ChunkProof {
+            chunk_id: ChunkId(42),
+            proof: vec![0xAB; 4096],
+            public_inputs: vec![[1; 32]; 8],
+            error_bound: 0.001,
+            generation_time_ms: 100,
+        }
+    }
+
+    #[test]
+    fn test_gzip_compression_roundtrip() {
+        let serializer = ProofSerializer::with_config(SerializationConfig {
+            compression: CompressionMode::Gzip,
+            compression_level: 6,
+            ..Default::default()
+        });
+        let original = make_large_chunk_proof();
+
+        let serialized = serializer.serialize_chunk(&original).unwrap();
+        assert_eq!(serialized.compression, CompressionMode::Gzip);
+        assert!(
+            serialized.data.len() < serialized.uncompressed_size,
+            "Gzip should compress repeated data: {} >= {}",
+            serialized.data.len(),
+            serialized.uncompressed_size
+        );
+
+        let deserialized = serializer.deserialize_chunk(&serialized).unwrap();
+        assert_eq!(original.chunk_id.0, deserialized.chunk_id.0);
+        assert_eq!(original.proof, deserialized.proof);
+    }
+
+    #[test]
+    fn test_lz4_compression_roundtrip() {
+        let serializer = ProofSerializer::with_config(SerializationConfig {
+            compression: CompressionMode::Lz4,
+            ..Default::default()
+        });
+        let original = make_large_chunk_proof();
+
+        let serialized = serializer.serialize_chunk(&original).unwrap();
+        assert_eq!(serialized.compression, CompressionMode::Lz4);
+
+        let deserialized = serializer.deserialize_chunk(&serialized).unwrap();
+        assert_eq!(original.chunk_id.0, deserialized.chunk_id.0);
+        assert_eq!(original.proof, deserialized.proof);
+    }
+
+    #[test]
+    fn test_zstd_compression_roundtrip() {
+        let serializer = ProofSerializer::with_config(SerializationConfig {
+            compression: CompressionMode::Zstd,
+            compression_level: 3,
+            ..Default::default()
+        });
+        let original = make_large_chunk_proof();
+
+        let serialized = serializer.serialize_chunk(&original).unwrap();
+        assert_eq!(serialized.compression, CompressionMode::Zstd);
+        assert!(
+            serialized.data.len() < serialized.uncompressed_size,
+            "Zstd should compress repeated data: {} >= {}",
+            serialized.data.len(),
+            serialized.uncompressed_size
+        );
+
+        let deserialized = serializer.deserialize_chunk(&serialized).unwrap();
+        assert_eq!(original.chunk_id.0, deserialized.chunk_id.0);
+        assert_eq!(original.proof, deserialized.proof);
+    }
+
+    #[test]
+    fn test_compression_modes_all_produce_valid_checksums() {
+        let original = make_large_chunk_proof();
+
+        for mode in [
+            CompressionMode::None,
+            CompressionMode::Gzip,
+            CompressionMode::Lz4,
+            CompressionMode::Zstd,
+        ] {
+            let serializer = ProofSerializer::with_config(SerializationConfig {
+                compression: mode,
+                ..Default::default()
+            });
+
+            let serialized = serializer.serialize_chunk(&original).unwrap();
+            let computed = ProofSerializer::compute_checksum(&serialized.data);
+            assert_eq!(
+                serialized.checksum, computed,
+                "Checksum mismatch for {:?}",
+                mode
+            );
+
+            let deserialized = serializer.deserialize_chunk(&serialized).unwrap();
+            assert_eq!(original.proof, deserialized.proof, "Data mismatch for {:?}", mode);
+        }
     }
 }

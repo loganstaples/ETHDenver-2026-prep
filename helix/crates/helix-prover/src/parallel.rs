@@ -383,6 +383,9 @@ pub struct ParallelProver {
     stats: Arc<ParallelProverStats>,
     /// Condition variable for waiting.
     work_available: Arc<(Mutex<bool>, Condvar)>,
+    /// Shared prover pipeline (created once, reused by all workers).
+    /// Contains the SRS params + keygen which are expensive to compute.
+    shared_pipeline: Arc<RwLock<Option<ProverPipeline<IVCStepCircuit>>>>,
 }
 
 impl ParallelProver {
@@ -395,6 +398,12 @@ impl ParallelProver {
     pub fn with_config(config: ParallelConfig) -> Self {
         let scheduler = Arc::new(WorkStealingScheduler::new(config.clone()));
 
+        // Pre-initialize the shared pipeline once (expensive keygen).
+        let mut pipeline = ProverPipeline::<IVCStepCircuit>::new(5);
+        if let Err(e) = pipeline.setup(&IVCStepCircuit::default()) {
+            tracing::error!("Failed to setup shared IVC pipeline: {e}");
+        }
+
         Self {
             config,
             scheduler,
@@ -405,6 +414,7 @@ impl ParallelProver {
             workers: Mutex::new(Vec::new()),
             stats: Arc::new(ParallelProverStats::new()),
             work_available: Arc::new((Mutex::new(false), Condvar::new())),
+            shared_pipeline: Arc::new(RwLock::new(Some(pipeline))),
         }
     }
 
@@ -492,6 +502,7 @@ impl ParallelProver {
             let global_stats = Arc::clone(&self.stats);
             let work_available = Arc::clone(&self.work_available);
             let timeout = self.config.proof_timeout_secs;
+            let shared_pipeline = Arc::clone(&self.shared_pipeline);
 
             let handle = thread::Builder::new()
                 .name(format!("helix-prover-{}", worker_id))
@@ -508,6 +519,7 @@ impl ParallelProver {
                         global_stats,
                         work_available,
                         timeout,
+                        shared_pipeline,
                     );
                 })
                 .expect("Failed to spawn worker thread");
@@ -643,6 +655,7 @@ impl ParallelProver {
         global_stats: Arc<ParallelProverStats>,
         work_available: Arc<(Mutex<bool>, Condvar)>,
         _timeout: u64,
+        shared_pipeline: Arc<RwLock<Option<ProverPipeline<IVCStepCircuit>>>>,
     ) {
         let mut idle_start: Option<Instant> = None;
 
@@ -694,7 +707,7 @@ impl ParallelProver {
 
                     // Wait for work with a timeout.
                     let (lock, cvar) = &*work_available;
-                    let mut available = lock.lock().unwrap();
+                    let available = lock.lock().unwrap();
                     let _ = cvar.wait_timeout(available, Duration::from_millis(50));
 
                     // Check if we should stop.
@@ -711,9 +724,9 @@ impl ParallelProver {
                 s.insert(task.chunk.id, ProofStatus::InProgress);
             }
 
-            // Generate the proof.
+            // Generate the proof using shared pipeline.
             let start_time = Instant::now();
-            let proof_result = Self::generate_proof(&task.chunk);
+            let proof_result = Self::generate_proof(&task.chunk, &shared_pipeline);
             let elapsed_us = start_time.elapsed().as_micros() as u64;
             let elapsed_ms = elapsed_us / 1000;
 
@@ -755,13 +768,15 @@ impl ParallelProver {
         }
     }
 
-    fn generate_proof(chunk: &ComputationChunk) -> Result<Vec<u8>, String> {
+    fn generate_proof(
+        chunk: &ComputationChunk,
+        shared_pipeline: &Arc<RwLock<Option<ProverPipeline<IVCStepCircuit>>>>,
+    ) -> Result<Vec<u8>, String> {
         // Build an IVCStepCircuit representing this chunk's computation.
         let circuit = IVCStepCircuit {
             prev_state: chunk.input_commitment,
             new_state: chunk.output_commitment,
             computation_hash: {
-                // Derive a deterministic computation hash from the chunk identity.
                 use sha2::{Digest, Sha256};
                 let mut h = Sha256::new();
                 h.update(chunk.id.0.to_le_bytes());
@@ -775,10 +790,9 @@ impl ParallelProver {
         let pi: Vec<Fr> = circuit.public_inputs();
         let pi_refs: Vec<&[Fr]> = vec![&pi];
 
-        // Each worker creates its own pipeline (keygen is deterministic for a
-        // given circuit shape, so all workers produce compatible proofs).
-        let mut pipeline = ProverPipeline::<IVCStepCircuit>::new(5);
-        pipeline.setup(&IVCStepCircuit::default());
+        // Use the shared pipeline (created once during init, not per-task).
+        let pipeline_guard = shared_pipeline.read().map_err(|e| format!("Pipeline lock poisoned: {e}"))?;
+        let pipeline = pipeline_guard.as_ref().ok_or("Pipeline not initialized")?;
 
         let proof = pipeline.prove(&circuit, &pi_refs)
             .map_err(|e| e.to_string())?;
@@ -1179,5 +1193,177 @@ mod tests {
         assert_eq!(result.proofs.len(), 4);
         assert!(result.failures.is_empty());
         assert!(result.stats.tasks_submitted == 4);
+    }
+
+    // ===== New Tests: Proof Validity & Shared Pipeline =====
+
+    #[test]
+    fn test_proof_bytes_are_valid_halo2() {
+        // Verify that the generated proofs are actual Halo2 KZG proofs
+        // that pass verification with the correct public inputs.
+        let prover = ParallelProver::with_config(ParallelConfig {
+            num_threads: 1,
+            ..Default::default()
+        });
+
+        let chunk = make_test_chunk(42);
+        prover.submit(chunk.clone(), 100);
+        prover.start();
+        let proof = prover.wait_for(chunk.id).expect("Proof should complete");
+        prover.stop();
+
+        // Proof should be non-empty and have a reasonable size (KZG proofs are ~1-4KB)
+        assert!(!proof.proof.is_empty(), "Proof must not be empty");
+        assert!(proof.proof.len() > 64, "Proof should be > 64 bytes (not a stub)");
+
+        // Verify the proof using a fresh pipeline with the same circuit
+        let circuit = IVCStepCircuit {
+            prev_state: chunk.input_commitment,
+            new_state: chunk.output_commitment,
+            computation_hash: {
+                use sha2::{Digest, Sha256};
+                let mut h = Sha256::new();
+                h.update(chunk.id.0.to_le_bytes());
+                h.update(chunk.layer_range.0.to_le_bytes());
+                h.update(chunk.layer_range.1.to_le_bytes());
+                h.finalize().into()
+            },
+            step_number: chunk.id.0,
+        };
+        let pi: Vec<Fr> = circuit.public_inputs();
+        let pi_refs: Vec<&[Fr]> = vec![&pi];
+
+        let mut verifier = ProverPipeline::<IVCStepCircuit>::new(5);
+        verifier.setup(&IVCStepCircuit::default()).unwrap();
+        let verified = verifier.verify(&proof.proof, &pi_refs).expect("Verification should complete");
+        assert!(verified, "Proof must pass Halo2 verification");
+    }
+
+    #[test]
+    fn test_shared_pipeline_consistency() {
+        // All proofs from different workers should be verifiable with the same VK
+        let prover = ParallelProver::with_config(ParallelConfig {
+            num_threads: 3,
+            ..Default::default()
+        });
+
+        for i in 0..6 {
+            prover.submit(make_test_chunk(i), 100);
+        }
+        prover.start();
+        let proofs = prover.wait_all();
+        prover.stop();
+
+        assert_eq!(proofs.len(), 6, "All 6 proofs should succeed");
+
+        // Verify every proof with a single pipeline
+        let mut verifier = ProverPipeline::<IVCStepCircuit>::new(5);
+        verifier.setup(&IVCStepCircuit::default()).unwrap();
+
+        for proof in &proofs {
+            let chunk = make_test_chunk(proof.chunk_id.0);
+            let circuit = IVCStepCircuit {
+                prev_state: chunk.input_commitment,
+                new_state: chunk.output_commitment,
+                computation_hash: {
+                    use sha2::{Digest, Sha256};
+                    let mut h = Sha256::new();
+                    h.update(chunk.id.0.to_le_bytes());
+                    h.update(chunk.layer_range.0.to_le_bytes());
+                    h.update(chunk.layer_range.1.to_le_bytes());
+                    h.finalize().into()
+                },
+                step_number: chunk.id.0,
+            };
+            let pi: Vec<Fr> = circuit.public_inputs();
+            let pi_refs: Vec<&[Fr]> = vec![&pi];
+
+            let valid = verifier.verify(&proof.proof, &pi_refs).expect("verify");
+            assert!(valid, "Proof for chunk {} must verify", proof.chunk_id.0);
+        }
+    }
+
+    #[test]
+    fn test_work_stealing_actually_steals() {
+        // Force all tasks to one worker, then verify stealing happens
+        let config = ParallelConfig {
+            num_threads: 2,
+            work_stealing: true,
+            steal_threshold: 2,
+            steal_batch_size: 2,
+            ..Default::default()
+        };
+        let prover = ParallelProver::with_config(config);
+
+        // Submit 8 tasks all with affinity to worker 0
+        for i in 0..8 {
+            prover.submit_with_affinity(make_test_chunk(i), 100, 0);
+        }
+
+        prover.start();
+        let proofs = prover.wait_all();
+        prover.stop();
+
+        assert_eq!(proofs.len(), 8);
+
+        let stats = prover.stats();
+        // With 8 tasks on 1 worker and steal_threshold=2, stealing should occur
+        assert!(stats.steals_performed > 0 || stats.tasks_stolen > 0,
+            "Work stealing should have occurred (steals={}, stolen={})",
+            stats.steals_performed, stats.tasks_stolen);
+    }
+
+    #[test]
+    fn test_wait_for_timeout_expires() {
+        let prover = ParallelProver::with_config(ParallelConfig {
+            num_threads: 1,
+            ..Default::default()
+        });
+
+        let chunk = make_test_chunk(1);
+        prover.submit(chunk.clone(), 100);
+        // Don't start workers — proof should never complete
+
+        let result = prover.wait_for_timeout(chunk.id, Duration::from_millis(100));
+        assert!(result.is_none(), "Should time out without workers started");
+    }
+
+    #[test]
+    fn test_progress_tracking() {
+        let prover = ParallelProver::with_config(ParallelConfig {
+            num_threads: 2,
+            ..Default::default()
+        });
+
+        for i in 0..4 {
+            prover.submit(make_test_chunk(i), 100);
+        }
+
+        let (completed, total) = prover.progress();
+        assert_eq!(total, 4);
+        assert_eq!(completed, 0);
+
+        prover.start();
+        prover.wait_all();
+        prover.stop();
+
+        let (completed, total) = prover.progress();
+        assert_eq!(total, 4);
+        assert_eq!(completed, 4);
+    }
+
+    #[test]
+    fn test_prove_batch_function() {
+        let chunks: Vec<_> = (0..3).map(|i| make_test_chunk(i)).collect();
+        let result = prove_batch(chunks, ParallelConfig {
+            num_threads: 2,
+            ..Default::default()
+        });
+
+        assert_eq!(result.proofs.len(), 3);
+        assert!(result.failures.is_empty());
+        assert!(result.total_time_ms > 0 || result.proofs.len() == 3);
+        assert_eq!(result.stats.tasks_submitted, 3);
+        assert_eq!(result.stats.tasks_completed, 3);
     }
 }

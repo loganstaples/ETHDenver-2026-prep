@@ -27,6 +27,9 @@ rayon = { version = "1.8", optional = true }
 blake3 = "1.5"
 thiserror = "1.0"
 tracing = "0.1"
+flate2 = "1.0"
+lz4_flex = "0.11"
+zstd = "0.13"
 
 # Metal GPU acceleration (macOS only)
 [target.'cfg(target_os = "macos")'.dependencies]

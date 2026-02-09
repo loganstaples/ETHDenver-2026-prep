@@ -1169,6 +1169,10 @@ impl BatchTrainingProverV2 {
     /// Tolerates individual step failures and records them in `failed_steps`.
     /// Always advances weights through each step (even failed ones) so that
     /// subsequent steps compute correct state.
+    ///
+    /// Returns a result with `proofs.len() == 0` only if `training_samples` is
+    /// empty or every step failed — check [`BatchProofResult::failed_steps`]
+    /// to distinguish the two cases.
     pub fn prove_batch_with_options(
         &self,
         initial_weights: TrainingWeights,
@@ -1177,6 +1181,18 @@ impl BatchTrainingProverV2 {
         progress: ProgressCallback,
         cancel_token: Option<&CancellationToken>,
     ) -> BatchProofResult {
+        if training_samples.is_empty() {
+            tracing::warn!("prove_batch_with_options: called with 0 training samples");
+            return BatchProofResult {
+                proofs: Vec::new(),
+                final_weights: initial_weights,
+                total_loss: Fr::zero(),
+                num_steps: 0,
+                failed_steps: Vec::new(),
+                total_time: Duration::ZERO,
+            };
+        }
+
         let start = Instant::now();
         let mut current_weights = initial_weights;
         let mut proofs = Vec::new();
@@ -1237,6 +1253,15 @@ impl BatchTrainingProverV2 {
                     failed_steps.push((step, e.to_string()));
                 }
             }
+        }
+
+        if proofs.is_empty() && !failed_steps.is_empty() {
+            tracing::error!(
+                total_steps = total_steps,
+                failed_count = failed_steps.len(),
+                "Batch proving produced 0 proofs — all {} steps failed",
+                total_steps,
+            );
         }
 
         BatchProofResult {
