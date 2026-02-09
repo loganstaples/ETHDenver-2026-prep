@@ -619,6 +619,12 @@ impl MPCWorkerHandle {
 
     /// Computes gradient share on a training batch.
     ///
+    /// **WARNING: SIMULATION ONLY** — This method computes gradients on the full
+    /// local model, NOT on secret shares. Every worker holds the complete model
+    /// weights in memory. For real MPC privacy, workers must compute on their
+    /// individual `ModelShare` using Beaver triples for secure multiplication,
+    /// ensuring no single party can reconstruct the full model.
+    ///
     /// The worker computes gradients on its local view of the model,
     /// then divides by num_parties to create its share of the full gradient.
     /// Returns a WorkerComputation that can be sent to the aggregator.
@@ -627,6 +633,12 @@ impl MPCWorkerHandle {
         x: &[f64],
         target: &[f64],
     ) -> MPCResult<WorkerComputation> {
+        log::warn!(
+            "MPC SIMULATION: party {} computing on FULL model (not secret shares). \
+             This provides NO privacy guarantees.",
+            self.party_index
+        );
+
         let party = PartyId::from_index(self.party_index);
 
         // Forward and backward pass on local model.

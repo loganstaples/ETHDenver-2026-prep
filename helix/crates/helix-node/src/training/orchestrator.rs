@@ -175,6 +175,9 @@ pub struct CollectedGradient {
     pub received_at: Instant,
     /// Validation result.
     pub validation: Option<ValidationResult>,
+    /// Gradient L2 norm (if provided by the worker). Used for Byzantine
+    /// outlier detection. When absent, `error_bound` is used as a proxy.
+    pub gradient_norm: Option<f64>,
 }
 
 /// Orchestrator event.
@@ -328,6 +331,11 @@ impl TrainingOrchestrator {
     pub async fn start_round(&self, model_hash: [u8; 32]) -> Result<u64, OrchestratorError> {
         if !self.is_leader() {
             return Err(OrchestratorError::NotLeader);
+        }
+
+        // Check if training is paused due to network partition
+        if self.network.is_training_paused() {
+            return Err(OrchestratorError::TrainingPaused);
         }
 
         // Check we have enough workers
@@ -484,6 +492,7 @@ impl TrainingOrchestrator {
             proof,
             received_at: Instant::now(),
             validation: Some(validation),
+            gradient_norm: None,
         };
 
         round.gradients.insert(from.clone(), gradient);
@@ -703,11 +712,15 @@ impl TrainingOrchestrator {
         }
 
         // === Byzantine gradient filtering (Task B3.3) ===
-        // Convert gradients to filter format: (id, norm, gradient_proxy)
+        // Convert gradients to filter format: (id, norm, gradient_vector).
+        // NOTE: When actual gradient vectors are unavailable (current protocol only
+        // sends commitments + proofs), we use error_bound as a 1-element proxy.
+        // This enables TrimmedMean and z-score filtering on a meaningful value.
+        // Krum on 1-D data degrades to "reject the most distant error_bound" which
+        // is still useful for catching outliers.
         let submissions: Vec<(String, f64, Vec<f32>)> = gradients.iter().map(|(peer_id, grad)| {
-            // Use commitment bytes as gradient proxy for distance computation
-            let grad_proxy: Vec<f32> = grad.commitment.iter().map(|&b| b as f32).collect();
-            let norm = grad.error_bound;
+            let norm = grad.gradient_norm.unwrap_or(grad.error_bound);
+            let grad_proxy = vec![norm as f32];
             (peer_id.0.clone(), norm, grad_proxy)
         }).collect();
 
@@ -1105,6 +1118,7 @@ impl TrainingOrchestrator {
                                 proof,
                                 received_at: Instant::now(),
                                 validation: Some(validation),
+                                gradient_norm: None,
                             };
                             round.gradients.insert(from.clone(), gradient);
 
@@ -1188,6 +1202,8 @@ pub struct WorkerStats {
 pub enum OrchestratorError {
     #[error("Not the leader")]
     NotLeader,
+    #[error("Training paused due to network partition")]
+    TrainingPaused,
     #[error("Insufficient workers: have {have}, need {need}")]
     InsufficientWorkers { have: usize, need: usize },
     #[error("No active round")]

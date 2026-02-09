@@ -119,6 +119,9 @@ pub struct NetworkRunner {
     capabilities: NodeCapabilities,
     /// Our listen address.
     listen_addr: String,
+    /// Whether training should be paused due to network issues
+    /// (partition detection sets this to true when PauseTraining/Halt is recommended).
+    training_paused: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl NetworkRunner {
@@ -163,6 +166,7 @@ impl NetworkRunner {
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             capabilities,
             listen_addr,
+            training_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -182,9 +186,10 @@ impl NetworkRunner {
         let event_tx = self.event_tx.clone();
         let pool = self.pool.clone();
         let rate_limiter = self.rate_limiter.clone();
+        let eclipse_manager = self.eclipse_manager.clone();
 
         tokio::spawn(async move {
-            Self::receive_loop(running, transport, gossip, discovery, sync, event_tx, pool, rate_limiter).await;
+            Self::receive_loop(running, transport, gossip, discovery, sync, event_tx, pool, rate_limiter, eclipse_manager).await;
         });
 
         // Spawn gossip send loop
@@ -207,11 +212,13 @@ impl NetworkRunner {
         let partition_detector = self.partition_detector.clone();
         let rate_limiter_cleanup = self.rate_limiter.clone();
         let event_tx_cleanup = self.event_tx.clone();
+        let training_paused = self.training_paused.clone();
 
         tokio::spawn(async move {
             Self::cleanup_loop(
                 running, gossip, discovery, cleanup_interval,
                 partition_detector, rate_limiter_cleanup, event_tx_cleanup,
+                training_paused,
             ).await;
         });
 
@@ -341,6 +348,11 @@ impl NetworkRunner {
         &self.partition_detector
     }
 
+    /// Returns whether training is paused due to network partition.
+    pub fn is_training_paused(&self) -> bool {
+        self.training_paused.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     async fn get_connected_peer_ids(&self) -> Vec<PeerId> {
         self.discovery.get_all_peers().await
             .into_iter()
@@ -368,6 +380,7 @@ impl NetworkRunner {
         event_tx: mpsc::Sender<NetworkEvent>,
         pool: Arc<ConnectionPool>,
         rate_limiter: Arc<parking_lot::Mutex<RateLimiter>>,
+        eclipse_manager: Arc<parking_lot::Mutex<EclipseResistantPeerManager>>,
     ) {
         while running.load(std::sync::atomic::Ordering::SeqCst) {
             match transport.recv().await {
@@ -445,6 +458,26 @@ impl NetworkRunner {
                             // === Inbound peer registration (Task B3.6) ===
                             // Register inbound peers on JoinRequest so we can route responses
                             if let DiscoveryMessage::JoinRequest { capabilities, listen_addr } = disc_msg {
+                                // === Eclipse diversity check for inbound peers (Task B3.5) ===
+                                if let Ok(addr) = listen_addr.parse::<SocketAddr>() {
+                                    let peer_net_info = PeerNetworkInfo::new(
+                                        message.sender.clone(),
+                                        Some(addr.ip()),
+                                        ConnectionType::Inbound,
+                                        DiscoverySource::PeerExchange,
+                                    );
+                                    let eclipse_result = eclipse_manager.lock().try_add_peer(peer_net_info);
+                                    if let Err(e) = eclipse_result {
+                                        log::warn!(
+                                            "Eclipse diversity check rejected inbound peer {}: {}",
+                                            message.sender, e
+                                        );
+                                        continue; // Drop the connection — don't register
+                                    }
+
+                                    pool.register_peer(message.sender.clone(), addr);
+                                }
+
                                 let peer_info = PeerInfo {
                                     id: message.sender.clone(),
                                     address: listen_addr.clone(),
@@ -452,11 +485,6 @@ impl NetworkRunner {
                                     last_seen: message.timestamp,
                                     reputation: 0,
                                 };
-
-                                // Register peer in connection pool for response routing
-                                if let Ok(addr) = listen_addr.parse::<SocketAddr>() {
-                                    pool.register_peer(message.sender.clone(), addr);
-                                }
 
                                 // Mark as connected in discovery
                                 discovery.mark_connected(peer_info.clone()).await;
@@ -554,6 +582,7 @@ impl NetworkRunner {
         partition_detector: Arc<PartitionDetector>,
         rate_limiter: Arc<parking_lot::Mutex<RateLimiter>>,
         event_tx: mpsc::Sender<NetworkEvent>,
+        training_paused: Arc<std::sync::atomic::AtomicBool>,
     ) {
         let mut interval = tokio::time::interval(Duration::from_secs(cleanup_interval_secs));
 
@@ -581,16 +610,28 @@ impl NetworkRunner {
                         );
                         match status.recommended_action {
                             PartitionAction::PauseTraining | PartitionAction::Halt => {
+                                // Actually pause training — orchestrator checks this flag
+                                training_paused.store(true, std::sync::atomic::Ordering::SeqCst);
+                                log::warn!(
+                                    "Training PAUSED due to network partition (action={:?})",
+                                    status.recommended_action,
+                                );
                                 let _ = event_tx.send(NetworkEvent::Error {
                                     peer: None,
                                     error: format!(
-                                        "Network partition: {} unreachable peers, action={:?}",
+                                        "Network partition: {} unreachable peers, training paused (action={:?})",
                                         status.unreachable_peers,
                                         status.recommended_action,
                                     ),
                                 }).await;
                             }
                             _ => {}
+                        }
+                    } else {
+                        // Network healthy — resume training if previously paused
+                        if training_paused.load(std::sync::atomic::Ordering::SeqCst) {
+                            training_paused.store(false, std::sync::atomic::Ordering::SeqCst);
+                            log::info!("Training RESUMED: network partition resolved");
                         }
                     }
                 }
