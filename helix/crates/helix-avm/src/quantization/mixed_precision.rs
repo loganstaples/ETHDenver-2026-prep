@@ -13,12 +13,12 @@
 //! - INT8 weights + INT8 activations (W8A8): Good balance of accuracy and efficiency
 //! - FP32 accumulator with INT8 operands: Standard for training
 
-use helix_core::types::{BoundedTensor, BoundedValue, Precision, Shape};
+use helix_core::types::{BoundedTensor, BoundedValue, Shape};
 use std::collections::HashMap;
 
 use super::int4_tensor::Int4Tensor;
 use super::int8_tensor::Int8Tensor;
-use super::schemes::{QuantScheme, TensorQuantParams};
+use super::schemes::QuantScheme;
 
 /// Precision level for a computation or storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -587,7 +587,7 @@ impl MixedPrecisionExecutor {
         &mut self,
         input: &MixedPrecisionTensor,
         activation_type: ActivationType,
-        layer_name: &str,
+        _layer_name: &str,
     ) -> MixedPrecisionTensor {
         self.stats.operations += 1;
 

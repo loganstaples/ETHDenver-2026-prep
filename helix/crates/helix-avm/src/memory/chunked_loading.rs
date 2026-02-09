@@ -621,7 +621,7 @@ mod tests {
         assert!(chunks.len() >= 3);
 
         // Verify chunk shapes
-        for (i, chunk) in chunks.iter().enumerate() {
+        for (_i, chunk) in chunks.iter().enumerate() {
             assert_eq!(chunk.shape()[1], 10); // All chunks should have 10 columns
             if !chunk.is_last {
                 assert!(chunk.shape()[0] <= 3); // Non-last chunks should have at most 3 rows

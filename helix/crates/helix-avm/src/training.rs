@@ -19,13 +19,12 @@
 //! ```
 
 use crate::data::{create_mnist_like_loader, DataPipeline, PipelineConfig};
-use crate::gradient::loss::mse_loss;
 use crate::gradient::optimizer::{LRScheduler, LinearWarmupCosineDecay};
 use crate::models::serialization::{
     Checkpoint, CheckpointMetadata, ModelSerializer,
 };
 use crate::nn::Linear;
-use helix_core::types::{BoundedTensor, BoundedValue, ErrorMargin, Precision};
+use helix_core::types::{BoundedTensor, Precision};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -175,6 +174,7 @@ impl MnistModel {
     }
 
     /// Forward pass: layer1 → ReLU → layer2
+    #[allow(dead_code)]
     fn forward(&self, input: &BoundedTensor) -> BoundedTensor {
         let h = self.layer1.forward(input).expect("layer1 forward");
         let h = h.relu();

@@ -25,17 +25,18 @@ pub mod validation;
 
 // Re-export commonly used types
 pub use attention::{
-    AttentionConfig, AttentionError, MultiHeadAttention, scaled_dot_product_attention,
+    AttentionConfig, AttentionError, AttentionGradients, MultiHeadAttention,
+    scaled_dot_product_attention,
     EfficientAttentionConfig, EfficientMultiHeadAttention, chunked_scaled_dot_product_attention,
     estimate_attention_memory,
 };
 pub use embedding::{Embedding, EmbeddingError, PositionalEncoding};
 pub use layer::{Layer, Sequential};
 pub use linear::{Linear, LinearConfig, LinearError};
-pub use mlp::{ActivationType, GatedMLP, MLP, MLPConfig, MLPError};
+pub use mlp::{ActivationType, GatedMLP, MLP, MLPConfig, MLPError, MLPGradients};
 pub use transformer::{
     NormPosition, NormType, ProvableBlock, TransformerBlock, TransformerConfig, TransformerError,
-    TransformerModel, TransformerStack,
+    TransformerGradients, TransformerModel, TransformerStack,
 };
 
 // Re-export quantized layer types

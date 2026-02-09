@@ -18,15 +18,13 @@
 //! 2. Use lookup tables for complex functions
 //! 3. Fall back to dequantize-compute-requantize for accuracy
 
-use helix_core::types::{BoundedTensor, BoundedValue, Shape};
+use helix_core::types::{BoundedTensor, BoundedValue};
 
 use crate::quantization::{
     int8_ops::{int8_gelu, int8_leaky_relu, int8_relu, int8_sigmoid, int8_silu, int8_tanh},
     int8_tensor::Int8Tensor,
     int4_ops::{int4_gelu, int4_relu},
-    int4_tensor::Int4Tensor,
     mixed_precision::{MixedPrecisionTensor, PrecisionLevel},
-    schemes::{QuantScheme, TensorQuantParams},
 };
 
 use super::{QuantizedLayer, QuantizedLayerError};

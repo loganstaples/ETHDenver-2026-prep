@@ -24,10 +24,8 @@ use crate::memory::{
     CheckpointStrategy, GradientCheckpointer, MemoryBudget, MemoryProfiler, MemoryTracker,
     ProfilingConfig,
 };
-use crate::nn::linear::Linear;
-use crate::nn::transformer::{TransformerBlock, TransformerConfig, TransformerError, TransformerStack};
-use crate::ops::normalization;
-use crate::quantization::{MixedPrecisionConfig, MixedPrecisionExecutor, PrecisionLevel};
+use crate::nn::transformer::{TransformerBlock, TransformerError};
+use crate::quantization::{MixedPrecisionConfig, MixedPrecisionExecutor};
 use helix_core::types::{BoundedTensor, Precision};
 use thiserror::Error;
 
@@ -368,8 +366,8 @@ impl LargeModelExecutor {
     }
 
     /// Allocates memory for a tensor.
-    pub fn allocate_tensor(&mut self, name: &str, size_bytes: usize) -> Result<(), LargeModelError> {
-        self.memory_tracker.allocate("activations", size_bytes).map_err(|e| {
+    pub fn allocate_tensor(&mut self, _name: &str, size_bytes: usize) -> Result<(), LargeModelError> {
+        self.memory_tracker.allocate("activations", size_bytes).map_err(|_e| {
             LargeModelError::OutOfMemory {
                 required: size_bytes,
                 available: self.memory_tracker.available(),
@@ -378,7 +376,7 @@ impl LargeModelExecutor {
     }
 
     /// Frees memory for a tensor.
-    pub fn free_tensor(&mut self, name: &str, size_bytes: usize) {
+    pub fn free_tensor(&mut self, _name: &str, size_bytes: usize) {
         let _ = self.memory_tracker.free("activations", size_bytes);
     }
 
@@ -438,7 +436,7 @@ pub fn chunked_attention(
     for chunk_idx in 0..num_chunks {
         let start = chunk_idx * chunk_size;
         let end = (start + chunk_size).min(seq_len);
-        let chunk_len = end - start;
+        let _chunk_len = end - start;
 
         // Extract query chunk
         let query_chunk = extract_rows(query, start, end)?;
@@ -525,6 +523,7 @@ pub fn compute_optimal_batch_size(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nn::transformer::TransformerConfig;
 
     #[test]
     fn test_large_model_config() {

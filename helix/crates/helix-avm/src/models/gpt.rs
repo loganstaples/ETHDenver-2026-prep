@@ -34,7 +34,7 @@ use crate::memory::{GradientCheckpointer, MemoryProfiler, MemoryTracker};
 use crate::nn::embedding::{Embedding, EmbeddingError, PositionalEncoding};
 use crate::nn::linear::{Linear, LinearConfig, LinearError};
 use crate::nn::transformer::{
-    NormPosition, NormType, TransformerConfig, TransformerError, TransformerModel, TransformerStack,
+    NormPosition, NormType, TransformerConfig, TransformerError, TransformerStack,
 };
 use crate::nn::ActivationType;
 use crate::ops::normalization;
@@ -463,7 +463,7 @@ impl GPTModel {
         // For now, use the existing transformer forward
         current = self.transformer.forward(&current)?;
 
-        if let Some(ref mut checkpointer) = self.checkpointer {
+        if let Some(ref mut _checkpointer) = self.checkpointer {
             // End forward would be called here
         }
 

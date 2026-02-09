@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use helix_core::types::{BoundedTensor, BoundedValue};
+use helix_core::types::BoundedTensor;
 
 use super::schemes::{CalibrationMethod, ObserverType, QuantScheme, TensorQuantParams};
 
@@ -13,8 +13,10 @@ use super::schemes::{CalibrationMethod, ObserverType, QuantScheme, TensorQuantPa
 #[derive(Debug)]
 pub struct Observer {
     /// Observer type.
+    #[allow(dead_code)]
     observer_type: ObserverType,
     /// Name of the layer being observed.
+    #[allow(dead_code)]
     layer_name: String,
     /// Minimum value seen.
     min_val: f64,
@@ -178,7 +180,7 @@ impl Observer {
         if let Some(ref hist) = self.histogram {
             // Search for optimal threshold that minimizes KL divergence
             let bits = scheme.bits() as usize;
-            let num_levels = 1 << bits;
+            let _num_levels = 1 << bits;
             
             let mut best_threshold = self.max_val;
             let mut _best_divergence = f64::INFINITY;
@@ -494,6 +496,7 @@ impl Calibrator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use helix_core::types::BoundedValue;
 
     #[test]
     fn test_observer_min_max() {

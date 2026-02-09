@@ -40,12 +40,9 @@ pub use linear::{
     QuantizedLinear, QuantizedLinearConfig, QuantizedLinearGradients,
 };
 
-use helix_core::types::{BoundedTensor, BoundedValue, Shape};
+use helix_core::types::{BoundedTensor, Shape};
 use crate::quantization::{
-    int8_tensor::Int8Tensor,
-    int4_tensor::Int4Tensor,
     mixed_precision::{MixedPrecisionTensor, PrecisionLevel},
-    schemes::{QuantScheme, TensorQuantParams},
 };
 
 /// Error type for quantized layer operations.
@@ -410,6 +407,7 @@ impl AccuracyMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use helix_core::types::BoundedValue;
 
     #[test]
     fn test_gradient_stats() {

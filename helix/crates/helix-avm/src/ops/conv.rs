@@ -614,7 +614,7 @@ pub fn conv2d_auto(
 ) -> Result<BoundedTensor, ConvError> {
     let has_batch = input.ndim() == 4;
 
-    let (_, in_channels, in_h, in_w) = if has_batch {
+    let (_, _in_channels, in_h, in_w) = if has_batch {
         (input.shape()[0], input.shape()[1], input.shape()[2], input.shape()[3])
     } else {
         (1, input.shape()[0], input.shape()[1], input.shape()[2])
@@ -655,6 +655,7 @@ fn conv_output_size(
 
 /// Gets a value from tensor with padding (returns 0 if out of bounds).
 #[inline]
+#[allow(dead_code)]
 fn get_padded_value(
     tensor: &BoundedTensor,
     indices: &[usize],
@@ -1126,7 +1127,7 @@ pub fn conv2d_transpose_with_config(
     for n in 0..batch_size {
         for ic in 0..in_channels {
             let group = ic / in_channels_per_group;
-            let ic_in_group = ic % in_channels_per_group;
+            let _ic_in_group = ic % in_channels_per_group;
             let oc_start = group * out_channels_per_group;
 
             for ih in 0..in_h {
@@ -1429,7 +1430,6 @@ pub fn avg_pool2d(
                 for ow in 0..out_w {
                     let mut sum = 0.0;
                     let mut sum_error = 0.0;
-                    let mut count = 0;
 
                     for kh in 0..kernel_size.0 {
                         for kw in 0..kernel_size.1 {
@@ -1442,7 +1442,6 @@ pub fn avg_pool2d(
                                 || ih >= in_h + padding.0
                                 || iw >= in_w + padding.1
                             {
-                                count += 1;
                                 continue;
                             }
 
@@ -1461,7 +1460,6 @@ pub fn avg_pool2d(
 
                             sum += val.value();
                             sum_error += val.absolute_error();
-                            count += 1;
                         }
                     }
 
@@ -2070,7 +2068,7 @@ pub fn conv1d_backward_weight(
 ) -> Result<BoundedTensor, ConvError> {
     let has_batch = input.ndim() == 3;
 
-    let (batch_size, in_channels, in_length) = if has_batch {
+    let (batch_size, _in_channels, in_length) = if has_batch {
         (input.shape()[0], input.shape()[1], input.shape()[2])
     } else {
         (1, input.shape()[0], input.shape()[1])

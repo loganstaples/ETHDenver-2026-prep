@@ -17,13 +17,13 @@
 //! 1. **Straight-Through Estimator (STE)**: Gradient flows through quantization
 //! 2. **Fake Quantization**: Simulate quantization during training
 
-use helix_core::types::{BoundedTensor, BoundedValue, Precision, Shape};
+use helix_core::types::{BoundedTensor, BoundedValue};
 use std::sync::RwLock;
 
 use crate::quantization::{
-    int4_ops::{int4_int8_matmul, int4_linear},
+    int4_ops::int4_linear,
     int4_tensor::Int4Tensor,
-    int8_ops::{int8_linear, int8_matmul},
+    int8_ops::int8_linear,
     int8_tensor::Int8Tensor,
     mixed_precision::{MixedPrecisionTensor, PrecisionLevel},
     schemes::{QuantScheme, TensorQuantParams},

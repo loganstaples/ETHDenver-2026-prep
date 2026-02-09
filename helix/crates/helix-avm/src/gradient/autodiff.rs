@@ -81,6 +81,43 @@ pub enum Operation {
         stride: (usize, usize),
         padding: (usize, usize),
     },
+    /// Embedding lookup: maps token indices to embedding vectors.
+    /// `table` is the embedding table (vocab_size x embedding_dim).
+    /// `indices` are the token IDs to look up.
+    /// `embedding_dim` is the dimension of each embedding vector.
+    Embedding {
+        table: NodeIndex,
+        indices: Vec<usize>,
+        embedding_dim: usize,
+    },
+    /// GELU activation: x * sigmoid(1.702 * x) (approximate form).
+    Gelu(NodeIndex),
+    /// Multi-head attention: Attention(Q, K, V).
+    /// Stores query, key, value node indices and the number of heads.
+    Attention {
+        query: NodeIndex,
+        key: NodeIndex,
+        value: NodeIndex,
+        num_heads: usize,
+    },
+    /// MLP block: hidden = activation(input @ W1 + b1), output = hidden @ W2 + b2.
+    /// Stores input, weights1, optional bias1, weights2, optional bias2.
+    MLP {
+        input: NodeIndex,
+        weights1: NodeIndex,
+        bias1: Option<NodeIndex>,
+        weights2: NodeIndex,
+        bias2: Option<NodeIndex>,
+    },
+    /// Grouped 2D convolution: splits input channels into groups and applies
+    /// separate convolutions per group.
+    GroupedConv2d {
+        input: NodeIndex,
+        kernel: NodeIndex,
+        stride: (usize, usize),
+        padding: (usize, usize),
+        groups: usize,
+    },
 }
 
 /// Metadata for a node in the computation graph.
@@ -419,6 +456,191 @@ impl Variable {
         Self::with_op(result, op, tape)
     }
 
+    /// GELU activation: x * sigmoid(1.702 * x) (approximate form).
+    pub fn gelu(&self) -> Variable {
+        let precision = helix_core::types::Precision::F32;
+        let result = crate::ops::gelu(&self.tensor, precision);
+        let op = if let (Some(idx), Some(_)) = (self.node_index, &self.tape) {
+            Operation::Gelu(idx)
+        } else {
+            Operation::Input
+        };
+        Self::with_op(result, op, self.tape.clone())
+    }
+
+    /// Embedding lookup from a table variable.
+    ///
+    /// `table` is the embedding table variable (vocab_size x embedding_dim).
+    /// `indices` are the token IDs to look up.
+    /// `embedding_dim` is the dimension of each embedding vector.
+    pub fn embedding(table: &Variable, indices: &[usize], embedding_dim: usize) -> Variable {
+        let seq_len = indices.len();
+        let table_data = table.tensor.data();
+        let mut result_data = Vec::with_capacity(seq_len * embedding_dim);
+
+        for &token_id in indices {
+            for j in 0..embedding_dim {
+                let idx = token_id * embedding_dim + j;
+                if idx < table_data.len() {
+                    result_data.push(table_data[idx]);
+                } else {
+                    result_data.push(helix_core::types::BoundedValue::exact(0.0));
+                }
+            }
+        }
+
+        let result = helix_core::types::BoundedTensor::new(result_data, vec![seq_len, embedding_dim]);
+        let op = if let (Some(table_idx), Some(_)) = (table.node_index, &table.tape) {
+            Operation::Embedding {
+                table: table_idx,
+                indices: indices.to_vec(),
+                embedding_dim,
+            }
+        } else {
+            Operation::Input
+        };
+        Self::with_op(result, op, table.tape.clone())
+    }
+
+    /// Multi-head attention: Attention(Q, K, V).
+    pub fn attention(
+        query: &Variable,
+        key: &Variable,
+        value: &Variable,
+        num_heads: usize,
+    ) -> Variable {
+        let precision = helix_core::types::Precision::F32;
+
+        // Compute scaled dot-product attention
+        let d_k = if query.tensor.is_matrix() {
+            query.tensor.shape()[1]
+        } else {
+            query.tensor.shape().last().copied().unwrap_or(1)
+        };
+        let scale = 1.0 / (d_k as f64).sqrt();
+        let scale_val = helix_core::types::BoundedValue::exact(scale);
+
+        let key_t = key.tensor.transpose();
+        let scores = crate::ops::matmul::matmul(&query.tensor, &key_t, precision)
+            .expect("Attention Q@K^T shape mismatch");
+        let scaled_scores = scores.scale(scale_val);
+
+        // Row-wise softmax
+        let softmax_result = crate::ops::softmax::softmax(&scaled_scores, precision)
+            .unwrap_or(scaled_scores);
+
+        let result = crate::ops::matmul::matmul(&softmax_result, &value.tensor, precision)
+            .expect("Attention attn@V shape mismatch");
+
+        let tape = merge_tapes(&query.tape, &merge_tapes(&key.tape, &value.tape));
+        let op = if let (Some(q_idx), Some(k_idx), Some(v_idx), Some(_)) =
+            (query.node_index, key.node_index, value.node_index, &tape)
+        {
+            Operation::Attention {
+                query: q_idx,
+                key: k_idx,
+                value: v_idx,
+                num_heads,
+            }
+        } else {
+            Operation::Input
+        };
+        Self::with_op(result, op, tape)
+    }
+
+    /// MLP block: hidden = relu(input @ W1 + b1), output = hidden @ W2 + b2.
+    pub fn mlp(
+        input: &Variable,
+        weights1: &Variable,
+        bias1: Option<&Variable>,
+        weights2: &Variable,
+        bias2: Option<&Variable>,
+    ) -> Variable {
+        let precision = helix_core::types::Precision::F32;
+
+        // Forward: hidden = input @ W1^T + b1
+        let w1_t = weights1.tensor.transpose();
+        let mut hidden = crate::ops::matmul::matmul(&input.tensor, &w1_t, precision)
+            .expect("MLP input@W1^T shape mismatch");
+        if let Some(b1) = bias1 {
+            hidden = hidden.add(&b1.tensor);
+        }
+
+        // Activation (ReLU)
+        let activated = crate::ops::relu(&hidden);
+
+        // Output: output = activated @ W2^T + b2
+        let w2_t = weights2.tensor.transpose();
+        let mut output = crate::ops::matmul::matmul(&activated, &w2_t, precision)
+            .expect("MLP activated@W2^T shape mismatch");
+        if let Some(b2) = bias2 {
+            output = output.add(&b2.tensor);
+        }
+
+        // Merge tapes from all operands
+        let mut tape = merge_tapes(&input.tape, &weights1.tape);
+        tape = merge_tapes(&tape, &weights2.tape);
+        if let Some(b1) = bias1 {
+            tape = merge_tapes(&tape, &b1.tape);
+        }
+        if let Some(b2) = bias2 {
+            tape = merge_tapes(&tape, &b2.tape);
+        }
+
+        let op = if let (Some(input_idx), Some(w1_idx), Some(w2_idx), Some(_)) =
+            (input.node_index, weights1.node_index, weights2.node_index, &tape)
+        {
+            Operation::MLP {
+                input: input_idx,
+                weights1: w1_idx,
+                bias1: bias1.and_then(|b| b.node_index),
+                weights2: w2_idx,
+                bias2: bias2.and_then(|b| b.node_index),
+            }
+        } else {
+            Operation::Input
+        };
+        Self::with_op(output, op, tape)
+    }
+
+    /// Grouped 2D convolution.
+    pub fn grouped_conv2d(
+        &self,
+        kernel: &Variable,
+        stride: (usize, usize),
+        padding: (usize, usize),
+        groups: usize,
+    ) -> Variable {
+        let precision = helix_core::types::Precision::F32;
+
+        let config = crate::ops::Conv2dConfig {
+            stride,
+            padding,
+            dilation: (1, 1),
+            groups,
+        };
+
+        let result = crate::ops::conv2d_with_config(&self.tensor, &kernel.tensor, config, precision)
+            .expect("GroupedConv2d shape mismatch in Variable::grouped_conv2d");
+
+        let tape = merge_tapes(&self.tape, &kernel.tape);
+        let op = if let (Some(input_idx), Some(kernel_idx), Some(_)) =
+            (self.node_index, kernel.node_index, &tape)
+        {
+            Operation::GroupedConv2d {
+                input: input_idx,
+                kernel: kernel_idx,
+                stride,
+                padding,
+                groups,
+            }
+        } else {
+            Operation::Input
+        };
+
+        Self::with_op(result, op, tape)
+    }
+
     /// Global average pooling.
     pub fn global_avg_pool2d(&self) -> Variable {
         let precision = helix_core::types::Precision::F32;
@@ -448,6 +670,229 @@ impl Variable {
     }
 }
 
+// ============================================================================
+// Result-returning API variants (avoid panics in public-facing code)
+// ============================================================================
+
+impl Variable {
+    /// Fallible matrix multiplication. Returns `Err` on shape mismatch.
+    pub fn try_matmul(&self, other: &Variable) -> Result<Variable, String> {
+        let precision = helix_core::types::Precision::F32;
+        let result = crate::ops::matmul::matmul(&self.tensor, &other.tensor, precision)
+            .map_err(|e| format!("MatMul error: {}", e))?;
+        let tape = try_merge_tapes(&self.tape, &other.tape)?;
+        let op = if let (Some(lhs), Some(rhs), Some(_)) = (self.node_index, other.node_index, &tape) {
+            Operation::MatMul(lhs, rhs)
+        } else {
+            Operation::Input
+        };
+        Ok(Self::with_op(result, op, tape))
+    }
+
+    /// Fallible 1D convolution.
+    pub fn try_conv1d(&self, kernel: &Variable, stride: usize, padding: usize) -> Result<Variable, String> {
+        let precision = helix_core::types::Precision::F32;
+        let result = crate::ops::conv1d(&self.tensor, &kernel.tensor, stride, padding, precision)
+            .map_err(|e| format!("Conv1d error: {}", e))?;
+        let tape = try_merge_tapes(&self.tape, &kernel.tape)?;
+        let op = if let (Some(input_idx), Some(kernel_idx), Some(_)) =
+            (self.node_index, kernel.node_index, &tape)
+        {
+            Operation::Conv1d { input: input_idx, kernel: kernel_idx, stride, padding }
+        } else {
+            Operation::Input
+        };
+        Ok(Self::with_op(result, op, tape))
+    }
+
+    /// Fallible 2D convolution.
+    pub fn try_conv2d(
+        &self,
+        kernel: &Variable,
+        stride: (usize, usize),
+        padding: (usize, usize),
+    ) -> Result<Variable, String> {
+        self.try_conv2d_with_config(kernel, stride, padding, (1, 1), 1)
+    }
+
+    /// Fallible 2D convolution with full configuration.
+    pub fn try_conv2d_with_config(
+        &self,
+        kernel: &Variable,
+        stride: (usize, usize),
+        padding: (usize, usize),
+        dilation: (usize, usize),
+        groups: usize,
+    ) -> Result<Variable, String> {
+        let precision = helix_core::types::Precision::F32;
+        let config = crate::ops::Conv2dConfig { stride, padding, dilation, groups };
+        let result = crate::ops::conv2d_with_config(&self.tensor, &kernel.tensor, config, precision)
+            .map_err(|e| format!("Conv2d error: {}", e))?;
+        let tape = try_merge_tapes(&self.tape, &kernel.tape)?;
+        let op = if let (Some(input_idx), Some(kernel_idx), Some(_)) =
+            (self.node_index, kernel.node_index, &tape)
+        {
+            Operation::Conv2d { input: input_idx, kernel: kernel_idx, stride, padding, dilation, groups }
+        } else {
+            Operation::Input
+        };
+        Ok(Self::with_op(result, op, tape))
+    }
+
+    /// Fallible max pooling 2D.
+    pub fn try_max_pool2d(
+        &self,
+        kernel_size: (usize, usize),
+        stride: (usize, usize),
+        padding: (usize, usize),
+    ) -> Result<Variable, String> {
+        let config = crate::ops::Pool2dConfig { kernel_size, stride, padding };
+        let pool_result = crate::ops::max_pool2d(&self.tensor, config)
+            .map_err(|e| format!("MaxPool2d error: {}", e))?;
+        let op = if let (Some(idx), Some(_)) = (self.node_index, &self.tape) {
+            Operation::MaxPool2d { input: idx, kernel_size, stride, padding, indices: pool_result.indices.clone() }
+        } else {
+            Operation::Input
+        };
+        Ok(Self::with_op(pool_result.output, op, self.tape.clone()))
+    }
+
+    /// Fallible average pooling 2D.
+    pub fn try_avg_pool2d(
+        &self,
+        kernel_size: (usize, usize),
+        stride: (usize, usize),
+        padding: (usize, usize),
+    ) -> Result<Variable, String> {
+        let precision = helix_core::types::Precision::F32;
+        let config = crate::ops::Pool2dConfig { kernel_size, stride, padding };
+        let result = crate::ops::avg_pool2d(&self.tensor, config, precision)
+            .map_err(|e| format!("AvgPool2d error: {}", e))?;
+        let op = if let (Some(idx), Some(_)) = (self.node_index, &self.tape) {
+            Operation::AvgPool2d { input: idx, kernel_size, stride, padding }
+        } else {
+            Operation::Input
+        };
+        Ok(Self::with_op(result, op, self.tape.clone()))
+    }
+
+    /// Fallible depthwise 2D convolution.
+    pub fn try_depthwise_conv2d(
+        &self,
+        kernel: &Variable,
+        stride: (usize, usize),
+        padding: (usize, usize),
+    ) -> Result<Variable, String> {
+        let precision = helix_core::types::Precision::F32;
+        let result = crate::ops::depthwise_conv2d(&self.tensor, &kernel.tensor, stride, padding, precision)
+            .map_err(|e| format!("DepthwiseConv2d error: {}", e))?;
+        let tape = try_merge_tapes(&self.tape, &kernel.tape)?;
+        let op = if let (Some(input_idx), Some(kernel_idx), Some(_)) =
+            (self.node_index, kernel.node_index, &tape)
+        {
+            Operation::DepthwiseConv2d { input: input_idx, kernel: kernel_idx, stride, padding }
+        } else {
+            Operation::Input
+        };
+        Ok(Self::with_op(result, op, tape))
+    }
+
+    /// Fallible global average pooling.
+    pub fn try_global_avg_pool2d(&self) -> Result<Variable, String> {
+        let precision = helix_core::types::Precision::F32;
+        let result = crate::ops::global_avg_pool2d(&self.tensor, precision)
+            .map_err(|e| format!("GlobalAvgPool2d error: {}", e))?;
+        let (h, w) = if self.tensor.ndim() == 4 {
+            (self.tensor.shape()[2], self.tensor.shape()[3])
+        } else {
+            (self.tensor.shape()[1], self.tensor.shape()[2])
+        };
+        let op = if let (Some(idx), Some(_)) = (self.node_index, &self.tape) {
+            Operation::AvgPool2d { input: idx, kernel_size: (h, w), stride: (h, w), padding: (0, 0) }
+        } else {
+            Operation::Input
+        };
+        Ok(Self::with_op(result, op, self.tape.clone()))
+    }
+
+    /// Fallible GELU activation.
+    pub fn try_gelu(&self) -> Result<Variable, String> {
+        let precision = helix_core::types::Precision::F32;
+        let result = crate::ops::gelu(&self.tensor, precision);
+        let op = if let (Some(idx), Some(_)) = (self.node_index, &self.tape) {
+            Operation::Gelu(idx)
+        } else {
+            Operation::Input
+        };
+        Ok(Self::with_op(result, op, self.tape.clone()))
+    }
+
+    /// Fallible embedding lookup.
+    pub fn try_embedding(table: &Variable, indices: &[usize], embedding_dim: usize) -> Result<Variable, String> {
+        let table_data = table.tensor.data();
+        let vocab_size = if table.tensor.is_matrix() {
+            table.tensor.shape()[0]
+        } else {
+            return Err("Embedding table must be a 2D tensor".to_string());
+        };
+
+        for &idx in indices {
+            if idx >= vocab_size {
+                return Err(format!("Token index {} out of range (vocab size: {})", idx, vocab_size));
+            }
+        }
+
+        let seq_len = indices.len();
+        let mut result_data = Vec::with_capacity(seq_len * embedding_dim);
+        for &token_id in indices {
+            for j in 0..embedding_dim {
+                let flat_idx = token_id * embedding_dim + j;
+                result_data.push(table_data[flat_idx]);
+            }
+        }
+
+        let result = helix_core::types::BoundedTensor::new(result_data, vec![seq_len, embedding_dim]);
+        let op = if let (Some(table_idx), Some(_)) = (table.node_index, &table.tape) {
+            Operation::Embedding {
+                table: table_idx,
+                indices: indices.to_vec(),
+                embedding_dim,
+            }
+        } else {
+            Operation::Input
+        };
+        Ok(Self::with_op(result, op, table.tape.clone()))
+    }
+
+    /// Fallible grouped 2D convolution.
+    pub fn try_grouped_conv2d(
+        &self,
+        kernel: &Variable,
+        stride: (usize, usize),
+        padding: (usize, usize),
+        groups: usize,
+    ) -> Result<Variable, String> {
+        let precision = helix_core::types::Precision::F32;
+        let config = crate::ops::Conv2dConfig {
+            stride,
+            padding,
+            dilation: (1, 1),
+            groups,
+        };
+        let result = crate::ops::conv2d_with_config(&self.tensor, &kernel.tensor, config, precision)
+            .map_err(|e| format!("GroupedConv2d error: {}", e))?;
+        let tape = try_merge_tapes(&self.tape, &kernel.tape)?;
+        let op = if let (Some(input_idx), Some(kernel_idx), Some(_)) =
+            (self.node_index, kernel.node_index, &tape)
+        {
+            Operation::GroupedConv2d { input: input_idx, kernel: kernel_idx, stride, padding, groups }
+        } else {
+            Operation::Input
+        };
+        Ok(Self::with_op(result, op, tape))
+    }
+}
+
 /// Helper to merge tapes. Only works if they refer to the same tape (same Rc pointer).
 /// If they are different tapes, we panic (can't mix graphs).
 fn merge_tapes(t1: &Option<Rc<RefCell<GradientTape>>>, t2: &Option<Rc<RefCell<GradientTape>>>) -> Option<Rc<RefCell<GradientTape>>> {
@@ -459,5 +904,23 @@ fn merge_tapes(t1: &Option<Rc<RefCell<GradientTape>>>, t2: &Option<Rc<RefCell<Gr
         (Some(t), None) => Some(t.clone()),
         (None, Some(t)) => Some(t.clone()),
         (None, None) => None,
+    }
+}
+
+/// Fallible version of `merge_tapes` that returns `Err` instead of panicking.
+fn try_merge_tapes(
+    t1: &Option<Rc<RefCell<GradientTape>>>,
+    t2: &Option<Rc<RefCell<GradientTape>>>,
+) -> Result<Option<Rc<RefCell<GradientTape>>>, String> {
+    match (t1, t2) {
+        (Some(t1), Some(t2)) => {
+            if !Rc::ptr_eq(t1, t2) {
+                return Err("Variables belong to different calculation graphs".to_string());
+            }
+            Ok(Some(t1.clone()))
+        }
+        (Some(t), None) => Ok(Some(t.clone())),
+        (None, Some(t)) => Ok(Some(t.clone())),
+        (None, None) => Ok(None),
     }
 }

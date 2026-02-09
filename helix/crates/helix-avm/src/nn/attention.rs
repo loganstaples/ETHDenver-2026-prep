@@ -4,8 +4,27 @@
 
 use super::linear::{Linear, LinearError};
 use crate::ops::{self, softmax, MatMulError, SoftmaxError};
-use helix_core::types::{BoundedTensor, BoundedValue, Precision};
+use helix_core::types::{BoundedTensor, BoundedValue, ErrorMargin, Precision};
 use thiserror::Error;
+
+/// Gradients produced by the multi-head attention backward pass.
+#[derive(Debug, Clone)]
+pub struct AttentionGradients {
+    /// Gradient with respect to the query input.
+    pub grad_query: BoundedTensor,
+    /// Gradient with respect to the key input.
+    pub grad_key: BoundedTensor,
+    /// Gradient with respect to the value input.
+    pub grad_value: BoundedTensor,
+    /// Gradient with respect to the Q projection weight matrix.
+    pub grad_w_q: BoundedTensor,
+    /// Gradient with respect to the K projection weight matrix.
+    pub grad_w_k: BoundedTensor,
+    /// Gradient with respect to the V projection weight matrix.
+    pub grad_w_v: BoundedTensor,
+    /// Gradient with respect to the output projection weight matrix.
+    pub grad_w_o: BoundedTensor,
+}
 
 /// Errors from attention operations.
 #[derive(Error, Debug)]
@@ -202,10 +221,12 @@ fn combine_batch_slices(
 #[derive(Debug, Clone)]
 pub struct MultiHeadAttention {
     /// Number of attention heads.
+    #[allow(dead_code)]
     num_heads: usize,
     /// Dimension per head.
     head_dim: usize,
     /// Model dimension.
+    #[allow(dead_code)]
     d_model: usize,
     /// Q projection.
     w_q: Linear,
@@ -320,6 +341,11 @@ impl MultiHeadAttention {
         Ok(output)
     }
 
+    /// Returns the head dimension.
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+
     /// Returns the Q projection layer.
     pub fn w_q(&self) -> &Linear {
         &self.w_q
@@ -344,6 +370,126 @@ impl MultiHeadAttention {
     pub fn forward_self(&self, input: &BoundedTensor) -> Result<BoundedTensor, AttentionError> {
         self.forward(input, input, input)
     }
+
+    /// Backward pass for multi-head attention.
+    ///
+    /// Requires cached intermediate values from forward pass.
+    ///
+    /// grad_output: gradient flowing back from downstream, shape (seq_len, d_model)
+    /// query, key, value: the original inputs to the forward pass
+    /// attention_weights: the softmax attention weights from forward pass (seq_len, seq_len)
+    ///
+    /// Returns gradients for all inputs and projection weights.
+    pub fn backward(
+        &self,
+        grad_output: &BoundedTensor,
+        query: &BoundedTensor,
+        key: &BoundedTensor,
+        value: &BoundedTensor,
+        attention_weights: &BoundedTensor,
+    ) -> Result<AttentionGradients, AttentionError> {
+        let precision = self.precision;
+
+        // Backward through output projection W_o
+        // forward: output = attention_result @ W_o^T + b_o
+        // dL/d_attn_result = grad_output @ W_o
+        let grad_attn_result = ops::matmul(grad_output, self.w_o.weights(), precision)?;
+
+        // Recompute attn_result = attn_weights @ V_proj
+        let q_proj = self.w_q.forward(query)?;
+        let k_proj = self.w_k.forward(key)?;
+        let v_proj = self.w_v.forward(value)?;
+        let attn_result = ops::matmul(attention_weights, &v_proj, precision)?;
+
+        // dL/d_W_o = grad_output^T @ attn_result
+        let grad_output_t = grad_output.transpose();
+        let grad_w_o = ops::matmul(&grad_output_t, &attn_result, precision)?;
+
+        // Backward through attention: out = attn_weights @ V_proj
+        // dL/d_V_proj = attn_weights^T @ grad_attn_result
+        let attn_t = attention_weights.transpose();
+        let grad_v_proj = ops::matmul(&attn_t, &grad_attn_result, precision)?;
+
+        // dL/d_attn_weights = grad_attn_result @ V_proj^T
+        let v_proj_t = v_proj.transpose();
+        let grad_attn_weights = ops::matmul(&grad_attn_result, &v_proj_t, precision)?;
+
+        // Backward through softmax
+        let grad_scores = softmax_backward_2d(&grad_attn_weights, attention_weights);
+
+        // Backward through scaling: scores = Q_proj @ K_proj^T / sqrt(d_k)
+        let d_k = self.head_dim as f64;
+        let scale = 1.0 / d_k.sqrt();
+        let grad_scores_unscaled = grad_scores.scale(BoundedValue::exact(scale));
+
+        // dL/d_Q_proj = grad_scores_unscaled @ K_proj
+        let grad_q_proj = ops::matmul(&grad_scores_unscaled, &k_proj, precision)?;
+
+        // dL/d_K_proj = grad_scores_unscaled^T @ Q_proj
+        let gs_t = grad_scores_unscaled.transpose();
+        let grad_k_proj = ops::matmul(&gs_t, &q_proj, precision)?;
+
+        // Backward through projection layers
+        // For linear y = x @ W^T + b: dL/dW = dL/dy^T @ x, dL/dx = dL/dy @ W
+
+        // dL/d_W_q = grad_q_proj^T @ query
+        let grad_q_proj_t = grad_q_proj.transpose();
+        let grad_w_q = ops::matmul(&grad_q_proj_t, query, precision)?;
+        let grad_query = ops::matmul(&grad_q_proj, self.w_q.weights(), precision)?;
+
+        // dL/d_W_k = grad_k_proj^T @ key
+        let grad_k_proj_t = grad_k_proj.transpose();
+        let grad_w_k = ops::matmul(&grad_k_proj_t, key, precision)?;
+        let grad_key = ops::matmul(&grad_k_proj, self.w_k.weights(), precision)?;
+
+        // dL/d_W_v = grad_v_proj^T @ value
+        let grad_v_proj_t = grad_v_proj.transpose();
+        let grad_w_v = ops::matmul(&grad_v_proj_t, value, precision)?;
+        let grad_value = ops::matmul(&grad_v_proj, self.w_v.weights(), precision)?;
+
+        Ok(AttentionGradients {
+            grad_query,
+            grad_key,
+            grad_value,
+            grad_w_q,
+            grad_w_k,
+            grad_w_v,
+            grad_w_o,
+        })
+    }
+}
+
+/// Applies softmax backward across each row of a 2D tensor.
+///
+/// dL/d_scores_i = attn_i * (dL/d_attn_i - sum_j(dL/d_attn_j * attn_j))
+fn softmax_backward_2d(
+    grad_attn: &BoundedTensor,
+    attn_weights: &BoundedTensor,
+) -> BoundedTensor {
+    let rows = grad_attn.shape()[0];
+    let cols = grad_attn.shape()[1];
+    let grad_data = grad_attn.data();
+    let attn_data = attn_weights.data();
+    let mut result = Vec::with_capacity(rows * cols);
+
+    for i in 0..rows {
+        let row_start = i * cols;
+        let weighted_sum: f64 = (0..cols)
+            .map(|j| grad_data[row_start + j].value() * attn_data[row_start + j].value())
+            .sum();
+
+        for j in 0..cols {
+            let attn_val = attn_data[row_start + j].value();
+            let grad_val = attn_val * (grad_data[row_start + j].value() - weighted_sum);
+            let error = attn_val.abs() * grad_data[row_start + j].absolute_error();
+            result.push(BoundedValue::new(
+                grad_val,
+                ErrorMargin::absolute(error),
+            ));
+        }
+    }
+
+    BoundedTensor::new(result, grad_attn.shape().clone())
 }
 
 /// Configuration for memory-efficient attention.

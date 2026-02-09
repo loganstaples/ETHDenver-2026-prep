@@ -3,11 +3,8 @@
 //! Provides quantized versions of common neural network operations
 //! that operate directly on integer representations.
 
-use helix_core::types::{BoundedTensor, BoundedValue, Shape};
-
-use super::quantize::{QuantizedTensor, quantize_scalar};
-use super::dequantize::dequantize_scalar;
-use super::schemes::{QuantScheme, TensorQuantParams};
+use super::quantize::QuantizedTensor;
+use super::schemes::TensorQuantParams;
 
 /// Performs quantized matrix multiplication.
 ///
@@ -357,6 +354,7 @@ pub fn compute_op_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::schemes::QuantScheme;
 
     fn create_quantized_tensor(data: Vec<i64>, shape: Vec<usize>) -> QuantizedTensor {
         let params = TensorQuantParams::new(QuantScheme::SymmetricInt8, 0.01, 0);

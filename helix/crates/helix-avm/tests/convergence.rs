@@ -12,16 +12,13 @@
 //! - Model outputs match expected behavior after training
 //! - INT8 vs FP32 error within acceptable bounds
 
-use helix_avm::gradient::autodiff::{GradientTape, Variable};
-use helix_avm::gradient::backward::backward;
-use helix_avm::gradient::loss::{mse_loss, mse_grad, softmax_cross_entropy_loss, softmax_cross_entropy_grad};
-use helix_avm::gradient::optimizer::{SGD, Adam, Optimizer};
-use helix_avm::nn::{Linear, LinearConfig};
+use helix_avm::gradient::optimizer::{Adam, Optimizer};
+use helix_avm::nn::Linear;
 use helix_avm::models::serialization::{Checkpoint, CheckpointMetadata, ModelSerializer};
 use helix_avm::quantization::int8_tensor::Int8Tensor;
 use helix_avm::quantization::schemes::QuantScheme;
 use helix_avm::ops;
-use helix_core::types::{BoundedTensor, BoundedValue, Precision};
+use helix_core::types::{BoundedTensor, Precision};
 use std::collections::HashMap;
 
 // ============================================================================

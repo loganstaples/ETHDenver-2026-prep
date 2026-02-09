@@ -200,7 +200,7 @@ pub struct AttentionGradientError {
 }
 
 /// Rotary Position Embedding (RoPE) error bounds.
-pub fn rope_error(dim: usize, position: usize, base_error: f64) -> f64 {
+pub fn rope_error(_dim: usize, _position: usize, base_error: f64) -> f64 {
     // RoPE applies rotation: x' = x * cos(θ) + rotate(x) * sin(θ)
     // Error from sin/cos: O(ε)
     // Error from rotation (element swap): 0

@@ -399,6 +399,7 @@ pub struct BERTModel {
     /// MLM head (optional).
     mlm_head: Option<MLMHead>,
     /// Memory profiler.
+    #[allow(dead_code)]
     profiler: Option<MemoryProfiler>,
     /// Cached dimensions.
     dimensions: ModelDimensions,

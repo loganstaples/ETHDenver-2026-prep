@@ -4,8 +4,7 @@
 //! inference and training. This implementation is designed for HELIX's approximate computing
 //! model with proper error bound tracking.
 
-use helix_core::types::{BoundedTensor, BoundedValue, ErrorMargin, Shape};
-use std::ops::{Add, Mul, Sub};
+use helix_core::types::{BoundedTensor, BoundedValue, Shape};
 
 use super::schemes::{QuantScheme, TensorQuantParams};
 

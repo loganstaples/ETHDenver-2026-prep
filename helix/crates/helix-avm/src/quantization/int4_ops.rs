@@ -9,11 +9,11 @@
 //! - Weight-only quantization with INT8 activations
 //! - Edge deployment with extreme memory constraints
 
-use helix_core::types::{BoundedTensor, BoundedValue, Shape};
+use helix_core::types::BoundedTensor;
 
 use super::int4_tensor::Int4Tensor;
 use super::int8_tensor::Int8Tensor;
-use super::schemes::{QuantScheme, TensorQuantParams};
+use super::schemes::QuantScheme;
 
 // ============================================================================
 // Matrix Operations
@@ -58,7 +58,7 @@ pub fn int4_matmul(a: &Int4Tensor, b: &Int4Tensor, output_scale: f64) -> Int4Ten
     }
 
     let matmul_error = k as f64 * a.quantization_error() * b.quantization_error();
-    let total_error = matmul_error + output_scale / 2.0;
+    let _total_error = matmul_error + output_scale / 2.0;
 
     Int4Tensor::new(output, vec![m, n], output_scale, 0, true)
 }
@@ -210,7 +210,7 @@ pub fn int4_add(a: &Int4Tensor, b: &Int4Tensor, output_scale: f64) -> Int4Tensor
         output[i] = quantized.clamp(-7, 7) as i8;
     }
 
-    let error = a.quantization_error() + b.quantization_error() + output_scale / 2.0;
+    let _error = a.quantization_error() + b.quantization_error() + output_scale / 2.0;
     Int4Tensor::new(output, a.shape().clone(), output_scale, 0, true)
 }
 
@@ -235,7 +235,7 @@ pub fn int4_mul(a: &Int4Tensor, b: &Int4Tensor, output_scale: f64) -> Int4Tensor
         output[i] = prod.round().clamp(-7.0, 7.0) as i8;
     }
 
-    let error = a.quantization_error() * b.quantization_error() + output_scale / 2.0;
+    let _error = a.quantization_error() * b.quantization_error() + output_scale / 2.0;
     Int4Tensor::new(output, a.shape().clone(), output_scale, 0, true)
 }
 
@@ -253,7 +253,7 @@ pub fn int4_scale(tensor: &Int4Tensor, scalar: f64, output_scale: f64) -> Int4Te
         output[i] = val.round().clamp(-7.0, 7.0) as i8;
     }
 
-    let error = tensor.quantization_error() * scalar.abs() + output_scale / 2.0;
+    let _error = tensor.quantization_error() * scalar.abs() + output_scale / 2.0;
     Int4Tensor::new(output, tensor.shape().clone(), output_scale, 0, true)
 }
 
@@ -297,7 +297,7 @@ pub fn int8_to_int4(tensor: &Int8Tensor) -> Int4Tensor {
 ///
 /// This pattern is used when we need higher precision for intermediate
 /// computations but want to store results in INT4.
-pub fn int4_through_int8<F>(tensor: &Int4Tensor, operation: F, output_scale: f64) -> Int4Tensor
+pub fn int4_through_int8<F>(tensor: &Int4Tensor, operation: F, _output_scale: f64) -> Int4Tensor
 where
     F: FnOnce(&Int8Tensor) -> Int8Tensor,
 {
@@ -334,8 +334,6 @@ pub fn int4_linear(
 
 /// Adds a bias vector to each row of a matrix.
 fn int8_add_bias_vector(tensor: &Int8Tensor, bias: &Int8Tensor, output_scale: f64) -> Int8Tensor {
-    use super::int8_ops::int8_add;
-
     assert!(tensor.is_matrix(), "Input must be 2D");
     assert!(bias.is_vector(), "Bias must be 1D");
 

@@ -2,7 +2,7 @@
 //!
 //! Implements a lookup table for token embeddings.
 
-use helix_core::types::{BoundedTensor, BoundedValue};
+use helix_core::types::{BoundedTensor, BoundedValue, ErrorMargin};
 use thiserror::Error;
 
 /// Errors from embedding operations.
@@ -123,6 +123,47 @@ impl Embedding {
         }
 
         Ok(BoundedTensor::new(result, vec![seq_len, self.embedding_dim]))
+    }
+
+    /// Backward pass for embedding lookup.
+    ///
+    /// Computes the gradient with respect to the embedding table.
+    /// Only the rows that were looked up receive gradient; all other rows get zero.
+    ///
+    /// # Arguments
+    /// * `grad_output` - Gradient from downstream, shape (seq_len, embedding_dim)
+    /// * `token_ids` - The token IDs that were looked up in the forward pass
+    ///
+    /// # Returns
+    /// Gradient for the embedding table, shape (vocab_size, embedding_dim)
+    pub fn backward(
+        &self,
+        grad_output: &BoundedTensor,
+        token_ids: &[usize],
+    ) -> BoundedTensor {
+        let mut grad_table_data = vec![BoundedValue::exact(0.0); self.vocab_size * self.embedding_dim];
+        let grad_data = grad_output.data();
+
+        for (pos, &token_id) in token_ids.iter().enumerate() {
+            if token_id < self.vocab_size {
+                for j in 0..self.embedding_dim {
+                    let src_idx = pos * self.embedding_dim + j;
+                    let dst_idx = token_id * self.embedding_dim + j;
+                    if src_idx < grad_data.len() {
+                        let existing = grad_table_data[dst_idx];
+                        let incoming = grad_data[src_idx];
+                        grad_table_data[dst_idx] = BoundedValue::new(
+                            existing.value() + incoming.value(),
+                            ErrorMargin::absolute(
+                                existing.absolute_error() + incoming.absolute_error(),
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+
+        BoundedTensor::new(grad_table_data, vec![self.vocab_size, self.embedding_dim])
     }
 
     /// Batched forward pass.

@@ -13,11 +13,11 @@ use helix_avm::models::{
 use helix_avm::nn::large_model::{
     compute_optimal_batch_size, estimate_forward_memory, LargeModelConfig, LargeModelExecutor,
 };
-use helix_avm::nn::transformer::{TransformerBlock, TransformerConfig, TransformerStack};
-use helix_core::types::{BoundedTensor, Precision};
+use helix_avm::nn::transformer::{TransformerBlock, TransformerConfig};
+use helix_core::types::BoundedTensor;
 
 /// Test helper to create a model config for a specific parameter count.
-fn config_for_params(target_params: usize) -> TransformerConfig {
+fn _config_for_params(target_params: usize) -> TransformerConfig {
     // Compute dimensions that roughly achieve the target
     let dims = ModelDimensions::new(
         128,  // d_model
@@ -510,7 +510,7 @@ fn test_model_checkpoint_roundtrip() {
     use helix_avm::models::{Checkpoint, CheckpointMetadata, ModelSerializer};
 
     // Create a small model for testing
-    let config = GPTConfig::minimal().unwrap();
+    let _config = GPTConfig::minimal().unwrap();
 
     // Create checkpoint
     let mut checkpoint = Checkpoint::new(

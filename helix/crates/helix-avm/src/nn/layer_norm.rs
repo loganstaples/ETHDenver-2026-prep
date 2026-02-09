@@ -21,7 +21,6 @@
 //! let output = layer_norm.forward(&input)?;
 //! ```
 
-use crate::ops::normalization::{layer_norm as layer_norm_fn, rms_norm as rms_norm_fn};
 use helix_core::types::{BoundedTensor, BoundedValue, ErrorMargin, Precision};
 use thiserror::Error;
 

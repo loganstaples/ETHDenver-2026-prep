@@ -7,7 +7,6 @@
 //! for many neural network operations, especially when combined with INT8 activations.
 
 use helix_core::types::{BoundedTensor, BoundedValue, Shape};
-use std::ops::{Add, Mul, Sub};
 
 use super::schemes::{QuantScheme, TensorQuantParams};
 

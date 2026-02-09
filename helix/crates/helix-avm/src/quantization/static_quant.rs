@@ -5,9 +5,9 @@
 
 use std::collections::HashMap;
 
-use helix_core::types::{BoundedTensor, BoundedValue, Shape};
+use helix_core::types::BoundedTensor;
 
-use super::calibration::{Calibrator, CalibrationData};
+use super::calibration::CalibrationData;
 use super::quantize::{QuantizedTensor, quantize_tensor, fake_quantize_tensor};
 use super::dequantize::dequantize_tensor;
 use super::schemes::{QuantConfig, QuantScheme, TensorQuantParams};
@@ -187,6 +187,7 @@ pub struct StaticQuantizedModel {
     /// Quantized layers.
     layers: Vec<StaticQuantizedLayer>,
     /// Overall config.
+    #[allow(dead_code)]
     config: QuantConfig,
 }
 
@@ -248,6 +249,7 @@ pub fn fake_quantize_weights(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use helix_core::types::BoundedValue;
 
     #[test]
     fn test_static_quantizer_creation() {

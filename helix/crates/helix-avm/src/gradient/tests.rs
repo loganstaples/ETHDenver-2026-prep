@@ -18,9 +18,8 @@ use crate::gradient::autodiff::{GradientTape, Variable};
 use crate::gradient::backward::backward;
 use crate::gradient::loss::{mse_loss, mse_grad, cross_entropy_loss, softmax_cross_entropy_loss};
 use crate::gradient::optimizer::{SGD, Adam, Optimizer};
-use helix_core::types::{BoundedTensor, BoundedValue, Precision};
+use helix_core::types::{BoundedTensor, Precision};
 use std::collections::HashMap;
-use std::rc::Rc;
 
 // ============================================================================
 // Basic Autodiff Tests
@@ -576,7 +575,7 @@ fn test_autodiff_training_step() {
 
 #[test]
 fn test_gradient_clipping_by_value() {
-    use crate::gradient::clipping::{clip_grad_value, GradientClipConfig};
+    use crate::gradient::clipping::GradientClipConfig;
 
     let mut grads = HashMap::new();
     grads.insert(0, BoundedTensor::from_exact(vec![5.0, -10.0, 2.0], vec![3]));
@@ -592,7 +591,7 @@ fn test_gradient_clipping_by_value() {
 
 #[test]
 fn test_gradient_clipping_by_norm() {
-    use crate::gradient::clipping::{clip_grad_norm, GradientClipConfig};
+    use crate::gradient::clipping::clip_grad_norm;
 
     let mut grads = HashMap::new();
     // Gradient with L2 norm = sqrt(9 + 16) = 5.0

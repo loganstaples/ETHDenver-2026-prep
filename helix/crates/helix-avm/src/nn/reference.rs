@@ -36,7 +36,7 @@
 //! 3. Maximum acceptable error tolerance
 //! 4. Test name for identification
 
-use helix_core::types::{BoundedTensor, BoundedValue, Precision};
+use helix_core::types::BoundedTensor;
 use std::collections::HashMap;
 
 /// A reference test vector with input/output pairs.
@@ -656,6 +656,7 @@ pub fn generate_matmul_reference() -> ReferenceTestSuite {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use helix_core::types::Precision;
     use crate::ops;
     use crate::nn::Linear;
 

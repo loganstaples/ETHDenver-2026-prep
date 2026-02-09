@@ -252,7 +252,7 @@ mod tests {
     fn test_temperature_scaling() {
         let bounds = SoftmaxBounds::new(100, 10.0);
         
-        let base_error = bounds.forward_error(1e-7);
+        let _base_error = bounds.forward_error(1e-7);
         let cold_error = temperature_scaled_error(&bounds, 0.5);
         let hot_error = temperature_scaled_error(&bounds, 2.0);
         

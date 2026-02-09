@@ -14,7 +14,7 @@
 //! PyTorch reference vectors. This ensures the AVM computes mathematically
 //! correct results within specified error tolerances.
 
-use helix_core::types::{BoundedTensor, BoundedValue, ErrorMargin, Precision};
+use helix_core::types::{BoundedTensor, Precision};
 use std::collections::HashMap;
 use thiserror::Error;
 

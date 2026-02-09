@@ -3,7 +3,7 @@
 //! Runtime quantization where activation parameters are computed dynamically
 //! based on the actual values during inference. Weights are still pre-quantized.
 
-use helix_core::types::{BoundedTensor, BoundedValue, Shape};
+use helix_core::types::{BoundedTensor, BoundedValue};
 
 use super::quantize::{QuantizedTensor, quantize_tensor, quantize_scalar};
 use super::dequantize::dequantize_tensor;
@@ -13,10 +13,12 @@ use super::schemes::{QuantScheme, TensorQuantParams};
 #[derive(Debug)]
 pub struct DynamicQuantizer {
     /// Weight quantization scheme.
+    #[allow(dead_code)]
     weight_scheme: QuantScheme,
     /// Activation quantization scheme.
     activation_scheme: QuantScheme,
     /// Whether to use symmetric quantization for activations.
+    #[allow(dead_code)]
     symmetric_activations: bool,
     /// Minimum number of samples before using statistics.
     min_samples: usize,

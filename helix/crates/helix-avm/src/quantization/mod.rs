@@ -6,7 +6,7 @@
 //! # Overview
 //!
 //! This module implements:
-//! - **Tensor Types**: Dedicated INT8 and INT4 tensor representations
+//! - **Tensor Types**: Dedicated INT8, INT4, and FP8 tensor representations
 //! - **Operations**: Specialized quantized operations (matmul, activations, normalization)
 //! - **Schemes**: Different quantization formats (INT8, INT4, FP8)
 //! - **Static Quantization**: Pre-calibrated quantization with fixed parameters
@@ -43,6 +43,8 @@ pub mod calibration;
 pub mod circuit_quantizer;
 pub mod dequantize;
 pub mod dynamic;
+pub mod fp8_ops;
+pub mod fp8_tensor;
 pub mod int4_ops;
 pub mod int4_tensor;
 pub mod int8_ops;
@@ -60,6 +62,8 @@ pub use circuit_quantizer::CircuitQuantizer;
 pub use calibration::{CalibrationData, Calibrator, Observer};
 pub use dequantize::{dequantize_scalar, dequantize_tensor};
 pub use dynamic::{DynamicQuantizer, DynamicQuantizedLinear, PerTokenDynamicQuantizer};
+pub use fp8_ops::{fp8_add, fp8_cast, fp8_gelu, fp8_linear, fp8_matmul, fp8_relu, fp8_scale};
+pub use fp8_tensor::{Fp8Format, Fp8Tensor};
 pub use int4_ops::{
     compute_int4_quantization_error, int4_add, int4_gelu, int4_int8_matmul, int4_linear,
     int4_matmul, int4_mul, int4_relu, int4_requantize, int4_scale, Int4QuantConfig,
@@ -97,8 +101,8 @@ pub use static_quant::{
 /// Prelude module for convenient imports.
 pub mod prelude {
     pub use super::{
-        CalibrationData, Calibrator, DynamicQuantizer, Int4Tensor, Int8Tensor,
-        MixedPrecisionConfig, MixedPrecisionExecutor, MixedPrecisionTensor, Observer,
+        CalibrationData, Calibrator, DynamicQuantizer, Fp8Format, Fp8Tensor, Int4Tensor,
+        Int8Tensor, MixedPrecisionConfig, MixedPrecisionExecutor, MixedPrecisionTensor, Observer,
         PrecisionLevel, QuantConfig, QuantScheme, QuantizedTensor, StaticQuantizer,
         TensorQuantParams,
     };

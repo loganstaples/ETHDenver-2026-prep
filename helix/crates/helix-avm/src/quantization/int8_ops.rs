@@ -9,10 +9,9 @@
 //! 2. Track error bounds through computation
 //! 3. Requantize to INT8 for storage
 
-use helix_core::types::{BoundedTensor, BoundedValue, Shape};
+use helix_core::types::BoundedTensor;
 
 use super::int8_tensor::Int8Tensor;
-use super::schemes::{QuantScheme, TensorQuantParams};
 
 // ============================================================================
 // Matrix Operations
@@ -935,6 +934,7 @@ pub struct QuantizationErrorMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::schemes::QuantScheme;
 
     #[test]
     fn test_int8_matmul() {

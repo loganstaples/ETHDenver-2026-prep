@@ -3,15 +3,33 @@
 //! Standard transformer MLP: Linear → Activation → Linear
 
 use super::linear::{Linear, LinearError};
-use crate::ops::activation;
-use helix_core::types::{BoundedTensor, Precision};
+use crate::ops::{self, activation, MatMulError};
+use helix_core::types::{BoundedTensor, BoundedValue, ErrorMargin, Precision};
 use thiserror::Error;
+
+/// Gradients produced by the MLP backward pass.
+#[derive(Debug, Clone)]
+pub struct MLPGradients {
+    /// Gradient with respect to the input.
+    pub grad_input: BoundedTensor,
+    /// Gradient with respect to fc1 weight matrix.
+    pub grad_fc1_weight: BoundedTensor,
+    /// Gradient with respect to fc1 bias.
+    pub grad_fc1_bias: BoundedTensor,
+    /// Gradient with respect to fc2 weight matrix.
+    pub grad_fc2_weight: BoundedTensor,
+    /// Gradient with respect to fc2 bias.
+    pub grad_fc2_bias: BoundedTensor,
+}
 
 /// Errors from MLP operations.
 #[derive(Error, Debug)]
 pub enum MLPError {
     #[error("Linear layer error: {0}")]
     Linear(#[from] LinearError),
+
+    #[error("Matrix multiplication error: {0}")]
+    MatMul(#[from] MatMulError),
 
     #[error("Dimension mismatch: expected {expected}, got {actual}")]
     DimensionMismatch { expected: usize, actual: usize },
@@ -179,6 +197,132 @@ impl MLP {
 
         Ok(output)
     }
+
+    /// Backward pass for MLP block.
+    ///
+    /// Requires cached hidden activations from forward.
+    ///
+    /// grad_output: gradient flowing back, shape (seq_len, d_model)
+    /// input: the original input to the MLP forward pass
+    /// hidden_pre_activation: output of fc1 before activation, shape (seq_len, d_ff)
+    /// hidden_post_activation: output of fc1 after activation, shape (seq_len, d_ff)
+    ///
+    /// Returns MLPGradients containing gradients for input, fc1 weight/bias, fc2 weight/bias.
+    pub fn backward(
+        &self,
+        grad_output: &BoundedTensor,
+        input: &BoundedTensor,
+        hidden_pre_activation: &BoundedTensor,
+        hidden_post_activation: &BoundedTensor,
+    ) -> Result<MLPGradients, MLPError> {
+        let precision = self.precision;
+
+        // Backward through fc2 (y = activated @ W2^T + b2)
+        // dL/d_activated = grad_output @ W2
+        let grad_activated = ops::matmul(grad_output, self.fc2.weights(), precision)?;
+
+        // dL/d_W2 = grad_output^T @ activated
+        let grad_output_t = grad_output.transpose();
+        let grad_fc2_weight =
+            ops::matmul(&grad_output_t, hidden_post_activation, precision)?;
+
+        // dL/d_b2 = sum of grad_output over rows
+        let grad_fc2_bias = sum_over_rows(grad_output);
+
+        // Backward through activation
+        let grad_pre_activation = match self.activation {
+            ActivationType::ReLU => {
+                let mask_data: Vec<BoundedValue<f64>> = hidden_pre_activation
+                    .data()
+                    .iter()
+                    .map(|v| {
+                        if v.value() > 0.0 {
+                            BoundedValue::exact(1.0)
+                        } else {
+                            BoundedValue::exact(0.0)
+                        }
+                    })
+                    .collect();
+                let mask = BoundedTensor::new(mask_data, hidden_pre_activation.shape().clone());
+                grad_activated.hadamard(&mask)
+            }
+            ActivationType::GELU => {
+                let deriv_data: Vec<BoundedValue<f64>> = hidden_pre_activation
+                    .data()
+                    .iter()
+                    .zip(grad_activated.data().iter())
+                    .map(|(x_bv, g)| {
+                        let x = x_bv.value();
+                        let sig_arg = 1.702 * x;
+                        let sig = 1.0 / (1.0 + (-sig_arg).exp());
+                        let gelu_deriv = sig + x * 1.702 * sig * (1.0 - sig);
+                        let grad_val = g.value() * gelu_deriv;
+                        let error = g.absolute_error() * gelu_deriv.abs()
+                            + g.value().abs() * x_bv.absolute_error() * 1.702;
+                        BoundedValue::new(grad_val, ErrorMargin::absolute(error))
+                    })
+                    .collect();
+                BoundedTensor::new(deriv_data, hidden_pre_activation.shape().clone())
+            }
+            ActivationType::SiLU => {
+                let deriv_data: Vec<BoundedValue<f64>> = hidden_pre_activation
+                    .data()
+                    .iter()
+                    .zip(grad_activated.data().iter())
+                    .map(|(x_bv, g)| {
+                        let x = x_bv.value();
+                        let sig = 1.0 / (1.0 + (-x).exp());
+                        let silu_deriv = sig + x * sig * (1.0 - sig);
+                        let grad_val = g.value() * silu_deriv;
+                        let error = g.absolute_error() * silu_deriv.abs()
+                            + g.value().abs() * x_bv.absolute_error();
+                        BoundedValue::new(grad_val, ErrorMargin::absolute(error))
+                    })
+                    .collect();
+                BoundedTensor::new(deriv_data, hidden_pre_activation.shape().clone())
+            }
+        };
+
+        // Backward through fc1 (h = input @ W1^T + b1)
+        // dL/d_input = grad_pre_activation @ W1
+        let grad_input = ops::matmul(&grad_pre_activation, self.fc1.weights(), precision)?;
+
+        // dL/d_W1 = grad_pre_activation^T @ input
+        let grad_pre_t = grad_pre_activation.transpose();
+        let grad_fc1_weight = ops::matmul(&grad_pre_t, input, precision)?;
+
+        // dL/d_b1 = sum of grad_pre_activation over rows
+        let grad_fc1_bias = sum_over_rows(&grad_pre_activation);
+
+        Ok(MLPGradients {
+            grad_input,
+            grad_fc1_weight,
+            grad_fc1_bias,
+            grad_fc2_weight,
+            grad_fc2_bias,
+        })
+    }
+}
+
+/// Sums a 2D tensor over rows, producing a 1D vector of column sums.
+fn sum_over_rows(tensor: &BoundedTensor) -> BoundedTensor {
+    let rows = tensor.shape()[0];
+    let cols = tensor.shape()[1];
+    let data = tensor.data();
+    let mut result = vec![BoundedValue::exact(0.0); cols];
+
+    for i in 0..rows {
+        for j in 0..cols {
+            let val = data[i * cols + j];
+            let existing = result[j];
+            result[j] = BoundedValue::new(
+                existing.value() + val.value(),
+                ErrorMargin::absolute(existing.absolute_error() + val.absolute_error()),
+            );
+        }
+    }
+
+    BoundedTensor::new(result, vec![cols])
 }
 
 /// Gated MLP block used in LLaMA (SwiGLU variant).
