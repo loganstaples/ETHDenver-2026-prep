@@ -316,6 +316,63 @@ impl ShareConsistencyTracker {
     }
 }
 
+/// Fiat-Shamir transcript for deriving deterministic challenges from data.
+///
+/// Instead of using caller-provided seeds (which can be predicted or manipulated),
+/// this derives challenges by hashing all the data being verified. This binds the
+/// random challenges to the specific inputs, preventing a malicious party from
+/// crafting shares that pass verification for a known seed.
+pub struct FiatShamirTranscript {
+    hasher: Sha256,
+}
+
+impl FiatShamirTranscript {
+    /// Creates a new transcript with a domain separator.
+    ///
+    /// The domain separator ensures that transcripts for different verification
+    /// contexts cannot collide, even if they process the same numeric data.
+    pub fn new(domain: &[u8]) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(domain);
+        Self { hasher }
+    }
+
+    /// Appends a single f64 value to the transcript.
+    pub fn append_f64(&mut self, value: f64) {
+        self.hasher.update(value.to_le_bytes());
+    }
+
+    /// Appends a slice of f64 values to the transcript.
+    pub fn append_f64_slice(&mut self, values: &[f64]) {
+        for v in values {
+            self.hasher.update(v.to_le_bytes());
+        }
+    }
+
+    /// Appends raw bytes to the transcript.
+    pub fn append_bytes(&mut self, data: &[u8]) {
+        self.hasher.update(data);
+    }
+
+    /// Finalizes the transcript and returns a deterministic ChaCha20 RNG
+    /// seeded from the transcript hash.
+    pub fn challenge_rng(self) -> ChaCha20Rng {
+        let hash = self.hasher.finalize();
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&hash);
+        ChaCha20Rng::from_seed(seed)
+    }
+
+    /// Finalizes the transcript and returns `count` deterministic challenge values
+    /// in the range [1.0, 1000.0).
+    pub fn challenges(self, count: usize) -> Vec<f64> {
+        let mut rng = self.challenge_rng();
+        (0..count)
+            .map(|_| rng.gen_range(1.0..1000.0))
+            .collect()
+    }
+}
+
 /// Cross-party share verification.
 pub struct CrossPartyVerifier {
     /// Number of parties
@@ -362,11 +419,13 @@ impl CrossPartyVerifier {
     ///
     /// Instead of checking all values, we sample random positions
     /// and verify those. This is faster but provides probabilistic guarantees.
+    ///
+    /// Sampling indices are derived via Fiat-Shamir from the data being verified,
+    /// preventing a malicious party from crafting shares that pass for a known seed.
     pub fn statistical_verify(
         &self,
         all_shares: &[Vec<f64>],
         expected_sums: &[f64],
-        seed: u64,
     ) -> MPCResult<()> {
         let num_values = expected_sums.len();
         if num_values == 0 {
@@ -375,7 +434,14 @@ impl CrossPartyVerifier {
 
         // Number of samples based on security parameter
         let num_samples = (self.security_bits * 2).min(num_values);
-        let mut rng = ChaCha20Rng::seed_from_u64(seed);
+
+        // Derive sampling indices via Fiat-Shamir from the data
+        let mut transcript = FiatShamirTranscript::new(b"helix-mpc-statistical-verify");
+        for party_shares in all_shares {
+            transcript.append_f64_slice(party_shares);
+        }
+        transcript.append_f64_slice(expected_sums);
+        let mut rng = transcript.challenge_rng();
 
         // Random sampling
         let mut checked = 0;
@@ -408,21 +474,26 @@ impl CrossPartyVerifier {
     ///
     /// This is useful for batch verification: instead of checking n equations,
     /// we take a random linear combination and check one equation.
+    ///
+    /// Coefficients are derived via Fiat-Shamir from the data being verified,
+    /// preventing a malicious party from crafting shares that pass for a known seed.
     pub fn verify_random_linear_combination(
         &self,
         all_shares: &[Vec<f64>],
         expected_sums: &[f64],
-        seed: u64,
     ) -> MPCResult<()> {
         let num_values = expected_sums.len();
         if num_values == 0 {
             return Ok(());
         }
 
-        let mut rng = ChaCha20Rng::seed_from_u64(seed);
-
-        // Generate random coefficients
-        let coeffs: Vec<f64> = (0..num_values).map(|_| rng.gen_range(1.0..1000.0)).collect();
+        // Derive challenges via Fiat-Shamir from the data
+        let mut transcript = FiatShamirTranscript::new(b"helix-mpc-linear-combination-verify");
+        for party_shares in all_shares {
+            transcript.append_f64_slice(party_shares);
+        }
+        transcript.append_f64_slice(expected_sums);
+        let coeffs = transcript.challenges(num_values);
 
         // Compute random linear combination of shares
         let combined_sum: f64 = (0..num_values)
@@ -518,17 +589,21 @@ impl BeaverTripleVerifier {
     }
 
     /// Batch verifies multiple multiplications.
+    ///
+    /// Coefficients are derived via Fiat-Shamir from all operation data,
+    /// preventing a malicious party from crafting shares that pass for a known seed.
     pub fn batch_verify_multiplications(
         &self,
         operations: &[(Vec<f64>, Vec<f64>, Vec<f64>)],
-        seed: u64,
     ) -> MPCResult<()> {
-        let mut rng = ChaCha20Rng::seed_from_u64(seed);
-
-        // Generate random coefficients
-        let coeffs: Vec<f64> = (0..operations.len())
-            .map(|_| rng.gen_range(1.0..1000.0))
-            .collect();
+        // Derive challenges via Fiat-Shamir from all operation data
+        let mut transcript = FiatShamirTranscript::new(b"helix-mpc-beaver-batch-verify");
+        for (x_shares, y_shares, result_shares) in operations {
+            transcript.append_f64_slice(x_shares);
+            transcript.append_f64_slice(y_shares);
+            transcript.append_f64_slice(result_shares);
+        }
+        let coeffs = transcript.challenges(operations.len());
 
         // Compute combined check
         let mut combined_expected = 0.0;
@@ -662,8 +737,59 @@ mod tests_advanced {
         let shares = vec![vec![1.0], vec![2.0], vec![3.0]]; // sum = 6
         let expected = vec![6.0];
 
-        assert!(verifier.statistical_verify(&shares, &expected, 42).is_ok());
-        assert!(verifier.verify_random_linear_combination(&shares, &expected, 42).is_ok());
+        assert!(verifier.statistical_verify(&shares, &expected).is_ok());
+        assert!(verifier.verify_random_linear_combination(&shares, &expected).is_ok());
+    }
+
+    #[test]
+    fn test_fiat_shamir_transcript_determinism() {
+        // Same input data must produce the same challenges every time
+        let make_challenges = || {
+            let mut transcript = FiatShamirTranscript::new(b"test-domain");
+            transcript.append_f64(1.0);
+            transcript.append_f64(2.0);
+            transcript.append_f64_slice(&[3.0, 4.0, 5.0]);
+            transcript.challenges(5)
+        };
+
+        let challenges_a = make_challenges();
+        let challenges_b = make_challenges();
+        assert_eq!(challenges_a, challenges_b);
+
+        // Different data must produce different challenges
+        let mut different_transcript = FiatShamirTranscript::new(b"test-domain");
+        different_transcript.append_f64(99.0);
+        different_transcript.append_f64(2.0);
+        different_transcript.append_f64_slice(&[3.0, 4.0, 5.0]);
+        let challenges_c = different_transcript.challenges(5);
+        assert_ne!(challenges_a, challenges_c);
+
+        // Different domain must produce different challenges
+        let mut diff_domain_transcript = FiatShamirTranscript::new(b"other-domain");
+        diff_domain_transcript.append_f64(1.0);
+        diff_domain_transcript.append_f64(2.0);
+        diff_domain_transcript.append_f64_slice(&[3.0, 4.0, 5.0]);
+        let challenges_d = diff_domain_transcript.challenges(5);
+        assert_ne!(challenges_a, challenges_d);
+    }
+
+    #[test]
+    fn test_fiat_shamir_batch_verify() {
+        let verifier = BeaverTripleVerifier::new(1e-6);
+
+        // Valid multiplications: 2*3=6 and 4*5=20
+        let ops = vec![
+            (vec![1.0, 1.0], vec![1.5, 1.5], vec![3.0, 3.0]),  // x=2, y=3, r=6
+            (vec![2.0, 2.0], vec![2.5, 2.5], vec![10.0, 10.0]), // x=4, y=5, r=20
+        ];
+        assert!(verifier.batch_verify_multiplications(&ops).is_ok());
+
+        // Invalid: result doesn't match
+        let bad_ops = vec![
+            (vec![1.0, 1.0], vec![1.5, 1.5], vec![3.0, 3.0]),  // x=2, y=3, r=6 OK
+            (vec![2.0, 2.0], vec![2.5, 2.5], vec![10.0, 11.0]), // x=4, y=5, r=21 BAD
+        ];
+        assert!(verifier.batch_verify_multiplications(&bad_ops).is_err());
     }
 
     #[test]

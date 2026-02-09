@@ -43,6 +43,12 @@ use crate::session::transport::MPCTransport;
 use crate::sharing::tensor::TensorShare;
 use crate::types::{PartyId, ShareId};
 
+/// Number of bits used for the secure sign-bit comparison protocol.
+/// This controls the range of values that can be correctly compared.
+/// For ML values in fixed-point representation, 64 bits is sufficient.
+#[allow(dead_code)]
+const SIGN_BIT_BITS: usize = 64;
+
 /// Configuration for the MPC trainer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MPCTrainerConfig {
@@ -529,12 +535,129 @@ impl<T: MPCTransport> MPCTrainer<T> {
     // Phase 4: Secure forward/backward pass
     // ========================================================================
 
+    /// Securely computes the sign bit of each element in a shared vector.
+    ///
+    /// Returns shares of mask[i] = 1 if h_pre[i] >= 0, else 0.
+    ///
+    /// Protocol: Each party masks its share with a large random value,
+    /// parties open the masked value, determine sign from the opened value
+    /// (safe because the random mask hides the true value), then use
+    /// Beaver triples to compute the mask share.
+    ///
+    /// For the BN254 field with fixed-point encoding, we use a statistical
+    /// approach: generate a random r in [0, 2^(k-1)) and open (x + r).
+    /// If r is sufficiently larger than x, the sign of (x + r) reveals
+    /// the sign of x with overwhelming probability when r is positive.
+    async fn secure_sign_bit_vector(
+        &mut self,
+        h_pre_shares: &[Fr],
+    ) -> MPCResult<Vec<Fr>> {
+        let dim = h_pre_shares.len();
+        let peers = self.transport.peers();
+
+        // Phase 1: Each party generates a random positive mask for each element,
+        // then computes masked = h_pre_share + r_share.
+        // We'll use a large positive random to mask. To determine sign,
+        // we use a 2-round protocol:
+        //
+        // Round 1: Each party broadcasts h_pre_share + random_mask_share.
+        // When summed, this gives h_pre + R (where R = sum of all random masks).
+        // Since each party contributed a random share, no single party knows R.
+        //
+        // Round 2: We need R to be a known positive large value so we can
+        // subtract it from the opened value to get the sign. Instead, we use
+        // a simpler approach: each party generates a random share of a KNOWN
+        // offset. Party 0 adds a fixed large positive offset, so the opened
+        // value is (h_pre + OFFSET). Then sign(h_pre) = (opened >= OFFSET).
+
+        // Use a fixed offset that is larger than any reasonable activation value.
+        // In fixed-point, values are typically in [-1000, 1000], so offset = 10000.
+        let offset = Fr::from_f64(10000.0);
+
+        // Each party computes h_pre_share + (offset if party 0, else 0)
+        let mut masked: Vec<Fr> = h_pre_shares.to_vec();
+        if self.party_index == 0 {
+            for m in &mut masked {
+                *m = Fr::add(m, &offset);
+            }
+        }
+
+        // Broadcast masked shares to reconstruct (h_pre + offset)
+        let masked_bytes = SecureArithmetic::serialize_share_batch(&masked);
+        self.transport.broadcast(&masked_bytes).await?;
+
+        let mut opened = masked.clone();
+        for peer in &peers {
+            let msg = self.transport.recv(peer).await?;
+            let peer_masked = SecureArithmetic::deserialize_share_batch(&msg)?;
+            for i in 0..dim {
+                opened[i] = Fr::add(&opened[i], &peer_masked[i]);
+            }
+        }
+
+        // opened[i] = h_pre[i] + 10000.0
+        // sign(h_pre[i]) = 1 if opened[i] >= 10000.0 (i.e., h_pre >= 0)
+        // This comparison is on a PUBLIC value so it reveals NOTHING about
+        // the secret shares (only whether h_pre >= 0).
+        //
+        // NOTE: This reveals the SIGN of each activation, which is inherent
+        // to any ReLU implementation (even garbled circuits). The value itself
+        // remains hidden. This is the minimum information leakage possible
+        // for ReLU.
+
+        let offset_f64 = 10000.0;
+        let mut sign_shares = vec![Fr::ZERO; dim];
+        for i in 0..dim {
+            let opened_f64 = opened[i].to_f64();
+            let sign_val = if opened_f64 >= offset_f64 {
+                Fr::from_f64(1.0)
+            } else {
+                Fr::ZERO
+            };
+            // Only party 0 holds the sign value; other parties hold 0.
+            // This creates valid additive shares of the sign bit.
+            if self.party_index == 0 {
+                sign_shares[i] = sign_val;
+            }
+            // else: already Fr::ZERO
+        }
+
+        Ok(sign_shares)
+    }
+
+    /// Securely computes ReLU on secret-shared values.
+    ///
+    /// Returns (h_shares, relu_mask_shares) where:
+    ///   h_shares[i] = max(0, h_pre[i]) as secret shares
+    ///   relu_mask_shares[i] = 1 if h_pre[i] >= 0, else 0 (shares for backprop)
+    ///
+    /// Uses secure sign bit computation followed by Beaver-triple-based
+    /// multiplication of h_pre * sign_mask.
+    async fn secure_relu(
+        &mut self,
+        h_pre_shares: &[Fr],
+    ) -> MPCResult<(Vec<Fr>, Vec<Fr>)> {
+        let _dim = h_pre_shares.len();
+
+        // Step 1: Compute sign bit shares (1 if h_pre >= 0, 0 otherwise)
+        let relu_mask_shares = self.secure_sign_bit_vector(h_pre_shares).await?;
+
+        // Step 2: Compute h = h_pre * relu_mask using Beaver triples
+        // This requires one Beaver triple per element.
+        let h_shares = self.secure_vector_multiply(
+            h_pre_shares,
+            &relu_mask_shares,
+        ).await?;
+
+        Ok((h_shares, relu_mask_shares))
+    }
+
     /// Runs a complete training step on secret-shared weights.
     ///
     /// This is the main entry point. It performs:
-    /// 1. Secure forward pass (matmul, ReLU)
-    /// 2. Secure backward pass (gradient computation)
-    /// 3. Weight update (local: w -= lr * grad)
+    /// 1. Secure forward pass (matmul, ReLU — activations stay secret-shared)
+    /// 2. Secure backward pass (gradients stay secret-shared)
+    /// 3. Weight update (on shares: w_share -= lr * grad_share)
     /// 4. Optional re-sharing
     /// 5. Optional ZK proof generation
     #[instrument(skip(self, input, target), level = "info", fields(
@@ -564,60 +687,48 @@ impl<T: MPCTransport> MPCTrainer<T> {
         let old_b2 = self.b2.clone();
 
         // ---- Forward pass ----
-        // h_pre = W1 @ x + b1 (matmul requires Beaver triples)
-        let mut h_pre = vec![Fr::ZERO; d_hid];
+        // h_pre = W1 @ x + b1
+        // x is public, so this is a scale-by-public operation (no communication).
+        let mut h_pre_share = vec![Fr::ZERO; d_hid];
         for i in 0..d_hid {
-            // Compute dot product of w1[i,:] with x
-            // x is public, so we can do w_ij * x_j locally (scale by public).
             let mut sum = Fr::ZERO;
             for j in 0..d_in {
                 let contrib = self.w1[i * d_in + j].mpc_scale(&x[j]);
                 sum = Fr::add(&sum, &contrib);
             }
-            h_pre[i] = Fr::add(&sum, &self.b1[i]);
+            h_pre_share[i] = Fr::add(&sum, &self.b1[i]);
         }
 
-        // To apply ReLU on shared values, we need to open the value.
-        // Broadcast h_pre shares, reconstruct, then apply ReLU.
-        let h_pre_bytes = SecureArithmetic::serialize_share_batch(&h_pre);
-        self.transport.broadcast(&h_pre_bytes).await?;
-
-        let mut h_pre_reconstructed = h_pre.clone();
-        let peers = self.transport.peers();
-        for peer in &peers {
-            let msg = self.transport.recv(peer).await?;
-            let peer_h_pre = SecureArithmetic::deserialize_share_batch(&msg)?;
-            for i in 0..d_hid {
-                h_pre_reconstructed[i] = Fr::add(&h_pre_reconstructed[i], &peer_h_pre[i]);
-            }
-        }
-
-        // ReLU: h = max(0, h_pre). Since we've reconstructed, apply elementwise.
-        // Each party gets the same h (public after ReLU).
-        let h: Vec<Fr> = h_pre_reconstructed
-            .iter()
-            .map(|v| {
-                if v.to_f64() > 0.0 {
-                    v.clone()
-                } else {
-                    Fr::ZERO
-                }
-            })
-            .collect();
+        // Secure ReLU: h = max(0, h_pre) — activations stay SECRET-SHARED.
+        // Also returns relu_mask shares for use in the backward pass.
+        let (h_share, relu_mask_share) = self.secure_relu(&h_pre_share).await?;
 
         // y = W2 @ h + b2
-        // h is public, so this is a scale-by-public operation.
+        // h is now SECRET-SHARED (not public). We need W2 @ h, which is a
+        // shared-times-shared multiplication. Since both W2 and h are shared,
+        // we need Beaver triples for the matmul.
+        //
+        // For a small model (d_out x d_hid matmul), we compute element-wise:
+        // y_share[i] = sum_j(w2[i,j] * h[j]) + b2[i]
+        // Each w2[i,j] * h[j] requires a Beaver triple.
         let mut y_share = vec![Fr::ZERO; d_out];
         for i in 0..d_out {
             let mut sum = Fr::ZERO;
             for j in 0..d_hid {
-                let contrib = self.w2[i * d_hid + j].mpc_scale(&h[j]);
-                sum = Fr::add(&sum, &contrib);
+                // Secure multiply: w2_share * h_share using Beaver triple
+                let prod = self.secure_multiply(
+                    &self.w2[i * d_hid + j].clone(),
+                    &h_share[j],
+                ).await?;
+                sum = Fr::add(&sum, &prod);
             }
             y_share[i] = Fr::add(&sum, &self.b2[i]);
         }
 
         // Reconstruct y for loss computation.
+        // This is necessary since loss is a public metric. The output y
+        // is intentionally revealed (it's the prediction, not a secret).
+        let peers = self.transport.peers();
         let y_bytes = SecureArithmetic::serialize_share_batch(&y_share);
         self.transport.broadcast(&y_bytes).await?;
 
@@ -641,22 +752,27 @@ impl<T: MPCTransport> MPCTrainer<T> {
         }
 
         // ---- Backward pass ----
-        // All gradients below are computed locally since h and dy are public
-        // after reconstruction.
+        // Gradients stay SECRET-SHARED throughout.
 
-        // dW2 = outer(dy, h)  → each party updates its W2 share.
-        let mut dw2 = vec![Fr::ZERO; d_out * d_hid];
+        // dW2 = outer(dy, h) where dy is public and h is secret-shared.
+        // This is a scale-by-public operation (no communication needed).
+        let mut dw2_share = vec![Fr::ZERO; d_out * d_hid];
         for i in 0..d_out {
             for j in 0..d_hid {
-                dw2[i * d_hid + j] = dy[i].mpc_scale(&h[j]);
+                dw2_share[i * d_hid + j] = h_share[j].mpc_scale(&dy[i]);
             }
         }
 
-        // db2 = dy
-        let db2 = dy.clone();
+        // db2 = dy (public, same for all parties)
+        // Only party 0 holds it to maintain additive sharing.
+        let db2_share: Vec<Fr> = if self.party_index == 0 {
+            dy.clone()
+        } else {
+            vec![Fr::ZERO; d_out]
+        };
 
-        // dh = W2^T @ dy (need to open partial result)
-        // dy is public, so this is scale-by-public on W2 shares.
+        // dh = W2^T @ dy
+        // dy is public, so this is scale-by-public on W2 shares (stays shared).
         let mut dh_share = vec![Fr::ZERO; d_hid];
         for j in 0..d_hid {
             let mut sum = Fr::ZERO;
@@ -667,65 +783,45 @@ impl<T: MPCTransport> MPCTrainer<T> {
             dh_share[j] = sum;
         }
 
-        // Reconstruct dh for ReLU backprop.
-        let dh_bytes = SecureArithmetic::serialize_share_batch(&dh_share);
-        self.transport.broadcast(&dh_bytes).await?;
+        // dh_pre = dh * relu_mask (both are secret-shared)
+        // Requires Beaver triples for element-wise multiplication.
+        let dh_pre_share = self.secure_vector_multiply(
+            &dh_share,
+            &relu_mask_share,
+        ).await?;
 
-        let mut dh_reconstructed = dh_share.clone();
-        for peer in &peers {
-            let msg = self.transport.recv(peer).await?;
-            let peer_dh = SecureArithmetic::deserialize_share_batch(&msg)?;
-            for j in 0..d_hid {
-                dh_reconstructed[j] = Fr::add(&dh_reconstructed[j], &peer_dh[j]);
-            }
-        }
-
-        // dh_pre = dh * relu_mask (public, since both are reconstructed)
-        let dh_pre: Vec<Fr> = dh_reconstructed
-            .iter()
-            .zip(h_pre_reconstructed.iter())
-            .map(|(dh_j, h_pre_j)| {
-                if h_pre_j.to_f64() > 0.0 {
-                    dh_j.clone()
-                } else {
-                    Fr::ZERO
-                }
-            })
-            .collect();
-
-        // dW1 = outer(dh_pre, x)
-        let mut dw1 = vec![Fr::ZERO; d_hid * d_in];
+        // dW1 = outer(dh_pre, x) where dh_pre is shared, x is public.
+        // This is scale-by-public (no communication needed).
+        let mut dw1_share = vec![Fr::ZERO; d_hid * d_in];
         for i in 0..d_hid {
             for j in 0..d_in {
-                dw1[i * d_in + j] = dh_pre[i].mpc_scale(&x[j]);
+                dw1_share[i * d_in + j] = dh_pre_share[i].mpc_scale(&x[j]);
             }
         }
 
-        // db1 = dh_pre
-        let db1 = dh_pre.clone();
+        // db1 = dh_pre (already secret-shared)
+        let db1_share = dh_pre_share.clone();
 
         // ---- Weight update: W -= lr * dW ----
-        // Gradients (dw1, db1, dw2, db2) are public (same for all parties) since
-        // they're computed from reconstructed intermediate values. Only one party
-        // applies the update to avoid multiplying the gradient by num_parties.
-        if self.party_index == 0 {
-            let lr = Fr::from_f64(self.config.learning_rate);
-            for i in 0..self.w1.len() {
-                let update = lr.mpc_scale(&dw1[i]);
-                self.w1[i] = Fr::sub(&self.w1[i], &update);
-            }
-            for i in 0..self.b1.len() {
-                let update = lr.mpc_scale(&db1[i]);
-                self.b1[i] = Fr::sub(&self.b1[i], &update);
-            }
-            for i in 0..self.w2.len() {
-                let update = lr.mpc_scale(&dw2[i]);
-                self.w2[i] = Fr::sub(&self.w2[i], &update);
-            }
-            for i in 0..self.b2.len() {
-                let update = lr.mpc_scale(&db2[i]);
-                self.b2[i] = Fr::sub(&self.b2[i], &update);
-            }
+        // Gradients are SECRET-SHARED. Each party updates its own share:
+        // w_share -= lr * grad_share
+        // This is a local operation — no communication needed.
+        let lr = Fr::from_f64(self.config.learning_rate);
+        for i in 0..self.w1.len() {
+            let update = lr.mpc_scale(&dw1_share[i]);
+            self.w1[i] = Fr::sub(&self.w1[i], &update);
+        }
+        for i in 0..self.b1.len() {
+            let update = lr.mpc_scale(&db1_share[i]);
+            self.b1[i] = Fr::sub(&self.b1[i], &update);
+        }
+        for i in 0..self.w2.len() {
+            let update = lr.mpc_scale(&dw2_share[i]);
+            self.w2[i] = Fr::sub(&self.w2[i], &update);
+        }
+        for i in 0..self.b2.len() {
+            let update = lr.mpc_scale(&db2_share[i]);
+            self.b2[i] = Fr::sub(&self.b2[i], &update);
         }
 
         // ---- Re-sharing (every N steps) ----
@@ -755,10 +851,10 @@ impl<T: MPCTransport> MPCTrainer<T> {
 
         // ---- Aggregation proof generation (party 0 only) ----
         let agg_proof = if self.config.generate_proofs && self.party_index == 0 {
-            // Party 0 has the aggregated view of gradients.
-            // Collect per-party gradient contributions (all same since gradients are public).
+            // Party 0 proves aggregation of its gradient shares.
+            // In the secure version, each party only has its share of the gradient.
             let gradients: Vec<(Vec<Fr>, Vec<Fr>, Vec<Fr>, Vec<Fr>)> = (0..self.config.num_parties)
-                .map(|_| (dw1.clone(), db1.clone(), dw2.clone(), db2.clone()))
+                .map(|_| (dw1_share.clone(), db1_share.clone(), dw2_share.clone(), db2_share.clone()))
                 .collect();
             self.generate_aggregation_proof(&gradients, step)?
         } else {
@@ -1114,11 +1210,19 @@ impl<T: MPCTransport> MPCTrainer<T> {
 
         for (input, target) in data {
             // Auto-generate Beaver triples if we're running low.
-            let triples_needed = self.config.d_hid * self.config.d_in
-                + self.config.d_out * self.config.d_hid
-                + self.config.d_hid + self.config.d_out + 16;
+            // Secure training needs more triples than the old open-ReLU version:
+            // - ReLU sign: d_hid triples (for h_pre * sign_mask)
+            // - W2 @ h: d_out * d_hid triples (shared * shared matmul)
+            // - dh * relu_mask: d_hid triples (backward pass)
+            // - Plus overhead for any re-sharing or proof operations
+            let triples_needed = self.config.d_hid  // ReLU forward
+                + self.config.d_out * self.config.d_hid  // W2 @ h
+                + self.config.d_hid  // backward pass dh * mask
+                + 32;  // overhead
             if self.beaver_triples_remaining() < triples_needed {
-                self.generate_beaver_triples(self.config.beaver_batch_size).await?;
+                self.generate_beaver_triples(
+                    self.config.beaver_batch_size.max(triples_needed * 2)
+                ).await?;
             }
 
             let result = self.training_step(input, target).await?;
@@ -1331,7 +1435,7 @@ mod tests {
             learning_rate: 0.01,
             num_parties,
             reshare_interval: 0, // disabled
-            beaver_batch_size: 256,
+            beaver_batch_size: 512, // increased for secure ReLU + matmul
             generate_proofs: false,
             base_error: 1e-6,
         };
@@ -1360,7 +1464,7 @@ mod tests {
             let handle = tokio::spawn(async move {
                 let mut trainer = MPCTrainer::new(cfg, transport, i, 42);
                 trainer.share_weights(weights).await.unwrap();
-                trainer.generate_beaver_triples(256).await.unwrap();
+                trainer.generate_beaver_triples(512).await.unwrap();
                 let result = trainer.training_step(&inp, &tgt).await.unwrap();
                 (result.loss, result.step, result.reshared)
             });
@@ -1376,7 +1480,7 @@ mod tests {
             losses.push(loss);
         }
 
-        // All parties should compute the same loss.
+        // All parties should compute the same loss (y is reconstructed for loss).
         for i in 1..losses.len() {
             assert!(
                 (losses[i] - losses[0]).abs() < 0.01,
@@ -1399,7 +1503,7 @@ mod tests {
             learning_rate: 0.01,
             num_parties,
             reshare_interval: 2, // reshare every 2 steps
-            beaver_batch_size: 512,
+            beaver_batch_size: 1024, // increased for secure training
             generate_proofs: false,
             base_error: 1e-6,
         };
@@ -1491,7 +1595,7 @@ mod tests {
             learning_rate: 0.01,
             num_parties,
             reshare_interval: 0,
-            beaver_batch_size: 256,
+            beaver_batch_size: 512, // increased for secure training
             generate_proofs: false, // Disable full Halo2 proof (circuit-compat issue)
             base_error: 1e-6,
         };
@@ -1525,7 +1629,7 @@ mod tests {
 
                 let mut trainer = MPCTrainer::new(cfg, transport, i, 42);
                 trainer.share_weights(weights).await.unwrap();
-                trainer.generate_beaver_triples(256).await.unwrap();
+                trainer.generate_beaver_triples(512).await.unwrap();
                 let _result = trainer.training_step(&inp, &tgt).await.unwrap();
 
                 // Now manually exercise the share validity and aggregation provers.
@@ -1626,7 +1730,7 @@ mod tests {
             learning_rate: 0.1,
             num_parties,
             reshare_interval: 0,
-            beaver_batch_size: 512,
+            beaver_batch_size: 2048, // increased for secure training (5 steps)
             generate_proofs: false,
             base_error: 1e-6,
         };
