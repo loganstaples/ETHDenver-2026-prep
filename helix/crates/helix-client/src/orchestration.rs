@@ -183,11 +183,20 @@ pub struct TrainingOrchestrator {
     prover: Option<helix_prover::MLTrainingProverV2>,
     /// Current training state (weights) used to build witnesses.
     training_state: Option<crate::demo::real_training::TrainingState>,
+    /// Shared HTTP client for communicating with spawned nodes.
+    /// Reuses connection pool across all health checks, round triggers, and
+    /// status polls instead of creating a new client per request.
+    http_client: reqwest::Client,
 }
 
 impl TrainingOrchestrator {
     /// Create a new orchestrator from configuration.
     pub fn new(config: OrchestratorConfig) -> Self {
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .pool_max_idle_per_host(4)
+            .build()
+            .expect("static HTTP client config");
         Self {
             config,
             anvil_process: None,
@@ -198,6 +207,7 @@ impl TrainingOrchestrator {
             progress_callback: None,
             prover: None,
             training_state: None,
+            http_client,
         }
     }
 
@@ -356,9 +366,6 @@ impl TrainingOrchestrator {
 
         // Wait for Anvil to be ready by polling the RPC endpoint
         let rpc_url = format!("http://127.0.0.1:{}", self.config.anvil_port);
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .build()?;
 
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -373,7 +380,7 @@ impl TrainingOrchestrator {
                 "id": 1
             });
 
-            match client.post(&rpc_url).json(&body).send().await {
+            match self.http_client.post(&rpc_url).json(&body).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     info!("Anvil ready at {}", rpc_url);
                     break;
@@ -736,9 +743,6 @@ impl TrainingOrchestrator {
         info!("Waiting for {} workers to connect...", self.config.workers);
 
         let deadline = Instant::now() + self.config.worker_timeout;
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()?;
 
         let mut last_worker_count = 0u64;
 
@@ -768,7 +772,7 @@ impl TrainingOrchestrator {
             let _ = self.check_process_health();
 
             let url = format!("http://127.0.0.1:{}/health", self.config.http_port);
-            match client.get(&url).send().await {
+            match self.http_client.get(&url).send().await {
                 Ok(resp) => {
                     if let Ok(json) = resp.json::<serde_json::Value>().await {
                         let workers = json.get("workers")
@@ -798,8 +802,8 @@ impl TrainingOrchestrator {
     /// Trigger a training round via the aggregator's HTTP API.
     pub async fn trigger_round(&self) -> Result<serde_json::Value> {
         let url = format!("http://127.0.0.1:{}/round/start", self.config.http_port);
-        let client = reqwest::Client::new();
-        let resp = client
+        let resp = self
+            .http_client
             .post(&url)
             .send()
             .await
@@ -813,9 +817,6 @@ impl TrainingOrchestrator {
     /// Poll the aggregator until the current round completes.
     pub async fn wait_for_round_completion(&self, round: u32) -> Result<serde_json::Value> {
         let deadline = Instant::now() + self.config.round_timeout;
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()?;
 
         loop {
             if Instant::now() > deadline {
@@ -823,7 +824,7 @@ impl TrainingOrchestrator {
             }
 
             let url = format!("http://127.0.0.1:{}/round/status", self.config.http_port);
-            match client.get(&url).send().await {
+            match self.http_client.get(&url).send().await {
                 Ok(resp) => {
                     if let Ok(status) = resp.json::<serde_json::Value>().await {
                         let completed = status
@@ -1137,11 +1138,8 @@ impl TrainingOrchestrator {
     /// Check aggregator health via HTTP endpoint.
     pub async fn check_aggregator_health(&self) -> Result<bool> {
         let url = format!("http://127.0.0.1:{}/health", self.config.http_port);
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(3))
-            .build()?;
 
-        match client.get(&url).send().await {
+        match self.http_client.get(&url).send().await {
             Ok(resp) => {
                 if let Ok(json) = resp.json::<serde_json::Value>().await {
                     let status = json
