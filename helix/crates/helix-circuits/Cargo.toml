@@ -11,10 +11,10 @@ sha2 = "0.10"
 sha3 = "0.10"    # Keccak256 for EVM compatibility
 hex = "0.4"     # Hex encoding for EVM proof format
 subtle = "2.5"  # Constant-time cryptographic operations
+rand_core = "0.6"  # OsRng for SRS generation
 
 [dev-dependencies]
 rand = "0.8"
-rand_core = "0.6"
 criterion = "0.5"
 
 [features]

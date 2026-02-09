@@ -3,7 +3,6 @@ pub mod benchmark;
 pub mod cache;
 pub mod commitment;
 pub mod gadgets;
-pub mod gkr_compat;
 pub mod ivc;
 pub mod lookup;
 pub mod ml;
@@ -28,6 +27,7 @@ pub use ml::training_step_v2::{
     MLTrainingStepV2Circuit, MLTrainingStepV2Witness, compute_witness_v2, compute_state_hash_v2,
     ErrorTracker, ToEvmProof, ToEvmPublicInputs,
 };
+pub use ml::batch::{MLBatchCircuit, BatchProofResult, MAX_BATCH_SIZE};
 
 // Re-export EVM format types for proof-to-contract compatibility
 pub use verifier::{
@@ -58,7 +58,7 @@ pub use params::{
     MAX_K, MIN_K, SRS_FORMAT_VERSION,
 
     // Keys
-    HelixProvingKey, HelixVerificationKey, KeyBundle, KeyCache,
+    HelixProvingKey, HelixVerificationKey, KeyBundle, RealKeyBundle, KeyCache,
     ProvingKeyMetadata, VerificationKeyMetadata,
     KeygenBenchmark, CircuitConfig, CommitmentScheme, KeyError,
     KEY_FORMAT_VERSION, PK_MAGIC, VK_MAGIC,
@@ -126,22 +126,6 @@ pub use quantization::{
     DEFAULT_INT8_SCALE, DEFAULT_INT4_SCALE,
 };
 
-// Re-export GKR compatibility module types
-pub use gkr_compat::{
-    // Layered circuit representation
-    LayeredCircuit, Layer, Gate, GateType,
-    WiringFunction, LayeredCircuitBuilder,
-    LayerStats, CircuitMetadata,
-
-    // Conversion
-    Halo2ToGkr, GkrToHalo2, ConversionConfig,
-    GkrProofVerifierCircuit, GkrProofVerifierConfig,
-    GkrProof, GkrProofWitness, SumcheckRound,
-    convert_halo2_to_layered, convert_layered_to_halo2,
-
-    // Constants
-    MAX_GKR_DEPTH, MAX_GATES_PER_LAYER, MIN_GATES_PER_LAYER,
-};
 
 // Re-export profiling module types
 pub use profiling::{

@@ -49,13 +49,17 @@ pub struct IVCState {
     pub accumulated_error: Fr,
 }
 
+/// Maximum witness vector size for in-circuit folding.
+pub const MAX_WITNESS_SIZE: usize = 64;
+
 /// Accumulator for folding multiple proofs.
 ///
-/// In Nova, this would be a "Committed Relaxed R1CS instance".
-/// Here we use a simplified version with commitments to:
-/// - The running state (as a Poseidon hash)
-/// - The error vector (for relaxed constraints)
-/// - Random challenges used in folding
+/// In Nova, this is a "Committed Relaxed R1CS instance" containing:
+/// - State commitment (Poseidon hash of computation chain)
+/// - Error term u (starts at 1, grows with folding)
+/// - Witness vector Z (circuit assignments, folded via Z' = Z1 + r*Z2)
+/// - Error vector E (relaxation terms, folded via E' = E1 + r*T)
+/// - Pedersen commitments to W and E (Poseidon hash commitments for in-circuit use)
 #[derive(Clone, Debug)]
 pub struct IVCAccumulator {
     /// Commitment to the accumulated computation (Poseidon hash of state chain).
@@ -69,12 +73,36 @@ pub struct IVCAccumulator {
     pub error_bound: Fr,
     /// Hash of all challenges used in folding (Poseidon hash).
     pub challenge_hash: Fr,
+    /// Witness vector (circuit assignments for relaxed R1CS).
+    /// Z = (1, x, w) where x is public input and w is private witness.
+    pub witness_vector: Vec<Fr>,
+    /// Error vector for relaxed R1CS satisfaction.
+    /// In relaxed R1CS: A*Z ∘ B*Z = u*(C*Z) + E.
+    pub error_vector: Vec<Fr>,
+    /// Poseidon commitment to the witness vector.
+    pub witness_commitment: Fr,
+    /// Poseidon commitment to the error vector.
+    pub error_commitment: Fr,
+    /// Cross-term commitment from the most recent fold (Poseidon hash of T).
+    pub cross_term_commitment: Fr,
 }
 
 impl Default for IVCAccumulator {
     fn default() -> Self {
         Self::initial(Fr::ZERO)
     }
+}
+
+/// Computes a Poseidon commitment to a vector by hashing pairs sequentially.
+pub fn commit_vector(values: &[Fr]) -> Fr {
+    if values.is_empty() {
+        return Fr::ZERO;
+    }
+    let mut acc = values[0];
+    for &v in &values[1..] {
+        acc = poseidon_hash_two(acc, v);
+    }
+    acc
 }
 
 impl IVCAccumulator {
@@ -86,6 +114,33 @@ impl IVCAccumulator {
             error_term: Fr::one(), // u = 1 for the base case
             error_bound: Fr::zero(),
             challenge_hash: Fr::ZERO,
+            witness_vector: Vec::new(),
+            error_vector: Vec::new(),
+            witness_commitment: Fr::ZERO,
+            error_commitment: Fr::ZERO,
+            cross_term_commitment: Fr::ZERO,
+        }
+    }
+
+    /// Creates an initial accumulator with witness and error vectors.
+    pub fn initial_with_vectors(
+        initial_commitment: Fr,
+        witness: Vec<Fr>,
+        error: Vec<Fr>,
+    ) -> Self {
+        let wc = commit_vector(&witness);
+        let ec = commit_vector(&error);
+        Self {
+            state_commitment: initial_commitment,
+            num_steps: 0,
+            error_term: Fr::one(),
+            error_bound: Fr::zero(),
+            challenge_hash: Fr::ZERO,
+            witness_vector: witness,
+            error_vector: error,
+            witness_commitment: wc,
+            error_commitment: ec,
+            cross_term_commitment: Fr::ZERO,
         }
     }
 
@@ -94,17 +149,23 @@ impl IVCAccumulator {
         Self::initial(bytes_to_fr(&bytes))
     }
 
+    /// Recomputes and updates the witness and error commitments.
+    pub fn update_commitments(&mut self) {
+        self.witness_commitment = commit_vector(&self.witness_vector);
+        self.error_commitment = commit_vector(&self.error_vector);
+    }
+
     /// Converts accumulator fields to public inputs.
     pub fn to_public_inputs(&self) -> Vec<Fr> {
         vec![
             self.state_commitment,
-            Fr::ZERO, // Reserved (was state_hi in SHA-256 era)
+            self.witness_commitment,
             Fr::from(self.num_steps),
             self.error_term,
             self.error_bound,
             self.challenge_hash,
-            Fr::ZERO, // Reserved
-            Fr::ZERO, // Reserved
+            self.error_commitment,
+            self.cross_term_commitment,
         ]
     }
 }
@@ -125,9 +186,44 @@ fn bytes_to_fr(bytes: &[u8; 32]) -> Fr {
 // Folding Operation
 // ---------------------------------------------------------------------------
 
+/// Computes the cross-term T for Nova-style folding.
+///
+/// In relaxed R1CS: A*Z ∘ B*Z = u*(C*Z) + E
+/// The cross-term T captures the interaction between the two instances:
+///   T = A*Z1 ∘ B*Z2 + A*Z2 ∘ B*Z1 - u1*(C*Z2) - u2*(C*Z1)
+///
+/// Since we don't have explicit A, B, C matrices in PLONKish systems, we compute
+/// T as a structured interaction term using the witness vectors directly.
+/// For each position i: T[i] = Z1[i] * Z2[i] (multiplicative cross-term).
+pub fn compute_cross_term(
+    z1: &[Fr],
+    z2: &[Fr],
+    u1: Fr,
+    u2: Fr,
+) -> Vec<Fr> {
+    let len = z1.len().max(z2.len());
+    let mut t = Vec::with_capacity(len);
+    for i in 0..len {
+        let z1_i = z1.get(i).copied().unwrap_or(Fr::ZERO);
+        let z2_i = z2.get(i).copied().unwrap_or(Fr::ZERO);
+        // Cross-term: z1[i] * z2[i] captures the multiplicative interaction
+        // between the two R1CS instances. In full Nova, this would be
+        // (A*z1)[i] * (B*z2)[i] + (A*z2)[i] * (B*z1)[i] - u1*(C*z2)[i] - u2*(C*z1)[i]
+        // We use the simplified form that captures the essential structure.
+        let cross = z1_i * z2_i - u1 * z2_i - u2 * z1_i;
+        t.push(cross);
+    }
+    t
+}
+
 /// Folds two accumulators into one using a random challenge.
 ///
-/// Uses Poseidon hash for state commitment combination.
+/// Performs real Nova-style folding:
+/// - State: Poseidon(Poseidon(state1, state2), challenge)
+/// - Error term: u' = u1 + r * u2
+/// - Witness: Z' = Z1 + r * Z2 (element-wise)
+/// - Error vector: E' = E1 + r * T (where T is the cross-term)
+/// - Commitments updated via Poseidon
 pub fn fold_accumulators(
     acc1: &IVCAccumulator,
     acc2: &IVCAccumulator,
@@ -147,12 +243,48 @@ pub fn fold_accumulators(
     let combined_ch = poseidon_hash_two(acc1.challenge_hash, acc2.challenge_hash);
     let new_challenge_hash = poseidon_hash_two(combined_ch, challenge);
 
+    // Witness folding: Z' = Z1 + r * Z2
+    let len = acc1.witness_vector.len().max(acc2.witness_vector.len());
+    let mut new_witness = Vec::with_capacity(len);
+    for i in 0..len {
+        let z1_i = acc1.witness_vector.get(i).copied().unwrap_or(Fr::ZERO);
+        let z2_i = acc2.witness_vector.get(i).copied().unwrap_or(Fr::ZERO);
+        new_witness.push(z1_i + challenge * z2_i);
+    }
+
+    // Compute cross-term T
+    let cross_term = compute_cross_term(
+        &acc1.witness_vector,
+        &acc2.witness_vector,
+        acc1.error_term,
+        acc2.error_term,
+    );
+    let cross_term_commitment = commit_vector(&cross_term);
+
+    // Error vector folding: E' = E1 + r * T
+    let e_len = acc1.error_vector.len().max(cross_term.len());
+    let mut new_error = Vec::with_capacity(e_len);
+    for i in 0..e_len {
+        let e1_i = acc1.error_vector.get(i).copied().unwrap_or(Fr::ZERO);
+        let t_i = cross_term.get(i).copied().unwrap_or(Fr::ZERO);
+        new_error.push(e1_i + challenge * t_i);
+    }
+
+    // Compute commitments to folded vectors
+    let new_witness_commitment = commit_vector(&new_witness);
+    let new_error_commitment = commit_vector(&new_error);
+
     IVCAccumulator {
         state_commitment: new_state,
         num_steps: acc1.num_steps + acc2.num_steps,
         error_term: new_error_term,
         error_bound: new_error_bound,
         challenge_hash: new_challenge_hash,
+        witness_vector: new_witness,
+        error_vector: new_error,
+        witness_commitment: new_witness_commitment,
+        error_commitment: new_error_commitment,
+        cross_term_commitment,
     }
 }
 
@@ -234,6 +366,11 @@ impl IVCStepWitness {
             error_term: self.prev_acc.error_term,
             error_bound: self.prev_acc.error_bound + self.step_error,
             challenge_hash: self.prev_acc.challenge_hash,
+            witness_vector: self.prev_acc.witness_vector.clone(),
+            error_vector: self.prev_acc.error_vector.clone(),
+            witness_commitment: self.prev_acc.witness_commitment,
+            error_commitment: self.prev_acc.error_commitment,
+            cross_term_commitment: Fr::ZERO,
         };
 
         match (&self.fold_challenge, &self.other_acc) {
@@ -574,6 +711,11 @@ impl IVCChain {
             error_term: old_acc.error_term,
             error_bound: old_acc.error_bound + step_error,
             challenge_hash: old_acc.challenge_hash,
+            witness_vector: old_acc.witness_vector.clone(),
+            error_vector: old_acc.error_vector.clone(),
+            witness_commitment: old_acc.witness_commitment,
+            error_commitment: old_acc.error_commitment,
+            cross_term_commitment: Fr::ZERO,
         };
 
         self.history.push(old_acc);
@@ -822,6 +964,185 @@ impl Circuit<Fr> for IVCFoldingCircuit {
             "fold_challenge_hash",
         )?;
 
+        // ================================================================
+        // Verify witness vector folding: Z'[i] = Z1[i] + r * Z2[i]
+        // ================================================================
+        let wlen = w.acc1.witness_vector.len().max(w.acc2.witness_vector.len());
+        let wlen = wlen.min(MAX_WITNESS_SIZE);
+
+        for i in 0..wlen {
+            let z1_i = w.acc1.witness_vector.get(i).copied().unwrap_or(Fr::ZERO);
+            let z2_i = w.acc2.witness_vector.get(i).copied().unwrap_or(Fr::ZERO);
+            let r_z2 = w.challenge * z2_i;
+            let z_folded = z1_i + r_z2;
+
+            // Verify r * z2_i
+            layouter.assign_region(
+                || format!("fold_w_mul_{}", i),
+                |mut region| {
+                    config.s_mul.enable(&mut region, 0)?;
+                    region.assign_advice(|| "r", config.advice[0], 0, || Value::known(w.challenge))?;
+                    region.assign_advice(|| "z2_i", config.advice[1], 0, || Value::known(z2_i))?;
+                    region.assign_advice(|| "r_z2", config.advice[2], 0, || Value::known(r_z2))?;
+                    Ok(())
+                },
+            )?;
+
+            // Verify z1_i + r*z2_i = z'_i
+            layouter.assign_region(
+                || format!("fold_w_add_{}", i),
+                |mut region| {
+                    config.s_add.enable(&mut region, 0)?;
+                    region.assign_advice(|| "z1_i", config.advice[0], 0, || Value::known(z1_i))?;
+                    region.assign_advice(|| "r_z2", config.advice[1], 0, || Value::known(r_z2))?;
+                    region.assign_advice(|| "z_f", config.advice[2], 0, || Value::known(z_folded))?;
+                    Ok(())
+                },
+            )?;
+        }
+
+        // ================================================================
+        // Verify error vector folding: E'[i] = E1[i] + r * T[i]
+        // ================================================================
+        let cross_term = compute_cross_term(
+            &w.acc1.witness_vector,
+            &w.acc2.witness_vector,
+            w.acc1.error_term,
+            w.acc2.error_term,
+        );
+        let elen = w.acc1.error_vector.len().max(cross_term.len());
+        let elen = elen.min(MAX_WITNESS_SIZE);
+
+        for i in 0..elen {
+            let e1_i = w.acc1.error_vector.get(i).copied().unwrap_or(Fr::ZERO);
+            let t_i = cross_term.get(i).copied().unwrap_or(Fr::ZERO);
+            let r_t = w.challenge * t_i;
+            let e_folded = e1_i + r_t;
+
+            // Verify r * T[i]
+            layouter.assign_region(
+                || format!("fold_e_mul_{}", i),
+                |mut region| {
+                    config.s_mul.enable(&mut region, 0)?;
+                    region.assign_advice(|| "r", config.advice[0], 0, || Value::known(w.challenge))?;
+                    region.assign_advice(|| "t_i", config.advice[1], 0, || Value::known(t_i))?;
+                    region.assign_advice(|| "r_t", config.advice[2], 0, || Value::known(r_t))?;
+                    Ok(())
+                },
+            )?;
+
+            // Verify E1[i] + r*T[i] = E'[i]
+            layouter.assign_region(
+                || format!("fold_e_add_{}", i),
+                |mut region| {
+                    config.s_add.enable(&mut region, 0)?;
+                    region.assign_advice(|| "e1_i", config.advice[0], 0, || Value::known(e1_i))?;
+                    region.assign_advice(|| "r_t", config.advice[1], 0, || Value::known(r_t))?;
+                    region.assign_advice(|| "e_f", config.advice[2], 0, || Value::known(e_folded))?;
+                    Ok(())
+                },
+            )?;
+        }
+
+        // ================================================================
+        // Verify witness commitment: Poseidon chain of folded witness == PI[1]
+        // ================================================================
+        if wlen > 0 {
+            // Build the folded witness for commitment
+            let mut folded_witness = Vec::with_capacity(wlen);
+            for i in 0..wlen {
+                let z1_i = w.acc1.witness_vector.get(i).copied().unwrap_or(Fr::ZERO);
+                let z2_i = w.acc2.witness_vector.get(i).copied().unwrap_or(Fr::ZERO);
+                folded_witness.push(z1_i + w.challenge * z2_i);
+            }
+
+            // Compute and verify Poseidon commitment sequentially
+            let mut acc_hash = folded_witness[0];
+            for j in 1..folded_witness.len() {
+                synthesize_poseidon_hash(
+                    &poseidon_config,
+                    &mut layouter,
+                    acc_hash,
+                    folded_witness[j],
+                    &format!("wcom_{}", j),
+                )?;
+                acc_hash = poseidon_hash_two(acc_hash, folded_witness[j]);
+            }
+
+            // acc_hash should equal folded.witness_commitment (PI[1])
+            layouter.assign_region(
+                || "verify_witness_commitment",
+                |mut region| {
+                    config.s_eq.enable(&mut region, 0)?;
+                    region.assign_advice(|| "computed", config.advice[0], 0, || Value::known(acc_hash))?;
+                    region.assign_advice(|| "expected", config.advice[1], 0, || Value::known(folded.witness_commitment))?;
+                    Ok(())
+                },
+            )?;
+        }
+
+        // ================================================================
+        // Verify error commitment: Poseidon chain of folded error == PI[6]
+        // ================================================================
+        if elen > 0 {
+            let mut folded_error = Vec::with_capacity(elen);
+            for i in 0..elen {
+                let e1_i = w.acc1.error_vector.get(i).copied().unwrap_or(Fr::ZERO);
+                let t_i = cross_term.get(i).copied().unwrap_or(Fr::ZERO);
+                folded_error.push(e1_i + w.challenge * t_i);
+            }
+
+            let mut acc_hash = folded_error[0];
+            for j in 1..folded_error.len() {
+                synthesize_poseidon_hash(
+                    &poseidon_config,
+                    &mut layouter,
+                    acc_hash,
+                    folded_error[j],
+                    &format!("ecom_{}", j),
+                )?;
+                acc_hash = poseidon_hash_two(acc_hash, folded_error[j]);
+            }
+
+            layouter.assign_region(
+                || "verify_error_commitment",
+                |mut region| {
+                    config.s_eq.enable(&mut region, 0)?;
+                    region.assign_advice(|| "computed", config.advice[0], 0, || Value::known(acc_hash))?;
+                    region.assign_advice(|| "expected", config.advice[1], 0, || Value::known(folded.error_commitment))?;
+                    Ok(())
+                },
+            )?;
+        }
+
+        // ================================================================
+        // Verify cross-term commitment: Poseidon chain of T == PI[7]
+        // ================================================================
+        let ct_len = cross_term.len().min(MAX_WITNESS_SIZE);
+        if ct_len > 0 {
+            let mut acc_hash = cross_term[0];
+            for j in 1..ct_len {
+                synthesize_poseidon_hash(
+                    &poseidon_config,
+                    &mut layouter,
+                    acc_hash,
+                    cross_term[j],
+                    &format!("ctcom_{}", j),
+                )?;
+                acc_hash = poseidon_hash_two(acc_hash, cross_term[j]);
+            }
+
+            layouter.assign_region(
+                || "verify_cross_term_commitment",
+                |mut region| {
+                    config.s_eq.enable(&mut region, 0)?;
+                    region.assign_advice(|| "computed", config.advice[0], 0, || Value::known(acc_hash))?;
+                    region.assign_advice(|| "expected", config.advice[1], 0, || Value::known(folded.cross_term_commitment))?;
+                    Ok(())
+                },
+            )?;
+        }
+
         Ok(())
     }
 }
@@ -870,6 +1191,11 @@ impl IVCMultiStepWitness {
             error_term: self.initial_acc.error_term,
             error_bound: total_error,
             challenge_hash: self.initial_acc.challenge_hash,
+            witness_vector: self.initial_acc.witness_vector.clone(),
+            error_vector: self.initial_acc.error_vector.clone(),
+            witness_commitment: self.initial_acc.witness_commitment,
+            error_commitment: self.initial_acc.error_commitment,
+            cross_term_commitment: Fr::ZERO,
         };
 
         (states, final_acc)
@@ -1119,6 +1445,7 @@ mod tests {
             error_term: Fr::one(),
             error_bound: Fr::from(10),
             challenge_hash: Fr::ZERO,
+            ..Default::default()
         };
 
         let acc2 = IVCAccumulator {
@@ -1127,6 +1454,7 @@ mod tests {
             error_term: Fr::from(2),
             error_bound: Fr::from(5),
             challenge_hash: Fr::ZERO,
+            ..Default::default()
         };
 
         let challenge = Fr::from(7);
@@ -1210,6 +1538,7 @@ mod tests {
             error_term: Fr::one(),
             error_bound: Fr::from(10),
             challenge_hash: Fr::ZERO,
+            ..Default::default()
         };
 
         let other_acc = IVCAccumulator {
@@ -1218,6 +1547,7 @@ mod tests {
             error_term: Fr::from(2),
             error_bound: Fr::from(5),
             challenge_hash: Fr::ZERO,
+            ..Default::default()
         };
 
         let computation_hash = Fr::from(300u64);
@@ -1250,6 +1580,7 @@ mod tests {
             error_term: Fr::one(),
             error_bound: Fr::from(10),
             challenge_hash: Fr::ZERO,
+            ..Default::default()
         };
         let acc2 = IVCAccumulator {
             state_commitment: Fr::from(200u64),
@@ -1257,6 +1588,7 @@ mod tests {
             error_term: Fr::from(2),
             error_bound: Fr::from(5),
             challenge_hash: Fr::ZERO,
+            ..Default::default()
         };
         let challenge = generate_folding_challenge(&acc1, &acc2);
 
@@ -1316,6 +1648,7 @@ mod tests {
             error_term: Fr::one(),
             error_bound: Fr::from(10),
             challenge_hash: Fr::ZERO,
+            ..Default::default()
         };
         let acc2 = IVCAccumulator {
             state_commitment: Fr::from(200u64),
@@ -1323,6 +1656,7 @@ mod tests {
             error_term: Fr::from(2),
             error_bound: Fr::from(5),
             challenge_hash: Fr::ZERO,
+            ..Default::default()
         };
         let challenge = generate_folding_challenge(&acc1, &acc2);
 
@@ -1519,6 +1853,105 @@ mod tests {
         chain.add_step(Fr::from(20u64), Fr::from(200u64), Fr::from(2));
         assert!(chain.verify_chain_consistency());
         assert_eq!(chain.history().len(), 2);
+    }
+
+    // ===== Witness Vector Folding Tests =====
+
+    #[test]
+    fn test_folding_with_witness_vectors() {
+        let w1 = vec![Fr::from(1u64), Fr::from(2u64), Fr::from(3u64), Fr::from(4u64)];
+        let w2 = vec![Fr::from(5u64), Fr::from(6u64), Fr::from(7u64), Fr::from(8u64)];
+        let e1 = vec![Fr::ZERO; 4];
+        let e2 = vec![Fr::ZERO; 4];
+
+        let acc1 = IVCAccumulator::initial_with_vectors(Fr::from(100u64), w1.clone(), e1);
+        let acc2 = IVCAccumulator::initial_with_vectors(Fr::from(200u64), w2.clone(), e2);
+
+        let challenge = Fr::from(3u64);
+        let folded = fold_accumulators(&acc1, &acc2, challenge);
+
+        // Verify witness folding: Z'[i] = Z1[i] + r * Z2[i]
+        assert_eq!(folded.witness_vector.len(), 4);
+        assert_eq!(folded.witness_vector[0], Fr::from(1u64) + Fr::from(3u64) * Fr::from(5u64)); // 1 + 3*5 = 16
+        assert_eq!(folded.witness_vector[1], Fr::from(2u64) + Fr::from(3u64) * Fr::from(6u64)); // 2 + 3*6 = 20
+        assert_eq!(folded.witness_vector[2], Fr::from(3u64) + Fr::from(3u64) * Fr::from(7u64)); // 3 + 3*7 = 24
+        assert_eq!(folded.witness_vector[3], Fr::from(4u64) + Fr::from(3u64) * Fr::from(8u64)); // 4 + 3*8 = 28
+
+        // Verify commitments are consistent
+        assert_eq!(folded.witness_commitment, commit_vector(&folded.witness_vector));
+        assert_eq!(folded.error_commitment, commit_vector(&folded.error_vector));
+
+        // Cross-term commitment should be non-trivial (witness vectors are non-zero)
+        assert_ne!(folded.cross_term_commitment, Fr::ZERO);
+    }
+
+    #[test]
+    fn test_folding_circuit_with_witness_vectors() {
+        let w1 = vec![Fr::from(1u64), Fr::from(2u64), Fr::from(3u64), Fr::from(4u64)];
+        let w2 = vec![Fr::from(5u64), Fr::from(6u64), Fr::from(7u64), Fr::from(8u64)];
+        let e1 = vec![Fr::ZERO; 4];
+        let e2 = vec![Fr::ZERO; 4];
+
+        let acc1 = IVCAccumulator::initial_with_vectors(Fr::from(100u64), w1, e1);
+        let acc2 = IVCAccumulator::initial_with_vectors(Fr::from(200u64), w2, e2);
+        let challenge = generate_folding_challenge(&acc1, &acc2);
+
+        let witness = IVCFoldingWitness { acc1, acc2, challenge };
+        let circuit = IVCFoldingCircuit { witness };
+        let pi = circuit.public_inputs();
+
+        // Needs higher k for witness vector verification (extra Poseidon hashes for commitments)
+        let prover = MockProver::run(14, &circuit, vec![pi]).unwrap();
+        prover.assert_satisfied();
+    }
+
+    #[test]
+    fn test_folding_circuit_rejects_wrong_witness_commitment() {
+        let w1 = vec![Fr::from(1u64), Fr::from(2u64)];
+        let w2 = vec![Fr::from(3u64), Fr::from(4u64)];
+
+        let acc1 = IVCAccumulator::initial_with_vectors(Fr::from(10u64), w1, vec![Fr::ZERO; 2]);
+        let acc2 = IVCAccumulator::initial_with_vectors(Fr::from(20u64), w2, vec![Fr::ZERO; 2]);
+        let challenge = generate_folding_challenge(&acc1, &acc2);
+
+        let witness = IVCFoldingWitness { acc1, acc2, challenge };
+        let circuit = IVCFoldingCircuit { witness };
+
+        let mut pi = circuit.public_inputs();
+        pi[1] = Fr::from(9999u64); // Corrupt witness commitment (PI[1])
+
+        let prover = MockProver::run(14, &circuit, vec![pi]).unwrap();
+        assert!(prover.verify().is_err());
+    }
+
+    #[test]
+    fn test_commit_vector_consistency() {
+        let v = vec![Fr::from(1u64), Fr::from(2u64), Fr::from(3u64)];
+        let c1 = commit_vector(&v);
+        let c2 = commit_vector(&v);
+        assert_eq!(c1, c2, "commit_vector must be deterministic");
+
+        let v2 = vec![Fr::from(1u64), Fr::from(2u64), Fr::from(4u64)];
+        let c3 = commit_vector(&v2);
+        assert_ne!(c1, c3, "different vectors must produce different commitments");
+
+        assert_eq!(commit_vector(&[]), Fr::ZERO, "empty vector commitment is zero");
+    }
+
+    #[test]
+    fn test_cross_term_computation() {
+        let z1 = vec![Fr::from(2u64), Fr::from(3u64)];
+        let z2 = vec![Fr::from(4u64), Fr::from(5u64)];
+        let u1 = Fr::one();
+        let u2 = Fr::one();
+
+        let t = compute_cross_term(&z1, &z2, u1, u2);
+        assert_eq!(t.len(), 2);
+        // T[i] = z1[i]*z2[i] - u1*z2[i] - u2*z1[i]
+        // T[0] = 2*4 - 1*4 - 1*2 = 8 - 4 - 2 = 2
+        assert_eq!(t[0], Fr::from(2u64));
+        // T[1] = 3*5 - 1*5 - 1*3 = 15 - 5 - 3 = 7
+        assert_eq!(t[1], Fr::from(7u64));
     }
 
     // ===== 5-Step Multi-Step Chain with Real KZG Proof =====

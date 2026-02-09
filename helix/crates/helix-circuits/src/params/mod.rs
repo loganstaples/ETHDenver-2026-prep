@@ -84,6 +84,7 @@ pub use keys::{
 
     // Bundle and cache
     KeyBundle,
+    RealKeyBundle,
     KeyCache,
 
     // Benchmark

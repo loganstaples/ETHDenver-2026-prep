@@ -40,6 +40,9 @@
 //! └─────────────────────────────────────────────────────────────────┘
 //! ```
 
+use halo2_proofs::poly::kzg::commitment::ParamsKZG;
+use halo2curves::bn256::Bn256;
+use rand_core::OsRng;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -667,6 +670,92 @@ impl HelixSRS {
                     expected_g1, self.metadata.num_g1_elements),
             ));
         }
+
+        Ok(())
+    }
+
+    /// Generates real KZG parameters for proving/verification.
+    ///
+    /// This creates actual `ParamsKZG<Bn256>` with cryptographic curve points
+    /// suitable for proof generation and verification.
+    pub fn generate_params(&self) -> ParamsKZG<Bn256> {
+        ParamsKZG::<Bn256>::setup(self.metadata.k, OsRng)
+    }
+
+    /// Generates or loads cached KZG parameters from `~/.cache/helix/srs/`.
+    ///
+    /// Attempts to load from the cache directory first. If not found,
+    /// generates fresh parameters and saves them for future use.
+    pub fn download_or_generate(&self) -> Result<ParamsKZG<Bn256>, SetupError> {
+        let cache_dir = Self::default_cache_dir()?;
+        let cache_path = cache_dir.join(format!("params_k{}.bin", self.metadata.k));
+
+        // Try loading from disk cache
+        if cache_path.exists() {
+            match Self::load_params_from_file(&cache_path, self.metadata.k) {
+                Ok(params) => return Ok(params),
+                Err(e) => {
+                    // Corrupt cache file — regenerate
+                    eprintln!("Warning: cached SRS at {:?} is invalid ({}), regenerating", cache_path, e);
+                    let _ = std::fs::remove_file(&cache_path);
+                }
+            }
+        }
+
+        // Generate fresh parameters
+        let params = self.generate_params();
+
+        // Save to disk cache (best-effort)
+        if let Err(e) = Self::save_params_to_file(&params, &cache_path) {
+            eprintln!("Warning: failed to cache SRS to {:?}: {}", cache_path, e);
+        }
+
+        Ok(params)
+    }
+
+    /// Returns the default cache directory (`~/.cache/helix/srs/`).
+    fn default_cache_dir() -> Result<PathBuf, SetupError> {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .map_err(|_| SetupError::CacheError("Cannot determine home directory".to_string()))?;
+        let dir = PathBuf::from(home).join(".cache").join("helix").join("srs");
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
+
+    /// Loads ParamsKZG from a file with validation.
+    fn load_params_from_file(path: &Path, expected_k: u32) -> Result<ParamsKZG<Bn256>, SetupError> {
+        use halo2_proofs::poly::commitment::Params;
+
+        let mut file = std::fs::File::open(path)?;
+        let params = ParamsKZG::<Bn256>::read(&mut file)
+            .map_err(|e| SetupError::CorruptData(format!("Failed to read params: {:?}", e)))?;
+
+        // Validate k matches
+        if params.k() != expected_k {
+            return Err(SetupError::ValidationFailed(format!(
+                "Expected k={}, got k={}", expected_k, params.k()
+            )));
+        }
+
+        Ok(params)
+    }
+
+    /// Saves ParamsKZG to a file.
+    fn save_params_to_file(params: &ParamsKZG<Bn256>, path: &Path) -> Result<(), SetupError> {
+        use halo2_proofs::poly::commitment::Params;
+
+        // Ensure parent directory exists
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let mut file = std::fs::File::create(path)?;
+        params.write(&mut file)
+            .map_err(|e| SetupError::IoError(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to write params: {:?}", e),
+            )))?;
 
         Ok(())
     }

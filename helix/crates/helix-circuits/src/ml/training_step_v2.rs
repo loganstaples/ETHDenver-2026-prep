@@ -177,29 +177,29 @@ pub trait Profilable {
 #[derive(Clone, Debug)]
 pub struct MLTrainingStepV2Config {
     /// Three shared advice columns for arithmetic operations.
-    advice: [Column<Advice>; 4],
+    pub(crate) advice: [Column<Advice>; 4],
     /// Instance column for public inputs.
-    instance: Column<Instance>,
+    pub(crate) instance: Column<Instance>,
     /// Lookup table columns for ReLU.
-    relu_table_in: TableColumn,
-    relu_table_out: TableColumn,
+    pub(crate) relu_table_in: TableColumn,
+    pub(crate) relu_table_out: TableColumn,
     /// Lookup table columns for exp (used in softmax if needed).
-    exp_table_in: TableColumn,
-    exp_table_out: TableColumn,
+    pub(crate) exp_table_in: TableColumn,
+    pub(crate) exp_table_out: TableColumn,
     /// Selector for multiplication gate: a * b = c
-    s_mul: Selector,
+    pub(crate) s_mul: Selector,
     /// Selector for addition gate: a + b = c
-    s_add: Selector,
+    pub(crate) s_add: Selector,
     /// Selector for subtraction gate: a - b = c
-    s_sub: Selector,
+    pub(crate) s_sub: Selector,
     /// Selector for equality check: a = b
-    s_eq: Selector,
+    pub(crate) s_eq: Selector,
     /// Selector for ReLU lookup.
-    s_relu: Selector,
+    pub(crate) s_relu: Selector,
     /// Selector for Freivalds dot product verification.
-    s_freivalds: Selector,
+    pub(crate) s_freivalds: Selector,
     /// Selector for error bound accumulation.
-    _s_error_acc: Selector,
+    pub(crate) _s_error_acc: Selector,
 }
 
 // ---------------------------------------------------------------------------
@@ -800,6 +800,203 @@ impl MLTrainingStepV2Circuit {
         }
         Ok(())
     }
+
+    /// Synthesizes this circuit instance without loading lookup tables.
+    ///
+    /// Used by `MLBatchCircuit` to synthesize multiple instances sharing
+    /// the same lookup tables. The `pi_offset` shifts the public input
+    /// binding to the correct position in the concatenated PI column.
+    pub(crate) fn synthesize_instance(
+        &self,
+        config: &MLTrainingStepV2Config,
+        layouter: &mut impl Layouter<Fr>,
+        pi_offset: usize,
+    ) -> Result<(), ErrorFront> {
+        let w = &self.witness;
+
+        // 1. Bind public inputs at the given offset
+        let pi = w.public_inputs();
+        let pi_cells = layouter.assign_region(
+            || format!("pi_offset_{}", pi_offset),
+            |mut region| {
+                let mut cells = Vec::with_capacity(NUM_PUBLIC_INPUTS);
+                for (i, val) in pi.iter().enumerate() {
+                    let cell = region.assign_advice(
+                        || format!("pi_{}", pi_offset + i),
+                        config.advice[0],
+                        i,
+                        || Value::known(*val),
+                    )?;
+                    cells.push(cell);
+                }
+                Ok(cells)
+            },
+        )?;
+        for (i, cell) in pi_cells.iter().enumerate() {
+            layouter.constrain_instance(cell.cell(), config.instance, pi_offset + i)?;
+        }
+
+        // 2. Forward pass — Layer 1
+        if self.use_freivalds && !w.freivalds_r1.is_empty() {
+            verify_matmul_freivalds(
+                config, layouter,
+                &w.w1, &w.x,
+                &w.h_pre.iter().zip(w.b1.iter()).map(|(h, b)| *h - *b).collect::<Vec<_>>(),
+                w.d_hid, w.d_in, 1, &w.freivalds_r1,
+                &format!("b{}_fwd_l1_freivalds", pi_offset),
+            )?;
+        } else {
+            for j in 0..w.d_hid {
+                verify_dot_product(
+                    config, layouter,
+                    &w.w1[j * w.d_in..(j + 1) * w.d_in], &w.x,
+                    w.h_pre[j] - w.b1[j],
+                    &format!("b{}_fwd_l1_dot_{}", pi_offset, j),
+                )?;
+            }
+        }
+
+        for j in 0..w.d_hid {
+            assign_add(config, layouter, w.h_pre[j] - w.b1[j], w.b1[j], w.h_pre[j],
+                &format!("b{}_fwd_l1_bias_{}", pi_offset, j))?;
+            assign_relu(config, layouter, w.h_pre[j], w.h[j],
+                &format!("b{}_fwd_l1_relu_{}", pi_offset, j))?;
+        }
+
+        // 3. Forward pass — Layer 2
+        if self.use_freivalds && !w.freivalds_r2.is_empty() {
+            verify_matmul_freivalds(
+                config, layouter,
+                &w.w2, &w.h,
+                &w.y.iter().zip(w.b2.iter()).map(|(y, b)| *y - *b).collect::<Vec<_>>(),
+                w.d_out, w.d_hid, 1, &w.freivalds_r2,
+                &format!("b{}_fwd_l2_freivalds", pi_offset),
+            )?;
+        } else {
+            for j in 0..w.d_out {
+                verify_dot_product(
+                    config, layouter,
+                    &w.w2[j * w.d_hid..(j + 1) * w.d_hid], &w.h,
+                    w.y[j] - w.b2[j],
+                    &format!("b{}_fwd_l2_dot_{}", pi_offset, j),
+                )?;
+            }
+        }
+
+        for j in 0..w.d_out {
+            assign_add(config, layouter, w.y[j] - w.b2[j], w.b2[j], w.y[j],
+                &format!("b{}_fwd_l2_bias_{}", pi_offset, j))?;
+        }
+
+        // 4. Loss computation
+        {
+            let mut running_loss = Fr::ZERO;
+            for j in 0..w.d_out {
+                let diff = w.y[j] - w.target[j];
+                let sq = diff * diff;
+                assign_sub(config, layouter, w.y[j], w.target[j], diff,
+                    &format!("b{}_loss_diff_{}", pi_offset, j))?;
+                assign_mul(config, layouter, diff, diff, sq,
+                    &format!("b{}_loss_sq_{}", pi_offset, j))?;
+                let new_loss = running_loss + sq;
+                if j > 0 {
+                    assign_add(config, layouter, running_loss, sq, new_loss,
+                        &format!("b{}_loss_acc_{}", pi_offset, j))?;
+                }
+                running_loss = new_loss;
+            }
+            assign_eq(config, layouter, running_loss, w.loss,
+                &format!("b{}_loss_check", pi_offset))?;
+        }
+
+        // 5. Backward pass — Output gradient
+        let two = Fr::from(2u64);
+        for j in 0..w.d_out {
+            let diff = w.y[j] - w.target[j];
+            let expected_dy = two * diff;
+            assign_mul(config, layouter, two, diff, expected_dy,
+                &format!("b{}_bwd_dy_{}", pi_offset, j))?;
+            assign_eq(config, layouter, expected_dy, w.dy[j],
+                &format!("b{}_bwd_dy_check_{}", pi_offset, j))?;
+        }
+
+        // 6. Backward pass — dW2, db2, dh
+        for j in 0..w.d_out {
+            for k in 0..w.d_hid {
+                let expected = w.dy[j] * w.h[k];
+                assign_mul(config, layouter, w.dy[j], w.h[k], expected,
+                    &format!("b{}_bwd_dw2_{}_{}", pi_offset, j, k))?;
+                assign_eq(config, layouter, expected, w.dw2[j * w.d_hid + k],
+                    &format!("b{}_bwd_dw2_check_{}_{}", pi_offset, j, k))?;
+            }
+        }
+        for j in 0..w.d_out {
+            assign_eq(config, layouter, w.dy[j], w.db2[j],
+                &format!("b{}_bwd_db2_check_{}", pi_offset, j))?;
+        }
+        for k in 0..w.d_hid {
+            let w2_col: Vec<Fr> = (0..w.d_out).map(|j| w.w2[j * w.d_hid + k]).collect();
+            verify_dot_product(config, layouter, &w2_col, &w.dy, w.dh[k],
+                &format!("b{}_bwd_dh_{}", pi_offset, k))?;
+        }
+
+        // 7. Backward pass — ReLU mask and dh_pre
+        for k in 0..w.d_hid {
+            assign_mul(config, layouter, w.dh[k], w.relu_mask[k], w.dh_pre[k],
+                &format!("b{}_bwd_relu_mask_{}", pi_offset, k))?;
+        }
+
+        // 8. Backward pass — dW1, db1
+        for j in 0..w.d_hid {
+            for i in 0..w.d_in {
+                let expected = w.dh_pre[j] * w.x[i];
+                assign_mul(config, layouter, w.dh_pre[j], w.x[i], expected,
+                    &format!("b{}_bwd_dw1_{}_{}", pi_offset, j, i))?;
+                assign_eq(config, layouter, expected, w.dw1[j * w.d_in + i],
+                    &format!("b{}_bwd_dw1_check_{}_{}", pi_offset, j, i))?;
+            }
+        }
+        for j in 0..w.d_hid {
+            assign_eq(config, layouter, w.dh_pre[j], w.db1[j],
+                &format!("b{}_bwd_db1_check_{}", pi_offset, j))?;
+        }
+
+        // 9. Weight updates
+        for idx in 0..w.w1.len() {
+            let lr_grad = w.lr * w.dw1[idx];
+            assign_mul(config, layouter, w.lr, w.dw1[idx], lr_grad,
+                &format!("b{}_upd_w1_lr_{}", pi_offset, idx))?;
+            assign_sub(config, layouter, w.w1[idx], lr_grad, w.w1_new[idx],
+                &format!("b{}_upd_w1_{}", pi_offset, idx))?;
+        }
+        for idx in 0..w.b1.len() {
+            let lr_grad = w.lr * w.db1[idx];
+            assign_mul(config, layouter, w.lr, w.db1[idx], lr_grad,
+                &format!("b{}_upd_b1_lr_{}", pi_offset, idx))?;
+            assign_sub(config, layouter, w.b1[idx], lr_grad, w.b1_new[idx],
+                &format!("b{}_upd_b1_{}", pi_offset, idx))?;
+        }
+        for idx in 0..w.w2.len() {
+            let lr_grad = w.lr * w.dw2[idx];
+            assign_mul(config, layouter, w.lr, w.dw2[idx], lr_grad,
+                &format!("b{}_upd_w2_lr_{}", pi_offset, idx))?;
+            assign_sub(config, layouter, w.w2[idx], lr_grad, w.w2_new[idx],
+                &format!("b{}_upd_w2_{}", pi_offset, idx))?;
+        }
+        for idx in 0..w.b2.len() {
+            let lr_grad = w.lr * w.db2[idx];
+            assign_mul(config, layouter, w.lr, w.db2[idx], lr_grad,
+                &format!("b{}_upd_b2_lr_{}", pi_offset, idx))?;
+            assign_sub(config, layouter, w.b2[idx], lr_grad, w.b2_new[idx],
+                &format!("b{}_upd_b2_{}", pi_offset, idx))?;
+        }
+
+        // 10. Error bound verification
+        verify_error_bound(config, layouter, w.total_error,
+            &format!("b{}_error_bound_check", pi_offset))?;
+
+        Ok(())
+    }
 }
 
 /// Trait for converting Halo2 proofs to EVM-compatible format.
@@ -985,243 +1182,12 @@ impl Circuit<Fr> for MLTrainingStepV2Circuit {
         config: Self::Config,
         mut layouter: impl Layouter<Fr>,
     ) -> Result<(), ErrorFront> {
-        let w = &self.witness;
-
-        // ================================================================
-        // 0. Load lookup tables
-        // ================================================================
+        // Load lookup tables (shared across all instances for batch)
         load_relu_table(&config, &mut layouter, self.relu_range)?;
         load_exp_table(&config, &mut layouter, self.exp_range, self.exp_scale)?;
 
-        // ================================================================
-        // 1. Bind public inputs
-        // ================================================================
-        let pi = w.public_inputs();
-        let pi_cells = layouter.assign_region(
-            || "public_inputs",
-            |mut region| {
-                let mut cells = Vec::with_capacity(NUM_PUBLIC_INPUTS);
-                for (i, val) in pi.iter().enumerate() {
-                    let cell = region.assign_advice(
-                        || format!("pi_{}", i),
-                        config.advice[0],
-                        i,
-                        || Value::known(*val),
-                    )?;
-                    cells.push(cell);
-                }
-                Ok(cells)
-            },
-        )?;
-        for (i, cell) in pi_cells.iter().enumerate() {
-            layouter.constrain_instance(cell.cell(), config.instance, i)?;
-        }
-
-        // ================================================================
-        // 2. Forward pass — Layer 1 with Freivalds verification
-        // ================================================================
-        if self.use_freivalds && !w.freivalds_r1.is_empty() {
-            // Use Freivalds: verify h_pre = W1 * x + b1 using random vector r
-            verify_matmul_freivalds(
-                &config,
-                &mut layouter,
-                &w.w1,
-                &w.x,
-                &w.h_pre.iter().zip(w.b1.iter()).map(|(h, b)| *h - *b).collect::<Vec<_>>(),
-                w.d_hid,
-                w.d_in,
-                1, // x is a column vector
-                &w.freivalds_r1,
-                "fwd_l1_freivalds",
-            )?;
-        } else {
-            // Fallback to direct verification
-            for j in 0..w.d_hid {
-                verify_dot_product(
-                    &config,
-                    &mut layouter,
-                    &w.w1[j * w.d_in..(j + 1) * w.d_in],
-                    &w.x,
-                    w.h_pre[j] - w.b1[j],
-                    &format!("fwd_l1_dot_{}", j),
-                )?;
-            }
-        }
-
-        // Bias addition and ReLU for layer 1
-        for j in 0..w.d_hid {
-            assign_add(
-                &config,
-                &mut layouter,
-                w.h_pre[j] - w.b1[j],
-                w.b1[j],
-                w.h_pre[j],
-                &format!("fwd_l1_bias_{}", j),
-            )?;
-
-            assign_relu(
-                &config,
-                &mut layouter,
-                w.h_pre[j],
-                w.h[j],
-                &format!("fwd_l1_relu_{}", j),
-            )?;
-        }
-
-        // ================================================================
-        // 3. Forward pass — Layer 2 with Freivalds verification
-        // ================================================================
-        if self.use_freivalds && !w.freivalds_r2.is_empty() {
-            verify_matmul_freivalds(
-                &config,
-                &mut layouter,
-                &w.w2,
-                &w.h,
-                &w.y.iter().zip(w.b2.iter()).map(|(y, b)| *y - *b).collect::<Vec<_>>(),
-                w.d_out,
-                w.d_hid,
-                1,
-                &w.freivalds_r2,
-                "fwd_l2_freivalds",
-            )?;
-        } else {
-            for j in 0..w.d_out {
-                verify_dot_product(
-                    &config,
-                    &mut layouter,
-                    &w.w2[j * w.d_hid..(j + 1) * w.d_hid],
-                    &w.h,
-                    w.y[j] - w.b2[j],
-                    &format!("fwd_l2_dot_{}", j),
-                )?;
-            }
-        }
-
-        for j in 0..w.d_out {
-            assign_add(
-                &config,
-                &mut layouter,
-                w.y[j] - w.b2[j],
-                w.b2[j],
-                w.y[j],
-                &format!("fwd_l2_bias_{}", j),
-            )?;
-        }
-
-        // ================================================================
-        // 4. Loss computation: L = sum((y[j] - target[j])^2)
-        // ================================================================
-        {
-            let mut running_loss = Fr::ZERO;
-            for j in 0..w.d_out {
-                let diff = w.y[j] - w.target[j];
-                let sq = diff * diff;
-
-                assign_sub(&config, &mut layouter, w.y[j], w.target[j], diff, &format!("loss_diff_{}", j))?;
-                assign_mul(&config, &mut layouter, diff, diff, sq, &format!("loss_sq_{}", j))?;
-
-                let new_loss = running_loss + sq;
-                if j > 0 {
-                    assign_add(&config, &mut layouter, running_loss, sq, new_loss, &format!("loss_acc_{}", j))?;
-                }
-                running_loss = new_loss;
-            }
-
-            assign_eq(&config, &mut layouter, running_loss, w.loss, "loss_check")?;
-        }
-
-        // ================================================================
-        // 5. Backward pass — Output gradient: dy = 2*(y - target)
-        // ================================================================
-        let two = Fr::from(2u64);
-        for j in 0..w.d_out {
-            let diff = w.y[j] - w.target[j];
-            let expected_dy = two * diff;
-
-            assign_mul(&config, &mut layouter, two, diff, expected_dy, &format!("bwd_dy_{}", j))?;
-            assign_eq(&config, &mut layouter, expected_dy, w.dy[j], &format!("bwd_dy_check_{}", j))?;
-        }
-
-        // ================================================================
-        // 6. Backward pass — dW2, db2, dh
-        // ================================================================
-        for j in 0..w.d_out {
-            for k in 0..w.d_hid {
-                let expected = w.dy[j] * w.h[k];
-                assign_mul(&config, &mut layouter, w.dy[j], w.h[k], expected, &format!("bwd_dw2_{}_{}", j, k))?;
-                assign_eq(&config, &mut layouter, expected, w.dw2[j * w.d_hid + k], &format!("bwd_dw2_check_{}_{}", j, k))?;
-            }
-        }
-
-        for j in 0..w.d_out {
-            assign_eq(&config, &mut layouter, w.dy[j], w.db2[j], &format!("bwd_db2_check_{}", j))?;
-        }
-
-        for k in 0..w.d_hid {
-            let w2_col: Vec<Fr> = (0..w.d_out).map(|j| w.w2[j * w.d_hid + k]).collect();
-            verify_dot_product(&config, &mut layouter, &w2_col, &w.dy, w.dh[k], &format!("bwd_dh_{}", k))?;
-        }
-
-        // ================================================================
-        // 7. Backward pass — ReLU mask and dh_pre
-        // ================================================================
-        for k in 0..w.d_hid {
-            assign_mul(&config, &mut layouter, w.dh[k], w.relu_mask[k], w.dh_pre[k], &format!("bwd_relu_mask_{}", k))?;
-        }
-
-        // ================================================================
-        // 8. Backward pass — dW1, db1
-        // ================================================================
-        for j in 0..w.d_hid {
-            for i in 0..w.d_in {
-                let expected = w.dh_pre[j] * w.x[i];
-                assign_mul(&config, &mut layouter, w.dh_pre[j], w.x[i], expected, &format!("bwd_dw1_{}_{}", j, i))?;
-                assign_eq(&config, &mut layouter, expected, w.dw1[j * w.d_in + i], &format!("bwd_dw1_check_{}_{}", j, i))?;
-            }
-        }
-
-        for j in 0..w.d_hid {
-            assign_eq(&config, &mut layouter, w.dh_pre[j], w.db1[j], &format!("bwd_db1_check_{}", j))?;
-        }
-
-        // ================================================================
-        // 9. Weight updates
-        // ================================================================
-        for idx in 0..w.w1.len() {
-            let lr_grad = w.lr * w.dw1[idx];
-            assign_mul(&config, &mut layouter, w.lr, w.dw1[idx], lr_grad, &format!("upd_w1_lr_{}", idx))?;
-            assign_sub(&config, &mut layouter, w.w1[idx], lr_grad, w.w1_new[idx], &format!("upd_w1_{}", idx))?;
-        }
-
-        for idx in 0..w.b1.len() {
-            let lr_grad = w.lr * w.db1[idx];
-            assign_mul(&config, &mut layouter, w.lr, w.db1[idx], lr_grad, &format!("upd_b1_lr_{}", idx))?;
-            assign_sub(&config, &mut layouter, w.b1[idx], lr_grad, w.b1_new[idx], &format!("upd_b1_{}", idx))?;
-        }
-
-        for idx in 0..w.w2.len() {
-            let lr_grad = w.lr * w.dw2[idx];
-            assign_mul(&config, &mut layouter, w.lr, w.dw2[idx], lr_grad, &format!("upd_w2_lr_{}", idx))?;
-            assign_sub(&config, &mut layouter, w.w2[idx], lr_grad, w.w2_new[idx], &format!("upd_w2_{}", idx))?;
-        }
-
-        for idx in 0..w.b2.len() {
-            let lr_grad = w.lr * w.db2[idx];
-            assign_mul(&config, &mut layouter, w.lr, w.db2[idx], lr_grad, &format!("upd_b2_lr_{}", idx))?;
-            assign_sub(&config, &mut layouter, w.b2[idx], lr_grad, w.b2_new[idx], &format!("upd_b2_{}", idx))?;
-        }
-
-        // ================================================================
-        // 10. Error bound verification
-        // ================================================================
-        verify_error_bound(
-            &config,
-            &mut layouter,
-            w.total_error,
-            "error_bound_check",
-        )?;
-
-        Ok(())
+        // Delegate to the reusable instance synthesizer at offset 0
+        self.synthesize_instance(&config, &mut layouter, 0)
     }
 }
 
@@ -1239,7 +1205,7 @@ impl Circuit<Fr> for MLTrainingStepV2Circuit {
 ///   4. Check y == z (m constraints)
 ///
 /// Total: O(m*k + n*k + m*n + m) ≈ O(n²) vs O(n³) for direct verification.
-fn verify_matmul_freivalds(
+pub(crate) fn verify_matmul_freivalds(
     config: &MLTrainingStepV2Config,
     layouter: &mut impl Layouter<Fr>,
     a: &[Fr],       // m x k matrix, row-major
@@ -1321,7 +1287,7 @@ fn verify_matmul_freivalds(
 }
 
 /// Verifies that the accumulated error bound is within acceptable limits.
-fn verify_error_bound(
+pub(crate) fn verify_error_bound(
     config: &MLTrainingStepV2Config,
     layouter: &mut impl Layouter<Fr>,
     total_error: Fr,
@@ -1341,7 +1307,7 @@ fn verify_error_bound(
 // Helper: load lookup tables
 // ---------------------------------------------------------------------------
 
-fn load_relu_table(
+pub(crate) fn load_relu_table(
     config: &MLTrainingStepV2Config,
     layouter: &mut impl Layouter<Fr>,
     half_range: usize,
@@ -1377,7 +1343,7 @@ fn load_relu_table(
     )
 }
 
-fn load_exp_table(
+pub(crate) fn load_exp_table(
     config: &MLTrainingStepV2Config,
     layouter: &mut impl Layouter<Fr>,
     range: usize,
@@ -1404,7 +1370,7 @@ fn load_exp_table(
 // Primitive assignment helpers
 // ---------------------------------------------------------------------------
 
-fn verify_dot_product(
+pub(crate) fn verify_dot_product(
     config: &MLTrainingStepV2Config,
     layouter: &mut impl Layouter<Fr>,
     a: &[Fr],
@@ -1434,7 +1400,7 @@ fn verify_dot_product(
     Ok(())
 }
 
-fn assign_mul(
+pub(crate) fn assign_mul(
     config: &MLTrainingStepV2Config,
     layouter: &mut impl Layouter<Fr>,
     a: Fr,
@@ -1454,7 +1420,7 @@ fn assign_mul(
     )
 }
 
-fn assign_add(
+pub(crate) fn assign_add(
     config: &MLTrainingStepV2Config,
     layouter: &mut impl Layouter<Fr>,
     a: Fr,
@@ -1474,7 +1440,7 @@ fn assign_add(
     )
 }
 
-fn assign_sub(
+pub(crate) fn assign_sub(
     config: &MLTrainingStepV2Config,
     layouter: &mut impl Layouter<Fr>,
     a: Fr,
@@ -1494,7 +1460,7 @@ fn assign_sub(
     )
 }
 
-fn assign_eq(
+pub(crate) fn assign_eq(
     config: &MLTrainingStepV2Config,
     layouter: &mut impl Layouter<Fr>,
     a: Fr,
@@ -1512,7 +1478,7 @@ fn assign_eq(
     )
 }
 
-fn assign_relu(
+pub(crate) fn assign_relu(
     config: &MLTrainingStepV2Config,
     layouter: &mut impl Layouter<Fr>,
     input: Fr,

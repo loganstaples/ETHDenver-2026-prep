@@ -34,7 +34,13 @@
 //! - SRS version: Underlying parameter changes
 
 use super::setup::{HelixSRS, ParameterProfile, SetupError};
-use halo2_proofs::plonk::{Circuit, Error as PlonkError};
+use halo2_proofs::plonk::{
+    keygen_pk, keygen_vk, Circuit, Error as PlonkError,
+    ProvingKey, VerifyingKey,
+};
+use halo2_proofs::poly::commitment::Params;
+use halo2_proofs::poly::kzg::commitment::ParamsKZG;
+use halo2curves::bn256::{Bn256, Fr, G1Affine};
 use halo2curves::ff::PrimeField;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -188,12 +194,13 @@ impl ProvingKeyMetadata {
         bytes.extend_from_slice(&self.num_lookups.to_le_bytes());
         bytes.extend_from_slice(&self.num_gates.to_le_bytes());
 
-        // Profile
+        // Profile (always 2 bytes: presence flag + ID/padding)
         if let Some(profile) = self.profile {
             bytes.push(1);
             bytes.push(profile.id());
         } else {
             bytes.push(0);
+            bytes.push(0); // padding to keep fixed-size encoding
         }
 
         bytes.extend_from_slice(&self.generated_at.to_le_bytes());
@@ -570,6 +577,61 @@ impl HelixProvingKey {
         HelixVerificationKey { metadata: vk_metadata }
     }
 
+    /// Generates a real halo2 proving key from KZG parameters and a circuit.
+    ///
+    /// This performs actual keygen using `keygen_vk` + `keygen_pk` from halo2.
+    /// Returns a `RealKeyBundle` containing the actual cryptographic keys.
+    pub fn generate_real<C: Circuit<Fr>>(
+        circuit: &C,
+        params: &ParamsKZG<Bn256>,
+        circuit_name: &str,
+    ) -> Result<RealKeyBundle, KeyError> {
+        let start = Instant::now();
+
+        let vk = keygen_vk(params, circuit)?;
+        let vk_time = start.elapsed();
+
+        let pk_start = Instant::now();
+        let pk = keygen_pk(params, vk.clone(), circuit)?;
+        let pk_time = pk_start.elapsed();
+
+        let total_time = start.elapsed();
+
+        // Build metadata
+        let circuit_id = Self::compute_circuit_id(circuit_name);
+        let mut metadata = ProvingKeyMetadata::new(circuit_name, params.k(), circuit_id);
+
+        // Compute content hash from the VK pinned data
+        let mut hasher = Sha256::new();
+        hasher.update(b"HELIX_REAL_PK");
+        hasher.update(&circuit_id);
+        hasher.update(&params.k().to_le_bytes());
+        metadata.content_hash = hasher.finalize().into();
+
+        Ok(RealKeyBundle {
+            pk,
+            vk,
+            metadata: HelixProvingKey { metadata },
+            generation_time: total_time,
+            vk_generation_time: vk_time,
+            pk_generation_time: pk_time,
+        })
+    }
+
+    /// Saves the proving key metadata to a file.
+    pub fn save(&self, path: &Path) -> Result<(), KeyError> {
+        let bytes = self.metadata.to_bytes();
+        std::fs::write(path, bytes)?;
+        Ok(())
+    }
+
+    /// Loads proving key metadata from a file.
+    pub fn load(path: &Path) -> Result<Self, KeyError> {
+        let bytes = std::fs::read(path)?;
+        let metadata = ProvingKeyMetadata::from_bytes(&bytes)?;
+        Ok(Self { metadata })
+    }
+
     /// Validates the proving key metadata.
     pub fn validate(&self) -> Result<(), KeyError> {
         // Verify format version
@@ -627,6 +689,20 @@ impl HelixVerificationKey {
         }
 
         Ok(())
+    }
+
+    /// Saves the verification key metadata to a file.
+    pub fn save(&self, path: &Path) -> Result<(), KeyError> {
+        let bytes = self.metadata.to_bytes();
+        std::fs::write(path, bytes)?;
+        Ok(())
+    }
+
+    /// Loads verification key metadata from a file.
+    pub fn load(path: &Path) -> Result<Self, KeyError> {
+        let bytes = std::fs::read(path)?;
+        let metadata = VerificationKeyMetadata::from_bytes(&bytes)?;
+        Ok(Self { metadata })
     }
 
     /// Returns the commitment points placeholder for EVM verification.
@@ -744,6 +820,53 @@ impl KeyBundle {
             self.k(),
             self.generation_time,
             self.generated_at,
+        )
+    }
+}
+
+/// A key bundle containing actual halo2 proving and verification keys.
+///
+/// Unlike `KeyBundle` (metadata-only), this holds the real cryptographic keys
+/// needed for proof generation and verification.
+pub struct RealKeyBundle {
+    /// The actual halo2 proving key.
+    pub pk: ProvingKey<G1Affine>,
+    /// The actual halo2 verification key.
+    pub vk: VerifyingKey<G1Affine>,
+    /// Metadata descriptor.
+    pub metadata: HelixProvingKey,
+    /// Total key generation time.
+    pub generation_time: Duration,
+    /// VK generation time.
+    pub vk_generation_time: Duration,
+    /// PK generation time.
+    pub pk_generation_time: Duration,
+}
+
+impl RealKeyBundle {
+    /// Returns the circuit name.
+    pub fn circuit_name(&self) -> &str {
+        &self.metadata.metadata.circuit_name
+    }
+
+    /// Returns the K value.
+    pub fn k(&self) -> u32 {
+        self.metadata.metadata.k
+    }
+
+    /// Returns a summary of the key generation.
+    pub fn summary(&self) -> String {
+        format!(
+            "RealKeyBundle: {}\n  \
+             K: {}\n  \
+             VK generation: {:?}\n  \
+             PK generation: {:?}\n  \
+             Total: {:?}",
+            self.circuit_name(),
+            self.k(),
+            self.vk_generation_time,
+            self.pk_generation_time,
+            self.generation_time,
         )
     }
 }
@@ -1107,5 +1230,58 @@ mod tests {
 
         assert_eq!(bundle.k(), 12);
         assert!(bundle.validate().is_ok());
+    }
+
+    #[test]
+    fn test_real_key_generation() {
+        use halo2_proofs::poly::kzg::commitment::ParamsKZG;
+        use halo2curves::bn256::Bn256;
+        use rand_core::OsRng;
+
+        let circuit = IVCStepCircuit::default();
+        let params = ParamsKZG::<Bn256>::setup(12, OsRng);
+
+        let real_bundle = HelixProvingKey::generate_real(
+            &circuit, &params, "IVCStepCircuit",
+        ).expect("real keygen must succeed");
+
+        assert_eq!(real_bundle.k(), 12);
+        assert_eq!(real_bundle.circuit_name(), "IVCStepCircuit");
+        assert!(!real_bundle.summary().is_empty());
+    }
+
+    #[test]
+    fn test_pk_save_load() {
+        let pk = HelixProvingKey::new("TestCircuit", 14);
+
+        let dir = std::env::temp_dir().join("helix_test_pk_save_load");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test_pk.bin");
+
+        pk.save(&path).expect("save must succeed");
+        let loaded = HelixProvingKey::load(&path).expect("load must succeed");
+
+        assert_eq!(loaded.k(), 14);
+        assert_eq!(loaded.metadata().circuit_name, "TestCircuit");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_vk_save_load() {
+        let pk = HelixProvingKey::new("TestCircuit", 14);
+        let vk = pk.extract_vk();
+
+        let dir = std::env::temp_dir().join("helix_test_vk_save_load");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test_vk.bin");
+
+        vk.save(&path).expect("save must succeed");
+        let loaded = HelixVerificationKey::load(&path).expect("load must succeed");
+
+        assert_eq!(loaded.metadata().k, 14);
+        assert_eq!(loaded.metadata().circuit_name, "TestCircuit");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

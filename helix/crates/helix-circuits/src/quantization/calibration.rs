@@ -424,31 +424,49 @@ impl<F: PrimeField> CalibrationChip<F> {
         let s_scale_valid = meta.selector();
         let s_histogram = meta.selector();
 
-        // Min-max constraint: Verify calibration parameters are set
-        // Note: True range checking (max >= min) is complex in finite fields and
-        // requires bit decomposition. This is a simplified witness validation.
+        // Min-max constraint: Verify calibration parameters are consistent.
+        // Constrains:
+        //   aux[0] = data_max - data_min  (data_range)
+        //   scale * 255 = data_range + aux[1]  (slack ≥ 0, ensures scale covers range)
         meta.create_gate("minmax_calibration", |meta| {
             let s = meta.query_selector(s_minmax);
-            let _min = meta.query_advice(data_min, Rotation::cur());
-            let _max = meta.query_advice(data_max, Rotation::cur());
-            let _scl = meta.query_advice(scale, Rotation::cur());
+            let min = meta.query_advice(data_min, Rotation::cur());
+            let max = meta.query_advice(data_max, Rotation::cur());
+            let scl = meta.query_advice(scale, Rotation::cur());
+            let data_range = meta.query_advice(aux[0], Rotation::cur());
+            let slack = meta.query_advice(aux[1], Rotation::cur());
 
-            // Constraint: 0 = 0 (always satisfied - serves as witness commitment)
-            // Actual validation happens off-circuit; this just commits to the values
-            vec![s * Expression::Constant(F::ZERO)]
+            let num_levels = Expression::Constant(F::from(255u64)); // INT8_MAX - INT8_MIN
+
+            vec![
+                // data_range = data_max - data_min
+                s.clone() * (max - min - data_range.clone()),
+                // scale * 255 = data_range + slack (scale covers the range, slack ≥ 0)
+                s * (scl * num_levels - data_range - slack),
+            ]
         });
 
-        // Range check: Commit to the value being checked
-        // Note: True range checking in finite fields requires bit decomposition
-        // or lookup tables. This is a simplified witness commitment.
+        // Range check: Verify value ∈ [data_min, data_max] via arithmetic decomposition.
+        // Constrains:
+        //   aux[1] = value - data_min  (diff_lo)
+        //   aux[2] = data_max - value  (diff_hi)
+        //   diff_lo + diff_hi = data_max - data_min  (cross-check)
         meta.create_gate("range_check", |meta| {
             let s = meta.query_selector(s_range_check);
-            let _min = meta.query_advice(data_min, Rotation::cur());
-            let _max = meta.query_advice(data_max, Rotation::cur());
-            let _value = meta.query_advice(aux[0], Rotation::cur());
+            let min = meta.query_advice(data_min, Rotation::cur());
+            let max = meta.query_advice(data_max, Rotation::cur());
+            let value = meta.query_advice(aux[0], Rotation::cur());
+            let diff_lo = meta.query_advice(aux[1], Rotation::cur());
+            let diff_hi = meta.query_advice(aux[2], Rotation::cur());
 
-            // Constraint: 0 = 0 (always satisfied - serves as witness commitment)
-            vec![s * Expression::Constant(F::ZERO)]
+            vec![
+                // diff_lo = value - data_min
+                s.clone() * (value.clone() - min.clone() - diff_lo.clone()),
+                // diff_hi = data_max - value
+                s.clone() * (max.clone() - value - diff_hi.clone()),
+                // Cross-check: diff_lo + diff_hi = data_max - data_min
+                s * (diff_lo + diff_hi - max + min),
+            ]
         });
 
         // Error bound check: error <= 0.5 * scale
@@ -504,6 +522,15 @@ impl<F: PrimeField> CalibrationChip<F> {
         region.assign_advice(|| "zero_point", self.config.zero_point, row, || Value::known(witness.zero_point))?;
         region.assign_advice(|| "error_bound", self.config.error_bound, row, || Value::known(witness.error_bound))?;
 
+        // Compute data_range = data_max - data_min
+        let data_range = witness.data_max - witness.data_min;
+        region.assign_advice(|| "data_range", self.config.aux[0], row, || Value::known(data_range))?;
+
+        // Compute slack = scale * 255 - data_range (must be ≥ 0)
+        let num_levels = F::from(255u64);
+        let slack = witness.scale * num_levels - data_range;
+        region.assign_advice(|| "slack", self.config.aux[1], row, || Value::known(slack))?;
+
         Ok(())
     }
 
@@ -521,6 +548,12 @@ impl<F: PrimeField> CalibrationChip<F> {
         region.assign_advice(|| "value", self.config.aux[0], row, || value)?;
         region.assign_advice(|| "min", self.config.data_min, row, || min)?;
         region.assign_advice(|| "max", self.config.data_max, row, || max)?;
+
+        // Compute diff_lo = value - min and diff_hi = max - value
+        let diff_lo = value.zip(min).map(|(v, m)| v - m);
+        let diff_hi = max.zip(value).map(|(mx, v)| mx - v);
+        region.assign_advice(|| "diff_lo", self.config.aux[1], row, || diff_lo)?;
+        region.assign_advice(|| "diff_hi", self.config.aux[2], row, || diff_hi)?;
 
         Ok(())
     }
