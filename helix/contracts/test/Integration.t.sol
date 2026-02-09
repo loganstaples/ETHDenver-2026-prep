@@ -684,12 +684,15 @@ contract IntegrationTest is Test {
 
     /// @notice Test admin parameter changes
     function test_AdminParameterChanges() public {
-        // Only owner can change parameters
+        // Only owner can change parameters (onlyOwner checked before whenPaused)
         vm.prank(attacker);
         vm.expectRevert(HelixCoordinatorV2.OnlyOwner.selector);
         coordinator.setSlashPercentage(2500);
 
-        // Owner can change
+        // Legacy setters require emergency pause
+        coordinator.emergencyPause();
+
+        // Owner can change when paused
         coordinator.setSlashPercentage(2500);
         assertEq(coordinator.slashPercentage(), 2500);
 
@@ -702,6 +705,8 @@ contract IntegrationTest is Test {
         // Cannot set slash percentage over 100%
         vm.expectRevert(HelixCoordinatorV2.MaxPercentage.selector);
         coordinator.setSlashPercentage(10001);
+
+        coordinator.unpause();
     }
 
     /// @notice Test verifier swap
@@ -722,10 +727,12 @@ contract IntegrationTest is Test {
         // Proof fails with current mock
         mockVerifier.setShouldPass(false);
 
-        // Swap to new mock that passes
+        // Swap to new mock that passes (requires emergency pause for legacy setter)
         MockVerifier newVerifier = new MockVerifier();
         newVerifier.setShouldPass(true);
+        coordinator.emergencyPause();
         coordinator.setVerifier(address(newVerifier));
+        coordinator.unpause();
 
         // Now proof succeeds
         uint256[] memory inputs = new uint256[](8);

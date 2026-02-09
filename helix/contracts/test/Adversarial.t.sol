@@ -64,6 +64,19 @@ contract AdversarialTest is Test {
 
     // ============ Helper Functions ============
 
+    /// @dev Wraps legacy setter calls with pause/unpause (emergency-only since B4 hardening)
+    function _emergencySetVerifier(address _verifier) internal {
+        coordinator.emergencyPause();
+        coordinator.setVerifier(_verifier);
+        coordinator.unpause();
+    }
+
+    function _emergencySetSlashPercentage(uint256 _percentage) internal {
+        coordinator.emergencyPause();
+        coordinator.setSlashPercentage(_percentage);
+        coordinator.unpause();
+    }
+
     function _setupModelAndRound() internal returns (uint256 modelId, uint256 hashLo, uint256 hashHi) {
         hashLo = 12345;
         hashHi = 67890;
@@ -125,7 +138,7 @@ contract AdversarialTest is Test {
 
     /// @notice Test submitting malformed proof (too short)
     function test_MalformedProofTooShort() public {
-        coordinator.setVerifier(address(realVerifier));
+        _emergencySetVerifier(address(realVerifier));
         (uint256 modelId, uint256 hashLo, uint256 hashHi) = _setupModelAndRound();
 
         vm.prank(attacker1);
@@ -161,7 +174,7 @@ contract AdversarialTest is Test {
 
     /// @notice Test submitting proof with invalid field elements (exceeding scalar field)
     function test_InvalidFieldElements() public {
-        coordinator.setVerifier(address(realVerifier));
+        _emergencySetVerifier(address(realVerifier));
         (uint256 modelId, uint256 hashLo, uint256 hashHi) = _setupModelAndRound();
 
         vm.prank(attacker1);
@@ -758,7 +771,7 @@ contract AdversarialTest is Test {
 
     /// @notice Test that large proof doesn't cause excessive gas
     function test_LargeProofGasLimit() public {
-        coordinator.setVerifier(address(realVerifier));
+        _emergencySetVerifier(address(realVerifier));
         (uint256 modelId, uint256 hashLo, uint256 hashHi) = _setupModelAndRound();
 
         vm.prank(attacker1);
@@ -960,7 +973,7 @@ contract AdversarialTest is Test {
 
     /// @notice Test with boundary value public inputs
     function test_BoundaryValuePublicInputs() public {
-        coordinator.setVerifier(address(realVerifier));
+        _emergencySetVerifier(address(realVerifier));
         (uint256 modelId, uint256 hashLo, uint256 hashHi) = _setupModelAndRound();
 
         vm.prank(attacker1);
@@ -1116,7 +1129,7 @@ contract AdversarialTest is Test {
         coordinator.stake{value: LARGE_STAKE}(modelId);
 
         // Change slash percentage to 75%
-        coordinator.setSlashPercentage(7500);
+        _emergencySetSlashPercentage(7500);
 
         mockVerifier.setShouldPass(false);
 
@@ -1140,7 +1153,7 @@ contract AdversarialTest is Test {
         coordinator.stake{value: LARGE_STAKE}(modelId);
 
         // Change slash percentage to 100%
-        coordinator.setSlashPercentage(10000);
+        _emergencySetSlashPercentage(10000);
 
         mockVerifier.setShouldPass(false);
 
@@ -1164,7 +1177,7 @@ contract AdversarialTest is Test {
         coordinator.stake{value: LARGE_STAKE}(modelId);
 
         // Change slash percentage to 0%
-        coordinator.setSlashPercentage(0);
+        _emergencySetSlashPercentage(0);
 
         mockVerifier.setShouldPass(false);
 

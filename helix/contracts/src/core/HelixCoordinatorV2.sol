@@ -427,6 +427,11 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
         _;
     }
 
+    modifier whenPaused() {
+        if (!paused) revert NotPaused();
+        _;
+    }
+
     modifier modelExists(uint256 modelId) {
         if (models[modelId].owner == address(0)) revert ModelNotFound();
         _;
@@ -1030,37 +1035,38 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
         emit ChallengerConfigUpdated(_rewardPercentage, _minReward, _maxReward, _enabled);
     }
 
-    // ============ Legacy Admin Functions (kept for backwards compatibility, emit deprecation) ============
-    // NOTE: These immediate setters are retained for emergency use but should be replaced
-    // by the timelocked versions in normal operation.
+    // ============ Emergency-Only Admin Functions (bypass timelocks only when paused) ============
+    // NOTE: These immediate setters bypass timelocks but ONLY work during emergency pause.
+    // In normal operation, use the timelocked propose/execute functions above.
 
-    /// @notice Updates the verifier contract (DEPRECATED: use proposeSetVerifier/executeSetVerifier)
-    function setVerifier(address _verifier) external onlyOwner {
+    /// @notice Emergency verifier update (only when paused)
+    function setVerifier(address _verifier) external onlyOwner whenPaused {
         emit ConfigUpdated("verifier", uint256(uint160(address(verifier))), uint256(uint160(_verifier)));
         verifier = IHelixVerifier(_verifier);
     }
 
-    /// @notice Updates the treasury address (DEPRECATED: use proposeSetTreasury/executeSetTreasury)
-    function setTreasury(address _treasury) external onlyOwner {
+    /// @notice Emergency treasury update (only when paused)
+    function setTreasury(address _treasury) external onlyOwner whenPaused {
+        if (_treasury == address(0)) revert InvalidTreasury();
         emit ConfigUpdated("treasury", uint256(uint160(treasury)), uint256(uint160(_treasury)));
         treasury = _treasury;
     }
 
-    /// @notice Updates the slash percentage (DEPRECATED: use proposeSetSlashPercentage/executeSetSlashPercentage)
-    function setSlashPercentage(uint256 _percentage) external onlyOwner {
+    /// @notice Emergency slash percentage update (only when paused)
+    function setSlashPercentage(uint256 _percentage) external onlyOwner whenPaused {
         if (_percentage > 10000) revert MaxPercentage();
         emit ConfigUpdated("slashPercentage", slashPercentage, _percentage);
         slashPercentage = uint16(_percentage);
     }
 
-    /// @notice Updates the default minimum stake (DEPRECATED: use proposeSetDefaultMinStake/executeSetDefaultMinStake)
-    function setDefaultMinStake(uint256 _minStake) external onlyOwner {
+    /// @notice Emergency default min stake update (only when paused)
+    function setDefaultMinStake(uint256 _minStake) external onlyOwner whenPaused {
         emit ConfigUpdated("defaultMinStake", defaultMinStake, _minStake);
         defaultMinStake = _minStake;
     }
 
-    /// @notice Updates the max error bound (DEPRECATED: use proposeSetMaxErrorBound/executeSetMaxErrorBound)
-    function setMaxErrorBound(uint256 _maxErrorBound) external onlyOwner {
+    /// @notice Emergency max error bound update (only when paused)
+    function setMaxErrorBound(uint256 _maxErrorBound) external onlyOwner whenPaused {
         emit ConfigUpdated("maxErrorBound", maxErrorBound, _maxErrorBound);
         maxErrorBound = _maxErrorBound;
     }

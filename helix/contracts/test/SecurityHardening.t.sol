@@ -884,7 +884,57 @@ contract CustomErrorsTest is Test {
     }
 
     function test_CustomError_MaxPercentage() public {
+        // Legacy setSlashPercentage now requires paused state
+        coordinator.emergencyPause();
         vm.expectRevert(HelixCoordinatorV2.MaxPercentage.selector);
         coordinator.setSlashPercentage(10001);
+    }
+
+    // ---- Emergency-Only Legacy Functions ----
+
+    function test_LegacySetVerifier_RevertsWhenNotPaused() public {
+        vm.expectRevert(HelixCoordinatorV2.NotPaused.selector);
+        coordinator.setVerifier(address(mockVerifier));
+    }
+
+    function test_LegacySetTreasury_RevertsWhenNotPaused() public {
+        vm.expectRevert(HelixCoordinatorV2.NotPaused.selector);
+        coordinator.setTreasury(makeAddr("newTreasury"));
+    }
+
+    function test_LegacySetSlashPercentage_RevertsWhenNotPaused() public {
+        vm.expectRevert(HelixCoordinatorV2.NotPaused.selector);
+        coordinator.setSlashPercentage(1000);
+    }
+
+    function test_LegacySetDefaultMinStake_RevertsWhenNotPaused() public {
+        vm.expectRevert(HelixCoordinatorV2.NotPaused.selector);
+        coordinator.setDefaultMinStake(1 ether);
+    }
+
+    function test_LegacySetMaxErrorBound_RevertsWhenNotPaused() public {
+        vm.expectRevert(HelixCoordinatorV2.NotPaused.selector);
+        coordinator.setMaxErrorBound(2e18);
+    }
+
+    function test_LegacyFunctions_WorkWhenPaused() public {
+        coordinator.emergencyPause();
+
+        // All legacy setters should work during emergency
+        coordinator.setVerifier(address(mockVerifier));
+        coordinator.setTreasury(makeAddr("newTreasury"));
+        coordinator.setSlashPercentage(2500);
+        coordinator.setDefaultMinStake(0.5 ether);
+        coordinator.setMaxErrorBound(2e18);
+
+        assertEq(coordinator.slashPercentage(), 2500);
+        assertEq(coordinator.defaultMinStake(), 0.5 ether);
+        assertEq(coordinator.maxErrorBound(), 2e18);
+    }
+
+    function test_LegacySetTreasury_RevertsZeroAddress() public {
+        coordinator.emergencyPause();
+        vm.expectRevert(HelixCoordinatorV2.InvalidTreasury.selector);
+        coordinator.setTreasury(address(0));
     }
 }

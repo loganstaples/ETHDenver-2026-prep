@@ -224,7 +224,9 @@ contract FuzzTest is Test {
         // Bound percentage to valid range (0-100%)
         percentage = uint96(bound(percentage, 0, 10000));
 
+        coordinator.emergencyPause();
         coordinator.setSlashPercentage(percentage);
+        coordinator.unpause();
         assertEq(coordinator.slashPercentage(), percentage);
 
         // Test slashing with this percentage
@@ -370,7 +372,9 @@ contract FuzzTest is Test {
         // Bound to reasonable range
         defaultMin = uint96(bound(defaultMin, 0.001 ether, 10 ether));
 
+        coordinator.emergencyPause();
         coordinator.setDefaultMinStake(defaultMin);
+        coordinator.unpause();
         assertEq(coordinator.defaultMinStake(), defaultMin);
 
         // Register with zero min stake should use default

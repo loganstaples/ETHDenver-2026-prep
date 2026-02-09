@@ -242,7 +242,9 @@ contract HelixCoordinatorV2Test is Test {
     function test_SlashPercentage() public {
         assertEq(coordinator.slashPercentage(), 5000); // 50%
 
+        coordinator.emergencyPause();
         coordinator.setSlashPercentage(2500); // 25%
+        coordinator.unpause();
         assertEq(coordinator.slashPercentage(), 2500);
     }
 
@@ -299,13 +301,17 @@ contract HelixCoordinatorV2Test is Test {
 
     function test_SetVerifier() public {
         Halo2Verifier newVerifier = new Halo2Verifier(Halo2VKDefaults.g2Generator());
+        coordinator.emergencyPause();
         coordinator.setVerifier(address(newVerifier));
+        coordinator.unpause();
         assertEq(address(coordinator.verifier()), address(newVerifier));
     }
 
     function test_SetTreasury() public {
         address newTreasury = makeAddr("newTreasury");
+        coordinator.emergencyPause();
         coordinator.setTreasury(newTreasury);
+        coordinator.unpause();
         assertEq(coordinator.treasury(), newTreasury);
     }
 
