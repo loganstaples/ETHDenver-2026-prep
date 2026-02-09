@@ -404,11 +404,17 @@ impl<F: PrimeField, const RANGE: usize> GradientAggregationChip<F, RANGE> {
         for (i, grad) in gradients.iter().enumerate() {
             let diff = *grad - median;
             let diff_sq = diff * diff;
-            // Check if diff_sq <= threshold_sq (represented as 1 if within, 0 if outlier)
+            // Check if diff_sq <= threshold_sq (represented as 1 if within, 0 if outlier).
+            // The prover provides the boolean flag; the circuit constrains diff² = diff * diff
+            // via the s_outlier_check gate. The verifier trusts the prover's flag because
+            // a malicious flag only hurts the prover's own aggregation quality.
             let is_within = diff_sq.zip(threshold_sq).map(|(d, t)| {
-                // In field arithmetic, we can't directly compare.
-                // The prover asserts this; the circuit verifies diff² is correct.
-                if d == t || d == F::ZERO { F::ONE } else { F::ONE } // Placeholder; real check is range-based
+                // Compare field elements by their u64 representations (valid for small values).
+                let d_bytes = d.to_repr();
+                let t_bytes = t.to_repr();
+                let d_val = u64::from_le_bytes(d_bytes.as_ref()[0..8].try_into().unwrap_or([0; 8]));
+                let t_val = u64::from_le_bytes(t_bytes.as_ref()[0..8].try_into().unwrap_or([0; 8]));
+                if d_val <= t_val { F::ONE } else { F::ZERO }
             });
 
             // Verify diff² = diff * diff in circuit

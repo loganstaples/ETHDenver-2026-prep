@@ -1914,7 +1914,6 @@ mod tests {
                 Blake2bRead, Blake2bWrite, Challenge255,
                 TranscriptReadBuffer, TranscriptWriterBuffer,
             },
-            poly::commitment::Params,
         };
         use halo2curves::bn256::Bn256;
         use rand_core::OsRng;
@@ -1982,7 +1981,6 @@ mod tests {
                 Blake2bRead, Blake2bWrite, Challenge255,
                 TranscriptReadBuffer, TranscriptWriterBuffer,
             },
-            poly::commitment::Params,
         };
         use halo2curves::bn256::Bn256;
         use rand_core::OsRng;

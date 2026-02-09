@@ -279,7 +279,6 @@ pub(crate) fn hash_to_fr(hash_bytes: &[u8]) -> Fr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use halo2curves::ff::Field;
     use halo2curves::group::Curve;
 
     #[test]

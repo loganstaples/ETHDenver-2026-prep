@@ -659,7 +659,6 @@ fn read_halo2_compressed_g1(bytes: &[u8], point_index: usize) -> Result<G1Affine
 #[cfg(test)]
 mod tests {
     use super::*;
-    use halo2curves::ff::Field;
 
     #[test]
     fn test_fr_roundtrip() {

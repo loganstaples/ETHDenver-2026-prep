@@ -1,5 +1,5 @@
-use crate::gadgets::range::{RangeChip, RangeConfig};
-use crate::gadgets::arithmetic::{ArithmeticChip, ArithmeticConfig};
+use crate::gadgets::range::RangeConfig;
+use crate::gadgets::arithmetic::ArithmeticChip;
 use crate::approximate::bounded_add::{BoundedAddChip, BoundedAddConfig};
 use crate::approximate::bounded_mul::{BoundedMulChip, BoundedMulConfig};
 use crate::approximate::bounded_matmul::{BoundedMatMulChip, BoundedMatMulConfig};
@@ -9,7 +9,7 @@ use halo2curves::bn256::Fr;
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
     dev::MockProver,
-    plonk::{Circuit, ConstraintSystem, Error, ErrorFront},
+    plonk::{Circuit, ConstraintSystem, ErrorFront},
 };
 
 #[derive(Clone)]
@@ -285,7 +285,7 @@ fn test_state_transition() {
 
 mod evm_format_tests {
     use crate::ml::training_step_v2::{
-        MLTrainingStepV2Circuit, MLTrainingStepV2Witness, compute_witness_v2, compute_state_hash_v2,
+        MLTrainingStepV2Circuit, compute_witness_v2, compute_state_hash_v2,
         ToEvmPublicInputs,
     };
     use crate::verifier::{
@@ -297,9 +297,7 @@ mod evm_format_tests {
         create_test_proof, create_test_public_inputs,
     };
     use halo2curves::bn256::{Fr, G1Affine};
-    use halo2curves::ff::{PrimeField, Field};
     use halo2curves::group::Curve;
-    use halo2curves::group::prime::PrimeCurveAffine;
 
     /// Test that proof length validation works correctly.
     #[test]

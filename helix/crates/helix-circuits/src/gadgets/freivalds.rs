@@ -314,7 +314,7 @@ mod tests {
         fn synthesize(
             &self,
             config: Self::Config,
-            mut layouter: impl Layouter<Fr>,
+            layouter: impl Layouter<Fr>,
         ) -> Result<(), ErrorFront> {
             let chip = FreivaldsChip::new(config);
 

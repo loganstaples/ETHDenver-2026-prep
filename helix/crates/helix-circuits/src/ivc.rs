@@ -110,11 +110,14 @@ impl IVCAccumulator {
 }
 
 /// Converts a [u8; 32] to Fr by interpreting as LE representation.
+/// Returns Fr::ZERO if the bytes do not represent a valid field element after masking.
 fn bytes_to_fr(bytes: &[u8; 32]) -> Fr {
     let mut repr = [0u8; 32];
     repr.copy_from_slice(bytes);
-    // Clear top bits to ensure valid field element
+    // Clear top 3 bits to keep value below 2^253, well within BN254 scalar field modulus
     repr[31] &= 0x1F;
+    // Note: after masking, value is < 2^253 < p (BN254 scalar modulus), so this always succeeds.
+    // unwrap_or(ZERO) is a defensive fallback that should never trigger in practice.
     Fr::from_repr_vartime(repr.into()).unwrap_or(Fr::ZERO)
 }
 
@@ -1289,6 +1292,89 @@ mod tests {
         assert!(prover.verify().is_err());
     }
 
+    /// Real KZG proof generation and verification for IVCFoldingCircuit.
+    #[test]
+    fn test_folding_circuit_real_proof() {
+        use halo2_proofs::{
+            plonk::{create_proof, keygen_pk, keygen_vk, verify_proof_multi},
+            poly::kzg::{
+                commitment::{KZGCommitmentScheme, ParamsKZG},
+                multiopen::{ProverSHPLONK, VerifierSHPLONK},
+                strategy::SingleStrategy,
+            },
+            transcript::{
+                Blake2bRead, Blake2bWrite, Challenge255,
+                TranscriptReadBuffer, TranscriptWriterBuffer,
+            },
+        };
+        use halo2curves::bn256::{Bn256, G1Affine};
+        use rand_core::OsRng;
+
+        let acc1 = IVCAccumulator {
+            state_commitment: Fr::from(100u64),
+            num_steps: 5,
+            error_term: Fr::one(),
+            error_bound: Fr::from(10),
+            challenge_hash: Fr::ZERO,
+        };
+        let acc2 = IVCAccumulator {
+            state_commitment: Fr::from(200u64),
+            num_steps: 3,
+            error_term: Fr::from(2),
+            error_bound: Fr::from(5),
+            challenge_hash: Fr::ZERO,
+        };
+        let challenge = generate_folding_challenge(&acc1, &acc2);
+
+        let witness = IVCFoldingWitness { acc1, acc2, challenge };
+        let circuit = IVCFoldingCircuit { witness };
+        let pi = circuit.public_inputs();
+        let k = 13; // 4 Poseidon hashes need k=13
+
+        // Setup
+        let params = ParamsKZG::<Bn256>::setup(k, OsRng);
+        let vk = keygen_vk(&params, &circuit).expect("keygen_vk failed");
+        let pk = keygen_pk(&params, vk.clone(), &circuit).expect("keygen_pk failed");
+
+        // Prove
+        let instances = vec![pi.clone()];
+        let mut transcript = Blake2bWrite::<Vec<u8>, G1Affine, Challenge255<_>>::init(vec![]);
+
+        create_proof::<
+            KZGCommitmentScheme<Bn256>,
+            ProverSHPLONK<'_, Bn256>,
+            _,
+            _,
+            _,
+            _,
+        >(
+            &params,
+            &pk,
+            &[circuit],
+            &[instances.clone()],
+            OsRng,
+            &mut transcript,
+        )
+        .expect("IVC folding create_proof failed");
+
+        let proof = transcript.finalize();
+        assert!(!proof.is_empty(), "Proof must not be empty");
+
+        // Verify
+        let mut verifier_transcript =
+            Blake2bRead::<_, G1Affine, Challenge255<_>>::init(proof.as_slice());
+        let verifier_params = params.verifier_params();
+        let verified = verify_proof_multi::<
+            KZGCommitmentScheme<Bn256>,
+            VerifierSHPLONK<Bn256>,
+            _,
+            _,
+            SingleStrategy<Bn256>,
+        >(&verifier_params, &vk, &[instances], &mut verifier_transcript);
+
+        assert!(verified, "IVC folding real proof verification must succeed");
+    }
+
     // ===== Multi-Step Circuit Tests =====
 
     #[test]
@@ -1450,7 +1536,6 @@ mod tests {
                 Blake2bRead, Blake2bWrite, Challenge255,
                 TranscriptReadBuffer, TranscriptWriterBuffer,
             },
-            poly::commitment::Params,
         };
         use halo2curves::bn256::{Bn256, G1Affine};
         use rand_core::OsRng;
@@ -1512,7 +1597,6 @@ mod tests {
                 Blake2bRead, Blake2bWrite, Challenge255,
                 TranscriptReadBuffer, TranscriptWriterBuffer,
             },
-            poly::commitment::Params,
         };
         use halo2curves::bn256::{Bn256, G1Affine};
         use rand_core::OsRng;

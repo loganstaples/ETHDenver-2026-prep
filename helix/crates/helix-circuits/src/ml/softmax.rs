@@ -351,7 +351,7 @@ pub fn compute_softmax<F: PrimeField>(scores: &[F], scale: u64) -> SoftmaxWitnes
     // Find max for numerical stability
     let max_score_f64 = scores_f64.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let max_idx = scores_f64.iter().enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(i, _)| i)
         .unwrap_or(0);
 
@@ -449,8 +449,6 @@ impl<F: PrimeField, const RANGE: usize, const SCALE: u64> Circuit<F> for Softmax
 #[cfg(test)]
 mod tests {
     use super::*;
-    use halo2_proofs::arithmetic::Field;
-    use halo2_proofs::dev::MockProver;
     use halo2curves::bn256::Fr;
 
     #[test]

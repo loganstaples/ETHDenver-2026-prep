@@ -513,7 +513,7 @@ mod tests {
 
     #[test]
     fn test_freivalds_optimizer() {
-        let mut optimizer = FreivaldsOptimizer::new(4);
+        let optimizer = FreivaldsOptimizer::new(4);
 
         // 8×8 matrix should be optimized
         assert!(optimizer.can_optimize(8, 8, 8));

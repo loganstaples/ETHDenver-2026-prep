@@ -1612,7 +1612,6 @@ mod tests {
     /// Tests circuit for 500K parameter model with representative dimensions.
     #[test]
     fn test_circuit_500k_model() {
-        use crate::ml::config::TransformerConfig;
         use std::time::Instant;
 
         // Create a representative block config matching small_demo proportions
@@ -1694,7 +1693,7 @@ mod tests {
         let mut current_input = input.clone();
 
         let start = Instant::now();
-        for layer_idx in 0..4 {
+        for _layer_idx in 0..4 {
             let witness = compute_transformer_block_witness(&current_input, &weights, &block_config, base_error);
             current_input = witness.output.clone();
             layers.push(witness);

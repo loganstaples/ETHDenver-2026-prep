@@ -758,15 +758,15 @@ mod tests {
         assert_eq!(entries[0], (Fr::ZERO, Fr::from(64u64)));
 
         // exp(-x) should decrease for increasing x
-        let exp_neg1 = entries[1]; // exp(-1/64)
-        let exp_neg2 = entries[2]; // exp(-2/64)
+        let _exp_neg1 = entries[1]; // exp(-1/64)
+        let _exp_neg2 = entries[2]; // exp(-2/64)
         // Both should be less than scale
         // Hard to check numerically without converting back
     }
 
     #[test]
     fn test_hard_sigmoid() {
-        let lookup = HardSigmoidLookup::<Fr, 256, 64>::new();
+        let _lookup = HardSigmoidLookup::<Fr, 256, 64>::new();
 
         // HardSigmoid(0) = 0.5
         assert!((HardSigmoidLookup::<Fr, 256, 64>::compute(0.0) - 0.5).abs() < 1e-6);
@@ -780,7 +780,7 @@ mod tests {
 
     #[test]
     fn test_hard_tanh() {
-        let lookup = HardTanhLookup::<Fr, 256, 64>::new();
+        let _lookup = HardTanhLookup::<Fr, 256, 64>::new();
 
         // HardTanh(0) = 0
         assert_eq!(HardTanhLookup::<Fr, 256, 64>::compute(0.0), 0.0);

@@ -321,7 +321,6 @@ impl Default for BenchmarkSuite {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use halo2_proofs::arithmetic::Field;
     use crate::ml::training_step::{compute_witness, compute_state_hash, MLTrainingStepCircuit};
 
     #[test]
