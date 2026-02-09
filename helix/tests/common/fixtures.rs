@@ -151,6 +151,23 @@ impl TestSample {
         }
     }
 
+    /// Creates a circuit-safe random sample.
+    ///
+    /// Values are kept in 1..5 to ensure intermediate values (h_pre = W1 @ x)
+    /// stay within the ReLU lookup range of ±128. With known weights
+    /// [1,2,3,4] and x in 1..5: h_pre_max = 4*5+3*5 = 35 (safe).
+    pub fn circuit_safe(d_in: usize, d_out: usize, seed: u64) -> Self {
+        // Deterministic tiny values: vary by seed to avoid identical samples
+        Self {
+            x: (0..d_in)
+                .map(|i| Fr::from(((seed + i as u64) % 4 + 1) as u64))
+                .collect(),
+            target: (0..d_out)
+                .map(|i| Fr::from(((seed + d_in as u64 + i as u64) % 4 + 1) as u64))
+                .collect(),
+        }
+    }
+
     /// Creates a sample with known values.
     pub fn known(d_in: usize, d_out: usize) -> Self {
         Self {
@@ -171,6 +188,15 @@ impl TestDataset {
     pub fn new(d_in: usize, d_out: usize, num_samples: usize, seed: u64) -> Self {
         let samples = (0..num_samples)
             .map(|i| TestSample::random(d_in, d_out, seed + i as u64))
+            .collect();
+        Self { samples }
+    }
+
+    /// Creates a circuit-safe dataset where all inputs stay within the
+    /// ReLU lookup range when combined with known model weights.
+    pub fn circuit_safe(d_in: usize, d_out: usize, num_samples: usize, seed: u64) -> Self {
+        let samples = (0..num_samples)
+            .map(|i| TestSample::circuit_safe(d_in, d_out, seed + i as u64))
             .collect();
         Self { samples }
     }

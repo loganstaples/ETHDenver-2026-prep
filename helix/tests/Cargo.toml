@@ -149,6 +149,10 @@ name = "ci_validation"
 path = "ci_validation.rs"
 
 [[test]]
+name = "orchestrator_lifecycle"
+path = "integration/orchestrator_lifecycle.rs"
+
+[[test]]
 name = "on_chain_verification"
 path = "integration/on_chain_verification.rs"
 required-features = ["on-chain"]

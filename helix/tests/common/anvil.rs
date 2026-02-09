@@ -436,6 +436,108 @@ impl OnChainTestEnv {
             .expect("setAccept confirm failed")
             .expect("setAccept receipt missing");
     }
+
+    /// Creates a test environment with the **real** Halo2Verifier.sol deployed.
+    ///
+    /// Extracts the SRS `[s]₂` G2 point from the Rust prover's KZG parameters
+    /// and passes it to the Halo2Verifier constructor. This means the on-chain
+    /// verifier will perform real BN254 pairing checks against the same SRS.
+    pub async fn new_with_real_verifier(s_g2: [U256; 4]) -> Self {
+        let out_dir = ensure_contracts_compiled();
+
+        // Spawn Anvil
+        let anvil = Anvil::new().spawn();
+        let provider = Provider::<Http>::try_from(anvil.endpoint())
+            .expect("Failed to connect to Anvil");
+
+        // Create wallet from first Anvil account
+        let wallet: LocalWallet = anvil.keys()[0].clone().into();
+        let wallet = wallet.with_chain_id(anvil.chain_id());
+        let deployer = wallet.address();
+        let client = Arc::new(SignerMiddleware::new(provider, wallet));
+
+        // Deploy real Halo2Verifier with the SRS [s]₂ point
+        let (verifier_abi, verifier_bytecode) =
+            load_contract_artifact(&out_dir, "Halo2Verifier.sol", "Halo2Verifier");
+        let verifier_factory =
+            ContractFactory::new(verifier_abi.clone(), verifier_bytecode, client.clone());
+        let verifier_contract = verifier_factory
+            .deploy(Token::FixedArray(vec![
+                Token::Uint(s_g2[0]),
+                Token::Uint(s_g2[1]),
+                Token::Uint(s_g2[2]),
+                Token::Uint(s_g2[3]),
+            ]))
+            .expect("Halo2Verifier deploy args")
+            .send()
+            .await
+            .expect("Halo2Verifier deploy failed");
+        let verifier_addr = verifier_contract.address();
+
+        // Deploy HelixCoordinatorV2(verifier, treasury)
+        let (coord_abi, coord_bytecode) =
+            load_contract_artifact(&out_dir, "HelixCoordinatorV2.sol", "HelixCoordinatorV2");
+        let coord_factory = ContractFactory::new(coord_abi.clone(), coord_bytecode, client.clone());
+        let coord_contract = coord_factory
+            .deploy((
+                Token::Address(verifier_addr),
+                Token::Address(deployer),
+            ))
+            .expect("Coordinator deploy args")
+            .send()
+            .await
+            .expect("Coordinator deploy failed");
+        let coordinator_addr = coord_contract.address();
+
+        let verifier = Contract::new(verifier_addr, verifier_abi, client.clone());
+        let coordinator = Contract::new(coordinator_addr, coord_abi, client.clone());
+
+        let max_error_bound: U256 = coordinator
+            .method::<_, U256>("maxErrorBound", ())
+            .expect("maxErrorBound method")
+            .call()
+            .await
+            .expect("maxErrorBound call failed");
+
+        Self {
+            anvil,
+            client,
+            mock_verifier_addr: verifier_addr,
+            coordinator_addr,
+            mock_verifier: verifier,
+            coordinator,
+            deployer,
+            max_error_bound,
+        }
+    }
+
+    /// Calls verifyProof directly on the verifier contract (for real verifier tests).
+    pub async fn verify_proof_directly(
+        &self,
+        proof_bytes: Bytes,
+        public_inputs: Vec<U256>,
+    ) -> bool {
+        self.mock_verifier
+            .method::<_, bool>("verifyProof", (proof_bytes, public_inputs))
+            .expect("verifyProof method")
+            .call()
+            .await
+            .unwrap_or(false)
+    }
+}
+
+/// Extracts the SRS `[s]₂` G2 point from an `MLTrainingProverV2` as 4 `U256` values
+/// suitable for deploying `Halo2Verifier.sol`.
+pub fn extract_s_g2_from_prover(
+    prover: &helix_prover::MLTrainingProverV2,
+) -> [U256; 4] {
+    let vk_data = prover.export_vk_data().expect("VK not initialized");
+    [
+        U256::from_dec_str(&vk_data.s_g2.0).expect("Invalid s_g2[0]"),
+        U256::from_dec_str(&vk_data.s_g2.1).expect("Invalid s_g2[1]"),
+        U256::from_dec_str(&vk_data.s_g2.2).expect("Invalid s_g2[2]"),
+        U256::from_dec_str(&vk_data.s_g2.3).expect("Invalid s_g2[3]"),
+    ]
 }
 
 // ============================================================================
