@@ -1792,12 +1792,10 @@ pub fn conv2d_backward_input(
     padding: (usize, usize),
     precision: Precision,
 ) -> Result<BoundedTensor, ConvError> {
-    // For backward pass, we need to transpose the kernel and apply transposed conv
-    // dL/dX = conv2d_transpose(dL/dY, W^T)
-
-    // First, flip and transpose the kernel
-    // Original: (out_ch, in_ch/g, kH, kW)
-    // For backward: (in_ch, out_ch/g, kH, kW) with spatial flip
+    // For cross-correlation forward: y = xcorr(x, w)
+    // Backward for input: dL/dX = conv2d_transpose(dL/dY, W_transposed)
+    // where W_transposed swaps (out_ch, in_ch) dims but does NOT flip spatially,
+    // since the forward pass is cross-correlation (no spatial flip).
 
     let (out_channels, in_channels_per_group, kernel_h, kernel_w) = (
         kernel.shape()[0],
@@ -1806,8 +1804,9 @@ pub fn conv2d_backward_input(
         kernel.shape()[3],
     );
 
-    // Create transposed and flipped kernel
-    let mut flipped_data = vec![BoundedValue::exact(0.0); kernel.len()];
+    // Transpose channel dimensions only: (out_ch, in_ch, kH, kW) -> (in_ch, out_ch, kH, kW)
+    // No spatial flip needed for cross-correlation backward.
+    let mut transposed_data = vec![BoundedValue::exact(0.0); kernel.len()];
 
     for oc in 0..out_channels {
         for ic in 0..in_channels_per_group {
@@ -1818,25 +1817,22 @@ pub fn conv2d_backward_input(
                         + kh * kernel_w
                         + kw;
 
-                    // Flip spatially: (kh, kw) -> (kernel_h-1-kh, kernel_w-1-kw)
                     // Transpose channels: (oc, ic) -> (ic, oc)
-                    let flipped_kh = kernel_h - 1 - kh;
-                    let flipped_kw = kernel_w - 1 - kw;
-
+                    // Keep spatial dimensions as-is
                     let dst_idx = ic * out_channels * kernel_h * kernel_w
                         + oc * kernel_h * kernel_w
-                        + flipped_kh * kernel_w
-                        + flipped_kw;
+                        + kh * kernel_w
+                        + kw;
 
-                    flipped_data[dst_idx] = kernel.data()[src_idx];
+                    transposed_data[dst_idx] = kernel.data()[src_idx];
                 }
             }
         }
     }
 
     let in_channels = input_shape[if input_shape.len() == 4 { 1 } else { 0 }];
-    let flipped_kernel = BoundedTensor::new(
-        flipped_data,
+    let transposed_kernel = BoundedTensor::new(
+        transposed_data,
         vec![in_channels, out_channels, kernel_h, kernel_w],
     );
 
@@ -1848,7 +1844,6 @@ pub fn conv2d_backward_input(
     let grad_w = grad_output.shape()[if grad_output.ndim() == 4 { 3 } else { 2 }];
 
     // Output size of transposed conv: (in_h - 1) * stride - 2*pad + kernel + out_pad = out_h
-    // out_pad = out_h - ((grad_h - 1) * stride - 2*padding + kernel)
     let expected_h = (grad_h - 1) * stride.0 + kernel_h;
     let expected_w = (grad_w - 1) * stride.1 + kernel_w;
 
@@ -1859,7 +1854,7 @@ pub fn conv2d_backward_input(
 
     conv2d_transpose(
         grad_output,
-        &flipped_kernel,
+        &transposed_kernel,
         stride,
         padding,
         output_padding,

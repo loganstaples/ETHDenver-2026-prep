@@ -1086,9 +1086,9 @@ impl TrainingCoordinator {
 
         let round_id = round.id;
 
-        // Check verification cache first
-        let proof_hash = self.hash_proof(&proof);
-        let cached_result = self.get_cached_verification(&proof_hash, round_id);
+        // Check verification cache first — key includes model commitment
+        let cache_key = self.cache_key(&proof, &gradient_hash);
+        let cached_result = self.get_cached_verification(&cache_key, round_id);
 
         let verification_result = if let Some(cached) = cached_result {
             // Use cached result
@@ -1104,7 +1104,7 @@ impl TrainingCoordinator {
             ).await;
 
             // Cache the result
-            self.cache_verification(&proof_hash, &result, round_id);
+            self.cache_verification(&cache_key, &result, round_id);
 
             result
         };
@@ -1419,10 +1419,14 @@ impl TrainingCoordinator {
         compute_gradient_norm_static(gradient)
     }
 
-    /// Hashes a proof for caching.
-    fn hash_proof(&self, proof: &[u8]) -> [u8; 32] {
+    /// Computes a cache key from proof bytes and model commitment.
+    ///
+    /// Including the model commitment ensures the same proof bytes verified
+    /// against different model states produce distinct cache entries.
+    fn cache_key(&self, proof: &[u8], model_commitment: &[u8; 32]) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(proof);
+        hasher.update(model_commitment);
         hasher.finalize().into()
     }
 
@@ -2163,7 +2167,8 @@ mod tests {
         let mut coordinator = TrainingCoordinator::new(config);
 
         let proof = vec![1u8; 64];
-        let proof_hash = coordinator.hash_proof(&proof);
+        let model_commitment = [0xAA_u8; 32];
+        let cache_key = coordinator.cache_key(&proof, &model_commitment);
         let round_id = RoundId::new(1);
 
         let result = VerificationResult {
@@ -2173,14 +2178,20 @@ mod tests {
             public_inputs: Some(vec![1]),
         };
 
-        coordinator.cache_verification(&proof_hash, &result, round_id);
+        coordinator.cache_verification(&cache_key, &result, round_id);
 
-        let cached = coordinator.get_cached_verification(&proof_hash, round_id);
+        let cached = coordinator.get_cached_verification(&cache_key, round_id);
         assert!(cached.is_some());
         assert!(cached.unwrap().is_valid);
 
         // Different round should not use cache
-        let cached = coordinator.get_cached_verification(&proof_hash, RoundId::new(2));
+        let cached = coordinator.get_cached_verification(&cache_key, RoundId::new(2));
+        assert!(cached.is_none());
+
+        // Same proof, different model commitment should not hit cache
+        let different_commitment = [0xBB_u8; 32];
+        let different_key = coordinator.cache_key(&proof, &different_commitment);
+        let cached = coordinator.get_cached_verification(&different_key, round_id);
         assert!(cached.is_none());
     }
 

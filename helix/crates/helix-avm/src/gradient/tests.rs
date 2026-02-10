@@ -727,3 +727,1334 @@ fn test_linear_regression_convergence() {
     assert!((w - 2.0).abs() < 0.1);
     assert!((b - 1.0).abs() < 0.1);
 }
+
+// ============================================================================
+// Comprehensive Backward Pass Tests with Finite-Difference Verification
+// ============================================================================
+
+/// Helper for finite-difference gradient checking of autodiff operations.
+///
+/// Compares the autodiff gradient (from `backward()`) against the numerical gradient
+/// computed via central finite differences for a single parameter variable.
+///
+/// # Arguments
+/// * `param_vals` - Initial values for the parameter
+/// * `param_shape` - Shape of the parameter tensor
+/// * `build_loss` - Closure: given a tracked Variable (the parameter), returns the loss Variable
+/// * `numerical_loss` - Closure: given raw &[f64] values, returns the scalar loss
+/// * `epsilon` - Finite-difference step size (typically 1e-5)
+/// * `tolerance` - Max allowed relative difference between autodiff and numerical gradients
+fn check_autodiff_gradient(
+    param_vals: &[f64],
+    param_shape: &[usize],
+    build_loss: impl Fn(&Variable) -> Variable,
+    numerical_loss: impl Fn(&[f64]) -> f64,
+    epsilon: f64,
+    tolerance: f64,
+) {
+    // 1. Compute autodiff gradient
+    let tape = GradientTape::new();
+    let param = Variable::param(
+        BoundedTensor::from_exact(param_vals.to_vec(), param_shape.to_vec()),
+        tape.clone(),
+        None,
+    );
+    let loss = build_loss(&param);
+    let grads = backward(&loss).expect("backward() failed");
+    let ad_grad = grads
+        .get(&param.node_index.unwrap())
+        .expect("No gradient for parameter")
+        .values();
+
+    // 2. Compute numerical gradient via central finite differences
+    let num_grad = numerical_gradient(&numerical_loss, param_vals, epsilon);
+
+    // 3. Compare element-wise
+    assert_eq!(
+        ad_grad.len(),
+        num_grad.len(),
+        "Gradient length mismatch: autodiff={}, numerical={}",
+        ad_grad.len(),
+        num_grad.len()
+    );
+
+    for (i, (&ad, &nd)) in ad_grad.iter().zip(num_grad.iter()).enumerate() {
+        let diff = (ad - nd).abs();
+        let scale = ad.abs().max(nd.abs()).max(1e-7);
+        assert!(
+            diff / scale < tolerance || diff < 1e-7,
+            "Gradient mismatch at index {}: autodiff={:.8}, numerical={:.8}, rel_diff={:.8}",
+            i,
+            ad,
+            nd,
+            diff / scale,
+        );
+    }
+}
+
+// --- Element-wise Mul backward ---
+
+#[test]
+fn test_mul_backward_analytical() {
+    // loss = sum(a * b), dL/da = b, dL/db = a
+    let tape = GradientTape::new();
+    let a = Variable::param(
+        BoundedTensor::from_exact(vec![2.0, 3.0, 4.0], vec![3]),
+        tape.clone(),
+        Some("a".into()),
+    );
+    let b = Variable::param(
+        BoundedTensor::from_exact(vec![5.0, 6.0, 7.0], vec![3]),
+        tape.clone(),
+        Some("b".into()),
+    );
+    let loss = a.mul(&b).sum();
+    let grads = backward(&loss).unwrap();
+
+    let da = grads.get(&a.node_index.unwrap()).unwrap().values();
+    let db = grads.get(&b.node_index.unwrap()).unwrap().values();
+
+    // dL/da_i = b_i
+    assert!((da[0] - 5.0).abs() < 1e-6);
+    assert!((da[1] - 6.0).abs() < 1e-6);
+    assert!((da[2] - 7.0).abs() < 1e-6);
+
+    // dL/db_i = a_i
+    assert!((db[0] - 2.0).abs() < 1e-6);
+    assert!((db[1] - 3.0).abs() < 1e-6);
+    assert!((db[2] - 4.0).abs() < 1e-6);
+}
+
+#[test]
+fn test_mul_backward_finite_diff() {
+    let a_vals = vec![2.0, 3.0, 4.0];
+    let b_vals = vec![5.0, 6.0, 7.0];
+
+    // Check gradient w.r.t. a
+    check_autodiff_gradient(
+        &a_vals,
+        &[3],
+        |a| {
+            let b = Variable::input(
+                BoundedTensor::from_exact(b_vals.clone(), vec![3]),
+                a.tape.as_ref().unwrap().clone(),
+                None,
+            );
+            a.mul(&b).sum()
+        },
+        |a| a.iter().zip(b_vals.iter()).map(|(ai, bi)| ai * bi).sum(),
+        1e-5,
+        1e-4,
+    );
+
+    // Check gradient w.r.t. b
+    check_autodiff_gradient(
+        &b_vals,
+        &[3],
+        |b| {
+            let a = Variable::input(
+                BoundedTensor::from_exact(a_vals.clone(), vec![3]),
+                b.tape.as_ref().unwrap().clone(),
+                None,
+            );
+            a.mul(b).sum()
+        },
+        |b| a_vals.iter().zip(b.iter()).map(|(ai, bi)| ai * bi).sum(),
+        1e-5,
+        1e-4,
+    );
+}
+
+#[test]
+fn test_mul_self_backward() {
+    // loss = sum(x * x) = sum(x^2), dL/dx_i = 2 * x_i
+    let tape = GradientTape::new();
+    let x = Variable::param(
+        BoundedTensor::from_exact(vec![1.0, 2.0, 3.0], vec![3]),
+        tape.clone(),
+        Some("x".into()),
+    );
+    let loss = x.mul(&x).sum();
+    let grads = backward(&loss).unwrap();
+    let dx = grads.get(&x.node_index.unwrap()).unwrap().values();
+
+    assert!((dx[0] - 2.0).abs() < 1e-6);
+    assert!((dx[1] - 4.0).abs() < 1e-6);
+    assert!((dx[2] - 6.0).abs() < 1e-6);
+}
+
+// --- Sigmoid backward ---
+
+#[test]
+fn test_sigmoid_backward_analytical() {
+    // loss = sum(sigmoid(x)), dL/dx_i = sigmoid(x_i) * (1 - sigmoid(x_i))
+    let tape = GradientTape::new();
+    let x = Variable::param(
+        BoundedTensor::from_exact(vec![-1.0, 0.0, 1.0], vec![3]),
+        tape.clone(),
+        None,
+    );
+    let loss = x.sigmoid().sum();
+    let grads = backward(&loss).unwrap();
+    let dx = grads.get(&x.node_index.unwrap()).unwrap().values();
+
+    for (i, &xi) in [-1.0_f64, 0.0, 1.0].iter().enumerate() {
+        let s = 1.0 / (1.0 + (-xi).exp());
+        let expected = s * (1.0 - s);
+        assert!(
+            (dx[i] - expected).abs() < 1e-6,
+            "sigmoid grad mismatch at {}: got {}, expected {}",
+            i,
+            dx[i],
+            expected
+        );
+    }
+}
+
+#[test]
+fn test_sigmoid_backward_finite_diff() {
+    let x_vals = vec![-2.0, -0.5, 0.0, 0.5, 2.0];
+
+    check_autodiff_gradient(
+        &x_vals,
+        &[5],
+        |x| x.sigmoid().sum(),
+        |x| x.iter().map(|xi| 1.0 / (1.0 + (-xi).exp())).sum(),
+        1e-5,
+        1e-4,
+    );
+}
+
+// --- Softmax backward ---
+
+#[test]
+fn test_softmax_backward_finite_diff() {
+    let x_vals = vec![1.0, 2.0, 3.0];
+    let selector = vec![1.0, 0.0, 0.0]; // Select first softmax output
+
+    check_autodiff_gradient(
+        &x_vals,
+        &[3],
+        |x| {
+            let sel = Variable::input(
+                BoundedTensor::from_exact(selector.clone(), vec![3]),
+                x.tape.as_ref().unwrap().clone(),
+                None,
+            );
+            x.softmax().mul(&sel).sum()
+        },
+        |x| {
+            let max_x = x.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let exp_x: Vec<f64> = x.iter().map(|xi| (xi - max_x).exp()).collect();
+            let sum_exp: f64 = exp_x.iter().sum();
+            exp_x[0] / sum_exp // softmax(x)[0]
+        },
+        1e-5,
+        1e-4,
+    );
+}
+
+#[test]
+fn test_softmax_backward_second_element() {
+    let x_vals = vec![0.5, 1.5, 0.2, 0.8];
+    let selector = vec![0.0, 1.0, 0.0, 0.0]; // Select second softmax output
+
+    check_autodiff_gradient(
+        &x_vals,
+        &[4],
+        |x| {
+            let sel = Variable::input(
+                BoundedTensor::from_exact(selector.clone(), vec![4]),
+                x.tape.as_ref().unwrap().clone(),
+                None,
+            );
+            x.softmax().mul(&sel).sum()
+        },
+        |x| {
+            let max_x = x.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let exp_x: Vec<f64> = x.iter().map(|xi| (xi - max_x).exp()).collect();
+            let sum_exp: f64 = exp_x.iter().sum();
+            exp_x[1] / sum_exp
+        },
+        1e-5,
+        1e-4,
+    );
+}
+
+// --- Tanh backward ---
+
+#[test]
+fn test_tanh_backward_analytical() {
+    // loss = sum(tanh(x)), dL/dx_i = 1 - tanh^2(x_i)
+    let tape = GradientTape::new();
+    let x = Variable::param(
+        BoundedTensor::from_exact(vec![-1.0, 0.0, 0.5, 1.0], vec![4]),
+        tape.clone(),
+        None,
+    );
+    let loss = x.tanh().sum();
+    let grads = backward(&loss).unwrap();
+    let dx = grads.get(&x.node_index.unwrap()).unwrap().values();
+
+    for (i, &xi) in [-1.0_f64, 0.0, 0.5, 1.0].iter().enumerate() {
+        let t = xi.tanh();
+        let expected = 1.0 - t * t;
+        assert!(
+            (dx[i] - expected).abs() < 1e-6,
+            "tanh grad mismatch at {}: got {}, expected {}",
+            i,
+            dx[i],
+            expected
+        );
+    }
+}
+
+#[test]
+fn test_tanh_backward_finite_diff() {
+    let x_vals = vec![-2.0, -0.5, 0.0, 0.5, 2.0];
+
+    check_autodiff_gradient(
+        &x_vals,
+        &[5],
+        |x| x.tanh().sum(),
+        |x| x.iter().map(|xi| xi.tanh()).sum(),
+        1e-5,
+        1e-4,
+    );
+}
+
+// --- LeakyReLU backward ---
+
+#[test]
+fn test_leaky_relu_backward_analytical() {
+    let alpha = 0.01;
+    let tape = GradientTape::new();
+    let x = Variable::param(
+        BoundedTensor::from_exact(vec![-2.0, -0.5, 0.5, 2.0], vec![4]),
+        tape.clone(),
+        None,
+    );
+    let loss = x.leaky_relu(alpha).sum();
+    let grads = backward(&loss).unwrap();
+    let dx = grads.get(&x.node_index.unwrap()).unwrap().values();
+
+    // dL/dx = 1 if x > 0, alpha if x <= 0
+    assert!((dx[0] - alpha).abs() < 1e-6); // x=-2 < 0
+    assert!((dx[1] - alpha).abs() < 1e-6); // x=-0.5 < 0
+    assert!((dx[2] - 1.0).abs() < 1e-6);   // x=0.5 > 0
+    assert!((dx[3] - 1.0).abs() < 1e-6);   // x=2 > 0
+}
+
+#[test]
+fn test_leaky_relu_backward_finite_diff() {
+    let x_vals = vec![-2.0, -0.5, 0.5, 2.0];
+    let alpha = 0.01;
+
+    check_autodiff_gradient(
+        &x_vals,
+        &[4],
+        |x| x.leaky_relu(alpha).sum(),
+        |x| {
+            x.iter()
+                .map(|&xi| if xi > 0.0 { xi } else { alpha * xi })
+                .sum()
+        },
+        1e-5,
+        1e-4,
+    );
+}
+
+// --- GELU backward ---
+
+#[test]
+fn test_gelu_backward_finite_diff() {
+    let x_vals = vec![-2.0, -0.5, 0.0, 0.5, 2.0];
+
+    check_autodiff_gradient(
+        &x_vals,
+        &[5],
+        |x| x.gelu().sum(),
+        |x| {
+            x.iter()
+                .map(|&xi| {
+                    let sig = 1.0 / (1.0 + (-1.702 * xi).exp());
+                    xi * sig
+                })
+                .sum()
+        },
+        1e-5,
+        1e-4,
+    );
+}
+
+// --- Div backward ---
+
+#[test]
+fn test_div_backward_finite_diff() {
+    let a_vals = vec![6.0, 8.0, 10.0];
+    let b_vals = vec![2.0, 4.0, 5.0];
+
+    check_autodiff_gradient(
+        &a_vals,
+        &[3],
+        |a| {
+            let b = Variable::input(
+                BoundedTensor::from_exact(b_vals.clone(), vec![3]),
+                a.tape.as_ref().unwrap().clone(),
+                None,
+            );
+            a.div(&b).sum()
+        },
+        |a| a.iter().zip(b_vals.iter()).map(|(ai, bi)| ai / bi).sum(),
+        1e-5,
+        1e-4,
+    );
+}
+
+// --- Sub backward ---
+
+#[test]
+fn test_sub_backward_analytical() {
+    let tape = GradientTape::new();
+    let a = Variable::param(
+        BoundedTensor::from_exact(vec![3.0, 5.0], vec![2]),
+        tape.clone(),
+        None,
+    );
+    let b = Variable::param(
+        BoundedTensor::from_exact(vec![1.0, 2.0], vec![2]),
+        tape.clone(),
+        None,
+    );
+    let loss = a.sub(&b).sum();
+    let grads = backward(&loss).unwrap();
+
+    let da = grads.get(&a.node_index.unwrap()).unwrap().values();
+    let db = grads.get(&b.node_index.unwrap()).unwrap().values();
+
+    // dL/da = 1, dL/db = -1
+    assert!((da[0] - 1.0).abs() < 1e-6);
+    assert!((da[1] - 1.0).abs() < 1e-6);
+    assert!((db[0] - (-1.0)).abs() < 1e-6);
+    assert!((db[1] - (-1.0)).abs() < 1e-6);
+}
+
+#[test]
+fn test_sub_backward_finite_diff() {
+    let a_vals = vec![3.0, 5.0, 7.0];
+    let b_vals = vec![1.0, 2.0, 3.0];
+
+    check_autodiff_gradient(
+        &a_vals,
+        &[3],
+        |a| {
+            let b = Variable::input(
+                BoundedTensor::from_exact(b_vals.clone(), vec![3]),
+                a.tape.as_ref().unwrap().clone(),
+                None,
+            );
+            a.sub(&b).sum()
+        },
+        |a| a.iter().zip(b_vals.iter()).map(|(ai, bi)| ai - bi).sum(),
+        1e-5,
+        1e-4,
+    );
+}
+
+// --- Mean backward ---
+
+#[test]
+fn test_mean_backward_analytical() {
+    // loss = mean(x), dL/dx_i = 1/n
+    let tape = GradientTape::new();
+    let x = Variable::param(
+        BoundedTensor::from_exact(vec![1.0, 2.0, 3.0, 4.0], vec![4]),
+        tape.clone(),
+        None,
+    );
+    let loss = x.mean();
+    let grads = backward(&loss).unwrap();
+    let dx = grads.get(&x.node_index.unwrap()).unwrap().values();
+
+    for &d in &dx {
+        assert!((d - 0.25).abs() < 1e-6, "mean grad should be 1/n=0.25, got {}", d);
+    }
+}
+
+#[test]
+fn test_mean_backward_finite_diff() {
+    let x_vals = vec![1.0, 2.0, 3.0, 4.0];
+
+    check_autodiff_gradient(
+        &x_vals,
+        &[4],
+        |x| x.mean(),
+        |x| x.iter().sum::<f64>() / x.len() as f64,
+        1e-5,
+        1e-4,
+    );
+}
+
+// --- MatMul backward ---
+
+#[test]
+fn test_matmul_backward_weight_finite_diff() {
+    // loss = sum(W @ x), check gradient w.r.t. W
+    let w_vals = vec![1.0, 2.0, 3.0, 4.0]; // 2x2
+    let x_vals = vec![0.5, 1.5]; // 2x1
+
+    check_autodiff_gradient(
+        &w_vals,
+        &[2, 2],
+        |w| {
+            let x = Variable::input(
+                BoundedTensor::from_exact(x_vals.clone(), vec![2, 1]),
+                w.tape.as_ref().unwrap().clone(),
+                None,
+            );
+            w.matmul(&x).sum()
+        },
+        |w| {
+            // y = W @ x, loss = sum(y)
+            let mut result = 0.0;
+            for i in 0..2 {
+                for j in 0..2 {
+                    result += w[i * 2 + j] * x_vals[j];
+                }
+            }
+            result
+        },
+        1e-5,
+        1e-4,
+    );
+}
+
+#[test]
+fn test_matmul_backward_input_finite_diff() {
+    // loss = sum(W @ x), check gradient w.r.t. x
+    let w_vals = vec![1.0, 2.0, 3.0, 4.0]; // 2x2
+    let x_vals = vec![0.5, 1.5]; // 2x1
+
+    check_autodiff_gradient(
+        &x_vals,
+        &[2, 1],
+        |x| {
+            let w = Variable::input(
+                BoundedTensor::from_exact(w_vals.clone(), vec![2, 2]),
+                x.tape.as_ref().unwrap().clone(),
+                None,
+            );
+            w.matmul(x).sum()
+        },
+        |x| {
+            let mut result = 0.0;
+            for i in 0..2 {
+                for j in 0..2 {
+                    result += w_vals[i * 2 + j] * x[j];
+                }
+            }
+            result
+        },
+        1e-5,
+        1e-4,
+    );
+}
+
+// --- Conv2d backward ---
+
+#[test]
+fn test_conv2d_backward_input_finite_diff() {
+    // Input: [1, 1, 4, 4], Kernel: [1, 1, 3, 3]
+    let input_vals: Vec<f64> = (1..=16).map(|x| x as f64 * 0.1).collect();
+    let kernel_vals = vec![1.0, 0.0, -1.0, 2.0, 0.0, -2.0, 1.0, 0.0, -1.0];
+
+    check_autodiff_gradient(
+        &input_vals,
+        &[1, 1, 4, 4],
+        |input| {
+            let kernel = Variable::input(
+                BoundedTensor::from_exact(kernel_vals.clone(), vec![1, 1, 3, 3]),
+                input.tape.as_ref().unwrap().clone(),
+                None,
+            );
+            input.conv2d(&kernel, (1, 1), (0, 0)).sum()
+        },
+        |input_v| {
+            let input_t = BoundedTensor::from_exact(input_v.to_vec(), vec![1, 1, 4, 4]);
+            let kernel_t = BoundedTensor::from_exact(kernel_vals.clone(), vec![1, 1, 3, 3]);
+            let config = crate::ops::Conv2dConfig {
+                stride: (1, 1),
+                padding: (0, 0),
+                dilation: (1, 1),
+                groups: 1,
+            };
+            let out = crate::ops::conv2d_with_config(&input_t, &kernel_t, config, Precision::F32)
+                .unwrap();
+            out.values().iter().sum()
+        },
+        1e-5,
+        1e-3, // Conv2d accumulates more numerical error
+    );
+}
+
+#[test]
+fn test_conv2d_backward_kernel_finite_diff() {
+    let input_vals: Vec<f64> = (1..=16).map(|x| x as f64 * 0.1).collect();
+    let kernel_vals = vec![1.0, 0.0, -1.0, 2.0, 0.0, -2.0, 1.0, 0.0, -1.0];
+
+    check_autodiff_gradient(
+        &kernel_vals,
+        &[1, 1, 3, 3],
+        |kernel| {
+            let input = Variable::input(
+                BoundedTensor::from_exact(input_vals.clone(), vec![1, 1, 4, 4]),
+                kernel.tape.as_ref().unwrap().clone(),
+                None,
+            );
+            input.conv2d(kernel, (1, 1), (0, 0)).sum()
+        },
+        |kernel_v| {
+            let input_t = BoundedTensor::from_exact(input_vals.clone(), vec![1, 1, 4, 4]);
+            let kernel_t = BoundedTensor::from_exact(kernel_v.to_vec(), vec![1, 1, 3, 3]);
+            let config = crate::ops::Conv2dConfig {
+                stride: (1, 1),
+                padding: (0, 0),
+                dilation: (1, 1),
+                groups: 1,
+            };
+            let out = crate::ops::conv2d_with_config(&input_t, &kernel_t, config, Precision::F32)
+                .unwrap();
+            out.values().iter().sum()
+        },
+        1e-5,
+        1e-3,
+    );
+}
+
+#[test]
+fn test_conv2d_backward_with_padding_finite_diff() {
+    // Test conv2d backward with padding
+    let input_vals: Vec<f64> = (1..=9).map(|x| x as f64 * 0.1).collect();
+    let kernel_vals = vec![1.0, 0.5, 0.5, 1.0];
+
+    check_autodiff_gradient(
+        &input_vals,
+        &[1, 1, 3, 3],
+        |input| {
+            let kernel = Variable::input(
+                BoundedTensor::from_exact(kernel_vals.clone(), vec![1, 1, 2, 2]),
+                input.tape.as_ref().unwrap().clone(),
+                None,
+            );
+            input.conv2d(&kernel, (1, 1), (1, 1)).sum()
+        },
+        |input_v| {
+            let input_t = BoundedTensor::from_exact(input_v.to_vec(), vec![1, 1, 3, 3]);
+            let kernel_t = BoundedTensor::from_exact(kernel_vals.clone(), vec![1, 1, 2, 2]);
+            let config = crate::ops::Conv2dConfig {
+                stride: (1, 1),
+                padding: (1, 1),
+                dilation: (1, 1),
+                groups: 1,
+            };
+            let out = crate::ops::conv2d_with_config(&input_t, &kernel_t, config, Precision::F32)
+                .unwrap();
+            out.values().iter().sum()
+        },
+        1e-5,
+        1e-3,
+    );
+}
+
+// --- MaxPool2d backward ---
+
+#[test]
+fn test_max_pool2d_backward_analytical() {
+    // Input [1,1,4,4]: values 1..16; pool 2x2, stride 2
+    // Max of each 2x2 block: positions (1,1)=6, (1,3)=8, (3,1)=14, (3,3)=16
+    // Only those positions should receive gradient 1.0; all others get 0.0
+    let input_vals: Vec<f64> = (1..=16).map(|x| x as f64).collect();
+    let tape = GradientTape::new();
+    let input = Variable::param(
+        BoundedTensor::from_exact(input_vals, vec![1, 1, 4, 4]),
+        tape.clone(),
+        None,
+    );
+    let loss = input.max_pool2d((2, 2), (2, 2), (0, 0)).sum();
+    let grads = backward(&loss).unwrap();
+    let dx = grads.get(&input.node_index.unwrap()).unwrap().values();
+
+    // Check that gradient is 1.0 at max positions, 0.0 elsewhere
+    let max_positions = vec![5, 7, 13, 15]; // 0-indexed flat positions of max elements in each 2x2 block
+    for i in 0..16 {
+        if max_positions.contains(&i) {
+            assert!(
+                (dx[i] - 1.0).abs() < 1e-6,
+                "Expected grad 1.0 at max position {}, got {}",
+                i,
+                dx[i]
+            );
+        } else {
+            assert!(
+                dx[i].abs() < 1e-6,
+                "Expected grad 0.0 at non-max position {}, got {}",
+                i,
+                dx[i]
+            );
+        }
+    }
+}
+
+#[test]
+fn test_max_pool2d_backward_finite_diff() {
+    // Use well-separated values to ensure stable max positions under perturbation
+    let input_vals: Vec<f64> = (1..=16).map(|x| x as f64 * 10.0).collect();
+
+    check_autodiff_gradient(
+        &input_vals,
+        &[1, 1, 4, 4],
+        |input| input.max_pool2d((2, 2), (2, 2), (0, 0)).sum(),
+        |input_v| {
+            let input_t = BoundedTensor::from_exact(input_v.to_vec(), vec![1, 1, 4, 4]);
+            let config = crate::ops::Pool2dConfig {
+                kernel_size: (2, 2),
+                stride: (2, 2),
+                padding: (0, 0),
+            };
+            let result = crate::ops::max_pool2d(&input_t, config).unwrap();
+            result.output.values().iter().sum()
+        },
+        1e-5,
+        1e-4,
+    );
+}
+
+// --- Chain Rule Tests ---
+
+#[test]
+fn test_chain_matmul_sigmoid_sum_finite_diff() {
+    let w_vals = vec![0.5, -0.3, 0.2, 0.8]; // 2x2
+    let x_vals = vec![1.0, 2.0]; // 2x1
+
+    check_autodiff_gradient(
+        &w_vals,
+        &[2, 2],
+        |w| {
+            let x = Variable::input(
+                BoundedTensor::from_exact(x_vals.clone(), vec![2, 1]),
+                w.tape.as_ref().unwrap().clone(),
+                None,
+            );
+            w.matmul(&x).sigmoid().sum()
+        },
+        |w| {
+            let mut y = vec![0.0; 2];
+            for i in 0..2 {
+                for j in 0..2 {
+                    y[i] += w[i * 2 + j] * x_vals[j];
+                }
+                y[i] = 1.0 / (1.0 + (-y[i]).exp());
+            }
+            y.iter().sum()
+        },
+        1e-5,
+        1e-4,
+    );
+}
+
+#[test]
+fn test_chain_matmul_tanh_sum_finite_diff() {
+    let w_vals = vec![0.5, -0.3, 0.2, 0.8]; // 2x2
+    let x_vals = vec![1.0, 2.0]; // 2x1
+
+    check_autodiff_gradient(
+        &w_vals,
+        &[2, 2],
+        |w| {
+            let x = Variable::input(
+                BoundedTensor::from_exact(x_vals.clone(), vec![2, 1]),
+                w.tape.as_ref().unwrap().clone(),
+                None,
+            );
+            w.matmul(&x).tanh().sum()
+        },
+        |w| {
+            let mut y = vec![0.0; 2];
+            for i in 0..2 {
+                for j in 0..2 {
+                    y[i] += w[i * 2 + j] * x_vals[j];
+                }
+                y[i] = y[i].tanh();
+            }
+            y.iter().sum()
+        },
+        1e-5,
+        1e-4,
+    );
+}
+
+#[test]
+fn test_chain_matmul_relu_sum_finite_diff() {
+    let w_vals = vec![0.5, -0.3, -0.2, 0.8]; // 2x2
+    let x_vals = vec![1.0, 2.0]; // 2x1
+
+    check_autodiff_gradient(
+        &w_vals,
+        &[2, 2],
+        |w| {
+            let x = Variable::input(
+                BoundedTensor::from_exact(x_vals.clone(), vec![2, 1]),
+                w.tape.as_ref().unwrap().clone(),
+                None,
+            );
+            w.matmul(&x).relu().sum()
+        },
+        |w| {
+            let mut y = vec![0.0; 2];
+            for i in 0..2 {
+                for j in 0..2 {
+                    y[i] += w[i * 2 + j] * x_vals[j];
+                }
+                y[i] = y[i].max(0.0);
+            }
+            y.iter().sum()
+        },
+        1e-5,
+        1e-4,
+    );
+}
+
+#[test]
+fn test_chain_mul_sigmoid_sum_finite_diff() {
+    // loss = sum(sigmoid(a * b))
+    let a_vals = vec![0.5, 1.0, -0.5, 1.5];
+    let b_vals = vec![2.0, -1.0, 3.0, 0.5];
+
+    check_autodiff_gradient(
+        &a_vals,
+        &[4],
+        |a| {
+            let b = Variable::input(
+                BoundedTensor::from_exact(b_vals.clone(), vec![4]),
+                a.tape.as_ref().unwrap().clone(),
+                None,
+            );
+            a.mul(&b).sigmoid().sum()
+        },
+        |a| {
+            a.iter()
+                .zip(b_vals.iter())
+                .map(|(&ai, &bi)| 1.0 / (1.0 + (-(ai * bi)).exp()))
+                .sum()
+        },
+        1e-5,
+        1e-4,
+    );
+}
+
+#[test]
+fn test_chain_add_mul_sum() {
+    // loss = sum((a + b) * c)
+    let a_vals = vec![1.0, 2.0, 3.0];
+    let b_vals = vec![0.5, 1.5, 2.5];
+    let c_vals = vec![2.0, 3.0, 4.0];
+
+    check_autodiff_gradient(
+        &a_vals,
+        &[3],
+        |a| {
+            let tape = a.tape.as_ref().unwrap().clone();
+            let b = Variable::input(
+                BoundedTensor::from_exact(b_vals.clone(), vec![3]),
+                tape.clone(),
+                None,
+            );
+            let c = Variable::input(
+                BoundedTensor::from_exact(c_vals.clone(), vec![3]),
+                tape,
+                None,
+            );
+            a.add(&b).mul(&c).sum()
+        },
+        |a| {
+            a.iter()
+                .zip(b_vals.iter())
+                .zip(c_vals.iter())
+                .map(|((&ai, &bi), &ci)| (ai + bi) * ci)
+                .sum()
+        },
+        1e-5,
+        1e-4,
+    );
+}
+
+#[test]
+fn test_chain_conv2d_relu_pool_sum_finite_diff() {
+    // Common CNN pattern: conv2d -> relu -> max_pool -> sum
+    // Input: [1, 1, 6, 6], Kernel: [1, 1, 3, 3]
+    let input_vals: Vec<f64> = (1..=36).map(|x| x as f64 * 0.01).collect();
+    let kernel_vals = vec![1.0, 0.0, -1.0, 0.0, 1.0, 0.0, -1.0, 0.0, 1.0];
+
+    check_autodiff_gradient(
+        &input_vals,
+        &[1, 1, 6, 6],
+        |input| {
+            let kernel = Variable::input(
+                BoundedTensor::from_exact(kernel_vals.clone(), vec![1, 1, 3, 3]),
+                input.tape.as_ref().unwrap().clone(),
+                None,
+            );
+            input
+                .conv2d(&kernel, (1, 1), (0, 0))
+                .relu()
+                .max_pool2d((2, 2), (2, 2), (0, 0))
+                .sum()
+        },
+        |input_v| {
+            let input_t = BoundedTensor::from_exact(input_v.to_vec(), vec![1, 1, 6, 6]);
+            let kernel_t = BoundedTensor::from_exact(kernel_vals.clone(), vec![1, 1, 3, 3]);
+            let config = crate::ops::Conv2dConfig {
+                stride: (1, 1),
+                padding: (0, 0),
+                dilation: (1, 1),
+                groups: 1,
+            };
+            let conv_out =
+                crate::ops::conv2d_with_config(&input_t, &kernel_t, config, Precision::F32)
+                    .unwrap();
+            let relu_out = crate::ops::relu(&conv_out);
+            let pool_config = crate::ops::Pool2dConfig {
+                kernel_size: (2, 2),
+                stride: (2, 2),
+                padding: (0, 0),
+            };
+            let pool_out = crate::ops::max_pool2d(&relu_out, pool_config).unwrap();
+            pool_out.output.values().iter().sum()
+        },
+        1e-5,
+        1e-2, // Multi-layer chain accumulates more error
+    );
+}
+
+// --- Multi-path gradient accumulation ---
+
+#[test]
+fn test_gradient_accumulation_multi_path() {
+    // loss = sum(x) + sum(x * x) — x contributes via two paths
+    // dL/dx_i = 1 + 2*x_i
+    let tape = GradientTape::new();
+    let x = Variable::param(
+        BoundedTensor::from_exact(vec![1.0, 2.0, 3.0], vec![3]),
+        tape.clone(),
+        None,
+    );
+    let path1 = x.sum();
+    let path2 = x.mul(&x).sum();
+    let loss = path1.add(&path2);
+    let grads = backward(&loss).unwrap();
+    let dx = grads.get(&x.node_index.unwrap()).unwrap().values();
+
+    assert!((dx[0] - 3.0).abs() < 1e-6, "1 + 2*1 = 3, got {}", dx[0]);
+    assert!((dx[1] - 5.0).abs() < 1e-6, "1 + 2*2 = 5, got {}", dx[1]);
+    assert!((dx[2] - 7.0).abs() < 1e-6, "1 + 2*3 = 7, got {}", dx[2]);
+}
+
+#[test]
+fn test_gradient_accumulation_multi_path_finite_diff() {
+    let x_vals = vec![1.0, 2.0, 3.0];
+
+    check_autodiff_gradient(
+        &x_vals,
+        &[3],
+        |x| {
+            let sum1 = x.sum();
+            let sum2 = x.mul(x).sum();
+            sum1.add(&sum2)
+        },
+        |x| {
+            let sum1: f64 = x.iter().sum();
+            let sum2: f64 = x.iter().map(|xi| xi * xi).sum();
+            sum1 + sum2
+        },
+        1e-5,
+        1e-4,
+    );
+}
+
+// ============================================================================
+// MLP Backward Verification
+// ============================================================================
+
+#[test]
+fn test_mlp_backward_gives_nonzero_gradients() {
+    let tape = GradientTape::new();
+
+    let w1 = Variable::param(
+        BoundedTensor::from_exact(vec![0.5, -0.3, 0.2, 0.8, -0.1, 0.6, 0.4, -0.2,
+                                        0.3, 0.7, -0.5, 0.1, 0.9, -0.4, 0.2, 0.6], vec![8, 2]),
+        tape.clone(), Some("w1".into()),
+    );
+    let b1 = Variable::param(
+        BoundedTensor::from_exact(vec![0.0; 8], vec![8]),
+        tape.clone(), Some("b1".into()),
+    );
+    let w2 = Variable::param(
+        BoundedTensor::from_exact(vec![0.3, -0.2, 0.5, 0.1, -0.4, 0.6, 0.2, -0.3], vec![1, 8]),
+        tape.clone(), Some("w2".into()),
+    );
+    let b2 = Variable::param(
+        BoundedTensor::from_exact(vec![0.0], vec![1]),
+        tape.clone(), Some("b2".into()),
+    );
+
+    let x = Variable::input(
+        BoundedTensor::from_exact(vec![0.0, 1.0], vec![1, 2]),
+        tape.clone(), None,
+    );
+    let target = Variable::input(
+        BoundedTensor::from_exact(vec![1.0], vec![1, 1]),
+        tape.clone(), None,
+    );
+
+    let output = Variable::mlp(&x, &w1, Some(&b1), &w2, Some(&b2));
+    let diff = output.sub(&target);
+    let loss = diff.mul(&diff).mean();
+
+    let grads = backward(&loss).unwrap();
+
+    for (name, var) in [("w1", &w1), ("b1", &b1), ("w2", &w2), ("b2", &b2)] {
+        let idx = var.node_index.unwrap();
+        let g = grads.get(&idx).unwrap_or_else(|| panic!("No gradient for {}", name));
+        let grad_norm: f64 = g.values().iter().map(|v| v * v).sum::<f64>().sqrt();
+        assert!(grad_norm > 1e-10, "{} gradient is zero", name);
+    }
+}
+
+#[test]
+fn test_trainer_updates_parameters_and_loss_decreases() {
+    use crate::gradient::training::{Trainer, TrainingConfig};
+
+    let d_in = 2;
+    let d_hid = 4;
+    let d_out = 1;
+
+    let config = TrainingConfig::new().with_accumulation_steps(1);
+    let optimizer = SGD::new(0.1);
+    let mut trainer = Trainer::new(optimizer, config);
+
+    trainer.register_parameter("w1", 0, BoundedTensor::from_exact(vec![0.5, -0.3, 0.2, 0.8, -0.1, 0.6, 0.4, -0.2], vec![d_hid, d_in]));
+    trainer.register_parameter("b1", 1, BoundedTensor::from_exact(vec![0.0; d_hid], vec![d_hid]));
+    trainer.register_parameter("w2", 2, BoundedTensor::from_exact(vec![0.3, -0.2, 0.5, 0.1], vec![d_out, d_hid]));
+    trainer.register_parameter("b2", 3, BoundedTensor::from_exact(vec![0.0], vec![d_out]));
+
+    let w1_before = trainer.get_param("w1").unwrap().values();
+
+    // Run one step
+    let loss_before = trainer_mlp_batch_step(
+        &mut trainer, &[0.0, 1.0], &[1.0], 1, d_in, d_out,
+    );
+
+    // Parameters should change
+    let w1_after = trainer.get_param("w1").unwrap().values();
+    let any_changed = w1_before.iter().zip(w1_after.iter())
+        .any(|(b, a)| (b - a).abs() > 1e-12);
+    assert!(any_changed, "Parameters did not change after trainer step!");
+
+    // Run 10 more steps, loss should decrease
+    for _ in 0..10 {
+        trainer_mlp_batch_step(&mut trainer, &[0.0, 1.0], &[1.0], 1, d_in, d_out);
+    }
+
+    let loss_after = trainer_mlp_batch_step(
+        &mut trainer, &[0.0, 1.0], &[1.0], 1, d_in, d_out,
+    );
+    assert!(loss_after < loss_before, "Loss should decrease over training steps");
+}
+
+// ============================================================================
+// XOR Convergence Tests with AutoDiff Trainer
+// ============================================================================
+
+/// Helper to run a single batched forward+backward training step.
+///
+/// Creates a fresh tape, builds Variable::mlp forward pass with batched input,
+/// computes MSE loss over the batch, then calls `trainer.step()`.
+fn trainer_mlp_batch_step(
+    trainer: &mut crate::gradient::training::Trainer<SGD>,
+    x_batch: &[f64],     // flat [batch_size * d_in]
+    y_batch: &[f64],     // flat [batch_size * d_out]
+    batch_size: usize,
+    d_in: usize,
+    d_out: usize,
+) -> f64 {
+    let tape = GradientTape::new();
+
+    let w1_var = Variable::param(trainer.get_param("w1").unwrap().clone(), tape.clone(), Some("w1".into()));
+    let b1_var = Variable::param(trainer.get_param("b1").unwrap().clone(), tape.clone(), Some("b1".into()));
+    let w2_var = Variable::param(trainer.get_param("w2").unwrap().clone(), tape.clone(), Some("w2".into()));
+    let b2_var = Variable::param(trainer.get_param("b2").unwrap().clone(), tape.clone(), Some("b2".into()));
+
+    trainer.update_param_index("w1", w1_var.node_index.unwrap());
+    trainer.update_param_index("b1", b1_var.node_index.unwrap());
+    trainer.update_param_index("w2", w2_var.node_index.unwrap());
+    trainer.update_param_index("b2", b2_var.node_index.unwrap());
+
+    let x_tensor = BoundedTensor::from_exact(x_batch.to_vec(), vec![batch_size, d_in]);
+    let x_var = Variable::input(x_tensor, tape.clone(), None);
+
+    let output = Variable::mlp(&x_var, &w1_var, Some(&b1_var), &w2_var, Some(&b2_var));
+
+    let target_tensor = BoundedTensor::from_exact(y_batch.to_vec(), vec![batch_size, d_out]);
+    let target_var = Variable::input(target_tensor, tape.clone(), None);
+    let diff = output.sub(&target_var);
+    let loss = diff.mul(&diff).mean(); // MSE over the entire batch
+
+    let loss_val = loss.tensor.data()[0].value();
+    trainer.step(&loss).unwrap();
+    loss_val
+}
+
+#[test]
+fn test_xor_convergence_with_autodiff_trainer() {
+    use crate::gradient::training::{Trainer, TrainingConfig};
+    use rand::Rng;
+    use rand::SeedableRng;
+
+    // XOR dataset - batched: all 4 samples in a single forward pass
+    let x_batch: Vec<f64> = vec![0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0];
+    let y_batch: Vec<f64> = vec![0.0, 1.0, 1.0, 0.0];
+    let batch_size = 4;
+
+    let d_in = 2;
+    let d_hid = 8;
+    let d_out = 1;
+
+    // Xavier initialization with fixed seed for reproducibility
+    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+    let xavier1 = (6.0 / (d_in + d_hid) as f64).sqrt();
+    let xavier2 = (6.0 / (d_hid + d_out) as f64).sqrt();
+
+    let w1_init: Vec<f64> = (0..d_hid * d_in).map(|_| rng.gen_range(-xavier1..xavier1)).collect();
+    let b1_init: Vec<f64> = vec![0.0; d_hid];
+    let w2_init: Vec<f64> = (0..d_out * d_hid).map(|_| rng.gen_range(-xavier2..xavier2)).collect();
+    let b2_init: Vec<f64> = vec![0.0; d_out];
+
+    // Trainer: SGD lr=0.5, batched gradient descent
+    let config = TrainingConfig::new().with_accumulation_steps(1);
+    let optimizer = SGD::new(0.5);
+    let mut trainer = Trainer::new(optimizer, config);
+
+    trainer.register_parameter("w1", 0, BoundedTensor::from_exact(w1_init, vec![d_hid, d_in]));
+    trainer.register_parameter("b1", 1, BoundedTensor::from_exact(b1_init, vec![d_hid]));
+    trainer.register_parameter("w2", 2, BoundedTensor::from_exact(w2_init, vec![d_out, d_hid]));
+    trainer.register_parameter("b2", 3, BoundedTensor::from_exact(b2_init, vec![d_out]));
+
+    let max_epochs = 5000;
+    let target_loss = 0.05;
+    let mut final_loss = f64::MAX;
+
+    for _epoch in 0..max_epochs {
+        let loss = trainer_mlp_batch_step(
+            &mut trainer, &x_batch, &y_batch, batch_size, d_in, d_out,
+        );
+        final_loss = loss;
+
+        if loss < target_loss {
+            break;
+        }
+    }
+
+    assert!(
+        final_loss < target_loss,
+        "XOR training did not converge: final loss = {:.6}, target = {}",
+        final_loss,
+        target_loss
+    );
+}
+
+#[test]
+fn test_gradient_accumulation_across_minibatches() {
+    use crate::gradient::training::{Trainer, TrainingConfig};
+    use rand::Rng;
+    use rand::SeedableRng;
+
+    // XOR dataset — each sample is its own mini-batch,
+    // gradients accumulate over all 4 before a weight update.
+    // This tests the gradient accumulation across tape boundaries.
+    let xor_inputs = [
+        vec![0.0, 0.0],
+        vec![0.0, 1.0],
+        vec![1.0, 0.0],
+        vec![1.0, 1.0],
+    ];
+    let xor_targets = [0.0, 1.0, 1.0, 0.0];
+
+    let d_in = 2;
+    let d_hid = 8;
+    let d_out = 1;
+
+    // Same Xavier init as the batched test
+    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+    let xavier1 = (6.0 / (d_in + d_hid) as f64).sqrt();
+    let xavier2 = (6.0 / (d_hid + d_out) as f64).sqrt();
+
+    let w1_init: Vec<f64> = (0..d_hid * d_in).map(|_| rng.gen_range(-xavier1..xavier1)).collect();
+    let b1_init: Vec<f64> = vec![0.0; d_hid];
+    let w2_init: Vec<f64> = (0..d_out * d_hid).map(|_| rng.gen_range(-xavier2..xavier2)).collect();
+    let b2_init: Vec<f64> = vec![0.0; d_out];
+
+    // 4 accumulation steps = full-batch GD via micro-batches of 1
+    let config = TrainingConfig::new().with_accumulation_steps(4);
+    let optimizer = SGD::new(0.5);
+    let mut trainer = Trainer::new(optimizer, config);
+
+    trainer.register_parameter("w1", 0, BoundedTensor::from_exact(w1_init, vec![d_hid, d_in]));
+    trainer.register_parameter("b1", 1, BoundedTensor::from_exact(b1_init, vec![d_hid]));
+    trainer.register_parameter("w2", 2, BoundedTensor::from_exact(w2_init, vec![d_out, d_hid]));
+    trainer.register_parameter("b2", 3, BoundedTensor::from_exact(b2_init, vec![d_out]));
+
+    let max_epochs = 10000;
+    let target_loss = 0.1;
+    let mut final_loss = f64::MAX;
+
+    for _epoch in 0..max_epochs {
+        let mut epoch_loss = 0.0;
+
+        for (x_data, &y_target) in xor_inputs.iter().zip(xor_targets.iter()) {
+            // Each sample in its own mini-batch (size 1)
+            epoch_loss += trainer_mlp_batch_step(
+                &mut trainer,
+                x_data,
+                &[y_target],
+                1,
+                d_in,
+                d_out,
+            );
+        }
+
+        epoch_loss /= xor_inputs.len() as f64;
+        final_loss = epoch_loss;
+
+        if epoch_loss < target_loss {
+            break;
+        }
+    }
+
+    assert!(
+        final_loss < target_loss,
+        "XOR with gradient accumulation did not converge: final loss = {:.6}, target = {}",
+        final_loss,
+        target_loss
+    );
+}
+
+// ============================================================================
+// Circuit Bridge Validation from Trained State
+// ============================================================================
+
+#[test]
+fn test_circuit_bridge_from_trained_state() {
+    use crate::gradient::training::{Trainer, TrainingConfig};
+    use crate::nn::Linear;
+    use crate::circuit_bridge::{build_training_witness, model_to_circuit_weights};
+    use helix_core::types::Precision;
+    use helix_circuits::halo2curves::bn256::Fr;
+    use helix_circuits::halo2curves::ff::Field;
+
+    // Tiny model: 2 → 2 → 1 with integer-ish initial weights
+    let d_in = 2;
+    let d_hid = 2;
+    let d_out = 1;
+
+    let config = TrainingConfig::new().with_accumulation_steps(1);
+    let optimizer = SGD::new(1.0);  // Large lr so quantized weights change at scale=1
+    let mut trainer = Trainer::new(optimizer, config);
+
+    trainer.register_parameter("w1", 0, BoundedTensor::from_exact(vec![1.0, 2.0, 3.0, 1.0], vec![d_hid, d_in]));
+    trainer.register_parameter("b1", 1, BoundedTensor::from_exact(vec![0.0, 0.0], vec![d_hid]));
+    trainer.register_parameter("w2", 2, BoundedTensor::from_exact(vec![1.0, 1.0], vec![d_out, d_hid]));
+    trainer.register_parameter("b2", 3, BoundedTensor::from_exact(vec![0.0], vec![d_out]));
+
+    let input_data = vec![1.0, 1.0];
+    let target_data = vec![5.0];
+
+    // Train for 1 step with lr=1.0 so weights change enough to be visible after
+    // integer quantization (circuit's scale=1 rounds to nearest integer)
+    trainer_mlp_batch_step(&mut trainer, &input_data, &target_data, 1, d_in, d_out);
+
+    // Extract trained weights and construct Linear layers
+    let w1_trained = trainer.get_param("w1").unwrap();
+    let b1_trained = trainer.get_param("b1").unwrap();
+    let w2_trained = trainer.get_param("w2").unwrap();
+    let b2_trained = trainer.get_param("b2").unwrap();
+
+    let layer1 = Linear::from_raw(
+        w1_trained.values(),
+        vec![d_hid, d_in],
+        Some(b1_trained.values()),
+        Precision::F32,
+    ).unwrap();
+
+    let layer2 = Linear::from_raw(
+        w2_trained.values(),
+        vec![d_out, d_hid],
+        Some(b2_trained.values()),
+        Precision::F32,
+    ).unwrap();
+
+    // Verify circuit weight extraction
+    let cw = model_to_circuit_weights(&layer1, &layer2).unwrap();
+    assert_eq!(cw.d_in, d_in);
+    assert_eq!(cw.d_hid, d_hid);
+    assert_eq!(cw.d_out, d_out);
+
+    for &v in cw.w1.iter().chain(cw.b1.iter()).chain(cw.w2.iter()).chain(cw.b2.iter()) {
+        assert!(v.is_finite(), "Trained weight is not finite: {}", v);
+    }
+
+    // Build training witness from the trained state
+    let output = build_training_witness(
+        &layer1,
+        &layer2,
+        &input_data,
+        &target_data,
+        1.0,
+        2, // step_number
+    ).expect("build_training_witness should succeed with trained weights");
+
+    let witness = &output.witness;
+
+    // Verify witness dimensions
+    assert_eq!(witness.d_in, d_in);
+    assert_eq!(witness.d_hid, d_hid);
+    assert_eq!(witness.d_out, d_out);
+
+    // Verify witness vector lengths
+    assert_eq!(witness.x.len(), d_in);
+    assert_eq!(witness.target.len(), d_out);
+    assert_eq!(witness.w1.len(), d_hid * d_in);
+    assert_eq!(witness.b1.len(), d_hid);
+    assert_eq!(witness.w2.len(), d_out * d_hid);
+    assert_eq!(witness.b2.len(), d_out);
+    assert_eq!(witness.h_pre.len(), d_hid);
+    assert_eq!(witness.h.len(), d_hid);
+    assert_eq!(witness.y.len(), d_out);
+    assert_eq!(witness.w1_new.len(), d_hid * d_in);
+    assert_eq!(witness.b1_new.len(), d_hid);
+    assert_eq!(witness.w2_new.len(), d_out * d_hid);
+    assert_eq!(witness.b2_new.len(), d_out);
+
+    // Public inputs should have 8 elements
+    let pi = witness.public_inputs();
+    assert_eq!(pi.len(), 8);
+
+    // State hashes should be non-trivial
+    assert_ne!(witness.old_state_hash.0, Fr::ZERO);
+    assert_ne!(witness.new_state_hash.0, Fr::ZERO);
+
+    // State should change after a training step
+    assert_ne!(witness.old_state_hash, witness.new_state_hash);
+
+    // relu_range should be reasonable
+    assert!(output.relu_range >= 256);
+}

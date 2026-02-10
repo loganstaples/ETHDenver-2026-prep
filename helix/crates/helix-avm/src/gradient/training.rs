@@ -251,7 +251,13 @@ pub struct Trainer<O: Optimizer> {
     /// Training state.
     state: TrainingState,
     /// Current model parameters (by name).
+    /// Maps name -> (current_tape_node_index, tensor).
     parameters: HashMap<String, (NodeIndex, BoundedTensor)>,
+    /// Stable canonical indices for gradient accumulation across tape boundaries.
+    /// Maps parameter name -> canonical index (assigned at registration time).
+    canonical_indices: HashMap<String, NodeIndex>,
+    /// Next canonical index to assign.
+    next_canonical: NodeIndex,
     /// Gradient checkpointer (if checkpointing is enabled).
     checkpointer: Option<GradientCheckpointer>,
 }
@@ -269,13 +275,37 @@ impl<O: Optimizer> Trainer<O> {
             accumulator: GradientAccumulator::new(),
             state: TrainingState::new(),
             parameters: HashMap::new(),
+            canonical_indices: HashMap::new(),
+            next_canonical: 0,
             checkpointer,
         }
     }
 
     /// Registers model parameters.
+    ///
+    /// Each parameter is assigned a stable canonical index that persists across
+    /// tape boundaries, enabling gradient accumulation across mini-batches.
     pub fn register_parameter(&mut self, name: &str, idx: NodeIndex, param: BoundedTensor) {
         self.parameters.insert(name.to_string(), (idx, param));
+        if !self.canonical_indices.contains_key(name) {
+            self.canonical_indices.insert(name.to_string(), self.next_canonical);
+            self.next_canonical += 1;
+        }
+    }
+
+    /// Updates the tape node index for a named parameter.
+    ///
+    /// Call this when a fresh tape is created for each training step,
+    /// so the trainer knows which tape node corresponds to which parameter.
+    pub fn update_param_index(&mut self, name: &str, new_idx: NodeIndex) {
+        if let Some((idx, _)) = self.parameters.get_mut(name) {
+            *idx = new_idx;
+        }
+    }
+
+    /// Gets a parameter tensor by name.
+    pub fn get_param(&self, name: &str) -> Option<&BoundedTensor> {
+        self.parameters.get(name).map(|(_, t)| t)
     }
 
     /// Gets parameter tensors as a HashMap by NodeIndex.
@@ -355,16 +385,39 @@ impl<O: Optimizer> Trainer<O> {
 
     /// Performs a single training step.
     ///
+    /// Uses canonical parameter indices for gradient accumulation across tape
+    /// boundaries. When parameters are registered via `register_parameter()`,
+    /// gradients from `backward()` are remapped from tape-specific NodeIndices
+    /// to stable canonical indices, enabling correct gradient accumulation
+    /// even when a fresh tape is created for each forward pass.
+    ///
     /// Returns the step metrics, or a TrainingError if training should halt.
     pub fn step(
         &mut self,
         loss_var: &Variable,
     ) -> Result<StepMetrics, TrainingError> {
         // Compute gradients
-        let mut grads = backward(loss_var).map_err(TrainingError::BackwardError)?;
+        let grads = backward(loss_var).map_err(TrainingError::BackwardError)?;
+
+        // Remap gradients from tape NodeIndex to canonical indices.
+        // This enables stable gradient accumulation across tape boundaries.
+        let use_canonical = !self.canonical_indices.is_empty();
+        let mut remapped_grads: HashMap<NodeIndex, BoundedTensor> = if use_canonical {
+            let mut remapped = HashMap::new();
+            for (name, (tape_idx, _)) in &self.parameters {
+                if let Some(grad) = grads.get(tape_idx) {
+                    if let Some(&canonical_idx) = self.canonical_indices.get(name) {
+                        remapped.insert(canonical_idx, grad.clone());
+                    }
+                }
+            }
+            remapped
+        } else {
+            grads
+        };
 
         // Apply gradient clipping
-        let grad_norm = self.config.grad_clip.apply(&mut grads);
+        let grad_norm = self.config.grad_clip.apply(&mut remapped_grads);
 
         // Check for exploding gradients
         if self.config.max_grad_norm > 0.0 && grad_norm > self.config.max_grad_norm {
@@ -374,24 +427,45 @@ impl<O: Optimizer> Trainer<O> {
             });
         }
 
-        // Accumulate gradients
-        self.accumulator.accumulate(grads);
+        // Accumulate gradients (canonical indices are stable across tapes)
+        self.accumulator.accumulate(remapped_grads);
 
         // Check if we should update
         if self.accumulator.step_count() >= self.config.accumulation_steps {
             // Get averaged gradients
             let avg_grads = self.accumulator.average();
 
-            // Get mutable params
-            let mut param_tensors = self.get_param_tensors();
+            // Build param tensors keyed by canonical or tape index
+            let mut param_tensors: HashMap<NodeIndex, BoundedTensor> = if use_canonical {
+                self.canonical_indices
+                    .iter()
+                    .filter_map(|(name, &canonical_idx)| {
+                        self.parameters
+                            .get(name)
+                            .map(|(_, t)| (canonical_idx, t.clone()))
+                    })
+                    .collect()
+            } else {
+                self.get_param_tensors()
+            };
 
             // Optimizer step
             self.optimizer.step(&mut param_tensors, &avg_grads);
 
             // Update stored parameters
-            for (_, (idx, param)) in self.parameters.iter_mut() {
-                if let Some(new_tensor) = param_tensors.get(idx) {
-                    *param = new_tensor.clone();
+            if use_canonical {
+                for (name, &canonical_idx) in &self.canonical_indices {
+                    if let Some(new_tensor) = param_tensors.get(&canonical_idx) {
+                        if let Some((_, stored_tensor)) = self.parameters.get_mut(name) {
+                            *stored_tensor = new_tensor.clone();
+                        }
+                    }
+                }
+            } else {
+                for (_, (idx, param)) in self.parameters.iter_mut() {
+                    if let Some(new_tensor) = param_tensors.get(idx) {
+                        *param = new_tensor.clone();
+                    }
                 }
             }
 

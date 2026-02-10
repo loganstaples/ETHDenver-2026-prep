@@ -268,10 +268,10 @@ impl ProofVerifier {
             };
         }
 
-        // Check cache
-        let proof_hash = self.hash_proof(proof);
+        // Check cache — key includes both proof hash and model commitment
+        let cache_key = self.cache_key(proof, &gradient_commitment);
         if self.config.enable_cache {
-            if let Some(cached) = self.get_cached(&proof_hash) {
+            if let Some(cached) = self.get_cached(&cache_key) {
                 let mut stats = self.stats.write();
                 stats.cache_hits += 1;
                 return cached;
@@ -304,7 +304,7 @@ impl ProofVerifier {
 
         // Cache result
         if self.config.enable_cache {
-            self.cache_result(&proof_hash, &result);
+            self.cache_result(&cache_key, &result);
         }
 
         result
@@ -511,9 +511,14 @@ impl ProofVerifier {
         }
     }
 
-    fn hash_proof(&self, proof: &[u8]) -> [u8; 32] {
+    /// Computes a cache key from proof bytes and model commitment.
+    ///
+    /// Including the model commitment ensures that the same proof bytes
+    /// verified against different model states are cached separately.
+    fn cache_key(&self, proof: &[u8], model_commitment: &[u8; 32]) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(proof);
+        hasher.update(model_commitment);
         let result = hasher.finalize();
         result.into()
     }

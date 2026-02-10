@@ -1,13 +1,20 @@
 //! Verifier Node Role.
 //!
 //! Implements the verifier node role which validates proofs
-//! and maintains network consensus. Supports structural validation,
-//! replay detection, and concurrency-limited verification.
+//! and maintains network consensus. Supports full Halo2 KZG verification
+//! (default), structural validation, replay detection, and
+//! concurrency-limited verification.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{RwLock, Semaphore};
+
+use parking_lot::RwLock as SyncRwLock;
+
+use helix_prover::halo2curves::bn256::Fr;
+use helix_prover::halo2curves::ff::PrimeField;
+use helix_prover::MLTrainingProverV2;
 
 use crate::network::messages::{NodeCapabilities, PeerId};
 use crate::sc_client::TrainingProofInputs;
@@ -35,7 +42,11 @@ pub enum VerifierState {
 /// Verification policy — controls how strictly proofs are validated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerificationPolicy {
-    /// Full structural validation: size check, public input count, range checks.
+    /// Full Halo2 KZG proof verification (structural checks + cryptographic verification).
+    /// Most secure — this is the production default.
+    VerifyAll,
+    /// Structural validation only: size check, public input count, range checks.
+    /// Suitable for testing environments where full proving is too slow.
     Structural,
     /// Permissive mode: only checks that proof is non-empty (for demos).
     Permissive,
@@ -43,7 +54,7 @@ pub enum VerificationPolicy {
 
 impl Default for VerificationPolicy {
     fn default() -> Self {
-        Self::Structural
+        Self::VerifyAll
     }
 }
 
@@ -56,6 +67,9 @@ pub struct VerifierConfig {
     pub timeout_secs: u64,
     /// Verification policy.
     pub policy: VerificationPolicy,
+    /// Model dimensions (d_in, d_hid, d_out) for Halo2 prover initialization.
+    /// Required when policy is `VerifyAll`.
+    pub model_dims: Option<(usize, usize, usize)>,
 }
 
 impl Default for VerifierConfig {
@@ -63,7 +77,8 @@ impl Default for VerifierConfig {
         Self {
             max_concurrent: 4,
             timeout_secs: 60,
-            policy: VerificationPolicy::Structural,
+            policy: VerificationPolicy::VerifyAll,
+            model_dims: None,
         }
     }
 }
@@ -112,12 +127,22 @@ pub struct VerifierNode {
     replay_cache: Arc<RwLock<HashSet<String>>>,
     /// Concurrency semaphore.
     semaphore: Arc<Semaphore>,
+    /// Halo2 prover for real KZG verification (lazy-initialized).
+    halo2_prover: Arc<SyncRwLock<Option<MLTrainingProverV2>>>,
 }
 
 impl VerifierNode {
     /// Creates a new verifier node.
     pub fn new(local_id: PeerId, config: VerifierConfig) -> Self {
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent));
+        // Pre-initialize prover if model_dims are given and policy requires it.
+        let prover = if config.policy == VerificationPolicy::VerifyAll {
+            config.model_dims.map(|(d_in, d_hid, d_out)| {
+                MLTrainingProverV2::new(d_in, d_hid, d_out)
+            })
+        } else {
+            None
+        };
         Self {
             local_id,
             config,
@@ -125,6 +150,68 @@ impl VerifierNode {
             stats: Arc::new(RwLock::new(VerifierStats::default())),
             replay_cache: Arc::new(RwLock::new(HashSet::new())),
             semaphore,
+            halo2_prover: Arc::new(SyncRwLock::new(prover)),
+        }
+    }
+
+    /// Ensures the Halo2 prover is initialized, creating it lazily if model_dims are available.
+    fn ensure_halo2_prover(&self) -> bool {
+        if self.halo2_prover.read().is_some() {
+            return true;
+        }
+        if let Some((d_in, d_hid, d_out)) = self.config.model_dims {
+            let prover = MLTrainingProverV2::new(d_in, d_hid, d_out);
+            *self.halo2_prover.write() = Some(prover);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Converts `TrainingProofInputs` (U256 values) to Halo2 `Fr` field elements.
+    /// Returns all 8 public inputs needed for native Halo2 KZG verification.
+    fn inputs_to_fr(inputs: &TrainingProofInputs) -> Vec<Fr> {
+        let mut result = Vec::with_capacity(8);
+        for u256 in &[
+            inputs.old_hash_lo,
+            inputs.old_hash_hi,
+            inputs.new_hash_lo,
+            inputs.new_hash_hi,
+            inputs.loss,
+            inputs.error_bound,
+            inputs.step_number,
+            inputs.error_checksum,
+        ] {
+            let mut le_bytes = [0u8; 32];
+            u256.to_little_endian(&mut le_bytes);
+            let repr = <Fr as PrimeField>::Repr::from(le_bytes);
+            match Option::from(Fr::from_repr(repr)) {
+                Some(fr) => result.push(fr),
+                None => {
+                    // If any U256 value doesn't fit in Fr, use zero
+                    result.push(Fr::from(0u64));
+                }
+            }
+        }
+        result
+    }
+
+    /// Performs full Halo2 KZG verification of a proof against public inputs.
+    fn halo2_verify(&self, proof: &[u8], inputs: &TrainingProofInputs) -> VerifyResult {
+        if !self.ensure_halo2_prover() {
+            return VerifyResult::Invalid(
+                "Halo2 prover not initialized: model_dims not configured".to_string()
+            );
+        }
+
+        let public_inputs_fr = Self::inputs_to_fr(inputs);
+        let prover_guard = self.halo2_prover.read();
+        let prover = prover_guard.as_ref().unwrap();
+
+        if prover.verify(proof, &public_inputs_fr) {
+            VerifyResult::Valid
+        } else {
+            VerifyResult::Invalid("Halo2 KZG proof verification failed".to_string())
         }
     }
 
@@ -213,6 +300,15 @@ impl VerifierNode {
 
         // Validate based on policy
         let result = match self.config.policy {
+            VerificationPolicy::VerifyAll => {
+                // Structural checks first, then full Halo2 KZG verification
+                let structural = Self::structural_check(proof, inputs);
+                if !structural.is_valid() {
+                    structural
+                } else {
+                    self.halo2_verify(proof, inputs)
+                }
+            }
             VerificationPolicy::Structural => {
                 Self::structural_check(proof, inputs)
             }
@@ -261,6 +357,7 @@ impl VerifierNode {
             loss: U256::zero(),
             error_bound: U256::from(10),
             step_number: U256::from(1),
+            error_checksum: U256::zero(),
         };
         // Use permissive check for legacy callers
         let result = if proof.is_empty() {
@@ -282,6 +379,15 @@ mod tests {
     use super::*;
     use ethers::types::U256;
 
+    /// Returns a `VerifierConfig` using `Structural` policy so unit tests that
+    /// fabricate proof bytes don't need a real Halo2 prover.
+    fn structural_config() -> VerifierConfig {
+        VerifierConfig {
+            policy: VerificationPolicy::Structural,
+            ..Default::default()
+        }
+    }
+
     fn make_valid_inputs() -> TrainingProofInputs {
         TrainingProofInputs {
             old_hash_lo: U256::from(1),
@@ -291,6 +397,7 @@ mod tests {
             loss: U256::from(100),
             error_bound: U256::from(10),
             step_number: U256::from(1),
+            error_checksum: U256::zero(),
         }
     }
 
@@ -301,21 +408,59 @@ mod tests {
     #[tokio::test]
     async fn test_verifier_init() {
         let local_id = PeerId::random();
-        let node = VerifierNode::new(local_id, VerifierConfig::default());
+        let node = VerifierNode::new(local_id, structural_config());
 
         assert!(matches!(node.get_state().await, VerifierState::Ready));
     }
 
+    #[test]
+    fn test_default_policy_is_verify_all() {
+        let config = VerifierConfig::default();
+        assert_eq!(config.policy, VerificationPolicy::VerifyAll);
+    }
+
+    #[tokio::test]
+    async fn test_verify_all_rejects_without_model_dims() {
+        // VerifyAll without model_dims should reject proofs (prover can't init)
+        let config = VerifierConfig {
+            policy: VerificationPolicy::VerifyAll,
+            model_dims: None,
+            ..Default::default()
+        };
+        let node = VerifierNode::new(PeerId::random(), config);
+        let result = node.verify_proof("p1".into(), &make_valid_proof(), &make_valid_inputs()).await;
+        assert!(!result.is_valid());
+        if let VerifyResult::Invalid(reason) = result {
+            assert!(reason.contains("not initialized"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_verify_all_rejects_fake_proof() {
+        // VerifyAll with model_dims should reject random bytes
+        let config = VerifierConfig {
+            policy: VerificationPolicy::VerifyAll,
+            model_dims: Some((2, 2, 1)),
+            ..Default::default()
+        };
+        let node = VerifierNode::new(PeerId::random(), config);
+        let result = node.verify_proof("p1".into(), &make_valid_proof(), &make_valid_inputs()).await;
+        assert!(!result.is_valid());
+        if let VerifyResult::Invalid(reason) = result {
+            assert!(reason.contains("Halo2 KZG"));
+        }
+    }
+
     #[tokio::test]
     async fn test_empty_proof_rejected() {
-        let node = VerifierNode::new(PeerId::random(), VerifierConfig::default());
+        let node = VerifierNode::new(PeerId::random(), structural_config());
         let result = node.verify_proof("p1".into(), &[], &make_valid_inputs()).await;
         assert!(!result.is_valid());
     }
 
     #[tokio::test]
     async fn test_undersized_proof_rejected() {
-        let node = VerifierNode::new(PeerId::random(), VerifierConfig::default());
+        let node = VerifierNode::new(PeerId::random(), structural_config());
         let small_proof = vec![1u8; 100]; // < 384
         let result = node.verify_proof("p1".into(), &small_proof, &make_valid_inputs()).await;
         assert!(!result.is_valid());
@@ -326,14 +471,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_valid_structural_proof_accepted() {
-        let node = VerifierNode::new(PeerId::random(), VerifierConfig::default());
+        let node = VerifierNode::new(PeerId::random(), structural_config());
         let result = node.verify_proof("p1".into(), &make_valid_proof(), &make_valid_inputs()).await;
         assert!(result.is_valid());
     }
 
     #[tokio::test]
     async fn test_zero_old_hash_rejected() {
-        let node = VerifierNode::new(PeerId::random(), VerifierConfig::default());
+        let node = VerifierNode::new(PeerId::random(), structural_config());
         let mut inputs = make_valid_inputs();
         inputs.old_hash_lo = U256::zero();
         inputs.old_hash_hi = U256::zero();
@@ -343,7 +488,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_zero_new_hash_rejected() {
-        let node = VerifierNode::new(PeerId::random(), VerifierConfig::default());
+        let node = VerifierNode::new(PeerId::random(), structural_config());
         let mut inputs = make_valid_inputs();
         inputs.new_hash_lo = U256::zero();
         inputs.new_hash_hi = U256::zero();
@@ -353,7 +498,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_excessive_step_number_rejected() {
-        let node = VerifierNode::new(PeerId::random(), VerifierConfig::default());
+        let node = VerifierNode::new(PeerId::random(), structural_config());
         let mut inputs = make_valid_inputs();
         inputs.step_number = U256::from(MAX_STEP_NUMBER + 1);
         let result = node.verify_proof("p1".into(), &make_valid_proof(), &inputs).await;
@@ -362,7 +507,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_replay_detection() {
-        let node = VerifierNode::new(PeerId::random(), VerifierConfig::default());
+        let node = VerifierNode::new(PeerId::random(), structural_config());
         let proof = make_valid_proof();
         let inputs = make_valid_inputs();
 
@@ -385,6 +530,7 @@ mod tests {
     async fn test_concurrency_limit_respected() {
         let config = VerifierConfig {
             max_concurrent: 2,
+            policy: VerificationPolicy::Structural,
             ..Default::default()
         };
         let node = Arc::new(VerifierNode::new(PeerId::random(), config));
@@ -428,7 +574,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats_tracking() {
-        let node = VerifierNode::new(PeerId::random(), VerifierConfig::default());
+        let node = VerifierNode::new(PeerId::random(), structural_config());
         let inputs = make_valid_inputs();
 
         // One valid, one invalid

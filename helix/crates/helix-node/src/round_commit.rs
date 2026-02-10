@@ -837,6 +837,7 @@ impl RoundCommitManager {
             loss: aggregated.public_inputs.loss,
             error_bound: U256::from((aggregated.total_error_bound * 1e18) as u64),
             step_number: U256::from(commit_id.round_number),
+            error_checksum: U256::zero(),
         };
 
         // Submit to chain via SCClient
@@ -1112,6 +1113,7 @@ impl RoundCommitCoordinator {
                 loss: U256::zero(),
                 error_bound: U256::from((error_bound * 1e18) as u64),
                 step_number: U256::from(share_index),
+                error_checksum: U256::zero(),
             },
             error_bound,
             share_index,
@@ -1264,6 +1266,7 @@ mod tests {
                 loss: U256::from(100),
                 error_bound: U256::from(10),
                 step_number: U256::from(share_index),
+                error_checksum: U256::zero(),
             },
             error_bound: 0.01,
             share_index,

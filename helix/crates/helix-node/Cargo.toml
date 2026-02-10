@@ -50,6 +50,9 @@ thiserror = "2.0"
 # Time utilities
 chrono = "0.4"
 
+# LRU cache for replay detection
+lru = "0.12"
+
 # HTTP API
 axum = "0.7"
 subtle = "2.5"
@@ -64,7 +67,7 @@ tempfile = "3.24.0"
 tokio-test = "0.4"
 
 [features]
-default = []
+default = ["crypto-sign"]
 dht = ["libp2p-kad"]
 crypto-sign = ["ed25519-dalek"]
 

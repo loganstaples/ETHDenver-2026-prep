@@ -2939,6 +2939,7 @@ dependencies = [
  "hostname",
  "libp2p-kad",
  "log",
+ "lru",
  "mdns-sd",
  "parking_lot",
  "prost",
