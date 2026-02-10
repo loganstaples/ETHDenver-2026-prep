@@ -214,6 +214,8 @@ pub enum MessagePayload {
     Sync(SyncMessage),
     /// Heartbeat/ping messages.
     Heartbeat(HeartbeatMessage),
+    /// BFT consensus messages (2-phase commit for gradient aggregation).
+    Consensus(ConsensusMessage),
 }
 
 /// Peer discovery messages.
@@ -411,6 +413,55 @@ pub struct HeartbeatMessage {
     pub is_pong: bool,
     /// Current load (0-100).
     pub load: u8,
+}
+
+/// BFT consensus messages for 2-phase commit gradient aggregation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ConsensusMessage {
+    /// Phase 1: Leader proposes aggregated gradient commitment.
+    Propose {
+        /// Round ID this proposal is for.
+        round_id: u64,
+        /// SHA-256 of sorted accepted gradient commitments.
+        aggregated_commitment: [u8; 32],
+        /// Cryptographic binding commitment from the proposer (H(proposal || proposer_id || nonce)).
+        proposer_binding: [u8; 32],
+        /// Number of individual gradients included.
+        num_gradients: usize,
+        /// Combined error bound for this aggregation.
+        error_bound: f64,
+        /// Nonce used in proposer_binding.
+        nonce: [u8; 16],
+    },
+    /// Phase 2: Participant votes on the proposal.
+    Vote {
+        /// Round ID this vote is for.
+        round_id: u64,
+        /// Whether this participant accepts the proposal.
+        accept: bool,
+        /// Voter's independently computed commitment (should match proposal).
+        voter_commitment: [u8; 32],
+        /// Reason for rejection (if accept is false).
+        reason: Option<String>,
+    },
+    /// Decision: Quorum reached, commit the aggregated gradient.
+    Commit {
+        /// Round ID.
+        round_id: u64,
+        /// Final agreed-upon commitment.
+        final_commitment: [u8; 32],
+        /// Number of votes in favor (>= 2f+1).
+        votes_for: usize,
+        /// Total participants in this consensus round.
+        total_participants: usize,
+    },
+    /// Decision: Consensus failed, abort this round.
+    Abort {
+        /// Round ID.
+        round_id: u64,
+        /// Reason for abort.
+        reason: String,
+    },
 }
 
 /// Serializes a message to bytes using bincode.

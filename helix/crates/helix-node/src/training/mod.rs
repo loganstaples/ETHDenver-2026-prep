@@ -33,6 +33,7 @@ pub mod state_machine;
 pub mod synchronization;
 pub mod fault_tolerance;
 pub mod distributed_coordinator;
+pub mod consensus;
 
 // Re-export key types
 pub use round::{
@@ -125,6 +126,12 @@ pub use distributed_coordinator::{
     DistributedTrainingConfig, DistributedTrainingState, WorkerInfo as DistributedWorkerInfo,
     DistributedTrainingEvent, GradientShare, GradientShareCollector,
     DistributedTrainingCoordinator, DistributedCoordinatorError,
+};
+
+pub use consensus::{
+    ConsensusConfig, ConsensusPhase, ConsensusProposal, ConsensusVote,
+    ConsensusResult, ConsensusEvent, ConsensusRound, ConsensusProtocol,
+    compute_aggregated_commitment, compute_binding, verify_bft_threshold,
 };
 
 pub use session_manager::{

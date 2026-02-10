@@ -18,8 +18,9 @@ use super::eclipse::{
 };
 use super::gossip::{GossipConfig, GossipProtocol};
 use super::messages::{
-    DiscoveryMessage, GradientMessage, HeartbeatMessage, MessagePayload, NetworkMessage,
-    NodeCapabilities, PeerId, PeerInfo, PeerKeyRegistry, SyncMessage, TrainingMessage,
+    ConsensusMessage, DiscoveryMessage, GradientMessage, HeartbeatMessage, MessagePayload,
+    NetworkMessage, NodeCapabilities, PeerId, PeerInfo, PeerKeyRegistry, SyncMessage,
+    TrainingMessage,
 };
 use super::partition_detect::{PartitionAction, PartitionDetectionConfig, PartitionDetector};
 use super::rate_limit::{BlacklistReason, MessageType, RateLimitConfig, RateLimitResult, RateLimiter};
@@ -41,6 +42,8 @@ pub enum NetworkEvent {
     SyncMessage { from: PeerId, message: SyncMessage },
     /// Heartbeat received.
     Heartbeat { from: PeerId, message: HeartbeatMessage },
+    /// BFT consensus message received (2-phase commit for gradient aggregation).
+    ConsensusMessage { from: PeerId, message: ConsensusMessage },
     /// Network error.
     Error { peer: Option<PeerId>, error: String },
 }
@@ -416,6 +419,9 @@ impl NetworkRunner {
             MessagePayload::Gradient(_) => MessageType::Gradient,
             MessagePayload::Sync(_) => MessageType::Sync,
             MessagePayload::Heartbeat(_) => MessageType::Heartbeat,
+            // Consensus messages use the Training rate limit bucket
+            // since they are part of the training coordination flow.
+            MessagePayload::Consensus(_) => MessageType::Training,
         }
     }
 
@@ -603,6 +609,12 @@ impl NetworkRunner {
                             let _ = event_tx.send(NetworkEvent::Heartbeat {
                                 from: message.sender,
                                 message: hb_msg,
+                            }).await;
+                        }
+                        MessagePayload::Consensus(consensus_msg) => {
+                            let _ = event_tx.send(NetworkEvent::ConsensusMessage {
+                                from: message.sender,
+                                message: consensus_msg,
                             }).await;
                         }
                     }

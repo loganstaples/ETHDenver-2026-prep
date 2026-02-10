@@ -28,6 +28,10 @@ use crate::training::DistributedRoundId;
 use ethers::types::U256;
 
 use super::aggregation::AggregationStrategy;
+use super::consensus::{
+    ConsensusConfig, ConsensusProtocol, ConsensusResult,
+    compute_aggregated_commitment, verify_bft_threshold,
+};
 use super::verification::{
     ByzantineGradientFilter, ByzantineStrategy, FilterResult,
     GradientValidator, ProofVerifier, ValidationResult, VerificationConfig,
@@ -56,6 +60,11 @@ pub struct OrchestratorConfig {
     pub verification: VerificationConfig,
     /// Default training parameters.
     pub default_params: TrainingParams,
+    /// BFT consensus configuration for gradient aggregation.
+    pub consensus: ConsensusConfig,
+    /// Enable BFT consensus (2-phase commit) for gradient aggregation.
+    /// When disabled, falls back to leader-only aggregation.
+    pub consensus_enabled: bool,
 }
 
 impl Default for OrchestratorConfig {
@@ -80,6 +89,8 @@ impl Default for OrchestratorConfig {
                 d_out: 2,
                 model_seed: 42,
             },
+            consensus: ConsensusConfig::default(),
+            consensus_enabled: true,
         }
     }
 }
@@ -233,6 +244,8 @@ pub struct TrainingOrchestrator {
     byzantine_filter: Arc<RwLock<ByzantineGradientFilter>>,
     /// Aggregation strategy.
     aggregation_strategy: Arc<RwLock<AggregationStrategy>>,
+    /// BFT consensus protocol for 2-phase commit on gradient aggregation.
+    consensus: Arc<RwLock<ConsensusProtocol>>,
 }
 
 impl TrainingOrchestrator {
@@ -255,6 +268,11 @@ impl TrainingOrchestrator {
             (config.min_workers / 3).max(1), // Tolerate up to n/3 Byzantine workers
         )));
 
+        let consensus = Arc::new(RwLock::new(ConsensusProtocol::new(
+            local_id.clone(),
+            config.consensus.clone(),
+        )));
+
         Self {
             local_id,
             config,
@@ -271,6 +289,7 @@ impl TrainingOrchestrator {
             model_id: Arc::new(RwLock::new(0)),
             byzantine_filter,
             aggregation_strategy: Arc::new(RwLock::new(AggregationStrategy::FedAvg)),
+            consensus,
         }
     }
 
@@ -805,13 +824,52 @@ impl TrainingOrchestrator {
         );
 
         // Compute aggregated commitment via SHA-256 of sorted accepted commitments
-        accepted_commitments.sort();
-        let mut hasher = sha2::Sha256::new();
-        for commitment in &accepted_commitments {
-            sha2::Digest::update(&mut hasher, commitment);
-        }
-        let combined: [u8; 32] = sha2::Digest::finalize(hasher).into();
+        let combined = compute_aggregated_commitment(&accepted_commitments);
 
+        // === BFT Consensus (2-Phase Commit) ===
+        // If consensus is enabled, run 2PC before accepting the aggregation.
+        // The leader proposes the aggregated commitment and waits for 2f+1 votes.
+        if self.config.consensus_enabled && worker_ids.len() >= 3 {
+            let participants: HashSet<PeerId> = worker_ids.iter().cloned().collect();
+
+            // Check BFT threshold: need n >= 3f+1
+            let max_faulty = self.config.consensus.max_faulty;
+            if !verify_bft_threshold(participants.len(), max_faulty) {
+                log::warn!(
+                    "Insufficient participants ({}) for BFT consensus (need >= 3f+1 = {}), \
+                     falling back to leader-only aggregation",
+                    participants.len(),
+                    3 * max_faulty + 1,
+                );
+            } else {
+                // Phase 1: Leader creates and broadcasts proposal
+                let propose_msg = {
+                    let mut consensus = self.consensus.write();
+                    consensus.create_proposal(
+                        round_id,
+                        participants,
+                        &accepted_commitments,
+                        gradients.iter().map(|(_, g)| g.error_bound).sum::<f64>()
+                            / gradients.len() as f64,
+                    )
+                };
+
+                self.network.broadcast(MessagePayload::Consensus(propose_msg)).await;
+
+                log::info!(
+                    "Consensus proposal broadcast for round {} (commitment={})",
+                    round_id,
+                    hex::encode(&combined[..8]),
+                );
+
+                // Note: Vote collection happens asynchronously via handle_consensus_message.
+                // The round completes when quorum is reached in handle_consensus_vote.
+                // We return here and let the consensus flow drive completion.
+                return;
+            }
+        }
+
+        // Fallback: no consensus, commit directly
         self.network.broadcast(MessagePayload::Gradient(GradientMessage::AggregatedGradient {
             round_id,
             commitment: combined,
@@ -980,6 +1038,205 @@ impl TrainingOrchestrator {
         *self.current_round.write() = None;
     }
 
+    /// Handles an incoming BFT consensus message.
+    ///
+    /// Routes Propose/Vote/Commit/Abort messages to the consensus protocol
+    /// and drives the 2-phase commit to completion.
+    pub async fn handle_consensus_message(
+        &self,
+        from: PeerId,
+        message: crate::network::messages::ConsensusMessage,
+    ) {
+        use crate::network::messages::ConsensusMessage;
+
+        match message {
+            ConsensusMessage::Propose {
+                round_id,
+                aggregated_commitment,
+                proposer_binding,
+                num_gradients,
+                error_bound,
+                nonce,
+            } => {
+                // Non-leader receives proposal — verify and vote
+                let local_commitments = self.get_local_gradient_commitments(round_id);
+                let participants = self.get_round_participants(round_id);
+
+                let (vote_msg, _events) = {
+                    let mut consensus = self.consensus.write();
+                    consensus.handle_proposal(
+                        &from,
+                        round_id,
+                        aggregated_commitment,
+                        proposer_binding,
+                        num_gradients,
+                        error_bound,
+                        nonce,
+                        &local_commitments,
+                        participants,
+                    )
+                };
+
+                // Broadcast vote
+                self.network.broadcast(MessagePayload::Consensus(vote_msg)).await;
+            }
+
+            ConsensusMessage::Vote {
+                round_id,
+                accept,
+                voter_commitment,
+                reason,
+            } => {
+                // Leader collects votes
+                let (decision, _events) = {
+                    let mut consensus = self.consensus.write();
+                    consensus.handle_vote(&from, round_id, accept, voter_commitment, reason)
+                };
+
+                if let Some(decision_msg) = decision {
+                    match decision_msg {
+                        ConsensusMessage::Commit {
+                            round_id: commit_round_id,
+                            final_commitment,
+                            votes_for,
+                            total_participants,
+                        } => {
+                            log::info!(
+                                "Consensus COMMITTED for round {}: {}/{} votes (commitment={})",
+                                commit_round_id,
+                                votes_for,
+                                total_participants,
+                                hex::encode(&final_commitment[..8]),
+                            );
+
+                            // Broadcast the commit decision
+                            self.network.broadcast(
+                                MessagePayload::Consensus(ConsensusMessage::Commit {
+                                    round_id: commit_round_id,
+                                    final_commitment,
+                                    votes_for,
+                                    total_participants,
+                                }),
+                            ).await;
+
+                            // Also broadcast the aggregated gradient
+                            self.network.broadcast(MessagePayload::Gradient(
+                                GradientMessage::AggregatedGradient {
+                                    round_id: commit_round_id,
+                                    commitment: final_commitment,
+                                    proof: vec![],
+                                },
+                            )).await;
+
+                            // Complete the round
+                            self.complete_round(final_commitment).await;
+
+                            // Clear consensus state
+                            self.consensus.write().clear_active_round();
+                        }
+                        ConsensusMessage::Abort { round_id: abort_round_id, reason } => {
+                            log::warn!(
+                                "Consensus ABORTED for round {}: {}",
+                                abort_round_id, reason,
+                            );
+
+                            // Broadcast the abort
+                            self.network.broadcast(
+                                MessagePayload::Consensus(ConsensusMessage::Abort {
+                                    round_id: abort_round_id,
+                                    reason: reason.clone(),
+                                }),
+                            ).await;
+
+                            // Fail the round
+                            self.fail_round(
+                                abort_round_id,
+                                &format!("Consensus aborted: {}", reason),
+                            ).await;
+
+                            self.consensus.write().clear_active_round();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            ConsensusMessage::Commit {
+                round_id,
+                final_commitment,
+                votes_for,
+                total_participants,
+            } => {
+                // Non-leader receives commit decision
+                let _events = {
+                    let mut consensus = self.consensus.write();
+                    consensus.handle_commit(
+                        round_id,
+                        final_commitment,
+                        votes_for,
+                        total_participants,
+                    )
+                };
+
+                log::info!(
+                    "Received consensus commit for round {} (commitment={})",
+                    round_id,
+                    hex::encode(&final_commitment[..8]),
+                );
+
+                self.consensus.write().clear_active_round();
+            }
+
+            ConsensusMessage::Abort { round_id, reason } => {
+                // Non-leader receives abort
+                let _events = {
+                    let mut consensus = self.consensus.write();
+                    consensus.handle_abort(round_id, reason.clone())
+                };
+
+                log::warn!(
+                    "Received consensus abort for round {}: {}",
+                    round_id, reason,
+                );
+
+                self.consensus.write().clear_active_round();
+            }
+        }
+    }
+
+    /// Returns the gradient commitments from the current round for consensus verification.
+    fn get_local_gradient_commitments(&self, round_id: u64) -> Vec<[u8; 32]> {
+        let round_guard = self.current_round.read();
+        if let Some(ref round) = *round_guard {
+            if round.id == round_id {
+                let mut commitments: Vec<[u8; 32]> = round
+                    .gradients
+                    .values()
+                    .map(|g| g.commitment)
+                    .collect();
+                commitments.sort();
+                return commitments;
+            }
+        }
+        vec![]
+    }
+
+    /// Returns the set of participants for a round.
+    fn get_round_participants(&self, round_id: u64) -> HashSet<PeerId> {
+        let round_guard = self.current_round.read();
+        if let Some(ref round) = *round_guard {
+            if round.id == round_id {
+                return round.workers.clone();
+            }
+        }
+        HashSet::new()
+    }
+
+    /// Returns a reference to the consensus protocol.
+    pub fn consensus(&self) -> &Arc<RwLock<ConsensusProtocol>> {
+        &self.consensus
+    }
+
     fn start_heartbeat_loop(&self) {
         let running = self.running.clone();
         let network = self.network.clone();
@@ -1086,6 +1343,7 @@ impl TrainingOrchestrator {
         // Using a channel-based approach instead of self reference
         let (gradient_tx, mut gradient_rx) = mpsc::channel::<(PeerId, u64, [u8; 32], f64, Vec<u8>)>(100);
         let (heartbeat_tx, mut heartbeat_rx) = mpsc::channel::<(PeerId, HeartbeatMessage)>(100);
+        let (consensus_tx, mut consensus_rx) = mpsc::channel::<(PeerId, crate::network::messages::ConsensusMessage)>(100);
 
         // Spawn event processing task
         tokio::spawn(async move {
@@ -1124,6 +1382,9 @@ impl TrainingOrchestrator {
                             NetworkEvent::PeerDisconnected(peer_id) => {
                                 orchestrator_workers.write().remove(&peer_id);
                                 let _ = event_tx.send(OrchestratorEvent::WorkerLeft { peer_id });
+                            }
+                            NetworkEvent::ConsensusMessage { from, message } => {
+                                let _ = consensus_tx.send((from, message)).await;
                             }
                             _ => {}
                         }
@@ -1252,6 +1513,244 @@ impl TrainingOrchestrator {
                         shard_id: None,
                     });
                     let _ = event_tx_clone.send(OrchestratorEvent::WorkerJoined { peer_id: from });
+                }
+            }
+        });
+
+        // Spawn consensus message handling task
+        let consensus_proto = self.consensus.clone();
+        let consensus_network = self.network.clone();
+        let consensus_round = self.current_round.clone();
+        let consensus_event_tx = self.event_tx.clone();
+        let consensus_workers = self.workers.clone();
+        let sc_client_consensus = self.sc_client.clone();
+        let model_id_consensus = self.model_id.clone();
+
+        tokio::spawn(async move {
+            while let Some((from, message)) = consensus_rx.recv().await {
+                use crate::network::messages::ConsensusMessage;
+
+                match message {
+                    ConsensusMessage::Propose {
+                        round_id,
+                        aggregated_commitment,
+                        proposer_binding,
+                        num_gradients,
+                        error_bound,
+                        nonce,
+                    } => {
+                        // Non-leader receives proposal — verify and vote
+                        let local_commitments = {
+                            let round_guard = consensus_round.read();
+                            if let Some(ref round) = *round_guard {
+                                if round.id == round_id {
+                                    round.gradients.values().map(|g| g.commitment).collect::<Vec<_>>()
+                                } else {
+                                    vec![]
+                                }
+                            } else {
+                                vec![]
+                            }
+                        };
+
+                        let participants = {
+                            let round_guard = consensus_round.read();
+                            if let Some(ref round) = *round_guard {
+                                if round.id == round_id {
+                                    round.workers.clone()
+                                } else {
+                                    HashSet::new()
+                                }
+                            } else {
+                                HashSet::new()
+                            }
+                        };
+
+                        let vote_msg = {
+                            let mut consensus = consensus_proto.write();
+                            let (msg, _events) = consensus.handle_proposal(
+                                &from,
+                                round_id,
+                                aggregated_commitment,
+                                proposer_binding,
+                                num_gradients,
+                                error_bound,
+                                nonce,
+                                &local_commitments,
+                                participants,
+                            );
+                            msg
+                        };
+
+                        consensus_network.broadcast(MessagePayload::Consensus(vote_msg)).await;
+                    }
+
+                    ConsensusMessage::Vote {
+                        round_id,
+                        accept,
+                        voter_commitment,
+                        reason,
+                    } => {
+                        // Leader collects votes
+                        let decision = {
+                            let mut consensus = consensus_proto.write();
+                            let (msg, _events) = consensus.handle_vote(
+                                &from, round_id, accept, voter_commitment, reason,
+                            );
+                            msg
+                        };
+
+                        if let Some(decision_msg) = decision {
+                            match decision_msg {
+                                ConsensusMessage::Commit {
+                                    round_id: commit_round_id,
+                                    final_commitment,
+                                    votes_for,
+                                    total_participants,
+                                } => {
+                                    log::info!(
+                                        "Consensus COMMITTED for round {}: {}/{} votes (commitment={})",
+                                        commit_round_id, votes_for, total_participants,
+                                        hex::encode(&final_commitment[..8]),
+                                    );
+
+                                    // Broadcast the commit decision
+                                    consensus_network.broadcast(
+                                        MessagePayload::Consensus(ConsensusMessage::Commit {
+                                            round_id: commit_round_id,
+                                            final_commitment,
+                                            votes_for,
+                                            total_participants,
+                                        }),
+                                    ).await;
+
+                                    // Also broadcast the aggregated gradient
+                                    consensus_network.broadcast(MessagePayload::Gradient(
+                                        GradientMessage::AggregatedGradient {
+                                            round_id: commit_round_id,
+                                            commitment: final_commitment,
+                                            proof: vec![],
+                                        },
+                                    )).await;
+
+                                    // Complete the round and reset workers
+                                    {
+                                        let mut round_guard = consensus_round.write();
+                                        if let Some(ref mut round) = *round_guard {
+                                            if round.id == commit_round_id {
+                                                round.phase = RoundPhase::Completed;
+
+                                                let mut workers = consensus_workers.write();
+                                                for peer_id in &round.workers {
+                                                    if let Some(worker) = workers.get_mut(peer_id) {
+                                                        if round.gradients.contains_key(peer_id) {
+                                                            worker.rounds_completed += 1;
+                                                        }
+                                                        worker.status = WorkerStatus::Available;
+                                                        worker.shard_id = None;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Broadcast round complete to training layer
+                                    consensus_network.broadcast(MessagePayload::Training(
+                                        TrainingMessage::RoundComplete {
+                                            round_id: commit_round_id,
+                                            result_hash: final_commitment,
+                                        },
+                                    )).await;
+
+                                    let _ = consensus_event_tx.send(OrchestratorEvent::RoundCompleted {
+                                        round_id: commit_round_id,
+                                        result_hash: final_commitment,
+                                    });
+
+                                    // Clear round state
+                                    *consensus_round.write() = None;
+                                    consensus_proto.write().clear_active_round();
+                                }
+                                ConsensusMessage::Abort { round_id: abort_round_id, reason } => {
+                                    log::warn!(
+                                        "Consensus ABORTED for round {}: {}",
+                                        abort_round_id, reason,
+                                    );
+
+                                    consensus_network.broadcast(
+                                        MessagePayload::Consensus(ConsensusMessage::Abort {
+                                            round_id: abort_round_id,
+                                            reason: reason.clone(),
+                                        }),
+                                    ).await;
+
+                                    // Fail the round and reset workers
+                                    {
+                                        let mut round_guard = consensus_round.write();
+                                        if let Some(ref mut round) = *round_guard {
+                                            if round.id == abort_round_id {
+                                                round.phase = RoundPhase::Failed;
+
+                                                let mut workers = consensus_workers.write();
+                                                for peer_id in &round.workers {
+                                                    if let Some(worker) = workers.get_mut(peer_id) {
+                                                        worker.status = WorkerStatus::Available;
+                                                        worker.shard_id = None;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    let _ = consensus_event_tx.send(OrchestratorEvent::RoundFailed {
+                                        round_id: abort_round_id,
+                                        reason: format!("Consensus aborted: {}", reason),
+                                    });
+
+                                    *consensus_round.write() = None;
+                                    consensus_proto.write().clear_active_round();
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+
+                    ConsensusMessage::Commit {
+                        round_id,
+                        final_commitment,
+                        votes_for,
+                        total_participants,
+                    } => {
+                        // Non-leader receives commit decision
+                        {
+                            let mut consensus = consensus_proto.write();
+                            let _events = consensus.handle_commit(
+                                round_id, final_commitment, votes_for, total_participants,
+                            );
+                        }
+
+                        log::info!(
+                            "Received consensus commit for round {} (commitment={})",
+                            round_id, hex::encode(&final_commitment[..8]),
+                        );
+
+                        consensus_proto.write().clear_active_round();
+                    }
+
+                    ConsensusMessage::Abort { round_id, reason } => {
+                        // Non-leader receives abort
+                        {
+                            let mut consensus = consensus_proto.write();
+                            let _events = consensus.handle_abort(round_id, reason.clone());
+                        }
+
+                        log::warn!(
+                            "Received consensus abort for round {}: {}",
+                            round_id, reason,
+                        );
+
+                        consensus_proto.write().clear_active_round();
+                    }
                 }
             }
         });

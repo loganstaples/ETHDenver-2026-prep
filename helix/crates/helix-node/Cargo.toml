@@ -50,6 +50,9 @@ thiserror = "2.0"
 # Time utilities
 chrono = "0.4"
 
+# LRU cache for replay detection
+lru = "0.12"
+
 # HTTP API
 axum = "0.7"
 subtle = "2.5"

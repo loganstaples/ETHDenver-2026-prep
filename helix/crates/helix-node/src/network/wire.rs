@@ -377,6 +377,7 @@ impl WireCodec {
             MessagePayload::Gradient(_) => MessageTypeId::Gradient as u16,
             MessagePayload::Sync(_) => MessageTypeId::Sync as u16,
             MessagePayload::Heartbeat(_) => MessageTypeId::Heartbeat as u16,
+            MessagePayload::Consensus(_) => MessageTypeId::Training as u16,
         }
     }
 }
