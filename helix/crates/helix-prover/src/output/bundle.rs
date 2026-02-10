@@ -670,13 +670,10 @@ mod tests {
         assert_eq!(bundle.header.proof_type, ProofType::Chunk);
         assert_eq!(bundle.header.version, BUNDLE_VERSION);
 
-        match &bundle.proof {
-            BundleProof::Chunk(c) => {
-                assert_eq!(c.chunk_id, 42);
-                assert_eq!(c.proof, proof.proof);
-            }
-            _ => panic!("Expected chunk proof"),
-        }
+        assert!(
+            matches!(&bundle.proof, BundleProof::Chunk(c) if c.chunk_id == 42 && c.proof == proof.proof),
+            "Expected Chunk proof with chunk_id=42, got {:?}", bundle.proof_type()
+        );
     }
 
     #[test]
@@ -720,13 +717,10 @@ mod tests {
 
         assert_eq!(bundle.header.proof_type, ProofType::TrainingStep);
 
-        match &bundle.proof {
-            BundleProof::TrainingStep(t) => {
-                assert_eq!(t.step_number, 1);
-                assert_eq!(t.chunks.len(), 2);
-            }
-            _ => panic!("Expected training step"),
-        }
+        assert!(
+            matches!(&bundle.proof, BundleProof::TrainingStep(t) if t.step_number == 1 && t.chunks.len() == 2),
+            "Expected TrainingStep proof with step_number=1 and 2 chunks, got {:?}", bundle.proof_type()
+        );
     }
 
     #[test]

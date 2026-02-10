@@ -67,12 +67,14 @@ pub struct TwiddleFactors {
 
 impl TwiddleFactors {
     /// Creates twiddle factors for the given domain size.
-    pub fn new(log_n: usize) -> Self {
+    ///
+    /// Returns an error if `log_n` exceeds the maximum supported domain size (28).
+    pub fn new(log_n: usize) -> MetalResult<Self> {
         let size = 1 << log_n;
 
         // BN254 scalar field primitive root of unity (for 2^28 domain)
         // Generator ω such that ω^{2^28} = 1
-        let omega = get_root_of_unity(log_n);
+        let omega = get_root_of_unity(log_n)?;
         let omega_inv = field_inverse(&omega);
 
         // Precompute forward twiddles: ω^0, ω^1, ω^2, ..., ω^{n-1}
@@ -101,12 +103,12 @@ impl TwiddleFactors {
         let n_mont = to_montgomery(&n_as_field);
         let size_inv = field_inverse(&n_mont);
 
-        Self {
+        Ok(Self {
             forward,
             inverse,
             size,
             size_inv,
-        }
+        })
     }
 }
 
@@ -474,7 +476,7 @@ impl MetalNtt {
             }
         }
 
-        let twiddles = TwiddleFactors::new(log_n);
+        let twiddles = TwiddleFactors::new(log_n)?;
 
         #[cfg(all(target_os = "macos", feature = "metal"))]
         {
@@ -497,7 +499,7 @@ impl MetalNtt {
         }
 
         if n < self.config.min_gpu_batch_size {
-            return Ok(self.forward_cpu(data));
+            return self.forward_cpu(data);
         }
 
         let log_n = n.trailing_zeros() as usize;
@@ -538,7 +540,7 @@ impl MetalNtt {
         }
 
         if n < self.config.min_gpu_batch_size {
-            return Ok(self.inverse_cpu(data));
+            return self.inverse_cpu(data);
         }
 
         let log_n = n.trailing_zeros() as usize;
@@ -750,15 +752,13 @@ impl MetalNtt {
     /// Forward NTT (stub for non-macOS).
     #[cfg(not(all(target_os = "macos", feature = "metal")))]
     pub fn forward(&mut self, data: &mut [[u64; 4]]) -> MetalResult<()> {
-        self.forward_cpu(data);
-        Ok(())
+        self.forward_cpu(data)
     }
 
     /// Inverse NTT (stub for non-macOS).
     #[cfg(not(all(target_os = "macos", feature = "metal")))]
     pub fn inverse(&mut self, data: &mut [[u64; 4]]) -> MetalResult<()> {
-        self.inverse_cpu(data);
-        Ok(())
+        self.inverse_cpu(data)
     }
 
     /// Bit-reverse permutation on CPU.
@@ -774,10 +774,10 @@ impl MetalNtt {
     }
 
     /// Forward NTT on CPU.
-    fn forward_cpu(&self, data: &mut [[u64; 4]]) {
+    fn forward_cpu(&self, data: &mut [[u64; 4]]) -> MetalResult<()> {
         let n = data.len();
         if n <= 1 {
-            return;
+            return Ok(());
         }
 
         let log_n = n.trailing_zeros() as usize;
@@ -786,7 +786,7 @@ impl MetalNtt {
         self.bit_reverse_cpu(data, log_n);
 
         // Get or compute twiddle factors
-        let omega = get_root_of_unity(log_n);
+        let omega = get_root_of_unity(log_n)?;
 
         // Cooley-Tukey iterative FFT
         for stage in 0..log_n {
@@ -820,13 +820,15 @@ impl MetalNtt {
                 }
             }
         }
+
+        Ok(())
     }
 
     /// Inverse NTT on CPU.
-    fn inverse_cpu(&self, data: &mut [[u64; 4]]) {
+    fn inverse_cpu(&self, data: &mut [[u64; 4]]) -> MetalResult<()> {
         let n = data.len();
         if n <= 1 {
-            return;
+            return Ok(());
         }
 
         let log_n = n.trailing_zeros() as usize;
@@ -835,7 +837,7 @@ impl MetalNtt {
         self.bit_reverse_cpu(data, log_n);
 
         // Get inverse root of unity
-        let omega = get_root_of_unity(log_n);
+        let omega = get_root_of_unity(log_n)?;
         let omega_inv = field_inverse(&omega);
 
         // Cooley-Tukey iterative IFFT
@@ -873,6 +875,8 @@ impl MetalNtt {
         for elem in data.iter_mut() {
             *elem = field_mul_limbs(elem, &n_inv);
         }
+
+        Ok(())
     }
 
     /// Returns statistics.
@@ -963,8 +967,7 @@ impl NttEngine {
         }
 
         // CPU fallback
-        self.forward_cpu(data);
-        Ok(())
+        self.forward_cpu(data)
     }
 
     /// Inverse NTT.
@@ -979,15 +982,14 @@ impl NttEngine {
         }
 
         // CPU fallback
-        self.inverse_cpu(data);
-        Ok(())
+        self.inverse_cpu(data)
     }
 
     /// CPU forward NTT.
-    fn forward_cpu(&mut self, data: &mut [[u64; 4]]) {
+    fn forward_cpu(&mut self, data: &mut [[u64; 4]]) -> MetalResult<()> {
         let n = data.len();
         if n <= 1 {
-            return;
+            return Ok(());
         }
 
         let log_n = n.trailing_zeros() as usize;
@@ -998,7 +1000,7 @@ impl NttEngine {
             Some(tw) => tw.size < n,
         };
         if needs_init {
-            self.twiddles = Some(TwiddleFactors::new(log_n));
+            self.twiddles = Some(TwiddleFactors::new(log_n)?);
         }
 
         // Bit-reverse permutation
@@ -1035,13 +1037,15 @@ impl NttEngine {
                 }
             }
         }
+
+        Ok(())
     }
 
     /// CPU inverse NTT.
-    fn inverse_cpu(&mut self, data: &mut [[u64; 4]]) {
+    fn inverse_cpu(&mut self, data: &mut [[u64; 4]]) -> MetalResult<()> {
         let n = data.len();
         if n <= 1 {
-            return;
+            return Ok(());
         }
 
         let log_n = n.trailing_zeros() as usize;
@@ -1052,7 +1056,7 @@ impl NttEngine {
             Some(tw) => tw.size < n,
         };
         if needs_init {
-            self.twiddles = Some(TwiddleFactors::new(log_n));
+            self.twiddles = Some(TwiddleFactors::new(log_n)?);
         }
 
         // Bit-reverse permutation
@@ -1095,6 +1099,8 @@ impl NttEngine {
         for elem in data.iter_mut() {
             *elem = field_mul_limbs(elem, n_inv);
         }
+
+        Ok(())
     }
 
     /// Polynomial multiplication using NTT.
@@ -1178,7 +1184,9 @@ fn to_montgomery(a: &[u64; 4]) -> [u64; 4] {
 }
 
 /// Get root of unity for the given domain size.
-fn get_root_of_unity(log_n: usize) -> [u64; 4] {
+///
+/// Returns an error if `log_n` exceeds 28 (the maximum domain size for BN254).
+fn get_root_of_unity(log_n: usize) -> MetalResult<[u64; 4]> {
     // BN254 has a 2^28-th root of unity
     // Generator: 0x30644e72e131a029b85045b68181585d2833e84879b97091043e1f593f0000001
     // For smaller domains, we use ω^{2^{28-log_n}}
@@ -1196,11 +1204,13 @@ fn get_root_of_unity(log_n: usize) -> [u64; 4] {
 
     // Compute ω^{2^{28-log_n}} to get n-th root
     if log_n > 28 {
-        panic!("Domain too large: log_n > 28");
+        return Err(MetalError::InvalidArgument(
+            format!("Domain too large: log_n={} exceeds maximum 28", log_n),
+        ));
     }
 
     let exp = 1u64 << (28 - log_n);
-    field_pow(&root_mont, exp)
+    Ok(field_pow(&root_mont, exp))
 }
 
 /// Field addition on limbs.
@@ -1433,7 +1443,7 @@ mod tests {
 
     #[test]
     fn test_twiddle_factors() {
-        let twiddles = TwiddleFactors::new(4);
+        let twiddles = TwiddleFactors::new(4).unwrap();
         assert_eq!(twiddles.size, 16);
         assert_eq!(twiddles.forward.len(), 16);
         assert_eq!(twiddles.inverse.len(), 16);

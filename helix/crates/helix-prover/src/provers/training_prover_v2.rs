@@ -780,7 +780,16 @@ impl MLTrainingProverV2 {
 
         let proof_result = self
             .pipeline
-            .prove_with_options(&circuit, &pi_refs, progress.clone(), cancel_token)?;
+            .prove_with_options(&circuit, &pi_refs, progress.clone(), cancel_token)
+            .map_err(|e| {
+                tracing::error!(
+                    witness_hash = %witness_hash,
+                    step = witness.step_number,
+                    error = %e,
+                    "Proof generation failed"
+                );
+                TrainingProverError::Pipeline(e)
+            })?;
 
         let gen_time = proof_result.generation_time;
         let proof = proof_result.proof;
@@ -1056,12 +1065,14 @@ impl BatchTrainingProverV2 {
     }
 
     /// Proves a batch of training steps sequentially.
+    ///
+    /// Returns an error if all steps fail (0 proofs produced from non-empty input).
     pub fn prove_batch(
         &self,
         initial_weights: TrainingWeights,
         training_samples: &[(Vec<Fr>, Vec<Fr>)],
         lr: Fr,
-    ) -> BatchProofResult {
+    ) -> TrainingProverResult<BatchProofResult> {
         self.prove_batch_with_options(
             initial_weights,
             training_samples,
@@ -1184,17 +1195,17 @@ impl BatchTrainingProverV2 {
         lr: Fr,
         progress: ProgressCallback,
         cancel_token: Option<&CancellationToken>,
-    ) -> BatchProofResult {
+    ) -> TrainingProverResult<BatchProofResult> {
         if training_samples.is_empty() {
             tracing::warn!("prove_batch_with_options: called with 0 training samples");
-            return BatchProofResult {
+            return Ok(BatchProofResult {
                 proofs: Vec::new(),
                 final_weights: initial_weights,
                 total_loss: Fr::zero(),
                 num_steps: 0,
                 failed_steps: Vec::new(),
                 total_time: Duration::ZERO,
-            };
+            });
         }
 
         let start = Instant::now();
@@ -1208,7 +1219,7 @@ impl BatchTrainingProverV2 {
             // Check cancellation
             if let Some(token) = cancel_token {
                 if token.is_cancelled() {
-                    break;
+                    return Err(TrainingProverError::Cancelled);
                 }
             }
 
@@ -1259,23 +1270,32 @@ impl BatchTrainingProverV2 {
             }
         }
 
+        // Return error if all steps failed (no proofs produced).
         if proofs.is_empty() && !failed_steps.is_empty() {
             tracing::error!(
                 total_steps = total_steps,
                 failed_count = failed_steps.len(),
-                "Batch proving produced 0 proofs — all {} steps failed",
+                "Batch proving produced 0 proofs: all {} steps failed",
                 total_steps,
             );
+            return Err(TrainingProverError::WitnessValidation {
+                message: format!(
+                    "Batch produced 0 proofs: all {} steps failed. First error: {}",
+                    total_steps,
+                    failed_steps[0].1,
+                ),
+                field: "training_samples".to_string(),
+            });
         }
 
-        BatchProofResult {
+        Ok(BatchProofResult {
             proofs,
             final_weights: current_weights,
             total_loss,
             num_steps: training_samples.len(),
             failed_steps,
             total_time: start.elapsed(),
-        }
+        })
     }
 
     /// Verifies all proofs in a batch result.
@@ -1539,7 +1559,8 @@ mod tests {
 
         let samples = vec![(vec![Fr::from(1), Fr::from(1)], vec![Fr::from(5)])];
 
-        let result = prover.prove_batch(weights, &samples, Fr::from(1));
+        let result = prover.prove_batch(weights, &samples, Fr::from(1))
+            .expect("batch prove should succeed");
 
         assert_eq!(result.num_steps, 1);
         assert_eq!(result.proofs.len(), 1);

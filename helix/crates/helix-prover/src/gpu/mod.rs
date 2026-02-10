@@ -109,25 +109,27 @@ pub fn detect_backends() -> Vec<(GpuBackendType, usize)> {
 }
 
 /// Select best backend based on availability and preferences.
-pub fn select_backend(config: &GpuConfig) -> GpuBackendType {
+///
+/// Returns an error if no GPU backend is available and CPU fallback is disabled.
+pub fn select_backend(config: &GpuConfig) -> Result<GpuBackendType, String> {
     let backends = detect_backends();
 
     // Try preferred backend first
     if backends.iter().any(|(t, n)| *t == config.preferred_backend && *n > 0) {
-        return config.preferred_backend;
+        return Ok(config.preferred_backend);
     }
 
     // Fall back to first available GPU backend
     for (backend, count) in &backends {
         if *backend != GpuBackendType::Cpu && *count > 0 {
-            return *backend;
+            return Ok(*backend);
         }
     }
 
     // CPU fallback
     if config.enable_cpu_fallback {
-        GpuBackendType::Cpu
+        Ok(GpuBackendType::Cpu)
     } else {
-        panic!("No GPU backend available and CPU fallback disabled");
+        Err("No GPU backend available and CPU fallback disabled".to_string())
     }
 }

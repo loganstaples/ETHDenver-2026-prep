@@ -119,6 +119,12 @@ pub use pipeline::{
 // Re-export serialization types
 pub use serialization::{ProofFormat, ProofSerializer, SerializedProof};
 
+// Re-export batch prover types
+pub use provers::batch_prover::{
+    BatchProveError, BatchProver, BatchConfig, BatchResult, BatchStatus,
+    EpochProver, EpochProofResult, StreamingBatchResult,
+};
+
 // Re-export step prover types
 pub use provers::step_prover::{MLTrainingStepProof, TrainingStepData, TrainingStepProver};
 

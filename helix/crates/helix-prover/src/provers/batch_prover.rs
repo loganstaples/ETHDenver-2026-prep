@@ -22,6 +22,18 @@ use sha2::{Digest, Sha256};
 
 use crate::parallel::{ChunkProof, ParallelConfig, ParallelProver, ProofStatus};
 use crate::chunking::{ChunkId, ComputationChunk, ComputationType};
+use thiserror::Error;
+
+/// Errors from batch proving operations.
+#[derive(Error, Debug)]
+pub enum BatchProveError {
+    /// All proofs in the batch failed.
+    #[error("Batch produced 0 proofs: all {total} steps failed")]
+    AllStepsFailed {
+        /// Total steps attempted.
+        total: usize,
+    },
+}
 
 /// Configuration for batch proving.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -359,12 +371,14 @@ impl BatchProver {
     }
 
     /// Proves a batch of training steps.
-    pub fn prove_batch(&self, steps: Vec<TrainingStep>) -> BatchResult {
+    ///
+    /// Returns an error if the batch produces 0 proofs (all steps failed).
+    pub fn prove_batch(&self, steps: Vec<TrainingStep>) -> Result<BatchResult, BatchProveError> {
         let start_time = Instant::now();
         let total_steps = steps.len();
 
         if steps.is_empty() {
-            return BatchResult {
+            return Ok(BatchResult {
                 batch_id: self.batch_id.clone(),
                 proofs: Vec::new(),
                 aggregated_proof: None,
@@ -374,7 +388,7 @@ impl BatchProver {
                 total_proof_bytes: 0,
                 first_step: 0,
                 last_step: 0,
-            };
+            });
         }
 
         // Update status.
@@ -428,6 +442,14 @@ impl BatchProver {
             None
         };
 
+        // Check for total failure: if we expected proofs but got none, return error.
+        if step_proofs.is_empty() && total_steps > 0 {
+            if let Ok(mut status) = self.status.write() {
+                *status = BatchStatus::Failed(format!("All {} steps produced 0 proofs", total_steps));
+            }
+            return Err(BatchProveError::AllStepsFailed { total: total_steps });
+        }
+
         // Update status.
         {
             if let Ok(mut status) = self.status.write() {
@@ -435,7 +457,7 @@ impl BatchProver {
             }
         }
 
-        BatchResult {
+        Ok(BatchResult {
             batch_id: self.batch_id.clone(),
             proofs: step_proofs,
             aggregated_proof: aggregated,
@@ -445,11 +467,13 @@ impl BatchProver {
             total_proof_bytes: total_bytes,
             first_step,
             last_step,
-        }
+        })
     }
 
     /// Proves a batch with streaming (memory-efficient for large batches).
-    pub fn prove_batch_streaming<I>(&self, steps: I) -> StreamingBatchResult
+    ///
+    /// Returns an error if any sub-batch produces 0 proofs.
+    pub fn prove_batch_streaming<I>(&self, steps: I) -> Result<StreamingBatchResult, BatchProveError>
     where
         I: Iterator<Item = TrainingStep>,
     {
@@ -473,7 +497,7 @@ impl BatchProver {
             current_batch.push(step);
 
             if current_batch.len() >= self.config.max_memory_proofs {
-                let batch_result = self.prove_batch(std::mem::take(&mut current_batch));
+                let batch_result = self.prove_batch(std::mem::take(&mut current_batch))?;
                 total_steps += batch_result.total_steps;
                 total_bytes += batch_result.total_proof_bytes;
                 batch_proofs.push(batch_result.proofs);
@@ -487,7 +511,7 @@ impl BatchProver {
 
         // Process remaining.
         if !current_batch.is_empty() {
-            let batch_result = self.prove_batch(current_batch);
+            let batch_result = self.prove_batch(current_batch)?;
             total_steps += batch_result.total_steps;
             total_bytes += batch_result.total_proof_bytes;
             batch_proofs.push(batch_result.proofs);
@@ -499,7 +523,7 @@ impl BatchProver {
 
         let total_time_ms = start_time.elapsed().as_millis() as u64;
 
-        StreamingBatchResult {
+        Ok(StreamingBatchResult {
             batch_id: self.batch_id.clone(),
             batches: batch_proofs,
             total_steps,
@@ -507,11 +531,11 @@ impl BatchProver {
             total_proof_bytes: total_bytes,
             first_step,
             last_step,
-        }
+        })
     }
 
     /// Resumes proving from a checkpoint.
-    pub fn resume_from_checkpoint(&self, checkpoint: &BatchCheckpoint) -> BatchResult {
+    pub fn resume_from_checkpoint(&self, checkpoint: &BatchCheckpoint) -> Result<BatchResult, BatchProveError> {
         // Load existing proofs.
         {
             if let Ok(mut proofs) = self.proofs.write() {
@@ -531,17 +555,17 @@ impl BatchProver {
             .collect();
 
         // Prove remaining.
-        let result = self.prove_batch(remaining_steps);
+        let result = self.prove_batch(remaining_steps)?;
 
         // Merge with existing proofs.
         let mut all_proofs: Vec<StepProof> = checkpoint.proofs.clone();
         all_proofs.extend(result.proofs);
         all_proofs.sort_by_key(|p| p.step_index);
 
-        BatchResult {
+        Ok(BatchResult {
             proofs: all_proofs,
             ..result
-        }
+        })
     }
 
     /// Creates a checkpoint.
@@ -754,7 +778,7 @@ impl EpochProver {
     }
 
     /// Proves an entire epoch.
-    pub fn prove_epoch(&self, steps: Vec<TrainingStep>) -> EpochProofResult {
+    pub fn prove_epoch(&self, steps: Vec<TrainingStep>) -> Result<EpochProofResult, BatchProveError> {
         let start = Instant::now();
 
         assert_eq!(
@@ -763,13 +787,13 @@ impl EpochProver {
             "Step count mismatch for epoch"
         );
 
-        let batch_result = self.batch_prover.prove_batch(steps);
+        let batch_result = self.batch_prover.prove_batch(steps)?;
 
-        EpochProofResult {
+        Ok(EpochProofResult {
             epoch: self.epoch,
             batch_result,
             epoch_time_ms: start.elapsed().as_millis() as u64,
-        }
+        })
     }
 }
 
@@ -855,18 +879,23 @@ impl BatchProvingPipeline {
                 };
 
                 if !steps.is_empty() {
-                    let result = prover.prove_batch(steps);
+                    match prover.prove_batch(steps) {
+                        Ok(result) => {
+                            // Push to output.
+                            {
+                                if let Ok(mut queue) = output_queue.lock() {
+                                    queue.extend(result.proofs);
+                                }
+                            }
 
-                    // Push to output.
-                    {
-                        if let Ok(mut queue) = output_queue.lock() {
-                            queue.extend(result.proofs);
+                            stats
+                                .proofs_generated
+                                .fetch_add(result.total_steps as u64, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            tracing::error!("Pipeline batch proving failed: {e}");
                         }
                     }
-
-                    stats
-                        .proofs_generated
-                        .fetch_add(result.total_steps as u64, std::sync::atomic::Ordering::Relaxed);
                 }
 
                 std::thread::sleep(Duration::from_millis(10));
@@ -910,7 +939,7 @@ mod tests {
         });
 
         let steps: Vec<_> = (0..4).map(make_test_step).collect();
-        let result = prover.prove_batch(steps);
+        let result = prover.prove_batch(steps).expect("batch should succeed");
 
         assert_eq!(result.total_steps, 4);
         assert_eq!(result.proofs.len(), 4);
@@ -926,7 +955,7 @@ mod tests {
             .build();
 
         let steps: Vec<_> = (0..2).map(make_test_step).collect();
-        let result = prover.prove_batch(steps);
+        let result = prover.prove_batch(steps).expect("batch should succeed");
 
         assert_eq!(result.total_steps, 2);
     }
@@ -947,7 +976,7 @@ mod tests {
         assert_eq!(prover.status(), BatchStatus::Pending);
 
         let steps: Vec<_> = (0..2).map(make_test_step).collect();
-        prover.prove_batch(steps);
+        prover.prove_batch(steps).expect("batch should succeed");
 
         assert_eq!(prover.status(), BatchStatus::Complete);
     }
@@ -961,7 +990,7 @@ mod tests {
         });
 
         let steps = (0..6).map(make_test_step);
-        let result = prover.prove_batch_streaming(steps);
+        let result = prover.prove_batch_streaming(steps).expect("streaming batch should succeed");
 
         assert_eq!(result.total_steps, 6);
         assert!(result.batches.len() >= 1);
@@ -977,7 +1006,7 @@ mod tests {
         });
 
         let steps: Vec<_> = (0..4).map(make_test_step).collect();
-        let result = prover.prove_batch(steps);
+        let result = prover.prove_batch(steps).expect("aggregated batch should succeed");
 
         assert!(result.aggregated_proof.is_some());
         let agg = result.aggregated_proof.unwrap();
@@ -1014,7 +1043,7 @@ mod tests {
         let prover = EpochProver::new(1, 4, config);
         let steps: Vec<_> = (0..4).map(make_test_step).collect();
 
-        let result = prover.prove_epoch(steps);
+        let result = prover.prove_epoch(steps).expect("epoch proving should succeed");
 
         assert_eq!(result.epoch, 1);
         assert_eq!(result.batch_result.total_steps, 4);
@@ -1028,7 +1057,7 @@ mod tests {
         });
 
         let steps: Vec<_> = (0..3).map(make_test_step).collect();
-        prover.prove_batch(steps);
+        prover.prove_batch(steps).expect("stats batch should succeed");
 
         let stats = prover.stats();
         assert_eq!(stats.proofs_generated, 3);
