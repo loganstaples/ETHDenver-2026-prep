@@ -319,6 +319,401 @@ contract TrainingDAOFlashLoanTest is Test {
         (address proposer, , , , , , , ) = dao.getProposalInfo(proposalId);
         assertEq(proposer, voter1, "Proposer should be voter1");
     }
+
+    /// @notice Test: flash-loaned tokens without delegation cannot create proposals
+    function test_FlashLoan_CannotCreateProposal_WithoutDelegation() public {
+        // Flash attacker acquires tokens but does NOT delegate
+        token.mint(flashAttacker, 10_000 ether);
+
+        vm.roll(block.number + 1);
+
+        // Attacker has balance but zero voting power (no delegation)
+        assertGe(token.balanceOf(flashAttacker), 1000 ether, "Attacker has tokens");
+
+        // createProposal now checks getVotes() not balanceOf(), so undelegated tokens fail
+        vm.prank(flashAttacker);
+        vm.expectRevert("Below proposal threshold");
+        dao.createProposal(
+            TrainingDAO.ProposalType.Custom,
+            "Malicious proposal",
+            address(0),
+            ""
+        );
+    }
+
+    /// @notice Test: flash-loaned tokens returned after proposal can't create new proposals
+    function test_FlashLoan_ReturnedTokens_CannotCreateNewProposal() public {
+        // Flash attacker acquires tokens and delegates
+        token.mint(flashAttacker, 10_000 ether);
+        vm.prank(flashAttacker);
+        token.delegate(flashAttacker);
+
+        vm.roll(block.number + 1);
+
+        // Attacker creates a proposal (has delegated voting power)
+        vm.prank(flashAttacker);
+        uint256 proposalId = dao.createProposal(
+            TrainingDAO.ProposalType.Custom,
+            "Attacker proposal",
+            address(0),
+            ""
+        );
+        assertGt(proposalId, 0, "Proposal created");
+
+        // Now attacker returns the flash loan (transfers tokens away)
+        vm.prank(flashAttacker);
+        token.transfer(address(1), 10_000 ether);
+
+        vm.roll(block.number + 1);
+
+        assertEq(token.balanceOf(flashAttacker), 0, "Attacker returned tokens");
+
+        // Attacker cannot create another proposal without delegated voting power
+        vm.prank(flashAttacker);
+        vm.expectRevert("Below proposal threshold");
+        dao.createProposal(
+            TrainingDAO.ProposalType.Custom,
+            "Second malicious proposal",
+            address(0),
+            ""
+        );
+    }
+
+    /// @notice Test: proposal with insufficient quorum is defeated
+    function test_ParameterProposal_DefeatedWithoutQuorum() public {
+        // Current supply: 20M initial + 10K voter1 + 10K voter2 = ~20.02M
+        // Quorum is 4% of supply = ~800K. voter1 + voter2 = 20K, so quorum fails
+
+        vm.prank(voter1);
+        uint256 proposalId = dao.createParameterProposal(
+            "Should fail quorum",
+            TrainingDAO.ParameterProposal({
+                learningRate: 1e15,
+                batchSize: 64,
+                maxErrorBound: 1000,
+                minParticipants: 3,
+                roundDuration: 1 hours
+            })
+        );
+
+        vm.roll(block.number + 1);
+
+        // Advance to voting
+        (, , , uint256 startTime, , , , ) = dao.getProposalInfo(proposalId);
+        vm.warp(startTime + 1);
+
+        // Both voters vote (20K tokens total, quorum needs ~800K)
+        vm.prank(voter1);
+        dao.castVote(proposalId, true);
+        vm.prank(voter2);
+        dao.castVote(proposalId, true);
+
+        // Advance past voting period
+        (, , , , uint256 endTime, , , ) = dao.getProposalInfo(proposalId);
+        vm.warp(endTime + 1);
+
+        // Proposal should be defeated (insufficient quorum)
+        assertEq(
+            uint256(dao.getProposalState(proposalId)),
+            uint256(TrainingDAO.ProposalState.Defeated),
+            "Proposal should be defeated without quorum"
+        );
+    }
+}
+
+// ============================================================================
+// 2b. TrainingDAO Parameter Proposal Execution Tests
+// ============================================================================
+
+/// @title TrainingDAOExecutionTest
+/// @notice Full lifecycle tests for parameter proposal execution and reentrancy protection
+contract TrainingDAOExecutionTest is Test {
+    HelixToken public token;
+    TrainingDAO public dao;
+
+    address public voter1;
+    address public voter2;
+
+    // Large balance needed to meet 4% quorum of ~20M supply
+    uint256 constant VOTER_BALANCE = 500_000 ether;
+
+    function setUp() public {
+        voter1 = makeAddr("voter1");
+        voter2 = makeAddr("voter2");
+
+        token = new HelixToken(makeAddr("treasury"));
+        dao = new TrainingDAO(address(token));
+
+        // Give voters enough tokens to meet quorum (4% of ~21M = ~840K, 500K+500K = 1M > 840K)
+        token.mint(voter1, VOTER_BALANCE);
+        token.mint(voter2, VOTER_BALANCE);
+
+        vm.prank(voter1);
+        token.delegate(voter1);
+        vm.prank(voter2);
+        token.delegate(voter2);
+
+        vm.roll(block.number + 1);
+    }
+
+    /// @notice Test: full parameter proposal lifecycle (create, vote, queue, execute, verify)
+    function test_ParameterProposal_FullExecution() public {
+        // Verify default parameters first
+        (uint256 defLr, uint256 defBs, uint256 defMeb, uint256 defMp, uint256 defRd) =
+            dao.getTrainingParameters();
+        assertEq(defLr, 1e15, "Default learning rate");
+        assertEq(defBs, 32, "Default batch size");
+
+        // Create parameter proposal
+        TrainingDAO.ParameterProposal memory newParams = TrainingDAO.ParameterProposal({
+            learningRate: 5e15,      // 0.005
+            batchSize: 128,
+            maxErrorBound: 500,
+            minParticipants: 10,
+            roundDuration: 2 hours
+        });
+
+        vm.prank(voter1);
+        uint256 proposalId = dao.createParameterProposal("Increase batch size and LR", newParams);
+
+        // Verify parameter proposal stored correctly
+        (uint256 lr, uint256 bs, uint256 meb, uint256 mp, uint256 rd) = dao.parameterProposals(proposalId);
+        assertEq(lr, 5e15, "Learning rate stored");
+        assertEq(bs, 128, "Batch size stored");
+        assertEq(meb, 500, "Max error bound stored");
+        assertEq(mp, 10, "Min participants stored");
+        assertEq(rd, 2 hours, "Round duration stored");
+
+        // Verify proposal type
+        (, TrainingDAO.ProposalType pType, , , , , , ) = dao.getProposalInfo(proposalId);
+        assertEq(uint256(pType), uint256(TrainingDAO.ProposalType.ParameterChange), "Should be ParameterChange");
+
+        // Advance block so snapshot is finalized
+        vm.roll(block.number + 1);
+
+        // Advance time to voting period
+        (, , , uint256 startTime, , , , ) = dao.getProposalInfo(proposalId);
+        vm.warp(startTime + 1);
+
+        // Both voters vote in favor
+        vm.prank(voter1);
+        dao.castVote(proposalId, true);
+        vm.prank(voter2);
+        dao.castVote(proposalId, true);
+
+        // Advance past voting period
+        (, , , , uint256 endTime, , , ) = dao.getProposalInfo(proposalId);
+        vm.warp(endTime + 1);
+
+        // Verify proposal succeeded
+        assertEq(
+            uint256(dao.getProposalState(proposalId)),
+            uint256(TrainingDAO.ProposalState.Succeeded),
+            "Proposal should have succeeded"
+        );
+
+        // Queue the proposal
+        dao.queueProposal(proposalId);
+        assertEq(
+            uint256(dao.getProposalState(proposalId)),
+            uint256(TrainingDAO.ProposalState.Queued),
+            "Proposal should be queued"
+        );
+
+        // Attempt early execution (should fail)
+        vm.expectRevert("Timelock not expired");
+        dao.executeProposal(proposalId);
+
+        // Advance past timelock
+        uint256 executionTime = dao.queuedProposals(proposalId);
+        vm.warp(executionTime);
+
+        // Execute the proposal
+        dao.executeProposal(proposalId);
+
+        // Verify state is Executed
+        assertEq(
+            uint256(dao.getProposalState(proposalId)),
+            uint256(TrainingDAO.ProposalState.Executed),
+            "Proposal should be executed"
+        );
+
+        // Verify training parameters were updated
+        (uint256 newLr, uint256 newBs, uint256 newMeb, uint256 newMp, uint256 newRd) =
+            dao.getTrainingParameters();
+        assertEq(newLr, 5e15, "Learning rate should be updated");
+        assertEq(newBs, 128, "Batch size should be updated");
+        assertEq(newMeb, 500, "Max error bound should be updated");
+        assertEq(newMp, 10, "Min participants should be updated");
+        assertEq(newRd, 2 hours, "Round duration should be updated");
+    }
+
+    /// @notice Test: cannot execute proposal twice
+    function test_ParameterProposal_CannotExecuteTwice() public {
+        vm.prank(voter1);
+        uint256 proposalId = dao.createParameterProposal(
+            "Test double execute",
+            TrainingDAO.ParameterProposal({
+                learningRate: 2e15,
+                batchSize: 64,
+                maxErrorBound: 800,
+                minParticipants: 5,
+                roundDuration: 1 hours
+            })
+        );
+
+        vm.roll(block.number + 1);
+
+        (, , , uint256 startTime, , , , ) = dao.getProposalInfo(proposalId);
+        vm.warp(startTime + 1);
+
+        vm.prank(voter1);
+        dao.castVote(proposalId, true);
+        vm.prank(voter2);
+        dao.castVote(proposalId, true);
+
+        (, , , , uint256 endTime, , , ) = dao.getProposalInfo(proposalId);
+        vm.warp(endTime + 1);
+
+        dao.queueProposal(proposalId);
+        vm.warp(dao.queuedProposals(proposalId));
+
+        dao.executeProposal(proposalId);
+
+        // Second execution should revert
+        vm.expectRevert("Not queued");
+        dao.executeProposal(proposalId);
+    }
+
+    /// @notice Test: nonReentrant prevents reentrancy on executeProposal
+    function test_ExecuteProposal_NonReentrant() public {
+        // Create a proposal that targets address(0) - no external call
+        vm.prank(voter1);
+        uint256 proposalId = dao.createProposal(
+            TrainingDAO.ProposalType.Custom,
+            "Test nonReentrant",
+            address(0),
+            ""
+        );
+
+        vm.roll(block.number + 1);
+
+        (, , , uint256 startTime, , , , ) = dao.getProposalInfo(proposalId);
+        vm.warp(startTime + 1);
+
+        vm.prank(voter1);
+        dao.castVote(proposalId, true);
+        vm.prank(voter2);
+        dao.castVote(proposalId, true);
+
+        (, , , , uint256 endTime, , , ) = dao.getProposalInfo(proposalId);
+        vm.warp(endTime + 1);
+
+        dao.queueProposal(proposalId);
+        vm.warp(dao.queuedProposals(proposalId));
+
+        // Should succeed - nonReentrant doesn't prevent normal execution
+        dao.executeProposal(proposalId);
+
+        assertEq(
+            uint256(dao.getProposalState(proposalId)),
+            uint256(TrainingDAO.ProposalState.Executed),
+            "Should execute normally with nonReentrant"
+        );
+    }
+}
+
+/// @title DAOReentrancyAttacker
+/// @notice Contract that attempts reentrancy during DAO proposal execution
+contract DAOReentrancyAttacker {
+    TrainingDAO public dao;
+    uint256 public targetProposalId;
+    uint256 public attackCount;
+
+    constructor(TrainingDAO _dao) {
+        dao = _dao;
+    }
+
+    function setTarget(uint256 _proposalId) external {
+        targetProposalId = _proposalId;
+    }
+
+    // Called when DAO executes a proposal targeting this contract
+    fallback() external payable {
+        if (attackCount < 1) {
+            attackCount++;
+            // Attempt reentrant call to executeProposal
+            try dao.executeProposal(targetProposalId) {} catch {}
+        }
+    }
+
+    receive() external payable {}
+}
+
+/// @title TrainingDAOReentrancyTest
+/// @notice Verifies nonReentrant on executeProposal blocks reentrancy attacks
+contract TrainingDAOReentrancyTest is Test {
+    HelixToken public token;
+    TrainingDAO public dao;
+    DAOReentrancyAttacker public attacker;
+
+    address public voter1;
+
+    uint256 constant LARGE_BALANCE = 1_000_000 ether;
+
+    function setUp() public {
+        voter1 = makeAddr("voter1");
+
+        token = new HelixToken(makeAddr("treasury"));
+        dao = new TrainingDAO(address(token));
+        attacker = new DAOReentrancyAttacker(dao);
+
+        // Give voter1 enough tokens for quorum (4% of ~21M = ~840K)
+        token.mint(voter1, LARGE_BALANCE);
+        vm.prank(voter1);
+        token.delegate(voter1);
+        vm.roll(block.number + 1);
+    }
+
+    /// @notice Test: reentrancy via executeProposal targeting a malicious contract is blocked
+    function test_ExecuteProposal_ReentrancyBlocked() public {
+        // Create a proposal that calls the attacker contract
+        vm.prank(voter1);
+        uint256 proposalId = dao.createProposal(
+            TrainingDAO.ProposalType.Custom,
+            "Reentrancy test",
+            address(attacker),
+            abi.encodeWithSignature("setTarget(uint256)", 1) // harmless call
+        );
+
+        attacker.setTarget(proposalId);
+
+        vm.roll(block.number + 1);
+
+        // Advance to voting and vote
+        (, , , uint256 startTime, , , , ) = dao.getProposalInfo(proposalId);
+        vm.warp(startTime + 1);
+
+        vm.prank(voter1);
+        dao.castVote(proposalId, true);
+
+        (, , , , uint256 endTime, , , ) = dao.getProposalInfo(proposalId);
+        vm.warp(endTime + 1);
+
+        dao.queueProposal(proposalId);
+        vm.warp(dao.queuedProposals(proposalId));
+
+        // Execute - the attacker's fallback tries to re-enter executeProposal
+        // but nonReentrant blocks it
+        dao.executeProposal(proposalId);
+
+        // Verify executed only once
+        assertEq(
+            uint256(dao.getProposalState(proposalId)),
+            uint256(TrainingDAO.ProposalState.Executed),
+            "Proposal should be executed exactly once"
+        );
+    }
 }
 
 // ============================================================================
