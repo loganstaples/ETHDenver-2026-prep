@@ -36,7 +36,7 @@ abigen!(
     ]"#
 );
 
-/// Public inputs for MLTrainingStepCircuit (7 elements).
+/// Public inputs for MLTrainingStepV2Circuit (8 elements).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TrainingProofInputs {
     /// Old state hash (lower 128 bits).

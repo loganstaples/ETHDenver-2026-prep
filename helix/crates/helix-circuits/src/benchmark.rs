@@ -321,7 +321,8 @@ impl Default for BenchmarkSuite {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ml::training_step::{compute_witness, compute_state_hash, MLTrainingStepCircuit};
+    use crate::halo2_proofs::arithmetic::Field;
+    use crate::ml::training_step_v2::{compute_witness_v2, compute_state_hash_v2, MLTrainingStepV2Circuit};
 
     #[test]
     fn test_benchmark_mock() {
@@ -337,22 +338,26 @@ mod tests {
         let x = vec![Fr::from(1), Fr::from(1)];
         let target = vec![Fr::from(5)];
         let lr = Fr::from(1);
+        let base_error = Fr::from(1);
 
-        let old_hash = compute_state_hash(&w1, &b1, &w2, &b2);
-        let witness = compute_witness(
+        let old_hash = compute_state_hash_v2(&w1, &b1, &w2, &b2);
+        let witness = compute_witness_v2(
             d_in, d_hid, d_out, &x, &target, &w1, &b1, &w2, &b2, lr,
-            old_hash, (Fr::zero(), Fr::zero()), 1,
+            old_hash, (Fr::ZERO, Fr::ZERO), 1, base_error,
         );
-        let new_hash = compute_state_hash(&witness.w1_new, &witness.b1_new, &witness.w2_new, &witness.b2_new);
-        let witness = compute_witness(
+        let new_hash = compute_state_hash_v2(&witness.w1_new, &witness.b1_new, &witness.w2_new, &witness.b2_new);
+        let witness = compute_witness_v2(
             d_in, d_hid, d_out, &x, &target, &w1, &b1, &w2, &b2, lr,
-            old_hash, new_hash, 1,
+            old_hash, new_hash, 1, base_error,
         );
 
         let pi = witness.public_inputs();
-        let circuit = MLTrainingStepCircuit {
+        let circuit = MLTrainingStepV2Circuit {
             witness,
             relu_range: 128,
+            exp_range: 64,
+            exp_scale: 32,
+            use_freivalds: true,
         };
 
         let result = benchmark_mock("tiny_mlp", &circuit, 14, vec![pi]).unwrap();

@@ -1000,7 +1000,7 @@ impl EvmProofBuilder {
 /// Public inputs serialized for EVM contract submission.
 #[derive(Debug, Clone)]
 pub struct EvmPublicInputsArray {
-    /// The 7 public input values as Fr elements
+    /// The 8 public input values as Fr elements
     values: [Fr; NUM_PUBLIC_INPUTS],
 }
 

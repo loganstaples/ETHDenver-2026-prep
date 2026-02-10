@@ -1,6 +1,6 @@
 //! ML Training Step Prover.
 //!
-//! Wraps the `MLTrainingStepCircuit` from `helix-circuits` with the Halo2
+//! Wraps the `MLTrainingStepV2Circuit` from `helix-circuits` with the Halo2
 //! `ProverPipeline` to produce and verify real KZG proofs for training steps.
 //!
 //! Usage:
@@ -22,8 +22,8 @@
 use crate::pipeline::ProverPipeline;
 use helix_circuits::halo2_proofs::arithmetic::Field;
 use helix_circuits::halo2curves::bn256::Fr;
-use helix_circuits::ml::training_step::{
-    compute_state_hash, compute_witness, MLTrainingStepCircuit, MLTrainingStepWitness,
+use helix_circuits::ml::training_step_v2::{
+    compute_state_hash_v2, compute_witness_v2, MLTrainingStepV2Circuit, MLTrainingStepV2Witness,
     NUM_PUBLIC_INPUTS,
 };
 use helix_circuits::verifier::{SolidityGenerator, VkData};
@@ -50,7 +50,7 @@ pub struct TrainingProofResult {
 /// ML Training Step Prover.
 ///
 /// Generates real Halo2 KZG proofs for ML training steps using the
-/// `MLTrainingStepCircuit`.
+/// `MLTrainingStepV2Circuit`.
 ///
 /// IMPORTANT: The prover must be initialized with the same model dimensions
 /// that will be used for all subsequent proofs. The Halo2 circuit structure
@@ -58,7 +58,7 @@ pub struct TrainingProofResult {
 /// prover initialized for one dimension with a different dimension.
 pub struct MLTrainingProver {
     /// Halo2 proving pipeline (params, pk, vk).
-    pipeline: ProverPipeline<MLTrainingStepCircuit>,
+    pipeline: ProverPipeline<MLTrainingStepV2Circuit>,
     /// ReLU lookup table half-range used in the circuit.
     relu_range: usize,
     /// Model dimensions (d_in, d_hid, d_out).
@@ -89,7 +89,7 @@ impl MLTrainingProver {
 
         // Create a dummy witness with the correct dimensions for setup.
         // The actual values don't matter; only the structure does.
-        let dummy_witness = MLTrainingStepWitness {
+        let dummy_witness = MLTrainingStepV2Witness {
             d_in,
             d_hid,
             d_out,
@@ -100,31 +100,51 @@ impl MLTrainingProver {
             w2: vec![Fr::ZERO; d_out * d_hid],
             b2: vec![Fr::ZERO; d_out],
             h_pre: vec![Fr::ZERO; d_hid],
+            h_pre_err: vec![Fr::ZERO; d_hid],
             h: vec![Fr::ZERO; d_hid],
+            h_err: vec![Fr::ZERO; d_hid],
             y: vec![Fr::ZERO; d_out],
+            y_err: vec![Fr::ZERO; d_out],
             loss: Fr::ZERO,
+            loss_err: Fr::ZERO,
             dy: vec![Fr::ZERO; d_out],
+            dy_err: vec![Fr::ZERO; d_out],
             dw2: vec![Fr::ZERO; d_out * d_hid],
+            dw2_err: vec![Fr::ZERO; d_out * d_hid],
             db2: vec![Fr::ZERO; d_out],
+            db2_err: vec![Fr::ZERO; d_out],
             dh: vec![Fr::ZERO; d_hid],
+            dh_err: vec![Fr::ZERO; d_hid],
             relu_mask: vec![Fr::ZERO; d_hid],
             dh_pre: vec![Fr::ZERO; d_hid],
+            dh_pre_err: vec![Fr::ZERO; d_hid],
             dw1: vec![Fr::ZERO; d_hid * d_in],
+            dw1_err: vec![Fr::ZERO; d_hid * d_in],
             db1: vec![Fr::ZERO; d_hid],
+            db1_err: vec![Fr::ZERO; d_hid],
             lr: Fr::ONE,
             w1_new: vec![Fr::ZERO; d_hid * d_in],
             b1_new: vec![Fr::ZERO; d_hid],
             w2_new: vec![Fr::ZERO; d_out * d_hid],
             b2_new: vec![Fr::ZERO; d_out],
             total_error: Fr::ZERO,
+            // Dummy Freivalds vectors — only structure matters for setup
+            freivalds_r1: vec![Fr::ONE; d_in],
+            freivalds_r2: vec![Fr::ONE; d_hid],
             old_state_hash: (Fr::ZERO, Fr::ZERO),
             new_state_hash: (Fr::ZERO, Fr::ZERO),
             step_number: 0,
+            model_id: [0u8; 32],
+            error_budget: Fr::ZERO,
+            error_checksum: Fr::ZERO,
         };
 
-        let setup_circuit = MLTrainingStepCircuit {
+        let setup_circuit = MLTrainingStepV2Circuit {
             witness: dummy_witness,
             relu_range,
+            exp_range: 128,
+            exp_scale: 64,
+            use_freivalds: true,
         };
         pipeline.setup(&setup_circuit);
 
@@ -142,7 +162,7 @@ impl MLTrainingProver {
 
     /// Builds a witness from raw training data (all in `Fr`).
     ///
-    /// This is a convenience wrapper around `compute_witness` + `compute_state_hash`
+    /// This is a convenience wrapper around `compute_witness_v2` + `compute_state_hash_v2`
     /// that correctly computes both old and new state hashes.
     pub fn build_witness(
         d_in: usize,
@@ -156,11 +176,12 @@ impl MLTrainingProver {
         b2: &[Fr],
         lr: Fr,
         step_number: u64,
-    ) -> MLTrainingStepWitness {
-        let old_hash = compute_state_hash(w1, b1, w2, b2);
+    ) -> MLTrainingStepV2Witness {
+        let base_error = Fr::from(1u64);
+        let old_hash = compute_state_hash_v2(w1, b1, w2, b2);
 
         // First pass to compute new weights.
-        let tmp = compute_witness(
+        let tmp = compute_witness_v2(
             d_in,
             d_hid,
             d_out,
@@ -174,12 +195,13 @@ impl MLTrainingProver {
             old_hash,
             (Fr::ZERO, Fr::ZERO),
             step_number,
+            base_error,
         );
 
-        let new_hash = compute_state_hash(&tmp.w1_new, &tmp.b1_new, &tmp.w2_new, &tmp.b2_new);
+        let new_hash = compute_state_hash_v2(&tmp.w1_new, &tmp.b1_new, &tmp.w2_new, &tmp.b2_new);
 
         // Second pass with correct new hash.
-        compute_witness(
+        compute_witness_v2(
             d_in,
             d_hid,
             d_out,
@@ -193,14 +215,18 @@ impl MLTrainingProver {
             old_hash,
             new_hash,
             step_number,
+            base_error,
         )
     }
 
     /// Generates a Halo2 proof for the given witness.
-    pub fn prove(&self, witness: &MLTrainingStepWitness) -> TrainingProofResult {
-        let circuit = MLTrainingStepCircuit {
+    pub fn prove(&self, witness: &MLTrainingStepV2Witness) -> TrainingProofResult {
+        let circuit = MLTrainingStepV2Circuit {
             witness: witness.clone(),
             relu_range: self.relu_range,
+            exp_range: 128,
+            exp_scale: 64,
+            use_freivalds: true,
         };
 
         let pi = witness.public_inputs();
@@ -235,7 +261,7 @@ impl MLTrainingProver {
 
     /// Generates a Solidity verifier contract for this prover's circuit.
     ///
-    /// The generated contract can verify proofs from `MLTrainingStepCircuit`
+    /// The generated contract can verify proofs from `MLTrainingStepV2Circuit`
     /// using BN254 pairing precompiles.
     pub fn generate_solidity_verifier(&self, contract_name: &str) -> String {
         let vk_data = self.pipeline.extract_vk_data(NUM_PUBLIC_INPUTS)
@@ -260,7 +286,7 @@ impl MLTrainingProver {
 mod tests {
     use super::*;
 
-    fn small_model_witness() -> MLTrainingStepWitness {
+    fn small_model_witness() -> MLTrainingStepV2Witness {
         MLTrainingProver::build_witness(
             2,
             2,

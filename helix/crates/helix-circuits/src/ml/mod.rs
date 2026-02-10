@@ -8,7 +8,6 @@ pub mod linear_layer;
 pub mod positional;
 pub mod softmax;
 pub mod batch;
-pub mod training_step;
 pub mod training_step_v2;
 pub mod transformer;
 

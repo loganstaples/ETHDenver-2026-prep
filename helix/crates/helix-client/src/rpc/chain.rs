@@ -76,7 +76,7 @@ pub struct ChainStakeInfo {
     pub slashed: bool,
 }
 
-/// Public inputs for MLTrainingStepCircuit (7 elements).
+/// Public inputs for MLTrainingStepV2Circuit (8 elements).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TrainingProofInputs {
     pub old_hash_lo: U256,

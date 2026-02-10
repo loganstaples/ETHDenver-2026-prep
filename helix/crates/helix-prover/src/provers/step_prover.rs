@@ -10,7 +10,7 @@
 //!    Suitable for very large models that don't fit in a single circuit.
 //!
 //! 2. **ML circuit mode** (`prove_ml_training_step`): Uses the real
-//!    `MLTrainingStepCircuit` to generate a single Halo2 KZG proof covering
+//!    `MLTrainingStepV2Circuit` to generate a single Halo2 KZG proof covering
 //!    forward + backward + weight update for a 2-layer MLP, then chains
 //!    the result into the IVC sequence.
 
@@ -39,7 +39,7 @@ pub struct TrainingStepProof {
 /// Result of proving a training step with the real ML circuit.
 #[derive(Debug)]
 pub struct MLTrainingStepProof {
-    /// The Halo2 KZG proof from MLTrainingStepCircuit.
+    /// The Halo2 KZG proof from MLTrainingStepV2Circuit.
     pub ml_proof: TrainingProofResult,
     /// IVC state proof linking this step to the chain.
     pub ivc_proof: Vec<u8>,
@@ -221,7 +221,7 @@ impl TrainingStepProver {
         })
     }
 
-    /// Proves a training step using the real `MLTrainingStepCircuit`.
+    /// Proves a training step using the real `MLTrainingStepV2Circuit`.
     ///
     /// This generates a Halo2 KZG proof that the forward pass, backward pass,
     /// and weight update were computed correctly for a 2-layer MLP, then chains

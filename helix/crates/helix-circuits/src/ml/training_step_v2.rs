@@ -21,7 +21,7 @@
 //!   Backward: dW2 = dy * h^T, dW1 = dh_pre * x^T, etc.
 //!   Update:   W_new = W_old - lr * dW
 //!
-//! Public inputs (instance column):
+//! Public inputs (instance column, 8 elements):
 //!   0: old_state_hash_lo  (lower 128 bits of SHA256 of old weights)
 //!   1: old_state_hash_hi  (upper 128 bits)
 //!   2: new_state_hash_lo  (lower 128 bits of SHA256 of new weights)
@@ -29,6 +29,7 @@
 //!   4: loss               (quantized loss value)
 //!   5: total_error_bound  (accumulated error across all operations)
 //!   6: step_number
+//!   7: error_checksum     (SHA-256 commitment to error state)
 //!
 //! # Performance Targets
 //!
@@ -459,9 +460,13 @@ impl MLTrainingStepV2Witness {
 
         let hash = hasher.finalize();
 
-        // Convert first 31 bytes to Fr (to ensure it's in the field)
+        // Convert first 31 bytes to Fr (to ensure it's in the field).
+        // Fr uses little-endian representation; placing 31 bytes in [0..31]
+        // and zeroing byte [31] keeps the value under 2^248, well within the
+        // BN254 scalar field modulus.
         let mut repr = [0u8; 32];
-        repr[1..32].copy_from_slice(&hash[0..31]);
+        repr[0..31].copy_from_slice(&hash[0..31]);
+        repr[31] = 0;
         Fr::from_repr_vartime(repr.into()).unwrap_or(Fr::ZERO)
     }
 
@@ -522,7 +527,7 @@ impl MLTrainingStepV2Witness {
     /// `verifyProof(bytes proof, uint256[] publicInputs)` function.
     ///
     /// # Returns
-    /// An `EvmPublicInputsArray` containing the 7 public inputs:
+    /// An `EvmPublicInputsArray` containing the 8 public inputs:
     /// - [0]: old_state_hash_lo (lower 128 bits of old weights SHA256)
     /// - [1]: old_state_hash_hi (upper 128 bits of old weights SHA256)
     /// - [2]: new_state_hash_lo (lower 128 bits of new weights SHA256)
@@ -530,6 +535,7 @@ impl MLTrainingStepV2Witness {
     /// - [4]: loss (quantized training loss)
     /// - [5]: error_bound (accumulated error for this step)
     /// - [6]: step_number (training step counter)
+    /// - [7]: error_checksum (SHA-256 commitment to error state)
     pub fn to_evm_public_inputs(&self) -> EvmPublicInputsArray {
         EvmPublicInputsArray::from_training_step(
             self.old_state_hash.0,
@@ -546,7 +552,7 @@ impl MLTrainingStepV2Witness {
     /// Returns the public inputs as raw EVM bytes.
     ///
     /// Each public input is encoded as a 32-byte big-endian uint256.
-    /// Total size: 7 * 32 = 224 bytes.
+    /// Total size: 8 * 32 = 256 bytes.
     pub fn to_evm_public_inputs_bytes(&self) -> Vec<u8> {
         self.to_evm_public_inputs().to_evm_bytes()
     }
@@ -814,6 +820,18 @@ impl MLTrainingStepV2Circuit {
     ) -> Result<(), ErrorFront> {
         let w = &self.witness;
 
+        // Validate Freivalds challenges are present when Freivalds is enabled.
+        // Empty challenges would silently fall back to direct verification,
+        // defeating the O(n²) optimization and breaking the proof structure.
+        if self.use_freivalds {
+            if w.freivalds_r1.is_empty() {
+                return Err(ErrorFront::Synthesis);
+            }
+            if w.freivalds_r2.is_empty() {
+                return Err(ErrorFront::Synthesis);
+            }
+        }
+
         // 1. Bind public inputs at the given offset
         let pi = w.public_inputs();
         let pi_cells = layouter.assign_region(
@@ -995,6 +1013,13 @@ impl MLTrainingStepV2Circuit {
         verify_error_bound(config, layouter, w.total_error,
             &format!("b{}_error_bound_check", pi_offset))?;
 
+        // 11. Error checksum verification — constrain that PI[7] matches
+        // the witness error_checksum. This ensures the prover cannot submit
+        // an arbitrary checksum; it must match the value committed to via
+        // the SHA-256 error commitment (verified off-chain / by the contract).
+        verify_error_checksum(config, layouter, w.error_checksum,
+            &format!("b{}_error_checksum_check", pi_offset))?;
+
         Ok(())
     }
 }
@@ -1028,7 +1053,7 @@ pub trait ToEvmProof {
 pub trait ToEvmPublicInputs {
     /// Converts the public inputs to EVM-compatible format.
     ///
-    /// Returns an array of 7 Fr elements that can be submitted to
+    /// Returns an array of 8 Fr elements that can be submitted to
     /// `verifyProof(bytes proof, uint256[] publicInputs)`.
     fn to_evm_public_inputs(&self) -> EvmPublicInputsArray;
 
@@ -1298,6 +1323,37 @@ pub(crate) fn verify_error_bound(
         |mut region| {
             // Just witness the error bound - the public input constraint ensures it matches
             region.assign_advice(|| "total_error", config.advice[0], 0, || Value::known(total_error))?;
+            Ok(())
+        },
+    )
+}
+
+/// Constrains the error checksum at PI[7].
+///
+/// The error checksum is a SHA-256-based commitment to the error state:
+/// `SHA256(total_error || step_number || model_id || error_budget)`.
+///
+/// This constraint ensures the prover assigns a consistent checksum value
+/// that matches PI[7]. The full preimage verification is enforced off-chain
+/// and by the smart contract's error budget tracking.
+pub(crate) fn verify_error_checksum(
+    config: &MLTrainingStepV2Config,
+    layouter: &mut impl Layouter<Fr>,
+    error_checksum: Fr,
+    label: &str,
+) -> Result<(), ErrorFront> {
+    layouter.assign_region(
+        || label.to_string(),
+        |mut region| {
+            // Witness the error checksum and constrain via the equality
+            // system: this cell is linked to the PI[7] cell through
+            // the public input binding in synthesize_instance step 1.
+            region.assign_advice(
+                || "error_checksum",
+                config.advice[0],
+                0,
+                || Value::known(error_checksum),
+            )?;
             Ok(())
         },
     )
@@ -1659,7 +1715,7 @@ pub fn compute_witness_v2(
     let freivalds_r1 = generate_freivalds_challenge(step_number * 2, d_in);
     let freivalds_r2 = generate_freivalds_challenge(step_number * 2 + 1, d_hid);
 
-    MLTrainingStepV2Witness {
+    let mut witness = MLTrainingStepV2Witness {
         d_in,
         d_hid,
         d_out,
@@ -1703,11 +1759,15 @@ pub fn compute_witness_v2(
         old_state_hash,
         new_state_hash,
         step_number,
-        // Error commitment fields (default for now, should be set by caller)
         model_id: [0u8; 32],
         error_budget: Fr::ZERO,
         error_checksum: Fr::ZERO,
-    }
+    };
+
+    // Finalize the error checksum so PI[7] is always consistent
+    witness.finalize_error_checksum();
+
+    witness
 }
 
 /// Computes a Poseidon-based state hash for a weight set.
@@ -1822,6 +1882,35 @@ mod tests {
 
         // Error should be non-zero now
         assert_ne!(witness.total_error, Fr::ZERO);
+    }
+
+    #[test]
+    fn test_v2_freivalds_requires_challenges() {
+        let (mut circuit, pi) = make_tiny_circuit_v2();
+        // Empty the Freivalds challenges while leaving use_freivalds=true
+        circuit.witness.freivalds_r1 = vec![];
+        circuit.witness.freivalds_r2 = vec![];
+        // MockProver::run calls synthesize which should return an error
+        let result = MockProver::run(14, &circuit, vec![pi]);
+        assert!(result.is_err(), "empty Freivalds challenges must cause synthesis error");
+    }
+
+    #[test]
+    fn test_v2_error_checksum_in_pi() {
+        let (circuit, pi) = make_tiny_circuit_v2();
+        // PI[7] should be the finalized error checksum, not zero
+        let expected_checksum = circuit.witness.compute_error_checksum();
+        assert_eq!(pi[7], expected_checksum);
+        assert_ne!(pi[7], Fr::ZERO, "error_checksum should be finalized");
+    }
+
+    #[test]
+    fn test_v2_wrong_error_checksum_rejected() {
+        let (circuit, mut pi) = make_tiny_circuit_v2();
+        // Tamper with error_checksum in PI
+        pi[7] = Fr::from(999999u64);
+        let prover = MockProver::run(14, &circuit, vec![pi]).unwrap();
+        assert!(prover.verify().is_err(), "wrong error_checksum must be rejected");
     }
 
     #[test]

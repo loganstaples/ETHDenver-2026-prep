@@ -70,18 +70,19 @@ cargo test --test verification_consistency
 2. Participants stake tokens via `stake(modelId)`
 3. Owner starts training round via `startRound(modelId, duration)`
 4. Participants generate ZK proofs of gradient computation (Rust prover)
-5. Proofs submitted via `submitProof()` with 7 public inputs: `[oldHashLo, oldHashHi, newHashLo, newHashHi, loss, errorBound, stepNumber]`
+5. Proofs submitted via `submitProof()` with 8 public inputs: `[oldHashLo, oldHashHi, newHashLo, newHashHi, loss, errorBound, stepNumber, errorChecksum]`
 6. `Halo2Verifier` validates proof; invalid proofs trigger slashing
 7. Valid proofs update model commitment and accumulate error bounds
 
 ### Circuit-Contract Interface
 
-Public inputs from `MLTrainingStepV2Circuit`:
+Public inputs from `MLTrainingStepV2Circuit` (8 elements):
 - Indices 0-1: Old weight hash (split into lo/hi 128-bit halves)
 - Indices 2-3: New weight hash (split into lo/hi 128-bit halves)
 - Index 4: Computed loss value
 - Index 5: Error bound for this step
 - Index 6: Training step number
+- Index 7: Error checksum (SHA-256 commitment to error state)
 
 The contract reconstructs commitments via `_hashPair(lo, hi)` using keccak256.
 
