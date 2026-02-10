@@ -18,6 +18,7 @@
 //! - Intelligent tiering for storage optimization
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::SystemTime;
 
 use super::{
@@ -26,6 +27,9 @@ use super::{
 };
 use crate::data::merkle::{Hash, MerkleHasher, Sha256Hasher};
 use crate::data::provenance::DataOrigin;
+use crate::data::security::{RateLimitConfig, RateLimitResult, RateLimiter};
+#[cfg(feature = "s3-fetch")]
+use crate::data::security::validate_presigned_url_expiry;
 
 /// Configuration for S3-compatible storage.
 #[derive(Debug, Clone)]
@@ -652,6 +656,8 @@ pub struct S3DataSource {
     active_uploads: HashMap<String, MultipartUploadState>,
     /// Presigned URL cache.
     presigned_cache: HashMap<String, PresignedUrl>,
+    /// Rate limiter for remote requests (wrapped in Mutex for interior mutability).
+    rate_limiter: Mutex<RateLimiter>,
 }
 
 /// Mock object for testing.
@@ -779,6 +785,32 @@ impl S3DataSource {
             mock_storage: HashMap::new(),
             active_uploads: HashMap::new(),
             presigned_cache: HashMap::new(),
+            rate_limiter: Mutex::new(RateLimiter::unlimited()),
+        }
+    }
+
+    /// Sets the rate limiter configuration for remote requests.
+    pub fn set_rate_limit(&self, config: RateLimitConfig) {
+        if let Ok(mut limiter) = self.rate_limiter.lock() {
+            *limiter = RateLimiter::new(config);
+        }
+    }
+
+    /// Checks the rate limiter and returns an error if the request is denied.
+    ///
+    /// Used by feature-gated HTTP fetch/upload methods (`s3-fetch`).
+    /// Also available for external callers to pre-check rate limits.
+    pub fn check_rate_limit(&self) -> DataSourceResult<()> {
+        let mut limiter = self.rate_limiter.lock().map_err(|_| {
+            DataSourceError::Custom("rate limiter lock poisoned".to_string())
+        })?;
+        match limiter.try_acquire() {
+            RateLimitResult::Allowed { .. } => Ok(()),
+            RateLimitResult::Denied { retry_after_ms } => {
+                Err(DataSourceError::RateLimited {
+                    retry_after: Some(retry_after_ms / 1000),
+                })
+            }
         }
     }
 
@@ -871,8 +903,36 @@ impl S3DataSource {
         self.presigned_url_with_config(key, &PresignedUrlConfig::for_download(expires_secs)).url
     }
 
+    /// Validates a presigned URL configuration for security.
+    ///
+    /// Returns an error if the expiry duration exceeds the AWS maximum (7 days).
+    pub fn validate_presigned_config(config: &PresignedUrlConfig) -> DataSourceResult<()> {
+        if config.expires_secs > crate::data::security::MAX_PRESIGNED_URL_EXPIRY_SECS {
+            return Err(DataSourceError::InvalidConfig(format!(
+                "presigned URL expiry {} seconds exceeds maximum allowed {} seconds (7 days)",
+                config.expires_secs,
+                crate::data::security::MAX_PRESIGNED_URL_EXPIRY_SECS
+            )));
+        }
+        Ok(())
+    }
+
     /// Generates a presigned URL with full configuration.
+    ///
+    /// Validates that the expiry duration does not exceed the AWS SigV4 maximum
+    /// of 7 days (604800 seconds). Returns an unsigned URL if credentials are
+    /// not configured.
     pub fn presigned_url_with_config(&self, key: &str, config: &PresignedUrlConfig) -> PresignedUrl {
+        // Validate expiry duration (silently clamp to max if exceeded, log warning)
+        if config.expires_secs > crate::data::security::MAX_PRESIGNED_URL_EXPIRY_SECS {
+            // Clamp to maximum allowed duration
+            let clamped_config = PresignedUrlConfig {
+                expires_secs: crate::data::security::MAX_PRESIGNED_URL_EXPIRY_SECS,
+                ..config.clone()
+            };
+            return self.presigned_url_with_config(key, &clamped_config);
+        }
+
         // Check cache first
         let cache_key = format!("{}:{}:{:?}", key, config.expires_secs, config.url_type);
         if let Some(cached) = self.presigned_cache.get(&cache_key) {
@@ -1281,6 +1341,10 @@ impl S3DataSource {
     }
 
     /// Real HTTP fetch via presigned URL with retry and integrity verification.
+    ///
+    /// Before making the HTTP request, this method:
+    /// 1. Checks the rate limiter to prevent request flooding
+    /// 2. Validates the presigned URL hasn't expired
     #[cfg(feature = "s3-fetch")]
     async fn fetch_real_http(
         &self,
@@ -1288,10 +1352,20 @@ impl S3DataSource {
         range: Option<(u64, u64)>,
         verify_hash: Option<Hash>,
     ) -> DataSourceResult<Vec<u8>> {
+        // Rate limit check
+        self.check_rate_limit()?;
+
         let presigned = self.presigned_url_with_config(
             id,
             &PresignedUrlConfig::for_download(300),
         );
+
+        // Validate presigned URL hasn't expired before using it
+        if presigned.expires_at > 0 {
+            validate_presigned_url_expiry(presigned.expires_at, 300).map_err(|msg| {
+                DataSourceError::InvalidConfig(format!("S3 presigned URL invalid: {}", msg))
+            })?;
+        }
 
         let max_retries = self.config.max_retries;
         let timeout_secs = self.config.timeout_secs;
@@ -1376,6 +1450,8 @@ impl S3DataSource {
     }
 
     /// Real HTTP upload via presigned PUT URL with retry.
+    ///
+    /// Rate-limited and validates presigned URL expiry before upload.
     #[cfg(feature = "s3-fetch")]
     async fn upload_real_http(
         &self,
@@ -1383,6 +1459,9 @@ impl S3DataSource {
         data: &[u8],
         content_type: Option<&str>,
     ) -> DataSourceResult<String> {
+        // Rate limit check
+        self.check_rate_limit()?;
+
         let presigned = self.presigned_upload_url(
             key,
             300,
@@ -2431,5 +2510,77 @@ mod tests {
         let wrong_hash = Sha256Hasher.hash_leaf(b"wrong");
         let result = source.fetch_internal("verified.bin", None, Some(wrong_hash)).await;
         assert!(matches!(result, Err(DataSourceError::IntegrityError { .. })));
+    }
+
+    // ========== Presigned URL Expiry Validation Tests ==========
+
+    #[test]
+    fn test_presigned_url_expiry_clamped() {
+        let source = S3DataSource::with_credentials(
+            "bucket",
+            "us-east-1",
+            "AKIAIOSFODNN7EXAMPLE",
+            "secret",
+        );
+
+        // Request 10 days expiry (exceeds 7 day max)
+        let ten_days = 10 * 24 * 60 * 60;
+        let presigned = source.presigned_url_with_config(
+            "key",
+            &PresignedUrlConfig::for_download(ten_days),
+        );
+
+        // Should be clamped to 7 days max
+        assert!(presigned.url.contains("X-Amz-Expires=604800"));
+    }
+
+    #[test]
+    fn test_validate_presigned_config_rejects_excessive_expiry() {
+        let ten_days = 10 * 24 * 60 * 60;
+        let config = PresignedUrlConfig::for_download(ten_days);
+        let result = S3DataSource::validate_presigned_config(&config);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            DataSourceError::InvalidConfig(msg) => {
+                assert!(msg.contains("exceeds maximum"));
+            }
+            other => panic!("Expected InvalidConfig, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_validate_presigned_config_allows_valid_expiry() {
+        let config = PresignedUrlConfig::for_download(3600); // 1 hour
+        assert!(S3DataSource::validate_presigned_config(&config).is_ok());
+    }
+
+    // ========== Rate Limiting Tests ==========
+
+    #[test]
+    fn test_s3_rate_limiter_default_unlimited() {
+        let source = S3DataSource::new(S3Config::aws("bucket", "us-east-1"));
+        // Default rate limiter is unlimited, should always allow
+        for _ in 0..100 {
+            assert!(source.check_rate_limit().is_ok());
+        }
+    }
+
+    #[test]
+    fn test_s3_rate_limiter_strict() {
+        let source = S3DataSource::new(S3Config::aws("bucket", "us-east-1"));
+        source.set_rate_limit(RateLimitConfig {
+            max_requests: 10,
+            window_secs: 60,
+            burst_size: 2,
+            block_on_limit: false,
+        });
+
+        // First 2 should succeed (burst)
+        assert!(source.check_rate_limit().is_ok());
+        assert!(source.check_rate_limit().is_ok());
+
+        // Third should be rate limited
+        let result = source.check_rate_limit();
+        assert!(matches!(result, Err(DataSourceError::RateLimited { .. })));
     }
 }

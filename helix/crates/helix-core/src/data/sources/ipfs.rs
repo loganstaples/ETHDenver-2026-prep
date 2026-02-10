@@ -15,6 +15,7 @@
 //! - Connection pooling and caching
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::SystemTime;
 
 use super::{
@@ -23,6 +24,7 @@ use super::{
 };
 use crate::data::merkle::{Hash, MerkleHasher, Sha256Hasher};
 use crate::data::provenance::DataOrigin;
+use crate::data::security::{RateLimitConfig, RateLimitResult, RateLimiter};
 
 /// Configuration for IPFS data source.
 #[derive(Debug, Clone)]
@@ -246,6 +248,8 @@ pub struct IpfsDataSource {
     dag_nodes: HashMap<String, DagNode>,
     /// Chunked content registry.
     chunked_content: HashMap<String, ChunkedContent>,
+    /// Rate limiter for remote requests (wrapped in Mutex for interior mutability).
+    rate_limiter: Mutex<RateLimiter>,
 }
 
 impl IpfsDataSource {
@@ -272,7 +276,66 @@ impl IpfsDataSource {
             pins: HashMap::new(),
             dag_nodes: HashMap::new(),
             chunked_content: HashMap::new(),
+            rate_limiter: Mutex::new(RateLimiter::unlimited()),
         }
+    }
+
+    /// Sets the rate limiter configuration for remote requests.
+    pub fn set_rate_limit(&self, config: RateLimitConfig) {
+        if let Ok(mut limiter) = self.rate_limiter.lock() {
+            *limiter = RateLimiter::new(config);
+        }
+    }
+
+    /// Checks the rate limiter and returns an error if the request is denied.
+    fn check_rate_limit(&self) -> DataSourceResult<()> {
+        let mut limiter = self.rate_limiter.lock().map_err(|_| {
+            DataSourceError::Custom("rate limiter lock poisoned".to_string())
+        })?;
+        match limiter.try_acquire() {
+            RateLimitResult::Allowed { .. } => Ok(()),
+            RateLimitResult::Denied { retry_after_ms } => {
+                Err(DataSourceError::RateLimited {
+                    retry_after: Some(retry_after_ms / 1000),
+                })
+            }
+        }
+    }
+
+    /// Verifies that fetched content matches its CID.
+    ///
+    /// IPFS is content-addressable: the CID is derived from the content hash.
+    /// This method recomputes the CID from the data and compares it to the
+    /// expected CID. Supports both CIDv0 (Qm...) and CIDv1 (bafybeig...).
+    ///
+    /// Returns `Ok(())` if the CID matches or the ID doesn't look like a CID.
+    /// Returns `Err(IntegrityError)` on mismatch.
+    fn verify_cid_integrity(&self, id: &str, data: &[u8]) -> DataSourceResult<()> {
+        if id.starts_with("Qm") && id.len() == 46 {
+            // CIDv0 verification
+            let computed = self.generate_cid(data);
+            if computed.0 != id {
+                let expected_hash = Hash::from_slice(id.as_bytes());
+                let actual_hash = Hash::from_slice(computed.0.as_bytes());
+                return Err(DataSourceError::IntegrityError {
+                    expected: expected_hash,
+                    actual: actual_hash,
+                });
+            }
+        } else if id.starts_with("bafybeig") {
+            // CIDv1 verification
+            let computed = self.generate_cidv1(data);
+            if computed.0 != id {
+                let expected_hash = Hash::from_slice(id.as_bytes());
+                let actual_hash = Hash::from_slice(computed.0.as_bytes());
+                return Err(DataSourceError::IntegrityError {
+                    expected: expected_hash,
+                    actual: actual_hash,
+                });
+            }
+        }
+        // For non-CID identifiers (custom keys), skip verification
+        Ok(())
     }
 
     /// Creates a data source with default configuration.
@@ -511,7 +574,12 @@ impl IpfsDataSource {
         best_gateway
     }
 
-    /// Internal fetch implementation with gateway fallback.
+    /// Internal fetch implementation with gateway fallback and CID verification.
+    ///
+    /// After fetching data from any source (local or remote), this method
+    /// automatically verifies that the content hash matches the CID when
+    /// the identifier is a valid CID (v0 or v1). This ensures content
+    /// integrity even for locally cached data.
     async fn fetch_internal(&self, id: &str, verify_hash: Option<Hash>) -> DataSourceResult<Vec<u8>> {
         // Check cache first
         // (Cache check would be here in full implementation)
@@ -519,6 +587,9 @@ impl IpfsDataSource {
         // Check local storage
         if let Some(data) = self.storage.get(id) {
             let data = data.clone();
+
+            // Verify CID matches content (content-addressable verification)
+            self.verify_cid_integrity(id, &data)?;
 
             // Verify hash if requested
             if let Some(expected) = verify_hash {
@@ -532,6 +603,9 @@ impl IpfsDataSource {
             }
             return Ok(data);
         }
+
+        // Rate limit check before remote fetch
+        self.check_rate_limit()?;
 
         // Try fetching from IPFS gateway when ipfs-fetch feature is enabled
         #[cfg(feature = "ipfs-fetch")]
@@ -560,6 +634,9 @@ impl IpfsDataSource {
                                     data.len(), self.config.max_file_size
                                 )));
                             }
+
+                            // Verify CID matches content hash (content-addressable verification)
+                            self.verify_cid_integrity(id, &data)?;
 
                             // Verify hash if requested
                             if let Some(expected) = verify_hash {
@@ -1793,5 +1870,118 @@ mod tests {
         let cid = source.generate_cidv1(&data);
 
         assert!(cid.0.starts_with("bafybeig"));
+    }
+
+    // =========================================================================
+    // CID CONTENT HASH VERIFICATION TESTS
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_cid_verification_valid() {
+        let mut source = IpfsDataSource::default_source();
+
+        let data = b"Content addressable data".to_vec();
+        let cid = source.generate_cid(&data);
+
+        // Store with correct CID
+        source.store_local(&cid.0, data.clone());
+
+        // Fetch should succeed (CID matches content)
+        let fetched = source.fetch_internal(&cid.0, None).await.unwrap();
+        assert_eq!(fetched, data);
+    }
+
+    #[tokio::test]
+    async fn test_cid_verification_tampered_content() {
+        let mut source = IpfsDataSource::default_source();
+
+        let original_data = b"Original content".to_vec();
+        let cid = source.generate_cid(&original_data);
+
+        // Store DIFFERENT data under the same CID (simulates tampering)
+        let tampered_data = b"Tampered content!".to_vec();
+        source.store_local(&cid.0, tampered_data);
+
+        // Fetch should fail (CID doesn't match content)
+        let result = source.fetch_internal(&cid.0, None).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            DataSourceError::IntegrityError { .. } => {}
+            other => panic!("Expected IntegrityError, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cidv1_verification_valid() {
+        let mut source = IpfsDataSource::default_source();
+
+        let data = b"CIDv1 content".to_vec();
+        let cid = source.generate_cidv1(&data);
+
+        source.store_local(&cid.0, data.clone());
+
+        let fetched = source.fetch_internal(&cid.0, None).await.unwrap();
+        assert_eq!(fetched, data);
+    }
+
+    #[tokio::test]
+    async fn test_cidv1_verification_tampered() {
+        let mut source = IpfsDataSource::default_source();
+
+        let data = b"CIDv1 original".to_vec();
+        let cid = source.generate_cidv1(&data);
+
+        // Store tampered data
+        source.store_local(&cid.0, b"CIDv1 tampered".to_vec());
+
+        let result = source.fetch_internal(&cid.0, None).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            DataSourceError::IntegrityError { .. } => {}
+            other => panic!("Expected IntegrityError, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_non_cid_key_skips_verification() {
+        let mut source = IpfsDataSource::default_source();
+
+        // Custom key (not a CID) should skip CID verification
+        source.store_local("custom-key-123", b"some data".to_vec());
+
+        let fetched = source.fetch_internal("custom-key-123", None).await.unwrap();
+        assert_eq!(fetched, b"some data");
+    }
+
+    // =========================================================================
+    // RATE LIMITING TESTS
+    // =========================================================================
+
+    #[test]
+    fn test_ipfs_rate_limiter_default_unlimited() {
+        let source = IpfsDataSource::default_source();
+        for _ in 0..100 {
+            assert!(source.check_rate_limit().is_ok());
+        }
+    }
+
+    #[test]
+    fn test_ipfs_rate_limiter_strict() {
+        let source = IpfsDataSource::default_source();
+        source.set_rate_limit(RateLimitConfig {
+            max_requests: 10,
+            window_secs: 60,
+            burst_size: 3,
+            block_on_limit: false,
+        });
+
+        // First 3 should succeed (burst)
+        assert!(source.check_rate_limit().is_ok());
+        assert!(source.check_rate_limit().is_ok());
+        assert!(source.check_rate_limit().is_ok());
+
+        // Fourth should be rate limited
+        let result = source.check_rate_limit();
+        assert!(matches!(result, Err(DataSourceError::RateLimited { .. })));
     }
 }

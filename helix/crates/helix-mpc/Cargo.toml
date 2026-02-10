@@ -9,6 +9,7 @@ default = ["parallel"]
 parallel = ["rayon"]
 metal = ["helix-prover/metal"]
 network-mpc = []
+simulation = []
 
 [dependencies]
 helix-core = { path = "../helix-core" }

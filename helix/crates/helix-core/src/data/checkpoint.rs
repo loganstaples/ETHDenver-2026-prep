@@ -25,8 +25,10 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::io::{Read as IoRead, Write as IoWrite};
 
 use crate::error::{HelixError, HelixResult, SerializationError};
+use crate::traits::serializable::{BinarySerializable, SerializeError};
 
 /// Magic bytes for checkpoint files.
 const CHECKPOINT_MAGIC: &[u8; 4] = b"HXCK";
@@ -108,7 +110,78 @@ pub struct CheckpointErrorState {
     /// Per-step error history (if tracking enabled).
     pub error_history: Vec<f64>,
     /// Error checksum (compact u64, matches on-chain format).
+    ///
+    /// This is the SHA256-based error checksum exported as a u64 Fr element,
+    /// matching circuit PI[7] and the Solidity `_computeErrorChecksum()` output.
     pub error_checksum: u64,
+}
+
+// ================================================================
+// BinarySerializable for CheckpointErrorState
+//
+// Binary layout (variable size):
+//   [accumulated_error: f64 LE]   (8 bytes)
+//   [budget_limit: f64 LE]        (8 bytes)
+//   [utilization: f64 LE]         (8 bytes)
+//   [history_len: u32 LE]         (4 bytes)
+//   [error_history: f64 LE * N]   (N * 8 bytes)
+//   [error_checksum: u64 LE]      (8 bytes)
+//
+// The error_checksum field stores the SHA256-based checksum as a u64
+// Fr element, ensuring the checkpoint can be used to restore and verify
+// the error commitment state for continued training or proof generation.
+// ================================================================
+
+impl BinarySerializable for CheckpointErrorState {
+    fn serialized_size(&self) -> usize {
+        8 + 8 + 8 + 4 + (self.error_history.len() * 8) + 8
+    }
+
+    fn serialize<W: IoWrite>(&self, writer: &mut W) -> Result<(), SerializeError> {
+        writer.write_all(&self.accumulated_error.to_le_bytes())?;
+        writer.write_all(&self.budget_limit.to_le_bytes())?;
+        writer.write_all(&self.utilization.to_le_bytes())?;
+        writer.write_all(&(self.error_history.len() as u32).to_le_bytes())?;
+        for &e in &self.error_history {
+            writer.write_all(&e.to_le_bytes())?;
+        }
+        writer.write_all(&self.error_checksum.to_le_bytes())?;
+        Ok(())
+    }
+
+    fn deserialize<R: IoRead>(reader: &mut R) -> Result<Self, SerializeError> {
+        let mut buf8 = [0u8; 8];
+        let mut buf4 = [0u8; 4];
+
+        reader.read_exact(&mut buf8)?;
+        let accumulated_error = f64::from_le_bytes(buf8);
+
+        reader.read_exact(&mut buf8)?;
+        let budget_limit = f64::from_le_bytes(buf8);
+
+        reader.read_exact(&mut buf8)?;
+        let utilization = f64::from_le_bytes(buf8);
+
+        reader.read_exact(&mut buf4)?;
+        let history_len = u32::from_le_bytes(buf4) as usize;
+
+        let mut error_history = Vec::with_capacity(history_len);
+        for _ in 0..history_len {
+            reader.read_exact(&mut buf8)?;
+            error_history.push(f64::from_le_bytes(buf8));
+        }
+
+        reader.read_exact(&mut buf8)?;
+        let error_checksum = u64::from_le_bytes(buf8);
+
+        Ok(Self {
+            accumulated_error,
+            budget_limit,
+            utilization,
+            error_history,
+            error_checksum,
+        })
+    }
 }
 
 impl ModelCheckpoint {
@@ -681,6 +754,82 @@ mod tests {
         let bytes = ckpt.to_bytes().unwrap();
         let restored = ModelCheckpoint::from_bytes(&bytes).unwrap();
         assert_eq!(restored.total_params(), 0);
+    }
+
+    // === BinarySerializable tests for CheckpointErrorState ===
+
+    #[test]
+    fn test_error_state_binary_serializable_roundtrip() {
+        let original = CheckpointErrorState {
+            accumulated_error: 0.003,
+            budget_limit: 0.01,
+            utilization: 0.3,
+            error_history: vec![0.001, 0.001, 0.001],
+            error_checksum: 12345678901234,
+        };
+
+        let bytes = BinarySerializable::to_bytes(&original);
+        let restored = CheckpointErrorState::from_bytes(&bytes).unwrap();
+
+        assert!((original.accumulated_error - restored.accumulated_error).abs() < 1e-15);
+        assert!((original.budget_limit - restored.budget_limit).abs() < 1e-15);
+        assert!((original.utilization - restored.utilization).abs() < 1e-15);
+        assert_eq!(original.error_history.len(), restored.error_history.len());
+        for (a, b) in original.error_history.iter().zip(restored.error_history.iter()) {
+            assert!((a - b).abs() < 1e-15);
+        }
+        assert_eq!(original.error_checksum, restored.error_checksum);
+    }
+
+    #[test]
+    fn test_error_state_binary_serializable_empty_history() {
+        let original = CheckpointErrorState {
+            accumulated_error: 0.0,
+            budget_limit: 0.01,
+            utilization: 0.0,
+            error_history: vec![],
+            error_checksum: 0,
+        };
+
+        let bytes = BinarySerializable::to_bytes(&original);
+        let restored = CheckpointErrorState::from_bytes(&bytes).unwrap();
+
+        assert_eq!(restored.error_history.len(), 0);
+        assert_eq!(restored.error_checksum, 0);
+    }
+
+    #[test]
+    fn test_error_state_binary_serializable_size() {
+        let es = CheckpointErrorState {
+            accumulated_error: 0.003,
+            budget_limit: 0.01,
+            utilization: 0.3,
+            error_history: vec![0.001, 0.001, 0.001],
+            error_checksum: 12345,
+        };
+
+        // 8 + 8 + 8 + 4 + (3 * 8) + 8 = 60
+        assert_eq!(es.serialized_size(), 60);
+
+        let bytes = BinarySerializable::to_bytes(&es);
+        assert_eq!(bytes.len(), 60);
+    }
+
+    #[test]
+    fn test_error_state_binary_serializable_checksum_preserved() {
+        // Verify the error_checksum u64 survives roundtrip exactly
+        let checksum: u64 = 0xDEAD_BEEF_CAFE_BABE;
+        let original = CheckpointErrorState {
+            accumulated_error: 0.005,
+            budget_limit: 0.05,
+            utilization: 0.1,
+            error_history: vec![0.005],
+            error_checksum: checksum,
+        };
+
+        let bytes = BinarySerializable::to_bytes(&original);
+        let restored = CheckpointErrorState::from_bytes(&bytes).unwrap();
+        assert_eq!(restored.error_checksum, checksum);
     }
 
     #[cfg(feature = "compression")]

@@ -33,6 +33,9 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::io::{Read, Write};
+
+use crate::traits::serializable::{BinarySerializable, SerializeError};
 
 /// Scale factor for converting f64 error values to u64 (10^12 for 12 decimal places).
 const ERROR_SCALE: f64 = 1e12;
@@ -276,6 +279,55 @@ impl ErrorCommitment {
         // uint256 is big-endian: least significant byte at index 31
         bytes[24..32].copy_from_slice(&value.to_be_bytes());
         bytes
+    }
+}
+
+// ================================================================
+// BinarySerializable implementation
+//
+// Binary layout (56 bytes, fixed):
+//   [accumulated_error: f64 LE] (8 bytes)
+//   [step_number: u64 LE]      (8 bytes)
+//   [model_id: raw bytes]      (32 bytes)
+//   [budget_limit: f64 LE]     (8 bytes)
+//
+// This layout matches the SHA256 preimage exactly, so the serialized
+// form can be hashed directly to recompute the checksum.
+// ================================================================
+
+impl BinarySerializable for ErrorCommitment {
+    fn serialized_size(&self) -> usize {
+        8 + 8 + 32 + 8 // 56 bytes
+    }
+
+    fn serialize<W: Write>(&self, writer: &mut W) -> Result<(), SerializeError> {
+        let error_scaled = Self::scale_to_u64(self.accumulated_error);
+        writer.write_all(&error_scaled.to_le_bytes())?;
+        writer.write_all(&self.step_number.to_le_bytes())?;
+        writer.write_all(&self.model_id)?;
+        let budget_scaled = Self::scale_to_u64(self.budget_limit);
+        writer.write_all(&budget_scaled.to_le_bytes())?;
+        Ok(())
+    }
+
+    fn deserialize<R: Read>(reader: &mut R) -> Result<Self, SerializeError> {
+        let mut buf8 = [0u8; 8];
+
+        reader.read_exact(&mut buf8)?;
+        let error_scaled = u64::from_le_bytes(buf8);
+        let accumulated_error = error_scaled as f64 / ERROR_SCALE;
+
+        reader.read_exact(&mut buf8)?;
+        let step_number = u64::from_le_bytes(buf8);
+
+        let mut model_id = [0u8; 32];
+        reader.read_exact(&mut model_id)?;
+
+        reader.read_exact(&mut buf8)?;
+        let budget_scaled = u64::from_le_bytes(buf8);
+        let budget_limit = budget_scaled as f64 / ERROR_SCALE;
+
+        Ok(Self::new(accumulated_error, step_number, model_id, budget_limit))
     }
 }
 
@@ -1000,5 +1052,60 @@ mod tests {
         let solidity_result = u64::from_le_bytes(hash[0..8].try_into().unwrap());
 
         assert_eq!(commitment.to_contract_u64(), solidity_result);
+    }
+
+    // === BinarySerializable tests ===
+
+    #[test]
+    fn test_binary_serializable_roundtrip() {
+        let original = ErrorCommitment::new(0.001, 42, [1u8; 32], 0.01);
+        let bytes = original.to_bytes();
+
+        assert_eq!(bytes.len(), 56); // 8 + 8 + 32 + 8
+
+        let restored = ErrorCommitment::from_bytes(&bytes).unwrap();
+        // Note: f64 -> u64 -> f64 scaling may lose precision, so compare checksums
+        assert_eq!(
+            original.compute_checksum(),
+            restored.compute_checksum(),
+            "Checksum must survive serialization roundtrip"
+        );
+        assert_eq!(original.step_number, restored.step_number);
+        assert_eq!(original.model_id, restored.model_id);
+        assert_eq!(
+            original.to_contract_u64(),
+            restored.to_contract_u64(),
+            "Contract u64 must survive serialization roundtrip"
+        );
+    }
+
+    #[test]
+    fn test_binary_serializable_preimage_layout() {
+        // The binary format matches the SHA256 preimage, so serializing and
+        // hashing should produce the same checksum as compute_checksum().
+        let commitment = ErrorCommitment::new(0.005, 100, [0x42u8; 32], 0.05);
+        let bytes = commitment.to_bytes();
+
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let hash = hasher.finalize();
+        let from_bytes = u64::from_le_bytes(hash[0..8].try_into().unwrap());
+
+        assert_eq!(commitment.to_contract_u64(), from_bytes);
+    }
+
+    #[test]
+    fn test_binary_serializable_size() {
+        let commitment = ErrorCommitment::new(0.001, 42, [1u8; 32], 0.01);
+        assert_eq!(commitment.serialized_size(), 56);
+    }
+
+    #[test]
+    fn test_binary_serializable_deterministic() {
+        let c = ErrorCommitment::new(0.001, 42, [1u8; 32], 0.01);
+        let b1 = c.to_bytes();
+        let b2 = c.to_bytes();
+        assert_eq!(b1, b2);
     }
 }

@@ -141,6 +141,10 @@ pub struct FetchOptions {
     pub range_end: Option<u64>,
     /// Whether to cache the result.
     pub cache: bool,
+    /// Decompression limits for streaming bomb protection.
+    /// When set, fetched compressed data will be decompressed through
+    /// a size-limited writer that aborts if limits are exceeded.
+    pub decompression_limits: Option<super::security::DecompressionLimits>,
 }
 
 impl FetchOptions {
