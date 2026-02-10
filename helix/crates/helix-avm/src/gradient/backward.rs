@@ -75,62 +75,9 @@ pub fn backward(loss: &Variable) -> Result<HashMap<NodeIndex, BoundedTensor>, St
                 // Y = A @ B
                 // dL/dA = dL/dY @ B^T
                 // dL/dB = A^T @ dL/dY
-                
-                // Need to retrieve A and B shapes to know if we need to access their values
-                // For MatMul backward we DO need the values of A and B.
-                // But the Tape currently only stores metadata (NodeInfo).
-                // THIS IS A DESIGN FLAW in the minimal tape. 
-                // A Wengert list usually stores references to the inputs or values.
-                //
-                // FIX: In a real implementation we need access to the forward pass values.
-                // Since this is a specialized implementation, let's assume `Variable` kept the values alive
-                // or the Tape stores the values.
-                //
-                // Given the constraints and the provided file structures, `Variable` holds the tensor.
-                // But `Variable`s are owned by the user.
-                // We need the `GradientTape` to store the *values* (or strong refs) if we want to do backward 
-                // without the user keeping all intermediates alive.
-                //
-                // For this stage, let's assume we can't implement MatMul backward fully without the values.
-                // However, I can't easily change `GradientTape` to store BoundedTensor without cloning.
-                // cloning BoundedTensor is fine (it's data).
-                //
-                // Let's modify the plan slightly: I will NOT change `GradientTape` definition in `autodiff.rs` now (too messy).
-                // I will add a panic! for now or implement what I can.
-                // Wait, if I can't do MatMul backward, I can't train.
-                //
-                // Actually, I can rely on the fact that I don't have the values.
-                // Retaining values is required for MatMul.
-                // 
-                // Let's look at `helix-avm/src/gradient/autodiff.rs` again.
-                // I should assume the `GradientTape` optionally can cache values, OR 
-                // I assume the user keeps variables alive? No, intermediate variables are dropped.
-                //
-                // OK, I will update `autodiff.rs` to store `Option<BoundedTensor>` in `NodeInfo`.
-                // This is necessary for non-linear ops and Mul/MatMul.
-                //
-                // Since I am writing `backward.rs` now, I will write it assuming `NodeInfo` has `cached_value`.
-                // I will then go back and update `autodiff.rs`.
-                
-                // Let's assume `node.cached_value` exists.
-                // Wait, I can't assume that if I haven't written it.
-                // I must update `autodiff.rs` FIRST or concurrently.
-                // But I am in the middle of writing `backward.rs`.
-                //
-                // Strategy: I will write `backward.rs` assuming `node.output` is available.
-                // Then I will update `autodiff.rs` immediately after.
-                
-                // ... logic continues assuming `node.output` ...
-                // But wait, for MatMul backwards: dL/dA = G @ B^T. We need B.
-                // `tape.nodes[rhs_idx]` should have the value of B.
-                
+                // Uses cached_value from NodeInfo to retrieve A and B.
                  let lhs_node = &tape.nodes[*lhs_idx];
                  let rhs_node = &tape.nodes[*rhs_idx];
-                 
-                 // We need the VALUES of lhs and rhs.
-                 // If the tape stored the *result* of the operation at `idx`, 
-                 // it doesn't store the inputs A and B directly, only their indices.
-                 // So we can look up `tape.nodes[lhs_idx].cached_value`.
                  
                  if let (Some(lhs_val), Some(rhs_val)) = (&lhs_node.cached_value, &rhs_node.cached_value) {
                      let precision = Precision::F32;
