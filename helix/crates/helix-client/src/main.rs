@@ -1945,7 +1945,7 @@ async fn cmd_train_chain(args: &TrainArgs) -> Result<()> {
                 .collect();
             let target_idx = rng.gen_range(0..d_out);
             let target: Vec<Fr> = (0..d_out)
-                .map(|i| if i == target_idx { Fr::ONE } else { Fr::ZERO })
+                .map(|i| if i == target_idx { Fr::from(1u64) } else { Fr::from(0u64) })
                 .collect();
             (x, target)
         };
