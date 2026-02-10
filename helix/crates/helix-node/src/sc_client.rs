@@ -36,7 +36,11 @@ abigen!(
     ]"#
 );
 
-/// Public inputs for MLTrainingStepCircuit (7 elements).
+/// Public inputs for MLTrainingStepV2Circuit (8 elements).
+///
+/// The first 7 are the on-chain public inputs consumed by `HelixCoordinatorV2`.
+/// The 8th (`error_checksum`) is required for native Halo2 KZG verification
+/// and is `SHA256(total_error || step_number || model_id || error_budget)`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TrainingProofInputs {
     /// Old state hash (lower 128 bits).
@@ -53,10 +57,14 @@ pub struct TrainingProofInputs {
     pub error_bound: U256,
     /// Training step number.
     pub step_number: U256,
+    /// Error checksum (8th public input for Halo2 verification).
+    /// Defaults to zero for backward compatibility with on-chain-only flows.
+    #[serde(default)]
+    pub error_checksum: U256,
 }
 
 impl TrainingProofInputs {
-    /// Converts to the format expected by the contract.
+    /// Converts to the 7-element format expected by the on-chain contract.
     pub fn to_vec(&self) -> Vec<U256> {
         vec![
             self.old_hash_lo,
@@ -66,6 +74,20 @@ impl TrainingProofInputs {
             self.loss,
             self.error_bound,
             self.step_number,
+        ]
+    }
+
+    /// Converts to the full 8-element format needed for native Halo2 verification.
+    pub fn to_vec_full(&self) -> Vec<U256> {
+        vec![
+            self.old_hash_lo,
+            self.old_hash_hi,
+            self.new_hash_lo,
+            self.new_hash_hi,
+            self.loss,
+            self.error_bound,
+            self.step_number,
+            self.error_checksum,
         ]
     }
 
@@ -87,6 +109,7 @@ impl TrainingProofInputs {
             loss: U256::from_big_endian(&loss),
             error_bound: U256::from_big_endian(&error_bound),
             step_number: U256::from(step_number),
+            error_checksum: U256::zero(),
         }
     }
 }
@@ -415,10 +438,17 @@ mod tests {
             loss: U256::from(100),
             error_bound: U256::from(10),
             step_number: U256::from(1),
+            error_checksum: U256::from(42),
         };
+        // On-chain format has 7 elements (no error_checksum)
         let vec = inputs.to_vec();
         assert_eq!(vec.len(), 7);
         assert_eq!(vec[0], U256::from(1));
         assert_eq!(vec[6], U256::from(1));
+
+        // Full format for native Halo2 verification has 8 elements
+        let vec_full = inputs.to_vec_full();
+        assert_eq!(vec_full.len(), 8);
+        assert_eq!(vec_full[7], U256::from(42));
     }
 }

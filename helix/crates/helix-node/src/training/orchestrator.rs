@@ -856,6 +856,7 @@ impl TrainingOrchestrator {
                     loss: U256::zero(),
                     error_bound: U256::from((gradient.error_bound * 1e18) as u64),
                     step_number: U256::from(round_id),
+                    error_checksum: U256::zero(),
                 },
                 error_bound: gradient.error_bound,
                 share_index: idx,

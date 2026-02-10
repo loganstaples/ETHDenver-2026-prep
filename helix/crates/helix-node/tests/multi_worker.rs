@@ -166,6 +166,7 @@ fn create_worker_proof(
             loss: U256::from(100u64),
             error_bound: U256::from(10u64),
             step_number: U256::from(share_index as u64),
+            error_checksum: U256::zero(),
         },
         error_bound: 0.001 * (share_index + 1) as f64,
         share_index,

@@ -946,6 +946,7 @@ impl DistributedTrainingCoordinator {
             loss: ethers::types::U256::zero(), // Would come from training metrics
             error_bound: ethers::types::U256::from((total_error * 1e18) as u64),
             step_number: ethers::types::U256::from(round_id.round_number),
+            error_checksum: ethers::types::U256::zero(),
         };
 
         // Create a combined proof (in production, this would be a proper aggregated proof)

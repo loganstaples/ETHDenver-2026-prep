@@ -64,7 +64,7 @@ tempfile = "3.24.0"
 tokio-test = "0.4"
 
 [features]
-default = []
+default = ["crypto-sign"]
 dht = ["libp2p-kad"]
 crypto-sign = ["ed25519-dalek"]
 
