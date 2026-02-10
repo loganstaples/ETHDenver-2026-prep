@@ -25,7 +25,18 @@ pub mod registry;
 pub mod sharding;
 pub mod shuffling;
 pub mod sources;
+pub mod security;
 pub mod streaming;
+
+// Re-export security types
+pub use security::{
+    DecompressionLimits, DecompressionError, LimitedWriter,
+    safe_decompress, validate_data_size,
+    RateLimitConfig, RateLimiter, RateLimitResult, RateLimitStats,
+    validate_column_name,
+    validate_presigned_url_expiry,
+    MAX_PRESIGNED_URL_EXPIRY_SECS, MIN_PRESIGNED_URL_REMAINING_SECS,
+};
 
 // Re-export dataset types
 pub use dataset::{

@@ -194,6 +194,20 @@ impl CsvDataLoader {
         let mut lines: Vec<&str> = content.lines().collect();
 
         if config.has_header && !lines.is_empty() {
+            // Validate column names for path traversal and injection attacks
+            let header_line = lines[0].trim();
+            if !header_line.is_empty() {
+                for col_name in header_line.split(delimiter) {
+                    let col_name = col_name.trim();
+                    if !col_name.is_empty() {
+                        super::security::validate_column_name(col_name).map_err(|msg| {
+                            HelixError::Data(DataError::InvalidFormat(
+                                format!("unsafe column name: {}", msg)
+                            ))
+                        })?;
+                    }
+                }
+            }
             lines.remove(0);
         }
 
@@ -1457,5 +1471,100 @@ mod tests {
         let (features, labels) = loader.load_batch(0).unwrap();
         assert_eq!(features, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         assert_eq!(labels, vec![1.0, 0.0]);
+    }
+
+    // ========================================================================
+    // Column name sanitization tests
+    // ========================================================================
+
+    #[test]
+    fn test_csv_loader_safe_column_names() {
+        let csv = "feature_1,feature_2,label\n1.0,2.0,0\n3.0,4.0,1\n";
+        let config = CsvLoaderConfig {
+            feature_columns: vec![0, 1],
+            label_columns: vec![2],
+            has_header: true,
+            batch_size: 100,
+            train_fraction: 1.0,
+            ..Default::default()
+        };
+
+        let loader = CsvDataLoader::from_csv_string(csv, &config).unwrap();
+        assert_eq!(loader.total_samples, 2);
+    }
+
+    #[test]
+    fn test_csv_loader_rejects_path_traversal_column_name() {
+        let csv = "../etc/passwd,label\n1.0,0\n2.0,1\n";
+        let config = CsvLoaderConfig {
+            feature_columns: vec![0],
+            label_columns: vec![1],
+            has_header: true,
+            ..Default::default()
+        };
+
+        let result = CsvDataLoader::from_csv_string(csv, &config);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("unsafe column name"), "got: {}", err_msg);
+    }
+
+    #[test]
+    fn test_csv_loader_rejects_slash_in_column_name() {
+        let csv = "path/to/file,label\n1.0,0\n2.0,1\n";
+        let config = CsvLoaderConfig {
+            feature_columns: vec![0],
+            label_columns: vec![1],
+            has_header: true,
+            ..Default::default()
+        };
+
+        let result = CsvDataLoader::from_csv_string(csv, &config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_csv_loader_rejects_null_byte_in_column_name() {
+        let csv = "col\0name,label\n1.0,0\n2.0,1\n";
+        let config = CsvLoaderConfig {
+            feature_columns: vec![0],
+            label_columns: vec![1],
+            has_header: true,
+            ..Default::default()
+        };
+
+        let result = CsvDataLoader::from_csv_string(csv, &config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_csv_loader_rejects_control_char_in_column_name() {
+        let csv = "col\x01name,label\n1.0,0\n2.0,1\n";
+        let config = CsvLoaderConfig {
+            feature_columns: vec![0],
+            label_columns: vec![1],
+            has_header: true,
+            ..Default::default()
+        };
+
+        let result = CsvDataLoader::from_csv_string(csv, &config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_csv_loader_allows_no_header() {
+        // When has_header is false, no column name validation occurs
+        let csv = "1.0,0\n2.0,1\n";
+        let config = CsvLoaderConfig {
+            feature_columns: vec![0],
+            label_columns: vec![1],
+            has_header: false,
+            batch_size: 100,
+            train_fraction: 1.0,
+            ..Default::default()
+        };
+
+        let loader = CsvDataLoader::from_csv_string(csv, &config).unwrap();
+        assert_eq!(loader.total_samples, 2);
     }
 }
