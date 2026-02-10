@@ -12,6 +12,9 @@ pub mod attestation;
 pub mod training_session;
 pub mod proof_chain;
 
+// Witness pipeline types
+pub mod witness;
+
 // Advanced error algebra modules
 pub mod probabilistic_error;
 pub mod error_composition;
@@ -111,6 +114,9 @@ pub use error_commitment::{
     ErrorCommitment, ErrorCommitmentBuilder, ErrorCommitmentPublicInputs,
     ErrorCommitmentTracker,
 };
+
+// Re-export witness types
+pub use witness::{TrainingStepWitnessData, verify_pi_error_checksum};
 
 // Re-export coordination types
 pub use coordination::{

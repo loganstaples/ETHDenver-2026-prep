@@ -87,3 +87,9 @@ pub use data::{CsvDataLoader, CsvLoaderConfig, Normalization};
 
 // Model checkpoints
 pub use data::{CheckpointErrorState, CheckpointLayer, CheckpointTensor, ModelCheckpoint};
+
+// Witness pipeline (error checksum wired through for circuit PI[7])
+pub use types::{TrainingStepWitnessData, verify_pi_error_checksum};
+
+// Error commitment types
+pub use types::{ErrorCommitment, ErrorCommitmentBuilder, ErrorCommitmentPublicInputs, ErrorCommitmentTracker};
