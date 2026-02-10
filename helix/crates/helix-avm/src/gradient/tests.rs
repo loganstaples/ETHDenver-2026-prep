@@ -1680,3 +1680,381 @@ fn test_gradient_accumulation_multi_path_finite_diff() {
         1e-4,
     );
 }
+
+// ============================================================================
+// MLP Backward Verification
+// ============================================================================
+
+#[test]
+fn test_mlp_backward_gives_nonzero_gradients() {
+    let tape = GradientTape::new();
+
+    let w1 = Variable::param(
+        BoundedTensor::from_exact(vec![0.5, -0.3, 0.2, 0.8, -0.1, 0.6, 0.4, -0.2,
+                                        0.3, 0.7, -0.5, 0.1, 0.9, -0.4, 0.2, 0.6], vec![8, 2]),
+        tape.clone(), Some("w1".into()),
+    );
+    let b1 = Variable::param(
+        BoundedTensor::from_exact(vec![0.0; 8], vec![8]),
+        tape.clone(), Some("b1".into()),
+    );
+    let w2 = Variable::param(
+        BoundedTensor::from_exact(vec![0.3, -0.2, 0.5, 0.1, -0.4, 0.6, 0.2, -0.3], vec![1, 8]),
+        tape.clone(), Some("w2".into()),
+    );
+    let b2 = Variable::param(
+        BoundedTensor::from_exact(vec![0.0], vec![1]),
+        tape.clone(), Some("b2".into()),
+    );
+
+    let x = Variable::input(
+        BoundedTensor::from_exact(vec![0.0, 1.0], vec![1, 2]),
+        tape.clone(), None,
+    );
+    let target = Variable::input(
+        BoundedTensor::from_exact(vec![1.0], vec![1, 1]),
+        tape.clone(), None,
+    );
+
+    let output = Variable::mlp(&x, &w1, Some(&b1), &w2, Some(&b2));
+    let diff = output.sub(&target);
+    let loss = diff.mul(&diff).mean();
+
+    let grads = backward(&loss).unwrap();
+
+    for (name, var) in [("w1", &w1), ("b1", &b1), ("w2", &w2), ("b2", &b2)] {
+        let idx = var.node_index.unwrap();
+        let g = grads.get(&idx).unwrap_or_else(|| panic!("No gradient for {}", name));
+        let grad_norm: f64 = g.values().iter().map(|v| v * v).sum::<f64>().sqrt();
+        assert!(grad_norm > 1e-10, "{} gradient is zero", name);
+    }
+}
+
+#[test]
+fn test_trainer_updates_parameters_and_loss_decreases() {
+    use crate::gradient::training::{Trainer, TrainingConfig};
+
+    let d_in = 2;
+    let d_hid = 4;
+    let d_out = 1;
+
+    let config = TrainingConfig::new().with_accumulation_steps(1);
+    let optimizer = SGD::new(0.1);
+    let mut trainer = Trainer::new(optimizer, config);
+
+    trainer.register_parameter("w1", 0, BoundedTensor::from_exact(vec![0.5, -0.3, 0.2, 0.8, -0.1, 0.6, 0.4, -0.2], vec![d_hid, d_in]));
+    trainer.register_parameter("b1", 1, BoundedTensor::from_exact(vec![0.0; d_hid], vec![d_hid]));
+    trainer.register_parameter("w2", 2, BoundedTensor::from_exact(vec![0.3, -0.2, 0.5, 0.1], vec![d_out, d_hid]));
+    trainer.register_parameter("b2", 3, BoundedTensor::from_exact(vec![0.0], vec![d_out]));
+
+    let w1_before = trainer.get_param("w1").unwrap().values();
+
+    // Run one step
+    let loss_before = trainer_mlp_batch_step(
+        &mut trainer, &[0.0, 1.0], &[1.0], 1, d_in, d_out,
+    );
+
+    // Parameters should change
+    let w1_after = trainer.get_param("w1").unwrap().values();
+    let any_changed = w1_before.iter().zip(w1_after.iter())
+        .any(|(b, a)| (b - a).abs() > 1e-12);
+    assert!(any_changed, "Parameters did not change after trainer step!");
+
+    // Run 10 more steps, loss should decrease
+    for _ in 0..10 {
+        trainer_mlp_batch_step(&mut trainer, &[0.0, 1.0], &[1.0], 1, d_in, d_out);
+    }
+
+    let loss_after = trainer_mlp_batch_step(
+        &mut trainer, &[0.0, 1.0], &[1.0], 1, d_in, d_out,
+    );
+    assert!(loss_after < loss_before, "Loss should decrease over training steps");
+}
+
+// ============================================================================
+// XOR Convergence Tests with AutoDiff Trainer
+// ============================================================================
+
+/// Helper to run a single batched forward+backward training step.
+///
+/// Creates a fresh tape, builds Variable::mlp forward pass with batched input,
+/// computes MSE loss over the batch, then calls `trainer.step()`.
+fn trainer_mlp_batch_step(
+    trainer: &mut crate::gradient::training::Trainer<SGD>,
+    x_batch: &[f64],     // flat [batch_size * d_in]
+    y_batch: &[f64],     // flat [batch_size * d_out]
+    batch_size: usize,
+    d_in: usize,
+    d_out: usize,
+) -> f64 {
+    let tape = GradientTape::new();
+
+    let w1_var = Variable::param(trainer.get_param("w1").unwrap().clone(), tape.clone(), Some("w1".into()));
+    let b1_var = Variable::param(trainer.get_param("b1").unwrap().clone(), tape.clone(), Some("b1".into()));
+    let w2_var = Variable::param(trainer.get_param("w2").unwrap().clone(), tape.clone(), Some("w2".into()));
+    let b2_var = Variable::param(trainer.get_param("b2").unwrap().clone(), tape.clone(), Some("b2".into()));
+
+    trainer.update_param_index("w1", w1_var.node_index.unwrap());
+    trainer.update_param_index("b1", b1_var.node_index.unwrap());
+    trainer.update_param_index("w2", w2_var.node_index.unwrap());
+    trainer.update_param_index("b2", b2_var.node_index.unwrap());
+
+    let x_tensor = BoundedTensor::from_exact(x_batch.to_vec(), vec![batch_size, d_in]);
+    let x_var = Variable::input(x_tensor, tape.clone(), None);
+
+    let output = Variable::mlp(&x_var, &w1_var, Some(&b1_var), &w2_var, Some(&b2_var));
+
+    let target_tensor = BoundedTensor::from_exact(y_batch.to_vec(), vec![batch_size, d_out]);
+    let target_var = Variable::input(target_tensor, tape.clone(), None);
+    let diff = output.sub(&target_var);
+    let loss = diff.mul(&diff).mean(); // MSE over the entire batch
+
+    let loss_val = loss.tensor.data()[0].value();
+    trainer.step(&loss).unwrap();
+    loss_val
+}
+
+#[test]
+fn test_xor_convergence_with_autodiff_trainer() {
+    use crate::gradient::training::{Trainer, TrainingConfig};
+    use rand::Rng;
+    use rand::SeedableRng;
+
+    // XOR dataset - batched: all 4 samples in a single forward pass
+    let x_batch: Vec<f64> = vec![0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0];
+    let y_batch: Vec<f64> = vec![0.0, 1.0, 1.0, 0.0];
+    let batch_size = 4;
+
+    let d_in = 2;
+    let d_hid = 8;
+    let d_out = 1;
+
+    // Xavier initialization with fixed seed for reproducibility
+    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+    let xavier1 = (6.0 / (d_in + d_hid) as f64).sqrt();
+    let xavier2 = (6.0 / (d_hid + d_out) as f64).sqrt();
+
+    let w1_init: Vec<f64> = (0..d_hid * d_in).map(|_| rng.gen_range(-xavier1..xavier1)).collect();
+    let b1_init: Vec<f64> = vec![0.0; d_hid];
+    let w2_init: Vec<f64> = (0..d_out * d_hid).map(|_| rng.gen_range(-xavier2..xavier2)).collect();
+    let b2_init: Vec<f64> = vec![0.0; d_out];
+
+    // Trainer: SGD lr=0.5, batched gradient descent
+    let config = TrainingConfig::new().with_accumulation_steps(1);
+    let optimizer = SGD::new(0.5);
+    let mut trainer = Trainer::new(optimizer, config);
+
+    trainer.register_parameter("w1", 0, BoundedTensor::from_exact(w1_init, vec![d_hid, d_in]));
+    trainer.register_parameter("b1", 1, BoundedTensor::from_exact(b1_init, vec![d_hid]));
+    trainer.register_parameter("w2", 2, BoundedTensor::from_exact(w2_init, vec![d_out, d_hid]));
+    trainer.register_parameter("b2", 3, BoundedTensor::from_exact(b2_init, vec![d_out]));
+
+    let max_epochs = 5000;
+    let target_loss = 0.05;
+    let mut final_loss = f64::MAX;
+
+    for _epoch in 0..max_epochs {
+        let loss = trainer_mlp_batch_step(
+            &mut trainer, &x_batch, &y_batch, batch_size, d_in, d_out,
+        );
+        final_loss = loss;
+
+        if loss < target_loss {
+            break;
+        }
+    }
+
+    assert!(
+        final_loss < target_loss,
+        "XOR training did not converge: final loss = {:.6}, target = {}",
+        final_loss,
+        target_loss
+    );
+}
+
+#[test]
+fn test_gradient_accumulation_across_minibatches() {
+    use crate::gradient::training::{Trainer, TrainingConfig};
+    use rand::Rng;
+    use rand::SeedableRng;
+
+    // XOR dataset — each sample is its own mini-batch,
+    // gradients accumulate over all 4 before a weight update.
+    // This tests the gradient accumulation across tape boundaries.
+    let xor_inputs = [
+        vec![0.0, 0.0],
+        vec![0.0, 1.0],
+        vec![1.0, 0.0],
+        vec![1.0, 1.0],
+    ];
+    let xor_targets = [0.0, 1.0, 1.0, 0.0];
+
+    let d_in = 2;
+    let d_hid = 8;
+    let d_out = 1;
+
+    // Same Xavier init as the batched test
+    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+    let xavier1 = (6.0 / (d_in + d_hid) as f64).sqrt();
+    let xavier2 = (6.0 / (d_hid + d_out) as f64).sqrt();
+
+    let w1_init: Vec<f64> = (0..d_hid * d_in).map(|_| rng.gen_range(-xavier1..xavier1)).collect();
+    let b1_init: Vec<f64> = vec![0.0; d_hid];
+    let w2_init: Vec<f64> = (0..d_out * d_hid).map(|_| rng.gen_range(-xavier2..xavier2)).collect();
+    let b2_init: Vec<f64> = vec![0.0; d_out];
+
+    // 4 accumulation steps = full-batch GD via micro-batches of 1
+    let config = TrainingConfig::new().with_accumulation_steps(4);
+    let optimizer = SGD::new(0.5);
+    let mut trainer = Trainer::new(optimizer, config);
+
+    trainer.register_parameter("w1", 0, BoundedTensor::from_exact(w1_init, vec![d_hid, d_in]));
+    trainer.register_parameter("b1", 1, BoundedTensor::from_exact(b1_init, vec![d_hid]));
+    trainer.register_parameter("w2", 2, BoundedTensor::from_exact(w2_init, vec![d_out, d_hid]));
+    trainer.register_parameter("b2", 3, BoundedTensor::from_exact(b2_init, vec![d_out]));
+
+    let max_epochs = 10000;
+    let target_loss = 0.1;
+    let mut final_loss = f64::MAX;
+
+    for _epoch in 0..max_epochs {
+        let mut epoch_loss = 0.0;
+
+        for (x_data, &y_target) in xor_inputs.iter().zip(xor_targets.iter()) {
+            // Each sample in its own mini-batch (size 1)
+            epoch_loss += trainer_mlp_batch_step(
+                &mut trainer,
+                x_data,
+                &[y_target],
+                1,
+                d_in,
+                d_out,
+            );
+        }
+
+        epoch_loss /= xor_inputs.len() as f64;
+        final_loss = epoch_loss;
+
+        if epoch_loss < target_loss {
+            break;
+        }
+    }
+
+    assert!(
+        final_loss < target_loss,
+        "XOR with gradient accumulation did not converge: final loss = {:.6}, target = {}",
+        final_loss,
+        target_loss
+    );
+}
+
+// ============================================================================
+// Circuit Bridge Validation from Trained State
+// ============================================================================
+
+#[test]
+fn test_circuit_bridge_from_trained_state() {
+    use crate::gradient::training::{Trainer, TrainingConfig};
+    use crate::nn::Linear;
+    use crate::circuit_bridge::{build_training_witness, model_to_circuit_weights};
+    use helix_core::types::Precision;
+    use helix_circuits::halo2curves::bn256::Fr;
+    use helix_circuits::halo2curves::ff::Field;
+
+    // Tiny model: 2 → 2 → 1 with integer-ish initial weights
+    let d_in = 2;
+    let d_hid = 2;
+    let d_out = 1;
+
+    let config = TrainingConfig::new().with_accumulation_steps(1);
+    let optimizer = SGD::new(1.0);  // Large lr so quantized weights change at scale=1
+    let mut trainer = Trainer::new(optimizer, config);
+
+    trainer.register_parameter("w1", 0, BoundedTensor::from_exact(vec![1.0, 2.0, 3.0, 1.0], vec![d_hid, d_in]));
+    trainer.register_parameter("b1", 1, BoundedTensor::from_exact(vec![0.0, 0.0], vec![d_hid]));
+    trainer.register_parameter("w2", 2, BoundedTensor::from_exact(vec![1.0, 1.0], vec![d_out, d_hid]));
+    trainer.register_parameter("b2", 3, BoundedTensor::from_exact(vec![0.0], vec![d_out]));
+
+    let input_data = vec![1.0, 1.0];
+    let target_data = vec![5.0];
+
+    // Train for 1 step with lr=1.0 so weights change enough to be visible after
+    // integer quantization (circuit's scale=1 rounds to nearest integer)
+    trainer_mlp_batch_step(&mut trainer, &input_data, &target_data, 1, d_in, d_out);
+
+    // Extract trained weights and construct Linear layers
+    let w1_trained = trainer.get_param("w1").unwrap();
+    let b1_trained = trainer.get_param("b1").unwrap();
+    let w2_trained = trainer.get_param("w2").unwrap();
+    let b2_trained = trainer.get_param("b2").unwrap();
+
+    let layer1 = Linear::from_raw(
+        w1_trained.values(),
+        vec![d_hid, d_in],
+        Some(b1_trained.values()),
+        Precision::F32,
+    ).unwrap();
+
+    let layer2 = Linear::from_raw(
+        w2_trained.values(),
+        vec![d_out, d_hid],
+        Some(b2_trained.values()),
+        Precision::F32,
+    ).unwrap();
+
+    // Verify circuit weight extraction
+    let cw = model_to_circuit_weights(&layer1, &layer2).unwrap();
+    assert_eq!(cw.d_in, d_in);
+    assert_eq!(cw.d_hid, d_hid);
+    assert_eq!(cw.d_out, d_out);
+
+    for &v in cw.w1.iter().chain(cw.b1.iter()).chain(cw.w2.iter()).chain(cw.b2.iter()) {
+        assert!(v.is_finite(), "Trained weight is not finite: {}", v);
+    }
+
+    // Build training witness from the trained state
+    let output = build_training_witness(
+        &layer1,
+        &layer2,
+        &input_data,
+        &target_data,
+        1.0,
+        2, // step_number
+    ).expect("build_training_witness should succeed with trained weights");
+
+    let witness = &output.witness;
+
+    // Verify witness dimensions
+    assert_eq!(witness.d_in, d_in);
+    assert_eq!(witness.d_hid, d_hid);
+    assert_eq!(witness.d_out, d_out);
+
+    // Verify witness vector lengths
+    assert_eq!(witness.x.len(), d_in);
+    assert_eq!(witness.target.len(), d_out);
+    assert_eq!(witness.w1.len(), d_hid * d_in);
+    assert_eq!(witness.b1.len(), d_hid);
+    assert_eq!(witness.w2.len(), d_out * d_hid);
+    assert_eq!(witness.b2.len(), d_out);
+    assert_eq!(witness.h_pre.len(), d_hid);
+    assert_eq!(witness.h.len(), d_hid);
+    assert_eq!(witness.y.len(), d_out);
+    assert_eq!(witness.w1_new.len(), d_hid * d_in);
+    assert_eq!(witness.b1_new.len(), d_hid);
+    assert_eq!(witness.w2_new.len(), d_out * d_hid);
+    assert_eq!(witness.b2_new.len(), d_out);
+
+    // Public inputs should have 8 elements
+    let pi = witness.public_inputs();
+    assert_eq!(pi.len(), 8);
+
+    // State hashes should be non-trivial
+    assert_ne!(witness.old_state_hash.0, Fr::ZERO);
+    assert_ne!(witness.new_state_hash.0, Fr::ZERO);
+
+    // State should change after a training step
+    assert_ne!(witness.old_state_hash, witness.new_state_hash);
+
+    // relu_range should be reasonable
+    assert!(output.relu_range >= 256);
+}

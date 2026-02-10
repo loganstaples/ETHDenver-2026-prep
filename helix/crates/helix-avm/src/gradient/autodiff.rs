@@ -688,7 +688,7 @@ impl Variable {
         let mut hidden = crate::ops::matmul::matmul(&input.tensor, &w1_t, precision)
             .expect("MLP input@W1^T shape mismatch");
         if let Some(b1) = bias1 {
-            hidden = hidden.add(&b1.tensor);
+            hidden = broadcast_add_bias(&hidden, &b1.tensor);
         }
 
         // Activation (ReLU)
@@ -699,7 +699,7 @@ impl Variable {
         let mut output = crate::ops::matmul::matmul(&activated, &w2_t, precision)
             .expect("MLP activated@W2^T shape mismatch");
         if let Some(b2) = bias2 {
-            output = output.add(&b2.tensor);
+            output = broadcast_add_bias(&output, &b2.tensor);
         }
 
         // Merge tapes from all operands
@@ -1016,6 +1016,41 @@ impl Variable {
         };
         Ok(Self::with_op(result, op, tape))
     }
+}
+
+/// Adds a 1D bias [cols] to each row of a 2D tensor [rows, cols].
+///
+/// If the bias already matches the tensor shape, plain addition is used.
+pub(crate) fn broadcast_add_bias(
+    tensor: &helix_core::types::BoundedTensor,
+    bias: &helix_core::types::BoundedTensor,
+) -> helix_core::types::BoundedTensor {
+    if tensor.shape() == bias.shape() {
+        return tensor.add(bias);
+    }
+
+    // bias is 1D [cols] or [1, cols], tensor is [rows, cols]
+    let bias_data = bias.data();
+    let cols = bias_data.len();
+    let tensor_data = tensor.data();
+    let total = tensor_data.len();
+
+    assert!(
+        total % cols == 0,
+        "Bias length {} doesn't divide tensor length {}",
+        cols,
+        total
+    );
+
+    let mut result_data = Vec::with_capacity(total);
+    for (i, tv) in tensor_data.iter().enumerate() {
+        let bv = &bias_data[i % cols];
+        result_data.push(helix_core::types::BoundedValue::new(
+            tv.value() + bv.value(),
+            helix_core::types::ErrorMargin::absolute(tv.absolute_error() + bv.absolute_error()),
+        ));
+    }
+    helix_core::types::BoundedTensor::new(result_data, tensor.shape().clone())
 }
 
 /// Helper to merge tapes. Only works if they refer to the same tape (same Rc pointer).

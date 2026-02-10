@@ -634,7 +634,7 @@ pub fn backward(loss: &Variable) -> Result<HashMap<NodeIndex, BoundedTensor>, St
                     if let Ok(mut pre_act) = matmul::matmul(input_val, &w1_t, precision) {
                         if let Some(b1_idx) = bias1 {
                             if let Some(b1_val) = &tape.nodes[*b1_idx].cached_value {
-                                pre_act = pre_act.add(b1_val);
+                                pre_act = super::autodiff::broadcast_add_bias(&pre_act, b1_val);
                             }
                         }
 
