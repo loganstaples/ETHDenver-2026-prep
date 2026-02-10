@@ -1302,6 +1302,48 @@ impl BatchTrainingProverV2 {
     pub fn verify_batch(&self, batch: &BatchProofResult) -> bool {
         batch.proofs.iter().all(|p| self.prover.verify_result(p))
     }
+
+    /// Proves a batch and produces an RLC-aggregated proof.
+    ///
+    /// This is a convenience method that:
+    /// 1. Proves each training step individually
+    /// 2. Aggregates all proofs into a single RLC-committed proof
+    ///
+    /// Returns the aggregated proof containing a single KZG proof for all steps.
+    pub fn prove_batch_with_aggregation(
+        &self,
+        initial_weights: TrainingWeights,
+        training_samples: &[(Vec<Fr>, Vec<Fr>)],
+        lr: Fr,
+        aggregation_k: u32,
+    ) -> TrainingProverResult<crate::aggregation::AggregatedTrainingProof> {
+        use crate::aggregation::RLCAggregationProver;
+
+        // First produce individual proofs
+        let batch_result = self.prove_batch_strict(initial_weights, training_samples, lr)?;
+
+        if batch_result.proofs.is_empty() {
+            return Err(TrainingProverError::WitnessValidation {
+                message: "Batch produced 0 proofs, cannot aggregate".to_string(),
+                field: "training_samples".to_string(),
+            });
+        }
+
+        // Create aggregation prover and aggregate
+        let agg_prover = RLCAggregationProver::new(
+            batch_result.proofs.len(),
+            aggregation_k,
+        );
+
+        agg_prover.aggregate(&batch_result.proofs)
+            .map_err(|e| TrainingProverError::Pipeline(
+                crate::pipeline::PipelineError::ProofGenError {
+                    message: format!("RLC aggregation failed: {e}"),
+                    cause: None,
+                    attempt: 1,
+                },
+            ))
+    }
 }
 
 // ============================================================================

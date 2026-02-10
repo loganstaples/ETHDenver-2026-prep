@@ -28,6 +28,11 @@ pub use ml::training_step_v2::{
     ErrorTracker, ToEvmProof, ToEvmPublicInputs,
 };
 pub use ml::batch::{MLBatchCircuit, BatchProofResult, MAX_BATCH_SIZE};
+pub use ml::proof_aggregation::{
+    SHPLONKAggregationCircuit, SHPLONKAggregationWitness, SHPLONKAggConfig,
+    AggregationStepWitness, step_witness_from_public_inputs,
+    MAX_AGGREGATION_BATCH, AGGREGATION_NUM_PUBLIC_INPUTS,
+};
 
 // Re-export EVM format types for proof-to-contract compatibility
 pub use verifier::{

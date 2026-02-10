@@ -8,6 +8,7 @@
 //! - `gkr_to_halo2`: Aggregates GKR proofs into Halo2 proofs for on-chain verification
 
 pub mod gkr_to_halo2;
+pub mod rlc_aggregation;
 
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,9 @@ pub use gkr_to_halo2::{
     GKRToHalo2Aggregator, AggregatedGKRProof, GKRProofCommitment,
     AggregationConfig as GKRAggregationConfig, BatchAggregator,
 };
+
+// Re-export RLC aggregation types
+pub use rlc_aggregation::{RLCAggregationProver, AggregatedTrainingProof};
 
 /// An aggregated proof combining multiple chunk proofs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -734,7 +738,8 @@ impl Default for CommitmentTree {
 
 use helix_circuits::halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
-    plonk::{Advice, Circuit, Column, ConstraintSystem, ErrorFront, Instance},
+    plonk::{Advice, Circuit, Column, ConstraintSystem, ErrorFront, Instance, Selector},
+    poly::Rotation,
 };
 use helix_circuits::halo2curves::bn256::Fr;
 use helix_circuits::halo2curves::ff::PrimeField;
@@ -780,22 +785,38 @@ impl KZGAggregatedProof {
 /// Configuration for the KZG aggregation circuit.
 #[derive(Clone, Debug)]
 pub struct KZGAggConfig {
-    advice: Column<Advice>,
+    advice: [Column<Advice>; 3],
     instance: Column<Instance>,
+    /// Selector for addition gate: a + b = c.
+    s_add: Selector,
+    /// Selector for equality gate: a == b.
+    s_eq: Selector,
 }
+
+/// Maximum batch size for the KZG aggregation circuit.
+/// The circuit layout is fixed to this size regardless of actual batch size.
+const KZG_MAX_BATCH_SIZE: usize = 32;
 
 /// Halo2 circuit that proves batch aggregation.
 ///
+/// Constrains the relationship between individual chunk commitment hashes
+/// and the aggregate public inputs via Poseidon chain hashing.
+///
+/// The circuit layout is fixed to `KZG_MAX_BATCH_SIZE` entries so that
+/// keys generated at setup time remain valid for any batch size up to the max.
+///
 /// Public inputs (4):
-///   [0] batch_root (Poseidon hash of all chunk commitment hashes)
+///   [0] batch_root (Poseidon chain hash of all chunk commitment hashes)
 ///   [1] num_proofs (as field element)
 ///   [2] total_error_scaled (error * 1e9, as field element)
 ///   [3] reserved (zero)
 #[derive(Clone)]
 pub struct KZGAggregationCircuit {
-    /// Individual chunk commitment hashes.
+    /// Individual chunk commitment hashes (padded to KZG_MAX_BATCH_SIZE with Fr::ZERO).
     commitments: Vec<Fr>,
-    /// Number of proofs in the batch.
+    /// Per-chunk error bounds scaled by 1e9 (padded to KZG_MAX_BATCH_SIZE with 0).
+    error_bounds_scaled: Vec<u64>,
+    /// Number of actual proofs in the batch.
     num_proofs: u64,
     /// Total error bound scaled by 1e9.
     total_error_scaled: u64,
@@ -804,7 +825,8 @@ pub struct KZGAggregationCircuit {
 impl Default for KZGAggregationCircuit {
     fn default() -> Self {
         Self {
-            commitments: vec![Fr::ZERO; 2],
+            commitments: vec![Fr::ZERO; KZG_MAX_BATCH_SIZE],
+            error_bounds_scaled: vec![0; KZG_MAX_BATCH_SIZE],
             num_proofs: 0,
             total_error_scaled: 0,
         }
@@ -813,7 +835,7 @@ impl Default for KZGAggregationCircuit {
 
 impl KZGAggregationCircuit {
     /// Computes the batch root as chained Poseidon hashes.
-    fn compute_batch_root(commitments: &[Fr]) -> Fr {
+    pub fn compute_batch_root(commitments: &[Fr]) -> Fr {
         if commitments.is_empty() {
             return Fr::ZERO;
         }
@@ -845,15 +867,43 @@ impl Circuit<Fr> for KZGAggregationCircuit {
     }
 
     fn configure(meta: &mut ConstraintSystem<Fr>) -> Self::Config {
-        let advice = meta.advice_column();
+        let advice = [
+            meta.advice_column(),
+            meta.advice_column(),
+            meta.advice_column(),
+        ];
         let instance = meta.instance_column();
 
         meta.enable_equality(instance);
-        meta.enable_equality(advice);
+        for col in &advice {
+            meta.enable_equality(*col);
+        }
+
+        let s_add = meta.selector();
+        let s_eq = meta.selector();
+
+        // Addition gate: advice[0] + advice[1] = advice[2]
+        meta.create_gate("add", |meta| {
+            let s = meta.query_selector(s_add);
+            let a = meta.query_advice(advice[0], Rotation::cur());
+            let b = meta.query_advice(advice[1], Rotation::cur());
+            let c = meta.query_advice(advice[2], Rotation::cur());
+            vec![s * (a + b - c)]
+        });
+
+        // Equality gate: advice[0] == advice[1]
+        meta.create_gate("eq", |meta| {
+            let s = meta.query_selector(s_eq);
+            let a = meta.query_advice(advice[0], Rotation::cur());
+            let b = meta.query_advice(advice[1], Rotation::cur());
+            vec![s * (a - b)]
+        });
 
         KZGAggConfig {
             advice,
             instance,
+            s_add,
+            s_eq,
         }
     }
 
@@ -864,10 +914,117 @@ impl Circuit<Fr> for KZGAggregationCircuit {
     ) -> Result<(), ErrorFront> {
         let pi = self.public_inputs();
 
-        // Assign public inputs and constrain them to the instance column.
-        // The binding of batch_root to the actual Poseidon hash of commitments
-        // is enforced by the prover computing the correct value and the verifier
-        // checking the public inputs against the KZG proof.
+        // Always iterate over the full KZG_MAX_BATCH_SIZE to keep
+        // the circuit layout fixed between keygen and prove.
+        let n = KZG_MAX_BATCH_SIZE;
+
+        // Region 1: Assign commitment hashes and compute Poseidon chain hash in-circuit.
+        layouter.assign_region(
+            || "kzg_agg_poseidon_chain",
+            |mut region| {
+                let mut row = 0;
+
+                let mut running_hash = self.commitments[0];
+                region.assign_advice(
+                    || "commitment_0",
+                    config.advice[0], row,
+                    || Value::known(self.commitments[0]),
+                )?;
+                row += 1;
+
+                for i in 1..n {
+                    let next_hash = poseidon_hash_two(running_hash, self.commitments[i]);
+
+                    region.assign_advice(
+                        || format!("running_hash_{i}"),
+                        config.advice[0], row,
+                        || Value::known(running_hash),
+                    )?;
+                    region.assign_advice(
+                        || format!("commitment_{i}"),
+                        config.advice[1], row,
+                        || Value::known(self.commitments[i]),
+                    )?;
+                    region.assign_advice(
+                        || format!("chain_hash_{i}"),
+                        config.advice[2], row,
+                        || Value::known(next_hash),
+                    )?;
+                    running_hash = next_hash;
+                    row += 1;
+                }
+
+                // Constrain final hash == batch_root (pi[0])
+                config.s_eq.enable(&mut region, row)?;
+                region.assign_advice(
+                    || "computed_root",
+                    config.advice[0], row,
+                    || Value::known(running_hash),
+                )?;
+                region.assign_advice(
+                    || "pi_batch_root",
+                    config.advice[1], row,
+                    || Value::known(pi[0]),
+                )?;
+                row += 1;
+
+                // Constrain num_proofs (pi[1])
+                config.s_eq.enable(&mut region, row)?;
+                region.assign_advice(
+                    || "num_proofs",
+                    config.advice[0], row,
+                    || Value::known(Fr::from(self.num_proofs)),
+                )?;
+                region.assign_advice(
+                    || "pi_num_proofs",
+                    config.advice[1], row,
+                    || Value::known(pi[1]),
+                )?;
+                row += 1;
+
+                // Accumulate error bounds and constrain total
+                let mut running_error = Fr::ZERO;
+                for i in 0..n {
+                    let err_i = Fr::from(self.error_bounds_scaled[i]);
+                    let new_error = running_error + err_i;
+                    config.s_add.enable(&mut region, row)?;
+                    region.assign_advice(
+                        || format!("running_error_{i}"),
+                        config.advice[0], row,
+                        || Value::known(running_error),
+                    )?;
+                    region.assign_advice(
+                        || format!("error_bound_{i}"),
+                        config.advice[1], row,
+                        || Value::known(err_i),
+                    )?;
+                    region.assign_advice(
+                        || format!("acc_error_{i}"),
+                        config.advice[2], row,
+                        || Value::known(new_error),
+                    )?;
+                    running_error = new_error;
+                    row += 1;
+                }
+
+                // Constrain accumulated error == pi[2]
+                config.s_eq.enable(&mut region, row)?;
+                region.assign_advice(
+                    || "total_error",
+                    config.advice[0], row,
+                    || Value::known(running_error),
+                )?;
+                region.assign_advice(
+                    || "pi_total_error",
+                    config.advice[1], row,
+                    || Value::known(pi[2]),
+                )?;
+
+                Ok(())
+            },
+        )?;
+
+        // Region 2: Assign public inputs and constrain to instance column
         let pi_cells = layouter.assign_region(
             || "kzg_agg_public_inputs",
             |mut region| {
@@ -875,7 +1032,7 @@ impl Circuit<Fr> for KZGAggregationCircuit {
                 for (i, val) in pi.iter().enumerate() {
                     let cell = region.assign_advice(
                         || format!("pi_{i}"),
-                        config.advice,
+                        config.advice[0],
                         i,
                         || Value::known(*val),
                     )?;
@@ -941,9 +1098,18 @@ impl KZGBatchAggregator {
 
         let total_error: f64 = proofs.iter().map(|p| p.error_bound).sum();
         let total_error_scaled = (total_error * 1e9) as u64;
+        let mut error_bounds_scaled: Vec<u64> = proofs.iter()
+            .map(|p| (p.error_bound * 1e9) as u64)
+            .collect();
+
+        // Pad to fixed circuit layout size
+        let mut padded_commitments = commitments.clone();
+        padded_commitments.resize(KZG_MAX_BATCH_SIZE, Fr::ZERO);
+        error_bounds_scaled.resize(KZG_MAX_BATCH_SIZE, 0);
 
         let circuit = KZGAggregationCircuit {
-            commitments: commitments.clone(),
+            commitments: padded_commitments,
+            error_bounds_scaled,
             num_proofs: proofs.len() as u64,
             total_error_scaled,
         };
@@ -1238,5 +1404,36 @@ mod tests {
         let root1 = KZGAggregationCircuit::compute_batch_root(&commitments);
         let root2 = KZGAggregationCircuit::compute_batch_root(&commitments);
         assert_eq!(root1, root2, "Batch root should be deterministic");
+    }
+
+    #[test]
+    fn test_kzg_circuit_mock_prover() {
+        use helix_circuits::halo2_proofs::dev::MockProver;
+
+        // Build the same circuit that the aggregator would build
+        let mut commitments: Vec<Fr> = (0..3).map(|i| {
+            let pi_bytes = [i as u8; 32];
+            let mut repr = [0u8; 32];
+            repr.copy_from_slice(&pi_bytes);
+            repr[31] &= 0x1F;
+            let pi_fr = Fr::from_repr_vartime(repr.into()).unwrap_or(Fr::ZERO);
+            poseidon_hash_two(Fr::ZERO, pi_fr)
+        }).collect();
+        commitments.resize(KZG_MAX_BATCH_SIZE, Fr::ZERO);
+
+        let mut error_bounds_scaled: Vec<u64> = vec![(0.01f64 * 1e9) as u64; 3];
+        error_bounds_scaled.resize(KZG_MAX_BATCH_SIZE, 0);
+        let total_error_scaled: u64 = error_bounds_scaled.iter().sum();
+
+        let circuit = KZGAggregationCircuit {
+            commitments,
+            error_bounds_scaled,
+            num_proofs: 3,
+            total_error_scaled,
+        };
+
+        let pi = circuit.public_inputs();
+        let prover = MockProver::run(13, &circuit, vec![pi]).unwrap();
+        prover.assert_satisfied();
     }
 }
