@@ -342,15 +342,17 @@ contract AdversarialTest is Test {
         coordinator.startRound(modelId, ROUND_DURATION);
 
         // Try to replay the same proof to round 2
-        // This should fail because the commitment changed
+        // This should fail because the proof hash is already used (replay protection)
         vm.prank(honestProver);
-        vm.expectRevert(HelixCoordinatorV2.OldCommitmentMismatch.selector);
+        vm.expectRevert(HelixCoordinatorV2.ProofAlreadyUsed.selector);
         coordinator.submitProof(modelId, 2, proof, inputs);
 
-        // Even with correct old commitment, replaying same new commitment would be suspicious
+        // Even with correct old commitment and fresh proof, round 2 succeeds
         uint256[] memory inputs2 = _createValidPublicInputs(newHashLo, newHashHi, 3333, 4444, modelId);
+        bytes memory proof2 = new bytes(320);
+        proof2[0] = 0x01; // Unique proof bytes
         vm.prank(honestProver);
-        coordinator.submitProof(modelId, 2, proof, inputs2);
+        coordinator.submitProof(modelId, 2, proof2, inputs2);
     }
 
     /// @notice Test replay attack with Halo2Verifier's verifyAndRecord
@@ -910,8 +912,13 @@ contract AdversarialTest is Test {
 
         mockVerifier.setShouldPass(true);
 
+        // Use different proof bytes so it's not flagged as replay
+        bytes memory honestProof = new bytes(320);
+        honestProof[0] = 0x01;
+        uint256[] memory honestInputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
+
         vm.prank(honestProver);
-        coordinator.submitProof(modelId, 1, proof, inputs);
+        coordinator.submitProof(modelId, 1, honestProof, honestInputs);
 
         // Model should still be active
         (,, bool active) = coordinator.getModelState(modelId);
@@ -1048,19 +1055,21 @@ contract AdversarialTest is Test {
         // First attacker submits invalid
         mockVerifier.setShouldPass(false);
         uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
-        bytes memory proof = new bytes(320);
+        bytes memory proof0 = new bytes(320);
 
         vm.prank(attackers[0]);
-        coordinator.submitProof(modelId, 1, proof, inputs);
+        coordinator.submitProof(modelId, 1, proof0, inputs);
 
         // First attacker slashed
         (,, bool slashed0) = coordinator.getStake(attackers[0], modelId);
         assertTrue(slashed0);
 
-        // Second attacker submits valid (completes round)
+        // Second attacker submits valid with unique proof bytes (completes round)
         mockVerifier.setShouldPass(true);
+        bytes memory proof1 = new bytes(320);
+        proof1[0] = 0x01; // Unique proof
         vm.prank(attackers[1]);
-        coordinator.submitProof(modelId, 1, proof, inputs);
+        coordinator.submitProof(modelId, 1, proof1, inputs);
 
         // Second attacker not slashed
         (,, bool slashed1) = coordinator.getStake(attackers[1], modelId);
@@ -1068,9 +1077,11 @@ contract AdversarialTest is Test {
 
         // Other attackers can't submit (round completed)
         for (uint256 i = 2; i < 5; i++) {
+            bytes memory proofI = new bytes(320);
+            proofI[0] = bytes1(uint8(i)); // Unique proof per attacker
             vm.prank(attackers[i]);
             vm.expectRevert(HelixCoordinatorV2.RoundAlreadyCompleted.selector);
-            coordinator.submitProof(modelId, 1, proof, inputs);
+            coordinator.submitProof(modelId, 1, proofI, inputs);
         }
     }
 

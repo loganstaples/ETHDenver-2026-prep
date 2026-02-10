@@ -71,6 +71,8 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
     error NoTimelockPending();
     error TimelockAlreadyPending();
     error PaginationOutOfBounds();
+    // Proof replay error
+    error ProofAlreadyUsed();
 
     // ============ Structs (Optimized for Storage Packing) ============
 
@@ -233,6 +235,9 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
     /// @notice Slashing records - append only for audit trail
     SlashingRecord[] public slashingRecords;
 
+    /// @notice Proof replay protection: hash(proof || publicInputs) => used
+    mapping(bytes32 => bool) public usedProofHashes;
+
     // ============ Admin Timelock State ============
 
     /// @notice Pending admin changes by change type key
@@ -305,6 +310,12 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
         uint256 indexed roundId,
         address indexed prover,
         bytes32 proofHash
+    );
+
+    /// @notice Emitted when a proof replay attempt is blocked
+    event ProofReplayBlocked(
+        bytes32 indexed proofHash,
+        address indexed submitter
     );
 
     /// @notice Emitted when model state changes
@@ -584,6 +595,11 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
         // Validate public inputs count (8 inputs including error checksum)
         if (publicInputs.length != 8) revert InvalidPublicInputsCount();
 
+        // Proof replay protection
+        bytes32 proofHash = keccak256(abi.encodePacked(proof, publicInputs));
+        if (usedProofHashes[proofHash]) revert ProofAlreadyUsed();
+        usedProofHashes[proofHash] = true;
+
         // Reconstruct and validate old commitment
         uint256 oldCommitmentFromProof = _hashPair(publicInputs[0], publicInputs[1]);
         if (oldCommitmentFromProof != round.modelCommitment) revert OldCommitmentMismatch();
@@ -846,6 +862,12 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
         return accumulatedErrorBound[modelId] <= maxAccumulated;
     }
 
+    /// @notice Checks if a proof has already been used
+    function isProofUsed(bytes memory proof, uint256[] memory publicInputs) external view returns (bool) {
+        bytes32 proofHash = keccak256(abi.encodePacked(proof, publicInputs));
+        return usedProofHashes[proofHash];
+    }
+
     /// @notice Gets the effective stake lock period in seconds
     function stakeLockPeriod() external view returns (uint256) {
         return uint256(stakeLockDays) * 1 days;
@@ -942,6 +964,7 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
 
     /// @notice Execute treasury update after timelock
     function executeSetTreasury(address _treasury) external onlyOwner {
+        if (_treasury == address(0)) revert InvalidTreasury();
         bytes32 key = keccak256("setTreasury");
         bytes32 hash = keccak256(abi.encode(_treasury));
         _executeChange(key, hash);
@@ -1320,11 +1343,13 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
     }
 
     /// @notice Commit data root for a specific round
+    /// @dev Restricted to model owner, contract owner, or dataCommitment contract
     function commitRoundData(
         uint256 modelId,
         uint256 roundId,
         bytes32 dataRoot
     ) external whenNotPaused modelExists(modelId) {
+        if (msg.sender != models[modelId].owner && msg.sender != owner && msg.sender != dataCommitment) revert NotAuthorized();
         if (roundId != models[modelId].currentRound) revert InvalidRound();
         if (dataRoot == bytes32(0)) revert InvalidDataRoot();
 

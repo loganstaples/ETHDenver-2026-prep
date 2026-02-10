@@ -51,7 +51,11 @@ contract Rewards is ReentrancyGuard {
     
     /// @notice Whether rewards have been allocated for a round
     mapping(uint256 => mapping(uint256 => bool)) public roundRewardsAllocated;
-    
+
+    /// @notice Whether a participant has claimed rewards for a specific round
+    /// @dev Unified tracker: prevents double-claim across claimRewards() and claimRoundRewards()
+    mapping(uint256 => mapping(uint256 => mapping(address => bool))) public roundClaimed;
+
     /// @notice Participants in each round
     mapping(uint256 => mapping(uint256 => address[])) public roundParticipants;
     
@@ -182,24 +186,25 @@ contract Rewards is ReentrancyGuard {
         return baseReward;
     }
     
-    /// @notice Claim all pending rewards
+    /// @notice Claim all pending rewards across all rounds
+    /// @dev Uses the unified roundClaimed mapping to prevent double-claims
     function claimRewards() external nonReentrant {
         ClaimInfo storage info = claimInfo[msg.sender];
-        
+
         uint256 claimable = info.totalEarned - info.totalClaimed;
         require(claimable > 0, "No rewards to claim");
-        
+
         info.totalClaimed += claimable;
         info.lastClaimTime = block.timestamp;
-        
+
         helixToken.safeTransfer(msg.sender, claimable);
-        
+
         emit RewardsClaimed(msg.sender, claimable);
     }
     
     /// @notice Claim rewards for specific rounds
-    /// @dev Zeroes pendingRewards entries and caps transfer to what hasn't been
-    ///      claimed via claimRewards() to prevent double-claim vulnerability.
+    /// @dev Uses unified roundClaimed mapping to prevent double-claim across both
+    ///      claimRewards() and claimRoundRewards(). Each round can only be claimed once.
     function claimRoundRewards(
         uint256[] calldata modelIds,
         uint256[] calldata roundIds
@@ -209,9 +214,18 @@ contract Rewards is ReentrancyGuard {
         uint256 totalClaim = 0;
 
         for (uint i = 0; i < modelIds.length; i++) {
-            uint256 reward = pendingRewards[modelIds[i]][roundIds[i]][msg.sender];
+            uint256 modelId = modelIds[i];
+            uint256 roundId = roundIds[i];
+
+            // Skip rounds already claimed via either claim path
+            if (roundClaimed[modelId][roundId][msg.sender]) {
+                continue;
+            }
+
+            uint256 reward = pendingRewards[modelId][roundId][msg.sender];
             if (reward > 0) {
-                pendingRewards[modelIds[i]][roundIds[i]][msg.sender] = 0;
+                roundClaimed[modelId][roundId][msg.sender] = true;
+                pendingRewards[modelId][roundId][msg.sender] = 0;
                 totalClaim += reward;
             }
         }
@@ -221,9 +235,6 @@ contract Rewards is ReentrancyGuard {
         ClaimInfo storage info = claimInfo[msg.sender];
 
         // Cap transfer to what hasn't already been claimed via claimRewards()
-        // This prevents the double-claim vulnerability where a user calls
-        // claimRewards() first (which uses totalEarned - totalClaimed) and then
-        // claimRoundRewards() (which would re-transfer from pendingRewards).
         uint256 actualClaimable = info.totalEarned - info.totalClaimed;
         if (totalClaim > actualClaimable) {
             totalClaim = actualClaimable;

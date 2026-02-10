@@ -171,26 +171,30 @@ contract ByzantineWorkerTest is Test {
         mockVerifier.setShouldPass(false);
 
         uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
-        bytes memory proof = new bytes(320);
+        bytes memory proof0 = new bytes(320);
 
         vm.prank(byzantineWorkers[0]);
-        coordinator.submitProof(modelId, 1, proof, inputs);
+        coordinator.submitProof(modelId, 1, proof0, inputs);
 
-        // Honest worker completes round 1
+        // Honest worker completes round 1 with unique proof
         mockVerifier.setShouldPass(true);
+        bytes memory honestProof = new bytes(320);
+        honestProof[0] = 0x01;
         vm.prank(honestWorkers[0]);
-        coordinator.submitProof(modelId, 1, proof, inputs);
+        coordinator.submitProof(modelId, 1, honestProof, inputs);
 
         // Start round 2
         vm.prank(modelOwner);
         coordinator.startRound(modelId, ROUND_DURATION);
 
-        // Second Byzantine submits invalid in round 2
+        // Second Byzantine submits invalid in round 2 with unique proof
         mockVerifier.setShouldPass(false);
         uint256[] memory inputs2 = _createValidPublicInputs(1111, 2222, 3333, 4444, modelId);
+        bytes memory proof1 = new bytes(320);
+        proof1[0] = 0x02;
 
         vm.prank(byzantineWorkers[1]);
-        coordinator.submitProof(modelId, 2, proof, inputs2);
+        coordinator.submitProof(modelId, 2, proof1, inputs2);
 
         // Both Byzantine workers should be slashed
         (,, bool slashed0) = coordinator.getStake(byzantineWorkers[0], modelId);
@@ -524,21 +528,24 @@ contract ByzantineWorkerTest is Test {
         (uint256 modelId, uint256 hashLo, uint256 hashHi) = _setupModelAndRound();
         _stakeAllWorkers(modelId, STANDARD_STAKE);
 
-        // Byzantine workers get slashed
+        // Byzantine workers get slashed (each with unique proof)
         mockVerifier.setShouldPass(false);
 
         uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
-        bytes memory proof = new bytes(320);
 
         for (uint256 i = 0; i < byzantineWorkers.length; i++) {
+            bytes memory proof = new bytes(320);
+            proof[0] = bytes1(uint8(i)); // Unique proof per worker
             vm.prank(byzantineWorkers[i]);
             coordinator.submitProof(modelId, 1, proof, inputs);
         }
 
-        // Honest worker can still complete round
+        // Honest worker can still complete round with unique proof
         mockVerifier.setShouldPass(true);
+        bytes memory honestProof = new bytes(320);
+        honestProof[0] = 0xFF; // Unique
         vm.prank(honestWorkers[0]);
-        coordinator.submitProof(modelId, 1, proof, inputs);
+        coordinator.submitProof(modelId, 1, honestProof, inputs);
 
         // Model should have advanced
         (uint256 currentRound,, bool active) = coordinator.getModelState(modelId);
@@ -554,10 +561,11 @@ contract ByzantineWorkerTest is Test {
         mockVerifier.setShouldPass(false);
 
         uint256[] memory inputs = _createValidPublicInputs(hashLo, hashHi, 1111, 2222, modelId);
-        bytes memory proof = new bytes(320);
 
-        // All Byzantine workers try invalid proofs
+        // All Byzantine workers try invalid proofs (each with unique proof bytes)
         for (uint256 i = 0; i < byzantineWorkers.length; i++) {
+            bytes memory proof = new bytes(320);
+            proof[0] = bytes1(uint8(i)); // Unique proof per worker
             vm.prank(byzantineWorkers[i]);
             coordinator.submitProof(modelId, 1, proof, inputs);
         }
@@ -614,9 +622,9 @@ contract ByzantineWorkerTest is Test {
         vm.prank(modelOwner);
         coordinator.startRound(modelId, ROUND_DURATION);
 
-        // Byzantine tries to replay old proof
+        // Byzantine tries to replay old proof - blocked by proof replay protection
         vm.prank(byzantineWorkers[0]);
-        vm.expectRevert(HelixCoordinatorV2.OldCommitmentMismatch.selector);
+        vm.expectRevert(HelixCoordinatorV2.ProofAlreadyUsed.selector);
         coordinator.submitProof(modelId, 2, proof, inputs);
     }
 

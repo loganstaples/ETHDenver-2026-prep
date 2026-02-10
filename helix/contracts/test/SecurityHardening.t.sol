@@ -1333,3 +1333,501 @@ contract CustomErrorsTest is Test {
         coordinator.setTreasury(address(0));
     }
 }
+
+// ============================================================================
+// 8. Proof Replay Protection Tests (V2)
+// ============================================================================
+
+/// @title ProofReplayProtectionTest
+/// @notice Verifies that V2 now blocks proof replay attacks via usedProofHashes
+contract ProofReplayProtectionTest is Test {
+    HelixCoordinatorV2 public coordinator;
+    MockVerifier public mockVerifier;
+    TestTreasury public treasuryContract;
+
+    address public owner;
+    address public prover1;
+    address public prover2;
+
+    uint256 constant ROUND_DURATION = 1 hours;
+
+    function setUp() public {
+        owner = address(this);
+        prover1 = makeAddr("prover1");
+        prover2 = makeAddr("prover2");
+        treasuryContract = new TestTreasury();
+        mockVerifier = new MockVerifier();
+        coordinator = new HelixCoordinatorV2(address(mockVerifier), address(treasuryContract));
+
+        vm.deal(prover1, 10 ether);
+        vm.deal(prover2, 10 ether);
+    }
+
+    /// @notice Helper to create a model, start round, and return public inputs
+    function _setupModelAndRound() internal returns (uint256 modelId, bytes memory proof, uint256[] memory publicInputs) {
+        uint256 oldHashLo = 12345;
+        uint256 oldHashHi = 67890;
+        uint256 correctCommitment = uint256(keccak256(abi.encodePacked(oldHashLo, oldHashHi)));
+
+        modelId = coordinator.registerModel("hash", correctCommitment, 0.1 ether);
+        coordinator.startRound(modelId, ROUND_DURATION);
+
+        proof = new bytes(320); // valid-length proof
+
+        publicInputs = new uint256[](8);
+        publicInputs[0] = oldHashLo;
+        publicInputs[1] = oldHashHi;
+        publicInputs[2] = 99;
+        publicInputs[3] = 100;
+        publicInputs[4] = 500;
+        publicInputs[5] = 10;
+        publicInputs[6] = 1;
+        publicInputs[7] = ProofFixtureHardcoded.computeErrorChecksum(10, 1, modelId, coordinator.maxErrorBound());
+    }
+
+    /// @notice Test: same proof cannot be submitted twice in the same round
+    function test_ProofReplay_SameRound_Blocked() public {
+        (uint256 modelId, bytes memory proof, uint256[] memory publicInputs) = _setupModelAndRound();
+
+        vm.prank(prover1);
+        coordinator.stake{value: 1 ether}(modelId);
+
+        // First submission succeeds (round completes)
+        vm.prank(prover1);
+        coordinator.submitProof(modelId, 1, proof, publicInputs);
+
+        // Start a new round with the new commitment so the round check passes
+        uint256 newCommitment = uint256(keccak256(abi.encodePacked(uint256(99), uint256(100))));
+        (,uint256 commitment,) = coordinator.getModelState(modelId);
+        assertEq(commitment, newCommitment);
+
+        coordinator.startRound(modelId, ROUND_DURATION);
+
+        // Prover2 stakes and tries to replay the exact same proof
+        vm.prank(prover2);
+        coordinator.stake{value: 1 ether}(modelId);
+
+        // Replay should fail with ProofAlreadyUsed
+        vm.prank(prover2);
+        vm.expectRevert(HelixCoordinatorV2.ProofAlreadyUsed.selector);
+        coordinator.submitProof(modelId, 2, proof, publicInputs);
+    }
+
+    /// @notice Test: isProofUsed returns correct state
+    function test_IsProofUsed_ReturnsCorrectly() public {
+        (uint256 modelId, bytes memory proof, uint256[] memory publicInputs) = _setupModelAndRound();
+
+        // Before submission
+        assertFalse(coordinator.isProofUsed(proof, publicInputs), "Proof should not be used initially");
+
+        vm.prank(prover1);
+        coordinator.stake{value: 1 ether}(modelId);
+
+        vm.prank(prover1);
+        coordinator.submitProof(modelId, 1, proof, publicInputs);
+
+        // After submission
+        assertTrue(coordinator.isProofUsed(proof, publicInputs), "Proof should be marked as used");
+    }
+
+    /// @notice Test: different proof for same round is allowed (not a replay)
+    function test_DifferentProof_Allowed() public {
+        (uint256 modelId, bytes memory proof, uint256[] memory publicInputs) = _setupModelAndRound();
+
+        vm.prank(prover1);
+        coordinator.stake{value: 1 ether}(modelId);
+
+        vm.prank(prover1);
+        coordinator.submitProof(modelId, 1, proof, publicInputs);
+
+        // Different proof bytes = different hash = not a replay
+        bytes memory differentProof = new bytes(320);
+        differentProof[0] = 0x01; // Make it different
+
+        assertFalse(coordinator.isProofUsed(differentProof, publicInputs), "Different proof should not be marked as used");
+    }
+
+    /// @notice Test: invalid proof that gets slashed still marks proof hash as used
+    function test_InvalidProof_StillMarksHashUsed() public {
+        uint256 oldHashLo = 555;
+        uint256 oldHashHi = 666;
+        uint256 correctCommitment = uint256(keccak256(abi.encodePacked(oldHashLo, oldHashHi)));
+
+        uint256 modelId = coordinator.registerModel("hash", correctCommitment, 0.1 ether);
+        coordinator.startRound(modelId, ROUND_DURATION);
+
+        // Use mock verifier that rejects proofs
+        mockVerifier.setShouldPass(false);
+
+        bytes memory proof = hex"deadbeef";
+        uint256[] memory publicInputs = new uint256[](8);
+        publicInputs[0] = oldHashLo;
+        publicInputs[1] = oldHashHi;
+        publicInputs[2] = 3;
+        publicInputs[3] = 4;
+        publicInputs[4] = 100;
+        publicInputs[5] = 10;
+        publicInputs[6] = 1;
+        publicInputs[7] = ProofFixtureHardcoded.computeErrorChecksum(10, 1, modelId, coordinator.maxErrorBound());
+
+        vm.prank(prover1);
+        coordinator.stake{value: 1 ether}(modelId);
+
+        // Submit invalid proof - gets slashed but proof hash recorded
+        vm.prank(prover1);
+        coordinator.submitProof(modelId, 1, proof, publicInputs);
+
+        // Proof hash should be marked as used even though it was invalid
+        assertTrue(coordinator.isProofUsed(proof, publicInputs), "Invalid proof hash should still be recorded");
+    }
+}
+
+// ============================================================================
+// 9. commitRoundData Authorization Tests
+// ============================================================================
+
+/// @title CommitRoundDataAuthTest
+/// @notice Verifies that commitRoundData is restricted to authorized callers
+contract CommitRoundDataAuthTest is Test {
+    HelixCoordinatorV2 public coordinator;
+    MockVerifier public mockVerifier;
+    TestTreasury public treasuryContract;
+
+    address public contractOwner;
+    address public modelOwner;
+    address public randomUser;
+    address public dataCommitmentContract;
+
+    function setUp() public {
+        contractOwner = address(this);
+        modelOwner = makeAddr("modelOwner");
+        randomUser = makeAddr("randomUser");
+        dataCommitmentContract = makeAddr("dataCommitment");
+
+        treasuryContract = new TestTreasury();
+        mockVerifier = new MockVerifier();
+        coordinator = new HelixCoordinatorV2(address(mockVerifier), address(treasuryContract));
+
+        // Set data commitment contract
+        coordinator.setDataCommitmentContract(dataCommitmentContract);
+    }
+
+    /// @notice Helper to register a model and start a round
+    function _setupModel() internal returns (uint256 modelId) {
+        vm.prank(modelOwner);
+        modelId = coordinator.registerModel("hash", 100, 0.1 ether);
+
+        vm.prank(modelOwner);
+        coordinator.startRound(modelId, 1 hours);
+    }
+
+    /// @notice Test: model owner can commit round data
+    function test_CommitRoundData_ModelOwner_Succeeds() public {
+        uint256 modelId = _setupModel();
+
+        vm.prank(modelOwner);
+        coordinator.commitRoundData(modelId, 1, bytes32(uint256(42)));
+
+        assertEq(coordinator.getRoundDataRoot(modelId, 1), bytes32(uint256(42)));
+    }
+
+    /// @notice Test: contract owner can commit round data
+    function test_CommitRoundData_ContractOwner_Succeeds() public {
+        uint256 modelId = _setupModel();
+
+        coordinator.commitRoundData(modelId, 1, bytes32(uint256(42)));
+
+        assertEq(coordinator.getRoundDataRoot(modelId, 1), bytes32(uint256(42)));
+    }
+
+    /// @notice Test: data commitment contract can commit round data
+    function test_CommitRoundData_DataCommitmentContract_Succeeds() public {
+        uint256 modelId = _setupModel();
+
+        vm.prank(dataCommitmentContract);
+        coordinator.commitRoundData(modelId, 1, bytes32(uint256(42)));
+
+        assertEq(coordinator.getRoundDataRoot(modelId, 1), bytes32(uint256(42)));
+    }
+
+    /// @notice Test: random user CANNOT commit round data
+    function test_CommitRoundData_RandomUser_Reverts() public {
+        uint256 modelId = _setupModel();
+
+        vm.prank(randomUser);
+        vm.expectRevert(HelixCoordinatorV2.NotAuthorized.selector);
+        coordinator.commitRoundData(modelId, 1, bytes32(uint256(42)));
+    }
+
+    /// @notice Test: random user cannot overwrite existing round data
+    function test_CommitRoundData_CannotOverwrite_ByUnauthorized() public {
+        uint256 modelId = _setupModel();
+
+        // Model owner sets data
+        vm.prank(modelOwner);
+        coordinator.commitRoundData(modelId, 1, bytes32(uint256(42)));
+
+        // Random user cannot overwrite
+        vm.prank(randomUser);
+        vm.expectRevert(HelixCoordinatorV2.NotAuthorized.selector);
+        coordinator.commitRoundData(modelId, 1, bytes32(uint256(99)));
+
+        // Data unchanged
+        assertEq(coordinator.getRoundDataRoot(modelId, 1), bytes32(uint256(42)));
+    }
+}
+
+// ============================================================================
+// 10. Treasury Zero-Address Check in Timelocked Setter
+// ============================================================================
+
+/// @title TreasuryZeroAddressTest
+/// @notice Verifies that executeSetTreasury rejects zero address
+contract TreasuryZeroAddressTest is Test {
+    HelixCoordinatorV2 public coordinator;
+    MockVerifier public mockVerifier;
+    TestTreasury public treasuryContract;
+
+    function setUp() public {
+        treasuryContract = new TestTreasury();
+        mockVerifier = new MockVerifier();
+        coordinator = new HelixCoordinatorV2(address(mockVerifier), address(treasuryContract));
+    }
+
+    /// @notice Test: proposeSetTreasury rejects zero address
+    function test_ProposeSetTreasury_ZeroAddress_Reverts() public {
+        vm.expectRevert(HelixCoordinatorV2.InvalidTreasury.selector);
+        coordinator.proposeSetTreasury(address(0));
+    }
+
+    /// @notice Test: executeSetTreasury rejects zero address (defense in depth)
+    function test_ExecuteSetTreasury_ZeroAddress_Reverts() public {
+        // We can't normally propose address(0) since proposeSetTreasury checks it.
+        // But for defense in depth, executeSetTreasury also checks.
+        // We test by proposing a valid address, then trying to execute with address(0).
+        address validTreasury = makeAddr("newTreasury");
+        coordinator.proposeSetTreasury(validTreasury);
+
+        bytes32 key = keccak256("setTreasury");
+        (, uint256 executionTime, ) = coordinator.getPendingChange(key);
+        vm.warp(executionTime);
+
+        // Execute with zero address - should revert even though timelock passed
+        vm.expectRevert(HelixCoordinatorV2.InvalidTreasury.selector);
+        coordinator.executeSetTreasury(address(0));
+    }
+
+    /// @notice Test: constructor rejects zero treasury
+    function test_Constructor_ZeroTreasury_Reverts() public {
+        vm.expectRevert(HelixCoordinatorV2.InvalidTreasury.selector);
+        new HelixCoordinatorV2(address(mockVerifier), address(0));
+    }
+
+    /// @notice Test: emergency setTreasury rejects zero address
+    function test_EmergencySetTreasury_ZeroAddress_Reverts() public {
+        coordinator.emergencyPause();
+        vm.expectRevert(HelixCoordinatorV2.InvalidTreasury.selector);
+        coordinator.setTreasury(address(0));
+    }
+}
+
+// ============================================================================
+// 11. Rewards Double-Claim Attack Vectors (Extended)
+// ============================================================================
+
+/// @title RewardsDoubleClaimExtendedTest
+/// @notice Extended tests for double-claim attack vectors using unified roundClaimed mapping
+contract RewardsDoubleClaimExtendedTest is Test {
+    HelixToken public token;
+    Rewards public rewards;
+
+    address public funder;
+    address public participant;
+    address public coordinator;
+
+    uint256 constant FUND_AMOUNT = 100_000 ether;
+    uint256 constant REWARDS_PER_ROUND = 1000 ether;
+    uint256 constant DURATION = 365 days;
+
+    function setUp() public {
+        funder = makeAddr("funder");
+        participant = makeAddr("participant");
+        coordinator = makeAddr("coordinator");
+
+        token = new HelixToken(makeAddr("treasury"));
+        rewards = new Rewards(address(token));
+
+        rewards.setCoordinator(coordinator);
+
+        token.mint(funder, FUND_AMOUNT);
+        vm.startPrank(funder);
+        token.approve(address(rewards), FUND_AMOUNT);
+        rewards.fundRewardPool(FUND_AMOUNT, REWARDS_PER_ROUND, DURATION);
+        vm.stopPrank();
+    }
+
+    /// @notice Test: calling claimRoundRewards twice for the same round
+    function test_ClaimRoundRewards_Twice_SameRound() public {
+        vm.startPrank(coordinator);
+        rewards.registerParticipant(0, 1, participant);
+        rewards.allocateRoundRewards(0, 1);
+        vm.stopPrank();
+
+        uint256[] memory modelIds = new uint256[](1);
+        uint256[] memory roundIds = new uint256[](1);
+        modelIds[0] = 0;
+        roundIds[0] = 1;
+
+        // First claim succeeds
+        vm.prank(participant);
+        rewards.claimRoundRewards(modelIds, roundIds);
+
+        uint256 balanceAfterFirst = token.balanceOf(participant);
+        assertGt(balanceAfterFirst, 0, "Should have received rewards");
+
+        // Second claim for same round should revert (roundClaimed = true, no rewards to add)
+        vm.prank(participant);
+        vm.expectRevert("No rewards to claim");
+        rewards.claimRoundRewards(modelIds, roundIds);
+
+        // Balance unchanged
+        assertEq(token.balanceOf(participant), balanceAfterFirst, "Balance should not change");
+    }
+
+    /// @notice Test: interleaved claims across multiple rounds can't exceed total
+    function test_InterleavedClaims_MultipleRounds() public {
+        // Allocate rewards for 3 rounds
+        vm.startPrank(coordinator);
+        rewards.registerParticipant(0, 1, participant);
+        rewards.allocateRoundRewards(0, 1);
+        rewards.registerParticipant(0, 2, participant);
+        rewards.allocateRoundRewards(0, 2);
+        rewards.registerParticipant(0, 3, participant);
+        rewards.allocateRoundRewards(0, 3);
+        vm.stopPrank();
+
+        (uint256 totalEarned,,,) = rewards.getParticipantStats(participant);
+
+        // Claim round 1 via claimRoundRewards
+        uint256[] memory modelIds = new uint256[](1);
+        uint256[] memory roundIds = new uint256[](1);
+        modelIds[0] = 0;
+        roundIds[0] = 1;
+
+        vm.prank(participant);
+        rewards.claimRoundRewards(modelIds, roundIds);
+
+        // Claim remaining via claimRewards (rounds 2 & 3)
+        vm.prank(participant);
+        rewards.claimRewards();
+
+        // Try to claim round 2 via claimRoundRewards - should fail
+        roundIds[0] = 2;
+        vm.prank(participant);
+        vm.expectRevert("Already claimed");
+        rewards.claimRoundRewards(modelIds, roundIds);
+
+        // Try to claim round 3 via claimRoundRewards - should fail
+        roundIds[0] = 3;
+        vm.prank(participant);
+        vm.expectRevert("Already claimed");
+        rewards.claimRoundRewards(modelIds, roundIds);
+
+        // Total claimed must equal total earned
+        assertEq(token.balanceOf(participant), totalEarned, "Total must equal earned");
+    }
+
+    /// @notice Test: batch claim with mix of already-claimed and new rounds
+    function test_BatchClaim_PartiallyClaimedRounds() public {
+        vm.startPrank(coordinator);
+        rewards.registerParticipant(0, 1, participant);
+        rewards.allocateRoundRewards(0, 1);
+        rewards.registerParticipant(0, 2, participant);
+        rewards.allocateRoundRewards(0, 2);
+        vm.stopPrank();
+
+        // Claim round 1 first
+        uint256[] memory modelIds = new uint256[](1);
+        uint256[] memory roundIds = new uint256[](1);
+        modelIds[0] = 0;
+        roundIds[0] = 1;
+
+        vm.prank(participant);
+        rewards.claimRoundRewards(modelIds, roundIds);
+        uint256 balanceAfterRound1 = token.balanceOf(participant);
+
+        // Now batch claim both rounds 1 and 2 - round 1 should be skipped
+        uint256[] memory batchModelIds = new uint256[](2);
+        uint256[] memory batchRoundIds = new uint256[](2);
+        batchModelIds[0] = 0;
+        batchModelIds[1] = 0;
+        batchRoundIds[0] = 1; // Already claimed
+        batchRoundIds[1] = 2; // Not claimed
+
+        vm.prank(participant);
+        rewards.claimRoundRewards(batchModelIds, batchRoundIds);
+
+        // Should have received only round 2 rewards (round 1 was skipped)
+        uint256 balanceAfterBatch = token.balanceOf(participant);
+        assertGt(balanceAfterBatch, balanceAfterRound1, "Should get round 2 rewards");
+
+        (uint256 totalEarned,,,) = rewards.getParticipantStats(participant);
+        assertEq(balanceAfterBatch, totalEarned, "Final balance should equal total earned");
+    }
+
+    /// @notice Test: claimRewards followed by claimRoundRewards is blocked
+    function test_ClaimRewards_Then_ClaimRoundRewards_Blocked() public {
+        vm.startPrank(coordinator);
+        rewards.registerParticipant(0, 1, participant);
+        rewards.allocateRoundRewards(0, 1);
+        vm.stopPrank();
+
+        // Claim all via claimRewards first
+        vm.prank(participant);
+        rewards.claimRewards();
+
+        // Try to double-claim via claimRoundRewards
+        uint256[] memory modelIds = new uint256[](1);
+        uint256[] memory roundIds = new uint256[](1);
+        modelIds[0] = 0;
+        roundIds[0] = 1;
+
+        vm.prank(participant);
+        vm.expectRevert("Already claimed");
+        rewards.claimRoundRewards(modelIds, roundIds);
+    }
+
+    /// @notice Test: two participants cannot steal each other's rewards
+    function test_TwoParticipants_IndependentClaims() public {
+        address participant2 = makeAddr("participant2");
+
+        vm.startPrank(coordinator);
+        rewards.registerParticipant(0, 1, participant);
+        rewards.registerParticipant(0, 1, participant2);
+        rewards.allocateRoundRewards(0, 1);
+        vm.stopPrank();
+
+        // Participant 1 claims
+        vm.prank(participant);
+        rewards.claimRewards();
+
+        // Participant 2 claims
+        vm.prank(participant2);
+        rewards.claimRewards();
+
+        // Both should have received equal shares
+        uint256 bal1 = token.balanceOf(participant);
+        uint256 bal2 = token.balanceOf(participant2);
+        assertEq(bal1, bal2, "Equal participants should receive equal rewards");
+        assertGt(bal1, 0, "Should have received rewards");
+
+        // Neither can claim again
+        vm.prank(participant);
+        vm.expectRevert("No rewards to claim");
+        rewards.claimRewards();
+
+        vm.prank(participant2);
+        vm.expectRevert("No rewards to claim");
+        rewards.claimRewards();
+    }
+}
