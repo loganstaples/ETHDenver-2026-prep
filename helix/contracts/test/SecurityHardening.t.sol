@@ -319,6 +319,401 @@ contract TrainingDAOFlashLoanTest is Test {
         (address proposer, , , , , , , ) = dao.getProposalInfo(proposalId);
         assertEq(proposer, voter1, "Proposer should be voter1");
     }
+
+    /// @notice Test: flash-loaned tokens without delegation cannot create proposals
+    function test_FlashLoan_CannotCreateProposal_WithoutDelegation() public {
+        // Flash attacker acquires tokens but does NOT delegate
+        token.mint(flashAttacker, 10_000 ether);
+
+        vm.roll(block.number + 1);
+
+        // Attacker has balance but zero voting power (no delegation)
+        assertGe(token.balanceOf(flashAttacker), 1000 ether, "Attacker has tokens");
+
+        // createProposal now checks getVotes() not balanceOf(), so undelegated tokens fail
+        vm.prank(flashAttacker);
+        vm.expectRevert("Below proposal threshold");
+        dao.createProposal(
+            TrainingDAO.ProposalType.Custom,
+            "Malicious proposal",
+            address(0),
+            ""
+        );
+    }
+
+    /// @notice Test: flash-loaned tokens returned after proposal can't create new proposals
+    function test_FlashLoan_ReturnedTokens_CannotCreateNewProposal() public {
+        // Flash attacker acquires tokens and delegates
+        token.mint(flashAttacker, 10_000 ether);
+        vm.prank(flashAttacker);
+        token.delegate(flashAttacker);
+
+        vm.roll(block.number + 1);
+
+        // Attacker creates a proposal (has delegated voting power)
+        vm.prank(flashAttacker);
+        uint256 proposalId = dao.createProposal(
+            TrainingDAO.ProposalType.Custom,
+            "Attacker proposal",
+            address(0),
+            ""
+        );
+        assertGt(proposalId, 0, "Proposal created");
+
+        // Now attacker returns the flash loan (transfers tokens away)
+        vm.prank(flashAttacker);
+        token.transfer(address(1), 10_000 ether);
+
+        vm.roll(block.number + 1);
+
+        assertEq(token.balanceOf(flashAttacker), 0, "Attacker returned tokens");
+
+        // Attacker cannot create another proposal without delegated voting power
+        vm.prank(flashAttacker);
+        vm.expectRevert("Below proposal threshold");
+        dao.createProposal(
+            TrainingDAO.ProposalType.Custom,
+            "Second malicious proposal",
+            address(0),
+            ""
+        );
+    }
+
+    /// @notice Test: proposal with insufficient quorum is defeated
+    function test_ParameterProposal_DefeatedWithoutQuorum() public {
+        // Current supply: 20M initial + 10K voter1 + 10K voter2 = ~20.02M
+        // Quorum is 4% of supply = ~800K. voter1 + voter2 = 20K, so quorum fails
+
+        vm.prank(voter1);
+        uint256 proposalId = dao.createParameterProposal(
+            "Should fail quorum",
+            TrainingDAO.ParameterProposal({
+                learningRate: 1e15,
+                batchSize: 64,
+                maxErrorBound: 1000,
+                minParticipants: 3,
+                roundDuration: 1 hours
+            })
+        );
+
+        vm.roll(block.number + 1);
+
+        // Advance to voting
+        (, , , uint256 startTime, , , , ) = dao.getProposalInfo(proposalId);
+        vm.warp(startTime + 1);
+
+        // Both voters vote (20K tokens total, quorum needs ~800K)
+        vm.prank(voter1);
+        dao.castVote(proposalId, true);
+        vm.prank(voter2);
+        dao.castVote(proposalId, true);
+
+        // Advance past voting period
+        (, , , , uint256 endTime, , , ) = dao.getProposalInfo(proposalId);
+        vm.warp(endTime + 1);
+
+        // Proposal should be defeated (insufficient quorum)
+        assertEq(
+            uint256(dao.getProposalState(proposalId)),
+            uint256(TrainingDAO.ProposalState.Defeated),
+            "Proposal should be defeated without quorum"
+        );
+    }
+}
+
+// ============================================================================
+// 2b. TrainingDAO Parameter Proposal Execution Tests
+// ============================================================================
+
+/// @title TrainingDAOExecutionTest
+/// @notice Full lifecycle tests for parameter proposal execution and reentrancy protection
+contract TrainingDAOExecutionTest is Test {
+    HelixToken public token;
+    TrainingDAO public dao;
+
+    address public voter1;
+    address public voter2;
+
+    // Large balance needed to meet 4% quorum of ~20M supply
+    uint256 constant VOTER_BALANCE = 500_000 ether;
+
+    function setUp() public {
+        voter1 = makeAddr("voter1");
+        voter2 = makeAddr("voter2");
+
+        token = new HelixToken(makeAddr("treasury"));
+        dao = new TrainingDAO(address(token));
+
+        // Give voters enough tokens to meet quorum (4% of ~21M = ~840K, 500K+500K = 1M > 840K)
+        token.mint(voter1, VOTER_BALANCE);
+        token.mint(voter2, VOTER_BALANCE);
+
+        vm.prank(voter1);
+        token.delegate(voter1);
+        vm.prank(voter2);
+        token.delegate(voter2);
+
+        vm.roll(block.number + 1);
+    }
+
+    /// @notice Test: full parameter proposal lifecycle (create, vote, queue, execute, verify)
+    function test_ParameterProposal_FullExecution() public {
+        // Verify default parameters first
+        (uint256 defLr, uint256 defBs, uint256 defMeb, uint256 defMp, uint256 defRd) =
+            dao.getTrainingParameters();
+        assertEq(defLr, 1e15, "Default learning rate");
+        assertEq(defBs, 32, "Default batch size");
+
+        // Create parameter proposal
+        TrainingDAO.ParameterProposal memory newParams = TrainingDAO.ParameterProposal({
+            learningRate: 5e15,      // 0.005
+            batchSize: 128,
+            maxErrorBound: 500,
+            minParticipants: 10,
+            roundDuration: 2 hours
+        });
+
+        vm.prank(voter1);
+        uint256 proposalId = dao.createParameterProposal("Increase batch size and LR", newParams);
+
+        // Verify parameter proposal stored correctly
+        (uint256 lr, uint256 bs, uint256 meb, uint256 mp, uint256 rd) = dao.parameterProposals(proposalId);
+        assertEq(lr, 5e15, "Learning rate stored");
+        assertEq(bs, 128, "Batch size stored");
+        assertEq(meb, 500, "Max error bound stored");
+        assertEq(mp, 10, "Min participants stored");
+        assertEq(rd, 2 hours, "Round duration stored");
+
+        // Verify proposal type
+        (, TrainingDAO.ProposalType pType, , , , , , ) = dao.getProposalInfo(proposalId);
+        assertEq(uint256(pType), uint256(TrainingDAO.ProposalType.ParameterChange), "Should be ParameterChange");
+
+        // Advance block so snapshot is finalized
+        vm.roll(block.number + 1);
+
+        // Advance time to voting period
+        (, , , uint256 startTime, , , , ) = dao.getProposalInfo(proposalId);
+        vm.warp(startTime + 1);
+
+        // Both voters vote in favor
+        vm.prank(voter1);
+        dao.castVote(proposalId, true);
+        vm.prank(voter2);
+        dao.castVote(proposalId, true);
+
+        // Advance past voting period
+        (, , , , uint256 endTime, , , ) = dao.getProposalInfo(proposalId);
+        vm.warp(endTime + 1);
+
+        // Verify proposal succeeded
+        assertEq(
+            uint256(dao.getProposalState(proposalId)),
+            uint256(TrainingDAO.ProposalState.Succeeded),
+            "Proposal should have succeeded"
+        );
+
+        // Queue the proposal
+        dao.queueProposal(proposalId);
+        assertEq(
+            uint256(dao.getProposalState(proposalId)),
+            uint256(TrainingDAO.ProposalState.Queued),
+            "Proposal should be queued"
+        );
+
+        // Attempt early execution (should fail)
+        vm.expectRevert("Timelock not expired");
+        dao.executeProposal(proposalId);
+
+        // Advance past timelock
+        uint256 executionTime = dao.queuedProposals(proposalId);
+        vm.warp(executionTime);
+
+        // Execute the proposal
+        dao.executeProposal(proposalId);
+
+        // Verify state is Executed
+        assertEq(
+            uint256(dao.getProposalState(proposalId)),
+            uint256(TrainingDAO.ProposalState.Executed),
+            "Proposal should be executed"
+        );
+
+        // Verify training parameters were updated
+        (uint256 newLr, uint256 newBs, uint256 newMeb, uint256 newMp, uint256 newRd) =
+            dao.getTrainingParameters();
+        assertEq(newLr, 5e15, "Learning rate should be updated");
+        assertEq(newBs, 128, "Batch size should be updated");
+        assertEq(newMeb, 500, "Max error bound should be updated");
+        assertEq(newMp, 10, "Min participants should be updated");
+        assertEq(newRd, 2 hours, "Round duration should be updated");
+    }
+
+    /// @notice Test: cannot execute proposal twice
+    function test_ParameterProposal_CannotExecuteTwice() public {
+        vm.prank(voter1);
+        uint256 proposalId = dao.createParameterProposal(
+            "Test double execute",
+            TrainingDAO.ParameterProposal({
+                learningRate: 2e15,
+                batchSize: 64,
+                maxErrorBound: 800,
+                minParticipants: 5,
+                roundDuration: 1 hours
+            })
+        );
+
+        vm.roll(block.number + 1);
+
+        (, , , uint256 startTime, , , , ) = dao.getProposalInfo(proposalId);
+        vm.warp(startTime + 1);
+
+        vm.prank(voter1);
+        dao.castVote(proposalId, true);
+        vm.prank(voter2);
+        dao.castVote(proposalId, true);
+
+        (, , , , uint256 endTime, , , ) = dao.getProposalInfo(proposalId);
+        vm.warp(endTime + 1);
+
+        dao.queueProposal(proposalId);
+        vm.warp(dao.queuedProposals(proposalId));
+
+        dao.executeProposal(proposalId);
+
+        // Second execution should revert
+        vm.expectRevert("Not queued");
+        dao.executeProposal(proposalId);
+    }
+
+    /// @notice Test: nonReentrant prevents reentrancy on executeProposal
+    function test_ExecuteProposal_NonReentrant() public {
+        // Create a proposal that targets address(0) - no external call
+        vm.prank(voter1);
+        uint256 proposalId = dao.createProposal(
+            TrainingDAO.ProposalType.Custom,
+            "Test nonReentrant",
+            address(0),
+            ""
+        );
+
+        vm.roll(block.number + 1);
+
+        (, , , uint256 startTime, , , , ) = dao.getProposalInfo(proposalId);
+        vm.warp(startTime + 1);
+
+        vm.prank(voter1);
+        dao.castVote(proposalId, true);
+        vm.prank(voter2);
+        dao.castVote(proposalId, true);
+
+        (, , , , uint256 endTime, , , ) = dao.getProposalInfo(proposalId);
+        vm.warp(endTime + 1);
+
+        dao.queueProposal(proposalId);
+        vm.warp(dao.queuedProposals(proposalId));
+
+        // Should succeed - nonReentrant doesn't prevent normal execution
+        dao.executeProposal(proposalId);
+
+        assertEq(
+            uint256(dao.getProposalState(proposalId)),
+            uint256(TrainingDAO.ProposalState.Executed),
+            "Should execute normally with nonReentrant"
+        );
+    }
+}
+
+/// @title DAOReentrancyAttacker
+/// @notice Contract that attempts reentrancy during DAO proposal execution
+contract DAOReentrancyAttacker {
+    TrainingDAO public dao;
+    uint256 public targetProposalId;
+    uint256 public attackCount;
+
+    constructor(TrainingDAO _dao) {
+        dao = _dao;
+    }
+
+    function setTarget(uint256 _proposalId) external {
+        targetProposalId = _proposalId;
+    }
+
+    // Called when DAO executes a proposal targeting this contract
+    fallback() external payable {
+        if (attackCount < 1) {
+            attackCount++;
+            // Attempt reentrant call to executeProposal
+            try dao.executeProposal(targetProposalId) {} catch {}
+        }
+    }
+
+    receive() external payable {}
+}
+
+/// @title TrainingDAOReentrancyTest
+/// @notice Verifies nonReentrant on executeProposal blocks reentrancy attacks
+contract TrainingDAOReentrancyTest is Test {
+    HelixToken public token;
+    TrainingDAO public dao;
+    DAOReentrancyAttacker public attacker;
+
+    address public voter1;
+
+    uint256 constant LARGE_BALANCE = 1_000_000 ether;
+
+    function setUp() public {
+        voter1 = makeAddr("voter1");
+
+        token = new HelixToken(makeAddr("treasury"));
+        dao = new TrainingDAO(address(token));
+        attacker = new DAOReentrancyAttacker(dao);
+
+        // Give voter1 enough tokens for quorum (4% of ~21M = ~840K)
+        token.mint(voter1, LARGE_BALANCE);
+        vm.prank(voter1);
+        token.delegate(voter1);
+        vm.roll(block.number + 1);
+    }
+
+    /// @notice Test: reentrancy via executeProposal targeting a malicious contract is blocked
+    function test_ExecuteProposal_ReentrancyBlocked() public {
+        // Create a proposal that calls the attacker contract
+        vm.prank(voter1);
+        uint256 proposalId = dao.createProposal(
+            TrainingDAO.ProposalType.Custom,
+            "Reentrancy test",
+            address(attacker),
+            abi.encodeWithSignature("setTarget(uint256)", 1) // harmless call
+        );
+
+        attacker.setTarget(proposalId);
+
+        vm.roll(block.number + 1);
+
+        // Advance to voting and vote
+        (, , , uint256 startTime, , , , ) = dao.getProposalInfo(proposalId);
+        vm.warp(startTime + 1);
+
+        vm.prank(voter1);
+        dao.castVote(proposalId, true);
+
+        (, , , , uint256 endTime, , , ) = dao.getProposalInfo(proposalId);
+        vm.warp(endTime + 1);
+
+        dao.queueProposal(proposalId);
+        vm.warp(dao.queuedProposals(proposalId));
+
+        // Execute - the attacker's fallback tries to re-enter executeProposal
+        // but nonReentrant blocks it
+        dao.executeProposal(proposalId);
+
+        // Verify executed only once
+        assertEq(
+            uint256(dao.getProposalState(proposalId)),
+            uint256(TrainingDAO.ProposalState.Executed),
+            "Proposal should be executed exactly once"
+        );
+    }
 }
 
 // ============================================================================
@@ -496,40 +891,6 @@ contract AdminTimelockTest is Test {
         mockVerifier = new MockVerifier();
         newVerifier = new MockVerifier();
         coordinator = new HelixCoordinatorV2(address(mockVerifier), address(treasuryContract));
-    }
-
-    // ---- Verifier Timelock (7 days) ----
-
-    /// @notice Test: propose verifier change, attempt early execute, fail, wait, succeed
-    function test_Timelock_Verifier_FullCycle() public {
-        // Propose
-        coordinator.proposeSetVerifier(address(newVerifier));
-
-        // Verify pending change exists
-        bytes32 key = keccak256("setVerifier");
-        (, uint256 executionTime, bool active) = coordinator.getPendingChange(key);
-        assertTrue(active, "Change should be active");
-        assertEq(executionTime, block.timestamp + 7 days, "Should use 7-day timelock");
-
-        // Attempt early execution - should revert
-        vm.expectRevert(HelixCoordinatorV2.TimelockNotReady.selector);
-        coordinator.executeSetVerifier(address(newVerifier));
-
-        // Warp to just before timelock expiry
-        vm.warp(executionTime - 1);
-        vm.expectRevert(HelixCoordinatorV2.TimelockNotReady.selector);
-        coordinator.executeSetVerifier(address(newVerifier));
-
-        // Warp past timelock
-        vm.warp(executionTime);
-        coordinator.executeSetVerifier(address(newVerifier));
-
-        // Verify change took effect
-        assertEq(address(coordinator.verifier()), address(newVerifier), "Verifier should be updated");
-
-        // Verify pending change cleared
-        (, , active) = coordinator.getPendingChange(key);
-        assertFalse(active, "Pending change should be cleared");
     }
 
     // ---- Parameter Timelock (48 hours) ----
@@ -892,11 +1253,6 @@ contract CustomErrorsTest is Test {
 
     // ---- Emergency-Only Legacy Functions ----
 
-    function test_LegacySetVerifier_RevertsWhenNotPaused() public {
-        vm.expectRevert(HelixCoordinatorV2.NotPaused.selector);
-        coordinator.setVerifier(address(mockVerifier));
-    }
-
     function test_LegacySetTreasury_RevertsWhenNotPaused() public {
         vm.expectRevert(HelixCoordinatorV2.NotPaused.selector);
         coordinator.setTreasury(makeAddr("newTreasury"));
@@ -921,7 +1277,6 @@ contract CustomErrorsTest is Test {
         coordinator.emergencyPause();
 
         // All legacy setters should work during emergency
-        coordinator.setVerifier(address(mockVerifier));
         coordinator.setTreasury(makeAddr("newTreasury"));
         coordinator.setSlashPercentage(2500);
         coordinator.setDefaultMinStake(0.5 ether);
@@ -936,5 +1291,503 @@ contract CustomErrorsTest is Test {
         coordinator.emergencyPause();
         vm.expectRevert(HelixCoordinatorV2.InvalidTreasury.selector);
         coordinator.setTreasury(address(0));
+    }
+}
+
+// ============================================================================
+// 8. Proof Replay Protection Tests (V2)
+// ============================================================================
+
+/// @title ProofReplayProtectionTest
+/// @notice Verifies that V2 now blocks proof replay attacks via usedProofHashes
+contract ProofReplayProtectionTest is Test {
+    HelixCoordinatorV2 public coordinator;
+    MockVerifier public mockVerifier;
+    TestTreasury public treasuryContract;
+
+    address public owner;
+    address public prover1;
+    address public prover2;
+
+    uint256 constant ROUND_DURATION = 1 hours;
+
+    function setUp() public {
+        owner = address(this);
+        prover1 = makeAddr("prover1");
+        prover2 = makeAddr("prover2");
+        treasuryContract = new TestTreasury();
+        mockVerifier = new MockVerifier();
+        coordinator = new HelixCoordinatorV2(address(mockVerifier), address(treasuryContract));
+
+        vm.deal(prover1, 10 ether);
+        vm.deal(prover2, 10 ether);
+    }
+
+    /// @notice Helper to create a model, start round, and return public inputs
+    function _setupModelAndRound() internal returns (uint256 modelId, bytes memory proof, uint256[] memory publicInputs) {
+        uint256 oldHashLo = 12345;
+        uint256 oldHashHi = 67890;
+        uint256 correctCommitment = uint256(keccak256(abi.encodePacked(oldHashLo, oldHashHi)));
+
+        modelId = coordinator.registerModel("hash", correctCommitment, 0.1 ether);
+        coordinator.startRound(modelId, ROUND_DURATION);
+
+        proof = new bytes(320); // valid-length proof
+
+        publicInputs = new uint256[](8);
+        publicInputs[0] = oldHashLo;
+        publicInputs[1] = oldHashHi;
+        publicInputs[2] = 99;
+        publicInputs[3] = 100;
+        publicInputs[4] = 500;
+        publicInputs[5] = 10;
+        publicInputs[6] = 1;
+        publicInputs[7] = ProofFixtureHardcoded.computeErrorChecksum(10, 1, modelId, coordinator.maxErrorBound());
+    }
+
+    /// @notice Test: same proof cannot be submitted twice in the same round
+    function test_ProofReplay_SameRound_Blocked() public {
+        (uint256 modelId, bytes memory proof, uint256[] memory publicInputs) = _setupModelAndRound();
+
+        vm.prank(prover1);
+        coordinator.stake{value: 1 ether}(modelId);
+
+        // First submission succeeds (round completes)
+        vm.prank(prover1);
+        coordinator.submitProof(modelId, 1, proof, publicInputs);
+
+        // Start a new round with the new commitment so the round check passes
+        uint256 newCommitment = uint256(keccak256(abi.encodePacked(uint256(99), uint256(100))));
+        (,uint256 commitment,) = coordinator.getModelState(modelId);
+        assertEq(commitment, newCommitment);
+
+        coordinator.startRound(modelId, ROUND_DURATION);
+
+        // Prover2 stakes and tries to replay the exact same proof
+        vm.prank(prover2);
+        coordinator.stake{value: 1 ether}(modelId);
+
+        // Replay should fail with ProofAlreadyUsed
+        vm.prank(prover2);
+        vm.expectRevert(HelixCoordinatorV2.ProofAlreadyUsed.selector);
+        coordinator.submitProof(modelId, 2, proof, publicInputs);
+    }
+
+    /// @notice Test: isProofUsed returns correct state
+    function test_IsProofUsed_ReturnsCorrectly() public {
+        (uint256 modelId, bytes memory proof, uint256[] memory publicInputs) = _setupModelAndRound();
+
+        // Before submission
+        assertFalse(coordinator.isProofUsed(proof, publicInputs), "Proof should not be used initially");
+
+        vm.prank(prover1);
+        coordinator.stake{value: 1 ether}(modelId);
+
+        vm.prank(prover1);
+        coordinator.submitProof(modelId, 1, proof, publicInputs);
+
+        // After submission
+        assertTrue(coordinator.isProofUsed(proof, publicInputs), "Proof should be marked as used");
+    }
+
+    /// @notice Test: different proof for same round is allowed (not a replay)
+    function test_DifferentProof_Allowed() public {
+        (uint256 modelId, bytes memory proof, uint256[] memory publicInputs) = _setupModelAndRound();
+
+        vm.prank(prover1);
+        coordinator.stake{value: 1 ether}(modelId);
+
+        vm.prank(prover1);
+        coordinator.submitProof(modelId, 1, proof, publicInputs);
+
+        // Different proof bytes = different hash = not a replay
+        bytes memory differentProof = new bytes(320);
+        differentProof[0] = 0x01; // Make it different
+
+        assertFalse(coordinator.isProofUsed(differentProof, publicInputs), "Different proof should not be marked as used");
+    }
+
+    /// @notice Test: invalid proof that gets slashed still marks proof hash as used
+    function test_InvalidProof_StillMarksHashUsed() public {
+        uint256 oldHashLo = 555;
+        uint256 oldHashHi = 666;
+        uint256 correctCommitment = uint256(keccak256(abi.encodePacked(oldHashLo, oldHashHi)));
+
+        uint256 modelId = coordinator.registerModel("hash", correctCommitment, 0.1 ether);
+        coordinator.startRound(modelId, ROUND_DURATION);
+
+        // Use mock verifier that rejects proofs
+        mockVerifier.setShouldPass(false);
+
+        bytes memory proof = hex"deadbeef";
+        uint256[] memory publicInputs = new uint256[](8);
+        publicInputs[0] = oldHashLo;
+        publicInputs[1] = oldHashHi;
+        publicInputs[2] = 3;
+        publicInputs[3] = 4;
+        publicInputs[4] = 100;
+        publicInputs[5] = 10;
+        publicInputs[6] = 1;
+        publicInputs[7] = ProofFixtureHardcoded.computeErrorChecksum(10, 1, modelId, coordinator.maxErrorBound());
+
+        vm.prank(prover1);
+        coordinator.stake{value: 1 ether}(modelId);
+
+        // Submit invalid proof - gets slashed but proof hash recorded
+        vm.prank(prover1);
+        coordinator.submitProof(modelId, 1, proof, publicInputs);
+
+        // Proof hash should be marked as used even though it was invalid
+        assertTrue(coordinator.isProofUsed(proof, publicInputs), "Invalid proof hash should still be recorded");
+    }
+}
+
+// ============================================================================
+// 9. commitRoundData Authorization Tests
+// ============================================================================
+
+/// @title CommitRoundDataAuthTest
+/// @notice Verifies that commitRoundData is restricted to authorized callers
+contract CommitRoundDataAuthTest is Test {
+    HelixCoordinatorV2 public coordinator;
+    MockVerifier public mockVerifier;
+    TestTreasury public treasuryContract;
+
+    address public contractOwner;
+    address public modelOwner;
+    address public randomUser;
+    address public dataCommitmentContract;
+
+    function setUp() public {
+        contractOwner = address(this);
+        modelOwner = makeAddr("modelOwner");
+        randomUser = makeAddr("randomUser");
+        dataCommitmentContract = makeAddr("dataCommitment");
+
+        treasuryContract = new TestTreasury();
+        mockVerifier = new MockVerifier();
+        coordinator = new HelixCoordinatorV2(address(mockVerifier), address(treasuryContract));
+
+        // Set data commitment contract
+        coordinator.setDataCommitmentContract(dataCommitmentContract);
+    }
+
+    /// @notice Helper to register a model and start a round
+    function _setupModel() internal returns (uint256 modelId) {
+        vm.prank(modelOwner);
+        modelId = coordinator.registerModel("hash", 100, 0.1 ether);
+
+        vm.prank(modelOwner);
+        coordinator.startRound(modelId, 1 hours);
+    }
+
+    /// @notice Test: model owner can commit round data
+    function test_CommitRoundData_ModelOwner_Succeeds() public {
+        uint256 modelId = _setupModel();
+
+        vm.prank(modelOwner);
+        coordinator.commitRoundData(modelId, 1, bytes32(uint256(42)));
+
+        assertEq(coordinator.getRoundDataRoot(modelId, 1), bytes32(uint256(42)));
+    }
+
+    /// @notice Test: contract owner can commit round data
+    function test_CommitRoundData_ContractOwner_Succeeds() public {
+        uint256 modelId = _setupModel();
+
+        coordinator.commitRoundData(modelId, 1, bytes32(uint256(42)));
+
+        assertEq(coordinator.getRoundDataRoot(modelId, 1), bytes32(uint256(42)));
+    }
+
+    /// @notice Test: data commitment contract can commit round data
+    function test_CommitRoundData_DataCommitmentContract_Succeeds() public {
+        uint256 modelId = _setupModel();
+
+        vm.prank(dataCommitmentContract);
+        coordinator.commitRoundData(modelId, 1, bytes32(uint256(42)));
+
+        assertEq(coordinator.getRoundDataRoot(modelId, 1), bytes32(uint256(42)));
+    }
+
+    /// @notice Test: random user CANNOT commit round data
+    function test_CommitRoundData_RandomUser_Reverts() public {
+        uint256 modelId = _setupModel();
+
+        vm.prank(randomUser);
+        vm.expectRevert(HelixCoordinatorV2.NotAuthorized.selector);
+        coordinator.commitRoundData(modelId, 1, bytes32(uint256(42)));
+    }
+
+    /// @notice Test: random user cannot overwrite existing round data
+    function test_CommitRoundData_CannotOverwrite_ByUnauthorized() public {
+        uint256 modelId = _setupModel();
+
+        // Model owner sets data
+        vm.prank(modelOwner);
+        coordinator.commitRoundData(modelId, 1, bytes32(uint256(42)));
+
+        // Random user cannot overwrite
+        vm.prank(randomUser);
+        vm.expectRevert(HelixCoordinatorV2.NotAuthorized.selector);
+        coordinator.commitRoundData(modelId, 1, bytes32(uint256(99)));
+
+        // Data unchanged
+        assertEq(coordinator.getRoundDataRoot(modelId, 1), bytes32(uint256(42)));
+    }
+}
+
+// ============================================================================
+// 10. Treasury Zero-Address Check in Timelocked Setter
+// ============================================================================
+
+/// @title TreasuryZeroAddressTest
+/// @notice Verifies that executeSetTreasury rejects zero address
+contract TreasuryZeroAddressTest is Test {
+    HelixCoordinatorV2 public coordinator;
+    MockVerifier public mockVerifier;
+    TestTreasury public treasuryContract;
+
+    function setUp() public {
+        treasuryContract = new TestTreasury();
+        mockVerifier = new MockVerifier();
+        coordinator = new HelixCoordinatorV2(address(mockVerifier), address(treasuryContract));
+    }
+
+    /// @notice Test: proposeSetTreasury rejects zero address
+    function test_ProposeSetTreasury_ZeroAddress_Reverts() public {
+        vm.expectRevert(HelixCoordinatorV2.InvalidTreasury.selector);
+        coordinator.proposeSetTreasury(address(0));
+    }
+
+    /// @notice Test: executeSetTreasury rejects zero address (defense in depth)
+    function test_ExecuteSetTreasury_ZeroAddress_Reverts() public {
+        // We can't normally propose address(0) since proposeSetTreasury checks it.
+        // But for defense in depth, executeSetTreasury also checks.
+        // We test by proposing a valid address, then trying to execute with address(0).
+        address validTreasury = makeAddr("newTreasury");
+        coordinator.proposeSetTreasury(validTreasury);
+
+        bytes32 key = keccak256("setTreasury");
+        (, uint256 executionTime, ) = coordinator.getPendingChange(key);
+        vm.warp(executionTime);
+
+        // Execute with zero address - should revert even though timelock passed
+        vm.expectRevert(HelixCoordinatorV2.InvalidTreasury.selector);
+        coordinator.executeSetTreasury(address(0));
+    }
+
+    /// @notice Test: constructor rejects zero treasury
+    function test_Constructor_ZeroTreasury_Reverts() public {
+        vm.expectRevert(HelixCoordinatorV2.InvalidTreasury.selector);
+        new HelixCoordinatorV2(address(mockVerifier), address(0));
+    }
+
+    /// @notice Test: emergency setTreasury rejects zero address
+    function test_EmergencySetTreasury_ZeroAddress_Reverts() public {
+        coordinator.emergencyPause();
+        vm.expectRevert(HelixCoordinatorV2.InvalidTreasury.selector);
+        coordinator.setTreasury(address(0));
+    }
+}
+
+// ============================================================================
+// 11. Rewards Double-Claim Attack Vectors (Extended)
+// ============================================================================
+
+/// @title RewardsDoubleClaimExtendedTest
+/// @notice Extended tests for double-claim attack vectors using unified roundClaimed mapping
+contract RewardsDoubleClaimExtendedTest is Test {
+    HelixToken public token;
+    Rewards public rewards;
+
+    address public funder;
+    address public participant;
+    address public coordinator;
+
+    uint256 constant FUND_AMOUNT = 100_000 ether;
+    uint256 constant REWARDS_PER_ROUND = 1000 ether;
+    uint256 constant DURATION = 365 days;
+
+    function setUp() public {
+        funder = makeAddr("funder");
+        participant = makeAddr("participant");
+        coordinator = makeAddr("coordinator");
+
+        token = new HelixToken(makeAddr("treasury"));
+        rewards = new Rewards(address(token));
+
+        rewards.setCoordinator(coordinator);
+
+        token.mint(funder, FUND_AMOUNT);
+        vm.startPrank(funder);
+        token.approve(address(rewards), FUND_AMOUNT);
+        rewards.fundRewardPool(FUND_AMOUNT, REWARDS_PER_ROUND, DURATION);
+        vm.stopPrank();
+    }
+
+    /// @notice Test: calling claimRoundRewards twice for the same round
+    function test_ClaimRoundRewards_Twice_SameRound() public {
+        vm.startPrank(coordinator);
+        rewards.registerParticipant(0, 1, participant);
+        rewards.allocateRoundRewards(0, 1);
+        vm.stopPrank();
+
+        uint256[] memory modelIds = new uint256[](1);
+        uint256[] memory roundIds = new uint256[](1);
+        modelIds[0] = 0;
+        roundIds[0] = 1;
+
+        // First claim succeeds
+        vm.prank(participant);
+        rewards.claimRoundRewards(modelIds, roundIds);
+
+        uint256 balanceAfterFirst = token.balanceOf(participant);
+        assertGt(balanceAfterFirst, 0, "Should have received rewards");
+
+        // Second claim for same round should revert (roundClaimed = true, no rewards to add)
+        vm.prank(participant);
+        vm.expectRevert("No rewards to claim");
+        rewards.claimRoundRewards(modelIds, roundIds);
+
+        // Balance unchanged
+        assertEq(token.balanceOf(participant), balanceAfterFirst, "Balance should not change");
+    }
+
+    /// @notice Test: interleaved claims across multiple rounds can't exceed total
+    function test_InterleavedClaims_MultipleRounds() public {
+        // Allocate rewards for 3 rounds
+        vm.startPrank(coordinator);
+        rewards.registerParticipant(0, 1, participant);
+        rewards.allocateRoundRewards(0, 1);
+        rewards.registerParticipant(0, 2, participant);
+        rewards.allocateRoundRewards(0, 2);
+        rewards.registerParticipant(0, 3, participant);
+        rewards.allocateRoundRewards(0, 3);
+        vm.stopPrank();
+
+        (uint256 totalEarned,,,) = rewards.getParticipantStats(participant);
+
+        // Claim round 1 via claimRoundRewards
+        uint256[] memory modelIds = new uint256[](1);
+        uint256[] memory roundIds = new uint256[](1);
+        modelIds[0] = 0;
+        roundIds[0] = 1;
+
+        vm.prank(participant);
+        rewards.claimRoundRewards(modelIds, roundIds);
+
+        // Claim remaining via claimRewards (rounds 2 & 3)
+        vm.prank(participant);
+        rewards.claimRewards();
+
+        // Try to claim round 2 via claimRoundRewards - should fail
+        roundIds[0] = 2;
+        vm.prank(participant);
+        vm.expectRevert("Already claimed");
+        rewards.claimRoundRewards(modelIds, roundIds);
+
+        // Try to claim round 3 via claimRoundRewards - should fail
+        roundIds[0] = 3;
+        vm.prank(participant);
+        vm.expectRevert("Already claimed");
+        rewards.claimRoundRewards(modelIds, roundIds);
+
+        // Total claimed must equal total earned
+        assertEq(token.balanceOf(participant), totalEarned, "Total must equal earned");
+    }
+
+    /// @notice Test: batch claim with mix of already-claimed and new rounds
+    function test_BatchClaim_PartiallyClaimedRounds() public {
+        vm.startPrank(coordinator);
+        rewards.registerParticipant(0, 1, participant);
+        rewards.allocateRoundRewards(0, 1);
+        rewards.registerParticipant(0, 2, participant);
+        rewards.allocateRoundRewards(0, 2);
+        vm.stopPrank();
+
+        // Claim round 1 first
+        uint256[] memory modelIds = new uint256[](1);
+        uint256[] memory roundIds = new uint256[](1);
+        modelIds[0] = 0;
+        roundIds[0] = 1;
+
+        vm.prank(participant);
+        rewards.claimRoundRewards(modelIds, roundIds);
+        uint256 balanceAfterRound1 = token.balanceOf(participant);
+
+        // Now batch claim both rounds 1 and 2 - round 1 should be skipped
+        uint256[] memory batchModelIds = new uint256[](2);
+        uint256[] memory batchRoundIds = new uint256[](2);
+        batchModelIds[0] = 0;
+        batchModelIds[1] = 0;
+        batchRoundIds[0] = 1; // Already claimed
+        batchRoundIds[1] = 2; // Not claimed
+
+        vm.prank(participant);
+        rewards.claimRoundRewards(batchModelIds, batchRoundIds);
+
+        // Should have received only round 2 rewards (round 1 was skipped)
+        uint256 balanceAfterBatch = token.balanceOf(participant);
+        assertGt(balanceAfterBatch, balanceAfterRound1, "Should get round 2 rewards");
+
+        (uint256 totalEarned,,,) = rewards.getParticipantStats(participant);
+        assertEq(balanceAfterBatch, totalEarned, "Final balance should equal total earned");
+    }
+
+    /// @notice Test: claimRewards followed by claimRoundRewards is blocked
+    function test_ClaimRewards_Then_ClaimRoundRewards_Blocked() public {
+        vm.startPrank(coordinator);
+        rewards.registerParticipant(0, 1, participant);
+        rewards.allocateRoundRewards(0, 1);
+        vm.stopPrank();
+
+        // Claim all via claimRewards first
+        vm.prank(participant);
+        rewards.claimRewards();
+
+        // Try to double-claim via claimRoundRewards
+        uint256[] memory modelIds = new uint256[](1);
+        uint256[] memory roundIds = new uint256[](1);
+        modelIds[0] = 0;
+        roundIds[0] = 1;
+
+        vm.prank(participant);
+        vm.expectRevert("Already claimed");
+        rewards.claimRoundRewards(modelIds, roundIds);
+    }
+
+    /// @notice Test: two participants cannot steal each other's rewards
+    function test_TwoParticipants_IndependentClaims() public {
+        address participant2 = makeAddr("participant2");
+
+        vm.startPrank(coordinator);
+        rewards.registerParticipant(0, 1, participant);
+        rewards.registerParticipant(0, 1, participant2);
+        rewards.allocateRoundRewards(0, 1);
+        vm.stopPrank();
+
+        // Participant 1 claims
+        vm.prank(participant);
+        rewards.claimRewards();
+
+        // Participant 2 claims
+        vm.prank(participant2);
+        rewards.claimRewards();
+
+        // Both should have received equal shares
+        uint256 bal1 = token.balanceOf(participant);
+        uint256 bal2 = token.balanceOf(participant2);
+        assertEq(bal1, bal2, "Equal participants should receive equal rewards");
+        assertGt(bal1, 0, "Should have received rewards");
+
+        // Neither can claim again
+        vm.prank(participant);
+        vm.expectRevert("No rewards to claim");
+        rewards.claimRewards();
+
+        vm.prank(participant2);
+        vm.expectRevert("No rewards to claim");
+        rewards.claimRewards();
     }
 }

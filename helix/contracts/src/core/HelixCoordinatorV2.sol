@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import "../interfaces/IHelixVerifier.sol";
+import "./ModelRegistry.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /// @title HelixCoordinatorV2
@@ -11,7 +12,7 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 ///      Includes multi-sig emergency pause mechanism with time-locked recovery
 ///      and comprehensive challenger reward distribution
 ///      ReentrancyGuard added to protect external calls in slash() and unstake()
-///      Admin timelocks: 48-hour delay for parameter changes, 7-day delay for verifier updates
+///      Admin timelocks: 48-hour delay for parameter changes
 contract HelixCoordinatorV2 is ReentrancyGuard {
     // ============ Custom Errors (gas-optimized, ~200 gas savings per revert) ============
 
@@ -71,6 +72,10 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
     error NoTimelockPending();
     error TimelockAlreadyPending();
     error PaginationOutOfBounds();
+    // Proof replay error
+    error ProofAlreadyUsed();
+    // Batch submission error
+    error EmptyBatch();
 
     // ============ Structs (Optimized for Storage Packing) ============
 
@@ -114,6 +119,14 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
         uint40 timestamp;             // 5 bytes
     }
 
+    /// @notice Data for a single proof submission in a batch
+    struct ProofSubmissionData {
+        uint256 modelId;
+        uint256 roundId;
+        bytes proof;
+        uint256[] publicInputs;
+    }
+
     /// @notice Pending admin change for timelock enforcement
     struct PendingChange {
         bytes32 changeHash;           // Hash of the change parameters
@@ -126,14 +139,26 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
     /// @notice Timelock delay for parameter changes (48 hours)
     uint256 public constant PARAM_TIMELOCK = 48 hours;
 
-    /// @notice Timelock delay for verifier updates (7 days)
-    uint256 public constant VERIFIER_TIMELOCK = 7 days;
+    uint16 public constant DEFAULT_SLASH_PERCENTAGE = 5000;       // 50%
+    uint16 public constant DEFAULT_STAKE_LOCK_DAYS = 7;
+    uint256 public constant DEFAULT_MIN_STAKE = 0.1 ether;
+    uint256 public constant DEFAULT_MAX_ERROR_BOUND = 1e18;
+    uint8 public constant DEFAULT_REQUIRED_GUARDIANS = 2;
+    uint256 public constant DEFAULT_RECOVERY_TIMELOCK = 48 hours;
+    uint16 public constant DEFAULT_CHALLENGER_REWARD_PCT = 1000;   // 10%
+    uint128 public constant DEFAULT_MIN_CHALLENGER_REWARD = 0.001 ether;
+    uint128 public constant DEFAULT_MAX_CHALLENGER_REWARD = 10 ether;
+    uint16 public constant MAX_PERCENTAGE = 10000;                 // 100%
+    uint16 public constant MAX_REWARD_PERCENTAGE = 5000;           // 50%
+    uint8 public constant EXPECTED_PUBLIC_INPUTS = 8;
+    uint256 public constant MIN_RECOVERY_TIMELOCK = 1 hours;
+    uint256 public constant MAX_RECOVERY_TIMELOCK = 30 days;
 
     // ============ State Variables (Ordered for Optimal Packing) ============
 
-    // Slot 1: Verifier (immutable after deployment for gas savings)
+    // Verifier is immutable for gas savings (saves 2100 gas per SLOAD on every submitProof call)
     /// @notice The ZK proof verifier contract
-    IHelixVerifier public verifier;
+    IHelixVerifier public immutable verifier;
 
     // Slot 2: Packed addresses and small values
     /// @notice Treasury to receive slashed funds
@@ -166,6 +191,9 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
 
     /// @notice Slashing evidence contract address
     address public slashingEvidence;
+
+    /// @notice Optional model registry for checkpoint tracking
+    ModelRegistry public modelRegistry;
 
     // ============ Multi-Sig Emergency Pause State ============
 
@@ -232,6 +260,9 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
 
     /// @notice Slashing records - append only for audit trail
     SlashingRecord[] public slashingRecords;
+
+    /// @notice Proof replay protection: hash(proof || publicInputs) => used
+    mapping(bytes32 => bool) public usedProofHashes;
 
     // ============ Admin Timelock State ============
 
@@ -307,6 +338,15 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
         bytes32 proofHash
     );
 
+    /// @notice Emitted when a batch of proofs is submitted
+    event BatchProofSubmitted(address indexed submitter, uint256 totalProofs);
+
+    /// @notice Emitted when a proof replay attempt is blocked
+    event ProofReplayBlocked(
+        bytes32 indexed proofHash,
+        address indexed submitter
+    );
+
     /// @notice Emitted when model state changes
     event ModelStateChanged(
         uint256 indexed modelId,
@@ -340,6 +380,9 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
         uint256 indexed roundId,
         bytes32 dataRoot
     );
+
+    /// @notice Emitted when model registry is updated
+    event ModelRegistryUpdated(address indexed oldRegistry, address indexed newRegistry);
 
     /// @notice Emitted when data commitment contract is updated
     event DataCommitmentContractUpdated(
@@ -463,19 +506,19 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
         owner = msg.sender;
 
         // Initialize packed values
-        slashPercentage = 5000;  // 50%
-        stakeLockDays = 7;       // 7 days
-        defaultMinStake = 0.1 ether;
-        maxErrorBound = 1e18;    // 1.0 in 18-decimal fixed point
+        slashPercentage = DEFAULT_SLASH_PERCENTAGE;
+        stakeLockDays = DEFAULT_STAKE_LOCK_DAYS;
+        defaultMinStake = DEFAULT_MIN_STAKE;
+        maxErrorBound = DEFAULT_MAX_ERROR_BOUND;
 
         // Initialize multi-sig pause configuration
-        requiredGuardians = 2;   // Require 2 guardians for pause
-        recoveryTimeLock = 48 hours;
+        requiredGuardians = DEFAULT_REQUIRED_GUARDIANS;
+        recoveryTimeLock = DEFAULT_RECOVERY_TIMELOCK;
 
         // Initialize challenger reward configuration
-        challengerRewardPercentage = 1000;  // 10%
-        minChallengerReward = 0.001 ether;
-        maxChallengerReward = 10 ether;
+        challengerRewardPercentage = DEFAULT_CHALLENGER_REWARD_PCT;
+        minChallengerReward = DEFAULT_MIN_CHALLENGER_REWARD;
+        maxChallengerReward = DEFAULT_MAX_CHALLENGER_REWARD;
         challengerRewardsEnabled = true;
 
         // Owner is first guardian
@@ -507,6 +550,11 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
         });
 
         emit ModelRegistered(modelId, msg.sender, initialCommitment, minStake > 0 ? minStake : defaultMinStake, ipfsHash);
+
+        // Optional ModelRegistry integration
+        if (address(modelRegistry) != address(0)) {
+            modelRegistry.registerModel("", "", ipfsHash, bytes32(initialCommitment));
+        }
     }
 
     /// @notice Starts a new training round
@@ -572,7 +620,42 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
         uint256 roundId,
         bytes memory proof,
         uint256[] memory publicInputs
-    ) external nonReentrant modelExists(modelId) hasStake(modelId) {
+    ) external nonReentrant whenNotPaused {
+        _processProof(msg.sender, modelId, roundId, proof, publicInputs);
+    }
+
+    /// @notice Submits multiple proofs in a single transaction to amortize base tx costs
+    function submitProofBatch(ProofSubmissionData[] calldata submissions) external nonReentrant whenNotPaused {
+        uint256 n = submissions.length;
+        if (n == 0) revert EmptyBatch();
+        for (uint256 i = 0; i < n; i++) {
+            _processProof(
+                msg.sender,
+                submissions[i].modelId,
+                submissions[i].roundId,
+                submissions[i].proof,
+                submissions[i].publicInputs
+            );
+        }
+        emit BatchProofSubmitted(msg.sender, n);
+    }
+
+    /// @notice Internal proof processing logic
+    function _processProof(
+        address prover,
+        uint256 modelId,
+        uint256 roundId,
+        bytes memory proof,
+        uint256[] memory publicInputs
+    ) internal {
+        // Validate model exists
+        if (models[modelId].owner == address(0)) revert ModelNotFound();
+
+        // Validate stake
+        Stake storage s = stakes[prover][modelId];
+        if (s.amount < models[modelId].minStake) revert InsufficientStake();
+        if (s.slashed) revert StakeSlashed();
+
         Model storage model = models[modelId];
         Round storage round = rounds[modelId][roundId];
 
@@ -582,7 +665,12 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
         if (block.timestamp > round.deadline) revert RoundExpired();
 
         // Validate public inputs count (8 inputs including error checksum)
-        if (publicInputs.length != 8) revert InvalidPublicInputsCount();
+        if (publicInputs.length != EXPECTED_PUBLIC_INPUTS) revert InvalidPublicInputsCount();
+
+        // Proof replay protection
+        bytes32 proofHash = keccak256(abi.encodePacked(proof, publicInputs));
+        if (usedProofHashes[proofHash]) revert ProofAlreadyUsed();
+        usedProofHashes[proofHash] = true;
 
         // Reconstruct and validate old commitment
         uint256 oldCommitmentFromProof = _hashPair(publicInputs[0], publicInputs[1]);
@@ -606,8 +694,8 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
         bool valid = verifier.verifyProof(proof, publicInputs);
 
         if (!valid) {
-            _slash(msg.sender, modelId, roundId, "Invalid proof");
-            emit InvalidProofDetected(modelId, roundId, msg.sender, keccak256(proof));
+            _slash(prover, modelId, roundId, "Invalid proof");
+            emit InvalidProofDetected(modelId, roundId, prover, keccak256(proof));
             return;
         }
 
@@ -618,16 +706,21 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
         model.currentCommitment = newCommitment;
         round.newCommitment = newCommitment;
         round.isCompleted = true;
-        round.prover = msg.sender;
+        round.prover = prover;
 
         // Track accumulated error bound
         uint256 newAccumulatedError = accumulatedErrorBound[modelId] + stepErrorBound;
         accumulatedErrorBound[modelId] = newAccumulatedError;
 
         // Reset stake lock (reward for valid submission)
-        stakes[msg.sender][modelId].lockedUntil = uint40(block.timestamp);
+        stakes[prover][modelId].lockedUntil = uint40(block.timestamp);
 
-        emit ProofSubmitted(modelId, roundId, msg.sender, newCommitment, stepErrorBound);
+        // Optional ModelRegistry integration
+        if (address(modelRegistry) != address(0)) {
+            modelRegistry.updateModel(modelId, bytes32(newCommitment), roundId, "", stepErrorBound, proofHash);
+        }
+
+        emit ProofSubmitted(modelId, roundId, prover, newCommitment, stepErrorBound);
         emit RoundCompleted(modelId, roundId, newCommitment, newAccumulatedError);
     }
 
@@ -707,7 +800,7 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
         if (s.amount == 0) revert NoStakeToSlash();
         if (s.slashed) revert AlreadySlashed();
 
-        uint128 slashAmount = uint128((uint256(s.amount) * slashPercentage) / 10000);
+        uint128 slashAmount = uint128((uint256(s.amount) * slashPercentage) / MAX_PERCENTAGE);
         s.amount -= slashAmount;
         s.slashed = true;
 
@@ -746,7 +839,7 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
 
     /// @notice Calculate challenger reward from slashed amount
     function _calculateChallengerReward(uint128 slashAmount) internal view returns (uint128 reward) {
-        reward = uint128((uint256(slashAmount) * challengerRewardPercentage) / 10000);
+        reward = uint128((uint256(slashAmount) * challengerRewardPercentage) / MAX_PERCENTAGE);
 
         // Apply min/max bounds
         if (reward < minChallengerReward) {
@@ -846,6 +939,12 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
         return accumulatedErrorBound[modelId] <= maxAccumulated;
     }
 
+    /// @notice Checks if a proof has already been used
+    function isProofUsed(bytes memory proof, uint256[] memory publicInputs) external view returns (bool) {
+        bytes32 proofHash = keccak256(abi.encodePacked(proof, publicInputs));
+        return usedProofHashes[proofHash];
+    }
+
     /// @notice Gets the effective stake lock period in seconds
     function stakeLockPeriod() external view returns (uint256) {
         return uint256(stakeLockDays) * 1 days;
@@ -915,23 +1014,6 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
 
     // ============ Timelocked Admin Functions ============
 
-    /// @notice Propose verifier update (7-day timelock)
-    function proposeSetVerifier(address _verifier) external onlyOwner {
-        bytes32 key = keccak256("setVerifier");
-        bytes32 hash = keccak256(abi.encode(_verifier));
-        _proposeChange(key, hash, VERIFIER_TIMELOCK);
-    }
-
-    /// @notice Execute verifier update after timelock
-    function executeSetVerifier(address _verifier) external onlyOwner {
-        bytes32 key = keccak256("setVerifier");
-        bytes32 hash = keccak256(abi.encode(_verifier));
-        _executeChange(key, hash);
-
-        emit ConfigUpdated("verifier", uint256(uint160(address(verifier))), uint256(uint160(_verifier)));
-        verifier = IHelixVerifier(_verifier);
-    }
-
     /// @notice Propose treasury update (48-hour timelock)
     function proposeSetTreasury(address _treasury) external onlyOwner {
         if (_treasury == address(0)) revert InvalidTreasury();
@@ -942,6 +1024,7 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
 
     /// @notice Execute treasury update after timelock
     function executeSetTreasury(address _treasury) external onlyOwner {
+        if (_treasury == address(0)) revert InvalidTreasury();
         bytes32 key = keccak256("setTreasury");
         bytes32 hash = keccak256(abi.encode(_treasury));
         _executeChange(key, hash);
@@ -952,7 +1035,7 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
 
     /// @notice Propose slash percentage update (48-hour timelock)
     function proposeSetSlashPercentage(uint256 _percentage) external onlyOwner {
-        if (_percentage > 10000) revert MaxPercentage();
+        if (_percentage > MAX_PERCENTAGE) revert MaxPercentage();
         bytes32 key = keccak256("setSlashPercentage");
         bytes32 hash = keccak256(abi.encode(_percentage));
         _proposeChange(key, hash, PARAM_TIMELOCK);
@@ -1009,7 +1092,7 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
         uint128 _maxReward,
         bool _enabled
     ) external onlyOwner {
-        if (_rewardPercentage > 5000) revert MaxRewardPercentage();
+        if (_rewardPercentage > MAX_REWARD_PERCENTAGE) revert MaxRewardPercentage();
         if (_minReward > _maxReward) revert MinExceedsMax();
         bytes32 key = keccak256("setChallengerConfig");
         bytes32 hash = keccak256(abi.encode(_rewardPercentage, _minReward, _maxReward, _enabled));
@@ -1039,12 +1122,6 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
     // NOTE: These immediate setters bypass timelocks but ONLY work during emergency pause.
     // In normal operation, use the timelocked propose/execute functions above.
 
-    /// @notice Emergency verifier update (only when paused)
-    function setVerifier(address _verifier) external onlyOwner whenPaused {
-        emit ConfigUpdated("verifier", uint256(uint160(address(verifier))), uint256(uint160(_verifier)));
-        verifier = IHelixVerifier(_verifier);
-    }
-
     /// @notice Emergency treasury update (only when paused)
     function setTreasury(address _treasury) external onlyOwner whenPaused {
         if (_treasury == address(0)) revert InvalidTreasury();
@@ -1054,7 +1131,7 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
 
     /// @notice Emergency slash percentage update (only when paused)
     function setSlashPercentage(uint256 _percentage) external onlyOwner whenPaused {
-        if (_percentage > 10000) revert MaxPercentage();
+        if (_percentage > MAX_PERCENTAGE) revert MaxPercentage();
         emit ConfigUpdated("slashPercentage", slashPercentage, _percentage);
         slashPercentage = uint16(_percentage);
     }
@@ -1225,8 +1302,8 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
 
     /// @notice Update recovery time lock
     function setRecoveryTimeLock(uint256 _timeLock) external onlyOwner {
-        if (_timeLock < 1 hours) revert MinimumTimeLock();
-        if (_timeLock > 30 days) revert MaximumTimeLock();
+        if (_timeLock < MIN_RECOVERY_TIMELOCK) revert MinimumTimeLock();
+        if (_timeLock > MAX_RECOVERY_TIMELOCK) revert MaximumTimeLock();
         recoveryTimeLock = _timeLock;
     }
 
@@ -1239,7 +1316,7 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
         uint128 _maxReward,
         bool _enabled
     ) external onlyOwner {
-        if (_rewardPercentage > 5000) revert MaxRewardPercentage();
+        if (_rewardPercentage > MAX_REWARD_PERCENTAGE) revert MaxRewardPercentage();
         if (_minReward > _maxReward) revert MinExceedsMax();
 
         challengerRewardPercentage = _rewardPercentage;
@@ -1298,6 +1375,12 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
 
     // ============ Data Commitment Functions ============
 
+    /// @notice Set model registry address (optional integration)
+    function setModelRegistry(address _registry) external onlyOwner {
+        emit ModelRegistryUpdated(address(modelRegistry), _registry);
+        modelRegistry = ModelRegistry(_registry);
+    }
+
     /// @notice Set data commitment contract address
     function setDataCommitmentContract(address _dataCommitment) external onlyOwner {
         emit DataCommitmentContractUpdated(dataCommitment, _dataCommitment);
@@ -1320,11 +1403,13 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
     }
 
     /// @notice Commit data root for a specific round
+    /// @dev Restricted to model owner, contract owner, or dataCommitment contract
     function commitRoundData(
         uint256 modelId,
         uint256 roundId,
         bytes32 dataRoot
     ) external whenNotPaused modelExists(modelId) {
+        if (msg.sender != models[modelId].owner && msg.sender != owner && msg.sender != dataCommitment) revert NotAuthorized();
         if (roundId != models[modelId].currentRound) revert InvalidRound();
         if (dataRoot == bytes32(0)) revert InvalidDataRoot();
 

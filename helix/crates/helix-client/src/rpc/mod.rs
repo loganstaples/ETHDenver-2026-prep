@@ -17,7 +17,7 @@ pub mod chain;
 pub mod client;
 
 #[cfg(feature = "chain")]
-pub use chain::{ChainClient, ChainModelState, ChainRoundState, ChainStakeInfo, ForgeDeployResult, TrainingProofInputs};
+pub use chain::{ChainClient, ChainCircuitBreaker, ChainCircuitState, ChainModelState, ChainRoundState, ChainStakeInfo, ForgeDeployResult, TrainingProofInputs};
 
 pub use client::{
     // Core client types

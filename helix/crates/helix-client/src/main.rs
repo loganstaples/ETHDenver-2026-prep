@@ -307,7 +307,7 @@ struct TrainArgs {
     rpc_url: String,
 
     /// Private key for on-chain transactions (live mode)
-    #[arg(long, env = "PRIVATE_KEY", default_value = "")]
+    #[arg(long, env = "HELIX_PRIVATE_KEY", default_value = "")]
     private_key: String,
 
     /// Coordinator contract address (live mode)
@@ -352,7 +352,7 @@ struct SubmitProofArgs {
     rpc_url: String,
 
     /// Private key for signing transactions
-    #[arg(long, env = "PRIVATE_KEY")]
+    #[arg(long, env = "HELIX_PRIVATE_KEY")]
     private_key: String,
 
     /// Coordinator contract address
@@ -410,8 +410,8 @@ struct DemoArgs {
     #[arg(long, default_value = "42")]
     model_seed: u64,
 
-    /// Private key for on-chain transactions (live mode, defaults to Anvil account 0)
-    #[arg(long, env = "PRIVATE_KEY", default_value = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")]
+    /// Private key for on-chain transactions (live mode, set via HELIX_PRIVATE_KEY env)
+    #[arg(long, env = "HELIX_PRIVATE_KEY", default_value = "")]
     demo_private_key: String,
 
     /// Pre-deployed coordinator address (live mode, skip deployment if set)
@@ -1285,6 +1285,13 @@ async fn cmd_demo_live(args: &DemoArgs, mut shutdown: broadcast::Receiver<()>) -
         None => find_contracts_dir()?,
     };
 
+    // Validate private key is provided for on-chain operations
+    if args.demo_private_key.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Private key required for live demo. Set HELIX_PRIVATE_KEY env var or pass --demo-private-key"
+        ));
+    }
+
     let deploy = args.coordinator_address.is_none() && !args.skip_deploy;
     let coordinator = args.coordinator_address.clone().unwrap_or_default();
 
@@ -1496,65 +1503,35 @@ async fn cmd_orchestrate(args: &OrchestrateArgs, _cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_health(args: &HealthArgs, _cli: &Cli) -> Result<()> {
+async fn cmd_health(args: &HealthArgs, cli: &Cli) -> Result<()> {
     println!("{}", "Running health checks...".cyan().bold());
     println!();
 
-    let check_item = |name: &str, ok: bool, detail: &str| {
-        if ok {
-            println!("  {} {} {}", "✓".green(), name, detail.dimmed());
-        } else {
-            println!("  {} {} {}", "✗".red(), name, detail.red());
-        }
+    // Load config to get RPC URL
+    let config = if cli.config.exists() {
+        config::HelixConfig::load(&cli.config).unwrap_or_default()
+    } else {
+        config::HelixConfig::default()
     };
 
-    match args.target {
-        HealthTarget::All | HealthTarget::Nodes => {
-            println!("{}", "Nodes:".yellow().bold());
-            check_item("Local Node", true, "running (pid: 12345)");
-            check_item("Peer Connections", true, "4 peers connected");
-            check_item("Memory Usage", true, "1.2 GB / 8 GB");
-            check_item("CPU Usage", true, "23%");
-            println!();
-        }
-        _ => {}
-    }
+    let checker = health::HealthChecker::new(
+        Duration::from_secs(args.timeout),
+        &config.rpc.url,
+    )
+    .with_ipfs_gateway(&config.storage.ipfs_gateway)
+    .with_data_dir(config.node.data_dir.clone());
 
-    match args.target {
-        HealthTarget::All | HealthTarget::Contracts => {
-            println!("{}", "Contracts:".yellow().bold());
-            check_item("HelixCoordinator", true, "0x5FbDB2315678...");
-            check_item("HelixVerifier", true, "0xe7f1725E7734CE...");
-            check_item("HelixToken", true, "0x9fE46736679d2D...");
-            println!();
-        }
-        _ => {}
-    }
+    // Map CLI target to health module target
+    let target = match args.target {
+        HealthTarget::All => health::HealthTarget::All,
+        HealthTarget::Nodes => health::HealthTarget::Nodes,
+        HealthTarget::Contracts => health::HealthTarget::Contracts,
+        HealthTarget::Network => health::HealthTarget::Network,
+        HealthTarget::Storage => health::HealthTarget::Storage,
+    };
 
-    match args.target {
-        HealthTarget::All | HealthTarget::Network => {
-            println!("{}", "Network:".yellow().bold());
-            check_item("RPC Connection", true, "http://localhost:8545");
-            check_item("Block Height", true, "12,345,678");
-            check_item("Gas Price", true, "20 gwei");
-            check_item("Chain ID", true, "31337 (localhost)");
-            println!();
-        }
-        _ => {}
-    }
-
-    match args.target {
-        HealthTarget::All | HealthTarget::Storage => {
-            println!("{}", "Storage:".yellow().bold());
-            check_item("Data Directory", true, "~/.helix/data");
-            check_item("Model Cache", true, "2.5 GB used");
-            check_item("IPFS Gateway", true, "connected");
-            println!();
-        }
-        _ => {}
-    }
-
-    println!("{}", "All health checks passed!".green().bold());
+    let report = checker.check(target).await;
+    health::display_health_report(&report, args.detailed);
 
     Ok(())
 }
@@ -1870,7 +1847,7 @@ async fn cmd_train_chain(args: &TrainArgs) -> Result<()> {
 
     if args.private_key.is_empty() {
         return Err(anyhow::anyhow!(
-            "--private-key (or PRIVATE_KEY env) required for chain mode"
+            "--private-key (or HELIX_PRIVATE_KEY env) required for chain mode"
         ));
     }
     if args.coordinator_address.is_empty() {
@@ -1939,9 +1916,9 @@ async fn cmd_train_chain(args: &TrainArgs) -> Result<()> {
         self_verify: true,
         ..helix_prover::V2ProverConfig::default()
     };
-    let prover = helix_prover::MLTrainingProverV2::with_config(
+    let prover = Arc::new(helix_prover::MLTrainingProverV2::with_config(
         d_in, d_hid, d_out, prover_config,
-    );
+    ));
     let mut training_state = demo::real_training::TrainingState::new_random(d_in, d_hid, d_out);
     progress.finish_spinner("ZK prover initialized");
 
@@ -1968,7 +1945,7 @@ async fn cmd_train_chain(args: &TrainArgs) -> Result<()> {
                 .collect();
             let target_idx = rng.gen_range(0..d_out);
             let target: Vec<Fr> = (0..d_out)
-                .map(|i| if i == target_idx { Fr::ONE } else { Fr::ZERO })
+                .map(|i| if i == target_idx { Fr::from(1u64) } else { Fr::from(0u64) })
                 .collect();
             (x, target)
         };
@@ -1986,10 +1963,31 @@ async fn cmd_train_chain(args: &TrainArgs) -> Result<()> {
             helix_prover::halo2curves::bn256::Fr::from(1u64),
         );
 
-        // Generate real ZK proof
-        let proof_result = prover.prove(&witness).map_err(|e| {
-            anyhow::anyhow!("Proof generation failed at step {}: {:?}", step, e)
-        })?;
+        // Generate real ZK proof with timeout to prevent indefinite hangs
+        let proof_timeout = Duration::from_secs(300); // 5 minute timeout per proof
+        let proof_result = {
+            let witness_clone = witness.clone();
+            let prover_arc = Arc::clone(&prover);
+            let prove_future = tokio::task::spawn_blocking(move || {
+                prover_arc.prove(&witness_clone)
+            });
+            match tokio::time::timeout(proof_timeout, prove_future).await {
+                Ok(Ok(result)) => result.map_err(|e| {
+                    anyhow::anyhow!("Proof generation failed at step {}: {:?}", step, e)
+                })?,
+                Ok(Err(join_err)) => {
+                    return Err(anyhow::anyhow!(
+                        "Proof generation panicked at step {}: {}", step, join_err
+                    ));
+                }
+                Err(_) => {
+                    return Err(anyhow::anyhow!(
+                        "Proof generation timed out at step {} (limit: {}s)",
+                        step, proof_timeout.as_secs()
+                    ));
+                }
+            }
+        };
 
         // Update training state
         training_state.w1 = witness.w1_new.clone();

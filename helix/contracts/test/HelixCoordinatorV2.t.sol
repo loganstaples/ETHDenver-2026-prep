@@ -299,14 +299,6 @@ contract HelixCoordinatorV2Test is Test {
         assertTrue(active);
     }
 
-    function test_SetVerifier() public {
-        Halo2Verifier newVerifier = new Halo2Verifier(Halo2VKDefaults.g2Generator());
-        coordinator.emergencyPause();
-        coordinator.setVerifier(address(newVerifier));
-        coordinator.unpause();
-        assertEq(address(coordinator.verifier()), address(newVerifier));
-    }
-
     function test_SetTreasury() public {
         address newTreasury = makeAddr("newTreasury");
         coordinator.emergencyPause();

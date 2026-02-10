@@ -7,12 +7,14 @@
 
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use ethers::prelude::*;
 use ethers::providers::{Http, Provider};
 use ethers::signers::{LocalWallet, Signer};
 use ethers::types::{Address, Bytes, U256};
+use tokio::sync::RwLock;
 
 /// Addresses of contracts deployed via `deploy_with_forge`.
 ///
@@ -124,14 +126,105 @@ impl TrainingProofInputs {
     }
 }
 
+/// Circuit breaker state for the on-chain RPC endpoint.
+///
+/// Prevents hammering a down/flaky RPC by tracking consecutive failures
+/// and temporarily rejecting calls when the failure threshold is exceeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainCircuitState {
+    /// Normal operation — calls flow through
+    Closed,
+    /// Breaker tripped — calls are rejected immediately
+    Open,
+    /// Testing recovery — one probe call allowed
+    HalfOpen,
+}
+
+/// Circuit breaker for the on-chain RPC endpoint.
+#[derive(Debug)]
+pub struct ChainCircuitBreaker {
+    state: ChainCircuitState,
+    failure_count: u32,
+    threshold: u32,
+    last_failure_time: Option<Instant>,
+    reset_timeout: Duration,
+}
+
+impl ChainCircuitBreaker {
+    pub fn new(threshold: u32, reset_timeout: Duration) -> Self {
+        Self {
+            state: ChainCircuitState::Closed,
+            failure_count: 0,
+            threshold,
+            last_failure_time: None,
+            reset_timeout,
+        }
+    }
+
+    /// Check whether a call should be allowed through.
+    pub fn allow_request(&mut self) -> bool {
+        match self.state {
+            ChainCircuitState::Closed => true,
+            ChainCircuitState::Open => {
+                if let Some(last) = self.last_failure_time {
+                    if last.elapsed() >= self.reset_timeout {
+                        self.state = ChainCircuitState::HalfOpen;
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
+            ChainCircuitState::HalfOpen => true,
+        }
+    }
+
+    /// Record a successful call — resets the breaker.
+    pub fn record_success(&mut self) {
+        self.failure_count = 0;
+        self.state = ChainCircuitState::Closed;
+    }
+
+    /// Record a failed call — may trip the breaker.
+    pub fn record_failure(&mut self) {
+        self.failure_count += 1;
+        self.last_failure_time = Some(Instant::now());
+        if self.failure_count >= self.threshold {
+            self.state = ChainCircuitState::Open;
+        }
+    }
+
+    /// Get the current state.
+    pub fn state(&self) -> ChainCircuitState {
+        self.state
+    }
+
+    /// Get the consecutive failure count.
+    pub fn failure_count(&self) -> u32 {
+        self.failure_count
+    }
+}
+
+impl Default for ChainCircuitBreaker {
+    fn default() -> Self {
+        Self::new(5, Duration::from_secs(30))
+    }
+}
+
 /// On-chain client for the HELIX coordinator contract.
 ///
 /// Wraps an ethers `SignerMiddleware<Provider<Http>, LocalWallet>` to make
 /// typed contract calls against `HelixCoordinatorV2`.
+///
+/// Includes a circuit breaker that trips after repeated RPC failures,
+/// preventing the client from hammering a downed endpoint.
 pub struct ChainClient {
     client: Arc<SignerMiddleware<Provider<Http>, LocalWallet>>,
     coordinator: HelixCoordinatorV2<SignerMiddleware<Provider<Http>, LocalWallet>>,
     coordinator_address: Address,
+    circuit_breaker: Arc<RwLock<ChainCircuitBreaker>>,
 }
 
 impl ChainClient {
@@ -168,6 +261,7 @@ impl ChainClient {
             client,
             coordinator,
             coordinator_address: addr,
+            circuit_breaker: Arc::new(RwLock::new(ChainCircuitBreaker::default())),
         })
     }
 
@@ -198,7 +292,56 @@ impl ChainClient {
             client,
             coordinator,
             coordinator_address: addr,
+            circuit_breaker: Arc::new(RwLock::new(ChainCircuitBreaker::default())),
         })
+    }
+
+    /// Check the circuit breaker before making an RPC call.
+    /// Returns an error if the breaker is open.
+    async fn check_circuit_breaker(&self) -> Result<()> {
+        let mut cb = self.circuit_breaker.write().await;
+        if !cb.allow_request() {
+            return Err(anyhow!(
+                "RPC circuit breaker is open — endpoint unavailable (failures: {}, cooldown: {}s)",
+                cb.failure_count(),
+                cb.reset_timeout.as_secs()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Record a successful RPC call.
+    async fn record_success(&self) {
+        self.circuit_breaker.write().await.record_success();
+    }
+
+    /// Record a failed RPC call.
+    async fn record_failure(&self) {
+        self.circuit_breaker.write().await.record_failure();
+    }
+
+    /// Execute an async operation with circuit breaker protection.
+    async fn with_circuit_breaker<F, Fut, T>(&self, op_name: &str, f: F) -> Result<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        self.check_circuit_breaker().await?;
+        match f().await {
+            Ok(result) => {
+                self.record_success().await;
+                Ok(result)
+            }
+            Err(e) => {
+                self.record_failure().await;
+                Err(anyhow!("{}: {}", op_name, e))
+            }
+        }
+    }
+
+    /// Get a reference to the circuit breaker (for monitoring/testing).
+    pub fn circuit_breaker(&self) -> &Arc<RwLock<ChainCircuitBreaker>> {
+        &self.circuit_breaker
     }
 
     /// Returns the signer's Ethereum address.
@@ -222,47 +365,57 @@ impl ChainClient {
         initial_commitment: U256,
         min_stake: U256,
     ) -> Result<(TransactionReceipt, u64)> {
-        let call = self.coordinator.register_model(
-            ipfs_hash.to_string(),
-            initial_commitment,
-            min_stake,
-        );
-        let pending = call.send().await.map_err(|e| anyhow!("register_model send: {}", e))?;
-        let receipt = pending
-            .await
-            .map_err(|e| anyhow!("register_model receipt: {}", e))?
-            .ok_or_else(|| anyhow!("register_model: tx dropped"))?;
+        self.check_circuit_breaker().await?;
+        let result: Result<(TransactionReceipt, u64)> = async {
+            let call = self.coordinator.register_model(
+                ipfs_hash.to_string(),
+                initial_commitment,
+                min_stake,
+            );
+            let pending = call.send().await.map_err(|e| anyhow!("register_model send: {}", e))?;
+            let receipt = pending
+                .await
+                .map_err(|e| anyhow!("register_model receipt: {}", e))?
+                .ok_or_else(|| anyhow!("register_model: tx dropped"))?;
 
-        // Parse model ID from event logs (first indexed topic after event sig)
-        let model_id = receipt
-            .logs
-            .iter()
-            .find_map(|log| {
-                if log.topics.len() >= 2 {
-                    Some(U256::from(log.topics[1].as_bytes()).as_u64())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(0);
+            // Parse model ID from event logs (first indexed topic after event sig)
+            let model_id = receipt
+                .logs
+                .iter()
+                .find_map(|log| {
+                    if log.topics.len() >= 2 {
+                        Some(U256::from(log.topics[1].as_bytes()).as_u64())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
 
-        Ok((receipt, model_id))
+            Ok((receipt, model_id))
+        }.await;
+        if result.is_ok() { self.record_success().await; } else { self.record_failure().await; }
+        result
     }
 
     /// Get the current state of a model.
     pub async fn get_model_state(&self, model_id: u64) -> Result<ChainModelState> {
-        let (current_round, current_commitment, active) = self
-            .coordinator
-            .get_model_state(U256::from(model_id))
-            .call()
-            .await
-            .map_err(|e| anyhow!("get_model_state: {}", e))?;
+        self.check_circuit_breaker().await?;
+        let result: Result<ChainModelState> = async {
+            let (current_round, current_commitment, active) = self
+                .coordinator
+                .get_model_state(U256::from(model_id))
+                .call()
+                .await
+                .map_err(|e| anyhow!("get_model_state: {}", e))?;
 
-        Ok(ChainModelState {
-            current_round: current_round.as_u64(),
-            current_commitment,
-            active,
-        })
+            Ok(ChainModelState {
+                current_round: current_round.as_u64(),
+                current_commitment,
+                active,
+            })
+        }.await;
+        if result.is_ok() { self.record_success().await; } else { self.record_failure().await; }
+        result
     }
 
     /// Start a new training round.
@@ -271,15 +424,20 @@ impl ChainClient {
         model_id: u64,
         duration_secs: u64,
     ) -> Result<TransactionReceipt> {
-        let call = self.coordinator.start_round(
-            U256::from(model_id),
-            U256::from(duration_secs),
-        );
-        let pending = call.send().await.map_err(|e| anyhow!("start_round send: {}", e))?;
-        pending
-            .await
-            .map_err(|e| anyhow!("start_round receipt: {}", e))?
-            .ok_or_else(|| anyhow!("start_round: tx dropped"))
+        self.check_circuit_breaker().await?;
+        let result: Result<TransactionReceipt> = async {
+            let call = self.coordinator.start_round(
+                U256::from(model_id),
+                U256::from(duration_secs),
+            );
+            let pending = call.send().await.map_err(|e| anyhow!("start_round send: {}", e))?;
+            pending
+                .await
+                .map_err(|e| anyhow!("start_round receipt: {}", e))?
+                .ok_or_else(|| anyhow!("start_round: tx dropped"))
+        }.await;
+        if result.is_ok() { self.record_success().await; } else { self.record_failure().await; }
+        result
     }
 
     /// Get the state of a specific round.
@@ -288,20 +446,25 @@ impl ChainClient {
         model_id: u64,
         round_id: u64,
     ) -> Result<ChainRoundState> {
-        let (model_commitment, new_commitment, is_completed, deadline, prover) = self
-            .coordinator
-            .rounds(U256::from(model_id), U256::from(round_id))
-            .call()
-            .await
-            .map_err(|e| anyhow!("get_round_state: {}", e))?;
+        self.check_circuit_breaker().await?;
+        let result: Result<ChainRoundState> = async {
+            let (model_commitment, new_commitment, is_completed, deadline, prover) = self
+                .coordinator
+                .rounds(U256::from(model_id), U256::from(round_id))
+                .call()
+                .await
+                .map_err(|e| anyhow!("get_round_state: {}", e))?;
 
-        Ok(ChainRoundState {
-            model_commitment,
-            new_commitment,
-            is_completed,
-            deadline: deadline.as_u64(),
-            prover,
-        })
+            Ok(ChainRoundState {
+                model_commitment,
+                new_commitment,
+                is_completed,
+                deadline: deadline.as_u64(),
+                prover,
+            })
+        }.await;
+        if result.is_ok() { self.record_success().await; } else { self.record_failure().await; }
+        result
     }
 
     // ======================== Staking ========================
@@ -312,22 +475,32 @@ impl ChainClient {
         model_id: u64,
         amount: U256,
     ) -> Result<TransactionReceipt> {
-        let call = self.coordinator.stake(U256::from(model_id)).value(amount);
-        let pending = call.send().await.map_err(|e| anyhow!("stake send: {}", e))?;
-        pending
-            .await
-            .map_err(|e| anyhow!("stake receipt: {}", e))?
-            .ok_or_else(|| anyhow!("stake: tx dropped"))
+        self.check_circuit_breaker().await?;
+        let result: Result<TransactionReceipt> = async {
+            let call = self.coordinator.stake(U256::from(model_id)).value(amount);
+            let pending = call.send().await.map_err(|e| anyhow!("stake send: {}", e))?;
+            pending
+                .await
+                .map_err(|e| anyhow!("stake receipt: {}", e))?
+                .ok_or_else(|| anyhow!("stake: tx dropped"))
+        }.await;
+        if result.is_ok() { self.record_success().await; } else { self.record_failure().await; }
+        result
     }
 
     /// Unstake from a model.
     pub async fn unstake(&self, model_id: u64) -> Result<TransactionReceipt> {
-        let call = self.coordinator.unstake(U256::from(model_id));
-        let pending = call.send().await.map_err(|e| anyhow!("unstake send: {}", e))?;
-        pending
-            .await
-            .map_err(|e| anyhow!("unstake receipt: {}", e))?
-            .ok_or_else(|| anyhow!("unstake: tx dropped"))
+        self.check_circuit_breaker().await?;
+        let result: Result<TransactionReceipt> = async {
+            let call = self.coordinator.unstake(U256::from(model_id));
+            let pending = call.send().await.map_err(|e| anyhow!("unstake send: {}", e))?;
+            pending
+                .await
+                .map_err(|e| anyhow!("unstake receipt: {}", e))?
+                .ok_or_else(|| anyhow!("unstake: tx dropped"))
+        }.await;
+        if result.is_ok() { self.record_success().await; } else { self.record_failure().await; }
+        result
     }
 
     /// Get stake info for an address.
@@ -336,18 +509,23 @@ impl ChainClient {
         prover: Address,
         model_id: u64,
     ) -> Result<ChainStakeInfo> {
-        let (amount, locked_until, slashed) = self
-            .coordinator
-            .get_stake(prover, U256::from(model_id))
-            .call()
-            .await
-            .map_err(|e| anyhow!("get_stake: {}", e))?;
+        self.check_circuit_breaker().await?;
+        let result: Result<ChainStakeInfo> = async {
+            let (amount, locked_until, slashed) = self
+                .coordinator
+                .get_stake(prover, U256::from(model_id))
+                .call()
+                .await
+                .map_err(|e| anyhow!("get_stake: {}", e))?;
 
-        Ok(ChainStakeInfo {
-            amount,
-            locked_until: locked_until.as_u64(),
-            slashed,
-        })
+            Ok(ChainStakeInfo {
+                amount,
+                locked_until: locked_until.as_u64(),
+                slashed,
+            })
+        }.await;
+        if result.is_ok() { self.record_success().await; } else { self.record_failure().await; }
+        result
     }
 
     // ======================== Proof Submission ========================
@@ -360,17 +538,22 @@ impl ChainClient {
         proof: Vec<u8>,
         inputs: &TrainingProofInputs,
     ) -> Result<TransactionReceipt> {
-        let call = self.coordinator.submit_proof(
-            U256::from(model_id),
-            U256::from(round_id),
-            Bytes::from(proof),
-            inputs.to_vec(),
-        );
-        let pending = call.send().await.map_err(|e| anyhow!("submit_proof send: {}", e))?;
-        pending
-            .await
-            .map_err(|e| anyhow!("submit_proof receipt: {}", e))?
-            .ok_or_else(|| anyhow!("submit_proof: tx dropped"))
+        self.check_circuit_breaker().await?;
+        let result: Result<TransactionReceipt> = async {
+            let call = self.coordinator.submit_proof(
+                U256::from(model_id),
+                U256::from(round_id),
+                Bytes::from(proof),
+                inputs.to_vec(),
+            );
+            let pending = call.send().await.map_err(|e| anyhow!("submit_proof send: {}", e))?;
+            pending
+                .await
+                .map_err(|e| anyhow!("submit_proof receipt: {}", e))?
+                .ok_or_else(|| anyhow!("submit_proof: tx dropped"))
+        }.await;
+        if result.is_ok() { self.record_success().await; } else { self.record_failure().await; }
+        result
     }
 
     /// Submit a proof with raw U256 public inputs.
@@ -381,17 +564,22 @@ impl ChainClient {
         proof: Vec<u8>,
         public_inputs: Vec<U256>,
     ) -> Result<TransactionReceipt> {
-        let call = self.coordinator.submit_proof(
-            U256::from(model_id),
-            U256::from(round_id),
-            Bytes::from(proof),
-            public_inputs,
-        );
-        let pending = call.send().await.map_err(|e| anyhow!("submit_proof_raw send: {}", e))?;
-        pending
-            .await
-            .map_err(|e| anyhow!("submit_proof_raw receipt: {}", e))?
-            .ok_or_else(|| anyhow!("submit_proof_raw: tx dropped"))
+        self.check_circuit_breaker().await?;
+        let result: Result<TransactionReceipt> = async {
+            let call = self.coordinator.submit_proof(
+                U256::from(model_id),
+                U256::from(round_id),
+                Bytes::from(proof),
+                public_inputs,
+            );
+            let pending = call.send().await.map_err(|e| anyhow!("submit_proof_raw send: {}", e))?;
+            pending
+                .await
+                .map_err(|e| anyhow!("submit_proof_raw receipt: {}", e))?
+                .ok_or_else(|| anyhow!("submit_proof_raw: tx dropped"))
+        }.await;
+        if result.is_ok() { self.record_success().await; } else { self.record_failure().await; }
+        result
     }
 
     // ======================== Event Querying ========================
@@ -402,13 +590,18 @@ impl ChainClient {
         from_block: u64,
         to_block: Option<u64>,
     ) -> Result<Vec<ProofSubmittedFilter>> {
-        let filter = self.coordinator.proof_submitted_filter().from_block(from_block);
-        let filter = if let Some(to) = to_block {
-            filter.to_block(to)
-        } else {
-            filter
-        };
-        filter.query().await.map_err(|e| anyhow!("query_proof_submitted: {}", e))
+        self.check_circuit_breaker().await?;
+        let result: Result<Vec<ProofSubmittedFilter>> = async {
+            let filter = self.coordinator.proof_submitted_filter().from_block(from_block);
+            let filter = if let Some(to) = to_block {
+                filter.to_block(to)
+            } else {
+                filter
+            };
+            filter.query().await.map_err(|e| anyhow!("query_proof_submitted: {}", e))
+        }.await;
+        if result.is_ok() { self.record_success().await; } else { self.record_failure().await; }
+        result
     }
 
     /// Query RoundCompleted events.
@@ -417,13 +610,18 @@ impl ChainClient {
         from_block: u64,
         to_block: Option<u64>,
     ) -> Result<Vec<RoundCompletedFilter>> {
-        let filter = self.coordinator.round_completed_filter().from_block(from_block);
-        let filter = if let Some(to) = to_block {
-            filter.to_block(to)
-        } else {
-            filter
-        };
-        filter.query().await.map_err(|e| anyhow!("query_round_completed: {}", e))
+        self.check_circuit_breaker().await?;
+        let result: Result<Vec<RoundCompletedFilter>> = async {
+            let filter = self.coordinator.round_completed_filter().from_block(from_block);
+            let filter = if let Some(to) = to_block {
+                filter.to_block(to)
+            } else {
+                filter
+            };
+            filter.query().await.map_err(|e| anyhow!("query_round_completed: {}", e))
+        }.await;
+        if result.is_ok() { self.record_success().await; } else { self.record_failure().await; }
+        result
     }
 
     /// Deploy contracts via `forge script` and return a `ChainClient`

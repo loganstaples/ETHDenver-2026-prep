@@ -357,11 +357,6 @@ contract HelixCoordinatorV3Test is Test {
         coordinator.setTreasury(address(0));
     }
 
-    function test_SetVerifier_RejectsZeroAddress() public {
-        vm.expectRevert("Invalid verifier");
-        coordinator.setVerifier(address(0));
-    }
-
     // ============ Pause Tests ============
 
     function test_EmergencyPause() public {

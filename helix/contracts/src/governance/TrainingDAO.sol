@@ -3,12 +3,13 @@ pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/governance/utils/IVotes.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /// @title TrainingDAO
 /// @notice Decentralized governance over training parameters and model updates
 /// @dev Uses ERC20Votes snapshot-based voting to prevent flash loan attacks.
 ///      Voting power is based on getPastVotes() at the block when the proposal was created.
-contract TrainingDAO {
+contract TrainingDAO is ReentrancyGuard {
     /// @notice The HELIX token for voting (must implement IVotes / ERC20Votes)
     IERC20 public immutable helixToken;
 
@@ -162,7 +163,7 @@ contract TrainingDAO {
         bytes memory callData
     ) public returns (uint256 proposalId) {
         require(
-            helixToken.balanceOf(msg.sender) >= govConfig.proposalThreshold,
+            votesToken.getVotes(msg.sender) >= govConfig.proposalThreshold,
             "Below proposal threshold"
         );
 
@@ -193,17 +194,15 @@ contract TrainingDAO {
         string calldata description,
         ParameterProposal calldata params
     ) external returns (uint256 proposalId) {
-        // Fix: use internal createProposal (public function) instead of this.createProposal
-        // (external call) which wastes gas and breaks msg.sender context
-        proposalId = createProposal(
+        // Pre-compute proposalId so calldata is correct from creation (no placeholder needed)
+        proposalId = proposalCount + 1;
+
+        createProposal(
             ProposalType.ParameterChange,
             description,
             address(this),
-            abi.encodeWithSignature("applyParameters(uint256)", 0) // placeholder, updated below
+            abi.encodeWithSignature("applyParameters(uint256)", proposalId)
         );
-
-        // Update the callData with the actual proposalId
-        proposals[proposalId].callData = abi.encodeWithSignature("applyParameters(uint256)", proposalId);
 
         parameterProposals[proposalId] = params;
     }
@@ -246,7 +245,7 @@ contract TrainingDAO {
 
     /// @notice Execute a queued proposal
     /// @param proposalId ID of the proposal
-    function executeProposal(uint256 proposalId) external {
+    function executeProposal(uint256 proposalId) external nonReentrant {
         require(getProposalState(proposalId) == ProposalState.Queued, "Not queued");
         require(block.timestamp >= queuedProposals[proposalId], "Timelock not expired");
 
@@ -271,7 +270,7 @@ contract TrainingDAO {
         require(!proposal.cancelled, "Already cancelled");
         require(
             msg.sender == proposal.proposer ||
-            helixToken.balanceOf(proposal.proposer) < govConfig.proposalThreshold,
+            votesToken.getVotes(proposal.proposer) < govConfig.proposalThreshold,
             "Cannot cancel"
         );
 

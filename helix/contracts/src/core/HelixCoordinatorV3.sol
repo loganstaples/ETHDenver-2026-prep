@@ -48,10 +48,29 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
         uint40 timestamp;
     }
 
+    /// @notice Data for a single proof submission in a batch
+    struct ProofSubmissionData {
+        uint256 modelId;
+        uint256 roundId;
+        bytes proof;
+        uint256[] publicInputs;
+    }
+
+    // ============ Constants ============
+
+    uint256 public constant DEFAULT_MAX_ERROR_BOUND = 1e18;
+    uint8 public constant DEFAULT_REQUIRED_GUARDIANS = 2;
+    uint256 public constant DEFAULT_RECOVERY_TIMELOCK = 48 hours;
+    uint16 public constant DEFAULT_CHALLENGER_REWARD_PCT = 1000;   // 10%
+    uint16 public constant MAX_REWARD_PERCENTAGE = 5000;           // 50%
+    uint8 public constant EXPECTED_PUBLIC_INPUTS = 8;
+    uint256 public constant MIN_RECOVERY_TIMELOCK = 1 hours;
+    uint256 public constant MAX_RECOVERY_TIMELOCK = 30 days;
+
     // ============ External Contracts ============
 
     /// @notice ZK proof verifier (Halo2Verifier)
-    IHelixVerifier public verifier;
+    IHelixVerifier public immutable verifier;
 
     /// @notice Token-based staking contract
     Staking public stakingContract;
@@ -152,6 +171,7 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
         address indexed prover,
         bytes32 proofHash
     );
+    event BatchProofSubmitted(address indexed submitter, uint256 totalProofs);
     event ProofReplayBlocked(
         bytes32 indexed proofHash,
         address indexed submitter
@@ -226,14 +246,14 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
         treasury = _treasury;
         owner = msg.sender;
 
-        maxErrorBound = 1e18;
+        maxErrorBound = DEFAULT_MAX_ERROR_BOUND;
 
         // Multi-sig pause
-        requiredGuardians = 2;
-        recoveryTimeLock = 48 hours;
+        requiredGuardians = DEFAULT_REQUIRED_GUARDIANS;
+        recoveryTimeLock = DEFAULT_RECOVERY_TIMELOCK;
 
         // Challenger rewards
-        challengerRewardPercentage = 1000; // 10%
+        challengerRewardPercentage = DEFAULT_CHALLENGER_REWARD_PCT;
         challengerRewardsEnabled = true;
 
         // Owner is first guardian
@@ -296,19 +316,44 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
     // ============ Proof Submission ============
 
     /// @notice Submits a training proof for a round
-    /// @dev Integrates: replay protection, token staking check, rewards, registry checkpoint
-    /// @param modelId The model ID
-    /// @param roundId The round ID
-    /// @param proof The ZK proof bytes
-    /// @param publicInputs [oldHashLo, oldHashHi, newHashLo, newHashHi, loss, errorBound, stepNumber, errorChecksum]
     function submitProof(
         uint256 modelId,
         uint256 roundId,
         bytes memory proof,
         uint256[] memory publicInputs
-    ) external whenNotPaused nonReentrant modelExists(modelId) {
+    ) external whenNotPaused nonReentrant {
+        _processProof(msg.sender, modelId, roundId, proof, publicInputs);
+    }
+
+    /// @notice Submits multiple proofs in a single transaction to amortize base tx costs
+    function submitProofBatch(ProofSubmissionData[] calldata submissions) external whenNotPaused nonReentrant {
+        uint256 n = submissions.length;
+        require(n > 0, "Empty batch");
+        for (uint256 i = 0; i < n; i++) {
+            _processProof(
+                msg.sender,
+                submissions[i].modelId,
+                submissions[i].roundId,
+                submissions[i].proof,
+                submissions[i].publicInputs
+            );
+        }
+        emit BatchProofSubmitted(msg.sender, n);
+    }
+
+    /// @notice Internal proof processing logic
+    function _processProof(
+        address prover,
+        uint256 modelId,
+        uint256 roundId,
+        bytes memory proof,
+        uint256[] memory publicInputs
+    ) internal {
+        // Validate model exists
+        require(models[modelId].owner != address(0), "Model does not exist");
+
         // Check staker has sufficient tokens via Staking.sol
-        require(stakingContract.canParticipate(msg.sender), "Insufficient stake or not active");
+        require(stakingContract.canParticipate(prover), "Insufficient stake or not active");
 
         Model storage model = models[modelId];
         Round storage round = rounds[modelId][roundId];
@@ -319,7 +364,7 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
         require(block.timestamp <= round.deadline, "Round expired");
 
         // Validate public inputs count
-        require(publicInputs.length == 8, "Invalid public inputs count");
+        require(publicInputs.length == EXPECTED_PUBLIC_INPUTS, "Invalid public inputs count");
 
         // Proof replay protection
         bytes32 proofHash = keccak256(abi.encodePacked(proof, publicInputs));
@@ -349,20 +394,19 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
 
         if (!valid) {
             // Slash via Staking.sol - invalid proofs are Major severity (50% slash)
-            // This matches V2 behavior where invalid proofs slash 50% immediately
             stakingContract.slashWithSeverity(
-                msg.sender,
+                prover,
                 Staking.SeverityLevel.Major,
                 Staking.ViolationType.InvalidProof,
                 address(0),
                 "Invalid ZK proof submitted"
             );
 
-            emit InvalidProofDetected(modelId, roundId, msg.sender, proofHash);
+            emit InvalidProofDetected(modelId, roundId, prover, proofHash);
 
             // Record slashing
             slashingRecords.push(SlashingRecord({
-                prover: msg.sender,
+                prover: prover,
                 modelId: uint64(modelId),
                 roundId: uint32(roundId),
                 amount: 0, // Actual amount determined by Staking.sol severity
@@ -379,7 +423,7 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
         model.currentCommitment = newCommitment;
         round.newCommitment = newCommitment;
         round.isCompleted = true;
-        round.prover = msg.sender;
+        round.prover = prover;
 
         // Track accumulated error bound
         uint256 newAccumulatedError = accumulatedErrorBound[modelId] + stepErrorBound;
@@ -396,11 +440,11 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
         );
 
         // Register participant for rewards and allocate round rewards
-        rewardsContract.registerParticipant(modelId, roundId, msg.sender);
+        rewardsContract.registerParticipant(modelId, roundId, prover);
         // Attempt to allocate rewards (may fail if pool is empty, which is OK)
         try rewardsContract.allocateRoundRewards(modelId, roundId) {} catch {}
 
-        emit ProofSubmitted(modelId, roundId, msg.sender, newCommitment, stepErrorBound);
+        emit ProofSubmitted(modelId, roundId, prover, newCommitment, stepErrorBound);
         emit RoundCompleted(modelId, roundId, newCommitment, newAccumulatedError);
     }
 
@@ -527,12 +571,6 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
     }
 
     // ============ Admin Functions ============
-
-    function setVerifier(address _verifier) external onlyOwner {
-        require(_verifier != address(0), "Invalid verifier");
-        emit ConfigUpdated("verifier", uint256(uint160(address(verifier))), uint256(uint160(_verifier)));
-        verifier = IHelixVerifier(_verifier);
-    }
 
     function setTreasury(address _treasury) external onlyOwner {
         require(_treasury != address(0), "Invalid treasury");
@@ -684,15 +722,15 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
     }
 
     function setRecoveryTimeLock(uint256 _timeLock) external onlyOwner {
-        require(_timeLock >= 1 hours, "Minimum 1 hour");
-        require(_timeLock <= 30 days, "Maximum 30 days");
+        require(_timeLock >= MIN_RECOVERY_TIMELOCK, "Minimum 1 hour");
+        require(_timeLock <= MAX_RECOVERY_TIMELOCK, "Maximum 30 days");
         recoveryTimeLock = _timeLock;
     }
 
     // ============ Challenger Config ============
 
     function setChallengerConfig(uint16 _rewardPercentage, bool _enabled) external onlyOwner {
-        require(_rewardPercentage <= 5000, "Max 50% reward");
+        require(_rewardPercentage <= MAX_REWARD_PERCENTAGE, "Max 50% reward");
         challengerRewardPercentage = _rewardPercentage;
         challengerRewardsEnabled = _enabled;
         emit ChallengerConfigUpdated(_rewardPercentage, _enabled);
