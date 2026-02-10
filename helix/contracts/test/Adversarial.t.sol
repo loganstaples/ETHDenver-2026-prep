@@ -64,11 +64,9 @@ contract AdversarialTest is Test {
 
     // ============ Helper Functions ============
 
-    /// @dev Wraps legacy setter calls with pause/unpause (emergency-only since B4 hardening)
-    function _emergencySetVerifier(address _verifier) internal {
-        coordinator.emergencyPause();
-        coordinator.setVerifier(_verifier);
-        coordinator.unpause();
+    /// @dev Configures mock verifier to reject proofs (simulates switching to real verifier)
+    function _setVerifierToReject() internal {
+        mockVerifier.setShouldPass(false);
     }
 
     function _emergencySetSlashPercentage(uint256 _percentage) internal {
@@ -138,7 +136,7 @@ contract AdversarialTest is Test {
 
     /// @notice Test submitting malformed proof (too short)
     function test_MalformedProofTooShort() public {
-        _emergencySetVerifier(address(realVerifier));
+        _setVerifierToReject();
         (uint256 modelId, uint256 hashLo, uint256 hashHi) = _setupModelAndRound();
 
         vm.prank(attacker1);
@@ -174,7 +172,7 @@ contract AdversarialTest is Test {
 
     /// @notice Test submitting proof with invalid field elements (exceeding scalar field)
     function test_InvalidFieldElements() public {
-        _emergencySetVerifier(address(realVerifier));
+        _setVerifierToReject();
         (uint256 modelId, uint256 hashLo, uint256 hashHi) = _setupModelAndRound();
 
         vm.prank(attacker1);
@@ -577,10 +575,6 @@ contract AdversarialTest is Test {
 
         vm.prank(attacker1);
         vm.expectRevert(HelixCoordinatorV2.OnlyOwner.selector);
-        coordinator.setVerifier(address(0));
-
-        vm.prank(attacker1);
-        vm.expectRevert(HelixCoordinatorV2.OnlyOwner.selector);
         coordinator.setTreasury(attacker1);
     }
 
@@ -773,7 +767,7 @@ contract AdversarialTest is Test {
 
     /// @notice Test that large proof doesn't cause excessive gas
     function test_LargeProofGasLimit() public {
-        _emergencySetVerifier(address(realVerifier));
+        _setVerifierToReject();
         (uint256 modelId, uint256 hashLo, uint256 hashHi) = _setupModelAndRound();
 
         vm.prank(attacker1);
@@ -980,7 +974,7 @@ contract AdversarialTest is Test {
 
     /// @notice Test with boundary value public inputs
     function test_BoundaryValuePublicInputs() public {
-        _emergencySetVerifier(address(realVerifier));
+        _setVerifierToReject();
         (uint256 modelId, uint256 hashLo, uint256 hashHi) = _setupModelAndRound();
 
         vm.prank(attacker1);

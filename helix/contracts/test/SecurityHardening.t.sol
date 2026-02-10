@@ -893,40 +893,6 @@ contract AdminTimelockTest is Test {
         coordinator = new HelixCoordinatorV2(address(mockVerifier), address(treasuryContract));
     }
 
-    // ---- Verifier Timelock (7 days) ----
-
-    /// @notice Test: propose verifier change, attempt early execute, fail, wait, succeed
-    function test_Timelock_Verifier_FullCycle() public {
-        // Propose
-        coordinator.proposeSetVerifier(address(newVerifier));
-
-        // Verify pending change exists
-        bytes32 key = keccak256("setVerifier");
-        (, uint256 executionTime, bool active) = coordinator.getPendingChange(key);
-        assertTrue(active, "Change should be active");
-        assertEq(executionTime, block.timestamp + 7 days, "Should use 7-day timelock");
-
-        // Attempt early execution - should revert
-        vm.expectRevert(HelixCoordinatorV2.TimelockNotReady.selector);
-        coordinator.executeSetVerifier(address(newVerifier));
-
-        // Warp to just before timelock expiry
-        vm.warp(executionTime - 1);
-        vm.expectRevert(HelixCoordinatorV2.TimelockNotReady.selector);
-        coordinator.executeSetVerifier(address(newVerifier));
-
-        // Warp past timelock
-        vm.warp(executionTime);
-        coordinator.executeSetVerifier(address(newVerifier));
-
-        // Verify change took effect
-        assertEq(address(coordinator.verifier()), address(newVerifier), "Verifier should be updated");
-
-        // Verify pending change cleared
-        (, , active) = coordinator.getPendingChange(key);
-        assertFalse(active, "Pending change should be cleared");
-    }
-
     // ---- Parameter Timelock (48 hours) ----
 
     /// @notice Test: propose slash percentage change with 48-hour timelock
@@ -1287,11 +1253,6 @@ contract CustomErrorsTest is Test {
 
     // ---- Emergency-Only Legacy Functions ----
 
-    function test_LegacySetVerifier_RevertsWhenNotPaused() public {
-        vm.expectRevert(HelixCoordinatorV2.NotPaused.selector);
-        coordinator.setVerifier(address(mockVerifier));
-    }
-
     function test_LegacySetTreasury_RevertsWhenNotPaused() public {
         vm.expectRevert(HelixCoordinatorV2.NotPaused.selector);
         coordinator.setTreasury(makeAddr("newTreasury"));
@@ -1316,7 +1277,6 @@ contract CustomErrorsTest is Test {
         coordinator.emergencyPause();
 
         // All legacy setters should work during emergency
-        coordinator.setVerifier(address(mockVerifier));
         coordinator.setTreasury(makeAddr("newTreasury"));
         coordinator.setSlashPercentage(2500);
         coordinator.setDefaultMinStake(0.5 ether);

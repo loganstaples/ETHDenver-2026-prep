@@ -727,12 +727,8 @@ contract IntegrationTest is Test {
         // Proof fails with current mock
         mockVerifier.setShouldPass(false);
 
-        // Swap to new mock that passes (requires emergency pause for legacy setter)
-        MockVerifier newVerifier = new MockVerifier();
-        newVerifier.setShouldPass(true);
-        coordinator.emergencyPause();
-        coordinator.setVerifier(address(newVerifier));
-        coordinator.unpause();
+        // Re-enable mock verifier (verifier is immutable, so toggle pass state instead)
+        mockVerifier.setShouldPass(true);
 
         // Now proof succeeds
         uint256[] memory inputs = new uint256[](8);
