@@ -17,6 +17,7 @@ ndarray = { version = "0.16", optional = true }
 default = ["blas-matmul"]
 blas-matmul = ["ndarray"]
 circuit-bridge = ["helix-circuits", "sha2"]
+manual-gradients = []
 
 [dev-dependencies]
 helix-circuits = { path = "../helix-circuits" }
