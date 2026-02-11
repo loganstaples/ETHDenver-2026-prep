@@ -49,6 +49,8 @@ pub struct TransportConfig {
     pub tcp_nodelay: bool,
     /// Keepalive interval.
     pub keepalive_secs: Option<u64>,
+    /// Maximum total peers in the connection pool (0 = unlimited).
+    pub max_pool_size: usize,
 }
 
 impl Default for TransportConfig {
@@ -62,6 +64,7 @@ impl Default for TransportConfig {
             connect_timeout: Duration::from_secs(10),
             tcp_nodelay: true,
             keepalive_secs: Some(30),
+            max_pool_size: 256,
         }
     }
 }
@@ -664,6 +667,8 @@ pub struct ConnectionPool {
     transport: Arc<TcpTransport>,
     /// Peer addresses.
     peer_addrs: Arc<RwLock<HashMap<PeerId, SocketAddr>>>,
+    /// Maximum pool size (0 = unlimited).
+    max_pool_size: usize,
 }
 
 impl ConnectionPool {
@@ -672,12 +677,38 @@ impl ConnectionPool {
         Self {
             transport,
             peer_addrs: Arc::new(RwLock::new(HashMap::new())),
+            max_pool_size: 256,
         }
     }
 
-    /// Registers a peer address.
-    pub fn register_peer(&self, peer_id: PeerId, addr: SocketAddr) {
-        self.peer_addrs.write().insert(peer_id, addr);
+    /// Creates a new connection pool with a maximum size.
+    pub fn with_max_size(transport: Arc<TcpTransport>, max_pool_size: usize) -> Self {
+        Self {
+            transport,
+            peer_addrs: Arc::new(RwLock::new(HashMap::new())),
+            max_pool_size,
+        }
+    }
+
+    /// Registers a peer address. Returns false if the pool is at capacity.
+    pub fn register_peer(&self, peer_id: PeerId, addr: SocketAddr) -> bool {
+        let mut addrs = self.peer_addrs.write();
+        // Allow re-registration of existing peers (address update)
+        if addrs.contains_key(&peer_id) {
+            addrs.insert(peer_id, addr);
+            return true;
+        }
+        if self.max_pool_size > 0 && addrs.len() >= self.max_pool_size {
+            log::warn!(
+                "Connection pool at capacity ({}/{}), rejecting peer {}",
+                addrs.len(),
+                self.max_pool_size,
+                peer_id,
+            );
+            return false;
+        }
+        addrs.insert(peer_id, addr);
+        true
     }
 
     /// Unregisters a peer.
@@ -760,5 +791,66 @@ mod tests {
 
         pool.unregister_peer(&peer_id);
         assert_eq!(pool.peer_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_connection_pool_max_size_enforced() {
+        let local_id = PeerId::random();
+        let config = TransportConfig::default();
+        let transport = Arc::new(TcpTransport::new(local_id, config).unwrap());
+        let pool = ConnectionPool::with_max_size(transport, 3);
+
+        // Fill to capacity
+        for i in 0..3 {
+            let peer = PeerId::from_string(format!("peer-{i}"));
+            let addr: SocketAddr = format!("127.0.0.1:{}", 9001 + i).parse().unwrap();
+            assert!(pool.register_peer(peer, addr));
+        }
+        assert_eq!(pool.peer_count(), 3);
+
+        // 4th peer should be rejected
+        let extra = PeerId::from_string("peer-extra".to_string());
+        assert!(!pool.register_peer(extra, "127.0.0.1:9999".parse().unwrap()));
+        assert_eq!(pool.peer_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_connection_pool_reregister_existing_peer() {
+        let local_id = PeerId::random();
+        let config = TransportConfig::default();
+        let transport = Arc::new(TcpTransport::new(local_id, config).unwrap());
+        let pool = ConnectionPool::with_max_size(transport, 2);
+
+        let peer = PeerId::from_string("peer-1".to_string());
+        assert!(pool.register_peer(peer.clone(), "127.0.0.1:9001".parse().unwrap()));
+        let peer2 = PeerId::from_string("peer-2".to_string());
+        assert!(pool.register_peer(peer2, "127.0.0.1:9002".parse().unwrap()));
+        assert_eq!(pool.peer_count(), 2);
+
+        // Re-registering an existing peer with new address should succeed
+        assert!(pool.register_peer(peer, "127.0.0.1:9003".parse().unwrap()));
+        assert_eq!(pool.peer_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_connection_pool_unlimited_when_zero() {
+        let local_id = PeerId::random();
+        let config = TransportConfig::default();
+        let transport = Arc::new(TcpTransport::new(local_id, config).unwrap());
+        let pool = ConnectionPool::with_max_size(transport, 0);
+
+        // Should accept many peers when limit is 0 (unlimited)
+        for i in 0..50 {
+            let peer = PeerId::from_string(format!("peer-{i}"));
+            let addr: SocketAddr = format!("127.0.0.1:{}", 9001 + i).parse().unwrap();
+            assert!(pool.register_peer(peer, addr));
+        }
+        assert_eq!(pool.peer_count(), 50);
+    }
+
+    #[test]
+    fn test_transport_config_max_pool_size_default() {
+        let config = TransportConfig::default();
+        assert_eq!(config.max_pool_size, 256);
     }
 }

@@ -117,8 +117,8 @@ pub struct NodeConfig {
     pub rpc_url: String,
 
     /// Private key for signing transactions (hex, without 0x prefix).
-    /// If None, the node operates in read-only mode.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// SECURITY: Never stored in config files. Read from HELIX_PRIVATE_KEY env var.
+    #[serde(skip)]
     pub private_key: Option<String>,
 
     /// Whether to use TLS for peer connections.
@@ -193,10 +193,29 @@ impl Default for NodeConfig {
 }
 
 impl NodeConfig {
+    /// Returns the private key from the HELIX_PRIVATE_KEY environment variable.
+    ///
+    /// Private keys are never stored in config files for security.
+    /// Set the `HELIX_PRIVATE_KEY` env var (hex, without 0x prefix) before starting the node.
+    pub fn private_key(&self) -> Option<String> {
+        self.private_key.clone().or_else(|| std::env::var("HELIX_PRIVATE_KEY").ok())
+    }
+
     /// Loads configuration from a JSON file.
     pub fn from_file(path: impl AsRef<std::path::Path>) -> Result<Self, ConfigError> {
         let data = std::fs::read_to_string(path.as_ref())
             .map_err(|e| ConfigError::Io(e.to_string()))?;
+
+        // Warn if the config file contains a private_key field
+        if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&data) {
+            if raw.get("private_key").is_some() {
+                log::warn!(
+                    "Config file contains 'private_key' field — this is ignored for security. \
+                     Use the HELIX_PRIVATE_KEY environment variable instead."
+                );
+            }
+        }
+
         let config: Self = serde_json::from_str(&data)
             .map_err(|e| ConfigError::Parse(e.to_string()))?;
         config.validate()?;
@@ -331,9 +350,25 @@ mod tests {
     }
 
     #[test]
-    fn test_private_key_not_serialized_when_none() {
-        let config = NodeConfig::default();
+    fn test_private_key_never_serialized() {
+        // With #[serde(skip)], private_key is never serialized even if set
+        let mut config = NodeConfig::default();
+        config.private_key = Some("secret_hex_key".to_string());
         let json = serde_json::to_string(&config).unwrap();
-        assert!(!json.contains("private_key"));
+        assert!(!json.contains("private_key"), "private_key must never appear in serialized config");
+        assert!(!json.contains("secret_hex_key"), "private key value must never appear in JSON");
+    }
+
+    #[test]
+    fn test_private_key_from_env() {
+        let config = NodeConfig::default();
+        // When env var is not set and field is None, should return None
+        std::env::remove_var("HELIX_PRIVATE_KEY");
+        assert!(config.private_key().is_none());
+
+        // When env var is set, should return it
+        std::env::set_var("HELIX_PRIVATE_KEY", "deadbeef");
+        assert_eq!(config.private_key(), Some("deadbeef".to_string()));
+        std::env::remove_var("HELIX_PRIVATE_KEY");
     }
 }

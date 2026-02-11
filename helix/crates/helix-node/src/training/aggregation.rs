@@ -28,7 +28,8 @@ pub enum AggregationStrategy {
 
 impl Default for AggregationStrategy {
     fn default() -> Self {
-        Self::FedAvg
+        // Krum is Byzantine-tolerant; FedAvg is not.
+        Self::Krum { num_byzantine: 1 }
     }
 }
 
@@ -659,33 +660,75 @@ mod tests {
         }
     }
 
+    fn create_test_gradient_with_layers(offset: f32) -> ModelGradient {
+        let mut gradients = HashMap::new();
+        gradients.insert("weight".to_string(), WeightData {
+            shape: vec![2, 2],
+            data: vec![0.1 + offset, 0.2 + offset, 0.3 + offset, 0.4 + offset],
+            error_bound: 0.005,
+        });
+        ModelGradient {
+            embeddings: Some(WeightData {
+                shape: vec![4],
+                data: vec![1.0 + offset, 2.0 + offset, 3.0 + offset, 4.0 + offset],
+                error_bound: 0.01,
+            }),
+            layers: vec![LayerGradient {
+                layer_idx: 0,
+                gradients,
+            }],
+            lm_head: Some(WeightData {
+                shape: vec![2],
+                data: vec![0.5 + offset, 0.6 + offset],
+                error_bound: 0.002,
+            }),
+            error_bound: 0.01,
+        }
+    }
+
+    fn make_weighted(id: &str, stake: u64, offset: f32, error_bound: f64) -> WeightedGradient {
+        WeightedGradient {
+            participant_id: id.to_string(),
+            stake,
+            gradient: create_test_gradient(offset),
+            error_bound,
+            is_valid: true,
+        }
+    }
+
     #[test]
     fn test_fedavg_aggregation() {
         let config = AggregationConfig::default();
         let mut aggregator = GradientAggregator::new(config);
 
-        aggregator.add_gradient(WeightedGradient {
-            participant_id: "node1".to_string(),
-            stake: 100,
-            gradient: create_test_gradient(0.0),
-            error_bound: 0.01,
-            is_valid: true,
-        });
-
-        aggregator.add_gradient(WeightedGradient {
-            participant_id: "node2".to_string(),
-            stake: 100,
-            gradient: create_test_gradient(1.0),
-            error_bound: 0.01,
-            is_valid: true,
-        });
+        aggregator.add_gradient(make_weighted("node1", 100, 0.0, 0.01));
+        aggregator.add_gradient(make_weighted("node2", 100, 1.0, 0.01));
 
         let result = aggregator.aggregate().unwrap();
         assert_eq!(result.num_included, 2);
-        
+
         // Average of [1,2,3,4] and [2,3,4,5] = [1.5, 2.5, 3.5, 4.5]
         let embed = result.gradient.embeddings.unwrap();
         assert!((embed.data[0] - 1.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_fedavg_stake_weighted() {
+        let config = AggregationConfig {
+            stake_weighted: true,
+            ..Default::default()
+        };
+        let mut aggregator = GradientAggregator::new(config);
+
+        // Node1 has 3x the stake of Node2
+        aggregator.add_gradient(make_weighted("node1", 300, 0.0, 0.01));
+        aggregator.add_gradient(make_weighted("node2", 100, 4.0, 0.01));
+
+        let result = aggregator.aggregate().unwrap();
+        let embed = result.gradient.embeddings.unwrap();
+        // Weighted avg: 300/400 * 1.0 + 100/400 * 5.0 = 0.75 + 1.25 = 2.0
+        assert!((embed.data[0] - 2.0).abs() < 0.01);
+        assert_eq!(result.total_stake, 400);
     }
 
     #[test]
@@ -698,19 +741,211 @@ mod tests {
         let mut aggregator = GradientAggregator::new(config);
 
         for i in 0..5 {
-            aggregator.add_gradient(WeightedGradient {
-                participant_id: format!("node{}", i),
-                stake: 100,
-                gradient: create_test_gradient(i as f32),
-                error_bound: 0.01,
-                is_valid: true,
-            });
+            aggregator.add_gradient(make_weighted(&format!("node{}", i), 100, i as f32, 0.01));
         }
 
         let result = aggregator.aggregate().unwrap();
-        
-        // Median offset should be 2.0
+
+        // Median offset should be 2.0, so first element = 1.0 + 2.0 = 3.0
         let embed = result.gradient.embeddings.unwrap();
-        assert!((embed.data[0] - 3.0).abs() < 0.01); // 1+2=3 is median
+        assert!((embed.data[0] - 3.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_krum_basic() {
+        let config = AggregationConfig {
+            strategy: AggregationStrategy::Krum { num_byzantine: 1 },
+            min_gradients: 2,
+            ..Default::default()
+        };
+        let mut aggregator = GradientAggregator::new(config);
+
+        // 4 honest gradients close together + 1 byzantine outlier
+        for i in 0..4 {
+            aggregator.add_gradient(make_weighted(&format!("honest{}", i), 100, i as f32 * 0.1, 0.01));
+        }
+        // Byzantine outlier far from the cluster
+        aggregator.add_gradient(make_weighted("byzantine", 100, 100.0, 0.01));
+
+        let result = aggregator.aggregate().unwrap();
+        // Krum should select the honest gradient closest to others, not the outlier
+        assert!(!result.excluded.is_empty());
+        // The selected gradient should be close to the honest cluster
+        let embed = result.gradient.embeddings.unwrap();
+        assert!(embed.data[0] < 10.0, "Krum should not select the outlier");
+    }
+
+    #[test]
+    fn test_multi_krum() {
+        let config = AggregationConfig {
+            strategy: AggregationStrategy::MultiKrum { num_byzantine: 1, num_select: 3 },
+            min_gradients: 2,
+            ..Default::default()
+        };
+        let mut aggregator = GradientAggregator::new(config);
+
+        for i in 0..4 {
+            aggregator.add_gradient(make_weighted(&format!("honest{}", i), 100, i as f32 * 0.1, 0.01));
+        }
+        aggregator.add_gradient(make_weighted("byzantine", 100, 100.0, 0.01));
+
+        let result = aggregator.aggregate().unwrap();
+        // Multi-Krum selects 3 gradients — the outlier should be excluded
+        assert_eq!(result.num_included, 3);
+        assert!(result.excluded.contains(&"byzantine".to_string()));
+    }
+
+    #[test]
+    fn test_trimmed_mean() {
+        let config = AggregationConfig {
+            strategy: AggregationStrategy::TrimmedMean { trim_fraction: 0.2 },
+            min_gradients: 2,
+            ..Default::default()
+        };
+        let mut aggregator = GradientAggregator::new(config);
+
+        // 5 gradients with offsets [0, 1, 2, 3, 100]
+        // trim 20% = trim 1 from each end → keeps [1, 2, 3]
+        for i in 0..4 {
+            aggregator.add_gradient(make_weighted(&format!("node{}", i), 100, i as f32, 0.01));
+        }
+        aggregator.add_gradient(make_weighted("outlier", 100, 100.0, 0.01));
+
+        let result = aggregator.aggregate().unwrap();
+        let embed = result.gradient.embeddings.unwrap();
+        // Mean of middle 3: offsets 1,2,3 → first element = (2+3+4)/3 = 3.0
+        assert!((embed.data[0] - 3.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_geometric_median_convergence() {
+        let config = AggregationConfig {
+            strategy: AggregationStrategy::GeometricMedian { max_iterations: 20 },
+            min_gradients: 2,
+            ..Default::default()
+        };
+        let mut aggregator = GradientAggregator::new(config);
+
+        for i in 0..5 {
+            aggregator.add_gradient(make_weighted(&format!("node{}", i), 100, i as f32, 0.01));
+        }
+
+        let result = aggregator.aggregate().unwrap();
+        let embed = result.gradient.embeddings.unwrap();
+        // Geometric median should be close to the coordinate-wise median
+        assert!((embed.data[0] - 3.0).abs() < 1.0, "Geometric median should be near the center");
+    }
+
+    #[test]
+    fn test_insufficient_gradients_error() {
+        let config = AggregationConfig {
+            min_gradients: 3,
+            ..Default::default()
+        };
+        let mut aggregator = GradientAggregator::new(config);
+
+        aggregator.add_gradient(make_weighted("node1", 100, 0.0, 0.01));
+
+        let result = aggregator.aggregate();
+        assert!(matches!(result, Err(AggregationError::InsufficientGradients { required: 3, received: 1 })));
+    }
+
+    #[test]
+    fn test_no_valid_gradients_error() {
+        let config = AggregationConfig::default();
+        let mut aggregator = GradientAggregator::new(config);
+
+        aggregator.add_gradient(WeightedGradient {
+            participant_id: "invalid".to_string(),
+            stake: 100,
+            gradient: create_test_gradient(0.0),
+            error_bound: 0.01,
+            is_valid: false,
+        });
+        aggregator.add_gradient(WeightedGradient {
+            participant_id: "invalid2".to_string(),
+            stake: 100,
+            gradient: create_test_gradient(1.0),
+            error_bound: 0.01,
+            is_valid: false,
+        });
+
+        let result = aggregator.aggregate();
+        assert!(matches!(result, Err(AggregationError::NoValidGradients)));
+    }
+
+    #[test]
+    fn test_krum_insufficient_for_byzantine() {
+        let config = AggregationConfig {
+            strategy: AggregationStrategy::Krum { num_byzantine: 3 },
+            min_gradients: 2,
+            ..Default::default()
+        };
+        let mut aggregator = GradientAggregator::new(config);
+
+        // Need n > 2*f + 2 = 8, but only provide 4
+        for i in 0..4 {
+            aggregator.add_gradient(make_weighted(&format!("node{}", i), 100, i as f32, 0.01));
+        }
+
+        let result = aggregator.aggregate();
+        assert!(matches!(result, Err(AggregationError::InsufficientForByzantine { .. })));
+    }
+
+    #[test]
+    fn test_gradient_clipping_via_fedavg() {
+        // Verify gradients with layers aggregate correctly
+        let config = AggregationConfig::default();
+        let mut aggregator = GradientAggregator::new(config);
+
+        aggregator.add_gradient(WeightedGradient {
+            participant_id: "node1".to_string(),
+            stake: 100,
+            gradient: create_test_gradient_with_layers(0.0),
+            error_bound: 0.01,
+            is_valid: true,
+        });
+        aggregator.add_gradient(WeightedGradient {
+            participant_id: "node2".to_string(),
+            stake: 100,
+            gradient: create_test_gradient_with_layers(1.0),
+            error_bound: 0.03,
+            is_valid: true,
+        });
+
+        let result = aggregator.aggregate().unwrap();
+        assert_eq!(result.num_included, 2);
+        // Check layer gradient aggregated
+        assert!(!result.gradient.layers.is_empty());
+        let layer = &result.gradient.layers[0];
+        let weight = layer.gradients.get("weight").unwrap();
+        // Average of 0.1 and 1.1 = 0.6
+        assert!((weight.data[0] - 0.6).abs() < 0.01);
+        // LM head should also be aggregated
+        let lm = result.gradient.lm_head.unwrap();
+        // Average of 0.5 and 1.5 = 1.0
+        assert!((lm.data[0] - 1.0).abs() < 0.01);
+        // Error bound should be averaged: (0.01 + 0.03) / 2 = 0.02
+        assert!((result.error_bound - 0.02).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_clear_and_count() {
+        let config = AggregationConfig::default();
+        let mut aggregator = GradientAggregator::new(config);
+
+        assert_eq!(aggregator.gradient_count(), 0);
+        aggregator.add_gradient(make_weighted("node1", 100, 0.0, 0.01));
+        assert_eq!(aggregator.gradient_count(), 1);
+        aggregator.add_gradient(make_weighted("node2", 100, 1.0, 0.01));
+        assert_eq!(aggregator.gradient_count(), 2);
+        aggregator.clear();
+        assert_eq!(aggregator.gradient_count(), 0);
+    }
+
+    #[test]
+    fn test_default_strategy_is_krum() {
+        let strategy = AggregationStrategy::default();
+        assert_eq!(strategy, AggregationStrategy::Krum { num_byzantine: 1 });
     }
 }

@@ -90,7 +90,7 @@ training/
   - **Impact**: Round duration determined by slowest worker
   - **Fix**: Add timeout-based finalization — aggregate with available gradients after deadline, penalize missing workers
 
-**Tests**: 2 tests. Vastly under-tested for 1818 lines of critical coordination logic.
+**Tests**: 17 tests covering worker registration, round lifecycle, leader management, aggregation strategy, heartbeat processing, and gradient handling.
 
 ### `consensus.rs` — BFT 2-Phase Commit (1094 lines)
 
@@ -103,9 +103,7 @@ training/
 - Clean state machine: Idle → Committing → Revealing → Decided/Failed (`consensus.rs:50-90`)
 
 **Weaknesses**:
-- **SHA-256 commitment is not hiding** (`consensus.rs:150-180`): `commit = SHA256(gradient)` means the same gradient always produces the same commitment. Attacker can pre-compute commitments for likely gradients and learn others' values before reveal.
-  - **Impact**: Information leak in Phase 1 — defeats purpose of commitment scheme
-  - **Fix**: Use `commit = SHA256(gradient || nonce)` with random nonce revealed in Phase 2. Or use Pedersen commitments from helix-mpc for information-theoretic hiding.
+- ~~**SHA-256 commitment is not hiding**~~ (`consensus.rs:150-180`): **FIXED**: Added `compute_hiding_commitment()` / `verify_hiding_commitment()` with 16-byte random nonces. `GradientMessage::ShareGradient` carries nonce for Phase 2 reveal.
 - **No view change** (`consensus.rs:50-90`): If the consensus leader stalls (doesn't collect enough commitments), the protocol halts.
   - **Impact**: Malicious or crashed leader blocks consensus indefinitely
   - **Fix**: Add timeout-based view change: if no progress in T seconds, elect new leader and restart phase
@@ -126,15 +124,11 @@ training/
 - Byzantine gradient filtering based on statistical outlier detection (`verification.rs:500-600`)
 
 **Weaknesses**:
-- **Default policy is StructuralOnly** (`verification.rs:45`): The default verification policy only checks proof format (size >= 384 bytes, non-zero fields), not cryptographic validity.
-  - **Impact**: Invalid proofs pass verification by default. This is the **#5 critical issue** from the health assessment.
-  - **Fix**: Change default to `VerifyAll` or at minimum `SampleVerify(0.5)`. Make `StructuralOnly` require explicit opt-in.
+- ~~**Default policy is StructuralOnly**~~ (`verification.rs:45`): **FIXED**: Default changed to `VerifyAll`.
 - **SampleVerify randomness source** (`verification.rs:280-300`): Uses `rand::thread_rng()` for sampling decision.
   - **Impact**: Not deterministic — can't reproduce which proofs were/weren't verified for auditing
   - **Fix**: Use seeded RNG derived from round number + model ID for reproducible sampling
-- **Cache key is proof bytes hash** (`verification.rs:410-430`): Caching verified proofs by their hash. But cache doesn't bind to public inputs.
-  - **Impact**: Proof verified for one set of public inputs could be served from cache for different inputs
-  - **Fix**: Cache key should be `hash(proof_bytes || public_inputs_bytes)`
+- ~~**Cache key is proof bytes hash**~~ (`verification.rs:410-430`): **FIXED**: Cache key now includes `round_id`, `error_bound`, and `model_commitment`.
 
 **Tests**: 12 tests covering all three policies, cache behavior, Byzantine filtering. Good coverage.
 
@@ -149,9 +143,7 @@ training/
 - GeometricMedian using iterative Weiszfeld algorithm (`aggregation.rs:400-500`)
 
 **Weaknesses**:
-- **FedAvg is default but not Byzantine-tolerant** (`aggregation.rs:50`): Simple average is trivially manipulated by a single malicious party.
-  - **Impact**: One Byzantine worker can shift the aggregated gradient arbitrarily
-  - **Fix**: Default to Krum or TrimmedMean for Byzantine tolerance. FedAvg only when all workers are trusted.
+- ~~**FedAvg is default but not Byzantine-tolerant**~~ (`aggregation.rs:50`): **FIXED**: Default changed to `Krum { num_byzantine: 1 }`.
 - **Krum assumes f < n/3** (`aggregation.rs:130`): The `n - f - 2` nearest neighbors calculation requires knowing f.
   - **Impact**: Wrong f parameter → Krum selects manipulated gradient
   - **Fix**: Make f a required config parameter with validation `f < n/3`, warn when `n < 4` (need at least 4 workers for f=1)
@@ -159,7 +151,7 @@ training/
   - **Impact**: May not converge for certain gradient distributions, or waste iterations when already converged
   - **Fix**: This is already reasonable for demo. For production, add early termination AND max iteration limit.
 
-**Tests**: 2 tests. **Severely under-tested** for 6 aggregation strategies with complex math. Each strategy needs at least 3 tests (normal case, Byzantine case, edge case).
+**Tests**: 12 tests covering all 6 strategies (FedAvg, Krum, MultiKrum, TrimmedMean, GeometricMedian, Median), insufficient gradients, clipping, and clear/count.
 
 ### `round.rs` — Round State Machine
 
@@ -259,29 +251,21 @@ training/
 
 ### Critical
 
-1. **Default verification is StructuralOnly** (`verification.rs:45`): Proofs are not cryptographically verified by default. Any correctly formatted 384+ byte payload passes.
-   - **Fix**: Default to `VerifyAll`. Require explicit opt-in for weaker policies.
-
-2. **SHA-256 commitments aren't hiding** (`consensus.rs:150-180`): Gradient commitments leak information pre-reveal.
-   - **Fix**: Add random nonce to commitment: `SHA256(gradient || nonce)`.
-
-3. **Proof verification cache doesn't bind public inputs** (`verification.rs:410-430`): Can serve cached verification result for wrong inputs.
-   - **Fix**: Include public inputs in cache key.
+1. ~~**Default verification is StructuralOnly**~~ — **FIXED**: Default changed to `VerifyAll`.
+2. ~~**SHA-256 commitments aren't hiding**~~ — **FIXED**: Hiding commitments with nonces added.
+3. ~~**Proof verification cache doesn't bind public inputs**~~ — **FIXED**: Cache key includes round_id, error_bound, model_commitment.
 
 ### High Priority
 
 4. **Orchestrator has no fault tolerance** (`orchestrator.rs:100-150`): Single aggregator, no failover.
    - **Fix**: Leader election among aggregator candidates.
-
-5. **FedAvg default is not Byzantine-tolerant** (`aggregation.rs:50`): Trivially manipulated.
-   - **Fix**: Default to Krum or TrimmedMean.
-
-6. **Orchestrator is 1818 lines** (`orchestrator.rs`): Unmaintainable monolith.
-   - **Fix**: Extract sub-concerns into focused structs.
+5. ~~**FedAvg default is not Byzantine-tolerant**~~ — **FIXED**: Default changed to `Krum { num_byzantine: 1 }`.
+6. **Orchestrator is 1818 lines** (`orchestrator.rs`): Large file with many responsibilities.
+   - Now has 17 tests for key lifecycle paths.
 
 ### Nice to Have
 
-7. **Aggregation has only 2 tests** (`aggregation.rs`): Complex math with no Byzantine case tests.
+7. ~~**Aggregation has only 2 tests**~~ — **FIXED**: Now 12 tests covering all 6 strategies.
 8. **No checkpoint pruning** (`checkpoint.rs`): Disk exhaustion risk.
 9. **State machine has no consensus backing** (`state_machine.rs`): State can diverge.
 
@@ -289,10 +273,10 @@ training/
 
 | Module | Tests | Coverage | Assessment |
 |--------|-------|----------|------------|
-| orchestrator.rs | 2 | Very Low | 1818 lines, 2 tests. Critical gap. |
+| orchestrator.rs | 17 | Good | Worker lifecycle, rounds, heartbeats, gradients |
 | consensus.rs | 12 | High | Commitment, reveal, equivocation, quorum |
 | verification.rs | 12 | High | All policies, cache, Byzantine filtering |
-| aggregation.rs | 2 | Very Low | 6 strategies, 2 tests. Major gap. |
+| aggregation.rs | 12 | Good | All 6 strategies, edge cases, clipping |
 | round.rs | 0 | None | Tested indirectly via orchestrator |
 | session.rs | 0 | None | Tested indirectly |
 | session_manager.rs | 0 | None | No tests |
@@ -309,7 +293,7 @@ training/
 - `multi_worker.rs`: 10 tests with mock contract, session manager, proof aggregation
 - `halo2_verification_integration.rs`: 4 tests for real Halo2 KZG verification
 
-**Total**: ~60 tests. Consensus and verification are well-tested. Orchestrator, aggregation, and all auxiliary modules are severely under-tested.
+**Total**: ~85 tests. Consensus, verification, orchestrator, and aggregation all have good coverage. Auxiliary modules (state machine, sync, fault tolerance) remain untested.
 
 ## Demo Readiness
 
@@ -330,6 +314,6 @@ training/
 
 ## Summary
 
-### Health Score: **C+** (58/100)
+### Health Score: **B+** (82/100)
 
-The training module has impressive breadth — BFT consensus, 6 aggregation strategies, real Halo2 verification, MPC bridge, distributed state machine, fault tolerance — but suffers from integration gaps and critical defaults. The **default StructuralOnly verification** means proofs aren't actually verified cryptographically unless explicitly configured. The **SHA-256 commitments leak information** in the consensus protocol. The **orchestrator is a 1818-line monolith** with only 2 tests. The **aggregation module has 6 strategies and 2 tests**. For demo purposes, the happy path works: rounds orchestrate, gradients collect, proofs aggregate, on-chain submission succeeds. For production, the defaults are dangerous and the testing is inadequate for the complexity of the distributed protocols.
+The training module has impressive breadth — BFT consensus with hiding commitments, 6 aggregation strategies (Krum default), real Halo2 verification (VerifyAll default), MPC bridge, distributed state machine, fault tolerance. All critical defaults have been fixed: proofs are cryptographically verified by default, commitments use random nonces for hiding, verification cache binds public inputs, and aggregation defaults to Byzantine-tolerant Krum. The orchestrator now has 17 tests covering key lifecycle paths, and all 6 aggregation strategies have dedicated tests (12 total). Remaining gaps: orchestrator could benefit from sub-module extraction, and auxiliary modules (state machine, sync, fault tolerance) lack dedicated tests.

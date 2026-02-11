@@ -268,8 +268,8 @@ impl ProofVerifier {
             };
         }
 
-        // Check cache — key includes both proof hash and model commitment
-        let cache_key = self.cache_key(proof, &gradient_commitment);
+        // Check cache — key includes proof hash, model commitment, round_id, and error_bound
+        let cache_key = self.cache_key(proof, &gradient_commitment, round_id, error_bound);
         if self.config.enable_cache {
             if let Some(cached) = self.get_cached(&cache_key) {
                 let mut stats = self.stats.write();
@@ -511,14 +511,16 @@ impl ProofVerifier {
         }
     }
 
-    /// Computes a cache key from proof bytes and model commitment.
+    /// Computes a cache key from proof bytes, model commitment, round ID, and error bound.
     ///
-    /// Including the model commitment ensures that the same proof bytes
-    /// verified against different model states are cached separately.
-    fn cache_key(&self, proof: &[u8], model_commitment: &[u8; 32]) -> [u8; 32] {
+    /// Including round_id and error_bound prevents cache hits across different
+    /// training steps or configurations that happen to share proof bytes.
+    fn cache_key(&self, proof: &[u8], model_commitment: &[u8; 32], round_id: u64, error_bound: f64) -> [u8; 32] {
         let mut hasher = Sha256::new();
         hasher.update(proof);
         hasher.update(model_commitment);
+        hasher.update(round_id.to_le_bytes());
+        hasher.update(error_bound.to_le_bytes());
         let result = hasher.finalize();
         result.into()
     }

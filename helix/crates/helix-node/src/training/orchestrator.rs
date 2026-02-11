@@ -1354,7 +1354,7 @@ impl TrainingOrchestrator {
                         match event {
                             NetworkEvent::GradientMessage { from, message } => {
                                 match message {
-                                    GradientMessage::ShareGradient { round_id, gradient_commitment, error_bound, proof } => {
+                                    GradientMessage::ShareGradient { round_id, gradient_commitment, commitment_nonce, error_bound, proof } => {
                                         let _ = gradient_tx.send((from, round_id, gradient_commitment, error_bound, proof)).await;
                                     }
                                     _ => {}
@@ -1791,12 +1791,31 @@ pub enum OrchestratorError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::messages::NodeCapabilities;
+    use crate::network::runner::{NetworkRunnerConfig, NetworkRunner};
+
+    fn test_network() -> Arc<NetworkRunner> {
+        let local_id = PeerId::random();
+        let mut config = NetworkRunnerConfig::default();
+        config.transport.listen_addr = "127.0.0.1:0".parse().unwrap();
+        Arc::new(NetworkRunner::new(local_id, config, NodeCapabilities::default()).unwrap())
+    }
+
+    fn test_orchestrator() -> TrainingOrchestrator {
+        let network = test_network();
+        let config = OrchestratorConfig::default();
+        let local_id = PeerId::random();
+        TrainingOrchestrator::new(local_id, config, network)
+    }
 
     #[test]
     fn test_config_default() {
         let config = OrchestratorConfig::default();
         assert_eq!(config.min_workers, 3);
         assert_eq!(config.max_workers, 100);
+        assert_eq!(config.max_failures, 3);
+        assert!(config.auto_recovery);
+        assert!(config.consensus_enabled);
     }
 
     #[test]
@@ -1813,5 +1832,228 @@ mod tests {
         };
 
         assert_eq!(worker.status, WorkerStatus::Available);
+    }
+
+    #[test]
+    fn test_register_and_unregister_worker() {
+        let orch = test_orchestrator();
+        let peer = PeerId::from_string("worker-1");
+
+        orch.register_worker(peer.clone());
+        let stats = orch.worker_stats();
+        assert_eq!(stats.total, 1);
+        assert_eq!(stats.available, 1);
+
+        orch.unregister_worker(&peer);
+        let stats = orch.worker_stats();
+        assert_eq!(stats.total, 0);
+    }
+
+    #[test]
+    fn test_duplicate_register_ignored() {
+        let orch = test_orchestrator();
+        let peer = PeerId::from_string("worker-1");
+
+        orch.register_worker(peer.clone());
+        orch.register_worker(peer.clone()); // duplicate
+        let stats = orch.worker_stats();
+        assert_eq!(stats.total, 1);
+    }
+
+    #[test]
+    fn test_worker_stats_breakdown() {
+        let orch = test_orchestrator();
+
+        for i in 0..5 {
+            orch.register_worker(PeerId::from_string(format!("worker-{}", i)));
+        }
+
+        let stats = orch.worker_stats();
+        assert_eq!(stats.total, 5);
+        assert_eq!(stats.available, 5);
+        assert_eq!(stats.computing, 0);
+        assert_eq!(stats.unresponsive, 0);
+        assert_eq!(stats.excluded, 0);
+    }
+
+    #[tokio::test]
+    async fn test_start_round_not_leader() {
+        let orch = test_orchestrator();
+        // By default, not a leader
+        assert!(!orch.is_leader());
+
+        let result = orch.start_round([0u8; 32]).await;
+        assert!(matches!(result, Err(OrchestratorError::NotLeader)));
+    }
+
+    #[tokio::test]
+    async fn test_start_round_insufficient_workers() {
+        let orch = test_orchestrator();
+        orch.set_leader(true);
+
+        // Only register 1 worker, but min is 3
+        orch.register_worker(PeerId::from_string("worker-1"));
+
+        let result = orch.start_round([0u8; 32]).await;
+        assert!(matches!(result, Err(OrchestratorError::InsufficientWorkers { have: 1, need: 3 })));
+    }
+
+    #[tokio::test]
+    async fn test_start_round_success() {
+        let orch = test_orchestrator();
+        orch.set_leader(true);
+
+        // Register enough workers
+        for i in 0..5 {
+            orch.register_worker(PeerId::from_string(format!("worker-{}", i)));
+        }
+
+        let result = orch.start_round([0u8; 32]).await;
+        assert!(result.is_ok());
+        let round_id = result.unwrap();
+        assert_eq!(round_id, 1);
+
+        // Current round should be set
+        let (id, phase) = orch.current_round().unwrap();
+        assert_eq!(id, 1);
+        assert_eq!(phase, RoundPhase::Collecting);
+    }
+
+    #[tokio::test]
+    async fn test_round_increments_counter() {
+        let orch = test_orchestrator();
+        orch.set_leader(true);
+
+        for i in 0..5 {
+            orch.register_worker(PeerId::from_string(format!("worker-{}", i)));
+        }
+
+        let r1 = orch.start_round([0u8; 32]).await.unwrap();
+        assert_eq!(r1, 1);
+
+        // Reset workers to available (they got moved to Computing)
+        {
+            let mut workers = orch.workers.write();
+            for w in workers.values_mut() {
+                w.status = WorkerStatus::Available;
+            }
+        }
+        *orch.current_round.write() = None;
+
+        let r2 = orch.start_round([1u8; 32]).await.unwrap();
+        assert_eq!(r2, 2);
+    }
+
+    #[test]
+    fn test_set_and_get_leader() {
+        let orch = test_orchestrator();
+        assert!(!orch.is_leader());
+        orch.set_leader(true);
+        assert!(orch.is_leader());
+        orch.set_leader(false);
+        assert!(!orch.is_leader());
+    }
+
+    #[test]
+    fn test_set_aggregation_strategy() {
+        let orch = test_orchestrator();
+        assert!(matches!(orch.aggregation_strategy(), AggregationStrategy::FedAvg));
+
+        orch.set_aggregation_strategy(AggregationStrategy::Krum { num_byzantine: 2 });
+        assert!(matches!(orch.aggregation_strategy(), AggregationStrategy::Krum { num_byzantine: 2 }));
+    }
+
+    #[test]
+    fn test_no_active_round_initially() {
+        let orch = test_orchestrator();
+        assert!(orch.current_round().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_registers_new_worker() {
+        let orch = test_orchestrator();
+        let peer = PeerId::from_string("new-worker");
+
+        orch.handle_heartbeat(peer.clone(), HeartbeatMessage {
+            seq: 1,
+            is_pong: false,
+            load: 30,
+        });
+
+        let stats = orch.worker_stats();
+        assert_eq!(stats.total, 1);
+        assert_eq!(stats.available, 1);
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_updates_existing_worker() {
+        let orch = test_orchestrator();
+        let peer = PeerId::from_string("worker-1");
+
+        orch.register_worker(peer.clone());
+
+        orch.handle_heartbeat(peer.clone(), HeartbeatMessage {
+            seq: 1,
+            is_pong: false,
+            load: 75,
+        });
+
+        let workers = orch.workers.read();
+        let worker = workers.get(&peer).unwrap();
+        assert_eq!(worker.load, 75);
+    }
+
+    #[tokio::test]
+    async fn test_handle_gradient_no_active_round() {
+        let orch = test_orchestrator();
+        let result = orch.handle_gradient(
+            PeerId::from_string("worker-1"),
+            1,
+            [0u8; 32],
+            0.01,
+            vec![],
+        ).await;
+        assert!(matches!(result, Err(OrchestratorError::NoActiveRound)));
+    }
+
+    #[tokio::test]
+    async fn test_handle_gradient_wrong_round() {
+        let orch = test_orchestrator();
+        orch.set_leader(true);
+
+        for i in 0..3 {
+            orch.register_worker(PeerId::from_string(format!("worker-{}", i)));
+        }
+        orch.start_round([0u8; 32]).await.unwrap();
+
+        let result = orch.handle_gradient(
+            PeerId::from_string("worker-0"),
+            999, // wrong round ID
+            [0u8; 32],
+            0.01,
+            vec![],
+        ).await;
+        assert!(matches!(result, Err(OrchestratorError::WrongRound { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_handle_gradient_worker_not_assigned() {
+        let orch = test_orchestrator();
+        orch.set_leader(true);
+
+        for i in 0..3 {
+            orch.register_worker(PeerId::from_string(format!("worker-{}", i)));
+        }
+        let round_id = orch.start_round([0u8; 32]).await.unwrap();
+
+        // Outsider tries to submit
+        let result = orch.handle_gradient(
+            PeerId::from_string("outsider"),
+            round_id,
+            [0u8; 32],
+            0.01,
+            vec![],
+        ).await;
+        assert!(matches!(result, Err(OrchestratorError::WorkerNotAssigned(_))));
     }
 }

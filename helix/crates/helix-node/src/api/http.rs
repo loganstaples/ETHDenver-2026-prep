@@ -124,7 +124,7 @@ pub struct ApiState {
 // ---------------------------------------------------------------------------
 
 /// Snapshot of orchestrator state (updated periodically).
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OrchestratorSnapshot {
     pub worker_count: usize,
     pub available_workers: usize,
@@ -134,7 +134,7 @@ pub struct OrchestratorSnapshot {
     pub workers: Vec<WorkerInfo>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoundInfo {
     pub round_id: u64,
     pub phase: String,
@@ -142,7 +142,7 @@ pub struct RoundInfo {
     pub workers_assigned: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerInfo {
     pub id: String,
     pub status: String,
@@ -185,7 +185,7 @@ impl Default for MetricsSnapshot {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct HealthResponse {
     status: String,
     role: String,
@@ -193,7 +193,7 @@ struct HealthResponse {
     current_round: Option<u64>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct RoundStartResponse {
     triggered: bool,
     message: String,
@@ -354,4 +354,271 @@ async fn peers_handler(State(state): State<Arc<ApiState>>) -> Json<PeerSnapshot>
 async fn metrics_handler(State(state): State<Arc<ApiState>>) -> Json<MetricsSnapshot> {
     let snapshot = state.metrics.read().clone();
     Json(snapshot)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt; // for oneshot
+
+    fn test_state(api_key: &str) -> Arc<ApiState> {
+        let (tx, _rx) = broadcast::channel(16);
+        Arc::new(ApiState {
+            orchestrator_workers: Arc::new(RwLock::new(OrchestratorSnapshot {
+                worker_count: 5,
+                available_workers: 3,
+                computing_workers: 2,
+                current_round: Some(RoundInfo {
+                    round_id: 42,
+                    phase: "Collecting".to_string(),
+                    gradients_received: 2,
+                    workers_assigned: 5,
+                }),
+                completed_rounds: 10,
+                workers: vec![
+                    WorkerInfo {
+                        id: "w1".to_string(),
+                        status: "Computing".to_string(),
+                        rounds_completed: 5,
+                    },
+                ],
+            })),
+            round_trigger_tx: tx,
+            peers: Arc::new(RwLock::new(PeerSnapshot {
+                peers: vec![PeerEntry {
+                    id: "peer1".to_string(),
+                    address: "127.0.0.1:9000".to_string(),
+                    last_seen: 12345,
+                    reputation: 50,
+                }],
+            })),
+            metrics: Arc::new(RwLock::new(MetricsSnapshot {
+                total_rounds: 100,
+                total_proofs: 200,
+                proofs_valid: 190,
+                proofs_invalid: 10,
+                avg_round_time_ms: 5000.0,
+                uptime_secs: 3600,
+            })),
+            api_key: api_key.to_string(),
+            rate_limiter: Arc::new(ApiRateLimiter::new(100)),
+        })
+    }
+
+    /// Build the app router without ConnectInfo (uses a simpler setup for tests).
+    fn test_app(state: Arc<ApiState>) -> Router {
+        // For testing, we skip the rate-limit middleware since it requires ConnectInfo.
+        // We test rate limiting separately.
+        let public_routes = Router::new()
+            .route("/health", get(health_handler))
+            .route("/metrics", get(metrics_handler));
+
+        let auth_routes = Router::new()
+            .route("/round/start", post(round_start_handler))
+            .route("/round/status", get(round_status_handler))
+            .route("/workers", get(workers_handler))
+            .route("/peers", get(peers_handler))
+            .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+
+        Router::new()
+            .merge(public_routes)
+            .merge(auth_routes)
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn test_health_endpoint() {
+        let state = test_state("test-key");
+        let app = test_app(state);
+
+        let response = app
+            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let health: HealthResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(health.status, "healthy");
+        assert_eq!(health.role, "aggregator");
+        assert_eq!(health.workers, 5);
+        assert_eq!(health.current_round, Some(42));
+    }
+
+    #[tokio::test]
+    async fn test_metrics_endpoint() {
+        let state = test_state("test-key");
+        let app = test_app(state);
+
+        let response = app
+            .oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let metrics: MetricsSnapshot = serde_json::from_slice(&body).unwrap();
+        assert_eq!(metrics.total_rounds, 100);
+        assert_eq!(metrics.proofs_valid, 190);
+    }
+
+    #[tokio::test]
+    async fn test_auth_required_without_token() {
+        let state = test_state("secret-token");
+        let app = test_app(state);
+
+        // Try accessing an auth-protected endpoint without a token
+        let response = app
+            .oneshot(Request::builder().uri("/workers").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_auth_required_with_invalid_token() {
+        let state = test_state("secret-token");
+        let app = test_app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/workers")
+                    .header("authorization", "Bearer wrong-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_auth_success_with_valid_token() {
+        let state = test_state("secret-token");
+        let app = test_app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/workers")
+                    .header("authorization", "Bearer secret-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let workers: Vec<WorkerInfo> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].id, "w1");
+    }
+
+    #[tokio::test]
+    async fn test_round_status_endpoint() {
+        let state = test_state("my-key");
+        let app = test_app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/round/status")
+                    .header("authorization", "Bearer my-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let snapshot: OrchestratorSnapshot = serde_json::from_slice(&body).unwrap();
+        assert_eq!(snapshot.completed_rounds, 10);
+        assert_eq!(snapshot.current_round.unwrap().round_id, 42);
+    }
+
+    #[tokio::test]
+    async fn test_round_start_trigger() {
+        let state = test_state("my-key");
+        // Subscribe before triggering so the send succeeds
+        let mut rx = state.round_trigger_tx.subscribe();
+        let app = test_app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/round/start")
+                    .header("authorization", "Bearer my-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let resp: RoundStartResponse = serde_json::from_slice(&body).unwrap();
+        assert!(resp.triggered);
+
+        // Verify the trigger was received
+        let received = rx.try_recv();
+        assert!(received.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_peers_endpoint() {
+        let state = test_state("key");
+        let app = test_app(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/peers")
+                    .header("authorization", "Bearer key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let snapshot: PeerSnapshot = serde_json::from_slice(&body).unwrap();
+        assert_eq!(snapshot.peers.len(), 1);
+        assert_eq!(snapshot.peers[0].id, "peer1");
+    }
+
+    #[test]
+    fn test_constant_time_eq() {
+        assert!(constant_time_eq(b"hello", b"hello"));
+        assert!(!constant_time_eq(b"hello", b"world"));
+        assert!(!constant_time_eq(b"hello", b"hell"));
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn test_rate_limiter() {
+        let limiter = ApiRateLimiter::new(2); // 2 req/s, burst capacity 4
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+
+        // First 4 requests should be allowed (burst capacity = 2 * 2 = 4)
+        assert!(limiter.check(ip));
+        assert!(limiter.check(ip));
+        assert!(limiter.check(ip));
+        assert!(limiter.check(ip));
+        // 5th should be rate limited (bucket exhausted)
+        assert!(!limiter.check(ip));
+
+        // Different IP should have its own bucket
+        let ip2: IpAddr = "10.0.0.1".parse().unwrap();
+        assert!(limiter.check(ip2));
+    }
 }

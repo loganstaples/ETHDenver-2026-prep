@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 use super::messages::PeerId;
 use serde::{Deserialize, Serialize};
 
+use crate::sc_client::SCClient;
+
 /// Configuration for Sybil resistance.
 #[derive(Debug, Clone)]
 pub struct SybilResistanceConfig {
@@ -219,6 +221,10 @@ pub struct SybilResistantSelector {
     max_history: usize,
     /// Random seed for deterministic selection.
     seed: u64,
+    /// Optional smart contract client for on-chain stake verification.
+    sc_client: Option<std::sync::Arc<SCClient>>,
+    /// Model ID for on-chain stake queries.
+    model_id: u64,
 }
 
 /// Record of a selection event.
@@ -238,7 +244,15 @@ impl SybilResistantSelector {
             selection_history: Vec::new(),
             max_history: 1000,
             seed: rand::random(),
+            sc_client: None,
+            model_id: 0,
         }
+    }
+
+    /// Sets the smart contract client for on-chain stake verification.
+    pub fn set_sc_client(&mut self, client: std::sync::Arc<SCClient>, model_id: u64) {
+        self.sc_client = Some(client);
+        self.model_id = model_id;
     }
 
     /// Registers a peer's stake.
@@ -503,15 +517,71 @@ impl SybilResistantSelector {
         self.selection_history.clear();
     }
 
-    /// Verifies stake on-chain (stub for integration).
+    /// Verifies a peer's stake against the on-chain coordinator contract.
+    ///
+    /// When an `SCClient` is configured, queries `getStake(address, modelId)` and
+    /// compares the on-chain amount against the locally claimed stake. The peer is
+    /// marked as verified only if the on-chain stake meets the minimum requirement
+    /// and is not slashed.
+    ///
+    /// Falls back to local-only verification (always passes) when no `SCClient`
+    /// is configured.
     pub async fn verify_stake_on_chain(&mut self, peer_id: &PeerId) -> Result<bool, SybilError> {
-        // In production, would call smart contract to verify
-        // For now, just mark as verified if stake exists
-        if let Some(stake) = self.stakes.get_mut(peer_id) {
-            stake.verified = true;
-            Ok(true)
-        } else {
-            Err(SybilError::PeerNotFound(peer_id.clone()))
+        let stake = self.stakes.get(peer_id)
+            .ok_or_else(|| SybilError::PeerNotFound(peer_id.clone()))?;
+
+        let sc_client = match &self.sc_client {
+            Some(client) => client.clone(),
+            None => {
+                // No on-chain client configured — mark as verified locally
+                if let Some(s) = self.stakes.get_mut(peer_id) {
+                    s.verified = true;
+                }
+                return Ok(true);
+            }
+        };
+
+        // Derive an Ethereum address from the peer ID for the on-chain lookup.
+        // PeerId wraps a String; we hash it to deterministically derive a 20-byte address.
+        use sha2::{Sha256, Digest};
+        let hash = Sha256::digest(peer_id.0.as_bytes());
+        let addr_bytes: [u8; 20] = hash[..20].try_into().unwrap();
+        let prover_address = ethers::types::Address::from(addr_bytes);
+
+        match sc_client.get_stake(prover_address, self.model_id).await {
+            Ok(stake_info) => {
+                if stake_info.slashed {
+                    return Err(SybilError::VerificationFailed(
+                        "Peer stake has been slashed".to_string(),
+                    ));
+                }
+
+                let on_chain_amount = stake_info.amount.as_u64();
+                if on_chain_amount < self.config.min_stake {
+                    return Err(SybilError::InsufficientStake {
+                        provided: on_chain_amount,
+                        required: self.config.min_stake,
+                    });
+                }
+
+                // Update local stake record with verified on-chain data
+                if let Some(s) = self.stakes.get_mut(peer_id) {
+                    s.verified = true;
+                    s.stake = on_chain_amount;
+                    s.update_effective_stake(
+                        self.config.max_stake_influence,
+                        self.config.use_quadratic_weighting,
+                    );
+                }
+
+                Ok(true)
+            }
+            Err(e) => {
+                Err(SybilError::VerificationFailed(format!(
+                    "On-chain stake query failed: {}",
+                    e
+                )))
+            }
         }
     }
 }

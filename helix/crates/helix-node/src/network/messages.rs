@@ -346,8 +346,11 @@ pub enum GradientMessage {
     ShareGradient {
         /// Round ID.
         round_id: u64,
-        /// Gradient commitment.
+        /// Gradient commitment (hiding: SHA-256(gradient || nonce)).
         gradient_commitment: [u8; 32],
+        /// Random nonce used in the hiding commitment.
+        /// Revealed in Phase 2 so peers can verify commitment correctness.
+        commitment_nonce: [u8; 16],
         /// Error bound.
         error_bound: f64,
         /// Proof of computation.
