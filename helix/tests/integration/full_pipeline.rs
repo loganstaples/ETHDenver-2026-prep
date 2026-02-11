@@ -1620,3 +1620,898 @@ mod full_pipeline_extended {
         );
     }
 }
+
+// ============================================================================
+// Distributed Training Integration Tests (Full V3 Stack)
+// ============================================================================
+//
+// These tests exercise the complete HELIX pipeline:
+//   data loading → distributed training across multiple workers → proof generation
+//   → on-chain submission → verification → rewards claim
+//
+// Requires: `cargo test --test full_pipeline --features full-pipeline -- --test-threads=1`
+
+#[cfg(feature = "full-pipeline")]
+mod distributed_pipeline {
+    use std::sync::{Arc, OnceLock};
+    use std::thread;
+    use std::time::Instant;
+
+    use ethers::abi::Token;
+    use ethers::contract::{Contract, ContractFactory};
+    use ethers::middleware::SignerMiddleware;
+    use ethers::providers::{Http, Provider};
+    use ethers::signers::{LocalWallet, Signer};
+    use ethers::types::{Address, Bytes, TransactionReceipt, U256};
+    use ethers::utils::Anvil;
+
+    use halo2curves::bn256::Fr;
+
+    use helix_circuits::compute_state_hash_v2;
+    use helix_prover::{
+        MLTrainingProverV2, RetryConfig, TrainingProofResultV2, TrainingWeights, V2ProverConfig,
+    };
+
+    use helix_integration_tests::common::anvil::*;
+
+    // ────────────────────────────────────────────────────────
+    // Model dimensions for all distributed tests
+    // ────────────────────────────────────────────────────────
+
+    const D_IN: usize = 2;
+    const D_HID: usize = 2;
+    const D_OUT: usize = 1;
+    const NUM_WORKERS: usize = 3;
+    const STEPS_PER_WORKER: usize = 5;
+
+    // ────────────────────────────────────────────────────────
+    // Shared prover (keygen is expensive — reuse)
+    // ────────────────────────────────────────────────────────
+
+    static DIST_PROVER: OnceLock<MLTrainingProverV2> = OnceLock::new();
+
+    fn get_prover() -> &'static MLTrainingProverV2 {
+        DIST_PROVER.get_or_init(|| {
+            let config = V2ProverConfig {
+                k: 14,
+                relu_range: 256,
+                exp_range: 256,
+                exp_scale: 1000,
+                self_verify: true,
+                use_witness_cache: false,
+                use_freivalds: false,
+                enable_tracing: false,
+                retry: RetryConfig::none(),
+                ..V2ProverConfig::default()
+            };
+            MLTrainingProverV2::with_config(D_IN, D_HID, D_OUT, config)
+        })
+    }
+
+    fn initial_weights() -> TrainingWeights {
+        TrainingWeights::new(
+            D_IN,
+            D_HID,
+            D_OUT,
+            vec![Fr::from(1u64), Fr::from(2u64), Fr::from(3u64), Fr::from(1u64)],
+            vec![Fr::zero(), Fr::zero()],
+            vec![Fr::from(1u64), Fr::from(1u64)],
+            vec![Fr::zero()],
+        )
+    }
+
+    fn lr() -> Fr {
+        Fr::from(1u64)
+    }
+
+    fn base_error() -> Fr {
+        Fr::from(1u64)
+    }
+
+    /// Synthetic dataset: 5 samples for a 2x2x1 MLP.
+    fn synthetic_dataset() -> Vec<(Vec<Fr>, Vec<Fr>)> {
+        vec![
+            (vec![Fr::from(1u64), Fr::from(1u64)], vec![Fr::from(5u64)]),
+            (vec![Fr::from(2u64), Fr::from(1u64)], vec![Fr::from(3u64)]),
+            (vec![Fr::from(1u64), Fr::from(2u64)], vec![Fr::from(4u64)]),
+            (vec![Fr::from(2u64), Fr::from(2u64)], vec![Fr::from(6u64)]),
+            (vec![Fr::from(1u64), Fr::from(3u64)], vec![Fr::from(7u64)]),
+        ]
+    }
+
+    /// Result from a single worker's training run.
+    #[derive(Debug)]
+    struct WorkerResult {
+        worker_id: usize,
+        proofs: Vec<TrainingProofResultV2>,
+        final_weights: TrainingWeights,
+        step_numbers: Vec<u64>,
+    }
+
+    /// Generates a proof for one training step.
+    fn prove_step(
+        weights: &TrainingWeights,
+        x: &[Fr],
+        target: &[Fr],
+        step_number: u64,
+    ) -> (TrainingProofResultV2, TrainingWeights) {
+        let prover = get_prover();
+
+        let witness = MLTrainingProverV2::build_witness(
+            weights.d_in,
+            weights.d_hid,
+            weights.d_out,
+            x,
+            target,
+            &weights.w1,
+            &weights.b1,
+            &weights.w2,
+            &weights.b2,
+            lr(),
+            step_number,
+            base_error(),
+        );
+
+        let result = prover.prove(&witness).expect("Proof generation failed");
+
+        let new_weights = TrainingWeights::new(
+            weights.d_in,
+            weights.d_hid,
+            weights.d_out,
+            witness.w1_new.clone(),
+            witness.b1_new.clone(),
+            witness.w2_new.clone(),
+            witness.b2_new.clone(),
+        );
+
+        (result, new_weights)
+    }
+
+    fn compute_initial_commitment(weights: &TrainingWeights) -> U256 {
+        let hash = compute_state_hash_v2(&weights.w1, &weights.b1, &weights.w2, &weights.b2);
+        let lo = fr_to_u256(&hash.0);
+        let hi = fr_to_u256(&hash.1);
+        compute_hash_pair(lo, hi)
+    }
+
+    fn get_s_g2() -> [U256; 4] {
+        extract_s_g2_from_prover(get_prover())
+    }
+
+    // ────────────────────────────────────────────────────────
+    // V3 Stack Deployment Helper
+    // ────────────────────────────────────────────────────────
+
+    /// Deploys the full V3 contract stack to Anvil with mock verifier.
+    /// Returns environment with all contract addresses and typed instances.
+    struct V3TestEnv {
+        #[allow(dead_code)]
+        anvil: ethers::utils::AnvilInstance,
+        client: SignedClient,
+        deployer: Address,
+        token: Contract<SignerMiddleware<Provider<Http>, LocalWallet>>,
+        staking: Contract<SignerMiddleware<Provider<Http>, LocalWallet>>,
+        rewards: Contract<SignerMiddleware<Provider<Http>, LocalWallet>>,
+        coordinator: Contract<SignerMiddleware<Provider<Http>, LocalWallet>>,
+        mock_verifier: Contract<SignerMiddleware<Provider<Http>, LocalWallet>>,
+        max_error_bound: U256,
+    }
+
+    impl V3TestEnv {
+        async fn new_with_mock() -> Self {
+            let out_dir = ensure_contracts_compiled();
+
+            let anvil = Anvil::new().spawn();
+            let provider =
+                Provider::<Http>::try_from(anvil.endpoint()).expect("Failed to connect to Anvil");
+
+            let wallet: LocalWallet = anvil.keys()[0].clone().into();
+            let wallet = wallet.with_chain_id(anvil.chain_id());
+            let deployer = wallet.address();
+            let client = Arc::new(SignerMiddleware::new(provider, wallet));
+
+            // 1. Deploy HelixToken
+            let (token_abi, token_bytecode) =
+                load_contract_artifact(&out_dir, "HelixToken.sol", "HelixToken");
+            let token_factory =
+                ContractFactory::new(token_abi.clone(), token_bytecode, client.clone());
+            let token_contract = token_factory
+                .deploy(Token::Address(deployer))
+                .expect("Token deploy args")
+                .send()
+                .await
+                .expect("Token deploy failed");
+            let token_addr = token_contract.address();
+
+            // 2. Deploy MockVerifier
+            let (mock_abi, mock_bytecode) =
+                load_contract_artifact(&out_dir, "Deploy.s.sol", "MockVerifierForDeploy");
+            let mock_factory =
+                ContractFactory::new(mock_abi.clone(), mock_bytecode, client.clone());
+            let mock_contract = mock_factory
+                .deploy(())
+                .expect("MockVerifier deploy args")
+                .send()
+                .await
+                .expect("MockVerifier deploy failed");
+            let mock_addr = mock_contract.address();
+
+            // 3. Deploy Staking (100 HELIX min, 7 day unbonding, 50% slash)
+            let (staking_abi, staking_bytecode) =
+                load_contract_artifact(&out_dir, "Staking.sol", "Staking");
+            let staking_factory =
+                ContractFactory::new(staking_abi.clone(), staking_bytecode, client.clone());
+            let min_stake = U256::from(100u64) * U256::exp10(18); // 100e18
+            let unbonding_period = U256::from(7u64 * 24 * 3600); // 7 days
+            let slash_rate = U256::from(5000u64); // 50%
+            let staking_contract = staking_factory
+                .deploy((
+                    Token::Address(token_addr),
+                    Token::Uint(min_stake),
+                    Token::Uint(unbonding_period),
+                    Token::Uint(slash_rate),
+                ))
+                .expect("Staking deploy args")
+                .send()
+                .await
+                .expect("Staking deploy failed");
+            let staking_addr = staking_contract.address();
+
+            // 4. Deploy Rewards
+            let (rewards_abi, rewards_bytecode) =
+                load_contract_artifact(&out_dir, "Rewards.sol", "Rewards");
+            let rewards_factory =
+                ContractFactory::new(rewards_abi.clone(), rewards_bytecode, client.clone());
+            let rewards_contract = rewards_factory
+                .deploy(Token::Address(token_addr))
+                .expect("Rewards deploy args")
+                .send()
+                .await
+                .expect("Rewards deploy failed");
+            let rewards_addr = rewards_contract.address();
+
+            // 5. Deploy ModelRegistry
+            let (registry_abi, registry_bytecode) =
+                load_contract_artifact(&out_dir, "ModelRegistry.sol", "ModelRegistry");
+            let registry_factory =
+                ContractFactory::new(registry_abi.clone(), registry_bytecode, client.clone());
+            let registry_contract = registry_factory
+                .deploy(())
+                .expect("Registry deploy args")
+                .send()
+                .await
+                .expect("Registry deploy failed");
+            let registry_addr = registry_contract.address();
+
+            // 6. Deploy HelixCoordinatorV3
+            let (coord_abi, coord_bytecode) =
+                load_contract_artifact(&out_dir, "HelixCoordinatorV3.sol", "HelixCoordinatorV3");
+            let coord_factory =
+                ContractFactory::new(coord_abi.clone(), coord_bytecode, client.clone());
+            let coord_contract = coord_factory
+                .deploy((
+                    Token::Address(mock_addr),
+                    Token::Address(staking_addr),
+                    Token::Address(rewards_addr),
+                    Token::Address(registry_addr),
+                    Token::Address(deployer),
+                ))
+                .expect("CoordinatorV3 deploy args")
+                .send()
+                .await
+                .expect("CoordinatorV3 deploy failed");
+            let coordinator_addr = coord_contract.address();
+
+            // 7. Wire contracts
+            let staking = Contract::new(staking_addr, staking_abi, client.clone());
+            let rewards = Contract::new(rewards_addr, rewards_abi, client.clone());
+            let registry = Contract::new(registry_addr, registry_abi, client.clone());
+            let coordinator = Contract::new(coordinator_addr, coord_abi, client.clone());
+            let token = Contract::new(token_addr, token_abi, client.clone());
+            let mock_verifier = Contract::new(mock_addr, mock_abi, client.clone());
+
+            // staking.setOperator(coordinator)
+            let _: TransactionReceipt = staking
+                .method::<_, ()>("setOperator", coordinator_addr)
+                .expect("setOperator method")
+                .send()
+                .await
+                .expect("setOperator send")
+                .await
+                .expect("setOperator confirm")
+                .expect("setOperator receipt");
+
+            // rewards.setCoordinator(coordinator)
+            let _: TransactionReceipt = rewards
+                .method::<_, ()>("setCoordinator", coordinator_addr)
+                .expect("setCoordinator method")
+                .send()
+                .await
+                .expect("setCoordinator send")
+                .await
+                .expect("setCoordinator confirm")
+                .expect("setCoordinator receipt");
+
+            // rewards.setStakingContract(staking)
+            let _: TransactionReceipt = rewards
+                .method::<_, ()>("setStakingContract", staking_addr)
+                .expect("setStakingContract method")
+                .send()
+                .await
+                .expect("setStakingContract send")
+                .await
+                .expect("setStakingContract confirm")
+                .expect("setStakingContract receipt");
+
+            // registry.setCoordinator(coordinator)
+            let _: TransactionReceipt = registry
+                .method::<_, ()>("setCoordinator", coordinator_addr)
+                .expect("registry setCoordinator method")
+                .send()
+                .await
+                .expect("registry setCoordinator send")
+                .await
+                .expect("registry setCoordinator confirm")
+                .expect("registry setCoordinator receipt");
+
+            // token.addMinter(rewards)
+            let _: TransactionReceipt = token
+                .method::<_, ()>("addMinter", rewards_addr)
+                .expect("addMinter method")
+                .send()
+                .await
+                .expect("addMinter send")
+                .await
+                .expect("addMinter confirm")
+                .expect("addMinter receipt");
+
+            let max_error_bound: U256 = coordinator
+                .method::<_, U256>("maxErrorBound", ())
+                .expect("maxErrorBound method")
+                .call()
+                .await
+                .expect("maxErrorBound call failed");
+
+            Self {
+                anvil,
+                client,
+                deployer,
+                token,
+                staking,
+                rewards,
+                coordinator,
+                mock_verifier,
+                max_error_bound,
+            }
+        }
+
+        /// Approve and stake HELIX tokens for the deployer.
+        async fn stake_tokens(&self, amount: U256) {
+            // Approve staking contract to spend tokens
+            let staking_addr = self.staking.address();
+            let _: TransactionReceipt = self
+                .token
+                .method::<_, ()>("approve", (staking_addr, amount))
+                .expect("approve method")
+                .send()
+                .await
+                .expect("approve send")
+                .await
+                .expect("approve confirm")
+                .expect("approve receipt");
+
+            // Stake
+            let _: TransactionReceipt = self
+                .staking
+                .method::<_, ()>("stake", amount)
+                .expect("stake method")
+                .send()
+                .await
+                .expect("stake send")
+                .await
+                .expect("stake confirm")
+                .expect("stake receipt");
+        }
+
+        /// Fund the reward pool with HELIX tokens.
+        async fn fund_rewards(&self, amount: U256, per_round: U256, duration: U256) {
+            // Approve rewards contract to spend tokens
+            let rewards_addr = self.rewards.address();
+            let _: TransactionReceipt = self
+                .token
+                .method::<_, ()>("approve", (rewards_addr, amount))
+                .expect("approve method")
+                .send()
+                .await
+                .expect("approve send")
+                .await
+                .expect("approve confirm")
+                .expect("approve receipt");
+
+            // Fund
+            let _: TransactionReceipt = self
+                .rewards
+                .method::<_, ()>("fundRewardPool", (amount, per_round, duration))
+                .expect("fundRewardPool method")
+                .send()
+                .await
+                .expect("fundRewardPool send")
+                .await
+                .expect("fundRewardPool confirm")
+                .expect("fundRewardPool receipt");
+        }
+
+        /// Register a model on the V3 coordinator.
+        async fn register_model(&self, initial_commitment: U256) -> U256 {
+            let next_id: u32 = self
+                .coordinator
+                .method::<_, u32>("nextModelId", ())
+                .expect("nextModelId method")
+                .call()
+                .await
+                .expect("nextModelId call failed");
+            let model_id = U256::from(next_id);
+
+            let _: TransactionReceipt = self
+                .coordinator
+                .method::<_, ()>(
+                    "registerModel",
+                    (
+                        "test-model".to_string(),
+                        "distributed pipeline test".to_string(),
+                        "ipfs://helix-dist-test".to_string(),
+                        initial_commitment,
+                    ),
+                )
+                .expect("registerModel method")
+                .send()
+                .await
+                .expect("registerModel send")
+                .await
+                .expect("registerModel confirm")
+                .expect("registerModel receipt");
+
+            model_id
+        }
+
+        /// Start a training round.
+        async fn start_round(&self, model_id: U256, duration_secs: U256) {
+            let _: TransactionReceipt = self
+                .coordinator
+                .method::<_, ()>("startRound", (model_id, duration_secs))
+                .expect("startRound method")
+                .send()
+                .await
+                .expect("startRound send")
+                .await
+                .expect("startRound confirm")
+                .expect("startRound receipt");
+        }
+
+        /// Submit a proof to the V3 coordinator.
+        async fn submit_proof(
+            &self,
+            model_id: U256,
+            round_id: U256,
+            proof_bytes: Bytes,
+            public_inputs: Vec<U256>,
+        ) -> TransactionReceipt {
+            self.coordinator
+                .method::<_, ()>(
+                    "submitProof",
+                    (model_id, round_id, proof_bytes, public_inputs),
+                )
+                .expect("submitProof method")
+                .gas(5_000_000u64)
+                .send()
+                .await
+                .expect("submitProof send")
+                .await
+                .expect("submitProof confirm")
+                .expect("submitProof receipt")
+        }
+
+        /// Read round data.
+        async fn get_round(
+            &self,
+            model_id: U256,
+            round_id: U256,
+        ) -> (U256, U256, U256, bool, Address) {
+            self.coordinator
+                .method::<_, (U256, U256, U256, bool, Address)>(
+                    "rounds",
+                    (model_id, round_id),
+                )
+                .expect("rounds method")
+                .call()
+                .await
+                .expect("rounds call failed")
+        }
+
+        /// Read model commitment.
+        async fn model_commitment(&self, model_id: U256) -> U256 {
+            let result: (String, U256, Address, u32, bool) = self
+                .coordinator
+                .method::<_, (String, U256, Address, u32, bool)>("models", model_id)
+                .expect("models method")
+                .call()
+                .await
+                .expect("models call failed");
+            result.1
+        }
+
+        /// Read accumulated error bound.
+        async fn accumulated_error_bound(&self, model_id: U256) -> U256 {
+            self.coordinator
+                .method::<_, U256>("accumulatedErrorBound", model_id)
+                .expect("accumulatedErrorBound method")
+                .call()
+                .await
+                .expect("accumulatedErrorBound call failed")
+        }
+
+        /// Set mock verifier accept/reject.
+        async fn set_mock_accept(&self, accept: bool) {
+            let _: TransactionReceipt = self
+                .mock_verifier
+                .method::<_, ()>("setAccept", accept)
+                .expect("setAccept method")
+                .send()
+                .await
+                .expect("setAccept send")
+                .await
+                .expect("setAccept confirm")
+                .expect("setAccept receipt");
+        }
+
+        /// Check staker's stake info via Staking contract.
+        async fn get_stake_info(
+            &self,
+            staker: Address,
+        ) -> (U256, U256, U256, bool, bool) {
+            self.staking
+                .method::<_, (U256, U256, U256, bool, bool)>("stakes", staker)
+                .expect("stakes method")
+                .call()
+                .await
+                .expect("stakes call failed")
+        }
+
+        /// Claim round rewards.
+        async fn claim_round_rewards(
+            &self,
+            model_ids: Vec<U256>,
+            round_ids: Vec<U256>,
+        ) -> TransactionReceipt {
+            self.rewards
+                .method::<_, ()>("claimRoundRewards", (model_ids, round_ids))
+                .expect("claimRoundRewards method")
+                .send()
+                .await
+                .expect("claimRoundRewards send")
+                .await
+                .expect("claimRoundRewards confirm")
+                .expect("claimRoundRewards receipt")
+        }
+
+        /// Get token balance.
+        async fn token_balance(&self, addr: Address) -> U256 {
+            self.token
+                .method::<_, U256>("balanceOf", addr)
+                .expect("balanceOf method")
+                .call()
+                .await
+                .expect("balanceOf call failed")
+        }
+    }
+
+    // ────────────────────────────────────────────────────────
+    // Test: Full Distributed Training Pipeline
+    // ────────────────────────────────────────────────────────
+
+    /// Comprehensive end-to-end test exercising the complete HELIX distributed
+    /// training pipeline:
+    ///
+    /// 1. Deploys the full V3 contract stack (HelixToken, Staking, Rewards,
+    ///    ModelRegistry, MockVerifier, HelixCoordinatorV3)
+    /// 2. Creates 3 worker threads, each running independent training
+    /// 3. Each worker trains a 2x2x1 MLP on synthetic data for 5 steps
+    /// 4. Each worker generates real ZK proofs via MLTrainingProverV2
+    /// 5. Workers submit proofs sequentially to the coordinator
+    /// 6. Verifies all proofs are accepted (not rejected)
+    /// 7. Verifies commitment chaining across steps
+    /// 8. Verifies a corrupted proof is rejected and triggers slashing
+    /// 9. Verifies rewards can be claimed
+    /// 10. Asserts the model's final on-chain state matches expected values
+    #[tokio::test]
+    async fn test_distributed_training_full_pipeline() {
+        let start = Instant::now();
+        eprintln!("\n=== HELIX Distributed Training Full Pipeline Test ===\n");
+
+        // ── Phase 1: Deploy full V3 stack ──
+        eprintln!("Phase 1: Deploying full V3 contract stack...");
+        let phase_start = Instant::now();
+        let env = V3TestEnv::new_with_mock().await;
+        eprintln!("  Deployed in {:?}", phase_start.elapsed());
+
+        // ── Phase 2: Setup — stake tokens and fund rewards ──
+        eprintln!("Phase 2: Setting up staking and rewards...");
+        let stake_amount = U256::from(200u64) * U256::exp10(18); // 200 HELIX
+        env.stake_tokens(stake_amount).await;
+
+        let reward_pool = U256::from(1000u64) * U256::exp10(18); // 1000 HELIX
+        let per_round = U256::from(10u64) * U256::exp10(18); // 10 per round
+        let duration = U256::from(86400u64); // 1 day
+        env.fund_rewards(reward_pool, per_round, duration).await;
+
+        // ── Phase 3: Register model ──
+        eprintln!("Phase 3: Registering model...");
+        let weights = initial_weights();
+        let initial_commitment = compute_initial_commitment(&weights);
+        let model_id = env.register_model(initial_commitment).await;
+        assert_eq!(model_id, U256::zero(), "First model should have ID 0");
+
+        let on_chain_commitment = env.model_commitment(model_id).await;
+        assert_eq!(
+            on_chain_commitment, initial_commitment,
+            "On-chain commitment should match initial"
+        );
+
+        // ── Phase 4: Run 3 workers in parallel, each producing 5 proofs ──
+        eprintln!("Phase 4: Running {} workers × {} steps...", NUM_WORKERS, STEPS_PER_WORKER);
+        let phase_start = Instant::now();
+
+        // Each worker trains independently on the same initial weights.
+        // We collect all proofs from all workers.
+        let dataset = synthetic_dataset();
+        let mut all_worker_results: Vec<WorkerResult> = Vec::new();
+
+        // Spawn workers in threads (proof generation is CPU-bound)
+        let handles: Vec<_> = (0..NUM_WORKERS)
+            .map(|worker_id| {
+                let dataset = dataset.clone();
+                let weights = initial_weights();
+
+                thread::spawn(move || {
+                    let mut w = weights;
+                    let mut proofs = Vec::new();
+                    let mut step_numbers = Vec::new();
+
+                    for step in 0..STEPS_PER_WORKER {
+                        let sample_idx = step % dataset.len();
+                        let (x, target) = &dataset[sample_idx];
+                        let step_number = (step + 1) as u64;
+
+                        let (proof, new_weights) = prove_step(&w, x, target, step_number);
+                        assert!(proof.verified, "Worker {}: step {} proof should self-verify", worker_id, step_number);
+
+                        proofs.push(proof);
+                        step_numbers.push(step_number);
+                        w = new_weights;
+                    }
+
+                    WorkerResult {
+                        worker_id,
+                        proofs,
+                        final_weights: w,
+                        step_numbers,
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            all_worker_results.push(handle.join().expect("Worker thread panicked"));
+        }
+
+        eprintln!(
+            "  {} workers completed {} proofs each in {:?}",
+            NUM_WORKERS, STEPS_PER_WORKER, phase_start.elapsed()
+        );
+
+        // ── Phase 5: Submit proofs from first worker sequentially ──
+        // (We pick worker 0's proofs for the on-chain commitment chain,
+        //  since commitment chaining is sequential.)
+        eprintln!("Phase 5: Submitting proofs on-chain...");
+        let worker = &all_worker_results[0];
+        let mut prev_new_commitment: Option<U256> = None;
+
+        for (i, proof_result) in worker.proofs.iter().enumerate() {
+            let step_number = worker.step_numbers[i];
+            let round_id = U256::from(step_number);
+
+            // Start round
+            env.start_round(model_id, U256::from(3600u64)).await;
+
+            // Format for EVM
+            let bundle =
+                EvmProofBundle::from_proof_result(proof_result, model_id, env.max_error_bound);
+
+            // Verify commitment chaining
+            if let Some(prev) = prev_new_commitment {
+                assert_eq!(
+                    bundle.old_commitment, prev,
+                    "Step {}: old commitment must chain from previous new",
+                    step_number
+                );
+            } else {
+                assert_eq!(
+                    bundle.old_commitment, initial_commitment,
+                    "Step 1: old commitment must match initial"
+                );
+            }
+
+            let receipt = env
+                .submit_proof(
+                    model_id,
+                    round_id,
+                    bundle.proof_as_bytes(),
+                    bundle.public_inputs.clone(),
+                )
+                .await;
+
+            assert_eq!(receipt.status, Some(1.into()), "Step {} tx should succeed", step_number);
+
+            let (_, _, _, is_completed, _) = env.get_round(model_id, round_id).await;
+            assert!(is_completed, "Step {} round should complete", step_number);
+
+            prev_new_commitment = Some(bundle.new_commitment);
+        }
+
+        // Verify final on-chain commitment matches worker's final weights
+        let final_commitment = env.model_commitment(model_id).await;
+        let expected_final = compute_initial_commitment(&worker.final_weights);
+        assert_eq!(
+            final_commitment, expected_final,
+            "Final on-chain commitment should match worker's final weights"
+        );
+
+        eprintln!("  All {} proofs submitted and verified", STEPS_PER_WORKER);
+
+        // ── Phase 6: Verify accumulated error ──
+        eprintln!("Phase 6: Verifying error bound accumulation...");
+        let accumulated_error = env.accumulated_error_bound(model_id).await;
+        assert!(
+            accumulated_error > U256::zero(),
+            "Accumulated error should be positive after {} steps",
+            STEPS_PER_WORKER
+        );
+        eprintln!("  Accumulated error: {}", accumulated_error);
+
+        // ── Phase 7: Submit corrupted proof → verify slashing ──
+        eprintln!("Phase 7: Testing slashing with corrupted proof...");
+
+        // Start a new round for the corrupted proof
+        env.start_round(model_id, U256::from(3600u64)).await;
+        let slash_round_id = U256::from((STEPS_PER_WORKER + 1) as u64);
+
+        // Generate a valid proof for the current weights state
+        let next_sample = &dataset[0];
+        let (valid_proof, _) = prove_step(
+            &worker.final_weights,
+            &next_sample.0,
+            &next_sample.1,
+            (STEPS_PER_WORKER + 1) as u64,
+        );
+
+        let bundle = EvmProofBundle::from_proof_result(
+            &valid_proof,
+            model_id,
+            env.max_error_bound,
+        );
+
+        // Make mock verifier reject
+        env.set_mock_accept(false).await;
+
+        let receipt = env
+            .submit_proof(
+                model_id,
+                slash_round_id,
+                bundle.proof_as_bytes(),
+                bundle.public_inputs.clone(),
+            )
+            .await;
+
+        assert_eq!(receipt.status, Some(1.into()), "Slash tx should succeed");
+
+        // Round should NOT be completed
+        let (_, _, _, is_completed, _) = env.get_round(model_id, slash_round_id).await;
+        assert!(
+            !is_completed,
+            "Round should NOT complete after rejected proof"
+        );
+
+        // Check slashing occurred via Staking
+        let (stake_after, _, _, _, _) = env.get_stake_info(env.deployer).await;
+        assert!(
+            stake_after < stake_amount,
+            "Stake should be reduced after slashing: {} < {}",
+            stake_after,
+            stake_amount
+        );
+
+        eprintln!(
+            "  Slashing confirmed: stake reduced from {} to {}",
+            stake_amount, stake_after
+        );
+
+        // ── Phase 8: Claim rewards ──
+        eprintln!("Phase 8: Claiming rewards...");
+
+        // Re-enable mock verifier for future operations
+        env.set_mock_accept(true).await;
+
+        let balance_before = env.token_balance(env.deployer).await;
+
+        // Claim rewards for all valid rounds (1..=STEPS_PER_WORKER)
+        let model_ids: Vec<U256> = (0..STEPS_PER_WORKER).map(|_| model_id).collect();
+        let round_ids: Vec<U256> = (1..=STEPS_PER_WORKER).map(|r| U256::from(r as u64)).collect();
+
+        let receipt = env.claim_round_rewards(model_ids, round_ids).await;
+        assert_eq!(receipt.status, Some(1.into()), "Claim tx should succeed");
+
+        let balance_after = env.token_balance(env.deployer).await;
+        eprintln!(
+            "  Token balance: {} → {} (delta: {})",
+            balance_before,
+            balance_after,
+            balance_after - balance_before
+        );
+
+        // ── Phase 9: Verify all workers produced valid proofs ──
+        eprintln!("Phase 9: Verifying all workers' proofs offline...");
+        let prover = get_prover();
+        for worker in &all_worker_results {
+            for (i, proof) in worker.proofs.iter().enumerate() {
+                assert!(
+                    prover.verify_result(proof),
+                    "Worker {} step {}: proof should verify",
+                    worker.worker_id,
+                    i + 1
+                );
+            }
+
+            // Verify commitment chain within each worker
+            for i in 0..worker.proofs.len() - 1 {
+                assert_eq!(
+                    worker.proofs[i].new_state_hash,
+                    worker.proofs[i + 1].old_state_hash,
+                    "Worker {}: chain broken at step {}",
+                    worker.worker_id,
+                    i + 1
+                );
+            }
+        }
+
+        // ── Phase 10: Final state assertions ──
+        eprintln!("Phase 10: Final state verification...");
+
+        // Model commitment should still be at the last valid proof's new commitment
+        let final_on_chain = env.model_commitment(model_id).await;
+        assert_eq!(final_on_chain, expected_final, "Final model state should match");
+
+        // All 3 workers should have the same final weights (same initial + same dataset + same steps)
+        for i in 1..all_worker_results.len() {
+            assert_eq!(
+                all_worker_results[0].final_weights.w1,
+                all_worker_results[i].final_weights.w1,
+                "Worker {} should have same final weights as worker 0",
+                i
+            );
+        }
+
+        let total_time = start.elapsed();
+        eprintln!(
+            "\n=== Full Pipeline Test PASSED in {:?} ===",
+            total_time
+        );
+        eprintln!(
+            "  {} workers × {} steps = {} proofs total",
+            NUM_WORKERS,
+            STEPS_PER_WORKER,
+            NUM_WORKERS * STEPS_PER_WORKER
+        );
+        eprintln!("  Final accumulated error: {}", accumulated_error);
+        eprintln!("  Slashing verified: stake {} → {}", stake_amount, stake_after);
+    }
+}
