@@ -2445,6 +2445,87 @@ impl TensorBuilder {
     }
 }
 
+// =========================================================================
+// Backward-pass convenience methods on BoundedTensor
+// =========================================================================
+
+impl BoundedTensor {
+    /// Backward pass for matmul, returning `GradTensor`s for both operands.
+    ///
+    /// Given `C = self.matmul(other)` and the upstream gradient `dc`,
+    /// returns `(grad_self, grad_other)` as `GradTensor`s with gradients set.
+    pub fn backward_matmul(
+        &self,
+        other: &BoundedTensor,
+        upstream: &BoundedTensor,
+    ) -> crate::error::HelixResult<(super::grad::GradTensor, super::grad::GradTensor)> {
+        let (da, db) = super::grad::GradTensor::backward_matmul(self, other, upstream)?;
+        let mut ga = super::grad::GradTensor::with_grad(self.clone());
+        ga.accumulate_grad(&da)?;
+        let mut gb = super::grad::GradTensor::with_grad(other.clone());
+        gb.accumulate_grad(&db)?;
+        Ok((ga, gb))
+    }
+
+    /// Backward pass for ReLU, returning a `GradTensor` with the gradient set.
+    ///
+    /// Given `y = self.relu()` and upstream gradient `upstream`,
+    /// returns a `GradTensor` wrapping `self` with the relu backward gradient accumulated.
+    pub fn backward_relu(
+        &self,
+        upstream: &BoundedTensor,
+    ) -> crate::error::HelixResult<super::grad::GradTensor> {
+        let dx = super::grad::GradTensor::backward_relu(self, upstream)?;
+        let mut gt = super::grad::GradTensor::with_grad(self.clone());
+        gt.accumulate_grad(&dx)?;
+        Ok(gt)
+    }
+
+    /// Backward pass for element-wise addition, returning `GradTensor`s for both operands.
+    ///
+    /// Given `C = self.add(other)` and upstream gradient `upstream`,
+    /// returns `(grad_self, grad_other)` as `GradTensor`s.
+    pub fn backward_add_op(
+        &self,
+        other: &BoundedTensor,
+        upstream: &BoundedTensor,
+    ) -> crate::error::HelixResult<(super::grad::GradTensor, super::grad::GradTensor)> {
+        let (da, db) = super::grad::GradTensor::backward_add(upstream);
+        let mut ga = super::grad::GradTensor::with_grad(self.clone());
+        ga.accumulate_grad(&da)?;
+        let mut gb = super::grad::GradTensor::with_grad(other.clone());
+        gb.accumulate_grad(&db)?;
+        Ok((ga, gb))
+    }
+
+    /// Backward pass for element-wise multiplication (Hadamard), returning `GradTensor`s.
+    pub fn backward_hadamard_op(
+        &self,
+        other: &BoundedTensor,
+        upstream: &BoundedTensor,
+    ) -> crate::error::HelixResult<(super::grad::GradTensor, super::grad::GradTensor)> {
+        let (da, db) = super::grad::GradTensor::backward_hadamard(self, other, upstream)?;
+        let mut ga = super::grad::GradTensor::with_grad(self.clone());
+        ga.accumulate_grad(&da)?;
+        let mut gb = super::grad::GradTensor::with_grad(other.clone());
+        gb.accumulate_grad(&db)?;
+        Ok((ga, gb))
+    }
+
+    /// Backward pass for softmax, returning a `GradTensor` with the gradient set.
+    ///
+    /// `self` should be the softmax *output*, and `upstream` is the upstream gradient.
+    pub fn backward_softmax_op(
+        &self,
+        upstream: &BoundedTensor,
+    ) -> crate::error::HelixResult<super::grad::GradTensor> {
+        let dx = super::grad::GradTensor::backward_softmax(self, upstream)?;
+        let mut gt = super::grad::GradTensor::with_grad(self.clone());
+        gt.accumulate_grad(&dx)?;
+        Ok(gt)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

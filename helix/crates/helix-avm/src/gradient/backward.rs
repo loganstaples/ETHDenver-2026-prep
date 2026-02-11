@@ -2,7 +2,7 @@
 
 use super::autodiff::{NodeIndex, Operation, Variable};
 use crate::ops::{matmul, conv};
-use helix_core::types::{BoundedTensor, BoundedValue, Precision};
+use helix_core::types::{BoundedTensor, BoundedValue, GradTensor, Precision};
 use std::collections::HashMap;
 
 /// Computes gradients for all variables in the computation graph with respect to the loss.
@@ -56,11 +56,10 @@ pub fn backward(loss: &Variable) -> Result<HashMap<NodeIndex, BoundedTensor>, St
                 // The gradient is already stored in `grads`.
             }
             Operation::Add(lhs_idx, rhs_idx) => {
-                // y = a + b
-                // dL/da = dL/dy
-                // dL/db = dL/dy
-                accumulate_grad(&mut grads, *lhs_idx, &grad_output);
-                accumulate_grad(&mut grads, *rhs_idx, &grad_output);
+                // y = a + b — delegate to GradTensor::backward_add
+                let (da, db) = GradTensor::backward_add(&grad_output);
+                accumulate_grad(&mut grads, *lhs_idx, &da);
+                accumulate_grad(&mut grads, *rhs_idx, &db);
             }
             Operation::Sub(lhs_idx, rhs_idx) => {
                 // y = a - b
@@ -72,26 +71,15 @@ pub fn backward(loss: &Variable) -> Result<HashMap<NodeIndex, BoundedTensor>, St
                 accumulate_grad(&mut grads, *rhs_idx, &neg_grad);
             }
             Operation::MatMul(lhs_idx, rhs_idx) => {
-                // Y = A @ B
-                // dL/dA = dL/dY @ B^T
-                // dL/dB = A^T @ dL/dY
-                // Uses cached_value from NodeInfo to retrieve A and B.
+                // Y = A @ B — delegate to GradTensor::backward_matmul for canonical
+                // gradient computation with proper error bound propagation.
                  let lhs_node = &tape.nodes[*lhs_idx];
                  let rhs_node = &tape.nodes[*rhs_idx];
-                 
+
                  if let (Some(lhs_val), Some(rhs_val)) = (&lhs_node.cached_value, &rhs_node.cached_value) {
-                     let precision = Precision::F32;
-                     
-                     // dL/dA = grad @ B^T
-                     let b_t = rhs_val.transpose();
-                     let grad_a = matmul::matmul(&grad_output, &b_t, precision)
+                     let (grad_a, grad_b) = GradTensor::backward_matmul(lhs_val, rhs_val, &grad_output)
                          .map_err(|e| e.to_string())?;
                      accumulate_grad(&mut grads, *lhs_idx, &grad_a);
-
-                     // dL/dB = A^T @ grad
-                     let a_t = lhs_val.transpose();
-                     let grad_b = matmul::matmul(&a_t, &grad_output, precision)
-                         .map_err(|e| e.to_string())?;
                      accumulate_grad(&mut grads, *rhs_idx, &grad_b);
                  } else {
                      return Err(format!("Missing cached values for MatMul inputs at node {}", idx));
@@ -99,20 +87,11 @@ pub fn backward(loss: &Variable) -> Result<HashMap<NodeIndex, BoundedTensor>, St
             }
             Operation::Relu(input_idx) => {
                 // y = Relu(x)
-                // dL/dx = dL/dy * (1 if x > 0 else 0)
+                // dL/dx = dL/dy * (1 if x > 0 else 0) — delegate to GradTensor::backward_relu
                 let input_node = &tape.nodes[*input_idx];
                 if let Some(input_val) = &input_node.cached_value {
-                    let mask_data: Vec<BoundedValue<f64>> = input_val.data().iter().map(|v| {
-                        if v.value() > 0.0 {
-                            BoundedValue::exact(1.0)
-                        } else {
-                            BoundedValue::exact(0.0)
-                        }
-                    }).collect();
-                    
-                    let mask = BoundedTensor::new(mask_data, input_val.shape().clone());
-                    let grad_input = grad_output.hadamard(&mask);
-                    
+                    let grad_input = GradTensor::backward_relu(input_val, &grad_output)
+                        .map_err(|e| e.to_string())?;
                     accumulate_grad(&mut grads, *input_idx, &grad_input);
                 }
             }
@@ -140,33 +119,11 @@ pub fn backward(loss: &Variable) -> Result<HashMap<NodeIndex, BoundedTensor>, St
                 }
             }
             Operation::Softmax(input_idx) => {
-                // y_i = softmax(x)_i = exp(x_i) / sum(exp(x))
-                // dL/dx_i = sum_j(dL/dy_j * dy_j/dx_i)
-                // dy_j/dx_i = y_i * (delta_ij - y_j)
-                // Simplified: dL/dx = y * (dL/dy - sum(dL/dy * y))
+                // Delegate to GradTensor::backward_softmax for canonical implementation
                 let current_node = &tape.nodes[idx];
                 if let Some(softmax_output) = &current_node.cached_value {
-                    // Compute sum(dL/dy * y)
-                    let weighted_sum: f64 = grad_output.data()
-                        .iter()
-                        .zip(softmax_output.data().iter())
-                        .map(|(g, y)| g.value() * y.value())
-                        .sum();
-                    
-                    let grad_input_data: Vec<BoundedValue<f64>> = softmax_output.data()
-                        .iter()
-                        .zip(grad_output.data().iter())
-                        .map(|(y, g)| {
-                            let y_val = y.value();
-                            let grad_val = y_val * (g.value() - weighted_sum);
-                            // Softmax gradient error is complex; approximate
-                            let error = y.absolute_error() * g.value().abs() 
-                                + g.absolute_error() * y_val;
-                            BoundedValue::new(grad_val, helix_core::types::ErrorMargin::absolute(error))
-                        })
-                        .collect();
-                    
-                    let grad_input = BoundedTensor::new(grad_input_data, softmax_output.shape().clone());
+                    let grad_input = GradTensor::backward_softmax(softmax_output, &grad_output)
+                        .map_err(|e| e.to_string())?;
                     accumulate_grad(&mut grads, *input_idx, &grad_input);
                 }
             }
@@ -240,11 +197,11 @@ pub fn backward(loss: &Variable) -> Result<HashMap<NodeIndex, BoundedTensor>, St
                 let rhs_node = &tape.nodes[*rhs_idx];
                 
                 if let (Some(lhs_val), Some(rhs_val)) = (&lhs_node.cached_value, &rhs_node.cached_value) {
-                    let grad_lhs = grad_output.hadamard(rhs_val);
-                    let grad_rhs = grad_output.hadamard(lhs_val);
-                    
-                    accumulate_grad(&mut grads, *lhs_idx, &grad_lhs);
-                    accumulate_grad(&mut grads, *rhs_idx, &grad_rhs);
+                    // Delegate to GradTensor::backward_hadamard for proper error propagation
+                    if let Ok((grad_lhs, grad_rhs)) = GradTensor::backward_hadamard(lhs_val, rhs_val, &grad_output) {
+                        accumulate_grad(&mut grads, *lhs_idx, &grad_lhs);
+                        accumulate_grad(&mut grads, *rhs_idx, &grad_rhs);
+                    }
                 }
             }
             Operation::Div(lhs_idx, rhs_idx) => {
