@@ -12,7 +12,7 @@
 
 use helix_prover::halo2curves::bn256::Fr;
 use helix_prover::provers::training_prover_v2::TrainingProofResultV2;
-use helix_prover::MLTrainingProverV2;
+use helix_prover::{EvmProofBundle, MLTrainingProverV2, VkData};
 use sha2::{Digest, Sha256};
 
 // ──────────────────────────────────────────────────────────────
@@ -283,27 +283,22 @@ fn quantize_vec(vals: &[f64]) -> Vec<Fr> {
 // ──────────────────────────────────────────────────────────────
 
 /// Result from a single training step with ZK proof.
+///
+/// The canonical on-chain-ready proof lives in `evm_bundle` (an `EvmProofBundle`).
+/// Raw proof bytes and public inputs are accessible via `proof_result`.
 #[derive(Debug)]
 pub struct ProvedStep {
-    /// The Halo2 KZG proof bytes (raw transcript format).
-    pub proof: Vec<u8>,
-    /// EVM-formatted proof bytes (320 bytes: 3 advice + 2 opening points).
-    /// `None` if EVM serialization failed (non-fatal).
-    pub evm_proof: Option<Vec<u8>>,
-    /// EVM-formatted public inputs (8 × 32-byte big-endian arrays).
-    pub evm_public_inputs: Vec<[u8; 32]>,
+    /// The full prover result (proof bytes, public inputs, metadata).
+    pub proof_result: TrainingProofResultV2,
+    /// On-chain-ready proof bundle (EVM-formatted proof + public inputs + VK data).
+    /// `None` only if EVM serialization failed (non-fatal).
+    pub evm_bundle: Option<EvmProofBundle>,
     /// Model state commitment (SHA-256 of weights after update).
     pub commitment: [u8; 32],
     /// Loss before this step's weight update.
     pub loss: f64,
     /// Step number.
     pub step: u64,
-    /// Public inputs for independent verification.
-    pub public_inputs: Vec<Fr>,
-    /// Whether the proof was self-verified by the prover.
-    pub verified: bool,
-    /// The full prover result, for creating `EvmProofBundle` or other downstream uses.
-    pub proof_result: TrainingProofResultV2,
 }
 
 /// Metrics collected during a training run.
@@ -335,6 +330,8 @@ pub struct Trainer {
     lr: f64,
     /// Prover instance (lazily initialised).
     prover: Option<MLTrainingProverV2>,
+    /// Cached VK data (populated on first proof generation).
+    vk_data: Option<VkData>,
     /// Step counter.
     step_count: u64,
 }
@@ -347,6 +344,7 @@ impl Trainer {
             model,
             lr,
             prover: None,
+            vk_data: None,
             step_count: 0,
         }
     }
@@ -357,6 +355,7 @@ impl Trainer {
             model,
             lr,
             prover: None,
+            vk_data: None,
             step_count: 0,
         }
     }
@@ -380,7 +379,22 @@ impl Trainer {
     ///
     /// The VK data is needed for creating `EvmProofBundle` instances and
     /// deploying the on-chain verifier contract.
-    pub fn export_vk_data(&mut self) -> anyhow::Result<helix_prover::VkData> {
+    pub fn export_vk_data(&mut self) -> anyhow::Result<VkData> {
+        if let Some(ref vk) = self.vk_data {
+            return Ok(vk.clone());
+        }
+        self.ensure_prover();
+        let vk = self.prover
+            .as_ref()
+            .unwrap()
+            .export_vk_data()
+            .map_err(|e| anyhow::anyhow!("Failed to export VK data: {}", e))?;
+        self.vk_data = Some(vk.clone());
+        Ok(vk)
+    }
+
+    /// Ensures the prover is initialised.
+    fn ensure_prover(&mut self) {
         if self.prover.is_none() {
             self.prover = Some(MLTrainingProverV2::new(
                 self.model.d_in,
@@ -388,11 +402,6 @@ impl Trainer {
                 self.model.d_out,
             ));
         }
-        self.prover
-            .as_ref()
-            .unwrap()
-            .export_vk_data()
-            .map_err(|e| anyhow::anyhow!("Failed to export VK data: {}", e))
     }
 
     /// Runs a single training step and generates a ZK proof.
@@ -435,13 +444,7 @@ impl Trainer {
         let lr_fr = quantize(self.lr);
 
         // 6. Generate ZK proof via V2 prover.
-        if self.prover.is_none() {
-            self.prover = Some(MLTrainingProverV2::new(
-                self.model.d_in,
-                self.model.d_hid,
-                self.model.d_out,
-            ));
-        }
+        self.ensure_prover();
         let prover = self.prover.as_ref().unwrap();
 
         let witness = MLTrainingProverV2::build_witness(
@@ -465,22 +468,24 @@ impl Trainer {
             anyhow::bail!("Proof self-verification failed at step {}", self.step_count);
         }
 
-        // Convert to EVM format (non-fatal if it fails)
-        let evm_proof = proof_result.to_evm_proof().ok();
-        let evm_public_inputs = proof_result.to_evm_public_inputs();
+        // Cache VK data on first proof (needed for EvmProofBundle).
+        if self.vk_data.is_none() {
+            self.vk_data = prover.export_vk_data().ok();
+        }
+
+        // Create EvmProofBundle (non-fatal if it fails).
+        let evm_bundle = self.vk_data.as_ref().and_then(|vk| {
+            EvmProofBundle::from_proof_result(&proof_result, vk.clone()).ok()
+        });
 
         let commitment = self.model.commitment();
 
         Ok(ProvedStep {
-            proof: proof_result.proof.clone(),
-            evm_proof,
-            evm_public_inputs,
+            proof_result,
+            evm_bundle,
             commitment,
             loss,
             step: self.step_count,
-            public_inputs: proof_result.public_inputs.clone(),
-            verified: proof_result.verified,
-            proof_result,
         })
     }
 
@@ -567,7 +572,7 @@ impl Trainer {
         target: &[f64],
     ) -> anyhow::Result<(Vec<u8>, [u8; 32])> {
         let result = self.train_step(x, target)?;
-        Ok((result.proof, result.commitment))
+        Ok((result.proof_result.proof.clone(), result.commitment))
     }
 }
 
@@ -708,18 +713,19 @@ mod tests {
 
         let result = trainer.train_step(&x, &target).expect("train_step failed");
 
-        assert!(!result.proof.is_empty(), "proof should be non-empty");
+        assert!(!result.proof_result.proof.is_empty(), "proof should be non-empty");
         assert!(result.loss > 0.0, "loss should be positive");
         assert_eq!(result.step, 1);
         assert_ne!(result.commitment, [0u8; 32], "commitment should be non-zero");
         // V2 prover self-verifies during generation
-        assert!(result.verified, "proof should be self-verified");
+        assert!(result.proof_result.verified, "proof should be self-verified");
 
-        // EVM public inputs should have 8 elements (V2 format)
-        assert_eq!(result.evm_public_inputs.len(), 8, "V2 should produce 8 public inputs");
+        // EvmProofBundle should be created successfully
+        let bundle = result.evm_bundle.as_ref().expect("evm_bundle should be Some");
+        assert_eq!(bundle.evm_public_inputs.len(), 8, "V2 should produce 8 public inputs");
 
         // Each EVM public input should be 32 bytes
-        for (i, pi) in result.evm_public_inputs.iter().enumerate() {
+        for (i, pi) in bundle.evm_public_inputs.iter().enumerate() {
             assert_eq!(pi.len(), 32, "public input {} should be 32 bytes", i);
         }
     }
@@ -766,12 +772,12 @@ mod tests {
         let r1 = trainer.train_step(&x, &target);
         assert!(r1.is_ok(), "step 1 failed: {:?}", r1.err());
         let r1 = r1.unwrap();
-        eprintln!("Step 1: loss={:.6}, proof_len={}, verified={}", r1.loss, r1.proof.len(), r1.verified);
+        eprintln!("Step 1: loss={:.6}, proof_len={}, verified={}", r1.loss, r1.proof_result.proof.len(), r1.proof_result.verified);
 
         // Step 2.
         let r2 = trainer.train_step(&x, &target);
         assert!(r2.is_ok(), "step 2 failed: {:?}", r2.err());
         let r2 = r2.unwrap();
-        eprintln!("Step 2: loss={:.6}, proof_len={}, verified={}", r2.loss, r2.proof.len(), r2.verified);
+        eprintln!("Step 2: loss={:.6}, proof_len={}, verified={}", r2.loss, r2.proof_result.proof.len(), r2.proof_result.verified);
     }
 }

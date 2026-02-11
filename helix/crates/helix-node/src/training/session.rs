@@ -212,7 +212,7 @@ impl ProvedTrainingSession {
                     .with_learning_rate(self.trainer.learning_rate())
                     .with_batch_size(1)
                     .with_processing_time(start.elapsed())
-                    .with_custom_metric("proof_size", result.proof.len() as f64);
+                    .with_custom_metric("proof_size", result.proof_result.proof.len() as f64);
                 self.metrics.record(im);
 
                 proofs.push(result);
@@ -335,7 +335,7 @@ mod tests {
         let result = session.run().unwrap();
 
         assert_eq!(result.proofs_generated, 1);
-        assert!(!result.proofs[0].proof.is_empty());
+        assert!(!result.proofs[0].proof_result.proof.is_empty());
         assert!(result.proofs[0].loss > 0.0);
     }
 
@@ -382,7 +382,7 @@ mod tests {
         // ── Assert: every proof is non-empty ──
         for (i, proof) in result.proofs.iter().enumerate() {
             assert!(
-                !proof.proof.is_empty(),
+                !proof.proof_result.proof.is_empty(),
                 "step {i}: proof should be non-empty"
             );
             assert!(
@@ -401,12 +401,13 @@ mod tests {
         // SRS. The V2 prover self-verifies during generation.
         for (i, proof) in result.proofs.iter().enumerate() {
             assert!(
-                proof.verified,
+                proof.proof_result.verified,
                 "step {i}: proof should be self-verified by V2 prover"
             );
-            // V2 proofs produce 8 EVM-formatted public inputs
+            // EvmProofBundle should be created with 8 public inputs
+            let bundle = proof.evm_bundle.as_ref().expect("evm_bundle should be Some");
             assert_eq!(
-                proof.evm_public_inputs.len(), 8,
+                bundle.evm_public_inputs.len(), 8,
                 "step {i}: should have 8 EVM public inputs"
             );
         }

@@ -255,13 +255,13 @@ fn benchmark_proved_with_analysis(
 
         // Capture proof size from first step
         if proof_size.is_none() {
-            if let Some(ref evm_proof) = result.evm_proof {
-                let pi_bytes = result.evm_public_inputs.len() * 32;
+            if let Some(ref bundle) = result.evm_bundle {
+                let pi_bytes = bundle.evm_public_inputs.len() * 32;
                 proof_size = Some(ProofSizeAnalysis {
-                    proof_bytes: evm_proof.len(),
-                    num_public_inputs: result.evm_public_inputs.len(),
+                    proof_bytes: bundle.evm_proof.len(),
+                    num_public_inputs: bundle.evm_public_inputs.len(),
                     public_inputs_bytes: pi_bytes,
-                    total_calldata_bytes: evm_proof.len() + pi_bytes + 64, // +64 for model_id + round_id
+                    total_calldata_bytes: bundle.evm_proof.len() + pi_bytes + 64, // +64 for model_id + round_id
                 });
             }
         }

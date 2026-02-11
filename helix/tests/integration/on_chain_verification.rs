@@ -583,7 +583,7 @@ async fn test_real_verifier_full_pipeline() {
     eprintln!(
         "Real Halo2Verifier.verifyProof() returned: {} (proof size: {} bytes)",
         direct_result,
-        bundle.proof_bytes.len()
+        bundle.bundle.evm_proof.len()
     );
 
     // Submit to coordinator — the real verifier performs BN254 pairing check
@@ -628,7 +628,7 @@ async fn test_real_verifier_full_pipeline() {
     eprintln!(
         "Real verifier test PASSED: proof accepted by BN254 pairing check on-chain \
          (proof size: {} bytes, generation: {:?})",
-        bundle.proof_bytes.len(),
+        bundle.bundle.evm_proof.len(),
         proof_result.generation_time
     );
 }
@@ -654,7 +654,7 @@ async fn test_real_verifier_corrupted_proof_rejected() {
     );
 
     // Corrupt the proof bytes — flip some bytes in the middle
-    let mut corrupted_proof = bundle.proof_bytes.clone();
+    let mut corrupted_proof = bundle.bundle.evm_proof.clone();
     for i in 32..64 {
         corrupted_proof[i] ^= 0xFF;
     }
@@ -732,7 +732,7 @@ async fn test_real_verifier_corrupted_proof_slashes() {
     let bundle = TestEvmProofBundle::from_proof_result(&proof_result, model_id, env.max_error_bound);
 
     // Corrupt the proof bytes
-    let mut corrupted = bundle.proof_bytes.clone();
+    let mut corrupted = bundle.bundle.evm_proof.clone();
     for i in 0..32 {
         corrupted[i] = 0; // Zero out the first G1 point
     }
@@ -910,7 +910,7 @@ async fn test_real_verifier_gas_measurement() {
     eprintln!(
         "Gas measurement: proof verification used {} gas (proof: {} bytes, {} public inputs)",
         gas_u64,
-        bundle.proof_bytes.len(),
+        bundle.bundle.evm_proof.len(),
         bundle.public_inputs.len()
     );
 

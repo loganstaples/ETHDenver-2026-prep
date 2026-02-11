@@ -416,6 +416,59 @@ pub struct ProofSubmission {
     pub step_number: u64,
 }
 
+impl ProofSubmission {
+    /// Creates a `ProofSubmission` from the canonical `EvmProofBundle`.
+    ///
+    /// Bridges from the prover's on-chain-ready proof format to the RPC
+    /// submission format used by `helix_submitProof`.
+    pub fn from_evm_bundle(
+        bundle: &helix_prover::EvmProofBundle,
+        model_id: u64,
+        round_id: u64,
+    ) -> Self {
+        let public_inputs: Vec<String> = bundle
+            .evm_public_inputs
+            .iter()
+            .map(|pi| format!("0x{}", pi.iter().map(|b| format!("{:02x}", b)).collect::<String>()))
+            .collect();
+
+        // Extract typed fields from the 8 public inputs (big-endian 32-byte arrays).
+        // PI layout: [old_hash_lo, old_hash_hi, new_hash_lo, new_hash_hi, loss, error_bound, step_number, error_checksum]
+        let pi = &bundle.evm_public_inputs;
+
+        let old_state_hash = (
+            public_inputs.get(0).cloned().unwrap_or_default(),
+            public_inputs.get(1).cloned().unwrap_or_default(),
+        );
+        let new_state_hash = (
+            public_inputs.get(2).cloned().unwrap_or_default(),
+            public_inputs.get(3).cloned().unwrap_or_default(),
+        );
+        let loss = public_inputs.get(4).cloned().unwrap_or_default();
+        let error_bound = public_inputs.get(5).cloned().unwrap_or_default();
+
+        // Step number from PI[6]: read as big-endian u64 from last 8 bytes.
+        let step_number = if pi.len() > 6 {
+            let bytes = &pi[6];
+            u64::from_be_bytes(bytes[24..32].try_into().unwrap_or([0u8; 8]))
+        } else {
+            0
+        };
+
+        Self {
+            proof: bundle.evm_proof.clone(),
+            public_inputs,
+            model_id,
+            round_id,
+            old_state_hash,
+            new_state_hash,
+            loss,
+            error_bound,
+            step_number,
+        }
+    }
+}
+
 /// Training progress snapshot
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrainingProgress {

@@ -14,7 +14,6 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use helix_node::trainer::{MlpModel, Trainer};
 use helix_prover::EvmProofBundle;
-use helix_prover::VkData;
 
 /// Results from a single worker's training run.
 #[derive(Debug)]
@@ -141,9 +140,6 @@ fn run_single_worker(
     let quantized_lr = lr * 0.001;
     let mut trainer = Trainer::with_model(model, quantized_lr);
 
-    // Extract VK data for creating EvmProofBundle instances
-    let vk_data: VkData = trainer.export_vk_data()?;
-
     let mut losses = Vec::with_capacity(num_steps);
     let mut evm_bundles = Vec::new();
     let mut total_prove_time = Duration::ZERO;
@@ -167,39 +163,34 @@ fn run_single_worker(
         total_prove_time += step_time;
         proofs_generated += 1;
 
-        // Self-verification: the Trainer's prover already self-verifies,
-        // but we double-check the EVM format is valid (320 bytes, correct structure).
-        if result.verified {
+        // Self-verification: the Trainer's prover already self-verifies.
+        if result.proof_result.verified {
             proofs_verified += 1;
         }
 
-        // Collect EVM bundles for first few steps (for on-chain submission)
+        // Collect EVM bundles for first few steps (for on-chain submission).
+        // The Trainer now creates EvmProofBundle internally.
         if step < 3 {
             // Check cache first
             if let Some(cached) = proof_cache.get(&cache_key) {
                 evm_bundles.push(cached.clone());
                 cache_hits += 1;
-            } else {
-                match EvmProofBundle::from_proof_result(&result.proof_result, vk_data.clone()) {
-                    Ok(bundle) => {
-                        // Validate EVM proof format: must be at least 320 bytes
-                        if bundle.evm_proof.len() >= 320 {
-                            proof_cache.insert(cache_key, bundle.clone());
-                            evm_bundles.push(bundle);
-                        } else {
-                            tracing::warn!(
-                                "Worker {}: step {} produced undersized proof ({} bytes, expected >=320)",
-                                worker_id, step, bundle.evm_proof.len(),
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Worker {}: step {} EVM bundle creation failed: {}",
-                            worker_id, step, e,
-                        );
-                    }
+            } else if let Some(bundle) = result.evm_bundle.clone() {
+                // Validate EVM proof format: must be at least 320 bytes
+                if bundle.evm_proof.len() >= 320 {
+                    proof_cache.insert(cache_key, bundle.clone());
+                    evm_bundles.push(bundle);
+                } else {
+                    tracing::warn!(
+                        "Worker {}: step {} produced undersized proof ({} bytes, expected >=320)",
+                        worker_id, step, bundle.evm_proof.len(),
+                    );
                 }
+            } else {
+                tracing::warn!(
+                    "Worker {}: step {} EVM bundle not available",
+                    worker_id, step,
+                );
             }
         }
 
@@ -211,7 +202,7 @@ fn run_single_worker(
                 step + 1,
                 num_steps,
                 result.loss,
-                result.verified,
+                result.proof_result.verified,
                 step_time.as_millis(),
             );
         }

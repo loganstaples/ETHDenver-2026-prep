@@ -509,14 +509,17 @@ pub fn extract_s_g2_from_prover(
 // Proof Formatting Helpers
 // ============================================================================
 
-/// Converts a `TrainingProofResultV2` into EVM-ready proof bytes and public inputs.
+// ============================================================================
+// EvmProofBundle Helper Functions
+// ============================================================================
+
+/// Convenience wrapper around `EvmProofBundle` with derived on-chain fields.
 ///
-/// The public inputs are adjusted so that PI[7] (error_checksum) matches
-/// the Solidity `_computeErrorChecksum` computation for the given model_id
-/// and max_error_bound.
+/// Bridges the canonical `EvmProofBundle` (from helix-prover) to the on-chain
+/// test format by pre-computing commitments and extracting typed fields.
 pub struct TestEvmProofBundle {
-    /// 320-byte EVM-formatted proof.
-    pub proof_bytes: Vec<u8>,
+    /// The canonical proof bundle.
+    pub bundle: helix_prover::EvmProofBundle,
     /// 8 public inputs as U256 values.
     pub public_inputs: Vec<U256>,
     /// The old state commitment (keccak256 hash pair).
@@ -530,10 +533,24 @@ pub struct TestEvmProofBundle {
 }
 
 impl TestEvmProofBundle {
-    /// Creates an EVM proof bundle from a Rust proof result.
+    /// Creates a test bundle from a `TrainingProofResultV2` and VK data.
     ///
-    /// The circuit's PI[7] (Poseidon-based error checksum) is passed through
-    /// directly — PoseidonHasher.sol now matches the Rust circuit's Poseidon.
+    /// This is the recommended way to create bundles in tests — it uses the
+    /// canonical `EvmProofBundle::from_proof_result` internally.
+    pub fn from_proof_result_with_vk(
+        result: &helix_prover::provers::training_prover_v2::TrainingProofResultV2,
+        vk: helix_prover::VkData,
+    ) -> Self {
+        let bundle = helix_prover::EvmProofBundle::from_proof_result(result, vk)
+            .expect("EvmProofBundle creation failed");
+        Self::from_evm_bundle(bundle)
+    }
+
+    /// Creates a test bundle from a proof result using legacy test signature.
+    ///
+    /// The `_model_id` and `_max_error_bound` parameters are retained for
+    /// backwards compatibility but are no longer used — the canonical
+    /// `EvmProofBundle` handles all formatting internally.
     pub fn from_proof_result(
         result: &helix_prover::provers::training_prover_v2::TrainingProofResultV2,
         _model_id: U256,
@@ -541,11 +558,11 @@ impl TestEvmProofBundle {
     ) -> Self {
         use helix_circuits::verifier::serialize_proof_for_evm;
 
-        // Convert raw Halo2 transcript to 320-byte EVM format
-        let proof_bytes = serialize_proof_for_evm(&result.proof, 3)
+        // For backwards compat: manually build the EVM proof since we don't
+        // have VkData in the legacy call signature.
+        let evm_proof = serialize_proof_for_evm(&result.proof, 3)
             .expect("EVM proof serialization failed");
 
-        // Convert public inputs to U256 — PI[7] flows through from circuit unchanged
         let evm_pi_bytes = result.to_evm_public_inputs();
         let public_inputs: Vec<U256> = evm_pi_bytes
             .iter()
@@ -560,8 +577,17 @@ impl TestEvmProofBundle {
         let old_commitment = compute_hash_pair(public_inputs[0], public_inputs[1]);
         let new_commitment = compute_hash_pair(public_inputs[2], public_inputs[3]);
 
+        // Build a minimal EvmProofBundle (without VK data, tests that need
+        // VK should use from_proof_result_with_vk instead).
+        let bundle = helix_prover::EvmProofBundle {
+            evm_proof,
+            evm_public_inputs: evm_pi_bytes,
+            vk_deployment_args: helix_prover::VkData::default(),
+            result: result.clone(),
+        };
+
         Self {
-            proof_bytes,
+            bundle,
             public_inputs,
             old_commitment,
             new_commitment,
@@ -570,9 +596,37 @@ impl TestEvmProofBundle {
         }
     }
 
+    /// Wraps an existing `EvmProofBundle` with derived test fields.
+    pub fn from_evm_bundle(bundle: helix_prover::EvmProofBundle) -> Self {
+        let public_inputs: Vec<U256> = bundle.evm_public_inputs
+            .iter()
+            .map(|bytes| U256::from_big_endian(bytes))
+            .collect();
+
+        let error_bound = public_inputs[5];
+        let step_number = public_inputs[6];
+
+        let old_commitment = compute_hash_pair(public_inputs[0], public_inputs[1]);
+        let new_commitment = compute_hash_pair(public_inputs[2], public_inputs[3]);
+
+        Self {
+            bundle,
+            public_inputs,
+            old_commitment,
+            new_commitment,
+            error_bound,
+            step_number,
+        }
+    }
+
+    /// Returns the raw proof bytes.
+    pub fn proof_bytes(&self) -> &[u8] {
+        &self.bundle.evm_proof
+    }
+
     /// Returns proof bytes as ethers Bytes.
     pub fn proof_as_bytes(&self) -> Bytes {
-        Bytes::from(self.proof_bytes.clone())
+        Bytes::from(self.bundle.evm_proof.clone())
     }
 }
 
@@ -600,37 +654,9 @@ mod tests {
     }
 
     #[test]
-    fn test_error_checksum_deterministic() {
-        let c1 = compute_solidity_error_checksum(
-            U256::from(100u64),
-            U256::from(1u64),
-            U256::zero(),
-            U256::from(1_000_000_000_000_000_000u64),
-        );
-        let c2 = compute_solidity_error_checksum(
-            U256::from(100u64),
-            U256::from(1u64),
-            U256::zero(),
-            U256::from(1_000_000_000_000_000_000u64),
-        );
-        assert_eq!(c1, c2);
-        assert_ne!(c1, U256::zero());
-    }
-
-    #[test]
-    fn test_different_inputs_different_checksum() {
-        let c1 = compute_solidity_error_checksum(
-            U256::from(100u64),
-            U256::from(1u64),
-            U256::zero(),
-            U256::from(1_000_000_000_000_000_000u64),
-        );
-        let c2 = compute_solidity_error_checksum(
-            U256::from(200u64), // different error bound
-            U256::from(1u64),
-            U256::zero(),
-            U256::from(1_000_000_000_000_000_000u64),
-        );
-        assert_ne!(c1, c2);
+    fn test_hash_pair_different_inputs() {
+        let h1 = compute_hash_pair(U256::from(1u64), U256::from(2u64));
+        let h2 = compute_hash_pair(U256::from(3u64), U256::from(4u64));
+        assert_ne!(h1, h2, "Different inputs should produce different hashes");
     }
 }

@@ -311,17 +311,21 @@ async fn run_worker(listen_addr: SocketAddr) -> anyhow::Result<()> {
                                     info!("Training step {} (round {})...", t.step_count() + 1, round_id);
                                     match t.train_step(&x, &target) {
                                         Ok(result) => {
+                                            let evm_proof_len = result.evm_bundle.as_ref().map(|b| b.evm_proof.len()).unwrap_or(0);
                                             info!(
                                                 "Proof generated: {} bytes (EVM: {}), loss={:.6}, verified={}, commitment={:?}",
-                                                result.proof.len(),
-                                                result.evm_proof.as_ref().map(|p| p.len()).unwrap_or(0),
+                                                result.proof_result.proof.len(),
+                                                evm_proof_len,
                                                 result.loss,
-                                                result.verified,
+                                                result.proof_result.verified,
                                                 hex::encode(&result.commitment[..4]),
                                             );
 
                                             // Use EVM-formatted proof if available, otherwise raw
-                                            let proof_bytes = result.evm_proof.unwrap_or(result.proof);
+                                            let proof_bytes = result.evm_bundle
+                                                .as_ref()
+                                                .map(|b| b.evm_proof.clone())
+                                                .unwrap_or_else(|| result.proof_result.proof.clone());
 
                                             // Send gradient + proof back to aggregator
                                             let (hiding_commitment, nonce) = helix_node::training::consensus::compute_hiding_gradient_commitment(&result.commitment);
