@@ -9,11 +9,21 @@ use std::time::SystemTime;
 use tokio::sync::RwLock;
 
 use sha2::{Digest, Sha256};
+use serde::{Deserialize, Serialize};
+
+use helix_mpc::poseidon::{poseidon_hash_two, poseidon_commit_with_domain, domains};
+use helix_mpc::Fr as MpcFr;
 
 use crate::network::messages::{
     GradientMessage, MessagePayload, NetworkMessage, NodeCapabilities, PeerId, TrainingMessage,
     TrainingParams,
 };
+use crate::network::partition_detect::{PartitionDetector, PartitionAction};
+use crate::training::aggregation::{
+    AggregationStrategy, AggregationConfig as ByzantineAggregationConfig,
+    GradientAggregator, WeightedGradient,
+};
+use crate::training::model::ModelGradient;
 
 /// Strategy for combining gradient commitments during aggregation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +34,22 @@ pub enum CommitmentAggregation {
     /// Requires that individual commitments are valid Pedersen commitments
     /// on the BN254 G1 curve.
     Pedersen,
+}
+
+/// Serializable aggregation proof containing a Poseidon commitment
+/// that binds the sorted commitments, participant count, and round ID.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AggregationProof {
+    /// Domain-separated Poseidon commitment (32 bytes, BN254 Fr).
+    pub poseidon_commitment: [u8; 32],
+    /// Sorted list of participant commitments included in the proof.
+    pub sorted_commitments: Vec<[u8; 32]>,
+    /// Number of participants.
+    pub participant_count: usize,
+    /// Round ID this proof covers.
+    pub round_id: u64,
+    /// Total accumulated error bound.
+    pub total_error_bound: f64,
 }
 
 /// Aggregator state.
@@ -58,6 +84,10 @@ pub struct AggregatorConfig {
     pub max_error_bound: f64,
     /// How to combine gradient commitments during aggregation.
     pub commitment_aggregation: CommitmentAggregation,
+    /// Optional Byzantine-fault-tolerant gradient filtering strategy.
+    /// When set and gradient data is available, outliers are excluded
+    /// before computing the aggregated commitment.
+    pub byzantine_strategy: Option<AggregationStrategy>,
 }
 
 impl Default for AggregatorConfig {
@@ -69,6 +99,7 @@ impl Default for AggregatorConfig {
             generate_proof: true,
             max_error_bound: 0.1,
             commitment_aggregation: CommitmentAggregation::HashBased,
+            byzantine_strategy: Some(AggregationStrategy::Krum { num_byzantine: 1 }),
         }
     }
 }
@@ -86,6 +117,10 @@ pub struct CollectedGradient {
     pub proof: Vec<u8>,
     /// Received timestamp.
     pub received_at: u64,
+    /// Optional raw gradient data for Byzantine filtering.
+    /// When present, the aggregator can run Krum/Median/TrimmedMean
+    /// to exclude outliers before computing the aggregated commitment.
+    pub gradient_data: Option<ModelGradient>,
 }
 
 /// Aggregated result.
@@ -99,8 +134,10 @@ pub struct AggregatedResult {
     pub total_error_bound: f64,
     /// Number of participants.
     pub num_participants: usize,
-    /// Aggregation proof.
+    /// Aggregation proof (bincode-serialized `AggregationProof`).
     pub proof: Vec<u8>,
+    /// Participants excluded by Byzantine filtering.
+    pub excluded_participants: Vec<PeerId>,
 }
 
 /// Aggregator node role.
@@ -121,6 +158,8 @@ pub struct AggregatorNode {
     completed_rounds: Arc<RwLock<HashMap<u64, AggregatedResult>>>,
     /// Statistics.
     stats: Arc<RwLock<AggregatorStats>>,
+    /// Optional partition detector to gate aggregation on network health.
+    partition_detector: Option<Arc<PartitionDetector>>,
 }
 
 /// Aggregator statistics.
@@ -148,7 +187,14 @@ impl AggregatorNode {
             gradients: Arc::new(RwLock::new(HashMap::new())),
             completed_rounds: Arc::new(RwLock::new(HashMap::new())),
             stats: Arc::new(RwLock::new(AggregatorStats::default())),
+            partition_detector: None,
         }
+    }
+
+    /// Sets the partition detector for network health gating.
+    pub fn with_partition_detector(mut self, detector: Arc<PartitionDetector>) -> Self {
+        self.partition_detector = Some(detector);
+        self
     }
 
     /// Gets the node's capabilities.
@@ -171,11 +217,55 @@ impl AggregatorNode {
     }
 
     /// Starts a new training round.
+    ///
+    /// If a partition detector is set and reports a `Halt` or `PauseTraining`
+    /// action, the round is not started and the aggregator transitions to
+    /// `Error` state instead.
     pub async fn start_round(
         &self,
         model_hash: [u8; 32],
         params: TrainingParams,
     ) -> NetworkMessage {
+        // Check partition status before starting
+        if let Some(ref detector) = self.partition_detector {
+            if detector.is_partitioned() {
+                if let Some(status) = detector.get_status() {
+                    match status.recommended_action {
+                        PartitionAction::Halt | PartitionAction::PauseTraining => {
+                            log::warn!(
+                                "Partition detected ({:?}), refusing to start round",
+                                status.recommended_action
+                            );
+                            let mut state = self.state.write().await;
+                            *state = AggregatorState::Error {
+                                message: format!(
+                                    "Network partitioned: {} unreachable peers, action={:?}",
+                                    status.unreachable_peers, status.recommended_action
+                                ),
+                            };
+                            // Return a round start message with round_id 0
+                            // to signal the round was not started
+                            return NetworkMessage::new(
+                                self.local_id.clone(),
+                                MessagePayload::Training(TrainingMessage::RoundStart {
+                                    round_id: 0,
+                                    model_hash,
+                                    params,
+                                }),
+                            );
+                        }
+                        PartitionAction::ReconnectPeers | PartitionAction::AlertOperator => {
+                            log::warn!(
+                                "Partition detected ({:?}), proceeding optimistically",
+                                status.recommended_action
+                            );
+                        }
+                        PartitionAction::Continue => {}
+                    }
+                }
+            }
+        }
+
         let round_id = {
             let mut round = self.current_round.write().await;
             *round += 1;
@@ -271,6 +361,19 @@ impl AggregatorNode {
         error_bound: f64,
         proof: Vec<u8>,
     ) -> bool {
+        self.handle_gradient_share_with_data(from, round_id, commitment, error_bound, proof, None).await
+    }
+
+    /// Handles a gradient share with optional raw gradient data for Byzantine filtering.
+    pub async fn handle_gradient_share_with_data(
+        &self,
+        from: PeerId,
+        round_id: u64,
+        commitment: [u8; 32],
+        error_bound: f64,
+        proof: Vec<u8>,
+        gradient_data: Option<ModelGradient>,
+    ) -> bool {
         let current_round = *self.current_round.read().await;
         if round_id != current_round {
             return false;
@@ -294,6 +397,7 @@ impl AggregatorNode {
             error_bound,
             proof,
             received_at: now,
+            gradient_data,
         };
 
         {
@@ -326,8 +430,34 @@ impl AggregatorNode {
     ///   collision-resistant, matches the orchestrator's aggregation).
     /// - **Pedersen**: Homomorphic addition of commitments on BN254 G1.
     ///   Requires that each commitment is a serialized Pedersen point.
+    ///
+    /// When `byzantine_strategy` is configured and gradient data is available,
+    /// outlier gradients are excluded before computing the aggregated commitment.
+    ///
+    /// Generates a domain-separated Poseidon commitment proof binding the
+    /// sorted commitments, participant count, and round ID.
     pub async fn aggregate(&self) -> Option<AggregatedResult> {
         let round_id = *self.current_round.read().await;
+
+        // Check partition status before aggregating
+        if let Some(ref detector) = self.partition_detector {
+            if detector.is_partitioned() {
+                if let Some(status) = detector.get_status() {
+                    if status.recommended_action == PartitionAction::Halt {
+                        log::warn!(
+                            "Partition detected with Halt action, refusing to aggregate round {}",
+                            round_id
+                        );
+                        return None;
+                    }
+                    // For PauseTraining/ReconnectPeers, proceed with warning
+                    log::warn!(
+                        "Partition detected ({:?}) during aggregation, proceeding optimistically",
+                        status.recommended_action
+                    );
+                }
+            }
+        }
 
         // Update state
         {
@@ -340,11 +470,75 @@ impl AggregatorNode {
             return None;
         }
 
-        // Collect and sort commitments for deterministic aggregation
+        // Run Byzantine filtering if configured and gradient data is available
+        let mut excluded_participants = Vec::new();
+        let excluded_peers: std::collections::HashSet<PeerId>;
+
+        if let Some(ref strategy) = self.config.byzantine_strategy {
+            let has_gradient_data = gradients.values().any(|g| g.gradient_data.is_some());
+            if has_gradient_data {
+                let byz_config = ByzantineAggregationConfig {
+                    strategy: *strategy,
+                    min_gradients: 2,
+                    max_gradient_norm: 10.0,
+                    stake_weighted: false,
+                };
+                let mut byz_aggregator = GradientAggregator::new(byz_config);
+
+                for grad in gradients.values() {
+                    if let Some(ref gd) = grad.gradient_data {
+                        byz_aggregator.add_gradient(WeightedGradient {
+                            participant_id: grad.participant.to_string(),
+                            stake: 100, // Equal stake for filtering
+                            gradient: gd.clone(),
+                            error_bound: grad.error_bound,
+                            is_valid: true,
+                        });
+                    }
+                }
+
+                match byz_aggregator.aggregate() {
+                    Ok(byz_result) => {
+                        for excl_id in &byz_result.excluded {
+                            // Find matching PeerId
+                            for grad in gradients.values() {
+                                if grad.participant.to_string() == *excl_id {
+                                    excluded_participants.push(grad.participant.clone());
+                                }
+                            }
+                        }
+                        if !excluded_participants.is_empty() {
+                            log::info!(
+                                "Byzantine filtering excluded {} participants: {:?}",
+                                excluded_participants.len(),
+                                excluded_participants
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("Byzantine filtering failed ({}), using all gradients", e);
+                    }
+                }
+            } else {
+                log::debug!(
+                    "Byzantine filtering configured but no gradient data available, skipping"
+                );
+            }
+        }
+
+        excluded_peers = excluded_participants.iter().cloned().collect();
+
+        // Collect and sort commitments for deterministic aggregation,
+        // excluding any participants flagged by Byzantine filtering
         let mut commitments: Vec<[u8; 32]> = gradients.values()
+            .filter(|g| !excluded_peers.contains(&g.participant))
             .map(|g| g.commitment)
             .collect();
         commitments.sort();
+
+        let included_gradients: Vec<&CollectedGradient> = gradients.values()
+            .filter(|g| !excluded_peers.contains(&g.participant))
+            .collect();
 
         let combined_commitment = match self.config.commitment_aggregation {
             CommitmentAggregation::HashBased => {
@@ -358,11 +552,6 @@ impl AggregatorNode {
             }
             CommitmentAggregation::Pedersen => {
                 // Homomorphic addition of Pedersen commitments on BN254 G1.
-                //
-                // Each 32-byte commitment is interpreted as a compressed G1Affine
-                // point. If any commitment fails to deserialize (e.g. because the
-                // wire protocol currently sends SHA-256 hashes rather than EC
-                // points), we fall back to hash-based aggregation with a warning.
                 use helix_mpc::security::commitment::PedersenCommitment;
                 use halo2curves::bn256::G1Affine;
                 use halo2curves::serde::SerdeObject;
@@ -370,8 +559,7 @@ impl AggregatorNode {
                 let mut acc: Option<PedersenCommitment> = None;
                 let mut pedersen_ok = true;
 
-                for grad in gradients.values() {
-                    // G1Affine compressed is 32 bytes on BN254
+                for grad in &included_gradients {
                     match G1Affine::from_raw_bytes(&grad.commitment) {
                         Some(point) => {
                             let pc = PedersenCommitment { point };
@@ -392,14 +580,12 @@ impl AggregatorNode {
                 }
 
                 if !pedersen_ok || acc.is_none() {
-                    // Fallback: SHA-256 hash of sorted commitments
                     let mut hasher = Sha256::new();
                     for c in &commitments {
                         hasher.update(c);
                     }
                     hasher.finalize().into()
                 } else {
-                    // Serialize the aggregated G1 point back to 32 bytes
                     let agg = acc.unwrap();
                     let mut bytes = [0u8; 32];
                     let raw = agg.point.to_raw_bytes();
@@ -411,31 +597,41 @@ impl AggregatorNode {
         };
 
         let mut total_error = 0.0;
-        for grad in gradients.values() {
+        for grad in &included_gradients {
             total_error += grad.error_bound;
         }
-
         // Average error
-        total_error /= gradients.len() as f64;
+        if !included_gradients.is_empty() {
+            total_error /= included_gradients.len() as f64;
+        }
+
+        // Generate Poseidon commitment proof
+        let proof_bytes = self.generate_aggregation_proof(
+            round_id,
+            &commitments,
+            included_gradients.len(),
+            total_error,
+        );
 
         let result = AggregatedResult {
             round_id,
             commitment: combined_commitment,
             total_error_bound: total_error,
-            num_participants: gradients.len(),
-            proof: vec![], // Would generate proof here
+            num_participants: included_gradients.len(),
+            proof: proof_bytes,
+            excluded_participants,
         };
 
         // Update stats
         {
             let mut stats = self.stats.write().await;
             stats.rounds_successful += 1;
-            stats.gradients_aggregated += gradients.len() as u64;
-            
+            stats.gradients_aggregated += included_gradients.len() as u64;
+
             // Update rolling average
             let total_rounds = stats.rounds_successful as f64;
-            stats.avg_participants = (stats.avg_participants * (total_rounds - 1.0) 
-                + gradients.len() as f64) / total_rounds;
+            stats.avg_participants = (stats.avg_participants * (total_rounds - 1.0)
+                + included_gradients.len() as f64) / total_rounds;
         }
 
         // Store result
@@ -451,6 +647,67 @@ impl AggregatorNode {
         }
 
         Some(result)
+    }
+
+    /// Generates a domain-separated Poseidon commitment proof.
+    ///
+    /// The proof binds: `Poseidon(H(sorted_commitments), Fr(num_participants))`
+    /// using the `AGGREGATION` domain separator (0x05).
+    fn generate_aggregation_proof(
+        &self,
+        round_id: u64,
+        sorted_commitments: &[[u8; 32]],
+        num_participants: usize,
+        total_error_bound: f64,
+    ) -> Vec<u8> {
+        // Hash all sorted commitments into a single Fr using tree-based Poseidon
+        let commitment_frs: Vec<MpcFr> = sorted_commitments
+            .iter()
+            .map(|c| MpcFr::from_bytes_le(c))
+            .collect();
+
+        // Fold commitments pairwise: H(c0, c1), H(c2, c3), ...
+        let mut current = commitment_frs;
+        while current.len() > 1 {
+            let mut next = Vec::new();
+            let mut i = 0;
+            while i < current.len() {
+                if i + 1 < current.len() {
+                    let h = poseidon_hash_two(*current[i].inner(), *current[i + 1].inner());
+                    next.push(MpcFr::from_inner(h));
+                } else {
+                    // Odd element: hash with zero
+                    let h = poseidon_hash_two(*current[i].inner(), *MpcFr::ZERO.inner());
+                    next.push(MpcFr::from_inner(h));
+                }
+                i += 2;
+            }
+            current = next;
+        }
+
+        let commitments_hash = if current.is_empty() {
+            MpcFr::ZERO
+        } else {
+            current[0]
+        };
+
+        // Create domain-separated commitment binding commitments + participant count
+        let num_participants_fr = MpcFr::from_u64(num_participants as u64);
+        let poseidon_commitment = poseidon_commit_with_domain(
+            domains::AGGREGATION,
+            &[commitments_hash, num_participants_fr],
+            MpcFr::from_u64(round_id),
+        );
+
+        let agg_proof = AggregationProof {
+            poseidon_commitment: poseidon_commitment.to_bytes_le(),
+            sorted_commitments: sorted_commitments.to_vec(),
+            participant_count: num_participants,
+            round_id,
+            total_error_bound,
+        };
+
+        bincode::serialize(&agg_proof).unwrap_or_default()
     }
 
     /// Creates an aggregated gradient message.
@@ -510,21 +767,11 @@ impl AggregatorNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::partition_detect::{PartitionDetectionConfig, PartitionStatus, PartitionGroup};
+    use crate::training::model::{ModelGradient, WeightData};
 
-    #[tokio::test]
-    async fn test_aggregator_init() {
-        let local_id = PeerId::random();
-        let node = AggregatorNode::new(local_id, AggregatorConfig::default());
-        
-        assert!(matches!(node.get_state().await, AggregatorState::Idle));
-    }
-
-    #[tokio::test]
-    async fn test_start_round() {
-        let local_id = PeerId::random();
-        let node = AggregatorNode::new(local_id, AggregatorConfig::default());
-        
-        let params = TrainingParams {
+    fn default_params() -> TrainingParams {
+        TrainingParams {
             learning_rate: 0.001,
             batch_size: 32,
             local_epochs: 5,
@@ -533,10 +780,37 @@ mod tests {
             d_hid: 8,
             d_out: 2,
             model_seed: 42,
-        };
-        
-        let _msg = node.start_round([1; 32], params).await;
-        
+        }
+    }
+
+    fn make_simple_gradient(offset: f32) -> ModelGradient {
+        ModelGradient {
+            embeddings: Some(WeightData {
+                shape: vec![4],
+                data: vec![1.0 + offset, 2.0 + offset, 3.0 + offset, 4.0 + offset],
+                error_bound: 0.01,
+            }),
+            layers: vec![],
+            lm_head: None,
+            error_bound: 0.01,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_aggregator_init() {
+        let local_id = PeerId::random();
+        let node = AggregatorNode::new(local_id, AggregatorConfig::default());
+
+        assert!(matches!(node.get_state().await, AggregatorState::Idle));
+    }
+
+    #[tokio::test]
+    async fn test_start_round() {
+        let local_id = PeerId::random();
+        let node = AggregatorNode::new(local_id, AggregatorConfig::default());
+
+        let _msg = node.start_round([1; 32], default_params()).await;
+
         match node.get_state().await {
             AggregatorState::Recruiting { round_id, .. } => {
                 assert_eq!(round_id, 1);
@@ -550,18 +824,7 @@ mod tests {
         let local_id = PeerId::random();
         let node = AggregatorNode::new(local_id, AggregatorConfig::default());
 
-        let params = TrainingParams {
-            learning_rate: 0.001,
-            batch_size: 32,
-            local_epochs: 5,
-            max_error_bound: 0.1,
-            d_in: 4,
-            d_hid: 8,
-            d_out: 2,
-            model_seed: 42,
-        };
-
-        node.start_round([1; 32], params).await;
+        node.start_round([1; 32], default_params()).await;
 
         let participant = PeerId::random();
         let response = node.handle_participate_request(participant, 1).await;
@@ -575,22 +838,12 @@ mod tests {
         let config = AggregatorConfig {
             min_participants: 1,
             commitment_aggregation: CommitmentAggregation::HashBased,
+            byzantine_strategy: None, // No filtering for this test
             ..Default::default()
         };
         let node = AggregatorNode::new(local_id, config);
 
-        let params = TrainingParams {
-            learning_rate: 0.001,
-            batch_size: 32,
-            local_epochs: 5,
-            max_error_bound: 0.1,
-            d_in: 4,
-            d_hid: 8,
-            d_out: 2,
-            model_seed: 42,
-        };
-
-        node.start_round([1; 32], params).await;
+        node.start_round([1; 32], default_params()).await;
 
         let p1 = PeerId::random();
         let p2 = PeerId::random();
@@ -615,5 +868,182 @@ mod tests {
 
         assert_eq!(result.commitment, expected);
         assert_eq!(result.num_participants, 2);
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_produces_nonempty_proof() {
+        let local_id = PeerId::random();
+        let config = AggregatorConfig {
+            min_participants: 1,
+            byzantine_strategy: None,
+            ..Default::default()
+        };
+        let node = AggregatorNode::new(local_id, config);
+
+        node.start_round([1; 32], default_params()).await;
+
+        let p1 = PeerId::random();
+        let p2 = PeerId::random();
+        node.handle_participate_request(p1.clone(), 1).await;
+        node.handle_participate_request(p2.clone(), 1).await;
+        node.start_collection().await;
+
+        node.handle_gradient_share(p1, 1, [0xAA; 32], 0.01, vec![1]).await;
+        node.handle_gradient_share(p2, 1, [0xBB; 32], 0.02, vec![2]).await;
+
+        let result = node.aggregate().await.expect("aggregation should succeed");
+
+        // Proof should be non-empty
+        assert!(!result.proof.is_empty(), "proof must not be empty");
+
+        // Proof should be deserializable as AggregationProof
+        let agg_proof: AggregationProof =
+            bincode::deserialize(&result.proof).expect("proof must be deserializable");
+
+        assert_eq!(agg_proof.participant_count, 2);
+        assert_eq!(agg_proof.round_id, 1);
+        assert_eq!(agg_proof.sorted_commitments.len(), 2);
+        // Poseidon commitment should be non-zero
+        assert_ne!(agg_proof.poseidon_commitment, [0u8; 32]);
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_with_byzantine_filtering() {
+        let local_id = PeerId::random();
+        let config = AggregatorConfig {
+            min_participants: 1,
+            byzantine_strategy: Some(AggregationStrategy::Krum { num_byzantine: 1 }),
+            ..Default::default()
+        };
+        let node = AggregatorNode::new(local_id, config);
+
+        node.start_round([1; 32], default_params()).await;
+
+        // Create 5 participants: 4 honest + 1 outlier
+        let mut peers = Vec::new();
+        for _ in 0..5 {
+            let p = PeerId::random();
+            node.handle_participate_request(p.clone(), 1).await;
+            peers.push(p);
+        }
+        node.start_collection().await;
+
+        // 4 honest gradients with small offsets
+        for (i, p) in peers[..4].iter().enumerate() {
+            node.handle_gradient_share_with_data(
+                p.clone(),
+                1,
+                [i as u8 + 1; 32],
+                0.01,
+                vec![1],
+                Some(make_simple_gradient(i as f32 * 0.1)),
+            ).await;
+        }
+        // 1 outlier with extreme values
+        node.handle_gradient_share_with_data(
+            peers[4].clone(),
+            1,
+            [0xFF; 32],
+            0.01,
+            vec![1],
+            Some(make_simple_gradient(1000.0)),
+        ).await;
+
+        let result = node.aggregate().await.expect("aggregation should succeed");
+
+        // The outlier should be excluded
+        assert!(
+            !result.excluded_participants.is_empty(),
+            "Byzantine filtering should exclude at least one participant"
+        );
+        // Only 4 participants should remain after filtering
+        assert!(result.num_participants <= 4, "Outlier should be filtered out");
+    }
+
+    #[tokio::test]
+    async fn test_partition_blocks_round_start() {
+        let detector = Arc::new(PartitionDetector::new(PartitionDetectionConfig {
+            min_peers_for_detection: 2,
+            ..Default::default()
+        }));
+
+        // Simulate a partition with Halt action by registering peers and
+        // making them unreachable
+        let addr1: std::net::SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        let addr2: std::net::SocketAddr = "127.0.0.1:9002".parse().unwrap();
+        let addr3: std::net::SocketAddr = "127.0.0.1:9003".parse().unwrap();
+        detector.register_peer(addr1);
+        detector.register_peer(addr2);
+        detector.register_peer(addr3);
+
+        // Record missed heartbeats to make them unreachable — need to also
+        // set unreachable_threshold very low for test
+        let fast_detector = Arc::new(PartitionDetector::new(PartitionDetectionConfig {
+            min_peers_for_detection: 2,
+            unreachable_threshold: std::time::Duration::from_millis(1),
+            ..Default::default()
+        }));
+        fast_detector.register_peer(addr1);
+        fast_detector.register_peer(addr2);
+        fast_detector.register_peer(addr3);
+
+        // Wait for threshold to expire
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Record missed heartbeats so status becomes Unreachable
+        for _ in 0..5 {
+            fast_detector.record_missed_heartbeat(&addr1);
+            fast_detector.record_missed_heartbeat(&addr2);
+            fast_detector.record_missed_heartbeat(&addr3);
+        }
+
+        // Run detection to populate status
+        let _ = fast_detector.detect_partition().await;
+
+        let local_id = PeerId::random();
+        let node = AggregatorNode::new(local_id, AggregatorConfig::default())
+            .with_partition_detector(fast_detector);
+
+        let _msg = node.start_round([1; 32], default_params()).await;
+
+        // Should be in Error state, not Recruiting
+        match node.get_state().await {
+            AggregatorState::Error { message } => {
+                assert!(message.contains("partitioned"), "Error should mention partition: {}", message);
+            }
+            other => panic!("Expected Error state due to partition, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_partition_allows_round_when_healthy() {
+        let detector = Arc::new(PartitionDetector::new(PartitionDetectionConfig {
+            min_peers_for_detection: 2,
+            ..Default::default()
+        }));
+
+        // Register healthy peers
+        let addr1: std::net::SocketAddr = "127.0.0.1:9010".parse().unwrap();
+        let addr2: std::net::SocketAddr = "127.0.0.1:9011".parse().unwrap();
+        detector.register_peer(addr1);
+        detector.register_peer(addr2);
+        for _ in 0..5 {
+            detector.record_heartbeat(&addr1, Some(std::time::Duration::from_millis(10)));
+            detector.record_heartbeat(&addr2, Some(std::time::Duration::from_millis(10)));
+        }
+
+        // Healthy network — is_partitioned() should be false (no status set yet)
+        let local_id = PeerId::random();
+        let node = AggregatorNode::new(local_id, AggregatorConfig::default())
+            .with_partition_detector(detector);
+
+        let _msg = node.start_round([1; 32], default_params()).await;
+
+        match node.get_state().await {
+            AggregatorState::Recruiting { round_id, .. } => {
+                assert_eq!(round_id, 1);
+            }
+            other => panic!("Expected Recruiting state with healthy network, got {:?}", other),
+        }
     }
 }

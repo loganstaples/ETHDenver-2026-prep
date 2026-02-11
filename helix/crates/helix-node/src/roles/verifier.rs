@@ -77,9 +77,28 @@ impl Default for VerifierConfig {
         Self {
             max_concurrent: 4,
             timeout_secs: 60,
-            policy: VerificationPolicy::VerifyAll,
+            policy: VerificationPolicy::Structural,
             model_dims: None,
         }
+    }
+}
+
+impl VerifierConfig {
+    /// Creates a config for production use with full Halo2 KZG verification.
+    ///
+    /// Requires model dimensions to initialize the prover circuit.
+    pub fn for_model(d_in: usize, d_hid: usize, d_out: usize) -> Self {
+        Self {
+            max_concurrent: 4,
+            timeout_secs: 60,
+            policy: VerificationPolicy::VerifyAll,
+            model_dims: Some((d_in, d_hid, d_out)),
+        }
+    }
+
+    /// Creates a config for demo use with the standard demo MLP (2, 2, 1).
+    pub fn demo() -> Self {
+        Self::for_model(2, 2, 1)
     }
 }
 
@@ -414,9 +433,24 @@ mod tests {
     }
 
     #[test]
-    fn test_default_policy_is_verify_all() {
+    fn test_default_policy_is_structural() {
         let config = VerifierConfig::default();
+        assert_eq!(config.policy, VerificationPolicy::Structural);
+        assert!(config.model_dims.is_none());
+    }
+
+    #[test]
+    fn test_for_model_constructor() {
+        let config = VerifierConfig::for_model(4, 8, 2);
         assert_eq!(config.policy, VerificationPolicy::VerifyAll);
+        assert_eq!(config.model_dims, Some((4, 8, 2)));
+    }
+
+    #[test]
+    fn test_demo_constructor() {
+        let config = VerifierConfig::demo();
+        assert_eq!(config.policy, VerificationPolicy::VerifyAll);
+        assert_eq!(config.model_dims, Some((2, 2, 1)));
     }
 
     #[tokio::test]

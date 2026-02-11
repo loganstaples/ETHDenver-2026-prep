@@ -37,6 +37,7 @@ pub async fn run_aggregator_demo(
         generate_proof: false,
         max_error_bound: 1000.0,
         commitment_aggregation: helix_node::roles::aggregator::CommitmentAggregation::HashBased,
+        byzantine_strategy: None, // No Byzantine filtering for demo
     };
 
     let aggregator = AggregatorNode::new(aggregator_id.clone(), config);
