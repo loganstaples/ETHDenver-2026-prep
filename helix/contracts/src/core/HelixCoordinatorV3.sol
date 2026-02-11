@@ -726,6 +726,7 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
     }
 
     function commitRoundData(uint256 modelId, uint256 roundId, bytes32 dataRoot) external whenNotPaused modelExists(modelId) {
+        require(msg.sender == models[modelId].owner || msg.sender == owner, "Not authorized");
         require(roundId == models[modelId].currentRound, "Invalid round");
         require(dataRoot != bytes32(0), "Invalid data root");
         roundDataRoot[modelId][roundId] = dataRoot;

@@ -58,7 +58,7 @@ contract RewardsDoubleClaimTest is Test {
         vm.stopPrank();
     }
 
-    /// @notice Core test: attempt double-claim via claimRewards() then claimRoundRewards()
+    /// @notice Core test: attempt double-claim via claimRoundRewards() twice
     function test_DoubleClaim_Prevention() public {
         uint256 modelId = 0;
         uint256 roundId = 1;
@@ -75,28 +75,28 @@ contract RewardsDoubleClaimTest is Test {
         assertEq(totalClaimed, 0, "Should not have claimed yet");
         uint256 expectedReward = totalEarned;
 
-        // Step 1: Claim all rewards via claimRewards()
-        vm.prank(participant1);
-        rewards.claimRewards();
-
-        uint256 balanceAfterFirst = token.balanceOf(participant1);
-        assertEq(balanceAfterFirst, expectedReward, "Should receive full reward");
-
-        // Step 2: Attempt to double-claim via claimRoundRewards()
+        // Step 1: Claim rewards via claimRoundRewards()
         uint256[] memory modelIds = new uint256[](1);
         uint256[] memory roundIds = new uint256[](1);
         modelIds[0] = modelId;
         roundIds[0] = roundId;
 
         vm.prank(participant1);
-        vm.expectRevert("Already claimed");
+        rewards.claimRoundRewards(modelIds, roundIds);
+
+        uint256 balanceAfterFirst = token.balanceOf(participant1);
+        assertEq(balanceAfterFirst, expectedReward, "Should receive full reward");
+
+        // Step 2: Attempt to double-claim via claimRoundRewards() again
+        vm.prank(participant1);
+        vm.expectRevert("No rewards to claim");
         rewards.claimRoundRewards(modelIds, roundIds);
 
         // Balance should not have changed
         assertEq(token.balanceOf(participant1), balanceAfterFirst, "Balance should not change after failed double-claim");
     }
 
-    /// @notice Test: claim via claimRoundRewards() first, then claimRewards() gives nothing
+    /// @notice Test: claimRoundRewards() twice for same round fails
     function test_DoubleClaim_ReverseOrder() public {
         uint256 modelId = 0;
         uint256 roundId = 1;
@@ -118,10 +118,10 @@ contract RewardsDoubleClaimTest is Test {
         rewards.claimRoundRewards(modelIds, roundIds);
         assertEq(token.balanceOf(participant1), totalEarned);
 
-        // Step 2: Try claimRewards() - should revert since nothing left
+        // Step 2: Try claimRoundRewards() again - should revert since already claimed
         vm.prank(participant1);
         vm.expectRevert("No rewards to claim");
-        rewards.claimRewards();
+        rewards.claimRoundRewards(modelIds, roundIds);
     }
 
     /// @notice Test: partial claims across rounds can't exceed total earned
@@ -147,21 +147,23 @@ contract RewardsDoubleClaimTest is Test {
         vm.prank(participant1);
         rewards.claimRoundRewards(modelIds, roundIds);
 
-        // Claim remaining via claimRewards
+        // Claim round 2 via claimRoundRewards
+        roundIds[0] = 2;
         vm.prank(participant1);
-        rewards.claimRewards();
+        rewards.claimRoundRewards(modelIds, roundIds);
 
         // Total claimed should equal total earned (no more, no less)
         assertEq(token.balanceOf(participant1), totalEarned, "Total claimed must equal total earned");
 
-        // Try claiming again - both paths should fail
+        // Try claiming again - should fail
+        roundIds[0] = 1;
         vm.prank(participant1);
         vm.expectRevert("No rewards to claim");
-        rewards.claimRewards();
+        rewards.claimRoundRewards(modelIds, roundIds);
 
         roundIds[0] = 2;
         vm.prank(participant1);
-        vm.expectRevert("Already claimed");
+        vm.expectRevert("No rewards to claim");
         rewards.claimRoundRewards(modelIds, roundIds);
     }
 }
@@ -364,11 +366,13 @@ contract TrainingDAOFlashLoanTest is Test {
         vm.prank(flashAttacker);
         token.transfer(address(1), 10_000 ether);
 
-        vm.roll(block.number + 1);
+        // Advance 2 blocks so getPastVotes(block.number - 1) sees the transfer
+        vm.roll(block.number + 2);
 
         assertEq(token.balanceOf(flashAttacker), 0, "Attacker returned tokens");
 
         // Attacker cannot create another proposal without delegated voting power
+        // getPastVotes(attacker, block.number - 1) now sees a block after the transfer
         vm.prank(flashAttacker);
         vm.expectRevert("Below proposal threshold");
         dao.createProposal(
@@ -1654,7 +1658,7 @@ contract RewardsDoubleClaimExtendedTest is Test {
         assertEq(token.balanceOf(participant), balanceAfterFirst, "Balance should not change");
     }
 
-    /// @notice Test: interleaved claims across multiple rounds can't exceed total
+    /// @notice Test: sequential claims across multiple rounds can't exceed total
     function test_InterleavedClaims_MultipleRounds() public {
         // Allocate rewards for 3 rounds
         vm.startPrank(coordinator);
@@ -1677,20 +1681,27 @@ contract RewardsDoubleClaimExtendedTest is Test {
         vm.prank(participant);
         rewards.claimRoundRewards(modelIds, roundIds);
 
-        // Claim remaining via claimRewards (rounds 2 & 3)
-        vm.prank(participant);
-        rewards.claimRewards();
+        // Claim rounds 2 & 3 via batch claimRoundRewards
+        uint256[] memory batchModelIds = new uint256[](2);
+        uint256[] memory batchRoundIds = new uint256[](2);
+        batchModelIds[0] = 0;
+        batchModelIds[1] = 0;
+        batchRoundIds[0] = 2;
+        batchRoundIds[1] = 3;
 
-        // Try to claim round 2 via claimRoundRewards - should fail
+        vm.prank(participant);
+        rewards.claimRoundRewards(batchModelIds, batchRoundIds);
+
+        // Try to claim round 2 via claimRoundRewards again - should fail
         roundIds[0] = 2;
         vm.prank(participant);
-        vm.expectRevert("Already claimed");
+        vm.expectRevert("No rewards to claim");
         rewards.claimRoundRewards(modelIds, roundIds);
 
-        // Try to claim round 3 via claimRoundRewards - should fail
+        // Try to claim round 3 via claimRoundRewards again - should fail
         roundIds[0] = 3;
         vm.prank(participant);
-        vm.expectRevert("Already claimed");
+        vm.expectRevert("No rewards to claim");
         rewards.claimRoundRewards(modelIds, roundIds);
 
         // Total claimed must equal total earned
@@ -1735,25 +1746,25 @@ contract RewardsDoubleClaimExtendedTest is Test {
         assertEq(balanceAfterBatch, totalEarned, "Final balance should equal total earned");
     }
 
-    /// @notice Test: claimRewards followed by claimRoundRewards is blocked
-    function test_ClaimRewards_Then_ClaimRoundRewards_Blocked() public {
+    /// @notice Test: claimRoundRewards followed by second claimRoundRewards is blocked
+    function test_ClaimRoundRewards_Then_SecondClaim_Blocked() public {
         vm.startPrank(coordinator);
         rewards.registerParticipant(0, 1, participant);
         rewards.allocateRoundRewards(0, 1);
         vm.stopPrank();
 
-        // Claim all via claimRewards first
-        vm.prank(participant);
-        rewards.claimRewards();
-
-        // Try to double-claim via claimRoundRewards
+        // Claim via claimRoundRewards first
         uint256[] memory modelIds = new uint256[](1);
         uint256[] memory roundIds = new uint256[](1);
         modelIds[0] = 0;
         roundIds[0] = 1;
 
         vm.prank(participant);
-        vm.expectRevert("Already claimed");
+        rewards.claimRoundRewards(modelIds, roundIds);
+
+        // Try to double-claim via claimRoundRewards again
+        vm.prank(participant);
+        vm.expectRevert("No rewards to claim");
         rewards.claimRoundRewards(modelIds, roundIds);
     }
 
@@ -1767,13 +1778,18 @@ contract RewardsDoubleClaimExtendedTest is Test {
         rewards.allocateRoundRewards(0, 1);
         vm.stopPrank();
 
+        uint256[] memory modelIds = new uint256[](1);
+        uint256[] memory roundIds = new uint256[](1);
+        modelIds[0] = 0;
+        roundIds[0] = 1;
+
         // Participant 1 claims
         vm.prank(participant);
-        rewards.claimRewards();
+        rewards.claimRoundRewards(modelIds, roundIds);
 
         // Participant 2 claims
         vm.prank(participant2);
-        rewards.claimRewards();
+        rewards.claimRoundRewards(modelIds, roundIds);
 
         // Both should have received equal shares
         uint256 bal1 = token.balanceOf(participant);
@@ -1784,10 +1800,10 @@ contract RewardsDoubleClaimExtendedTest is Test {
         // Neither can claim again
         vm.prank(participant);
         vm.expectRevert("No rewards to claim");
-        rewards.claimRewards();
+        rewards.claimRoundRewards(modelIds, roundIds);
 
         vm.prank(participant2);
         vm.expectRevert("No rewards to claim");
-        rewards.claimRewards();
+        rewards.claimRoundRewards(modelIds, roundIds);
     }
 }
