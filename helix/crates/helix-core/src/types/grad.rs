@@ -283,6 +283,39 @@ impl GradTensor {
     ) -> BoundedTensor {
         upstream.scale(scalar)
     }
+
+    /// Consumes this GradTensor and returns the inner BoundedTensor (forward data).
+    pub fn into_data(self) -> BoundedTensor {
+        self.data
+    }
+
+    /// Consumes this GradTensor and returns the accumulated gradient, if any.
+    pub fn into_grad(self) -> Option<BoundedTensor> {
+        self.grad
+    }
+
+    /// Returns a mutable reference to the forward-pass tensor data.
+    pub fn data_mut(&mut self) -> &mut BoundedTensor {
+        &mut self.data
+    }
+}
+
+// =========================================================================
+// Conversions between GradTensor and BoundedTensor
+// =========================================================================
+
+impl From<BoundedTensor> for GradTensor {
+    /// Creates a GradTensor that requires gradient computation from a BoundedTensor.
+    fn from(tensor: BoundedTensor) -> Self {
+        GradTensor::with_grad(tensor)
+    }
+}
+
+impl From<GradTensor> for BoundedTensor {
+    /// Extracts the forward-pass data from a GradTensor.
+    fn from(grad_tensor: GradTensor) -> Self {
+        grad_tensor.data
+    }
 }
 
 #[cfg(test)]
@@ -522,5 +555,113 @@ mod tests {
         // Gradients should have propagated errors from a and b
         assert!(da.max_error() > 0.0);
         assert!(db.max_error() > 0.0);
+    }
+
+    // =====================================================================
+    // Conversion tests
+    // =====================================================================
+
+    #[test]
+    fn test_from_bounded_tensor_for_grad_tensor() {
+        let t = BoundedTensor::from_exact(vec![1.0, 2.0, 3.0], vec![3]);
+        let gt: GradTensor = t.clone().into();
+        assert!(gt.requires_grad());
+        assert_eq!(gt.data().shape(), t.shape());
+        // Gradient should be zero-initialized
+        for v in gt.grad().unwrap().data() {
+            assert_eq!(v.value(), 0.0);
+        }
+    }
+
+    #[test]
+    fn test_from_grad_tensor_for_bounded_tensor() {
+        let t = BoundedTensor::from_exact(vec![1.0, 2.0, 3.0], vec![3]);
+        let gt = GradTensor::with_grad(t.clone());
+        let bt: BoundedTensor = gt.into();
+        assert_eq!(bt.shape(), t.shape());
+        assert_eq!(bt.data()[0].value(), 1.0);
+    }
+
+    #[test]
+    fn test_into_data_and_into_grad() {
+        let t = BoundedTensor::from_exact(vec![1.0, 2.0], vec![2]);
+        let mut gt = GradTensor::with_grad(t.clone());
+
+        let g = BoundedTensor::from_exact(vec![0.5, 0.5], vec![2]);
+        gt.accumulate_grad(&g).unwrap();
+
+        let grad = gt.clone().into_grad().unwrap();
+        assert!((grad.data()[0].value() - 0.5).abs() < 1e-10);
+
+        let data = gt.into_data();
+        assert_eq!(data.shape(), t.shape());
+    }
+
+    // =====================================================================
+    // BoundedTensor backward convenience method tests
+    // =====================================================================
+
+    #[test]
+    fn test_bounded_tensor_backward_matmul() {
+        let a = BoundedTensor::from_exact(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
+        let b = BoundedTensor::from_exact(vec![5.0, 6.0, 7.0, 8.0], vec![2, 2]);
+        let dc = BoundedTensor::from_exact(vec![1.0, 1.0, 1.0, 1.0], vec![2, 2]);
+
+        let (ga, gb) = a.backward_matmul(&b, &dc).unwrap();
+        assert!(ga.requires_grad());
+        assert!(gb.requires_grad());
+        assert_eq!(ga.grad().unwrap().shape(), &vec![2, 2]);
+        assert_eq!(gb.grad().unwrap().shape(), &vec![2, 2]);
+    }
+
+    #[test]
+    fn test_bounded_tensor_backward_relu() {
+        let input = BoundedTensor::from_exact(vec![-1.0, 2.0, -3.0, 4.0], vec![4]);
+        let upstream = BoundedTensor::from_exact(vec![1.0, 1.0, 1.0, 1.0], vec![4]);
+
+        let gt = input.backward_relu(&upstream).unwrap();
+        let grad = gt.grad().unwrap();
+        assert_eq!(grad.data()[0].value(), 0.0); // -1.0 <= 0
+        assert_eq!(grad.data()[1].value(), 1.0); //  2.0 > 0
+        assert_eq!(grad.data()[2].value(), 0.0); // -3.0 <= 0
+        assert_eq!(grad.data()[3].value(), 1.0); //  4.0 > 0
+    }
+
+    #[test]
+    fn test_bounded_tensor_backward_add_op() {
+        let a = BoundedTensor::from_exact(vec![1.0, 2.0], vec![2]);
+        let b = BoundedTensor::from_exact(vec![3.0, 4.0], vec![2]);
+        let dc = BoundedTensor::from_exact(vec![0.5, 0.5], vec![2]);
+
+        let (ga, gb) = a.backward_add_op(&b, &dc).unwrap();
+        // Add backward is pass-through
+        assert!((ga.grad().unwrap().data()[0].value() - 0.5).abs() < 1e-10);
+        assert!((gb.grad().unwrap().data()[0].value() - 0.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_bounded_tensor_backward_hadamard_op() {
+        let a = BoundedTensor::from_exact(vec![2.0, 3.0], vec![2]);
+        let b = BoundedTensor::from_exact(vec![5.0, 6.0], vec![2]);
+        let dc = BoundedTensor::from_exact(vec![1.0, 1.0], vec![2]);
+
+        let (ga, gb) = a.backward_hadamard_op(&b, &dc).unwrap();
+        // dA = dC * B -> [5, 6]
+        assert!((ga.grad().unwrap().data()[0].value() - 5.0).abs() < 1e-10);
+        // dB = dC * A -> [2, 3]
+        assert!((gb.grad().unwrap().data()[0].value() - 2.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_bounded_tensor_backward_softmax_op() {
+        let x = BoundedTensor::from_exact(vec![0.0, 0.0, 0.0], vec![3]);
+        let s = x.softmax().unwrap();
+        let ds = BoundedTensor::from_exact(vec![1.0, 0.0, 0.0], vec![3]);
+
+        let gt = s.backward_softmax_op(&ds).unwrap();
+        let grad = gt.grad().unwrap();
+        // s = [1/3, 1/3, 1/3], ds = [1, 0, 0]
+        // dx_0 = 1/3 * (1 - 1/3) = 2/9
+        assert!((grad.data()[0].value() - 2.0 / 9.0).abs() < 1e-10);
     }
 }

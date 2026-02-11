@@ -19,7 +19,12 @@
 compile_error!(
     "The filecoin-fetch feature is not yet implemented. \
      Filecoin data source currently only supports local/mock storage. \
-     Real Lotus JSON-RPC integration is planned for a future release."
+     To complete this feature, the following are needed: \
+     (1) Lotus JSON-RPC client for deal lifecycle management, \
+     (2) CAR file streaming parser for piece retrieval, \
+     (3) PoSt verification for storage provider proofs, \
+     (4) Retrieval market bidding for cost-optimized data access. \
+     See https://docs.filecoin.io/reference/json-rpc/introduction for the Lotus API."
 );
 
 use std::collections::HashMap;
