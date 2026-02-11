@@ -17,6 +17,10 @@ helix-circuits = { path = "../crates/helix-circuits" }
 helix-prover = { path = "../crates/helix-prover" }
 helix-mpc = { path = "../crates/helix-mpc" }
 helix-node = { path = "../crates/helix-node" }
+helix-client = { path = "../crates/helix-client", default-features = false }
+
+# HTTP (needed for RPC client in integration tests)
+reqwest = { version = "0.11", features = ["json"] }
 
 # Testing utilities
 tokio = { version = "1", features = ["full", "macros", "rt-multi-thread", "sync", "time"] }
@@ -161,6 +165,10 @@ required-features = ["on-chain"]
 name = "cross_crate_consistency"
 path = "integration/cross_crate_consistency.rs"
 required-features = ["on-chain"]
+
+[[test]]
+name = "rpc_alignment"
+path = "integration/rpc_alignment.rs"
 
 [features]
 default = []

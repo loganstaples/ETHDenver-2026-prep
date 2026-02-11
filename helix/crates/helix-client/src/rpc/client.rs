@@ -72,7 +72,7 @@ pub struct HelixRpcConfig {
 impl Default for HelixRpcConfig {
     fn default() -> Self {
         Self {
-            endpoint: "http://127.0.0.1:9545".to_string(),
+            endpoint: "http://127.0.0.1:9002/rpc".to_string(),
             timeout_secs: 30,
             max_retries: 3,
             retry_delay_ms: 500,
@@ -141,6 +141,8 @@ pub enum TrainingPhase {
     RoundComplete,
     Idle,
     Failed,
+    #[serde(other)]
+    Unknown,
 }
 
 impl TrainingPhase {
@@ -159,6 +161,7 @@ impl TrainingPhase {
             Self::RoundComplete => "Round Complete",
             Self::Idle => "Idle",
             Self::Failed => "Failed",
+            Self::Unknown => "Unknown",
         }
     }
 }
@@ -201,6 +204,8 @@ pub enum ProofPhase {
     Serialization,
     Complete,
     Failed,
+    #[serde(other)]
+    Unknown,
 }
 
 impl ProofPhase {
@@ -216,6 +221,7 @@ impl ProofPhase {
             Self::Serialization => "Serializing",
             Self::Complete => "Complete",
             Self::Failed => "Failed",
+            Self::Unknown => "Unknown",
         }
     }
 }
@@ -282,6 +288,8 @@ pub enum WorkerStatus {
     Waiting,
     Faulted,
     Slashed,
+    #[serde(other)]
+    Unknown,
 }
 
 /// Model information
@@ -467,6 +475,17 @@ impl ProofSubmission {
             step_number,
         }
     }
+}
+
+/// Acknowledgment returned when proof generation is triggered.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenerateProofAck {
+    /// Whether the proof generation request was accepted
+    pub accepted: bool,
+    /// Status message
+    pub message: String,
+    /// Round ID for the proof
+    pub round_id: u64,
 }
 
 /// Training progress snapshot
@@ -858,7 +877,8 @@ impl HelixRpcClient {
             round_duration_secs: u64,
         }
 
-        self.send_request(
+        // Void method — discard the response value
+        let _: serde_json::Value = self.send_request(
             "helix_startTraining",
             Params {
                 model_id,
@@ -866,7 +886,8 @@ impl HelixRpcClient {
                 round_duration_secs,
             },
         )
-        .await
+        .await?;
+        Ok(())
     }
 
     /// Stop training
@@ -876,7 +897,9 @@ impl HelixRpcClient {
             model_id: u64,
         }
 
-        self.send_request("helix_stopTraining", Params { model_id }).await
+        // Void method — discard the response value
+        let _: serde_json::Value = self.send_request("helix_stopTraining", Params { model_id }).await?;
+        Ok(())
     }
 
     /// Get training progress history
@@ -902,7 +925,7 @@ impl HelixRpcClient {
     }
 
     /// Generate proof for current training step
-    pub async fn generate_proof(&self, model_id: u64, round_id: u64) -> Result<ProofSubmission, RpcError> {
+    pub async fn generate_proof(&self, model_id: u64, round_id: u64) -> Result<GenerateProofAck, RpcError> {
         #[derive(Serialize)]
         struct Params {
             model_id: u64,
@@ -1939,7 +1962,7 @@ mod tests {
     #[test]
     fn test_config_defaults() {
         let config = HelixRpcConfig::default();
-        assert_eq!(config.endpoint, "http://127.0.0.1:9545");
+        assert_eq!(config.endpoint, "http://127.0.0.1:9002/rpc");
         assert_eq!(config.timeout_secs, 30);
     }
 

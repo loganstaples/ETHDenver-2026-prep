@@ -30,6 +30,7 @@ pub use client::{
     ModelInfo, RoundInfo, StakingInfo, SlashingEvent,
     ProofSubmission, TrainingProgress, TrainingResultData,
     NodeCapabilities, HealthStatus, ComponentHealth,
+    GenerateProofAck,
     // Snapshot type
     DemoSnapshot,
     // Mock client for demos
