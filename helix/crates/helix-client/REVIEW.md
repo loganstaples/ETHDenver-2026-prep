@@ -1,702 +1,394 @@
-# helix-client Crate Review
+# helix-client Code Review
 
-## Overview
-
-**Purpose**: CLI client and SDK for HELIX distributed ML training orchestration. Provides user-facing commands for node initialization, network participation, training management, wallet operations, and real-time visualization.
-
-**Role in HELIX**: User-facing interface to the HELIX protocol. Coordinates with `helix-node` for network operations, `helix-prover` for ZK proof generation, and `helix-avm` for ML computations. Critical for the ETHDenver demo experience.
-
-**Lines of Code**: ~18,000+ lines across 30+ source files
-
-**Test Coverage**: Unit tests present in most modules; integration tests incomplete
+**Date:** 2026-02-11
+**Reviewer:** Claude (automated deep review)
+**Scope:** All files in `crates/helix-client/` (~32,500 lines across ~40 .rs files)
+**Verdict:** C+ (65%) — Excellent demo scaffolding with genuine wallet/RPC/chain code, but majority of CLI commands are simulated
 
 ---
 
-## Architecture
+## 1. Overview & Purpose
 
-### Module Dependency Graph
+`helix-client` is the user-facing entry point for the HELIX protocol. It provides:
+- A **CLI binary** (`main.rs`, 2,142 lines) with 16+ subcommands
+- A **library crate** (`lib.rs`) re-exporting SDK types
+- **On-chain integration** via ethers-rs (`rpc/chain.rs`)
+- **Wallet management** with real BIP-39/BIP-44 HD derivation, OS keychain integration, and Ledger hardware wallet support
+- **Demo orchestration** with real ZK proof generation via `MLTrainingProverV2`
+- **Dashboard** REST API (axum) with auth, rate limiting, CORS
+- **Terminal UI** via ratatui with 4 interactive tabs
 
+The crate serves double duty: a polished demo shell for ETHDenver and the foundation for a production CLI client.
+
+---
+
+## 2. Architecture
+
+### Module Tree
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         helix-client                                 │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐               │
-│  │   main.rs   │──▶│  commands/  │──▶│   config/   │               │
-│  │  (CLI entry)│   │ (init/join/ │   │ (profiles,  │               │
-│  └──────┬──────┘   │  train/etc) │   │  training)  │               │
-│         │          └──────┬──────┘   └──────┬──────┘               │
-│         │                 │                 │                       │
-│         ▼                 ▼                 ▼                       │
-│  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐               │
-│  │    demo/    │──▶│    rpc/     │──▶│  progress.rs│               │
-│  │ (orchestr., │   │ (client,    │   │ (spinners,  │               │
-│  │  prewarm,   │   │  mock,      │   │  bars)      │               │
-│  │  recovery)  │   │  tracking)  │   └─────────────┘               │
-│  └──────┬──────┘   └──────┬──────┘                                 │
-│         │                 │                                         │
-│         ▼                 ▼                                         │
-│  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐               │
-│  │visualization│   │  wallet/    │   │  dashboard/ │               │
-│  │ (TUI with   │   │ (mnemonic,  │   │ (HTTP API,  │               │
-│  │  ratatui)   │   │  keychain,  │   │  Axum)      │               │
-│  └─────────────┘   │  hardware)  │   └─────────────┘               │
-│                    └─────────────┘                                  │
-│                                                                      │
-├─────────────────────────────────────────────────────────────────────┤
-│                     External Dependencies                            │
-│  ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────┐       │
-│  │ helix-core │ │ helix-avm  │ │helix-prover│ │helix-circuit│       │
-│  └────────────┘ └────────────┘ └────────────┘ └────────────┘       │
-└─────────────────────────────────────────────────────────────────────┘
+helix-client/
+  src/
+    lib.rs                    # Library re-exports (19 lines)
+    main.rs                   # CLI binary entry point (2,142 lines)
+    client.rs                 # HelixClient SDK facade (175 lines)
+    benchmark.rs              # Simulated benchmark runner (351 lines)
+    progress.rs               # Terminal progress indicators (204 lines)
+    health.rs                 # Real health monitoring (643 lines)
+    help.rs                   # CLI help system (1,071 lines)
+    orchestrator.rs           # Network orchestrator (526 lines)
+    orchestration.rs          # E2E training orchestration (1,396 lines)
+    dashboard.rs              # Axum REST API (577 lines)
+    visualization.rs          # Ratatui terminal UI (1,210 lines)
+    config/
+      mod.rs                  # HelixConfig with profiles (1,069 lines)
+      training.rs             # TrainingJobConfig (937 lines)
+    commands/
+      mod.rs                  # Command re-exports (14 lines)
+      init.rs                 # Node initialization (600 lines)
+      join.rs                 # Network join — SIMULATED (675 lines)
+      train.rs                # Training command — MIXED (1,043 lines)
+      status.rs               # Status display — SIMULATED (605 lines)
+      query.rs                # Query system — SIMULATED (893 lines)
+      export.rs               # Data export — SIMULATED (935 lines)
+    demo/
+      mod.rs                  # Demo re-exports + phased scenarios
+      orchestrator.rs         # 90-second timed demo orchestration
+      prewarm.rs              # Resource pre-warming + GPU detect
+      real_training.rs        # REAL ZK proof generation
+      recovery.rs             # Error recovery + circuit breaker (1,334 lines)
+    rpc/
+      mod.rs                  # RPC re-exports
+      client.rs               # JSON-RPC client + MockRpcClient (~2,000 lines)
+      chain.rs                # On-chain contract wrapper (761 lines)
+    wallet/
+      mod.rs                  # SecureWallet + WalletManager (1,173 lines)
+      audit.rs                # Tamper-evident audit log (719 lines)
+      derivation.rs           # BIP-32/BIP-44 HD derivation (900 lines)
+      legacy.rs               # Backward-compat wallet — PLACEHOLDER (972 lines)
+      mnemonic.rs             # BIP-39 mnemonics (529 lines)
+      keychain/
+        mod.rs                # Platform-agnostic keychain (485 lines)
+        linux.rs              # Secret Service D-Bus (326 lines)
+        macos.rs              # Security.framework (192 lines)
+        windows.rs            # DPAPI (414 lines)
+      hardware/
+        mod.rs                # Hardware wallet manager (621 lines)
+        ledger.rs             # Ledger HID protocol (523 lines)
+  tests/
+    demo_integration.rs       # Dashboard + auth + config tests (575 lines)
+    e2e_chain_integration.rs  # On-chain lifecycle tests (1,439 lines)
 ```
+
+### Key Types & Traits
+- **`HelixClient`** (`client.rs`): SDK facade wrapping config + RPC + optional dashboard
+- **`UnifiedRpcClient`** (`rpc/client.rs`): Wrapper supporting real JSON-RPC or mock fallback
+- **`ChainClient`** (`rpc/chain.rs`): ethers-rs contract wrapper with circuit breaker
+- **`SecureWallet`** (`wallet/mod.rs`): AES-256-GCM encrypted HD wallet
+- **`HardwareWallet`** trait (`wallet/hardware/mod.rs`): Async interface for Ledger/Trezor
+- **`TrainingOrchestrator`** (`orchestration.rs`): E2E training with Anvil + forge + ZK proofs
+- **`DemoOrchestrator`** (`demo/orchestrator.rs`): Phase-timed demo execution
+- **`RecoveryManager`** (`demo/recovery.rs`): Error recovery with circuit breaker + heartbeat
 
 ### Data Flow
-
 ```
-User Command ─▶ main.rs (clap parsing)
-                    │
-                    ▼
-              Commands Module
-              ┌────────────────────────────────────────┐
-              │ init   - Node initialization           │
-              │ join   - Network participation         │
-              │ train  - ML training orchestration     │
-              │ demo   - Demonstration mode            │
-              │ status - Network/training status       │
-              │ query  - Model/proof/stake queries     │
-              │ export - Metrics/checkpoint export     │
-              └───────────────┬────────────────────────┘
-                              │
-         ┌────────────────────┼────────────────────┐
-         ▼                    ▼                    ▼
-    Config System        RPC Client           Wallet Manager
-    (profiles,           (real/mock,          (HD wallets,
-     training.toml)       tracking)            keychain)
-                              │
-                              ▼
-              ┌───────────────────────────────┐
-              │     Demo Orchestrator         │
-              │   (90-second timing,          │
-              │    phase management,          │
-              │    real training execution)   │
-              └───────────────┬───────────────┘
-                              │
-         ┌────────────────────┼────────────────────┐
-         ▼                    ▼                    ▼
-    Real Training         Visualization       Dashboard API
-    (helix-prover,        (ratatui TUI)       (Axum REST)
-     helix-avm)
+CLI (main.rs) --> HelixClient --> UnifiedRpcClient --> {HelixRpcClient | MockRpcClient}
+                                                  --> ChainClient --> HelixCoordinatorV2 (on-chain)
+                              --> TrainingOrchestrator --> Anvil + forge + MLTrainingProverV2
+                              --> DashboardState --> axum REST API
 ```
 
----
-
-## Module Analysis
-
-### `main.rs` (~1,322 lines)
-
-**Purpose**: CLI entry point with clap-based command parsing
-
-**Key Components**:
-- `Cli` struct with 13+ subcommands (init, join, status, query, export, train, demo, orchestrate, health, dashboard, benchmark, logs, watch, visualize, guide)
-- Signal handling for graceful shutdown
-- Config file discovery and loading
-- Command routing to appropriate handlers
-
-**Strengths**:
-- Comprehensive command structure covering all use cases
-- Good use of clap derive macros for ergonomic CLI
-- Proper async runtime setup with tokio
-
-**Weaknesses**:
-- Large file that could benefit from splitting
-- Some commands have extensive inline logic rather than delegation
-
-### `config/mod.rs` (~1,045 lines)
-
-**Purpose**: Configuration management with profile support
-
-**Key Types**:
-- `HelixConfig` - Main configuration container
-- `ConfigProfile` - Environment presets (Local, Anvil, Sepolia, Mainnet)
-- `NodeConfig`, `NetworkConfig`, `TrainingConfig`, `RpcConfig`, etc.
-
-**Strengths**:
-- Excellent profile system for different deployment environments
-- Comprehensive configuration options with sensible defaults
-- TOML serialization for human-readable config files
-
-**Weaknesses**:
-- Config validation could be more thorough
-- Hot-reload support mentioned but not fully implemented
-
-### `config/training.rs` (~938 lines)
-
-**Purpose**: Training job configuration
-
-**Key Types**:
-- `TrainingJobConfig` - Complete training session config
-- `ModelConfig` - Architecture, dimensions, precision
-- `TrainingHyperParams` - LR, batch size, optimizer
-- `ProofSettings` - Circuit parameters, error bounds
-- `ResourceLimits` - Memory, CPU, GPU constraints
-
-**Strengths**:
-- Well-structured separation of concerns
-- Example TOML generation for documentation
-- Comprehensive resource limit specification
-
-**Weaknesses**:
-- Some duplication with `config/mod.rs`
-
-### `rpc/client.rs` (~1,605 lines)
-
-**Purpose**: JSON-RPC client for helix-node communication
-
-**Key Types**:
-- `HelixRpcClient` - Real RPC client
-- `MockRpcClient` - Demo/testing mock
-- `UnifiedRpcClient` - Wrapper abstracting real vs mock
-- `RealTimeProofTracker`, `RealTimeTrainingTracker` - Real-time status tracking
-
-**Strengths**:
-- Clean abstraction between real and mock implementations
-- Real-time tracking with async updates
-- Comprehensive RPC method coverage
-
-**Weaknesses**:
-- Mock responses are simulated, not recorded
-- No retry/backoff logic in real client
-- Connection pooling not implemented
-
-### `demo/mod.rs` + `demo/orchestrator.rs` (~1,500+ lines combined)
-
-**Purpose**: Demo mode orchestration for ETHDenver presentations
-
-**Key Types**:
-- `DemoBuilder`, `DemoRunner` - Demo setup and execution
-- `DemoScenarioType` - Quick, FullTraining, Slashing, MultiModel, FaultTolerance
-- `DemoOrchestrator` - Precise 90-second timing control
-- `OrchestratedPhase` - Phase-based progression
-
-**Strengths**:
-- **Excellent timing control** - 90-second demo fits ETHDenver format perfectly
-- Adaptive pacing to handle variance
-- Multiple scenario types for different demonstration needs
-- Phase-based architecture allows precise control
-
-**Weaknesses**:
-- Heavy reliance on simulated data
-- Recovery from mid-demo failures could be more robust
-
-### `demo/real_training.rs` (~551 lines)
-
-**Purpose**: Integration with actual helix-prover for real ZK proofs
-
-**Key Types**:
-- `RealTrainingExecutor` - Synchronous proof generation
-- `AsyncRealTrainingExecutor` - Async wrapper
-
-**Strengths**:
-- **Critical for demo authenticity** - Generates real ZK proofs
-- Proper integration with `MLTrainingProverV2`
-- Error bound tracking through actual proof generation
-
-**Weaknesses**:
-- Proof generation time may vary unpredictably
-- Could benefit from warmup/preloading
-
-### `demo/prewarm.rs` (~731 lines)
-
-**Purpose**: Pre-loading assets for fast demo starts
-
-**Key Types**:
-- `DemoPrewarmer` - Cache management
-- `PrewarmConfig` - Memory limits, parallelism
-- `GpuInfo` - GPU detection
-
-**Strengths**:
-- Addresses cold-start latency concerns
-- LRU cache eviction for memory management
-- GPU detection for Metal (macOS) and CUDA (Linux)
-
-**Weaknesses**:
-- Proving key pre-loading uses placeholders
-- Network pre-warming is simulated
-
-### `demo/recovery.rs` (~1,153 lines)
-
-**Purpose**: Error handling and recovery during demos
-
-**Key Types**:
-- `RecoveryManager` - Error tracking and recovery
-- `CircuitBreaker` - Rate limiting for failures
-- `HeartbeatMonitor` - Component health monitoring
-- `ErrorCategory` - Categorization for recovery strategy
-
-**Strengths**:
-- Comprehensive error categorization
-- Graceful degradation support
-- Pre-demo health checks
-
-**Weaknesses**:
-- Some recovery actions are simulated
-- Circuit breaker parameters may need tuning
-
-### `wallet/mod.rs` (~1,159 lines)
-
-**Purpose**: Secure key management
-
-**Key Types**:
-- `SecureWallet` - HD wallet with BIP-39/BIP-44
-- `WalletManager` - Multi-wallet management
-- `TransactionConfirmation` - User confirmation flow
-- `SecureBackup` - Encrypted backup/restore
-
-**Strengths**:
-- **Production-grade security** - Argon2id + AES-256-GCM
-- Platform keychain integration (macOS, Linux, Windows)
-- Hardware wallet support architecture (Ledger)
-- Comprehensive audit logging
-- Zeroize for secure memory handling
-
-**Weaknesses**:
-- Hardware wallet integration requires `hidapi` feature
-- Recovery phrase handling could use additional UX safeguards
-
-### `commands/` Directory
-
-**Files**: init.rs, join.rs, status.rs, query.rs, export.rs, train.rs
-
-**Strengths**:
-- Clean command separation
-- Consistent patterns across commands
-- Rich output formatting with colored terminal output
-
-**Weaknesses**:
-- Commands contain simulated data for most operations
-- Real network integration incomplete
-
-### `visualization.rs` (~1,211 lines)
-
-**Purpose**: TUI visualization with ratatui
-
-**Strengths**:
-- Multi-tab interface (Overview, Training, Workers, Events)
-- Real-time updates via async state tracking
-- Keyboard navigation
-
-**Weaknesses**:
-- Requires terminal with TUI support
-- Some visualizations use placeholder data
-
-### `dashboard.rs` (~580 lines)
-
-**Purpose**: HTTP REST API for external integrations
-
-**Endpoints**: `/health`, `/api/status`, `/api/network`, `/api/training`, `/api/nodes`, `/api/metrics`, `/api/events`
-
-**Strengths**:
-- Clean Axum-based API
-- CORS support for web dashboard integration
-- Matches Next.js dashboard expectations
-- Bearer-token authentication middleware
-- Per-IP rate limiting middleware
-- Demo data helpers (`demo_nodes()`, `demo_metrics()`, etc.) as single source of truth
-
-**Weaknesses**:
-- Demo fallback data is static (no simulation of live updates)
-
-### `help.rs` (~1,072 lines)
-
-**Purpose**: Comprehensive help system
-
-**Topics**: getting-started, configuration, profiles, training, proofs, troubleshooting
-
-**Strengths**:
-- Extensive documentation within CLI
-- Contextual help for commands
-- Well-organized topic hierarchy
+### Dependencies (Cargo.toml)
+- **Core:** tokio, serde, anyhow, clap 4.0
+- **Crypto:** aes-gcm, argon2, k256, sha3, coins-bip39, zeroize
+- **Chain:** ethers 2.0.14 (feature-gated)
+- **UI:** ratatui, crossterm, colored, indicatif
+- **Network:** reqwest, axum, tower-http
+- **Hardware:** hidapi (feature-gated)
+- **Proving:** helix-prover (for real ZK proof generation in demo/)
 
 ---
 
-## Key Types and Traits
+## 3. Per-Module Analysis
 
-### Core Configuration Types
+### 3.1 Core Files
 
-| Type | Location | Purpose |
-|------|----------|---------|
-| `HelixConfig` | config/mod.rs | Root configuration |
-| `ConfigProfile` | config/mod.rs | Environment presets |
-| `TrainingJobConfig` | config/training.rs | Training session config |
-| `NodeConfig` | config/mod.rs | Node-specific settings |
+**`client.rs` (175 lines)** — Clean SDK facade. `connect()` builds a `UnifiedRpcClient`, `train()` delegates to `TrainingOrchestrator`. Thin but well-designed. `connect_or_mock()` is properly gated behind `#[cfg(any(debug_assertions, feature = "mock-fallback"))]`.
 
-### Demo Types
+**`main.rs` (2,142 lines)** — The CLI entry point is the largest file and the biggest problem. Of 16+ subcommands, **6 are entirely fake** (`cmd_join`, `cmd_status`, `cmd_query`, `cmd_export`, `cmd_orchestrate`, `cmd_logs`): they print hardcoded data and use `tokio::time::sleep()` to simulate work. Real functionality exists in `cmd_train` (delegates to real orchestrator), `cmd_demo` (real ZK proofs), `cmd_health` (real probes), `cmd_dashboard` (real API), and `cmd_visualize` (real TUI).
 
-| Type | Location | Purpose |
-|------|----------|---------|
-| `DemoRunner` | demo/mod.rs | Demo execution engine |
-| `DemoOrchestrator` | demo/orchestrator.rs | 90-second timing control |
-| `RealTrainingExecutor` | demo/real_training.rs | Real proof integration |
-| `DemoPrewarmer` | demo/prewarm.rs | Asset preloading |
-| `RecoveryManager` | demo/recovery.rs | Error recovery |
+**`benchmark.rs` (351 lines)** — `BenchmarkRunner::run_single_iteration()` only calls `tokio::time::sleep()`. The entire benchmark module measures nothing real. The statistical analysis code (percentile, std_dev, comparison) is correct but wasted on fake data.
 
-### Wallet Types
+**`health.rs` (643 lines)** — Genuinely good. Real HTTP pings, TCP probes, JSON-RPC calls (`eth_chainId`, `eth_blockNumber`, `eth_gasPrice`), filesystem checks, IPFS gateway probes, process detection via `pgrep`. Production-quality health monitoring.
 
-| Type | Location | Purpose |
-|------|----------|---------|
-| `SecureWallet` | wallet/mod.rs | HD wallet implementation |
-| `WalletManager` | wallet/mod.rs | Multi-wallet management |
-| `SecureMnemonic` | wallet/mnemonic.rs | BIP-39 mnemonic handling |
-| `KeychainManager` | wallet/keychain/ | Platform keychain integration |
+**`orchestrator.rs` (526 lines)** — `NetworkOrchestrator` does real process spawning via `Command::new()`. Scale up/down and graceful shutdown work. `LiveTrainingOrchestrator` creates a **new `reqwest::Client` per `trigger_round()` call** (line 517) instead of reusing — minor inefficiency.
 
-### Command Types
+**`orchestration.rs` (1,396 lines)** — The real backbone. Starts Anvil, deploys contracts via `forge script`, registers models, stakes, spawns nodes, generates **real ZK proofs** via `MLTrainingProverV2`, submits on-chain. Process health monitoring with automatic restarts. **SECURITY ISSUE:** Default private key hardcoded at line 90-91 (`ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80` — Anvil account 0). This is fine for local Anvil but the default config struct shouldn't contain a real-looking key.
 
-| Type | Location | Purpose |
-|------|----------|---------|
-| `InitCommand` | commands/init.rs | Node initialization |
-| `JoinCommand` | commands/join.rs | Network joining |
-| `TrainCommand` | commands/train.rs | Training management |
-| `StatusCommand` | commands/status.rs | Status display |
-| `QueryCommand` | commands/query.rs | Data queries |
-| `ExportCommand` | commands/export.rs | Data export |
+**`dashboard.rs` (577 lines)** — Proper axum REST API with bearer token auth middleware, per-IP rate limiting (tower middleware), configurable CORS. Falls back to hardcoded demo data when no live data is available. Well-architected.
 
----
+**`help.rs` (1,071 lines)** — Comprehensive CLI help system with topic-based help (getting-started, configuration, profiles, training, proofs, troubleshooting). ASCII banner. Functional but large for what it does — could be external documentation.
 
-## Strengths
+**`visualization.rs` (1,210 lines)** — ratatui TUI with 4 tabs (Overview, Training, Workers, Events). Loss charts, error bound charts, worker tables, proof progress gauges. Has real-time tracker integration via `ProofTracker`/`TrainingTracker`. Falls back to simulation when no trackers connected. Proper terminal cleanup in `Drop`.
 
-### 1. Excellent Demo Infrastructure (A+)
-- 90-second orchestrated demos fit ETHDenver format perfectly
-- Multiple scenario types (Quick, FullTraining, Slashing, MultiModel, FaultTolerance)
-- Adaptive pacing handles timing variance
-- Pre-warming reduces cold-start latency
-- Recovery system enables graceful degradation
+**`progress.rs` (204 lines)** — Clean indicatif wrapper. Nothing wrong, nothing remarkable.
 
-### 2. Production-Grade Wallet Security (A)
-- BIP-39/BIP-44 HD wallet support
-- Argon2id + AES-256-GCM encryption
-- Platform keychain integration
-- Hardware wallet architecture
-- Comprehensive audit logging
-- Zeroize for secure memory
+### 3.2 Config Module
 
-### 3. Comprehensive Configuration System (A-)
-- Multiple profiles (Local, Anvil, Sepolia, Mainnet)
-- TOML configuration with sensible defaults
-- Extensive training parameter support
-- Resource limits and constraints
+**`config/mod.rs` (1,069 lines)** — `HelixConfig` with 4 profiles (Local, Anvil, Sepolia, Mainnet, Custom). Comprehensive sub-configs for node, network, training, RPC, contracts, staking, proof, storage, telemetry. TOML load/save. `ProfileManager` with caching. Validation logic. Well-tested.
 
-### 4. Rich User Experience (A-)
-- Colorized terminal output with progress indicators
-- TUI visualization with ratatui
-- HTTP dashboard API
-- Comprehensive help system
-- Multiple output formats (text, JSON, table)
+**`config/training.rs` (937 lines)** — `TrainingJobConfig` with model architectures (MLP/Transformer/BERT/CNN/RNN), hyperparameters (optimizer, LR scheduler, early stopping), data config, proof settings. Demo presets and TOML generation. Solid design with good defaults.
 
-### 5. Real Proof Integration (B+)
-- `RealTrainingExecutor` uses actual `MLTrainingProverV2`
-- Error bound tracking through proof pipeline
-- Integration with helix-prover and helix-avm
+### 3.3 Commands Module
 
----
+**`commands/init.rs` (600 lines)** — **80% real.** Creates actual filesystem directories (`~/.helix/`), generates UUIDs, saves TOML configs. `InitWizard::collect_options()` is stubbed (returns defaults). Hardcoded password `"helix-temp-password"` for wallet storage.
 
-## Weaknesses
+**`commands/join.rs` (675 lines)** — **95% simulated.** All networking, staking, peer discovery, model sync is hardcoded. Fixed 3-peer list, fake transaction hashes. No real blockchain interaction.
 
-### 1. Simulated Network Operations (Critical for Production)
-**Severity**: High
-**Location**: commands/join.rs, commands/status.rs, rpc/client.rs
+**`commands/train.rs` (1,043 lines)** — **60% real.** Real TOML config loading, round iteration, progress tracking, ETA calculations. Simulated proof generation (sleeps), synthetic loss/error values. Supports dry-run mode.
 
-Most network operations return simulated data rather than connecting to actual helix-node instances. This is acceptable for demos but blocks production deployment.
+**`commands/status.rs` (605 lines)** — **90% simulated.** All status values hardcoded (node uptime, peer count, loss, staking info). Real formatting and watch mode. JSON output option.
 
-**Files Affected**:
-- `commands/join.rs:343-375` - Simulated coordinator connection
-- `commands/status.rs:273-378` - Hardcoded status data
-- `rpc/client.rs` - MockRpcClient dominates real usage
+**`commands/query.rs` (893 lines)** — **100% simulated.** Eight query types all return hardcoded data. Well-structured Display implementations but no real data sources.
 
-**Recommendation**: Implement real RPC client integration with helix-node for production readiness.
+**`commands/export.rs` (935 lines)** — **70% simulated.** Real file I/O and JSON serialization. All exported data is synthetic (fake proof hashes, synthetic loss curves, hardcoded metrics).
 
-### 2. Missing Integration Tests (Critical)
-**Severity**: High
-**Location**: Throughout crate
+### 3.4 Demo Module
 
-Unit tests exist but integration tests for end-to-end flows are missing. Critical for verifying demo reliability.
+**`demo/orchestrator.rs`** — Phase-timed orchestrator with precise 90-second timing budgets. Adaptive pacing, phase sequencing, deadline enforcement. Real timing logic but mock RPC calls. Uses `DemoTimingConfig` with 10% setup / 70% training / 10% finalization / 10% buffer.
 
-**Recommendation**: Add integration tests covering:
-- Full demo scenario execution
-- Config loading → training → proof generation
-- Wallet creation → signing → transaction flows
+**`demo/prewarm.rs`** — Pre-loads resources (proving keys, model weights, GPU memory). Real GPU detection via `nvidia-smi` (Linux) / `system_profiler` (macOS). Proving keys and model weights are placeholder 1-2 MB allocations. Cache with eviction logic.
 
-### 3. Error Recovery Limitations (Medium)
-**Severity**: Medium
-**Location**: demo/recovery.rs
+**`demo/real_training.rs`** — **The crown jewel.** Actually generates real ZK proofs using `MLTrainingProverV2`. `RealTrainingExecutor` builds witnesses, calls `prover.prove()`, tracks error bounds. `AsyncRealTrainingExecutor` wraps with `spawn_blocking()` to avoid async runtime saturation. Fixed-point encoding (2^16 scale) for f64-to-Fr conversion.
 
-Recovery actions are partially simulated. Real recovery from proof failures or network partitions needs implementation.
+**`demo/recovery.rs` (1,334 lines)** — Comprehensive error recovery framework. `RecoveryManager` with error categorization (9 types), recovery action determination (8 actions), escalation logic. `CircuitBreaker` state machine (Closed/Open/HalfOpen). `HeartbeatMonitor` with TCP probes. Pre-demo checks (memory, network, RPC, proving system, error state) with reliability scoring. Real health checks.
 
-**Recommendation**: Implement actual recovery procedures:
-- Proof retry with different parameters
-- Network reconnection logic
-- Checkpoint restoration
+### 3.5 RPC Module
 
-### 4. RPC Client Lacks Resilience (Medium)
-**Severity**: Medium
-**Location**: rpc/client.rs
+**`rpc/client.rs` (~2,000 lines)** — Two clients:
+- `HelixRpcClient`: Real JSON-RPC 2.0 over HTTP with exponential backoff + jitter, auth token, circuit breaker. ~20 RPC methods covering training, proofs, models, rounds, workers, staking.
+- `MockRpcClient`: Simulated training with randomized loss/error values, worker management. Used for demos.
+- `UnifiedRpcClient`: Wraps both, routes to real or mock. Supports `connect_or_mock()` fallback.
 
-No retry logic, exponential backoff, or connection pooling in the real RPC client.
+**`rpc/chain.rs` (761 lines)** — `ChainClient` wraps `HelixCoordinatorV2` via `abigen!`. Real contract calls for model registration, staking, proof submission, event querying. `deploy_with_forge()` runs `forge script` and parses broadcast JSON. Circuit breaker integration. **Issue:** Hardcoded chain ID 31337 in broadcast path. Model ID parsing from event logs is fragile (assumes topic[1]).
 
-**Recommendation**: Add:
-- Retry with exponential backoff
-- Connection pooling
-- Request timeout handling
-- Circuit breaker pattern
+### 3.6 Wallet Module
 
-### 5. Large Files Need Splitting (Low)
-**Severity**: Low
-**Location**: main.rs, config/mod.rs
+**`wallet/mod.rs` (1,173 lines)** — **Production-grade.** `SecureWallet` with Argon2id + AES-256-GCM encryption. BIP-44 hierarchical derivation. Transaction confirmation with callbacks. Secure backup with SHA-256 checksums. All keys `zeroize` on drop. `WalletManager` for multi-wallet management.
 
-Some files exceed 1000 lines and could benefit from modularization.
+**`wallet/audit.rs` (719 lines)** — Tamper-evident audit log with SHA-256 hash chaining. 24 operation types, 5 severity levels. File rotation (10 MB max, keep 5). Export as JSON/CSV/Text.
 
-**Recommendation**: Split command handling into separate handler modules.
+**`wallet/derivation.rs` (900 lines)** — BIP-32/BIP-44 HD derivation using k256 (secp256k1). HMAC-SHA512 for child key derivation. Keccak256 for Ethereum address generation. EIP-55 checksum addresses. EIP-155 replay protection. All cryptographically sound.
+
+**`wallet/legacy.rs` (972 lines)** — **CRITICAL: Placeholder.** XOR-based "signing" and simplified "keccak256" that is NOT real Keccak256. Comments clearly state "simplified - in production use proper KDF." Exists for backward compatibility with older code. Should NOT be used for any real wallet operations.
+
+**`wallet/mnemonic.rs` (529 lines)** — BIP-39 using `coins_bip39`. PBKDF2-HMAC-SHA512 (2048 iterations). Proper entropy reconstruction. Zeroize on drop.
+
+**`wallet/keychain/` (mod.rs + linux.rs + macos.rs + windows.rs)** — Platform-specific OS keychain integration. macOS via Security.framework, Linux via Secret Service D-Bus, Windows via DPAPI. All real implementations.
+
+**`wallet/hardware/` (mod.rs + ledger.rs)** — Ledger Nano S/X/Plus support via HID APDU protocol. Real USB HID communication. Device enumeration, address derivation, message signing, transaction signing, EIP-712 typed data signing. Feature-gated behind `hardware-wallet`.
+
+### 3.7 Tests
+
+**`tests/demo_integration.rs` (575 lines)** — 20+ tests covering dashboard endpoints, auth middleware, rate limiting, circuit breaker state machines, config validation, HelixClient facade, benchmark NaN safety. All mocked (no blockchain).
+
+**`tests/e2e_chain_integration.rs` (1,439 lines)** — 15+ tests behind `chain` feature. Real Anvil + deployed contracts. Full lifecycle: register model, stake, start round, submit proof, verify events. Multi-participant scenarios. Circuit breaker integration. `TestEnv` with port isolation for parallel execution. **Gap:** Uses `vec![0u8; 320]` placeholder proofs, not real SNARK proofs. No slashing or rewards testing.
 
 ---
 
-## Recommendations
+## 4. Strengths
 
-### Priority 1: Critical for Demo (P0)
+1. **Wallet module is production-grade** — Real BIP-39/BIP-44 with audited crypto libraries (k256, aes-gcm, argon2). OS keychain integration on 3 platforms. Ledger HID protocol correctly implemented. Zeroize on drop throughout. (`wallet/mod.rs:42-89`, `wallet/derivation.rs:1-50`)
 
-1. **Verify 90-second Demo Timing Under Load**
-   - Run full demo scenarios with real proof generation
-   - Measure actual proof times and adjust phase budgets
-   - Target: All scenarios complete reliably within 90 seconds
+2. **Real ZK proof generation in demo** — `demo/real_training.rs` actually calls `MLTrainingProverV2::prove()`, not a simulation. The `AsyncRealTrainingExecutor` properly uses `spawn_blocking()` to avoid async runtime congestion. This is the real deal.
 
-2. **Pre-warm Proving Keys**
-   - Implement actual proving key loading in prewarm.rs
-   - Cache k=14/15 parameters before demo start
-   - Target: <500ms proof generation during demo
+3. **Robust RPC client with circuit breaker** — `HelixRpcClient` has exponential backoff with jitter, auth token support, and a proper circuit breaker (Closed/Open/HalfOpen). The `UnifiedRpcClient` wrapper provides clean fallback to mock mode. (`rpc/client.rs`)
 
-3. **Test Demo Recovery Paths**
-   - Trigger each ErrorCategory and verify recovery
-   - Ensure graceful degradation works end-to-end
-   - Test circuit breaker behavior
+4. **On-chain integration works end-to-end** — `ChainClient` + `deploy_with_forge()` + the e2e test suite demonstrate a working register-stake-submit-verify lifecycle on real deployed contracts. (`rpc/chain.rs`, `tests/e2e_chain_integration.rs`)
 
-### Priority 2: Important for Demo Quality (P1)
+5. **Error recovery framework** — `demo/recovery.rs` has sophisticated error escalation (repeated errors trigger degradation), circuit breaker, heartbeat monitoring with TCP probes, pre-demo checks with reliability scoring. Well-designed for resilient demos.
 
-1. **Add Demo Integration Tests**
-   - Create test harness for demo scenarios
-   - Automate timing verification
-   - Test slashing scenario specifically
+6. **Tamper-evident audit logging** — SHA-256 hash-chained audit log with rotation, export, and chain verification. Unusual and valuable for a demo project. (`wallet/audit.rs`)
 
-2. **Improve Real Training Integration**
-   - Verify `RealTrainingExecutor` produces valid proofs
-   - Test error bound accumulation accuracy
-   - Benchmark proof generation times
+7. **Health monitoring is genuinely useful** — `health.rs` does real HTTP pings, TCP probes, JSON-RPC calls, filesystem checks, and process detection. Not simulated. (`health.rs:1-643`)
 
-3. **Dashboard API Testing**
-   - Verify all endpoints return expected data
-   - Test with Next.js dashboard
-   - Add basic authentication
-
-### Priority 3: Post-Demo Improvements (P2)
-
-1. **Implement Real Network Operations**
-   - Connect to actual helix-node instances
-   - Real peer discovery and messaging
-   - Actual stake transactions
-
-2. **Add RPC Client Resilience**
-   - Retry with backoff
-   - Connection pooling
-   - Better error messages
-
-3. **Code Quality**
-   - Split large files
-   - Increase test coverage
-   - Add documentation comments
+8. **Config system is comprehensive** — 4 network profiles, TOML persistence, training job configs with model architecture presets, validation. `TrainingJobConfig` supports demo presets for quick setup. (`config/mod.rs`, `config/training.rs`)
 
 ---
 
-## Testing Assessment
+## 5. Weaknesses
 
-### Current State
+### CRITICAL
 
-| Category | Coverage | Notes |
-|----------|----------|-------|
-| Unit Tests | ~60% | Most modules have basic tests |
-| Integration Tests | ~25% | Dashboard, facade, benchmark, config, consistency tests |
-| Demo Scenarios | ~40% | Need automated verification |
-| Wallet Security | ~70% | Good crypto primitive tests |
-| Config Parsing | ~55% | Validation tests + profile round-trip |
+**W1: 6 of 16 CLI commands are entirely fake** (`main.rs:cmd_join`, `cmd_status`, `cmd_query`, `cmd_export`, `cmd_orchestrate`, `cmd_logs`)
+- **Impact:** A user running `helix status` or `helix query model 0` gets hardcoded data, not real system state. This is the primary user-facing interface.
+- **Fix:** Wire these commands to `UnifiedRpcClient` methods that already exist (e.g., `get_training_status()`, `get_network_status()`, `get_workers()`). The RPC client has all needed endpoints — the commands just don't call them.
 
-### Testing Gaps
+**W2: `benchmark.rs` measures nothing real** (`benchmark.rs:232-234`)
+- **Impact:** `helix benchmark` reports latency/throughput numbers that are pure fiction (`tokio::time::sleep()`). Users comparing against ETHDenver targets get meaningless data.
+- **Fix:** Replace `run_single_iteration()` with actual proof generation (call `RealTrainingExecutor::train_step()` from `demo/real_training.rs`). The infrastructure exists.
 
-1. **Demo Timing Verification** - No automated tests verify 90-second completion
-2. **End-to-End Proof Flow** - No tests verify real proof generation
-3. **Network Failure Scenarios** - Recovery paths untested
-4. **Wallet Operations** - Hardware wallet path untested
+**W3: `legacy.rs` has XOR "encryption" and fake "keccak256"** (`wallet/legacy.rs:174-211`)
+- **Impact:** If any code path accidentally uses `legacy::Wallet` instead of `SecureWallet`, keys are effectively unprotected. The fake keccak256 produces addresses that don't match real Ethereum addresses.
+- **Fix:** Add `#[deprecated(note = "Use wallet::SecureWallet instead")]` to all public types. Add compile-time warnings. Better yet, make `legacy.rs` `pub(crate)` only.
 
-### Recommended Test Additions
+**W4: Hardcoded Anvil private key in default config** (`orchestration.rs:90-91`)
+- **Impact:** `OrchestratorConfig::default()` contains `ac0974bec...` (Anvil account 0 private key). If someone copies this config to a non-Anvil context, funds are at risk. This key is well-known.
+- **Fix:** Remove from defaults. Require explicit configuration. Add validation that rejects known test keys when profile is Sepolia or Mainnet.
 
-```rust
-// Demo scenario tests
-#[tokio::test]
-async fn test_quick_demo_completes_in_90_seconds() { ... }
+### HIGH
 
-#[tokio::test]
-async fn test_full_training_demo_produces_valid_proofs() { ... }
+**W5: `lib.rs` and `main.rs` have divergent module declarations**
+- **Impact:** `lib.rs` doesn't export `health` or `orchestrator` modules. `main.rs` includes them. Users of the library crate can't access health monitoring or orchestration.
+- **Fix:** Add `pub mod health;` and `pub mod orchestrator;` to `lib.rs`.
 
-#[tokio::test]
-async fn test_demo_recovery_from_proof_failure() { ... }
+**W6: New `reqwest::Client` per `trigger_round()` call** (`orchestrator.rs:517`)
+- **Impact:** Each trigger_round creates a new TCP connection + TLS handshake instead of reusing. Under load this causes socket exhaustion.
+- **Fix:** Store `reqwest::Client` as a field on `LiveTrainingOrchestrator` (it's cheap to clone and shares a connection pool).
 
-// Integration tests
-#[tokio::test]
-async fn test_config_to_training_flow() { ... }
+**W7: `init.rs` hardcoded wallet password** (`commands/init.rs`)
+- **Impact:** `"helix-temp-password"` is used for wallet encryption during init. Any attacker who knows this (it's in the source) can decrypt the wallet file.
+- **Fix:** Prompt the user for a password, or use OS keychain to generate and store one. The keychain infrastructure already exists in `wallet/keychain/`.
 
-#[tokio::test]
-async fn test_real_training_executor_proof_validity() { ... }
-```
+**W8: Mock `advance_round()` allows unbounded error accumulation** (`rpc/client.rs`)
+- **Impact:** In demo mode, accumulated error grows without limit. Doesn't match production behavior where error exceeding max_error_bound should halt training.
+- **Fix:** Add `max_error_bound` check to `advance_round()`. Return `false` if exceeded.
 
----
+**W9: `TrainingProofInputs.to_vec()` returns 7 elements; V2 contract expects 8** (`rpc/chain.rs`)
+- **Impact:** Using `submit_proof()` (typed API) will fail on V2 contracts that require the error checksum as the 8th input.
+- **Fix:** Add `error_checksum` field to `TrainingProofInputs` and update `to_vec()`.
 
-## Demo Readiness Assessment
+### NICE-TO-HAVE
 
-### Target Metrics
+**W10: `help.rs` at 1,071 lines is large for embedded help** — Move to external docs or generate from doc comments.
 
-| Metric | Target | Current Status | Risk |
-|--------|--------|----------------|------|
-| Demo completion time | 90 seconds | Configurable | Low |
-| Proof generation time | <500ms | ~300-600ms simulated | Medium |
-| Cold start time | <5 seconds | ~2-3s with prewarm | Low |
-| Recovery from failure | Graceful | Partially implemented | Medium |
-| Visual appeal | High | Good with TUI | Low |
+**W11: `InitWizard::collect_options()` returns defaults without prompting** — Wire up `dialoguer` or similar for interactive init.
 
-### Demo Scenario Readiness
+**W12: No gas estimation in `ChainClient`** — All transactions use default gas. High-volume use may hit gas limits.
 
-| Scenario | Status | Notes |
-|----------|--------|-------|
-| Quick (30s) | Ready | Good for time-constrained demos |
-| FullTraining (90s) | Ready | Primary demo scenario |
-| Slashing | Partial | Needs visual polish |
-| MultiModel | Partial | Complex, needs testing |
-| FaultTolerance | Partial | Recovery paths need work |
+**W13: `deploy_with_forge()` hardcodes chain ID 31337 in broadcast path** (`rpc/chain.rs:666-669`) — Should be parameterized for other networks.
 
-### Critical Demo Checklist
-
-- [x] 90-second orchestrated timing
-- [x] Real ZK proof generation integration
-- [x] Progress visualization (TUI)
-- [x] HTTP dashboard API
-- [x] Pre-warming infrastructure
-- [x] HelixClient SDK facade for external consumers
-- [x] Dashboard auth middleware + rate limiting
-- [x] Benchmark NaN safety + percentile correctness
-- [x] Integration tests (facade, benchmark, config, dashboard consistency)
-- [ ] Proven 500ms proof generation (needs verification)
-- [ ] Recovery from mid-demo failures (needs testing)
-- [ ] Slashing scenario polish
-
-### Demo Risk Assessment
-
-| Risk | Likelihood | Impact | Mitigation |
-|------|------------|--------|------------|
-| Proof generation exceeds 500ms | Medium | High | Pre-warm keys, use k=12 |
-| Network failure during demo | Low | High | Mock fallback available |
-| TUI rendering issues | Low | Medium | Fallback to text mode |
-| Memory exhaustion | Low | High | Resource limits in config |
+**W14: Event log model ID parsing assumes `topic[1]`** (`rpc/chain.rs`) — Fragile if contract events change signature.
 
 ---
 
-## Dependencies Analysis
+## 6. Prioritized Recommendations
 
-### Internal Dependencies
+### Critical (Do Before Demo)
 
-| Crate | Purpose | Integration Quality |
-|-------|---------|---------------------|
-| helix-core | Types, tensors | Good |
-| helix-avm | ML computations | Good |
-| helix-prover | Proof generation | Good via RealTrainingExecutor |
-| helix-circuits | Circuit definitions | Indirect via prover |
+1. **Wire simulated commands to real RPC** — `cmd_status`, `cmd_query` should call `UnifiedRpcClient` methods. This is the single highest-impact change for credibility.
 
-### External Dependencies (Key)
+2. **Make benchmarks real** — Replace `tokio::time::sleep()` in `benchmark.rs` with actual proof generation. The `RealTrainingExecutor` is right there in `demo/real_training.rs`.
 
-| Dependency | Version | Purpose | Risk |
-|------------|---------|---------|------|
-| clap | 4.0 | CLI parsing | Low |
-| tokio | 1.x | Async runtime | Low |
-| ratatui | 0.26 | TUI | Low |
-| axum | 0.7 | HTTP server | Low |
-| k256 | 0.13 | ECDSA | Low |
-| aes-gcm | 0.10 | Encryption | Low |
-| argon2 | 0.5 | KDF | Low |
-| coins-bip39 | 0.8 | Mnemonics | Low |
+3. **Deprecate `legacy.rs`** — At minimum add `#[deprecated]` and reduce visibility. Ideally remove all callers.
 
----
+### High (Do Before Any Production Use)
 
-## Round 7 Changes
+4. **Remove hardcoded private key from defaults** — Add validation that rejects known Anvil keys on non-local profiles.
 
-### Step 1: HelixClient SDK Facade (`client.rs`)
-- Replaced 5-line stub with full facade wrapping `HelixConfig` + `UnifiedRpcClient` + optional `DashboardState`
-- Constructors: `new()`, `from_config_file()`, `from_profile()`
-- Async `connect()` upgrades mock RPC to real node connection
-- Builder method `with_dashboard()` for dashboard state attachment
-- Re-exported as `pub use client::HelixClient` in `lib.rs`
+5. **Fix `TrainingProofInputs` to include error checksum** — Align typed and raw APIs with V2 contract expectations.
 
-### Step 2: Benchmark Correctness Fixes (`benchmark.rs`)
-- **NaN-safe sort**: `partial_cmp().unwrap()` replaced with `unwrap_or(Ordering::Equal)` to prevent panic on NaN inputs
-- **`quick_benchmark` fix**: Samples are now sorted before percentile calculation; `std_dev` properly computed instead of hardcoded `0.0`
-- **Module exposure**: `pub mod benchmark` added to `lib.rs` for test accessibility
+6. **Unify `lib.rs` and `main.rs` module structure** — Export all public modules from `lib.rs`.
 
-### Step 3: Dashboard DRY Refactor (`dashboard.rs`)
-- Extracted 5 shared helpers: `demo_nodes()`, `demo_metrics()`, `demo_events()`, `demo_training_status()`, `populate_demo_network()`
-- `with_defaults()` and all handler fallbacks now call these helpers (eliminated ~120 lines of duplication)
-- Helpers are `pub` for test access and external consumers
+### Nice-to-Have
 
-### Step 4: Integration Tests (`tests/demo_integration.rs`)
-- **HelixClient facade**: `test_helix_client_from_profile`, `test_helix_client_with_dashboard`, `test_helix_client_rejects_invalid_config`
-- **Benchmark NaN safety**: `test_benchmark_results_nan_safety` (NaN inputs don't panic)
-- **Benchmark correctness**: `test_benchmark_percentile_sorted` (known-input verification of min/max/mean/P50/stddev)
-- **Config validation**: `test_config_default_validates`, `test_config_rejects_zero_batch_size`, `test_config_rejects_negative_learning_rate`
-- **Dashboard consistency**: `test_dashboard_defaults_and_fallback_match` (verifies handler fallbacks return identical data to helper functions)
-
-### Step 5: Documentation Updates
-- Fixed inaccurate weakness claim that "Authentication not implemented" and "Rate limiting not present" — both exist as middleware in `dashboard.rs`
-- Updated Integration Tests coverage from ~10% to ~25%
-- Added Round 7 items to Critical Demo Checklist
+7. Reuse `reqwest::Client` in `LiveTrainingOrchestrator`.
+8. Add interactive init wizard.
+9. Parameterize chain ID in forge deployment path.
+10. Add gas estimation to `ChainClient`.
 
 ---
 
-## Summary
+## 7. Improvement Ideas
 
-### Health Score: **B+ (85/100)**
+1. **Command plugin architecture** — Instead of a monolithic `main.rs` with 16 match arms, each command could be a trait impl registered dynamically. Reduces the 2,142-line file and enables extension.
 
-| Category | Score | Weight | Weighted |
-|----------|-------|--------|----------|
-| Architecture | A- (88) | 20% | 17.6 |
-| Demo Readiness | A- (87) | 25% | 21.75 |
-| Code Quality | B+ (85) | 15% | 12.75 |
-| Security | A (92) | 15% | 13.8 |
-| Testing | C+ (75) | 15% | 11.25 |
-| Documentation | B (82) | 10% | 8.2 |
-| **Total** | | | **85.35** |
+2. **Streaming proof progress** — Replace polling-based proof subscriptions with WebSocket or SSE for real-time dashboard updates.
 
-### Key Takeaways
+3. **Config migration** — As config evolves, a version field + migration system would prevent breakage.
 
-**Strengths**:
-1. Excellent demo infrastructure with 90-second orchestration
-2. Production-grade wallet security
-3. Comprehensive configuration system
-4. Real proof integration capability
-5. Rich user experience with TUI and API
+4. **Proof cache** — Cache proven steps locally to avoid re-proving on restart. The `demo/prewarm.rs` cache infrastructure could be extended.
 
-**Critical Gaps**:
-1. Most network operations are simulated
-2. Integration tests are insufficient
-3. Proof generation timing needs real-world verification
+5. **Multi-chain support** — `ChainClient` currently assumes one coordinator address. Support multiple chains with a chain registry.
+
+---
+
+## 8. Testing Assessment
+
+### Current Coverage
+
+| Area | Tests | Quality |
+|------|-------|---------|
+| Dashboard endpoints | 1 test, all 8 routes | Good — verifies 200 OK + JSON |
+| Auth middleware | 2 tests | Good — missing/wrong token to 401 |
+| Rate limiting | 1 test | Potentially flaky (clock-based) |
+| Circuit breaker | 5 tests | Thorough state machine coverage |
+| Recovery manager | 4 tests | Good — error recording, degradation |
+| Config validation | 4 tests | Good — rejects invalid configs |
+| HelixClient facade | 3 tests | Basic — creation + attachment |
+| On-chain lifecycle | 7 tests | Excellent — full register-submit-verify |
+| Multi-participant | 1 test | Good — 2 provers staking |
+| Proof validation | 3 tests | Good — wrong hash, over-bound, wrong count |
+| Benchmark stats | 2 tests | Good — NaN safety, percentile correctness |
+
+### Gaps
+
+- **No tests for simulated commands** (join, status, query, export) — but these are fake anyway
+- **No real ZK proof in e2e tests** — uses `vec![0u8; 320]` placeholder with MockVerifier
+- **No slashing scenario tests** — staking tested but invalid proof slashing path untested
+- **No rewards claim tests** — Rewards.sol deployed but never exercised
+- **No concurrent stress tests** — all sequential, no race condition coverage
+- **Rate limiter test may be flaky** — depends on timing within 1-second windows
+- **No wallet integration tests** — wallet module has unit tests but no cross-module integration
 
 ### Verdict
+Tests are **well-structured but incomplete**. The on-chain lifecycle tests are genuinely impressive (real Anvil + deployed contracts + port isolation). The missing piece is testing with real ZK proofs — currently the MockVerifier accepts everything, so proof validation logic is never exercised end-to-end.
 
-**helix-client is well-architected and demo-ready for ETHDenver with medium confidence.** The 90-second demo orchestration, pre-warming, and recovery infrastructure are excellent. The primary risks are:
+---
 
-1. **Proof generation timing** - Need to verify actual proof times under demo conditions
-2. **Recovery robustness** - Recovery paths need end-to-end testing
-3. **Simulated vs Real** - Demo works with mocks; production needs real network integration
+## 9. Demo Readiness (ETHDenver Targets)
 
-**Recommendation**: Conduct a full dress rehearsal with real proof generation to verify 500ms target before ETHDenver. Have the mock fallback ready as backup.
+| Target | Status | Details |
+|--------|--------|---------|
+| **<500ms proof gen** | MISS | Real proofs take 2-6s (k=12-14). Target unrealistic for real ZK proofs. |
+| **~30x overhead** | UNKNOWN | Benchmark module is fake. Cannot measure. Real overhead estimated 100-500x. |
+| **90s demo** | PASS | `DemoOrchestrator` has precise 90-second timing with adaptive pacing and hard 100-second deadline. |
+| **Adversarial demo** | PARTIAL | `generate_invalid_proof()` in `real_training.rs` corrupts proofs for slashing demo. But MockVerifier in e2e tests doesn't actually reject them. |
+| **On-chain verification** | PASS | `ChainClient` + `deploy_with_forge()` demonstrates real contract deployment and proof submission. |
+| **Terminal UI** | PASS | ratatui 4-tab UI with real-time loss charts, worker tables, event log. |
+| **Wallet integration** | PASS | Production-grade BIP-39/BIP-44 + OS keychain + Ledger support. |
+
+### Demo Flow Assessment
+The 90-second demo orchestrator (`demo/orchestrator.rs`) is well-designed:
+1. **Setup (9s):** Deploy contracts, register model, start workers, stake
+2. **Training (63s):** Multiple rounds with real ZK proof generation
+3. **Finalization (9s):** Summary, timing report
+4. **Buffer (9s):** Safety margin
+
+The `real_training.rs` module generates genuine halo2 proofs via `MLTrainingProverV2`. With k=12 and small model dims (d_in=16, d_hid=32, d_out=4), ~500ms-2s per proof in release mode is achievable. The adaptive pacing will skip remaining rounds if time runs low. **This should work for a convincing demo.**
+
+---
+
+## 10. Health Score
+
+| Component | Score | Rationale |
+|-----------|-------|-----------|
+| **Wallet** | A (90%) | Production-grade crypto, OS keychain, Ledger support. Legacy.rs is the only blemish. |
+| **RPC/Chain** | B+ (80%) | Real JSON-RPC + ethers-rs + circuit breaker. Minor issues (gas estimation, fragile event parsing). |
+| **Demo Framework** | B (78%) | Real ZK proofs, timing orchestration, recovery. Pre-warm is mostly placeholder. |
+| **Config** | B (78%) | Comprehensive profiles, validation, TOML persistence. Missing migration system. |
+| **Dashboard** | B- (72%) | Real axum API with auth + rate limiting. Falls back to demo data. |
+| **Health Monitoring** | B (78%) | Genuinely useful. Real probes. |
+| **CLI Commands** | D (35%) | 6 of 16 commands are fake. Main user interface is largely simulated. |
+| **Benchmarks** | F (10%) | Measures nothing real. Pure fiction. |
+| **Terminal UI** | B- (72%) | Functional ratatui TUI. Falls back to simulation. |
+| **Tests** | B- (72%) | Good on-chain lifecycle tests. No real proof testing. Some flaky timing tests. |
+| **OVERALL** | **C+ (65%)** | Excellent foundation (wallet, RPC, chain, demo proofs) undermined by simulated CLI commands and fake benchmarks. |
+
+### Key Metrics
+- **Lines of code:** ~32,500
+- **Real vs simulated:** ~55% real, ~45% simulated/placeholder
+- **Test count:** ~35+ (demo_integration + e2e_chain)
+- **Feature flags:** `chain` (ethers), `hardware-wallet` (hidapi), `mock-fallback`
+
+### Bottom Line
+`helix-client` has genuinely impressive wallet security, real on-chain integration, and actual ZK proof generation. The demo framework can produce a convincing 90-second ETHDenver presentation. But the primary user interface (CLI commands) is mostly theater — status, query, join, and export commands return hardcoded data. The infrastructure to make them real exists (the RPC client has all the methods), but the wiring was never completed. For a hackathon demo, this is fine. For anything beyond that, the simulated commands need to be connected to real data sources.
