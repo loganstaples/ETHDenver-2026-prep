@@ -161,6 +161,24 @@ impl<F: PrimeField, const RANGE: usize> ErrorAccumulationChip<F, RANGE> {
 
     /// Proves error propagation for a multiplication operation.
     /// For multiplication: err(a * b) ≤ |a|*err_b + |b|*err_a + err_a*err_b
+    ///
+    /// Uses a single region with 5 rows and copy constraints to prevent
+    /// a malicious prover from using inconsistent intermediate values.
+    ///
+    /// Layout (single region):
+    ///   Row 0: s_mul, val_a, err_b, term1         (term1 = val_a * err_b)
+    ///   Row 1: s_mul, val_b, err_a, term2         (term2 = val_b * err_a)
+    ///   Row 2: s_mul, err_a', err_b', term3       (term3 = err_a * err_b)
+    ///   Row 3: s_add, term1', term2', partial_sum (partial = term1 + term2)
+    ///   Row 4: s_add, partial', term3', err_result (err_result = partial + term3)
+    ///
+    /// Copy constraints bind shared values across rows:
+    ///   err_a (row 1) == err_a' (row 2)
+    ///   err_b (row 0) == err_b' (row 2)
+    ///   term1 (row 0) == term1' (row 3)
+    ///   term2 (row 1) == term2' (row 3)
+    ///   term3 (row 2) == term3' (row 4)
+    ///   partial_sum (row 3) == partial' (row 4)
     pub fn assign_mul_error_propagation(
         &self,
         mut layouter: impl Layouter<F>,
@@ -170,68 +188,52 @@ impl<F: PrimeField, const RANGE: usize> ErrorAccumulationChip<F, RANGE> {
         err_b: Value<F>,
         err_result: Value<F>,
     ) -> Result<(), ErrorFront> {
-        // Compute intermediate terms
-        let term1 = val_a * err_b;  // |a| * err_b
-        let term2 = val_b * err_a;  // |b| * err_a
-        let term3 = err_a * err_b;  // err_a * err_b
-        
-        // Verify term1 = val_a * err_b
+        let term1 = val_a * err_b;
+        let term2 = val_b * err_a;
+        let term3 = err_a * err_b;
+        let partial_sum = term1 + term2;
+
         layouter.assign_region(
-            || "mul error term1",
+            || "mul error propagation",
             |mut region| {
+                // Row 0: term1 = val_a * err_b
                 self.config.arithmetic.s_mul.enable(&mut region, 0)?;
                 region.assign_advice(|| "val_a", self.config.arithmetic.a, 0, || val_a)?;
-                region.assign_advice(|| "err_b", self.config.arithmetic.b, 0, || err_b)?;
-                region.assign_advice(|| "term1", self.config.arithmetic.c, 0, || term1)?;
-                Ok(())
-            },
-        )?;
-        
-        // Verify term2 = val_b * err_a
-        layouter.assign_region(
-            || "mul error term2",
-            |mut region| {
-                self.config.arithmetic.s_mul.enable(&mut region, 0)?;
-                region.assign_advice(|| "val_b", self.config.arithmetic.a, 0, || val_b)?;
-                region.assign_advice(|| "err_a", self.config.arithmetic.b, 0, || err_a)?;
-                region.assign_advice(|| "term2", self.config.arithmetic.c, 0, || term2)?;
-                Ok(())
-            },
-        )?;
-        
-        // Verify term3 = err_a * err_b
-        layouter.assign_region(
-            || "mul error term3",
-            |mut region| {
-                self.config.arithmetic.s_mul.enable(&mut region, 0)?;
-                region.assign_advice(|| "err_a", self.config.arithmetic.a, 0, || err_a)?;
-                region.assign_advice(|| "err_b", self.config.arithmetic.b, 0, || err_b)?;
-                region.assign_advice(|| "term3", self.config.arithmetic.c, 0, || term3)?;
-                Ok(())
-            },
-        )?;
-        
-        // Sum: term1 + term2
-        let partial_sum = term1 + term2;
-        layouter.assign_region(
-            || "mul error sum partial",
-            |mut region| {
-                self.config.arithmetic.s_add.enable(&mut region, 0)?;
-                region.assign_advice(|| "term1", self.config.arithmetic.a, 0, || term1)?;
-                region.assign_advice(|| "term2", self.config.arithmetic.b, 0, || term2)?;
-                region.assign_advice(|| "partial", self.config.arithmetic.c, 0, || partial_sum)?;
-                Ok(())
-            },
-        )?;
-        
-        // Final sum: partial + term3 = err_result
-        layouter.assign_region(
-            || "mul error sum final",
-            |mut region| {
-                self.config.arithmetic.s_add.enable(&mut region, 0)?;
-                region.assign_advice(|| "partial", self.config.arithmetic.a, 0, || partial_sum)?;
-                region.assign_advice(|| "term3", self.config.arithmetic.b, 0, || term3)?;
-                region.assign_advice(|| "err_result", self.config.arithmetic.c, 0, || err_result)?;
+                let err_b_0 = region.assign_advice(|| "err_b", self.config.arithmetic.b, 0, || err_b)?;
+                let term1_0 = region.assign_advice(|| "term1", self.config.arithmetic.c, 0, || term1)?;
+
+                // Row 1: term2 = val_b * err_a
+                self.config.arithmetic.s_mul.enable(&mut region, 1)?;
+                region.assign_advice(|| "val_b", self.config.arithmetic.a, 1, || val_b)?;
+                let err_a_1 = region.assign_advice(|| "err_a", self.config.arithmetic.b, 1, || err_a)?;
+                let term2_1 = region.assign_advice(|| "term2", self.config.arithmetic.c, 1, || term2)?;
+
+                // Row 2: term3 = err_a * err_b
+                self.config.arithmetic.s_mul.enable(&mut region, 2)?;
+                let err_a_2 = region.assign_advice(|| "err_a'", self.config.arithmetic.a, 2, || err_a)?;
+                let err_b_2 = region.assign_advice(|| "err_b'", self.config.arithmetic.b, 2, || err_b)?;
+                let term3_2 = region.assign_advice(|| "term3", self.config.arithmetic.c, 2, || term3)?;
+
+                // Row 3: partial_sum = term1 + term2
+                self.config.arithmetic.s_add.enable(&mut region, 3)?;
+                let term1_3 = region.assign_advice(|| "term1'", self.config.arithmetic.a, 3, || term1)?;
+                let term2_3 = region.assign_advice(|| "term2'", self.config.arithmetic.b, 3, || term2)?;
+                let partial_3 = region.assign_advice(|| "partial", self.config.arithmetic.c, 3, || partial_sum)?;
+
+                // Row 4: err_result = partial + term3
+                self.config.arithmetic.s_add.enable(&mut region, 4)?;
+                let partial_4 = region.assign_advice(|| "partial'", self.config.arithmetic.a, 4, || partial_sum)?;
+                let term3_4 = region.assign_advice(|| "term3'", self.config.arithmetic.b, 4, || term3)?;
+                region.assign_advice(|| "err_result", self.config.arithmetic.c, 4, || err_result)?;
+
+                // Copy constraints: bind shared values across rows
+                region.constrain_equal(err_a_1.cell(), err_a_2.cell())?;
+                region.constrain_equal(err_b_0.cell(), err_b_2.cell())?;
+                region.constrain_equal(term1_0.cell(), term1_3.cell())?;
+                region.constrain_equal(term2_1.cell(), term2_3.cell())?;
+                region.constrain_equal(term3_2.cell(), term3_4.cell())?;
+                region.constrain_equal(partial_3.cell(), partial_4.cell())?;
+
                 Ok(())
             },
         )
@@ -563,6 +565,32 @@ mod tests {
         let prover = MockProver::run(8, &circuit, vec![vec![]]).unwrap();
         // Range check should fail because remaining_budget = -10 which is a huge field element
         assert!(prover.verify().is_err());
+    }
+
+    #[test]
+    fn test_mul_error_wrong_result() {
+        // Prover claims err_result = 3 but correct is 6
+        // The s_add gate on row 4 should reject: partial + term3 != err_result
+        let operations = vec![
+            OperationData {
+                op_type: OpType::Mul,
+                input_val_a: Fr::from(2),
+                input_err_a: Fr::from(1),
+                input_val_b: Fr::from(3),
+                input_err_b: Fr::from(1),
+                output_val: Fr::from(6),
+                output_err: Fr::from(3),  // Wrong! Should be 2*1 + 3*1 + 1*1 = 6
+            },
+        ];
+
+        let circuit = ErrorAccumulationCircuit::<Fr, 100> {
+            operations,
+            max_allowed_error: Fr::from(10),
+            _marker: PhantomData,
+        };
+
+        let prover = MockProver::run(8, &circuit, vec![vec![]]).unwrap();
+        assert!(prover.verify().is_err(), "Should reject wrong mul error result");
     }
 
     #[test]

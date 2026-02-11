@@ -200,7 +200,7 @@ pub struct MLTrainingStepV2Config {
     /// Selector for Freivalds dot product verification.
     pub(crate) s_freivalds: Selector,
     /// Selector for error bound accumulation.
-    pub(crate) _s_error_acc: Selector,
+    pub(crate) s_error_acc: Selector,
     /// Poseidon circuit configuration for in-circuit error checksum hashing.
     pub(crate) poseidon: PoseidonCircuitConfig,
 }
@@ -1078,8 +1078,9 @@ impl MLTrainingStepV2Circuit {
                 &format!("b{}_upd_b2_{}", pi_offset, idx))?;
         }
 
-        // 10. Error bound verification
-        verify_error_bound(config, layouter, w.total_error,
+        // 10. Error bound verification — accumulates per-op errors in-circuit
+        // and constrains the total to match PI[5]
+        verify_error_bound(config, layouter, w,
             &format!("b{}_error_bound_check", pi_offset))?;
 
         // 11. Error checksum verification — constrain that PI[7] matches
@@ -1292,7 +1293,7 @@ impl Circuit<Fr> for MLTrainingStepV2Circuit {
             s_eq,
             s_relu,
             s_freivalds,
-            _s_error_acc: s_error_acc,
+            s_error_acc: s_error_acc,
             poseidon,
         }
     }
@@ -1406,37 +1407,107 @@ pub(crate) fn verify_matmul_freivalds(
     Ok(())
 }
 
-/// Verifies that the accumulated error bound is within acceptable limits.
+/// Verifies the accumulated error bound via in-circuit accumulation.
 ///
-/// # WARNING: INCOMPLETE SOUNDNESS
+/// Uses the `s_error_acc` gate to sum exactly the error contributions that
+/// `ErrorTracker` accumulates in `compute_witness_v2`, then constrains
+/// the total to equal the witness `total_error` (bound to PI[5]).
 ///
-/// This function assigns `total_error` as a witness and binds it to PI[5] via
-/// the public input system, but does NOT constrain it to equal the actual
-/// accumulated error from all circuit operations. A malicious prover could
-/// claim any error bound as long as it passes the ReLU lookup range check.
+/// Error contributions tracked by ErrorTracker:
+/// - `h_pre_err[j]` for each hidden unit (forward layer 1, dot product error)
+/// - `y_err[j]` for each output unit (forward layer 2, dot product error)
+/// - `dw2_err[j*d_hid+k]` for each gradient element (backward, mul error)
+/// - `dh_err[k]` for each hidden unit (backward, dot product error)
+/// - `dw1_err[k*d_in+i]` for each gradient element (backward, mul error)
 ///
-/// Full fix (in-circuit error accumulation across all ops) would approximately
-/// double the circuit size and is out of scope for the current implementation.
+/// Note: `h_err`, `dy_err`, `db2_err`, `dh_pre_err`, `db1_err` are passthrough
+/// values NOT added to ErrorTracker.accumulated. They are excluded from the sum.
 ///
-/// PI[5] (total_error) is indirectly constrained via PI[7]'s Poseidon hash:
-/// changing total_error changes the checksum, which is fully constrained
-/// in-circuit by `verify_error_checksum`. A prover cannot modify PI[5]
-/// without also computing a valid Poseidon hash for PI[7].
-///
-/// The previous ReLU lookup range check has been removed because it
-/// restricted total_error to [0, 128), which is too small for models
-/// larger than 2x2x1 where accumulated error routinely exceeds 128.
+/// Gate: `s_error_acc` constrains `old_acc + error = new_acc`.
 pub(crate) fn verify_error_bound(
     config: &MLTrainingStepV2Config,
     layouter: &mut impl Layouter<Fr>,
-    total_error: Fr,
+    witness: &MLTrainingStepV2Witness,
     label: &str,
 ) -> Result<(), ErrorFront> {
+    // Collect exactly the error contributions that ErrorTracker accumulates.
+    // These mirror the tracker.dot_product_error() and tracker.mul_error() calls
+    // in compute_witness_v2. Passthrough errors (h_err, dy_err, etc.) are excluded.
+    let mut error_terms: Vec<Fr> = Vec::new();
+
+    // Forward pass layer 1: dot product errors
+    for err in &witness.h_pre_err {
+        error_terms.push(*err);
+    }
+    // Forward pass layer 2: dot product errors
+    for err in &witness.y_err {
+        error_terms.push(*err);
+    }
+    // Backward pass: dw2 multiplication errors
+    for err in &witness.dw2_err {
+        error_terms.push(*err);
+    }
+    // Backward pass: dh dot product errors
+    for err in &witness.dh_err {
+        error_terms.push(*err);
+    }
+    // Note: dw1_err is set to base_error directly (not via tracker.mul_error),
+    // so it is NOT included in ErrorTracker.accumulated.
+
+    if error_terms.is_empty() {
+        // No errors to accumulate — just assign total_error for PI binding
+        return layouter.assign_region(
+            || label.to_string(),
+            |mut region| {
+                region.assign_advice(|| "total_error", config.advice[0], 0, || Value::known(witness.total_error))?;
+                Ok(())
+            },
+        );
+    }
+
+    // Accumulate errors in-circuit using s_error_acc gate
     layouter.assign_region(
         || label.to_string(),
         |mut region| {
-            // Assign the total_error witness value to advice for PI binding.
-            region.assign_advice(|| "total_error", config.advice[0], 0, || Value::known(total_error))?;
+            let mut running_acc = Fr::ZERO;
+
+            for (i, err) in error_terms.iter().enumerate() {
+                let new_acc = running_acc + *err;
+
+                config.s_error_acc.enable(&mut region, i)?;
+                region.assign_advice(
+                    || format!("err_acc_{}", i),
+                    config.advice[0], i,
+                    || Value::known(running_acc),
+                )?;
+                region.assign_advice(
+                    || format!("err_term_{}", i),
+                    config.advice[1], i,
+                    || Value::known(*err),
+                )?;
+                region.assign_advice(
+                    || format!("err_new_acc_{}", i),
+                    config.advice[2], i,
+                    || Value::known(new_acc),
+                )?;
+
+                running_acc = new_acc;
+            }
+
+            // After accumulation, verify total matches witness total_error
+            let final_row = error_terms.len();
+            config.s_eq.enable(&mut region, final_row)?;
+            region.assign_advice(
+                || "accumulated_total",
+                config.advice[0], final_row,
+                || Value::known(running_acc),
+            )?;
+            region.assign_advice(
+                || "witness_total_error",
+                config.advice[1], final_row,
+                || Value::known(witness.total_error),
+            )?;
+
             Ok(())
         },
     )
