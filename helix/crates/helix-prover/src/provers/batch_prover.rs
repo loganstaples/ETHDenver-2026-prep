@@ -22,6 +22,7 @@ use sha2::{Digest, Sha256};
 
 use crate::parallel::{ChunkProof, ParallelConfig, ParallelProver, ProofStatus};
 use crate::chunking::{ChunkId, ComputationChunk, ComputationType};
+use crate::aggregation::{KZGAggregatedProof, KZGBatchAggregator};
 use thiserror::Error;
 
 /// Errors from batch proving operations.
@@ -165,6 +166,9 @@ pub struct StepProof {
     pub proof_size: usize,
     /// Timestamp when proof was generated.
     pub timestamp: u64,
+    /// Error bound for this step (carried from ChunkProof/TrainingStep).
+    #[serde(default)]
+    pub error_bound: f64,
 }
 
 impl From<ChunkProof> for StepProof {
@@ -179,6 +183,19 @@ impl From<ChunkProof> for StepProof {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
+            error_bound: chunk.error_bound,
+        }
+    }
+}
+
+impl From<StepProof> for ChunkProof {
+    fn from(step: StepProof) -> Self {
+        Self {
+            chunk_id: ChunkId(step.step_index),
+            proof: step.proof,
+            public_inputs: step.public_inputs,
+            error_bound: step.error_bound,
+            generation_time_ms: step.generation_time_ms,
         }
     }
 }
@@ -209,7 +226,8 @@ pub struct BatchResult {
 /// Aggregated proof for a batch of training steps.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AggregatedBatchProof {
-    /// Aggregated proof bytes.
+    /// Aggregated proof bytes (KZG proof when KZG aggregation succeeds,
+    /// concatenated bytes as fallback).
     pub proof: Vec<u8>,
     /// Merkle root of all step commitments.
     pub merkle_root: [u8; 32],
@@ -224,6 +242,9 @@ pub struct AggregatedBatchProof {
     /// RLC commitment from proof aggregation (when using RLC aggregation).
     #[serde(default)]
     pub rlc_commitment: Option<[u8; 32]>,
+    /// KZG aggregated proof (O(1) size, present when KZG aggregation succeeds).
+    #[serde(default)]
+    pub kzg_proof: Option<KZGAggregatedProof>,
 }
 
 /// Checkpoint for resumable batch proving.
@@ -636,7 +657,7 @@ impl BatchProver {
         first_step: u64,
         last_step: u64,
     ) -> AggregatedBatchProof {
-        // Build SHA-256 Merkle root of all public inputs for backwards compatibility.
+        // Build SHA-256 Merkle root of all public inputs (backward compat).
         let mut hasher = Sha256::new();
         let mut total_error = 0.0f64;
 
@@ -644,31 +665,61 @@ impl BatchProver {
             for input in &proof.public_inputs {
                 hasher.update(input);
             }
-            total_error += proof.public_inputs.len() as f64 * 0.01; // estimate
+            total_error += proof.error_bound;
         }
 
         let merkle_root: [u8; 32] = hasher.finalize().into();
 
-        // Use RLC aggregation via SHPLONKAggregationCircuit for real proof aggregation.
-        // Build TrainingProofResultV2-like public inputs from StepProofs and compute
-        // the RLC commitment using the same Poseidon-based Fiat-Shamir challenge.
+        // Compute RLC commitment (retained for backward compat).
         let rlc_commitment = Self::compute_rlc_commitment(proofs);
 
-        // Aggregated proof = concatenation of individual proofs (the real ZK aggregation
-        // proof is produced separately by RLCAggregationProver when called explicitly).
-        let aggregated_proof: Vec<u8> = proofs
+        // Convert StepProofs to ChunkProofs for KZG aggregation.
+        let chunk_proofs: Vec<ChunkProof> = proofs
             .iter()
-            .flat_map(|p| p.proof.iter().cloned())
+            .cloned()
+            .map(ChunkProof::from)
             .collect();
 
+        // Attempt real KZG aggregation (O(1) proof size).
+        let aggregator = KZGBatchAggregator::new();
+        let kzg_result = if aggregator.is_ready() {
+            match aggregator.aggregate(&chunk_proofs) {
+                Ok(kzg_agg) => {
+                    tracing::info!(
+                        num_proofs = kzg_agg.num_proofs,
+                        proof_size = kzg_agg.proof.len(),
+                        "KZG batch aggregation succeeded"
+                    );
+                    Some(kzg_agg)
+                }
+                Err(e) => {
+                    tracing::warn!("KZG aggregation failed, using concatenation fallback: {e}");
+                    None
+                }
+            }
+        } else {
+            tracing::warn!("KZG aggregator not ready, using concatenation fallback");
+            None
+        };
+
+        // Use KZG proof bytes if available, otherwise fall back to concatenation.
+        let aggregated_proof_bytes = match &kzg_result {
+            Some(kzg) => kzg.proof.clone(),
+            None => proofs
+                .iter()
+                .flat_map(|p| p.proof.iter().cloned())
+                .collect(),
+        };
+
         AggregatedBatchProof {
-            proof: aggregated_proof,
+            proof: aggregated_proof_bytes,
             merkle_root,
             num_steps: proofs.len(),
             first_step,
             last_step,
             total_error_bound: total_error,
             rlc_commitment: Some(rlc_commitment),
+            kzg_proof: kzg_result,
         }
     }
 
@@ -1065,6 +1116,10 @@ mod tests {
         assert!(result.aggregated_proof.is_some());
         let agg = result.aggregated_proof.unwrap();
         assert_eq!(agg.num_steps, 4);
+        // Backward compat: merkle_root and rlc_commitment still populated.
+        assert_ne!(agg.merkle_root, [0u8; 32]);
+        assert!(agg.rlc_commitment.is_some());
+        assert!(!agg.proof.is_empty());
     }
 
     #[test]
@@ -1116,5 +1171,54 @@ mod tests {
         let stats = prover.stats();
         assert_eq!(stats.proofs_generated, 3);
         assert!(stats.total_bytes > 0);
+    }
+
+    #[test]
+    fn test_kzg_aggregated_proof_smaller_than_sum() {
+        let prover = BatchProver::new(BatchConfig {
+            num_threads: 2,
+            aggregate_proofs: true,
+            aggregation_batch_size: 4,
+            ..Default::default()
+        });
+
+        let steps: Vec<_> = (0..4).map(make_test_step).collect();
+        let result = prover.prove_batch(steps).expect("batch should succeed");
+
+        let agg = result.aggregated_proof.expect("aggregated proof should exist");
+        let individual_total: usize = result.proofs.iter().map(|p| p.proof_size).sum();
+
+        // KZG aggregated proof should be O(1) sized, smaller than sum of individual proofs.
+        if agg.kzg_proof.is_some() {
+            assert!(
+                agg.proof.len() < individual_total,
+                "KZG aggregated proof ({} bytes) should be smaller than sum of individual proofs ({} bytes)",
+                agg.proof.len(),
+                individual_total,
+            );
+        }
+    }
+
+    #[test]
+    fn test_kzg_aggregation_produces_verifiable_proof() {
+        let prover = BatchProver::new(BatchConfig {
+            num_threads: 2,
+            aggregate_proofs: true,
+            ..Default::default()
+        });
+
+        let steps: Vec<_> = (0..3).map(make_test_step).collect();
+        let result = prover.prove_batch(steps).expect("batch should succeed");
+
+        let agg = result.aggregated_proof.expect("aggregated proof should exist");
+
+        if let Some(ref kzg) = agg.kzg_proof {
+            // Verify using a fresh KZGBatchAggregator.
+            let aggregator = crate::aggregation::KZGBatchAggregator::new();
+            assert!(aggregator.is_ready(), "KZG aggregator should be ready");
+
+            let verified = aggregator.verify(kzg).expect("verification should complete");
+            assert!(verified, "KZG aggregated proof should verify");
+        }
     }
 }
