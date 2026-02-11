@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 
+use crate::field::Fr;
 use crate::types::PartyId;
 
 /// Abstract representation of a secret share.
@@ -24,8 +25,10 @@ pub struct AbstractShare {
 /// Symbolic value for formal reasoning.
 #[derive(Debug, Clone)]
 pub enum SymbolicValue {
-    /// Concrete value.
+    /// Concrete f64 value (for legacy/display).
     Concrete(f64),
+    /// Field element value (exact BN254 scalar).
+    FieldElement(Fr),
     /// Symbolic variable.
     Variable(String),
     /// Sum of values.
@@ -42,6 +45,11 @@ impl SymbolicValue {
         Self::Variable(name.into())
     }
 
+    /// Creates a field element value.
+    pub fn field(value: Fr) -> Self {
+        Self::FieldElement(value)
+    }
+
     /// Creates a sum.
     pub fn sum(values: Vec<SymbolicValue>) -> Self {
         Self::Sum(values)
@@ -52,10 +60,11 @@ impl SymbolicValue {
         Self::Product(values)
     }
 
-    /// Evaluates if all values are concrete.
+    /// Evaluates if all values are concrete (f64 or Fr → f64).
     pub fn evaluate(&self) -> Option<f64> {
         match self {
             Self::Concrete(v) => Some(*v),
+            Self::FieldElement(fr) => Some(fr.to_f64()),
             Self::Variable(_) | Self::Random(_) => None,
             Self::Sum(vals) => {
                 let mut sum = 0.0;
@@ -74,10 +83,33 @@ impl SymbolicValue {
         }
     }
 
+    /// Evaluates as Fr if all values are field elements.
+    pub fn evaluate_fr(&self) -> Option<Fr> {
+        match self {
+            Self::FieldElement(fr) => Some(fr.clone()),
+            Self::Concrete(v) => Some(Fr::from_f64(*v)),
+            Self::Variable(_) | Self::Random(_) => None,
+            Self::Sum(vals) => {
+                let mut sum = Fr::ZERO;
+                for v in vals {
+                    sum = Fr::add(&sum, &v.evaluate_fr()?);
+                }
+                Some(sum)
+            }
+            Self::Product(vals) => {
+                let mut prod = Fr::from_u64(1); // Multiplicative identity in the field.
+                for v in vals {
+                    prod = Fr::mul(&prod, &v.evaluate_fr()?);
+                }
+                Some(prod)
+            }
+        }
+    }
+
     /// Returns all variables in expression.
     pub fn variables(&self) -> Vec<String> {
         match self {
-            Self::Concrete(_) | Self::Random(_) => Vec::new(),
+            Self::Concrete(_) | Self::FieldElement(_) | Self::Random(_) => Vec::new(),
             Self::Variable(v) => vec![v.clone()],
             Self::Sum(vals) | Self::Product(vals) => {
                 vals.iter().flat_map(|v| v.variables()).collect()
@@ -553,6 +585,44 @@ mod tests {
         let var = SymbolicValue::var("x");
         assert!(var.evaluate().is_none());
         assert_eq!(var.variables(), vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn test_symbolic_field_element() {
+        let fr_val = Fr::from_f64(42.0);
+        let sv = SymbolicValue::field(fr_val.clone());
+
+        // evaluate() returns f64 approximation.
+        let eval = sv.evaluate().unwrap();
+        assert!((eval - 42.0).abs() < 1e-6);
+
+        // evaluate_fr() returns exact Fr.
+        let fr_eval = sv.evaluate_fr().unwrap();
+        assert!(fr_eval.ct_eq(&fr_val).to_bool());
+
+        // Field elements have no variables.
+        assert!(sv.variables().is_empty());
+    }
+
+    #[test]
+    fn test_symbolic_fr_arithmetic() {
+        let a = SymbolicValue::field(Fr::from_f64(3.0));
+        let b = SymbolicValue::field(Fr::from_f64(4.0));
+
+        // Sum uses Fr::add which is correct for additive shares.
+        let sum = SymbolicValue::sum(vec![a.clone(), b.clone()]);
+        let sum_fr = sum.evaluate_fr().unwrap();
+        assert!(sum_fr.ct_eq(&Fr::from_f64(7.0)).to_bool());
+
+        // Product uses raw Fr::mul — correct for abstract field arithmetic
+        // (e.g., MAC computations: alpha * x). For fixed-point neural network
+        // values, fixed_mul should be used instead.
+        // Here we test with raw field elements (not fixed-point encoded).
+        let raw_a = SymbolicValue::field(Fr::from_u64(3));
+        let raw_b = SymbolicValue::field(Fr::from_u64(4));
+        let prod = SymbolicValue::product(vec![raw_a, raw_b]);
+        let prod_fr = prod.evaluate_fr().unwrap();
+        assert!(prod_fr.ct_eq(&Fr::from_u64(12)).to_bool());
     }
 
     #[test]

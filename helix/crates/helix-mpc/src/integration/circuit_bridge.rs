@@ -183,13 +183,58 @@ impl CircuitBridge {
         &self.config
     }
 
+    /// Validates that all witness values are within acceptable magnitude bounds.
+    ///
+    /// Out-of-range Fr values silently produce invalid proofs. This check
+    /// catches them early with a clear error.
+    ///
+    /// `max_magnitude`: maximum absolute value allowed for any witness element
+    /// (in the f64 domain, before fixed-point encoding).
+    pub fn validate_witness_precision(
+        witness: &ReconstructedWitness,
+        max_magnitude: f64,
+    ) -> MPCResult<()> {
+        let check = |values: &[Fr], label: &str| -> MPCResult<()> {
+            for (i, v) in values.iter().enumerate() {
+                let val = v.to_f64();
+                if val.abs() > max_magnitude {
+                    return Err(MPCError::ErrorBoundExceeded {
+                        computed: val.abs(),
+                        maximum: max_magnitude,
+                    });
+                }
+                if val.is_nan() || val.is_infinite() {
+                    return Err(MPCError::ProtocolError(format!(
+                        "{} element {} is NaN or infinite",
+                        label, i,
+                    )));
+                }
+            }
+            Ok(())
+        };
+
+        check(&witness.w1, "w1")?;
+        check(&witness.b1, "b1")?;
+        check(&witness.w2, "w2")?;
+        check(&witness.b2, "b2")?;
+        check(&witness.w1_new, "w1_new")?;
+        check(&witness.b1_new, "b1_new")?;
+        check(&witness.w2_new, "w2_new")?;
+        check(&witness.b2_new, "b2_new")?;
+        check(&witness.input, "input")?;
+        check(&witness.target, "target")?;
+
+        Ok(())
+    }
+
     /// Generates a real Halo2 proof from a reconstructed MPC witness.
     ///
     /// This is the main proof generation function. It:
-    /// 1. Converts the MPC witness to circuit format
-    /// 2. Computes state hashes
-    /// 3. Generates the actual Halo2 KZG proof
-    /// 4. Returns the proof with all necessary metadata
+    /// 1. Validates witness precision bounds
+    /// 2. Converts the MPC witness to circuit format
+    /// 3. Computes state hashes
+    /// 4. Generates the actual Halo2 KZG proof
+    /// 5. Returns the proof with all necessary metadata
     #[instrument(skip(self, witness), level = "info", fields(
         d_in = self.config.d_in,
         d_hid = self.config.d_hid,
@@ -197,6 +242,10 @@ impl CircuitBridge {
         step = witness.step_number,
     ))]
     pub fn prove(&self, witness: &ReconstructedWitness) -> MPCResult<Halo2ProofResult> {
+        // Validate witness values are within bounds before attempting proof generation.
+        // The fixed-point encoding uses 2^64 scaling, so values beyond ~1e18 overflow.
+        // We use a conservative bound.
+        Self::validate_witness_precision(witness, 1e15)?;
         let start = Instant::now();
 
         debug!(
@@ -764,5 +813,36 @@ mod tests {
         for result in &results {
             assert!(bridge.verify(result).unwrap());
         }
+    }
+
+    #[test]
+    fn test_validate_witness_precision_ok() {
+        let witness = create_test_witness();
+        // All values are small (< 1.0), so 1e15 bound should pass easily.
+        assert!(CircuitBridge::validate_witness_precision(&witness, 1e15).is_ok());
+    }
+
+    #[test]
+    fn test_validate_witness_precision_rejects_large_values() {
+        let mut witness = create_test_witness();
+        // Inject an out-of-range value into w1.
+        witness.w1[0] = Fr::from_f64(1e16);
+
+        let result = CircuitBridge::validate_witness_precision(&witness, 1e15);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            MPCError::ErrorBoundExceeded { computed, maximum } => {
+                assert!(computed > maximum);
+            }
+            other => panic!("Expected ErrorBoundExceeded, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_validate_witness_precision_tight_bound() {
+        let witness = create_test_witness();
+        // Values are ~0.01-1.0, so a bound of 0.001 should fail.
+        let result = CircuitBridge::validate_witness_precision(&witness, 0.001);
+        assert!(result.is_err());
     }
 }

@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::RwLock;
 
+use crate::field::Fr;
 use crate::types::PartyId;
 
 /// A protocol invariant that can be checked.
@@ -47,12 +48,12 @@ pub struct InvariantContext {
 /// Per-party state for invariant checking.
 #[derive(Debug, Default, Clone)]
 pub struct PartyInvariantState {
-    /// Share values (for sum checking).
-    pub shares: Vec<f64>,
+    /// Share values (for sum checking) — field elements.
+    pub shares: Vec<Fr>,
     /// Commitment values.
     pub commitments: Vec<[u8; 32]>,
-    /// MAC values.
-    pub macs: Vec<f64>,
+    /// MAC values — field elements.
+    pub macs: Vec<Fr>,
     /// Party is active.
     pub active: bool,
     /// Messages sent count.
@@ -139,8 +140,8 @@ impl fmt::Display for InvariantViolation {
 pub struct ShareSumInvariant {
     /// Invariant ID.
     pub id: String,
-    /// Tolerance for numerical comparison.
-    pub tolerance: f64,
+    /// Expected secret (Fr field element).
+    pub expected_secret: Option<Fr>,
 }
 
 impl ShareSumInvariant {
@@ -148,13 +149,13 @@ impl ShareSumInvariant {
     pub fn new(id: impl Into<String>) -> Self {
         Self {
             id: id.into(),
-            tolerance: 1e-10,
+            expected_secret: None,
         }
     }
 
-    /// Sets tolerance.
-    pub fn with_tolerance(mut self, tolerance: f64) -> Self {
-        self.tolerance = tolerance;
+    /// Sets the expected secret value for checking.
+    pub fn with_expected(mut self, secret: Fr) -> Self {
+        self.expected_secret = Some(secret);
         self
     }
 }
@@ -169,32 +170,29 @@ impl ProtocolInvariant for ShareSumInvariant {
     }
 
     fn check(&self, context: &InvariantContext) -> Result<(), InvariantViolation> {
-        // Get expected secret from global state.
-        let expected = context.global_state.get("expected_secret").copied();
+        let expected = match &self.expected_secret {
+            Some(v) => v,
+            None => return Ok(()), // No secret to check against.
+        };
 
-        if expected.is_none() {
-            return Ok(()); // No secret to check against.
-        }
-
-        let expected = expected.unwrap();
-
-        // Sum all party shares.
-        let mut share_sums: HashMap<usize, f64> = HashMap::new();
+        // Sum all party shares at each position.
+        let mut share_sums: HashMap<usize, Fr> = HashMap::new();
 
         for state in context.party_state.values() {
-            for (i, &share) in state.shares.iter().enumerate() {
-                *share_sums.entry(i).or_insert(0.0) += share;
+            for (i, share) in state.shares.iter().enumerate() {
+                let entry = share_sums.entry(i).or_insert(Fr::ZERO);
+                *entry = Fr::add(entry, share);
             }
         }
 
-        // Check each position.
+        // Check each position using exact Fr comparison.
         for (i, sum) in share_sums {
-            if (sum - expected).abs() > self.tolerance {
+            if !sum.ct_eq(expected).to_bool() {
                 return Err(InvariantViolation {
                     invariant_id: self.id.clone(),
                     description: format!("Share sum at position {} incorrect", i),
-                    expected: Some(format!("{:.6}", expected)),
-                    actual: Some(format!("{:.6}", sum)),
+                    expected: Some(format!("{}", expected.to_f64())),
+                    actual: Some(format!("{}", sum.to_f64())),
                     context: ViolationContext {
                         phase: context.phase.clone(),
                         step: context.step,
@@ -213,23 +211,21 @@ impl ProtocolInvariant for ShareSumInvariant {
 }
 
 /// MAC consistency invariant: MACs must verify.
+/// Uses exact Fr field arithmetic: mac_i = alpha * share_i.
 #[derive(Debug)]
 pub struct MACConsistencyInvariant {
     /// Invariant ID.
     pub id: String,
-    /// Global MAC key (sum of party key shares).
-    pub alpha: f64,
-    /// Tolerance.
-    pub tolerance: f64,
+    /// Global MAC key (sum of party key shares) as Fr.
+    pub alpha: Fr,
 }
 
 impl MACConsistencyInvariant {
     /// Creates a new MAC consistency invariant.
-    pub fn new(id: impl Into<String>, alpha: f64) -> Self {
+    pub fn new(id: impl Into<String>, alpha: Fr) -> Self {
         Self {
             id: id.into(),
             alpha,
-            tolerance: 1e-6,
         }
     }
 }
@@ -259,14 +255,14 @@ impl ProtocolInvariant for MACConsistencyInvariant {
                 });
             }
 
-            for (i, (&share, &mac)) in state.shares.iter().zip(state.macs.iter()).enumerate() {
-                let expected_mac = self.alpha * share;
-                if (mac - expected_mac).abs() > self.tolerance {
+            for (i, (share, mac)) in state.shares.iter().zip(state.macs.iter()).enumerate() {
+                let expected_mac = Fr::mul(&self.alpha, share);
+                if !mac.ct_eq(&expected_mac).to_bool() {
                     return Err(InvariantViolation {
                         invariant_id: self.id.clone(),
                         description: format!("MAC verification failed at position {}", i),
-                        expected: Some(format!("{:.6}", expected_mac)),
-                        actual: Some(format!("{:.6}", mac)),
+                        expected: Some(format!("{}", expected_mac.to_f64())),
+                        actual: Some(format!("{}", mac.to_f64())),
                         context: ViolationContext {
                             phase: context.phase.clone(),
                             step: context.step,
@@ -281,13 +277,15 @@ impl ProtocolInvariant for MACConsistencyInvariant {
     }
 }
 
-/// Beaver triple invariant: a * b = c.
+/// Beaver triple invariant: a * b = c (exact Fr check).
 #[derive(Debug)]
 pub struct BeaverTripleInvariant {
     /// Invariant ID.
     pub id: String,
-    /// Tolerance.
-    pub tolerance: f64,
+    /// Triples to check: (a, b, c) where a * b must equal c.
+    pub triples: Vec<(Fr, Fr, Fr)>,
+    /// Whether to use fixed_mul (for fixed-point encoded values).
+    pub use_fixed_mul: bool,
 }
 
 impl BeaverTripleInvariant {
@@ -295,8 +293,21 @@ impl BeaverTripleInvariant {
     pub fn new(id: impl Into<String>) -> Self {
         Self {
             id: id.into(),
-            tolerance: 1e-10,
+            triples: Vec::new(),
+            use_fixed_mul: false,
         }
+    }
+
+    /// Adds a triple to check.
+    pub fn with_triple(mut self, a: Fr, b: Fr, c: Fr) -> Self {
+        self.triples.push((a, b, c));
+        self
+    }
+
+    /// Use fixed-point multiplication (for TrustedDealer triples).
+    pub fn with_fixed_mul(mut self) -> Self {
+        self.use_fixed_mul = true;
+        self
     }
 }
 
@@ -310,29 +321,25 @@ impl ProtocolInvariant for BeaverTripleInvariant {
     }
 
     fn check(&self, context: &InvariantContext) -> Result<(), InvariantViolation> {
-        // Check triples stored in global state.
-        let triple_count = context.global_state.get("triple_count").copied().unwrap_or(0.0) as usize;
+        for (i, (a, b, c)) in self.triples.iter().enumerate() {
+            let expected_c = if self.use_fixed_mul {
+                a.fixed_mul(b)
+            } else {
+                Fr::mul(a, b)
+            };
 
-        for i in 0..triple_count {
-            let a = context.global_state.get(&format!("triple_{}_a", i));
-            let b = context.global_state.get(&format!("triple_{}_b", i));
-            let c = context.global_state.get(&format!("triple_{}_c", i));
-
-            if let (Some(&a), Some(&b), Some(&c)) = (a, b, c) {
-                let expected_c = a * b;
-                if (c - expected_c).abs() > self.tolerance {
-                    return Err(InvariantViolation {
-                        invariant_id: self.id.clone(),
-                        description: format!("Triple {} fails a*b=c", i),
-                        expected: Some(format!("{:.6}", expected_c)),
-                        actual: Some(format!("{:.6}", c)),
-                        context: ViolationContext {
-                            phase: context.phase.clone(),
-                            step: context.step,
-                            party: None,
-                        },
-                    });
-                }
+            if !c.ct_eq(&expected_c).to_bool() {
+                return Err(InvariantViolation {
+                    invariant_id: self.id.clone(),
+                    description: format!("Triple {} fails a*b=c", i),
+                    expected: Some(format!("{}", expected_c.to_f64())),
+                    actual: Some(format!("{}", c.to_f64())),
+                    context: ViolationContext {
+                        phase: context.phase.clone(),
+                        step: context.step,
+                        party: None,
+                    },
+                });
             }
         }
 
@@ -568,16 +575,21 @@ mod tests {
 
     #[test]
     fn test_share_sum_invariant() {
-        let invariant = ShareSumInvariant::new("test_share_sum");
+        let secret = Fr::from_f64(10.0);
+        let invariant = ShareSumInvariant::new("test_share_sum")
+            .with_expected(secret.clone());
 
         let mut context = InvariantContext::new("computation", 1);
-        context.set_global("expected_secret", 10.0);
 
         // Add three parties whose shares sum to 10.
+        let s0 = Fr::from_f64(3.0);
+        let s1 = Fr::from_f64(4.0);
+        let s2 = Fr::sub(&secret, &Fr::add(&s0, &s1));
+
         context.add_party(
             PartyId::from_index(0),
             PartyInvariantState {
-                shares: vec![3.0],
+                shares: vec![s0],
                 active: true,
                 ..Default::default()
             },
@@ -585,7 +597,7 @@ mod tests {
         context.add_party(
             PartyId::from_index(1),
             PartyInvariantState {
-                shares: vec![4.0],
+                shares: vec![s1],
                 active: true,
                 ..Default::default()
             },
@@ -593,7 +605,7 @@ mod tests {
         context.add_party(
             PartyId::from_index(2),
             PartyInvariantState {
-                shares: vec![3.0],
+                shares: vec![s2],
                 active: true,
                 ..Default::default()
             },
@@ -602,22 +614,26 @@ mod tests {
         assert!(invariant.check(&context).is_ok());
 
         // Now break it.
-        context.party_state.get_mut(&PartyId::from_index(2)).unwrap().shares = vec![5.0];
+        context.party_state.get_mut(&PartyId::from_index(2)).unwrap().shares = vec![Fr::from_f64(5.0)];
         assert!(invariant.check(&context).is_err());
     }
 
     #[test]
     fn test_mac_consistency_invariant() {
-        let invariant = MACConsistencyInvariant::new("test_mac", 5.0);
+        let alpha = Fr::from_f64(5.0);
+        let invariant = MACConsistencyInvariant::new("test_mac", alpha.clone());
 
         let mut context = InvariantContext::new("computation", 1);
 
-        // Valid MACs.
+        let s0 = Fr::from_f64(2.0);
+        let s1 = Fr::from_f64(3.0);
+
+        // Valid MACs: alpha * share.
         context.add_party(
             PartyId::from_index(0),
             PartyInvariantState {
-                shares: vec![2.0, 3.0],
-                macs: vec![10.0, 15.0], // 5.0 * share
+                shares: vec![s0.clone(), s1.clone()],
+                macs: vec![Fr::mul(&alpha, &s0), Fr::mul(&alpha, &s1)],
                 active: true,
                 ..Default::default()
             },
@@ -626,28 +642,30 @@ mod tests {
         assert!(invariant.check(&context).is_ok());
 
         // Invalid MAC.
-        context.party_state.get_mut(&PartyId::from_index(0)).unwrap().macs[1] = 14.0;
+        context.party_state.get_mut(&PartyId::from_index(0)).unwrap().macs[1] = Fr::from_f64(14.0);
         assert!(invariant.check(&context).is_err());
     }
 
     #[test]
     fn test_beaver_triple_invariant() {
-        let invariant = BeaverTripleInvariant::new("test_beaver");
+        let a1 = Fr::from_f64(3.0);
+        let b1 = Fr::from_f64(4.0);
+        let c1 = Fr::mul(&a1, &b1);
+        let a2 = Fr::from_f64(5.0);
+        let b2 = Fr::from_f64(6.0);
+        let c2 = Fr::mul(&a2, &b2);
 
-        let mut context = InvariantContext::new("preprocessing", 0);
-        context.set_global("triple_count", 2.0);
-        context.set_global("triple_0_a", 3.0);
-        context.set_global("triple_0_b", 4.0);
-        context.set_global("triple_0_c", 12.0);
-        context.set_global("triple_1_a", 5.0);
-        context.set_global("triple_1_b", 6.0);
-        context.set_global("triple_1_c", 30.0);
+        let invariant = BeaverTripleInvariant::new("test_beaver")
+            .with_triple(a1, b1, c1)
+            .with_triple(a2.clone(), b2.clone(), c2);
 
+        let context = InvariantContext::new("preprocessing", 0);
         assert!(invariant.check(&context).is_ok());
 
         // Break triple 1.
-        context.set_global("triple_1_c", 31.0);
-        assert!(invariant.check(&context).is_err());
+        let bad = BeaverTripleInvariant::new("test_beaver_bad")
+            .with_triple(a2, b2, Fr::from_f64(31.0));
+        assert!(bad.check(&context).is_err());
     }
 
     #[test]
@@ -673,18 +691,21 @@ mod tests {
 
     #[test]
     fn test_runtime_checker() {
+        let secret = Fr::from_f64(10.0);
         let mut checker = RuntimeInvariantChecker::new(true);
-        checker.add(ShareSumInvariant::new("share_sum").with_tolerance(0.1));
+        checker.add(ShareSumInvariant::new("share_sum").with_expected(secret.clone()));
 
         checker.set_phase("computation");
         checker.advance_step();
 
+        let s0 = Fr::from_f64(5.0);
+        let s1 = Fr::sub(&secret, &s0);
+
         let violations = checker.check(|ctx| {
-            ctx.set_global("expected_secret", 10.0);
             ctx.add_party(
                 PartyId::from_index(0),
                 PartyInvariantState {
-                    shares: vec![5.0],
+                    shares: vec![s0.clone()],
                     active: true,
                     ..Default::default()
                 },
@@ -692,7 +713,7 @@ mod tests {
             ctx.add_party(
                 PartyId::from_index(1),
                 PartyInvariantState {
-                    shares: vec![5.0],
+                    shares: vec![s1.clone()],
                     active: true,
                     ..Default::default()
                 },

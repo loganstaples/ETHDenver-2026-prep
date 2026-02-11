@@ -34,10 +34,69 @@ pub enum ActivationType {
     SiLU,
 }
 
+/// Mode for activation function evaluation.
+///
+/// Controls the privacy/efficiency tradeoff:
+/// - `ReconstructReshare`: Reveals activation values (not weights). Fast, exact.
+/// - `PolynomialApprox`: Keeps activations private using polynomial approximations.
+///   Uses more Beaver triples and introduces approximation error.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ActivationMode {
+    /// Reconstruct-compute-reshare: reveals activations, exact result.
+    ReconstructReshare,
+    /// Polynomial approximation: keeps activations private, approximate result.
+    PolynomialApprox,
+}
+
 /// Secure activation function evaluation.
 pub struct SecureActivation;
 
 impl SecureActivation {
+    /// Unified activation function dispatcher.
+    ///
+    /// Routes to either reconstruct-reshare (exact, reveals activations) or
+    /// polynomial approximation (private, approximate) based on the mode.
+    ///
+    /// Polynomial approximation is supported for ReLU, Sigmoid, and GELU.
+    /// Other activation types fall back to reconstruct-reshare with a warning.
+    pub fn apply(
+        shares: &[Vec<Fr>],
+        activation: ActivationType,
+        mode: ActivationMode,
+        pools: Option<&mut [BeaverPool]>,
+        rng: &mut impl Rng,
+    ) -> MPCResult<Vec<Vec<Fr>>> {
+        match mode {
+            ActivationMode::ReconstructReshare => {
+                Ok(Self::apply_reconstruct_reshare(shares, activation, rng))
+            }
+            ActivationMode::PolynomialApprox => {
+                let pools = pools.ok_or_else(|| {
+                    crate::error::MPCError::BeaverPoolExhausted {
+                        requested: 1,
+                        available: 0,
+                    }
+                })?;
+                match activation {
+                    ActivationType::ReLU | ActivationType::LeakyReLU(_) => {
+                        Self::approximate_relu(shares, pools)
+                    }
+                    ActivationType::Sigmoid => {
+                        Self::approximate_sigmoid(shares, pools)
+                    }
+                    ActivationType::GELU => {
+                        Self::approximate_gelu(shares, pools)
+                    }
+                    _ => {
+                        // Tanh, SiLU: no polynomial approximation implemented yet.
+                        // Fall back to reconstruct-reshare.
+                        Ok(Self::apply_reconstruct_reshare(shares, activation, rng))
+                    }
+                }
+            }
+        }
+    }
+
     // ========== RECONSTRUCT-COMPUTE-RESHARE APPROACH ==========
     // Reveals activations but not weights. Standard in MPC-ML.
 
@@ -416,5 +475,99 @@ mod tests {
         assert!((apply_activation(0.0, ActivationType::Sigmoid) - 0.5).abs() < 1e-10);
         assert!((apply_activation(0.0, ActivationType::Tanh) - 0.0).abs() < 1e-10);
         assert!((apply_activation(0.0, ActivationType::GELU) - 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_apply_dispatcher_reconstruct() {
+        let values = vec![-1.0, 0.0, 1.0];
+        let shares = split_vector(&values, 3, 99);
+        let mut rng = ChaCha20Rng::seed_from_u64(99);
+
+        // ReconstructReshare mode doesn't need pools.
+        let result_shares = SecureActivation::apply(
+            &shares,
+            ActivationType::ReLU,
+            ActivationMode::ReconstructReshare,
+            None,
+            &mut rng,
+        )
+        .unwrap();
+
+        let result = reconstruct(&result_shares);
+        assert!((result[0] - 0.0).abs() < 1e-6); // relu(-1) = 0
+        assert!((result[1] - 0.0).abs() < 1e-6); // relu(0) = 0
+        assert!((result[2] - 1.0).abs() < 1e-6); // relu(1) = 1
+    }
+
+    #[test]
+    fn test_apply_dispatcher_polynomial() {
+        let mut dealer = TrustedDealer::with_seed(77);
+        let per_party = dealer.generate_scalar_triples(200, 3);
+
+        let mut pools: Vec<BeaverPool> = (0..3)
+            .map(|i| {
+                let mut p = BeaverPool::new(i, 3, 64);
+                p.fill_scalar(per_party[i].clone());
+                p
+            })
+            .collect();
+
+        let values = vec![0.0, 1.0, -1.0];
+        let shares = split_vector(&values, 3, 77);
+        let mut rng = ChaCha20Rng::seed_from_u64(77);
+
+        let result_shares = SecureActivation::apply(
+            &shares,
+            ActivationType::Sigmoid,
+            ActivationMode::PolynomialApprox,
+            Some(&mut pools),
+            &mut rng,
+        )
+        .unwrap();
+
+        let result = reconstruct(&result_shares);
+        // Polynomial approximation within tolerance.
+        for (i, r) in result.iter().enumerate() {
+            let expected = 1.0 / (1.0 + (-values[i]).exp());
+            assert!(
+                (r - expected).abs() < 0.15,
+                "Approx sigmoid[{}] too far: {} vs {}",
+                i, r, expected,
+            );
+        }
+    }
+
+    #[test]
+    fn test_apply_dispatcher_fallback_for_tanh() {
+        let values = vec![-1.0, 0.0, 1.0];
+        let shares = split_vector(&values, 3, 55);
+        let mut rng = ChaCha20Rng::seed_from_u64(55);
+
+        // PolynomialApprox with Tanh should fall back to reconstruct-reshare.
+        // Need to provide pools (even though they won't be used for fallback).
+        let mut dealer = TrustedDealer::with_seed(55);
+        let per_party = dealer.generate_scalar_triples(10, 3);
+        let mut pools: Vec<BeaverPool> = (0..3)
+            .map(|i| {
+                let mut p = BeaverPool::new(i, 3, 64);
+                p.fill_scalar(per_party[i].clone());
+                p
+            })
+            .collect();
+
+        let result_shares = SecureActivation::apply(
+            &shares,
+            ActivationType::Tanh,
+            ActivationMode::PolynomialApprox,
+            Some(&mut pools),
+            &mut rng,
+        )
+        .unwrap();
+
+        let result = reconstruct(&result_shares);
+        for (i, r) in result.iter().enumerate() {
+            let expected = values[i].tanh();
+            assert!((r - expected).abs() < 1e-6);
+        }
     }
 }

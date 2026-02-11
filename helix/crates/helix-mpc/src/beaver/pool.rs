@@ -82,10 +82,12 @@ impl BeaverPool {
 
     /// Consumes a scalar triple from the pool.
     pub fn take_scalar(&mut self) -> MPCResult<BeaverTriple> {
-        self.scalar_triples.pop().ok_or(MPCError::BeaverPoolExhausted {
+        let triple = self.scalar_triples.pop().ok_or(MPCError::BeaverPoolExhausted {
             requested: 1,
             available: 0,
-        })
+        })?;
+        self.scalar_consumed += 1;
+        Ok(triple)
     }
 
     /// Consumes multiple scalar triples.
@@ -158,6 +160,40 @@ impl BeaverPool {
             scalar_consumed: self.scalar_consumed,
             vector_dims: self.vector_triples.keys().cloned().collect(),
             matrix_dims: self.matrix_triples.keys().cloned().collect(),
+        }
+    }
+
+    /// Splits the pool into `count` sub-pools, distributing scalar triples
+    /// roughly evenly. Used for parallel head computation where each head
+    /// needs its own independent pool.
+    ///
+    /// The original pool is drained of scalar triples.
+    /// Vector and matrix triples remain in the original pool (not split).
+    pub fn split(&mut self, count: usize) -> Vec<BeaverPool> {
+        let total = self.scalar_triples.len();
+        let per_pool = total / count;
+        let remainder = total % count;
+
+        let mut sub_pools = Vec::with_capacity(count);
+        for i in 0..count {
+            let take = if i < remainder { per_pool + 1 } else { per_pool };
+            let start = self.scalar_triples.len() - take;
+            let triples = self.scalar_triples.split_off(start);
+
+            let mut pool = BeaverPool::new(self.party_index, self.num_parties, self.batch_size);
+            pool.fill_scalar(triples);
+            sub_pools.push(pool);
+        }
+
+        sub_pools
+    }
+
+    /// Merges sub-pools back into this pool, recovering all remaining scalar
+    /// triples. Consumption counters are accumulated.
+    pub fn merge(&mut self, sub_pools: Vec<BeaverPool>) {
+        for sub in sub_pools {
+            self.scalar_triples.extend(sub.scalar_triples);
+            self.scalar_consumed += sub.scalar_consumed;
         }
     }
 
@@ -302,6 +338,53 @@ mod tests {
         let t = pool.take_matrix(4, 3, 2).unwrap();
         assert_eq!(t.m, 4);
         assert_eq!(pool.matrix_available(4, 3, 2), 0);
+    }
+
+    #[test]
+    fn test_pool_split_merge() {
+        let mut dealer = TrustedDealer::with_seed(42);
+        let per_party = dealer.generate_scalar_triples(100, 3);
+
+        let mut pool = BeaverPool::new(0, 3, 64);
+        pool.fill_scalar(per_party[0].clone());
+        assert_eq!(pool.scalar_available(), 100);
+
+        // Split into 4 sub-pools.
+        let mut subs = pool.split(4);
+        assert_eq!(subs.len(), 4);
+        assert_eq!(pool.scalar_available(), 0);
+
+        // 100 / 4 = 25 each.
+        let total_in_subs: usize = subs.iter().map(|s| s.scalar_available()).sum();
+        assert_eq!(total_in_subs, 100);
+
+        // Consume some from each sub-pool.
+        for sub in &mut subs {
+            let _ = sub.take_scalar().unwrap();
+        }
+
+        let remaining: usize = subs.iter().map(|s| s.scalar_available()).sum();
+        assert_eq!(remaining, 96);
+
+        // Merge back.
+        pool.merge(subs);
+        assert_eq!(pool.scalar_available(), 96);
+        // Consumed counter should reflect the 4 consumed.
+        assert!(pool.stats().scalar_consumed >= 4);
+    }
+
+    #[test]
+    fn test_pool_split_uneven() {
+        let mut dealer = TrustedDealer::with_seed(42);
+        let per_party = dealer.generate_scalar_triples(7, 3);
+
+        let mut pool = BeaverPool::new(0, 3, 64);
+        pool.fill_scalar(per_party[0].clone());
+
+        // 7 triples split into 3 = [3, 2, 2]
+        let subs = pool.split(3);
+        let total: usize = subs.iter().map(|s| s.scalar_available()).sum();
+        assert_eq!(total, 7);
     }
 
     #[test]
