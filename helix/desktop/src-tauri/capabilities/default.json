@@ -1,0 +1,10 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicedaybrother/tauri-schemas/v2/capability.json",
+  "identifier": "default",
+  "description": "Default capabilities for the HELIX desktop app",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "shell:allow-open"
+  ]
+}
