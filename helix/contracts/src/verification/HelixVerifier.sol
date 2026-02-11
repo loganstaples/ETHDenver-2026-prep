@@ -69,7 +69,7 @@ contract HelixVerifier is IHelixVerifier {
     }
     
     constructor() {
-        owner = msg.sender;
+        revert("DEPRECATED: Use Halo2Verifier instead");
     }
     
     /// @notice Initialize the verification key

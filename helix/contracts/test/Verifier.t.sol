@@ -10,7 +10,6 @@ import "./ProofFixtures.t.sol";
 /// @title VerifierTest
 /// @notice Comprehensive tests for verifier contracts
 contract VerifierTest is Test {
-    HelixVerifier public helixVerifier;
     Halo2Verifier public halo2Verifier;
     MockVerifier public mockVerifier;
 
@@ -19,7 +18,6 @@ contract VerifierTest is Test {
     uint256 constant R = 21888242871839275222246405745257275088548364400416034343698204186575808495617;
 
     function setUp() public {
-        helixVerifier = new HelixVerifier();
         halo2Verifier = new Halo2Verifier(Halo2VKDefaults.g2Generator());
         mockVerifier = new MockVerifier();
     }
@@ -152,105 +150,9 @@ contract VerifierTest is Test {
 
     // ============ HelixVerifier Tests ============
 
-    function test_HelixVerifier_Constructor() public view {
-        assertEq(helixVerifier.owner(), address(this));
-        assertFalse(helixVerifier.initialized());
-    }
-
-    function test_HelixVerifier_Initialize() public {
-        uint256[2] memory selectors = [uint256(1), uint256(2)];
-        uint256[2] memory perms = [uint256(3), uint256(4)];
-        helixVerifier.initialize(selectors, perms, 1024, 12345, 1000);
-
-        assertTrue(helixVerifier.initialized());
-
-        (uint256 domainSize, uint256 maxErrorBound, bool isInit) = helixVerifier.getVerificationKeyInfo();
-        assertEq(domainSize, 1024);
-        assertEq(maxErrorBound, 1000);
-        assertTrue(isInit);
-    }
-
-    function test_HelixVerifier_CannotDoubleInitialize() public {
-        uint256[2] memory selectors = [uint256(1), uint256(2)];
-        uint256[2] memory perms = [uint256(3), uint256(4)];
-        helixVerifier.initialize(selectors, perms, 1024, 12345, 1000);
-
-        vm.expectRevert("Already initialized");
-        helixVerifier.initialize(selectors, perms, 1024, 12345, 1000);
-    }
-
-    function test_HelixVerifier_VerifyRequiresInit() public {
-        bytes memory proof = new bytes(256);
-        uint256[] memory inputs = _createValidPublicInputs();
-
-        vm.expectRevert("Not initialized");
-        helixVerifier.verifyProof(proof, inputs);
-    }
-
-    function test_HelixVerifier_RejectsWrongInputCount() public {
-        uint256[2] memory selectors = [uint256(1), uint256(2)];
-        uint256[2] memory perms = [uint256(3), uint256(4)];
-        helixVerifier.initialize(selectors, perms, 1024, 12345, 1000);
-
-        bytes memory proof = new bytes(256);
-        uint256[] memory inputs = new uint256[](5); // Should be 8
-
-        bool valid = helixVerifier.verifyProof(proof, inputs);
-        assertFalse(valid);
-    }
-
-    function test_HelixVerifier_RejectsShortProof() public {
-        uint256[2] memory selectors = [uint256(1), uint256(2)];
-        uint256[2] memory perms = [uint256(3), uint256(4)];
-        helixVerifier.initialize(selectors, perms, 1024, 12345, 1000);
-
-        bytes memory proof = new bytes(100); // Too short
-        uint256[] memory inputs = _createValidPublicInputs();
-
-        bool valid = helixVerifier.verifyProof(proof, inputs);
-        assertFalse(valid);
-    }
-
-    function test_HelixVerifier_ExceedMaxError() public {
-        uint256[2] memory selectors = [uint256(1), uint256(2)];
-        uint256[2] memory perms = [uint256(3), uint256(4)];
-        helixVerifier.initialize(selectors, perms, 1024, 12345, 100); // Set low max
-
-        bytes memory proof = new bytes(256);
-        uint256[] memory inputs = _createValidPublicInputs();
-        inputs[5] = 200; // Error bound exceeds max
-
-        bool valid = helixVerifier.verifyProof(proof, inputs);
-        assertFalse(valid);
-    }
-
-    function test_HelixVerifier_ReplayPrevention() public {
-        uint256[2] memory selectors = [uint256(1), uint256(2)];
-        uint256[2] memory perms = [uint256(3), uint256(4)];
-        helixVerifier.initialize(selectors, perms, 1024, 12345, 1000);
-
-        bytes memory proof = new bytes(256);
-        uint256[] memory inputs = _createValidPublicInputs();
-
-        bytes32 proofHash = keccak256(proof);
-
-        // After any verification, the hash is recorded
-        helixVerifier.verifyProof(proof, inputs);
-
-        // Check if proof was recorded
-        bool wasVerified = helixVerifier.verifiedProofs(proofHash);
-        // Depending on verification result, this might be true or false
-    }
-
-    function test_HelixVerifier_TransferOwnership() public {
-        address newOwner = makeAddr("newOwner");
-        helixVerifier.transferOwnership(newOwner);
-        assertEq(helixVerifier.owner(), newOwner);
-    }
-
-    function test_HelixVerifier_TransferOwnershipInvalidAddress() public {
-        vm.expectRevert("Invalid address");
-        helixVerifier.transferOwnership(address(0));
+    function test_HelixVerifier_ConstructorReverts_Deprecated() public {
+        vm.expectRevert("DEPRECATED: Use Halo2Verifier instead");
+        new HelixVerifier();
     }
 
     // ============ MockVerifier Tests ============

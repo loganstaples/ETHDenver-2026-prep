@@ -186,25 +186,8 @@ contract Rewards is ReentrancyGuard {
         return baseReward;
     }
     
-    /// @notice Claim all pending rewards across all rounds
-    /// @dev Uses the unified roundClaimed mapping to prevent double-claims
-    function claimRewards() external nonReentrant {
-        ClaimInfo storage info = claimInfo[msg.sender];
-
-        uint256 claimable = info.totalEarned - info.totalClaimed;
-        require(claimable > 0, "No rewards to claim");
-
-        info.totalClaimed += claimable;
-        info.lastClaimTime = block.timestamp;
-
-        helixToken.safeTransfer(msg.sender, claimable);
-
-        emit RewardsClaimed(msg.sender, claimable);
-    }
-    
-    /// @notice Claim rewards for specific rounds
-    /// @dev Uses unified roundClaimed mapping to prevent double-claim across both
-    ///      claimRewards() and claimRoundRewards(). Each round can only be claimed once.
+    /// @notice Claim rewards for specific rounds (single claim path to prevent double-claims)
+    /// @dev Each round can only be claimed once via the roundClaimed mapping.
     function claimRoundRewards(
         uint256[] calldata modelIds,
         uint256[] calldata roundIds
@@ -217,7 +200,7 @@ contract Rewards is ReentrancyGuard {
             uint256 modelId = modelIds[i];
             uint256 roundId = roundIds[i];
 
-            // Skip rounds already claimed via either claim path
+            // Skip rounds already claimed
             if (roundClaimed[modelId][roundId][msg.sender]) {
                 continue;
             }
@@ -233,13 +216,6 @@ contract Rewards is ReentrancyGuard {
         require(totalClaim > 0, "No rewards to claim");
 
         ClaimInfo storage info = claimInfo[msg.sender];
-
-        // Cap transfer to what hasn't already been claimed via claimRewards()
-        uint256 actualClaimable = info.totalEarned - info.totalClaimed;
-        if (totalClaim > actualClaimable) {
-            totalClaim = actualClaimable;
-        }
-        require(totalClaim > 0, "Already claimed");
 
         info.totalClaimed += totalClaim;
         info.lastClaimTime = block.timestamp;

@@ -4,7 +4,6 @@ pragma solidity ^0.8.19;
 import "forge-std/Test.sol";
 import "../src/core/HelixCoordinatorV2.sol";
 import "../src/verification/Halo2Verifier.sol";
-import "../src/verification/HelixVerifier.sol";
 import "../src/mocks/MockVerifier.sol";
 import "./ProofFixtures.t.sol";
 
@@ -14,7 +13,6 @@ import "./ProofFixtures.t.sol";
 contract GasBenchmark is Test {
     HelixCoordinatorV2 public coordinator;
     Halo2Verifier public halo2Verifier;
-    HelixVerifier public helixVerifier;
     MockVerifier public mockVerifier;
 
     address public owner;
@@ -39,7 +37,6 @@ contract GasBenchmark is Test {
         mockVerifier = new MockVerifier();
         coordinator = new HelixCoordinatorV2(address(mockVerifier), treasury);
         halo2Verifier = new Halo2Verifier(Halo2VKDefaults.g2Generator());
-        helixVerifier = new HelixVerifier();
 
         // Fund provers
         vm.deal(prover1, 100 ether);
@@ -50,11 +47,6 @@ contract GasBenchmark is Test {
         // Initial commitment = keccak256(abi.encodePacked(1, 2)) to match _createValidPublicInputs
         uint256 initialCommitment = uint256(keccak256(abi.encodePacked(uint256(1), uint256(2))));
         modelId = coordinator.registerModel("benchmark-model", initialCommitment, 0.1 ether);
-
-        // Initialize HelixVerifier for tests
-        uint256[2] memory selectors = [uint256(1), uint256(2)];
-        uint256[2] memory perms = [uint256(3), uint256(4)];
-        helixVerifier.initialize(selectors, perms, 1024, 12345, 1000);
     }
 
     // ============ Coordinator Operations ============
@@ -243,17 +235,6 @@ contract GasBenchmark is Test {
         emit log_named_uint("Halo2Verifier.verifyAndRecord gas", gasUsed);
     }
 
-    function test_GasBenchmark_HelixVerifyProof() public {
-        bytes memory proof = new bytes(256);
-        uint256[] memory inputs = _createValidPublicInputs();
-
-        uint256 gasBefore = gasleft();
-        helixVerifier.verifyProof(proof, inputs);
-        uint256 gasUsed = gasBefore - gasleft();
-
-        emit log_named_uint("HelixVerifier.verifyProof gas", gasUsed);
-    }
-
     function test_GasBenchmark_MockVerifyProof() public {
         bytes memory proof = new bytes(256);
         uint256[] memory inputs = _createValidPublicInputs();
@@ -289,14 +270,6 @@ contract GasBenchmark is Test {
         uint256 gasUsed = gasBefore - gasleft();
 
         emit log_named_uint("getStake gas", gasUsed);
-    }
-
-    function test_GasBenchmark_VerificationKeyInfo() public {
-        uint256 gasBefore = gasleft();
-        helixVerifier.getVerificationKeyInfo();
-        uint256 gasUsed = gasBefore - gasleft();
-
-        emit log_named_uint("getVerificationKeyInfo gas", gasUsed);
     }
 
     // ============ Comparative Analysis ============

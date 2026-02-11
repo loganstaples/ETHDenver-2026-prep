@@ -163,7 +163,7 @@ contract TrainingDAO is ReentrancyGuard {
         bytes memory callData
     ) public returns (uint256 proposalId) {
         require(
-            votesToken.getVotes(msg.sender) >= govConfig.proposalThreshold,
+            votesToken.getPastVotes(msg.sender, block.number - 1) >= govConfig.proposalThreshold,
             "Below proposal threshold"
         );
 
