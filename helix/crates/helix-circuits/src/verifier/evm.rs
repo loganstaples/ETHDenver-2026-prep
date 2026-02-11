@@ -179,6 +179,25 @@ impl VkData {
 }
 
 /// Solidity verifier generator for Halo2 proofs.
+///
+/// # Limitations
+///
+/// This generator produces two verification modes:
+///
+/// - **Without VK data** (`generate_simple_verify_body`): Only checks that the
+///   output point is on the BN254 curve. This does NOT verify the proof —
+///   any curve point will pass. Use only for testing proof serialization.
+///
+/// - **With VK data** (`generate_full_verify_body`): Implements a simplified
+///   SHPLONK-style KZG pairing check. While structurally correct, it omits
+///   evaluation proof binding and column-specific challenges required for full
+///   Halo2 SHPLONK verification.
+///
+/// # Production Use
+///
+/// For production on-chain verification, use the handwritten `Halo2Verifier.sol`
+/// in `contracts/src/verification/` which implements the complete SHPLONK protocol
+/// with proper transcript replay.
 #[derive(Debug)]
 pub struct SolidityGenerator {
     /// Contract name.
@@ -250,6 +269,10 @@ impl SolidityGenerator {
     }
 
     /// Generates the complete Solidity verifier contract.
+    ///
+    /// For production deployments, prefer the handwritten `Halo2Verifier.sol`
+    /// in `contracts/src/verification/` which implements complete SHPLONK.
+    /// This generator is useful for testing and prototyping.
     pub fn generate(&self) -> String {
         let mut code = String::new();
 

@@ -84,15 +84,63 @@ impl<F: PrimeField, const RANGE: usize> ReLULookup<F, RANGE> {
     }
 
     /// Computes ReLU with field representation.
+    ///
+    /// A field element `x` represents a "negative" value when `x > (p-1)/2`.
+    /// We detect this via lexicographic comparison of the little-endian byte
+    /// representation against `(p-1)/2`.
     pub fn compute_field(x: F) -> F {
-        // Check if x is "negative" (in the upper half of the field).
-        // For BN254, the modulus p starts with byte 0x30 at repr[31].
-        // Values > p/2 have repr[31] >= 0x19 (since p/2 ≈ 0x18...).
-        // The old check `bytes[31] & 0x80 != 0` was ALWAYS FALSE
-        // because BN254 field elements have repr[31] <= 0x30.
+        // For BN254 Fr:
+        //   p   = 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
+        //   p-1 = 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000000
+        //  (p-1)/2 = 0x183227397098d014dc2822db40c0ac2e9419f4243cdcb848a1f0fac9f8000000
+        //
+        // In little-endian byte repr, (p-1)/2 has bytes[31] = 0x18.
+        // Any field element with repr > (p-1)/2 (lexicographically in LE) is "negative".
+        //
+        // We compare from the most significant byte (index 31) down.
+        // The half-modulus LE bytes (last 4 bytes): [0x18, 0x32, 0x27, 0x39, ...]
+        // For most practical values used in HELIX (small integers), bytes[31] == 0x00
+        // (positive) or bytes[31] == 0x30 (negative, since -x = p-x has high byte 0x30).
+        // The threshold byte[31] of (p-1)/2 is 0x18.
+
+        // Precomputed (p-1)/2 for BN254 Fr in little-endian
+        const HALF_MODULUS_LAST_BYTE: u8 = 0x18;
+
         let repr = x.to_repr();
         let bytes = repr.as_ref();
-        let is_negative = bytes[31] >= 0x19;
+        let msb = bytes[31];
+
+        // Fast path: most values are clearly positive (0x00) or negative (0x30)
+        let is_negative = if msb > HALF_MODULUS_LAST_BYTE {
+            true
+        } else if msb < HALF_MODULUS_LAST_BYTE {
+            false
+        } else {
+            // msb == 0x18: need full lexicographic comparison (rare case)
+            // Compare remaining bytes from byte 30 down
+            // (p-1)/2 in LE: last few bytes are [0x00, 0x00, 0x00, 0x80, 0xf9, 0xac, 0x0f, ...]
+            // For the edge case, we use the double-and-check method:
+            // x > (p-1)/2 iff 2x overflows (wraps), i.e., x + x < x in the field
+            let double = x + x;
+            // If x > (p-1)/2, then 2x wraps around p, giving a small value < x
+            // Compare via repr bytes (smaller repr means smaller value)
+            let double_repr = double.to_repr();
+            let double_bytes = double_repr.as_ref();
+            // double < x means x is in the upper half
+            double_bytes[31] < bytes[31]
+                || (double_bytes[31] == bytes[31] && {
+                    let mut less = false;
+                    for i in (0..31).rev() {
+                        if double_bytes[i] < bytes[i] {
+                            less = true;
+                            break;
+                        } else if double_bytes[i] > bytes[i] {
+                            break;
+                        }
+                    }
+                    less
+                })
+        };
 
         if is_negative {
             F::ZERO
@@ -694,6 +742,52 @@ mod tests {
 
         let prover = MockProver::run(11, &circuit, vec![]).unwrap();
         assert_eq!(prover.verify(), Ok(()));
+    }
+
+    #[test]
+    fn test_relu_compute_field_negative_values() {
+        // -1 in the field is p-1, which is in the upper half → should return 0
+        let neg_1 = Fr::ZERO - Fr::from(1u64);
+        assert_eq!(ReLULookup::<Fr, 256>::compute_field(neg_1), Fr::ZERO);
+
+        // -127 should also return 0
+        let neg_127 = Fr::ZERO - Fr::from(127u64);
+        assert_eq!(ReLULookup::<Fr, 256>::compute_field(neg_127), Fr::ZERO);
+
+        // Large negative (close to -p/2)
+        let neg_big = Fr::ZERO - Fr::from(1000000u64);
+        assert_eq!(ReLULookup::<Fr, 256>::compute_field(neg_big), Fr::ZERO);
+    }
+
+    #[test]
+    fn test_relu_compute_field_positive_values() {
+        // 0 should stay 0
+        assert_eq!(ReLULookup::<Fr, 256>::compute_field(Fr::ZERO), Fr::ZERO);
+
+        // Small positive should pass through
+        assert_eq!(ReLULookup::<Fr, 256>::compute_field(Fr::from(1u64)), Fr::from(1u64));
+        assert_eq!(ReLULookup::<Fr, 256>::compute_field(Fr::from(127u64)), Fr::from(127u64));
+        assert_eq!(ReLULookup::<Fr, 256>::compute_field(Fr::from(1000000u64)), Fr::from(1000000u64));
+    }
+
+    #[test]
+    fn test_relu_compute_field_boundary() {
+        // (p-1)/2 should be treated as positive (it's <= (p-1)/2)
+        // (p-1)/2 + 1 should be treated as negative (it's > (p-1)/2)
+        // We compute (p-1)/2 by negating 1 and dividing the result
+        // Actually: (p-1)/2 = Fr(2).invert() * (p-1) but that's complex.
+        // Simpler: if x + x == p-1 (which is -1 in the field), then x = (p-1)/2
+        // Fr(2).invert().unwrap() * (-Fr::ONE) = (p-1)/2
+        let two_inv = Fr::from(2u64).invert().unwrap();
+        let half_p_minus_1 = two_inv * (Fr::ZERO - Fr::ONE);
+        // (p-1)/2 is in the lower half, so should pass through
+        let result = ReLULookup::<Fr, 256>::compute_field(half_p_minus_1);
+        assert_eq!(result, half_p_minus_1, "(p-1)/2 should be positive");
+
+        // (p-1)/2 + 1 = (p+1)/2 is in the upper half, should return 0
+        let half_p_plus_1 = half_p_minus_1 + Fr::ONE;
+        let result = ReLULookup::<Fr, 256>::compute_field(half_p_plus_1);
+        assert_eq!(result, Fr::ZERO, "(p+1)/2 should be negative");
     }
 
     #[test]

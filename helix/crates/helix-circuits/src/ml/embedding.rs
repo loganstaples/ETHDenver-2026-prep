@@ -126,15 +126,20 @@ impl<F: PrimeField> EmbeddingChip<F> {
             vec![s * (computed_hash - expected_hash)]
         });
 
-        // Hash accumulation gate (for Merkle tree path)
-        meta.create_gate("embed_hash", |meta| {
+        // NOTE: Merkle path verification is done NATIVELY (out-of-circuit) via SHA-256.
+        // The s_hash selector is retained for circuit layout compatibility but the
+        // in-circuit gate only constrains parent == expected (witness self-equality).
+        // For true in-circuit Merkle verification, replace with Poseidon hash gadget
+        // (~764 rows per Merkle step). See SECURITY.md "Known Limitations" #1.
+        meta.create_gate("embed_hash_native_only", |meta| {
             let s = meta.query_selector(s_hash);
             let _left = meta.query_advice(advice[0], Rotation::cur());
             let _right = meta.query_advice(advice[1], Rotation::cur());
             let parent = meta.query_advice(advice[2], Rotation::cur());
             let expected = meta.query_advice(advice[3], Rotation::cur());
-            // Simplified: parent should match expected
-            // Full implementation would verify hash(left || right) = parent
+            // WARNING: This gate only checks parent == expected (self-equality).
+            // The actual hash(left, right) == parent check is NOT done in-circuit.
+            // Merkle path integrity relies on native SHA-256 verification.
             vec![s * (parent - expected)]
         });
 
@@ -242,6 +247,15 @@ impl<F: PrimeField> EmbeddingChip<F> {
     }
 
     /// Verifies a Merkle path for embedding commitment.
+    ///
+    /// **WARNING: Native-only verification.** The `s_hash` gate checks
+    /// `parent == expected` (self-equality), NOT `hash(left, right) == parent`.
+    /// A malicious prover can supply arbitrary Merkle paths that will pass
+    /// the in-circuit check. Real Merkle integrity is enforced by native
+    /// SHA-256 verification outside the circuit. See SECURITY.md limitation #1.
+    ///
+    /// For production use with untrusted provers, replace with in-circuit
+    /// Poseidon hashing via `gadgets::poseidon::poseidon_hash_two()`.
     fn verify_merkle_path(
         &self,
         mut layouter: impl Layouter<F>,

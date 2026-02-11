@@ -11,11 +11,21 @@ The circuit exposes 8 public inputs (PIs) that form the contract-circuit interfa
 | PI[2] | new_hash_lo | **Direct** | Instance-bound via `constrain_instance` |
 | PI[3] | new_hash_hi | **Direct** | Instance-bound via `constrain_instance` |
 | PI[4] | loss | **Direct** | Instance-bound; computed in-circuit from forward pass |
-| PI[5] | total_error | **Indirect** | Committed via PI[7] Poseidon hash; changing PI[5] changes checksum |
+| PI[5] | total_error | **Direct** | In-circuit accumulation via `s_error_acc` gate; `constrain_equal` binds accumulated result to PI[5] instance cell |
 | PI[6] | step_number | **Indirect** | Committed via PI[7] Poseidon hash; changing PI[6] changes checksum |
 | PI[7] | error_checksum | **In-circuit** | 3 Poseidon hashes constrain: `Poseidon(Poseidon(total_error, step_number), Poseidon(model_id, error_budget))` |
 
 All 8 PIs are verified by adversarial MockProver tests that confirm tampering with any single PI causes proof rejection.
+
+## Transformer Verification
+
+The transformer circuit (`ml/transformer.rs`) verifies three components with real arithmetic constraints:
+
+- **Layer Normalization**: Constrains `(x - mean) * inv_std * scale_inv` computation, then `gamma * normalized + beta = output` via `s_sub`, `s_layer_norm`, `s_mul`, `s_add`, `s_eq` gates.
+- **Multi-Head Attention**: Q projection verified via `s_linear` gate for ALL positions. Attention weight sum check (sum == 256) and output verification for all positions. No `.min()` caps.
+- **FFN**: Both linear layers verified via `s_linear` for ALL `seq_len * d_ff` positions. GELU activation constrained via `activated * (hidden - activated) = 0`. Output verified via `s_eq`.
+
+Soundness tests verify wrong layer norm, FFN hidden, FFN output, and attention weights are rejected by MockProver.
 
 ## Freivalds Verification
 
@@ -28,10 +38,10 @@ The Freivalds equality gate (`s_freivalds`) constrains `advice[0] == advice[1]`,
 HELIX tracks numerical error through every operation:
 - Each arithmetic operation accumulates a base error term
 - Error propagation follows standard floating-point analysis rules
-- `total_error` (PI[5]) represents the worst-case accumulated error
+- `total_error` (PI[5]) is computed in-circuit by accumulating per-operation error terms via the `s_error_acc` gate, then constrained equal to the PI[5] instance cell
 - The error checksum (PI[7]) cryptographically commits to the error state
 
-The error bound system is honest-verifier: it trusts the prover's error computation but binds it to the proof via Poseidon hashing. A malicious prover cannot claim lower error without invalidating the checksum.
+The error bound system directly constrains PI[5] to the in-circuit accumulated error. A malicious prover cannot claim lower error without violating the `s_error_acc` accumulation or the `s_eq` final check.
 
 ## Copy Constraints
 
@@ -40,6 +50,7 @@ All bounded arithmetic gadgets use single-region synthesis with explicit `constr
 - `bounded_mul`: 8-row single region with cross-row copy constraints for shared operands
 - `bounded_matmul`: per-iteration regions with `AssignedCell` tracking and cross-iteration linking
 - `activation` (ReLU): 7-row region with copy constraints for val_y, neg, err_diff, err_y
+- `error_accumulation` (mul): 5-row single region with 6 copy constraints binding err_a, err_b, term1, term2, term3, partial_sum across rows
 
 ## Contract-Circuit Alignment
 
@@ -52,15 +63,17 @@ The error checksum uses Poseidon hashing in both the circuit (Rust) and contract
 
 ## Known Limitations
 
-1. **Merkle path verification is not implemented in-circuit.** `ModelCommitChip::verify_path()` will panic if called. Native SHA-256 Merkle verification is used out-of-circuit.
+1. **Merkle path verification is native-only.** The `s_hash` gate in `embedding.rs` checks `parent == expected` (self-equality), not `hash(left, right) == parent`. Real Merkle integrity relies on native SHA-256 verification outside the circuit. For in-circuit verification, replace with Poseidon hash gadget.
 
-2. **IVC/folding is scaffolding.** The IVC module provides the data structures and folding math but does not implement real multi-step proof compression.
+2. **IVC/folding has real math but no compression.** The IVC module implements Nova-style folding with cross-terms, element-wise vector operations, and in-circuit Poseidon commitments. 22 tests pass with real KZG proofs. However, it does not implement actual multi-step proof compression to constant size.
 
 3. **Lookup table range.** ReLU lookup tables cover [-128, 128) by default. Model weights must be quantized to stay within this range for proof generation to succeed.
 
 4. **No in-circuit matmul constraint.** The Freivalds gate checks equality between prover-assigned values. The actual matmul computation is done natively (in the witness), not as in-circuit constraints. Soundness relies on the prover committing to weights via state hash PIs.
 
 5. **Poseidon gas cost.** On-chain Poseidon verification via `PoseidonHasher.sol` computes 65 rounds of SHA-256-derived constants on the fly, consuming ~8M gas. For production, round constants should be precomputed and stored.
+
+6. **SolidityGenerator is simplified.** The generated Solidity verifier implements a simplified KZG pairing check, not full SHPLONK. Use the handwritten `Halo2Verifier.sol` in `contracts/src/verification/` for production on-chain verification.
 
 ## Proof Format
 
