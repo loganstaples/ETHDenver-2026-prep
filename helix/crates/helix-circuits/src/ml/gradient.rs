@@ -98,18 +98,26 @@ impl<F: PrimeField, const RANGE: usize> GradientVerificationChip<F, RANGE> {
         let s_grad_mask = meta.selector();
         let s_weight_update = meta.selector();
         
-        // ReLU gradient mask: grad_out = grad_in * (forward > 0 ? 1 : 0)
-        // Simplified: we just verify the multiplication
+        // ReLU gradient mask: local = upstream * mask, where mask in {0, 1}
+        //
+        // The mask is assigned in the `local_grad_err` column (reused for this purpose).
+        // Constraints:
+        //   1. local * (local - upstream) = 0  →  local is either 0 or upstream
+        //   2. mask * (mask - 1) = 0           →  mask is boolean {0, 1}
+        //
+        // The old gate `local * (forward - local * upstream)` was wrong because it
+        // was satisfied when forward == upstream (unrelated to ReLU correctness).
         meta.create_gate("relu_grad_mask", |meta| {
             let s = meta.query_selector(s_grad_mask);
-            let forward = meta.query_advice(forward_val, Rotation::cur());
             let upstream = meta.query_advice(upstream_grad, Rotation::cur());
             let local = meta.query_advice(local_grad, Rotation::cur());
-            // For ReLU: if forward > 0, local = upstream; else local = 0
-            // This is hard to express in arithmetic constraints without comparisons
-            // We use a relaxed constraint: local * (forward - local) constraints
-            // In practice, we'd use a different gadget or lookup
-            vec![s * (local.clone() * forward - local * upstream)]
+            let mask = meta.query_advice(local_grad_err, Rotation::cur());
+            let one = halo2_proofs::plonk::Expression::Constant(F::ONE);
+            // local must be 0 or upstream
+            let constraint1 = local.clone() * (local - upstream);
+            // mask must be boolean
+            let constraint2 = mask.clone() * (mask - one);
+            vec![s.clone() * constraint1, s * constraint2]
         });
         
         // Weight update: new_weight = old_weight - lr * gradient
@@ -181,7 +189,43 @@ impl<F: PrimeField, const RANGE: usize> GradientVerificationChip<F, RANGE> {
                     Ok(())
                 },
             )?;
-            
+
+            // Apply the relu_grad_mask gate which constrains:
+            //   1. local * (local - upstream) = 0  (local is 0 or upstream)
+            //   2. mask * (mask - 1) = 0            (mask is boolean)
+            layouter.assign_region(
+                || format!("relu grad mask constraint {}", i),
+                |mut region| {
+                    self.config.s_grad_mask.enable(&mut region, 0)?;
+                    region.assign_advice(
+                        || "forward",
+                        self.config.forward_val,
+                        0,
+                        || forward_vals[i],
+                    )?;
+                    region.assign_advice(
+                        || "upstream",
+                        self.config.upstream_grad,
+                        0,
+                        || upstream_grad_vals[i],
+                    )?;
+                    region.assign_advice(
+                        || "local",
+                        self.config.local_grad,
+                        0,
+                        || local_grad_vals[i],
+                    )?;
+                    // mask in local_grad_err column (boolean constraint enforced by gate)
+                    region.assign_advice(
+                        || "mask",
+                        self.config.local_grad_err,
+                        0,
+                        || masks[i],
+                    )?;
+                    Ok(())
+                },
+            )?;
+
             // Verify error: local_err = upstream_err * mask
             // (error is 0 when mask is 0, propagates when mask is 1)
             layouter.assign_region(
@@ -209,7 +253,7 @@ impl<F: PrimeField, const RANGE: usize> GradientVerificationChip<F, RANGE> {
                     Ok(())
                 },
             )?;
-            
+
             // Range check the local gradient error
             layouter.assign_region(
                 || format!("range check grad error {}", i),

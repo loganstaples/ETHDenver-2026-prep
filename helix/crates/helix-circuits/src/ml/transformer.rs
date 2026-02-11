@@ -1,5 +1,16 @@
 //! Complete Transformer Block Circuit.
 //!
+//! # WARNING: VERIFICATION STUBS — NOT SOUND
+//!
+//! The verification functions in this module (`verify_layer_norm`, `verify_attention`,
+//! `verify_ffn`) are architectural scaffolding that **do not provide ZK soundness**.
+//! They compare witness values to themselves (self-equality checks), which any prover
+//! can trivially satisfy with arbitrary values. These exist to demonstrate the intended
+//! circuit architecture for a complete transformer block, not to provide security.
+//!
+//! The critical-path training step circuit (`MLTrainingStepV2Circuit`) does NOT use
+//! this module — it has its own inline verification for the 2-layer MLP.
+//!
 //! Implements a full transformer block with:
 //! - Multi-head self-attention
 //! - Feed-forward network (FFN)
@@ -411,6 +422,8 @@ impl<F: PrimeField> TransformerBlockChip<F> {
     }
 
     /// Verifies layer normalization.
+    ///
+    /// # WARNING: STUB — compares output to itself (self-equality). Not sound.
     fn verify_layer_norm(
         &self,
         mut layouter: impl Layouter<F>,
@@ -443,6 +456,8 @@ impl<F: PrimeField> TransformerBlockChip<F> {
     }
 
     /// Verifies multi-head attention (simplified version).
+    ///
+    /// # WARNING: STUB — samples min(2) positions with self-equality. Not sound.
     #[allow(clippy::too_many_arguments)]
     fn verify_attention(
         &self,
@@ -566,6 +581,8 @@ impl<F: PrimeField> TransformerBlockChip<F> {
     }
 
     /// Verifies the feed-forward network.
+    ///
+    /// # WARNING: STUB — samples min(4) dimensions with self-equality. Not sound.
     #[allow(clippy::too_many_arguments)]
     fn verify_ffn(
         &self,

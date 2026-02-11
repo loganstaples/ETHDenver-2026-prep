@@ -1,5 +1,14 @@
 //! Freivalds Probabilistic Matrix Verification.
 //!
+//! # WARNING: GADGET LIBRARY — NOT USED IN CRITICAL PATH
+//!
+//! This is a standalone gadget that is NOT used by `MLTrainingStepV2Circuit`
+//! (which has its own inline Freivalds implementation). Known issues:
+//! - `challenge_seed` is a prover-chosen `u64` — in a sound implementation
+//!   the challenge should come from a Fiat-Shamir transcript or verifier randomness.
+//! - `s_dot` gate is defined but never enabled (only `s_check` equality is used).
+//! - Intermediate dot product values in `verify_matmul` are unconstrained advice.
+//!
 //! Verifies matrix multiplication C = A × B using O(n²) field operations
 //! instead of O(n³), with failure probability 1/|F|.
 

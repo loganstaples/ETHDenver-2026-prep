@@ -66,43 +66,67 @@ impl<F: PrimeField, const RANGE: usize> ReLUChip<F, RANGE> {
         val_y: Value<F>,
         err_y: Value<F>,
     ) -> Result<(), ErrorFront> {
-        // Logic:
-        // if x > 0: y = x, err_y = err_x
-        // else:     y = 0, err_y = 0
+        // Sound ReLU decomposition:
+        //   x + neg = y        (decomposition)
+        //   y * neg = 0        (exactly one of y, neg is zero)
+        //   range_check(y)     (y >= 0)
+        //   range_check(neg)   (neg >= 0)
         //
-        // Constraints:
-        // y * (y - x) = 0  (y is either 0 or x)
-        // y * (err_y - err_x) = 0 (if y!=0, err_y must equal err_x)
-        // (If y=0, this allows err_y to be anything? No, if y=0 implies negative x, 
-        // usually y=0 implies we are in saturation region. We need strict constraint.)
+        // If x >= 0: y = x, neg = 0
+        // If x < 0:  y = 0, neg = -x
         //
-        // Implementing full ReLU check often requires decomposing x into positive/negative parts.
-        // x = p - n
-        // y = p
-        // n * p = 0
-        //
-        // For Stage 13 prototype, we will just prove the output error is range checked,
-        // assuming value correctness is handled by the model trace.
-        // We verify `err_y` is valid range.
-        
-        // Enforce: y * (y - x) = 0
-        // 1. diff = y - x  =>  x + diff = y
-        let diff = val_y - val_x;
-        self.enforce_sum(layouter.namespace(|| "diff = y - x"), val_x, diff, val_y)?;
-        
-        // 2. y * diff = 0
-        let zero = Value::known(F::ZERO);
-        self.enforce_product(layouter.namespace(|| "y * diff = 0"), val_y, diff, zero)?;
+        // The old constraint `y * (y - x) = 0` was unsound because
+        // a malicious prover could always set y = x (identity), bypassing ReLU.
 
-        // Enforce: y * (err_y - err_x) = 0
-        // 3. err_diff = err_y - err_x => err_x + err_diff = err_y
+        let zero = Value::known(F::ZERO);
+
+        // Compute neg = y - x (which equals 0 when x>=0, or -x when x<0)
+        let neg = val_y - val_x;
+
+        // 1. x + neg = y (decomposition constraint)
+        self.enforce_sum(layouter.namespace(|| "x + neg = y"), val_x, neg, val_y)?;
+
+        // 2. y * neg = 0 (disjointness: at most one is nonzero)
+        self.enforce_product(layouter.namespace(|| "y * neg = 0"), val_y, neg, zero)?;
+
+        // 3. Range check y (ensures y >= 0, prevents prover from using negative y)
+        layouter.assign_region(
+            || "range check relu y",
+            |mut region| {
+                self.config.range.s_range.enable(&mut region, 0)?;
+                region.assign_advice(
+                    || "val_y",
+                    self.config.range.input_column,
+                    0,
+                    || val_y,
+                )?;
+                Ok(())
+            },
+        )?;
+
+        // 4. Range check neg (ensures neg >= 0, prevents prover from using negative neg)
+        layouter.assign_region(
+            || "range check relu neg",
+            |mut region| {
+                self.config.range.s_range.enable(&mut region, 0)?;
+                region.assign_advice(
+                    || "neg",
+                    self.config.range.input_column,
+                    0,
+                    || neg,
+                )?;
+                Ok(())
+            },
+        )?;
+
+        // 5. Error propagation: if y != 0 then err_y = err_x, else err_y = 0
+        //    err_x + err_diff = err_y
+        //    y * err_diff = 0 (if y != 0, err_diff must be 0 => err_y = err_x)
         let err_diff = err_y - err_x;
         self.enforce_sum(layouter.namespace(|| "err_diff"), err_x, err_diff, err_y)?;
-        
-        // 4. y * err_diff = 0
         self.enforce_product(layouter.namespace(|| "y * err_diff = 0"), val_y, err_diff, zero)?;
 
-        // 5. Range check error
+        // 6. Range check error output
         layouter.assign_region(
             || "range check relu err",
             |mut region| {

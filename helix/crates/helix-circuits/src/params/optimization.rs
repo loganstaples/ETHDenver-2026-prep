@@ -1,5 +1,13 @@
 //! Circuit Constraint Optimization and Proof Size Estimation.
 //!
+//! # WARNING: OPTIMIZATION PASSES ARE ESTIMATION STUBS
+//!
+//! The `CircuitOptimizer` and its `OptimizationPass` variants **simulate**
+//! optimizations using heuristic estimates (e.g., "10% of gates are mergeable").
+//! They do NOT actually modify circuits or perform real constraint analysis.
+//! The `ProofSizeEstimator` and `CircuitBenchmarkSuite` produce useful estimates
+//! based on structural properties and can be used for planning.
+//!
 //! This module provides tools for:
 //! - Analyzing circuit structure and constraint counts
 //! - Estimating proof sizes for different model architectures
@@ -373,6 +381,9 @@ impl CircuitOptimizer {
     }
 
     /// Applies a single optimization pass.
+    ///
+    /// WARNING: This simulates the optimization using heuristic estimates.
+    /// It does NOT actually modify any circuit constraints.
     fn apply_pass(&self, pass: OptimizationPass, analysis: &CircuitAnalysis) -> OptimizationResult {
         let start = Instant::now();
         let mut result = OptimizationResult::new(pass);

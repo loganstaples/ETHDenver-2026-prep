@@ -194,13 +194,19 @@ impl SRSMetadata {
         }
 
         let k = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-        let num_g1_elements = u64::from_le_bytes(data[12..20].try_into().unwrap()) as usize;
-        let num_g2_elements = u64::from_le_bytes(data[20..28].try_into().unwrap()) as usize;
+        let num_g1_elements = u64::from_le_bytes(
+            data[12..20].try_into().map_err(|_| SetupError::CorruptData("Invalid G1 count bytes".to_string()))?
+        ) as usize;
+        let num_g2_elements = u64::from_le_bytes(
+            data[20..28].try_into().map_err(|_| SetupError::CorruptData("Invalid G2 count bytes".to_string()))?
+        ) as usize;
 
         let mut content_hash = [0u8; 32];
         content_hash.copy_from_slice(&data[28..60]);
 
-        let generated_at = u64::from_le_bytes(data[60..68].try_into().unwrap());
+        let generated_at = u64::from_le_bytes(
+            data[60..68].try_into().map_err(|_| SetupError::CorruptData("Invalid timestamp bytes".to_string()))?
+        );
         let num_contributions = u32::from_le_bytes([data[68], data[69], data[70], data[71]]);
 
         let mut transcript_hash = [0u8; 32];
@@ -816,7 +822,8 @@ impl SRSCache {
     pub fn get_or_generate(&self, k: u32) -> Result<Arc<HelixSRS>, SetupError> {
         // Check in-memory cache first
         {
-            let cache = self.cache.read().unwrap();
+            let cache = self.cache.read()
+                .map_err(|e| SetupError::CacheError(format!("Read lock poisoned: {}", e)))?;
             if let Some(srs) = cache.get(&k) {
                 return Ok(Arc::clone(srs));
             }
@@ -828,7 +835,8 @@ impl SRSCache {
             if path.exists() {
                 if let Ok(srs) = self.load_from_file(&path) {
                     let srs = Arc::new(srs);
-                    let mut cache = self.cache.write().unwrap();
+                    let mut cache = self.cache.write()
+                        .map_err(|e| SetupError::CacheError(format!("Write lock poisoned: {}", e)))?;
                     cache.insert(k, Arc::clone(&srs));
                     return Ok(srs);
                 }
@@ -841,7 +849,8 @@ impl SRSCache {
 
         // Store in memory cache
         {
-            let mut cache = self.cache.write().unwrap();
+            let mut cache = self.cache.write()
+                .map_err(|e| SetupError::CacheError(format!("Write lock poisoned: {}", e)))?;
 
             // Evict if at capacity
             if cache.len() >= self.max_entries {
@@ -883,13 +892,14 @@ impl SRSCache {
 
     /// Clears the in-memory cache.
     pub fn clear(&self) {
-        let mut cache = self.cache.write().unwrap();
-        cache.clear();
+        if let Ok(mut cache) = self.cache.write() {
+            cache.clear();
+        }
     }
 
     /// Returns the number of cached entries.
     pub fn len(&self) -> usize {
-        self.cache.read().unwrap().len()
+        self.cache.read().map(|c| c.len()).unwrap_or(0)
     }
 
     /// Returns whether the cache is empty.

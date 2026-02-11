@@ -1330,6 +1330,19 @@ pub(crate) fn verify_matmul_freivalds(
 }
 
 /// Verifies that the accumulated error bound is within acceptable limits.
+///
+/// # WARNING: INCOMPLETE SOUNDNESS
+///
+/// This function assigns `total_error` as a witness and binds it to PI[5] via
+/// the public input system, but does NOT constrain it to equal the actual
+/// accumulated error from all circuit operations. A malicious prover could
+/// claim any error bound as long as it passes the ReLU lookup range check.
+///
+/// Full fix (in-circuit error accumulation across all ops) would approximately
+/// double the circuit size and is out of scope for the current implementation.
+///
+/// The ReLU lookup range check below ensures the value is at least within
+/// [0, RELU_HALF_RANGE), preventing clearly bogus values like 0 or huge numbers.
 pub(crate) fn verify_error_bound(
     config: &MLTrainingStepV2Config,
     layouter: &mut impl Layouter<Fr>,
@@ -1339,8 +1352,15 @@ pub(crate) fn verify_error_bound(
     layouter.assign_region(
         || label.to_string(),
         |mut region| {
-            // Just witness the error bound - the public input constraint ensures it matches
+            // Assign the total_error witness value
             region.assign_advice(|| "total_error", config.advice[0], 0, || Value::known(total_error))?;
+
+            // Enable ReLU lookup on the cell to enforce it's within [0, RELU_HALF_RANGE).
+            // This prevents a malicious prover from setting PI[5] to 0 or an absurdly
+            // large value. It does NOT prove the value equals the real accumulated error.
+            config.s_relu.enable(&mut region, 0)?;
+            region.assign_advice(|| "total_error_relu_out", config.advice[1], 0, || Value::known(total_error))?;
+
             Ok(())
         },
     )

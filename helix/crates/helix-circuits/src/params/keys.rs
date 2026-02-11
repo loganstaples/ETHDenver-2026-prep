@@ -78,6 +78,8 @@ pub enum KeyError {
     SetupError(SetupError),
     /// Plonk error.
     PlonkError(String),
+    /// Cache lock error.
+    CacheError(String),
 }
 
 impl std::fmt::Display for KeyError {
@@ -94,6 +96,7 @@ impl std::fmt::Display for KeyError {
             Self::IoError(e) => write!(f, "IO error: {}", e),
             Self::SetupError(e) => write!(f, "Setup error: {}", e),
             Self::PlonkError(msg) => write!(f, "Plonk error: {}", msg),
+            Self::CacheError(msg) => write!(f, "Cache error: {}", msg),
         }
     }
 }
@@ -917,7 +920,8 @@ impl KeyCache {
 
         // Check cache
         {
-            let cache = self.pk_cache.read().unwrap();
+            let cache = self.pk_cache.read()
+                .map_err(|e| KeyError::CacheError(format!("PK read lock poisoned: {}", e)))?;
             if let Some(pk) = cache.get(&circuit_id) {
                 return Ok(Arc::clone(pk));
             }
@@ -929,7 +933,8 @@ impl KeyCache {
 
         // Store in cache
         {
-            let mut cache = self.pk_cache.write().unwrap();
+            let mut cache = self.pk_cache.write()
+                .map_err(|e| KeyError::CacheError(format!("PK write lock poisoned: {}", e)))?;
             if cache.len() >= self.max_entries {
                 // Simple eviction: remove first entry
                 if let Some(key) = cache.keys().next().cloned() {
@@ -944,7 +949,7 @@ impl KeyCache {
 
     /// Gets a cached verification key.
     pub fn get_vk(&self, circuit_id: &[u8; 32]) -> Option<Arc<HelixVerificationKey>> {
-        let cache = self.vk_cache.read().unwrap();
+        let cache = self.vk_cache.read().ok()?;
         cache.get(circuit_id).map(Arc::clone)
     }
 
@@ -953,29 +958,34 @@ impl KeyCache {
         let circuit_id = vk.circuit_id();
         let vk = Arc::new(vk);
 
-        let mut cache = self.vk_cache.write().unwrap();
-        if cache.len() >= self.max_entries {
-            if let Some(key) = cache.keys().next().cloned() {
-                cache.remove(&key);
+        if let Ok(mut cache) = self.vk_cache.write() {
+            if cache.len() >= self.max_entries {
+                if let Some(key) = cache.keys().next().cloned() {
+                    cache.remove(&key);
+                }
             }
+            cache.insert(circuit_id, vk);
         }
-        cache.insert(circuit_id, vk);
     }
 
     /// Clears all caches.
     pub fn clear(&self) {
-        self.pk_cache.write().unwrap().clear();
-        self.vk_cache.write().unwrap().clear();
+        if let Ok(mut cache) = self.pk_cache.write() {
+            cache.clear();
+        }
+        if let Ok(mut cache) = self.vk_cache.write() {
+            cache.clear();
+        }
     }
 
     /// Returns the number of cached proving keys.
     pub fn pk_count(&self) -> usize {
-        self.pk_cache.read().unwrap().len()
+        self.pk_cache.read().map(|c| c.len()).unwrap_or(0)
     }
 
     /// Returns the number of cached verification keys.
     pub fn vk_count(&self) -> usize {
-        self.vk_cache.read().unwrap().len()
+        self.vk_cache.read().map(|c| c.len()).unwrap_or(0)
     }
 }
 

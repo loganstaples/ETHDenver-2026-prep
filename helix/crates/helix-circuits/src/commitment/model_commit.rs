@@ -56,7 +56,13 @@ impl<F: PrimeField> ModelCommitChip<F> {
     }
 
     /// Verifies that a leaf is in the Merkle tree at the given path.
-    /// Uses SHA-256 for the hash computation (native, not in-circuit).
+    ///
+    /// # WARNING: STUB — Returns Ok(()) unconditionally.
+    ///
+    /// This function performs NO in-circuit verification. A malicious prover
+    /// can claim any leaf is in the tree and this will accept it.
+    /// Native SHA-256 Merkle verification is done outside the circuit.
+    /// In-circuit verification requires PSE's standalone Poseidon crate.
     pub fn verify_path(
         &self,
         _layouter: impl Layouter<F>,
@@ -64,8 +70,6 @@ impl<F: PrimeField> ModelCommitChip<F> {
         _path_elements: Vec<Value<F>>,
         _path_indices: Vec<Value<bool>>,
     ) -> Result<(), ErrorFront> {
-        // Native SHA-256 Merkle verification is done outside the circuit.
-        // In-circuit verification requires PSE's poseidon crate integration.
         Ok(())
     }
 }
