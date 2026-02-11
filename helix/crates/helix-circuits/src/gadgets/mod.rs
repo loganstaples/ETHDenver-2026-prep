@@ -1,11 +1,9 @@
 pub mod arithmetic;
 pub mod builder;
-pub mod comparison;
 pub mod freivalds;
 pub mod lookup;
 pub mod poseidon;
 pub mod range;
-pub mod swap;
 
 pub use arithmetic::{ArithmeticChip, ArithmeticConfig};
 pub use builder::{ConstraintBuilder, BuilderConfig, WireAllocator, WireId};

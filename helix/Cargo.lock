@@ -2708,7 +2708,6 @@ dependencies = [
  "halo2curves",
  "helix-core",
  "hex",
- "parking_lot",
  "rand 0.8.5",
  "rand_core 0.6.4",
  "sha2",
