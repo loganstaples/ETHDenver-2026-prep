@@ -467,6 +467,100 @@ pub mod share_encoding {
     }
 }
 
+/// Applies a single gradient descent step to a 2-layer MLP.
+///
+/// Computes forward pass, MSE loss, backward pass, and returns updated weights:
+///   w_new = w - lr * grad
+///
+/// This is a simplified but correct gradient computation used for witness
+/// reconstruction. The actual MPC training step uses secret-shared arithmetic,
+/// but the reconstructed weights produce the same result.
+fn apply_gradient_update(
+    w1: &[Fr], b1: &[Fr], w2: &[Fr], b2: &[Fr],
+    input: &[Fr], target: &[Fr],
+    lr: &Fr,
+    d_in: usize, d_hid: usize, d_out: usize,
+) -> (Vec<Fr>, Vec<Fr>, Vec<Fr>, Vec<Fr>) {
+    use crate::field::ops::inner_product_fixed;
+
+    // Forward pass: h = ReLU(W1 * x + b1), y = W2 * h + b2
+    // W1 is d_hid x d_in, x is d_in x 1
+    let h_pre: Vec<Fr> = (0..d_hid).map(|i| {
+        let row = &w1[i * d_in..(i + 1) * d_in];
+        let dot = inner_product_fixed(row, input);
+        Fr::add(&dot, &b1[i])
+    }).collect();
+
+    // ReLU activation
+    let h: Vec<Fr> = h_pre.iter().map(|v| {
+        if v.to_f64() >= 0.0 { v.clone() } else { Fr::ZERO }
+    }).collect();
+
+    // Output: y = W2 * h + b2 (W2 is d_out x d_hid)
+    let y_pred: Vec<Fr> = (0..d_out).map(|i| {
+        let row = &w2[i * d_hid..(i + 1) * d_hid];
+        let dot = inner_product_fixed(row, &h);
+        Fr::add(&dot, &b2[i])
+    }).collect();
+
+    // Loss gradient: dL/dy = 2/n * (y_pred - target)
+    let n_inv = Fr::from_f64(2.0 / d_out as f64);
+    let dy: Vec<Fr> = y_pred.iter().zip(target.iter()).map(|(yp, t)| {
+        Fr::sub(yp, t).fixed_mul(&n_inv)
+    }).collect();
+
+    // Backward through output layer:
+    // dW2 = dy * h^T (d_out x d_hid)
+    // db2 = dy (d_out)
+    // dh = W2^T * dy (d_hid)
+    let mut dw2 = vec![Fr::ZERO; d_out * d_hid];
+    for i in 0..d_out {
+        for j in 0..d_hid {
+            dw2[i * d_hid + j] = dy[i].fixed_mul(&h[j]);
+        }
+    }
+    let db2 = dy.clone();
+
+    let mut dh = vec![Fr::ZERO; d_hid];
+    for j in 0..d_hid {
+        for i in 0..d_out {
+            dh[j] = Fr::add(&dh[j], &dy[i].fixed_mul(&w2[i * d_hid + j]));
+        }
+    }
+
+    // Backward through ReLU: dh_pre = dh * (h_pre > 0 ? 1 : 0)
+    let dh_pre: Vec<Fr> = dh.iter().zip(h_pre.iter()).map(|(grad, pre)| {
+        if pre.to_f64() >= 0.0 { grad.clone() } else { Fr::ZERO }
+    }).collect();
+
+    // Backward through first layer:
+    // dW1 = dh_pre * input^T (d_hid x d_in)
+    // db1 = dh_pre (d_hid)
+    let mut dw1 = vec![Fr::ZERO; d_hid * d_in];
+    for i in 0..d_hid {
+        for j in 0..d_in {
+            dw1[i * d_in + j] = dh_pre[i].fixed_mul(&input[j]);
+        }
+    }
+    let db1 = dh_pre;
+
+    // Apply gradient update: w_new = w - lr * grad
+    let w1_new: Vec<Fr> = w1.iter().zip(dw1.iter()).map(|(w, g)| {
+        Fr::sub(w, &lr.fixed_mul(g))
+    }).collect();
+    let b1_new: Vec<Fr> = b1.iter().zip(db1.iter()).map(|(w, g)| {
+        Fr::sub(w, &lr.fixed_mul(g))
+    }).collect();
+    let w2_new: Vec<Fr> = w2.iter().zip(dw2.iter()).map(|(w, g)| {
+        Fr::sub(w, &lr.fixed_mul(g))
+    }).collect();
+    let b2_new: Vec<Fr> = b2.iter().zip(db2.iter()).map(|(w, g)| {
+        Fr::sub(w, &lr.fixed_mul(g))
+    }).collect();
+
+    (w1_new, b1_new, w2_new, b2_new)
+}
+
 /// Converts a WitnessCapture from MPC operations into a ReconstructedWitness.
 ///
 /// This is the critical conversion that bridges the MPC computation
@@ -531,28 +625,48 @@ pub fn witness_capture_to_reconstructed(
     );
 
     // Extract weight shares from captures
-    // This assumes each capture contains the party's weight data as inputs
-    let _num_parties = captures.len();
+    // Each capture contains one party's additive shares of the weight data.
+    // Layout: [w1 (d_hid*d_in), b1 (d_hid), w2 (d_out*d_hid), b2 (d_out)]
+
+    let w1_size = d_hid * d_in;
+    let b1_size = d_hid;
+    let w2_size = d_out * d_hid;
+    let b2_size = d_out;
+    let total_weights = w1_size + b1_size + w2_size + b2_size;
 
     // Initialize weight accumulators
-    let mut w1 = vec![Fr::ZERO; d_hid * d_in];
-    let b1 = vec![Fr::ZERO; d_hid];
-    let w2 = vec![Fr::ZERO; d_out * d_hid];
-    let b2 = vec![Fr::ZERO; d_out];
+    let mut w1 = vec![Fr::ZERO; w1_size];
+    let mut b1 = vec![Fr::ZERO; b1_size];
+    let mut w2 = vec![Fr::ZERO; w2_size];
+    let mut b2 = vec![Fr::ZERO; b2_size];
 
     // Sum shares from all parties (additive secret sharing reconstruction)
     for capture in captures {
-        // Extract inputs from the capture
-        // The first operations typically contain the weight data
         let all_inputs = capture.all_inputs();
 
-        // Parse the inputs based on expected structure
-        // This is a simplified extraction - in practice would need more structure
-        if all_inputs.len() >= d_hid * d_in {
-            for (i, val) in all_inputs.iter().take(d_hid * d_in).enumerate() {
-                if i < w1.len() {
-                    w1[i] = Fr::add(&w1[i], val);
-                }
+        if all_inputs.len() >= total_weights {
+            // Extract w1
+            for (i, val) in all_inputs.iter().take(w1_size).enumerate() {
+                w1[i] = Fr::add(&w1[i], val);
+            }
+            // Extract b1
+            for (i, val) in all_inputs[w1_size..w1_size + b1_size].iter().enumerate() {
+                b1[i] = Fr::add(&b1[i], val);
+            }
+            // Extract w2
+            let w2_offset = w1_size + b1_size;
+            for (i, val) in all_inputs[w2_offset..w2_offset + w2_size].iter().enumerate() {
+                w2[i] = Fr::add(&w2[i], val);
+            }
+            // Extract b2
+            let b2_offset = w2_offset + w2_size;
+            for (i, val) in all_inputs[b2_offset..b2_offset + b2_size].iter().enumerate() {
+                b2[i] = Fr::add(&b2[i], val);
+            }
+        } else if all_inputs.len() >= w1_size {
+            // Fallback: at minimum extract w1 if full layout isn't available
+            for (i, val) in all_inputs.iter().take(w1_size).enumerate() {
+                w1[i] = Fr::add(&w1[i], val);
             }
         }
     }
@@ -570,12 +684,14 @@ pub fn witness_capture_to_reconstructed(
     // Compute state hashes
     let old_hash = compute_compatible_state_hash(&w1, &b1, &w2, &b2);
 
-    // Apply simplified gradient update (for demonstration)
-    // In full implementation, this would use actual gradients from captures
-    let w1_new = w1.clone();
-    let b1_new = b1.clone();
-    let w2_new = w2.clone();
-    let b2_new = b2.clone();
+    // Apply simplified gradient update using forward-backward pass on reconstructed weights.
+    // This computes a single training step: w_new = w - lr * grad(loss(w, input, target))
+    let (w1_new, b1_new, w2_new, b2_new) = apply_gradient_update(
+        &w1, &b1, &w2, &b2,
+        &input_fr, &target_fr,
+        &lr,
+        d_in, d_hid, d_out,
+    );
 
     let new_hash = compute_compatible_state_hash(&w1_new, &b1_new, &w2_new, &b2_new);
 

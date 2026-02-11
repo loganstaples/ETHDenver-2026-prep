@@ -1,9 +1,11 @@
 # Session Module - Technical Review
 
+**Updated**: 2026-02-11 — Critical OOM and HMAC replay issues resolved. Health score upgraded from C to B.
+
 **Review Date**: 2026-02-10
 **Files**: 11 (mod.rs, channel.rs, transport.rs, network.rs, secure_channel.rs, establishment.rs, key_rotation.rs, multiplexer.rs, party_selection.rs, manager.rs, integration_tests.rs)
 **Total Lines**: ~8,280
-**Health Score**: C (50-55% production-ready)
+**Health Score**: B (70-75% production-ready)
 
 ---
 
@@ -115,8 +117,8 @@ TCP/TLS network channel with HMAC authentication and framed messages.
 
 | # | Severity | Location | Issue | Fix |
 |---|----------|----------|-------|-----|
-| C1 | **CRITICAL** | network.rs:333-336 | **OOM vulnerability**: Reads 4-byte length prefix, then allocates `vec![0u8; len]` **without checking against `max_message_size`**. A malicious peer can send `len = 0xFFFFFFFF` and crash the node with a 4 GB allocation. | Add `if len > self.config.max_message_size { return Err(...); }` before allocation |
-| C2 | **CRITICAL** | network.rs (HMAC) | HMAC doesn't bind to sequence number — same message accepted multiple times. No `expected_seq` tracking per peer. The AuthenticatedTransport layer has replay protection, but `NetworkChannel` reimplements HMAC without it. | Add per-peer sequence tracking in `receive_messages()`, or remove duplicate HMAC and rely on AuthenticatedTransport |
+| C1 | ~~**CRITICAL**~~ | network.rs:333-336 | ~~**OOM vulnerability**: Reads 4-byte length prefix, then allocates `vec![0u8; len]` without checking against `max_message_size`.~~ | ✅ **RESOLVED** (2026-02-11): Added 64MB max message size check before allocation in network.rs. |
+| C2 | ~~**CRITICAL**~~ | network.rs (HMAC) | ~~HMAC doesn't bind to sequence number — same message accepted multiple times. No `expected_seq` tracking per peer.~~ | ✅ **RESOLVED** (2026-02-11): HMAC now includes sequence number. Per-peer sequence tracking rejects replayed messages. |
 | 6 | High | network.rs (TLS) | `use_tls` flag enables TLS but **no cert pinning** — self-signed certs not validated. TlsTransport has fingerprint pinning, but NetworkChannel's TLS doesn't use it. | Wire in `FingerprintVerifier` from TlsTransport |
 | 7 | Medium | network.rs (HMAC) | HMAC computed on bincode serialization — bincode format can change between versions, causing false HMAC failures on upgrade | Sign raw wire format (length prefix + payload bytes) instead |
 
@@ -312,7 +314,7 @@ The module has strong cryptographic primitives but weak protocol-level guarantee
 | Key Exchange | X25519, Ed25519 | Commit-reveal | Unilateral finalize |
 | Key Rotation | SHA-256 chain | State machine | No consensus |
 | Multiplexer | N/A | Flow control | Incomplete |
-| Network Channel | HMAC | Length-prefix framing | **OOM, no replay protection** |
+| Network Channel | HMAC | Length-prefix framing | ~~OOM, no replay protection~~ ✅ Fixed |
 
 ### 3.2 Duplicate Security Mechanisms
 
@@ -320,8 +322,8 @@ The module has strong cryptographic primitives but weak protocol-level guarantee
 
 | Feature | NetworkChannel | AuthenticatedTransport |
 |---------|---------------|----------------------|
-| HMAC | SHA-256(key \|\| msg) | SHA-256(key \|\| seq \|\| msg) |
-| Replay protection | **None** | Sequence tracking |
+| HMAC | SHA-256(key \|\| seq \|\| msg) ✅ Fixed | SHA-256(key \|\| seq \|\| msg) |
+| Replay protection | Per-peer sequence tracking ✅ Fixed | Sequence tracking |
 | Constant-time comparison | Not visible | Yes (XOR accumulation) |
 
 This duplication is dangerous — a developer might use `NetworkChannel` directly (without `AuthenticatedTransport`) and get weaker security without realizing it.
@@ -361,9 +363,11 @@ All three should use HKDF-SHA256 (RFC 5869) with proper salt, IKM, and info para
 - **key_rotation.rs**: Chain derivation provides genuine forward secrecy
 - **PFSManager**: Proper zeroization of ephemeral secrets
 
-### What's Broken
-- **network.rs OOM** (C1): Trivially exploitable DoS
-- **network.rs replay** (C2): No sequence tracking in NetworkChannel HMAC
+### What's Been Fixed (2026-02-11)
+- ✅ ~~**network.rs OOM** (C1)~~ — 64MB max message size check added
+- ✅ ~~**network.rs replay** (C2)~~ — HMAC now includes sequence number; per-peer tracking rejects replays
+
+### Remaining Issues
 - **Unilateral session finalize**: One party can finalize before others are ready
 - **Key rotation without consensus**: Parties can end up with different keys
 
@@ -407,7 +411,7 @@ All three should use HKDF-SHA256 (RFC 5869) with proper salt, IKM, and info para
 - `key_rotation.rs`: Works for cooperative parties; skip for demo if rotation not needed
 
 **Not ready for multi-machine deployment:**
-- `network.rs`: OOM vulnerability must be fixed before exposing to untrusted network
+- ~~`network.rs`: OOM vulnerability~~ — ✅ Fixed; 64MB max message size check in place. HMAC replay protection added.
 - `multiplexer.rs`: Flow control incomplete; fine for demos with small message counts
 - `TcpTransport` without TLS: Vulnerable to MITM
 
@@ -418,8 +422,8 @@ All three should use HKDF-SHA256 (RFC 5869) with proper salt, IKM, and info para
 ## 7. Prioritized Recommendations
 
 ### Critical (fix before any network deployment)
-1. **Fix network.rs OOM** — Add `max_message_size` check before `vec![0u8; len]` allocation (1 line fix)
-2. **Fix network.rs replay** — Either add sequence tracking to NetworkChannel HMAC, or remove its HMAC and require AuthenticatedTransport wrapping
+1. ✅ ~~**Fix network.rs OOM**~~ — **RESOLVED** (2026-02-11): Added 64MB max message size check before allocation.
+2. ✅ ~~**Fix network.rs replay**~~ — **RESOLVED** (2026-02-11): HMAC now includes sequence number. Per-peer sequence tracking rejects replayed messages.
 
 ### High (fix before multi-party deployment)
 3. **Standardize KDF** — Replace all `SHA-256(concat)` with HKDF-SHA256 across secure_channel.rs, establishment.rs, key_rotation.rs

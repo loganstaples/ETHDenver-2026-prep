@@ -284,8 +284,8 @@ pub struct BeaverTripleInvariant {
     pub id: String,
     /// Triples to check: (a, b, c) where a * b must equal c.
     pub triples: Vec<(Fr, Fr, Fr)>,
-    /// Whether to use fixed_mul (for fixed-point encoded values).
-    pub use_fixed_mul: bool,
+    /// Whether to use mpc_scale (for fixed-point encoded values).
+    pub use_fixed_point: bool,
 }
 
 impl BeaverTripleInvariant {
@@ -294,7 +294,7 @@ impl BeaverTripleInvariant {
         Self {
             id: id.into(),
             triples: Vec::new(),
-            use_fixed_mul: false,
+            use_fixed_point: false,
         }
     }
 
@@ -304,9 +304,9 @@ impl BeaverTripleInvariant {
         self
     }
 
-    /// Use fixed-point multiplication (for TrustedDealer triples).
+    /// Use fixed-point multiplication (mpc_scale) for encoded values.
     pub fn with_fixed_mul(mut self) -> Self {
-        self.use_fixed_mul = true;
+        self.use_fixed_point = true;
         self
     }
 }
@@ -322,8 +322,8 @@ impl ProtocolInvariant for BeaverTripleInvariant {
 
     fn check(&self, context: &InvariantContext) -> Result<(), InvariantViolation> {
         for (i, (a, b, c)) in self.triples.iter().enumerate() {
-            let expected_c = if self.use_fixed_mul {
-                a.fixed_mul(b)
+            let expected_c = if self.use_fixed_point {
+                a.mpc_scale(b)
             } else {
                 Fr::mul(a, b)
             };

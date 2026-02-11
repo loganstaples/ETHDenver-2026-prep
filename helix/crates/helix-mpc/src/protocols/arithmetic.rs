@@ -40,9 +40,9 @@ impl SecureArithmetic {
     }
 
     /// Multiplies a share by a public constant: [c*x]_i = c * [x]_i.
-    /// Uses fixed-point multiplication to maintain proper scaling.
+    /// Uses mpc_scale for exact linear fixed-point arithmetic on secret shares.
     pub fn scale_share(x_share: &Fr, public_constant: &Fr) -> Fr {
-        x_share.fixed_mul(public_constant)
+        x_share.mpc_scale(public_constant)
     }
 
     /// Adds a public constant to a share.
@@ -90,11 +90,12 @@ impl SecureArithmetic {
         party_index: usize,
     ) -> Fr {
         // [xy] = [c] + d*[b] + e*[a] + d*e (d*e only added by party 0)
-        // Use fixed_mul for proper fixed-point arithmetic
-        let mut result = Fr::add(&triple.c, &opened_d.fixed_mul(&triple.b));
-        result = Fr::add(&result, &opened_e.fixed_mul(&triple.a));
+        // Use mpc_scale for exact linear fixed-point arithmetic (opened values and
+        // triple shares are random-magnitude Fr elements, so mpc_scale is required).
+        let mut result = Fr::add(&triple.c, &opened_d.mpc_scale(&triple.b));
+        result = Fr::add(&result, &opened_e.mpc_scale(&triple.a));
         if party_index == 0 {
-            result = Fr::add(&result, &opened_d.fixed_mul(opened_e));
+            result = Fr::add(&result, &opened_d.mpc_scale(opened_e));
         }
         result
     }

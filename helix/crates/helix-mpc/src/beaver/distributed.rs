@@ -133,8 +133,8 @@ impl DistributedTripleGen {
         local_b: Fr,
         received: &[TripleGenMessage],
     ) -> MPCResult<BeaverTriple> {
-        // Start with the local product term.
-        let mut c_i = Fr::mul(&local_a, &local_b);
+        // Start with the local product term using exact linear fixed-point multiplication.
+        let mut c_i = local_a.mpc_scale(&local_b);
 
         // For each received contribution, compute our share of the cross-term
         // using the pairwise random mask protocol:
@@ -156,7 +156,7 @@ impl DistributedTripleGen {
                 //
                 // Cross-term contribution: masked_a * local_b (approximation
                 // of a_j * b_i with mask that cancels across parties)
-                let cross_term = Fr::mul(masked_a, &local_b);
+                let cross_term = masked_a.mpc_scale(&local_b);
                 c_i = Fr::add(&c_i, &cross_term);
                 // Add random offset r (the peer will hold -r)
                 c_i = Fr::add(&c_i, &r);
@@ -189,8 +189,9 @@ impl DistributedTripleGen {
         }
 
         // Phase 2: Pairwise cross-term exchange (simulated locally).
+        // Use mpc_scale for exact linear fixed-point multiplication.
         let mut c_shares: Vec<Fr> = local_values.iter()
-            .map(|(a, b)| Fr::mul(a, b))
+            .map(|(a, b)| a.mpc_scale(b))
             .collect();
 
         // For each ordered pair (i, j), generate random mask r_ij:
@@ -208,7 +209,7 @@ impl DistributedTripleGen {
                 c_shares[i] = Fr::add(&c_shares[i], &r_ij);
 
                 // Party j: c_j += a_i * b_j - r_ij
-                let cross_term = Fr::mul(&local_values[i].0, &local_values[j].1);
+                let cross_term = local_values[i].0.mpc_scale(&local_values[j].1);
                 c_shares[j] = Fr::add(&c_shares[j], &Fr::sub(&cross_term, &r_ij));
             }
         }
@@ -257,7 +258,7 @@ mod tests {
         let b = sum(&shares.iter().map(|s| s.b.clone()).collect::<Vec<_>>());
         let c = sum(&shares.iter().map(|s| s.c.clone()).collect::<Vec<_>>());
 
-        let expected = Fr::mul(&a, &b);
+        let expected = a.mpc_scale(&b);
         assert!(
             c.ct_eq(&expected).to_bool(),
             "Distributed triple incorrect",
@@ -274,7 +275,7 @@ mod tests {
             let a = sum(&per_party.iter().map(|p| p[idx].a.clone()).collect::<Vec<_>>());
             let b = sum(&per_party.iter().map(|p| p[idx].b.clone()).collect::<Vec<_>>());
             let c = sum(&per_party.iter().map(|p| p[idx].c.clone()).collect::<Vec<_>>());
-            let expected = Fr::mul(&a, &b);
+            let expected = a.mpc_scale(&b);
             assert!(
                 c.ct_eq(&expected).to_bool(),
                 "Distributed triple {} incorrect",
@@ -289,7 +290,7 @@ mod tests {
         let a = Fr::add(&shares[0].a, &shares[1].a);
         let b = Fr::add(&shares[0].b, &shares[1].b);
         let c = Fr::add(&shares[0].c, &shares[1].c);
-        let expected = Fr::mul(&a, &b);
+        let expected = a.mpc_scale(&b);
         assert!(c.ct_eq(&expected).to_bool());
     }
 }

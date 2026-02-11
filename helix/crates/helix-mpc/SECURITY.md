@@ -50,12 +50,18 @@ Security relies on the following assumptions:
 - Single point of trust
 - Dealer knows all secrets
 
-**OT-Based Generation**:
-- No trusted party required
-- Based on Oblivious Transfer security
-- Computational security under DDH assumption
+**OT-Based Generation** (⚠️ DEPRECATED):
+- ~~No trusted party required~~
+- ~~Based on Oblivious Transfer security~~
+- The OT implementation has known security limitations and is gated behind `#[cfg(feature = "experimental-ot")]`
+- Use `DistributedTripleGen::simulate_distributed_batch()` for non-trusted-dealer generation
 
-**Security Level**: Computational (DDH-based)
+**Distributed Generation**:
+- Simulated multi-party OT-style generation
+- Each party contributes local randomness
+- Uses `mpc_scale` for field-exact multiplication (matches TrustedDealer)
+
+**Security Level**: Computational (DDH-based for full OT); Trusted-dealer or simulated for current deployment
 
 ### 3. Secure Arithmetic (`protocols/arithmetic`)
 
@@ -70,15 +76,17 @@ Security relies on the following assumptions:
 
 ### 4. Secure Comparison (`protocols/comparison`)
 
-**Bit Decomposition**:
-- Reveals: Nothing (values remain shared)
-- Computational overhead: O(log n) multiplications per comparison
+**⚠️ Current Implementation (Reconstruct-Compare-Reshare)**:
+- All three operations (`sign_bit`, `secure_less_than`, `decompose`) use a unified approach
+- The secret value is reconstructed among all parties, the operation is applied in cleartext, and the result is re-shared
+- **This reveals the secret value to all parties** — it is NOT fully secure comparison
+- The garbled circuit infrastructure exists in the codebase but is gated as dead code pending a production-quality OT implementation
 
 **Polynomial Approximation**:
 - Reveals: Nothing (approximate computation on shares)
 - Trade-off: Lower accuracy for better efficiency
 
-**Security Level**: Computational (for garbled circuits) or Information-theoretic (for secret-shared comparison)
+**Security Level**: ⚠️ **Reveals values** in current implementation. Garbled circuit path requires production OT.
 
 ### 5. MAC Authentication (`security/mac`)
 
@@ -160,9 +168,9 @@ Security relies on the following assumptions:
 - Optional client authentication
 
 **Message Framing**:
-- Length-prefixed messages
-- HMAC on each message (optional layer)
-- Sequence numbers prevent replay
+- Length-prefixed messages with maximum size enforcement (64 MB default, prevents OOM attacks)
+- HMAC-SHA256 on each message with sequence number binding (prevents replay)
+- Per-peer sequence tracking rejects out-of-order or replayed messages
 
 **Security Level**: Computational (TLS security)
 
@@ -174,6 +182,7 @@ For transparency, here's what information may leak during protocol execution:
 |-----------|----------|--------------|
 | Sharing | Share count, shape | Values, sum |
 | Beaver multiply | d=x-a, e=y-b | x, y, a, b, xy |
+| Comparison/sign (current impl) | Reconstructed values | Nothing (⚠️ values leak) |
 | Activation (reconstruct-reshare) | Activation values | Weights |
 | Matmul | Matrix dimensions | Matrix contents |
 | Gradient aggregation | Sum of all gradients | Individual gradients |
@@ -183,7 +192,7 @@ For transparency, here's what information may leak during protocol execution:
 
 ## Known Limitations
 
-1. **Trusted Dealer Mode**: The default demo mode uses a trusted dealer for Beaver triples. For production, use OT-based generation.
+1. **Trusted Dealer Mode**: The default demo mode uses a trusted dealer for Beaver triples. For production, use distributed generation or implement full OT.
 
 2. ~~**f64 Arithmetic**: The demo uses f64 for convenience.~~ **FIXED (Round 6)**: SPDZ MAC system and Shamir secret sharing now use BN254 Fr field arithmetic internally. The Shamir `SecretSharingScheme` trait retains f64 interface for compatibility, with Fr conversion at sharing boundaries.
 
@@ -192,6 +201,12 @@ For transparency, here's what information may leak during protocol execution:
 4. ~~**Timing Side Channels**: Operations are not constant-time.~~ **PARTIALLY FIXED (Round 6)**: Commitment verification and fingerprint checks now use constant-time hash comparison (`ct_eq_hash`). Pedersen commitments use halo2curves EC operations which are inherently constant-time. Some non-critical operations may still have variable timing.
 
 5. **Network Metadata**: Message sizes and timing patterns may leak information about computation structure.
+
+6. **OT Implementation Deprecated**: The existing OT (`beaver/ot.rs`) has known security limitations and is gated behind `experimental-ot` feature flag. Do not use in production without a full audit.
+
+7. **Comparison Reveals Values**: `sign_bit`, `secure_less_than`, and `decompose` currently reconstruct the secret value to all parties. This is a standard demo simplification — for production, a garbled circuit or fully secret-shared comparison is needed.
+
+8. **Aggregation is Plaintext**: Gradient aggregation sums are visible to all parties. Individual gradients remain private but the aggregate is revealed.
 
 ## Security Recommendations
 
@@ -206,12 +221,11 @@ let triples = dealer.generate_scalar_triples(100, 3);
 ### For Production
 
 ```rust
-// Use OT-based triple generation:
-let triples = OTTripleGenerator::simulate_full_generation(3, 100, seed);
+// Use distributed triple generation (or implement full OT):
+let triples = DistributedTripleGen::simulate_distributed_batch(100, 3, seed);
 
-// Use field arithmetic:
-let config = FieldConfig::bn254_scalar();
-let shares = FieldSharing::new(config, seed);
+// Use field arithmetic with mpc_scale for Beaver protocol:
+let c = a.mpc_scale(&b); // Field-exact fixed-point multiplication
 
 // Enable all verification:
 let detector = ByzantineDetector::new(timeout, max_faults);
@@ -219,6 +233,8 @@ let mac_keys = MACKey::generate_shares(num_parties, seed);
 
 // Use secure session establishment:
 let sessions = simulate_session_establishment(&parties, duration)?;
+
+// Network channels enforce message size limits and HMAC replay protection
 ```
 
 ## Formal Security
@@ -254,3 +270,4 @@ Contact: security@helix.network (placeholder)
 | Version | Date | Changes |
 |---------|------|---------|
 | 0.1.0 | 2025-01 | Initial implementation |
+| 0.2.0 | 2026-02 | Production readiness: standardized mpc_scale multiplication, fixed OOM/replay in network, deprecated OT, unified comparison to reconstruct-compare-reshare, removed private shares from BeaverWitness, added gradient updates to circuit bridge |
