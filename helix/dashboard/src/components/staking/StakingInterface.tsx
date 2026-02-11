@@ -47,32 +47,36 @@ export default function StakingInterface({ modelId }: StakingInterfaceProps) {
         : 0;
 
     return (
-        <div className="staking-container">
-            <div className="staking-header">
-                <h2>Staking</h2>
-                <div className="model-info">
-                    <span className="model-label">Model #{modelId}</span>
-                    {model?.active && <span className="active-badge">Active</span>}
+        <div className="bg-helix-surface border border-helix-border rounded-md p-4">
+            <div className="flex justify-between items-center mb-4">
+                <h2 className="text-xl font-semibold text-white m-0">Staking</h2>
+                <div className="flex items-center gap-2">
+                    <span className="text-[#666] text-sm">Model #{modelId}</span>
+                    {model?.active && (
+                        <span className="bg-white/10 text-white px-2 py-0.5 rounded text-xs">
+                            Active
+                        </span>
+                    )}
                 </div>
             </div>
 
             {!isConnected ? (
-                <div className="connect-prompt">
-                    <div className="icon">
+                <div className="text-center py-10 px-5">
+                    <div className="w-12 h-12 mx-auto mb-4 text-white/50">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                             <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
                             <path d="M7 11V7a5 5 0 0110 0v4" />
                         </svg>
                     </div>
-                    <p>Connect your wallet to stake</p>
+                    <p className="text-[#666] m-0">Connect your wallet to stake</p>
                 </div>
             ) : (
                 <>
                     {/* Current Stake Info */}
-                    <div className="stake-info-panel">
-                        <div className="info-row">
-                            <span className="label">Your Stake</span>
-                            <span className="value">
+                    <div className="bg-white/5 rounded-md p-4 mb-5">
+                        <div className="flex justify-between items-center py-2">
+                            <span className="text-[#666] text-sm">Your Stake</span>
+                            <span className="text-white font-medium">
                                 {stakeLoading
                                     ? '...'
                                     : stake
@@ -80,9 +84,9 @@ export default function StakingInterface({ modelId }: StakingInterfaceProps) {
                                     : '0 ETH'}
                             </span>
                         </div>
-                        <div className="info-row">
-                            <span className="label">Lock Status</span>
-                            <span className={`value ${stake?.slashed ? 'slashed' : isLocked ? 'locked' : 'unlocked'}`}>
+                        <div className="flex justify-between items-center py-2 border-t border-helix-border">
+                            <span className="text-[#666] text-sm">Lock Status</span>
+                            <span className={`font-medium ${stake?.slashed || isLocked ? 'text-[#888]' : 'text-white'}`}>
                                 {stake?.slashed
                                     ? 'Slashed'
                                     : isLocked
@@ -90,30 +94,42 @@ export default function StakingInterface({ modelId }: StakingInterfaceProps) {
                                     : 'Unlocked'}
                             </span>
                         </div>
-                        <div className="info-row">
-                            <span className="label">Min Stake</span>
-                            <span className="value">
+                        <div className="flex justify-between items-center py-2 border-t border-helix-border">
+                            <span className="text-[#666] text-sm">Min Stake</span>
+                            <span className="text-white font-medium">
                                 {model ? `${formatEther(model.minStake)} ETH` : '...'}
                             </span>
                         </div>
                     </div>
 
                     {/* Tabs */}
-                    <div className="tabs">
+                    <div className="flex gap-1 bg-white/5 rounded-md p-1 mb-5">
                         <button
-                            className={`tab ${activeTab === 'stake' ? 'active' : ''}`}
+                            className={`flex-1 py-2.5 px-4 border-none rounded-md text-sm cursor-pointer transition-all ${
+                                activeTab === 'stake'
+                                    ? 'bg-white/10 text-white'
+                                    : 'bg-transparent text-[#666] hover:text-white'
+                            }`}
                             onClick={() => setActiveTab('stake')}
                         >
                             Stake
                         </button>
                         <button
-                            className={`tab ${activeTab === 'unstake' ? 'active' : ''}`}
+                            className={`flex-1 py-2.5 px-4 border-none rounded-md text-sm cursor-pointer transition-all ${
+                                activeTab === 'unstake'
+                                    ? 'bg-white/10 text-white'
+                                    : 'bg-transparent text-[#666] hover:text-white'
+                            }`}
                             onClick={() => setActiveTab('unstake')}
                         >
                             Unstake
                         </button>
                         <button
-                            className={`tab ${activeTab === 'info' ? 'active' : ''}`}
+                            className={`flex-1 py-2.5 px-4 border-none rounded-md text-sm cursor-pointer transition-all ${
+                                activeTab === 'info'
+                                    ? 'bg-white/10 text-white'
+                                    : 'bg-transparent text-[#666] hover:text-white'
+                            }`}
                             onClick={() => setActiveTab('info')}
                         >
                             Info
@@ -121,12 +137,14 @@ export default function StakingInterface({ modelId }: StakingInterfaceProps) {
                     </div>
 
                     {/* Tab Content */}
-                    <div className="tab-content">
+                    <div className="min-h-[200px]">
                         {activeTab === 'stake' && (
-                            <div className="stake-form">
-                                <div className="input-group">
-                                    <label>Amount to Stake</label>
-                                    <div className="input-wrapper">
+                            <div>
+                                <div className="mb-4">
+                                    <label className="block text-[#666] text-sm mb-2">
+                                        Amount to Stake
+                                    </label>
+                                    <div className="flex items-center bg-black border border-helix-border rounded-md overflow-hidden focus-within:border-white/30">
                                         <input
                                             type="number"
                                             step="0.01"
@@ -134,16 +152,17 @@ export default function StakingInterface({ modelId }: StakingInterfaceProps) {
                                             value={stakeAmount}
                                             onChange={(e) => setStakeAmount(e.target.value)}
                                             disabled={pending}
+                                            className="flex-1 py-3 px-4 bg-transparent border-none text-white text-lg outline-none"
                                         />
-                                        <span className="suffix">ETH</span>
+                                        <span className="px-4 text-white/40 text-sm">ETH</span>
                                     </div>
                                 </div>
 
-                                <div className="quick-amounts">
+                                <div className="flex gap-2 mb-5">
                                     {['0.1', '0.5', '1.0', '2.0'].map((amount) => (
                                         <button
                                             key={amount}
-                                            className="quick-btn"
+                                            className="flex-1 py-2 px-2 bg-white/5 border border-helix-border rounded-md text-[#888] text-xs cursor-pointer transition-all hover:text-white hover:bg-white/10 disabled:opacity-50 disabled:cursor-not-allowed"
                                             onClick={() => setStakeAmount(amount)}
                                             disabled={pending}
                                         >
@@ -153,18 +172,18 @@ export default function StakingInterface({ modelId }: StakingInterfaceProps) {
                                 </div>
 
                                 <button
-                                    className="action-btn stake-btn"
+                                    className="w-full py-3.5 px-6 border-none rounded-md text-base font-medium cursor-pointer flex items-center justify-center gap-2 transition-all bg-white text-black hover:bg-neutral-200 disabled:opacity-50 disabled:cursor-not-allowed"
                                     onClick={handleStake}
                                     disabled={pending || parseFloat(stakeAmount) <= 0}
                                 >
                                     {pending ? (
-                                        <span className="loading">
-                                            <span className="spinner" />
+                                        <span className="flex items-center gap-2">
+                                            <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
                                             Staking...
                                         </span>
                                     ) : (
                                         <>
-                                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                            <svg className="w-[18px] h-[18px]" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                                                 <path d="M12 2v20M2 12h20" />
                                             </svg>
                                             Stake {stakeAmount} ETH
@@ -175,52 +194,56 @@ export default function StakingInterface({ modelId }: StakingInterfaceProps) {
                         )}
 
                         {activeTab === 'unstake' && (
-                            <div className="unstake-form">
+                            <div>
                                 {stake?.slashed ? (
-                                    <div className="warning-box">
-                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                    <div className="flex gap-3 p-4 rounded-md mb-5 bg-white/5 border border-helix-border">
+                                        <svg className="flex-shrink-0 w-6 h-6 text-white/50" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                                             <path d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                                         </svg>
                                         <div>
-                                            <strong>Stake Slashed</strong>
-                                            <p>Your stake was slashed due to an invalid proof submission.</p>
+                                            <strong className="block text-white mb-1">Stake Slashed</strong>
+                                            <p className="text-[#666] text-sm m-0">
+                                                Your stake was slashed due to an invalid proof submission.
+                                            </p>
                                         </div>
                                     </div>
                                 ) : isLocked ? (
-                                    <div className="info-box">
-                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                    <div className="flex gap-3 p-4 rounded-md mb-5 bg-white/5 border border-helix-border">
+                                        <svg className="flex-shrink-0 w-6 h-6 text-white/50" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                                             <circle cx="12" cy="12" r="10" />
                                             <path d="M12 6v6l4 2" />
                                         </svg>
                                         <div>
-                                            <strong>Stake Locked</strong>
-                                            <p>
+                                            <strong className="block text-white mb-1">Stake Locked</strong>
+                                            <p className="text-[#666] text-sm m-0">
                                                 Your stake will unlock in {formatDuration(lockTimeRemaining)}.
                                             </p>
                                         </div>
                                     </div>
                                 ) : null}
 
-                                <div className="unstake-amount">
-                                    <span className="label">Amount to Unstake</span>
-                                    <span className="value">
+                                <div className="text-center py-6 px-4 bg-white/5 rounded-md mb-5">
+                                    <span className="block text-[#666] text-sm mb-2">
+                                        Amount to Unstake
+                                    </span>
+                                    <span className="text-lg font-semibold text-white">
                                         {stake ? formatEther(stake.amount) : '0'} ETH
                                     </span>
                                 </div>
 
                                 <button
-                                    className="action-btn unstake-btn"
+                                    className="w-full py-3.5 px-6 rounded-md text-base font-medium cursor-pointer flex items-center justify-center gap-2 transition-all border border-white/10 text-white hover:bg-white/10 disabled:opacity-50 disabled:cursor-not-allowed"
                                     onClick={handleUnstake}
                                     disabled={pending || !stake || stake.amount === BigInt(0) || isLocked || stake.slashed}
                                 >
                                     {pending ? (
-                                        <span className="loading">
-                                            <span className="spinner" />
+                                        <span className="flex items-center gap-2">
+                                            <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
                                             Unstaking...
                                         </span>
                                     ) : (
                                         <>
-                                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                            <svg className="w-[18px] h-[18px]" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                                                 <path d="M5 12h14" />
                                             </svg>
                                             Unstake All
@@ -231,29 +254,37 @@ export default function StakingInterface({ modelId }: StakingInterfaceProps) {
                         )}
 
                         {activeTab === 'info' && (
-                            <div className="info-content">
-                                <div className="info-section">
-                                    <h3>Staking Parameters</h3>
-                                    <div className="param-grid">
-                                        <div className="param">
-                                            <span className="param-label">Lock Period</span>
-                                            <span className="param-value">
+                            <div className="text-white/80">
+                                <div className="mb-4">
+                                    <h3 className="text-sm font-semibold text-white m-0 mb-3 uppercase tracking-wider">
+                                        Staking Parameters
+                                    </h3>
+                                    <div className="grid grid-cols-3 gap-3 max-sm:grid-cols-1">
+                                        <div className="bg-white/5 p-3 rounded-md text-center">
+                                            <span className="block text-white/50 text-xs mb-1">
+                                                Lock Period
+                                            </span>
+                                            <span className="text-white font-medium">
                                                 {contractState.stakeLockPeriod !== undefined
                                                     ? formatDuration(Number(contractState.stakeLockPeriod))
                                                     : '...'}
                                             </span>
                                         </div>
-                                        <div className="param">
-                                            <span className="param-label">Slash Percentage</span>
-                                            <span className="param-value">
+                                        <div className="bg-white/5 p-3 rounded-md text-center">
+                                            <span className="block text-white/50 text-xs mb-1">
+                                                Slash Percentage
+                                            </span>
+                                            <span className="text-white font-medium">
                                                 {contractState.slashPercentage !== undefined
                                                     ? `${Number(contractState.slashPercentage) / 100}%`
                                                     : '...'}
                                             </span>
                                         </div>
-                                        <div className="param">
-                                            <span className="param-label">Default Min Stake</span>
-                                            <span className="param-value">
+                                        <div className="bg-white/5 p-3 rounded-md text-center">
+                                            <span className="block text-white/50 text-xs mb-1">
+                                                Default Min Stake
+                                            </span>
+                                            <span className="text-white font-medium">
                                                 {contractState.defaultMinStake !== undefined
                                                     ? `${formatEther(contractState.defaultMinStake)} ETH`
                                                     : '...'}
@@ -262,13 +293,23 @@ export default function StakingInterface({ modelId }: StakingInterfaceProps) {
                                     </div>
                                 </div>
 
-                                <div className="info-section">
-                                    <h3>How Staking Works</h3>
-                                    <ul>
-                                        <li>Stake ETH to participate in model training</li>
-                                        <li>Stakes are locked for {contractState.stakeLockPeriod !== undefined ? formatDuration(Number(contractState.stakeLockPeriod)) : '7 days'} after staking</li>
-                                        <li>Invalid proofs result in {contractState.slashPercentage !== undefined ? `${Number(contractState.slashPercentage) / 100}%` : '50%'} stake slashing</li>
-                                        <li>Successfully verified proofs unlock your stake immediately</li>
+                                <div className="mb-4">
+                                    <h3 className="text-sm font-semibold text-white m-0 mb-3 uppercase tracking-wider">
+                                        How Staking Works
+                                    </h3>
+                                    <ul className="m-0 pl-5">
+                                        <li className="text-white/70 text-sm mb-2">
+                                            Stake ETH to participate in model training
+                                        </li>
+                                        <li className="text-white/70 text-sm mb-2">
+                                            Stakes are locked for {contractState.stakeLockPeriod !== undefined ? formatDuration(Number(contractState.stakeLockPeriod)) : '7 days'} after staking
+                                        </li>
+                                        <li className="text-white/70 text-sm mb-2">
+                                            Invalid proofs result in {contractState.slashPercentage !== undefined ? `${Number(contractState.slashPercentage) / 100}%` : '50%'} stake slashing
+                                        </li>
+                                        <li className="text-white/70 text-sm mb-2">
+                                            Successfully verified proofs unlock your stake immediately
+                                        </li>
                                     </ul>
                                 </div>
                             </div>
@@ -277,26 +318,27 @@ export default function StakingInterface({ modelId }: StakingInterfaceProps) {
 
                     {/* Error Display */}
                     {error && (
-                        <div className="error-box">
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <div className="flex items-center gap-2 p-3 rounded-md mt-4 bg-white/5 border border-helix-border">
+                            <svg className="flex-shrink-0 w-[18px] h-[18px] text-white/50" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                                 <circle cx="12" cy="12" r="10" />
                                 <path d="M15 9l-6 6M9 9l6 6" />
                             </svg>
-                            <span>{error}</span>
+                            <span className="text-[#666] text-sm">{error}</span>
                         </div>
                     )}
 
                     {/* Transaction Status */}
                     {txHash && (
-                        <div className="tx-status">
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <div className="flex items-center gap-2 p-3 rounded-md mt-4 bg-white/5 border border-helix-border">
+                            <svg className="flex-shrink-0 w-[18px] h-[18px] text-white/50" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                                 <path d="M20 6L9 17l-5-5" />
                             </svg>
-                            <span>Transaction submitted</span>
+                            <span className="text-white text-sm">Transaction submitted</span>
                             <a
                                 href={`https://etherscan.io/tx/${txHash}`}
                                 target="_blank"
                                 rel="noopener noreferrer"
+                                className="ml-auto text-white text-sm underline"
                             >
                                 View on Etherscan
                             </a>
@@ -304,456 +346,6 @@ export default function StakingInterface({ modelId }: StakingInterfaceProps) {
                     )}
                 </>
             )}
-
-            <style jsx>{`
-                .staking-container {
-                    background: linear-gradient(135deg, #1a1a2e 0%, #16162a 100%);
-                    border-radius: 16px;
-                    padding: 24px;
-                    border: 1px solid rgba(255, 255, 255, 0.1);
-                }
-
-                .staking-header {
-                    display: flex;
-                    justify-content: space-between;
-                    align-items: center;
-                    margin-bottom: 20px;
-                }
-
-                .staking-header h2 {
-                    font-size: 20px;
-                    font-weight: 600;
-                    color: #fff;
-                    margin: 0;
-                }
-
-                .model-info {
-                    display: flex;
-                    align-items: center;
-                    gap: 8px;
-                }
-
-                .model-label {
-                    color: rgba(255, 255, 255, 0.6);
-                    font-size: 14px;
-                }
-
-                .active-badge {
-                    background: rgba(34, 197, 94, 0.2);
-                    color: #22c55e;
-                    padding: 2px 8px;
-                    border-radius: 4px;
-                    font-size: 12px;
-                }
-
-                .connect-prompt {
-                    text-align: center;
-                    padding: 40px 20px;
-                }
-
-                .connect-prompt .icon {
-                    width: 48px;
-                    height: 48px;
-                    margin: 0 auto 16px;
-                    color: rgba(255, 255, 255, 0.3);
-                }
-
-                .connect-prompt p {
-                    color: rgba(255, 255, 255, 0.6);
-                    margin: 0;
-                }
-
-                .stake-info-panel {
-                    background: rgba(255, 255, 255, 0.05);
-                    border-radius: 12px;
-                    padding: 16px;
-                    margin-bottom: 20px;
-                }
-
-                .info-row {
-                    display: flex;
-                    justify-content: space-between;
-                    align-items: center;
-                    padding: 8px 0;
-                }
-
-                .info-row:not(:last-child) {
-                    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-                }
-
-                .info-row .label {
-                    color: rgba(255, 255, 255, 0.6);
-                    font-size: 14px;
-                }
-
-                .info-row .value {
-                    color: #fff;
-                    font-weight: 500;
-                }
-
-                .info-row .value.locked {
-                    color: #f59e0b;
-                }
-
-                .info-row .value.unlocked {
-                    color: #22c55e;
-                }
-
-                .info-row .value.slashed {
-                    color: #ef4444;
-                }
-
-                .tabs {
-                    display: flex;
-                    gap: 4px;
-                    background: rgba(255, 255, 255, 0.05);
-                    border-radius: 8px;
-                    padding: 4px;
-                    margin-bottom: 20px;
-                }
-
-                .tab {
-                    flex: 1;
-                    padding: 10px 16px;
-                    border: none;
-                    border-radius: 6px;
-                    background: transparent;
-                    color: rgba(255, 255, 255, 0.6);
-                    font-size: 14px;
-                    cursor: pointer;
-                    transition: all 0.2s;
-                }
-
-                .tab:hover {
-                    color: #fff;
-                }
-
-                .tab.active {
-                    background: rgba(99, 102, 241, 0.2);
-                    color: #6366f1;
-                }
-
-                .tab-content {
-                    min-height: 200px;
-                }
-
-                .input-group {
-                    margin-bottom: 16px;
-                }
-
-                .input-group label {
-                    display: block;
-                    color: rgba(255, 255, 255, 0.6);
-                    font-size: 14px;
-                    margin-bottom: 8px;
-                }
-
-                .input-wrapper {
-                    display: flex;
-                    align-items: center;
-                    background: rgba(0, 0, 0, 0.2);
-                    border: 1px solid rgba(255, 255, 255, 0.1);
-                    border-radius: 8px;
-                    overflow: hidden;
-                }
-
-                .input-wrapper input {
-                    flex: 1;
-                    padding: 12px 16px;
-                    background: transparent;
-                    border: none;
-                    color: #fff;
-                    font-size: 18px;
-                    outline: none;
-                }
-
-                .input-wrapper .suffix {
-                    padding: 0 16px;
-                    color: rgba(255, 255, 255, 0.4);
-                    font-size: 14px;
-                }
-
-                .quick-amounts {
-                    display: flex;
-                    gap: 8px;
-                    margin-bottom: 20px;
-                }
-
-                .quick-btn {
-                    flex: 1;
-                    padding: 8px;
-                    background: rgba(255, 255, 255, 0.05);
-                    border: 1px solid rgba(255, 255, 255, 0.1);
-                    border-radius: 6px;
-                    color: rgba(255, 255, 255, 0.6);
-                    font-size: 13px;
-                    cursor: pointer;
-                    transition: all 0.2s;
-                }
-
-                .quick-btn:hover:not(:disabled) {
-                    background: rgba(255, 255, 255, 0.1);
-                    color: #fff;
-                }
-
-                .action-btn {
-                    width: 100%;
-                    padding: 14px 24px;
-                    border: none;
-                    border-radius: 8px;
-                    font-size: 16px;
-                    font-weight: 500;
-                    cursor: pointer;
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                    gap: 8px;
-                    transition: all 0.2s;
-                }
-
-                .action-btn svg {
-                    width: 18px;
-                    height: 18px;
-                }
-
-                .stake-btn {
-                    background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
-                    color: #fff;
-                }
-
-                .stake-btn:hover:not(:disabled) {
-                    transform: translateY(-1px);
-                    box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
-                }
-
-                .unstake-btn {
-                    background: rgba(239, 68, 68, 0.2);
-                    color: #ef4444;
-                    border: 1px solid rgba(239, 68, 68, 0.3);
-                }
-
-                .unstake-btn:hover:not(:disabled) {
-                    background: rgba(239, 68, 68, 0.3);
-                }
-
-                .action-btn:disabled {
-                    opacity: 0.5;
-                    cursor: not-allowed;
-                }
-
-                .loading {
-                    display: flex;
-                    align-items: center;
-                    gap: 8px;
-                }
-
-                .spinner {
-                    width: 16px;
-                    height: 16px;
-                    border: 2px solid rgba(255, 255, 255, 0.3);
-                    border-top-color: #fff;
-                    border-radius: 50%;
-                    animation: spin 0.8s linear infinite;
-                }
-
-                @keyframes spin {
-                    to {
-                        transform: rotate(360deg);
-                    }
-                }
-
-                .warning-box,
-                .info-box {
-                    display: flex;
-                    gap: 12px;
-                    padding: 16px;
-                    border-radius: 8px;
-                    margin-bottom: 20px;
-                }
-
-                .warning-box {
-                    background: rgba(239, 68, 68, 0.1);
-                    border: 1px solid rgba(239, 68, 68, 0.2);
-                }
-
-                .warning-box svg {
-                    flex-shrink: 0;
-                    width: 24px;
-                    height: 24px;
-                    color: #ef4444;
-                }
-
-                .info-box {
-                    background: rgba(245, 158, 11, 0.1);
-                    border: 1px solid rgba(245, 158, 11, 0.2);
-                }
-
-                .info-box svg {
-                    flex-shrink: 0;
-                    width: 24px;
-                    height: 24px;
-                    color: #f59e0b;
-                }
-
-                .warning-box strong,
-                .info-box strong {
-                    display: block;
-                    color: #fff;
-                    margin-bottom: 4px;
-                }
-
-                .warning-box p,
-                .info-box p {
-                    color: rgba(255, 255, 255, 0.6);
-                    font-size: 14px;
-                    margin: 0;
-                }
-
-                .unstake-amount {
-                    text-align: center;
-                    padding: 24px;
-                    background: rgba(255, 255, 255, 0.05);
-                    border-radius: 12px;
-                    margin-bottom: 20px;
-                }
-
-                .unstake-amount .label {
-                    display: block;
-                    color: rgba(255, 255, 255, 0.6);
-                    font-size: 14px;
-                    margin-bottom: 8px;
-                }
-
-                .unstake-amount .value {
-                    font-size: 28px;
-                    font-weight: 600;
-                    color: #fff;
-                }
-
-                .info-content {
-                    color: rgba(255, 255, 255, 0.8);
-                }
-
-                .info-section {
-                    margin-bottom: 24px;
-                }
-
-                .info-section h3 {
-                    font-size: 14px;
-                    font-weight: 600;
-                    color: #fff;
-                    margin: 0 0 12px 0;
-                    text-transform: uppercase;
-                    letter-spacing: 0.5px;
-                }
-
-                .param-grid {
-                    display: grid;
-                    grid-template-columns: repeat(3, 1fr);
-                    gap: 12px;
-                }
-
-                .param {
-                    background: rgba(255, 255, 255, 0.05);
-                    padding: 12px;
-                    border-radius: 8px;
-                    text-align: center;
-                }
-
-                .param-label {
-                    display: block;
-                    color: rgba(255, 255, 255, 0.5);
-                    font-size: 12px;
-                    margin-bottom: 4px;
-                }
-
-                .param-value {
-                    color: #fff;
-                    font-weight: 500;
-                }
-
-                .info-content ul {
-                    margin: 0;
-                    padding-left: 20px;
-                }
-
-                .info-content li {
-                    color: rgba(255, 255, 255, 0.7);
-                    font-size: 14px;
-                    margin-bottom: 8px;
-                }
-
-                .error-box {
-                    display: flex;
-                    align-items: center;
-                    gap: 8px;
-                    padding: 12px;
-                    background: rgba(239, 68, 68, 0.1);
-                    border: 1px solid rgba(239, 68, 68, 0.2);
-                    border-radius: 8px;
-                    margin-top: 16px;
-                }
-
-                .error-box svg {
-                    flex-shrink: 0;
-                    width: 18px;
-                    height: 18px;
-                    color: #ef4444;
-                }
-
-                .error-box span {
-                    color: #ef4444;
-                    font-size: 14px;
-                }
-
-                .tx-status {
-                    display: flex;
-                    align-items: center;
-                    gap: 8px;
-                    padding: 12px;
-                    background: rgba(34, 197, 94, 0.1);
-                    border: 1px solid rgba(34, 197, 94, 0.2);
-                    border-radius: 8px;
-                    margin-top: 16px;
-                }
-
-                .tx-status svg {
-                    flex-shrink: 0;
-                    width: 18px;
-                    height: 18px;
-                    color: #22c55e;
-                }
-
-                .tx-status span {
-                    color: #22c55e;
-                    font-size: 14px;
-                }
-
-                .tx-status a {
-                    margin-left: auto;
-                    color: #6366f1;
-                    font-size: 14px;
-                    text-decoration: none;
-                }
-
-                .tx-status a:hover {
-                    text-decoration: underline;
-                }
-
-                @media (max-width: 640px) {
-                    .param-grid {
-                        grid-template-columns: 1fr;
-                    }
-
-                    .quick-amounts {
-                        flex-wrap: wrap;
-                    }
-
-                    .quick-btn {
-                        flex: 1 1 calc(50% - 4px);
-                    }
-                }
-            `}</style>
         </div>
     );
 }

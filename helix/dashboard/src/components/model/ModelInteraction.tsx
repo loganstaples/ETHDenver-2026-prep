@@ -74,272 +74,41 @@ export default function ModelInteraction({
     };
 
     return (
-        <div className="model-interaction">
-            <style jsx>{`
-        .model-interaction {
-          background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-          border-radius: 16px;
-          padding: 24px;
-          color: #fff;
-          font-family: 'Inter', -apple-system, sans-serif;
-        }
-
-        .header {
-          display: flex;
-          justify-content: space-between;
-          align-items: center;
-          margin-bottom: 24px;
-        }
-
-        .title {
-          font-size: 24px;
-          font-weight: 700;
-          background: linear-gradient(90deg, #14b8a6, #22c55e);
-          -webkit-background-clip: text;
-          -webkit-text-fill-color: transparent;
-        }
-
-        .model-badge {
-          padding: 8px 16px;
-          background: rgba(20, 184, 166, 0.2);
-          border: 1px solid rgba(20, 184, 166, 0.3);
-          border-radius: 8px;
-          font-family: 'JetBrains Mono', monospace;
-          font-size: 14px;
-          color: #14b8a6;
-        }
-
-        .tabs {
-          display: flex;
-          gap: 4px;
-          margin-bottom: 24px;
-          background: rgba(0, 0, 0, 0.2);
-          padding: 4px;
-          border-radius: 10px;
-        }
-
-        .tab {
-          flex: 1;
-          padding: 12px;
-          border: none;
-          background: transparent;
-          color: #9ca3af;
-          font-size: 14px;
-          font-weight: 500;
-          cursor: pointer;
-          border-radius: 8px;
-          transition: all 0.2s;
-        }
-
-        .tab.active {
-          background: rgba(99, 102, 241, 0.2);
-          color: #818cf8;
-        }
-
-        .overview-grid {
-          display: grid;
-          grid-template-columns: 1fr 1fr;
-          gap: 24px;
-        }
-
-        .section {
-          background: rgba(255, 255, 255, 0.03);
-          border-radius: 12px;
-          padding: 20px;
-          border: 1px solid rgba(255, 255, 255, 0.08);
-        }
-
-        .section-title {
-          font-size: 14px;
-          font-weight: 600;
-          margin-bottom: 16px;
-          color: #d1d5db;
-        }
-
-        .version-list {
-          display: flex;
-          flex-direction: column;
-          gap: 8px;
-        }
-
-        .version-item {
-          display: flex;
-          justify-content: space-between;
-          align-items: center;
-          padding: 12px;
-          background: rgba(0, 0, 0, 0.2);
-          border-radius: 8px;
-        }
-
-        .version-tag {
-          font-weight: 600;
-          color: #14b8a6;
-        }
-
-        .version-meta {
-          display: flex;
-          gap: 16px;
-          font-size: 12px;
-          color: #9ca3af;
-        }
-
-        .stat-value {
-          font-weight: 600;
-          color: #d1d5db;
-        }
-
-        .layer-list {
-          display: flex;
-          flex-direction: column;
-          gap: 8px;
-        }
-
-        .layer-item {
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          padding: 12px;
-          background: rgba(0, 0, 0, 0.2);
-          border-radius: 8px;
-        }
-
-        .layer-name {
-          font-weight: 600;
-          font-size: 13px;
-        }
-
-        .layer-type {
-          font-size: 11px;
-          color: #6b7280;
-        }
-
-        .layer-meta {
-          display: flex;
-          gap: 12px;
-          align-items: center;
-        }
-
-        .param-count {
-          font-family: 'JetBrains Mono', monospace;
-          font-size: 12px;
-          color: #a855f7;
-        }
-
-        .quantized-badge {
-          padding: 2px 8px;
-          border-radius: 4px;
-          font-size: 10px;
-          font-weight: 600;
-          background: rgba(34, 197, 94, 0.2);
-          color: #22c55e;
-        }
-
-        .inference-section {
-          display: flex;
-          flex-direction: column;
-          gap: 16px;
-        }
-
-        .input-group {
-          display: flex;
-          gap: 12px;
-        }
-
-        .prompt-input {
-          flex: 1;
-          padding: 16px;
-          background: rgba(0, 0, 0, 0.3);
-          border: 1px solid rgba(255, 255, 255, 0.1);
-          border-radius: 12px;
-          color: #fff;
-          font-size: 14px;
-          resize: none;
-        }
-
-        .prompt-input:focus {
-          outline: none;
-          border-color: rgba(99, 102, 241, 0.5);
-        }
-
-        .generate-btn {
-          padding: 16px 32px;
-          background: linear-gradient(135deg, #6366f1, #a855f7);
-          border: none;
-          border-radius: 12px;
-          color: #fff;
-          font-weight: 600;
-          cursor: pointer;
-          transition: all 0.2s;
-        }
-
-        .generate-btn:hover {
-          transform: translateY(-2px);
-          box-shadow: 0 4px 12px rgba(99, 102, 241, 0.4);
-        }
-
-        .generate-btn:disabled {
-          opacity: 0.5;
-          cursor: not-allowed;
-          transform: none;
-        }
-
-        .response-box {
-          padding: 20px;
-          background: rgba(0, 0, 0, 0.3);
-          border-radius: 12px;
-          min-height: 120px;
-          font-size: 14px;
-          line-height: 1.6;
-          color: #d1d5db;
-        }
-
-        .cursor {
-          display: inline-block;
-          width: 8px;
-          height: 16px;
-          background: #6366f1;
-          animation: blink 1s infinite;
-          margin-left: 2px;
-        }
-
-        @keyframes blink {
-          0%, 50% { opacity: 1; }
-          51%, 100% { opacity: 0; }
-        }
-
-        .proof-notice {
-          display: flex;
-          align-items: center;
-          gap: 8px;
-          padding: 12px 16px;
-          background: rgba(34, 197, 94, 0.1);
-          border: 1px solid rgba(34, 197, 94, 0.2);
-          border-radius: 8px;
-          font-size: 13px;
-          color: #22c55e;
-        }
-      `}</style>
-
-            <div className="header">
-                <h2 className="title">Model Interaction</h2>
-                <span className="model-badge">{modelName}</span>
+        <div className="bg-helix-surface rounded-md p-4 text-white font-sans">
+            <div className="flex justify-between items-center mb-4">
+                <h2 className="font-semibold text-[15px] text-white">Model Interaction</h2>
+                <span className="px-4 py-2 bg-white/10 border border-white/10 rounded-md font-mono text-sm text-white">
+                    {modelName}
+                </span>
             </div>
 
-            <div className="tabs">
+            <div className="flex gap-1 mb-4 bg-white/[0.03] p-1 rounded-md">
                 <button
-                    className={`tab ${activeTab === 'overview' ? 'active' : ''}`}
+                    className={`flex-1 px-3 py-3 border-none text-sm font-medium cursor-pointer rounded-md transition-all ${
+                        activeTab === 'overview'
+                            ? 'bg-white/10 text-white'
+                            : 'bg-transparent text-[#888] hover:text-white'
+                    }`}
                     onClick={() => setActiveTab('overview')}
                 >
                     Overview
                 </button>
                 <button
-                    className={`tab ${activeTab === 'architecture' ? 'active' : ''}`}
+                    className={`flex-1 px-3 py-3 border-none text-sm font-medium cursor-pointer rounded-md transition-all ${
+                        activeTab === 'architecture'
+                            ? 'bg-white/10 text-white'
+                            : 'bg-transparent text-[#888] hover:text-white'
+                    }`}
                     onClick={() => setActiveTab('architecture')}
                 >
                     Architecture
                 </button>
                 <button
-                    className={`tab ${activeTab === 'inference' ? 'active' : ''}`}
+                    className={`flex-1 px-3 py-3 border-none text-sm font-medium cursor-pointer rounded-md transition-all ${
+                        activeTab === 'inference'
+                            ? 'bg-white/10 text-white'
+                            : 'bg-transparent text-[#888] hover:text-white'
+                    }`}
                     onClick={() => setActiveTab('inference')}
                 >
                     Inference
@@ -347,36 +116,36 @@ export default function ModelInteraction({
             </div>
 
             {activeTab === 'overview' && (
-                <div className="overview-grid">
-                    <div className="section">
-                        <h3 className="section-title">Model Versions</h3>
-                        <div className="version-list">
+                <div className="grid grid-cols-2 gap-3">
+                    <div className="bg-white/[0.03] rounded-md p-4 border border-helix-border">
+                        <h3 className="text-sm font-semibold mb-4 text-[#aaa]">Model Versions</h3>
+                        <div className="flex flex-col gap-2">
                             {mockVersions.map((v) => (
-                                <div key={v.version} className="version-item">
-                                    <span className="version-tag">{v.version}</span>
-                                    <div className="version-meta">
-                                        <span>Acc: <span className="stat-value">{(v.accuracy * 100).toFixed(1)}%</span></span>
-                                        <span>Loss: <span className="stat-value">{v.loss.toFixed(3)}</span></span>
+                                <div key={v.version} className="flex justify-between items-center p-3 bg-white/[0.03] rounded-md">
+                                    <span className="font-semibold text-white">{v.version}</span>
+                                    <div className="flex gap-3 text-xs text-[#888]">
+                                        <span>Acc: <span className="font-semibold text-[#aaa]">{(v.accuracy * 100).toFixed(1)}%</span></span>
+                                        <span>Loss: <span className="font-semibold text-[#aaa]">{v.loss.toFixed(3)}</span></span>
                                         <span>{v.participants} nodes</span>
                                     </div>
                                 </div>
                             ))}
                         </div>
                     </div>
-                    <div className="section">
-                        <h3 className="section-title">Model Stats</h3>
-                        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                            <div className="version-item">
-                                <span>Total Parameters</span>
-                                <span className="stat-value" style={{ color: '#a855f7' }}>{formatParams(totalParams)}</span>
+                    <div className="bg-white/[0.03] rounded-md p-4 border border-helix-border">
+                        <h3 className="text-sm font-semibold mb-4 text-[#aaa]">Model Stats</h3>
+                        <div className="flex flex-col gap-3">
+                            <div className="flex justify-between items-center p-3 bg-white/[0.03] rounded-md">
+                                <span className="text-white">Total Parameters</span>
+                                <span className="font-semibold text-white">{formatParams(totalParams)}</span>
                             </div>
-                            <div className="version-item">
-                                <span>Quantized Layers</span>
-                                <span className="stat-value" style={{ color: '#22c55e' }}>{mockLayers.filter(l => l.quantized).length}/{mockLayers.length}</span>
+                            <div className="flex justify-between items-center p-3 bg-white/[0.03] rounded-md">
+                                <span className="text-white">Quantized Layers</span>
+                                <span className="font-semibold text-white">{mockLayers.filter(l => l.quantized).length}/{mockLayers.length}</span>
                             </div>
-                            <div className="version-item">
-                                <span>Max Error Bound</span>
-                                <span className="stat-value" style={{ color: '#f59e0b' }}>{Math.max(...mockLayers.map(l => l.errorBound)).toExponential(1)}</span>
+                            <div className="flex justify-between items-center p-3 bg-white/[0.03] rounded-md">
+                                <span className="text-white">Max Error Bound</span>
+                                <span className="font-semibold text-[#888]">{Math.max(...mockLayers.map(l => l.errorBound)).toExponential(1)}</span>
                             </div>
                         </div>
                     </div>
@@ -384,18 +153,22 @@ export default function ModelInteraction({
             )}
 
             {activeTab === 'architecture' && (
-                <div className="section">
-                    <h3 className="section-title">Layer Configuration</h3>
-                    <div className="layer-list">
+                <div className="bg-white/[0.03] rounded-md p-4 border border-helix-border">
+                    <h3 className="text-sm font-semibold mb-4 text-[#aaa]">Layer Configuration</h3>
+                    <div className="flex flex-col gap-2">
                         {mockLayers.map((layer) => (
-                            <div key={layer.name} className="layer-item">
+                            <div key={layer.name} className="flex items-center justify-between p-3 bg-white/[0.03] rounded-md">
                                 <div>
-                                    <div className="layer-name">{layer.name}</div>
-                                    <div className="layer-type">{layer.type}</div>
+                                    <div className="font-semibold text-[13px] text-white">{layer.name}</div>
+                                    <div className="text-[11px] text-[#666]">{layer.type}</div>
                                 </div>
-                                <div className="layer-meta">
-                                    <span className="param-count">{formatParams(layer.params)}</span>
-                                    {layer.quantized && <span className="quantized-badge">INT8</span>}
+                                <div className="flex gap-3 items-center">
+                                    <span className="font-mono text-xs text-white">{formatParams(layer.params)}</span>
+                                    {layer.quantized && (
+                                        <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-white/10 text-white">
+                                            INT8
+                                        </span>
+                                    )}
                                 </div>
                             </div>
                         ))}
@@ -404,28 +177,30 @@ export default function ModelInteraction({
             )}
 
             {activeTab === 'inference' && (
-                <div className="inference-section">
-                    <div className="input-group">
+                <div className="flex flex-col gap-3">
+                    <div className="flex gap-3">
                         <textarea
-                            className="prompt-input"
+                            className="flex-1 p-4 bg-white/[0.03] border border-helix-border rounded-md text-white text-sm resize-none focus:outline-none focus:border-white/30 placeholder:text-[#666]"
                             placeholder="Enter your prompt..."
                             rows={3}
                             value={prompt}
                             onChange={(e) => setPrompt(e.target.value)}
                         />
                         <button
-                            className="generate-btn"
+                            className="px-8 py-4 bg-white text-black border-none rounded-md font-semibold cursor-pointer transition-all hover:-translate-y-0.5 hover:bg-neutral-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none"
                             onClick={handleInference}
                             disabled={isGenerating || !prompt.trim()}
                         >
                             {isGenerating ? 'Generating...' : 'Generate'}
                         </button>
                     </div>
-                    <div className="response-box">
+                    <div className="p-4 bg-white/[0.03] rounded-md min-h-[120px] text-sm leading-relaxed text-[#aaa]">
                         {response || 'Response will appear here...'}
-                        {isGenerating && <span className="cursor" />}
+                        {isGenerating && (
+                            <span className="inline-block w-2 h-4 bg-white ml-0.5 animate-[blink_1s_infinite]" />
+                        )}
                     </div>
-                    <div className="proof-notice">
+                    <div className="flex items-center gap-2 px-4 py-3 bg-white/[0.04] border border-helix-border rounded-md text-[13px] text-white">
                         ✓ All inference computations are verified with ZK proofs
                     </div>
                 </div>

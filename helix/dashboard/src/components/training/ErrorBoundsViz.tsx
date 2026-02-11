@@ -49,13 +49,13 @@ interface LayerBound {
 function getRiskColor(level: string): { bg: string; text: string; border: string } {
     switch (level) {
         case 'critical':
-            return { bg: 'bg-red-500/20', text: 'text-red-400', border: 'border-red-500/30' };
+            return { bg: 'bg-white/15', text: 'text-white', border: 'border-white/30' };
         case 'high':
-            return { bg: 'bg-amber-500/20', text: 'text-amber-400', border: 'border-amber-500/30' };
+            return { bg: 'bg-white/10', text: 'text-white/80', border: 'border-white/10' };
         case 'medium':
-            return { bg: 'bg-yellow-500/20', text: 'text-yellow-400', border: 'border-yellow-500/30' };
+            return { bg: 'bg-white/5', text: 'text-[#888]', border: 'border-helix-border' };
         default:
-            return { bg: 'bg-emerald-500/20', text: 'text-emerald-400', border: 'border-emerald-500/30' };
+            return { bg: 'bg-white/[0.03]', text: 'text-[#666]', border: 'border-helix-border' };
     }
 }
 
@@ -89,32 +89,32 @@ function LayerCard({
             initial={{ opacity: 0, x: -20 }}
             animate={{ opacity: 1, x: 0 }}
             transition={{ delay: index * 0.05 }}
-            className={`border rounded-lg overflow-hidden ${colors.border} ${colors.bg}`}
+            className={`border rounded-md overflow-hidden ${colors.border} ${colors.bg}`}
         >
             <button
                 onClick={onToggle}
                 className="w-full p-3 flex items-center justify-between hover:bg-white/5 transition-colors"
             >
                 <div className="flex items-center gap-3">
-                    <div className={`w-8 h-8 rounded-lg ${colors.bg} flex items-center justify-center`}>
+                    <div className={`w-8 h-8 rounded-md ${colors.bg} flex items-center justify-center`}>
                         <Layers className={`w-4 h-4 ${colors.text}`} />
                     </div>
                     <div className="text-left">
                         <div className="text-sm font-medium text-white">{layer.name}</div>
-                        <div className="text-xs text-neutral-400">{layer.operation}</div>
+                        <div className="text-xs text-[#888]">{layer.operation}</div>
                     </div>
                 </div>
 
-                <div className="flex items-center gap-4">
+                <div className="flex items-center gap-3">
                     <div className="text-right">
                         <div className={`text-sm font-medium ${colors.text}`}>
                             {layer.amplification.toFixed(2)}x
                         </div>
-                        <div className="text-xs text-neutral-500">amplification</div>
+                        <div className="text-xs text-[#666]">amplification</div>
                     </div>
                     <motion.div
                         animate={{ rotate: isExpanded ? 90 : 0 }}
-                        className="text-neutral-500"
+                        className="text-[#666]"
                     >
                         <ChevronRight className="w-4 h-4" />
                     </motion.div>
@@ -127,18 +127,18 @@ function LayerCard({
                         initial={{ height: 0, opacity: 0 }}
                         animate={{ height: 'auto', opacity: 1 }}
                         exit={{ height: 0, opacity: 0 }}
-                        className="border-t border-neutral-800"
+                        className="border-t border-helix-border"
                     >
                         <div className="p-3 space-y-3">
                             <div className="grid grid-cols-2 gap-3">
-                                <div className="bg-neutral-800/50 rounded-lg p-2">
-                                    <div className="text-xs text-neutral-400">Input Bound</div>
+                                <div className="bg-neutral-800/50 rounded-md p-2">
+                                    <div className="text-xs text-[#888]">Input Bound</div>
                                     <div className="text-sm font-mono text-white">
                                         {layer.inputBound.toExponential(4)}
                                     </div>
                                 </div>
-                                <div className="bg-neutral-800/50 rounded-lg p-2">
-                                    <div className="text-xs text-neutral-400">Output Bound</div>
+                                <div className="bg-neutral-800/50 rounded-md p-2">
+                                    <div className="text-xs text-[#888]">Output Bound</div>
                                     <div className="text-sm font-mono text-white">
                                         {layer.outputBound.toExponential(4)}
                                     </div>
@@ -147,12 +147,12 @@ function LayerCard({
 
                             <div>
                                 <div className="flex items-center justify-between text-xs mb-1">
-                                    <span className="text-neutral-400">Contribution to Total</span>
+                                    <span className="text-[#888]">Contribution to Total</span>
                                     <span className={colors.text}>{(layer.contribution * 100).toFixed(1)}%</span>
                                 </div>
                                 <div className="h-2 bg-neutral-700 rounded-full overflow-hidden">
                                     <motion.div
-                                        className={`h-full rounded-full ${colors.bg.replace('/20', '')}`}
+                                        className="h-full rounded-full bg-white"
                                         initial={{ width: 0 }}
                                         animate={{ width: `${layer.contribution * 100}%` }}
                                         transition={{ duration: 0.5 }}
@@ -193,17 +193,17 @@ function BoundTimeline({
     const thresholdY = padding + chartHeight - (maxBound / maxY) * chartHeight;
 
     return (
-        <div className="bg-neutral-800/30 rounded-lg p-4">
+        <div className="bg-neutral-800/30 rounded-md p-4">
             <div className="flex items-center justify-between mb-3">
-                <h4 className="text-sm font-medium text-neutral-300">Error Bound Timeline</h4>
+                <h4 className="text-sm font-medium text-[#aaa]">Error Bound Timeline</h4>
                 <div className="flex items-center gap-2 text-xs">
                     <div className="flex items-center gap-1">
-                        <div className="w-3 h-0.5 bg-amber-500" />
-                        <span className="text-neutral-400">Accumulated</span>
+                        <div className="w-3 h-0.5 bg-white" />
+                        <span className="text-[#888]">Accumulated</span>
                     </div>
                     <div className="flex items-center gap-1">
-                        <div className="w-3 h-0.5 bg-red-500/50" style={{ borderStyle: 'dashed' }} />
-                        <span className="text-neutral-400">Max Allowed</span>
+                        <div className="w-3 h-0.5 bg-white/50" style={{ borderStyle: 'dashed' }} />
+                        <span className="text-[#888]">Max Allowed</span>
                     </div>
                 </div>
             </div>
@@ -215,10 +215,10 @@ function BoundTimeline({
                     y1={thresholdY}
                     x2={width - padding}
                     y2={thresholdY}
-                    stroke="#ef4444"
+                    stroke="#ffffff"
                     strokeWidth={1}
                     strokeDasharray="4,4"
-                    opacity={0.5}
+                    opacity={0.3}
                 />
 
                 {/* Area fill */}
@@ -231,7 +231,7 @@ function BoundTimeline({
                 <path
                     d={pathD}
                     fill="none"
-                    stroke="#f59e0b"
+                    stroke="#ffffff"
                     strokeWidth={2}
                     strokeLinecap="round"
                 />
@@ -242,15 +242,15 @@ function BoundTimeline({
                         cx={points[points.length - 1].x}
                         cy={points[points.length - 1].y}
                         r={4}
-                        fill="#f59e0b"
+                        fill="#ffffff"
                     />
                 )}
 
                 {/* Gradient definition */}
                 <defs>
                     <linearGradient id="boundGradient" x1="0%" y1="0%" x2="0%" y2="100%">
-                        <stop offset="0%" stopColor="#f59e0b" stopOpacity="0.3" />
-                        <stop offset="100%" stopColor="#f59e0b" stopOpacity="0" />
+                        <stop offset="0%" stopColor="#ffffff" stopOpacity="0.3" />
+                        <stop offset="100%" stopColor="#ffffff" stopOpacity="0" />
                     </linearGradient>
                 </defs>
             </svg>
@@ -360,7 +360,7 @@ export default function ErrorBoundsViz({
 
     if (isLoading && !metrics) {
         return (
-            <div className={`bg-neutral-900/50 rounded-xl border border-neutral-800 p-6 ${className}`}>
+            <div className={`bg-helix-surface rounded-md border border-helix-border p-4 ${className}`}>
                 <div className="animate-pulse">
                     <div className="h-6 bg-neutral-800 rounded w-1/3 mb-4" />
                     <div className="h-32 bg-neutral-800 rounded" />
@@ -373,7 +373,7 @@ export default function ErrorBoundsViz({
 
     if (compact) {
         return (
-            <div className={`bg-neutral-900/50 rounded-xl border border-neutral-800 p-4 ${className}`}>
+            <div className={`bg-helix-surface rounded-md border border-helix-border p-4 ${className}`}>
                 <div className="flex items-center justify-between mb-3">
                     <div className="flex items-center gap-2">
                         <Shield className={`w-5 h-5 ${statusColors.text}`} />
@@ -386,16 +386,16 @@ export default function ErrorBoundsViz({
                 <div className="h-2 bg-neutral-700 rounded-full overflow-hidden">
                     <motion.div
                         className={`h-full rounded-full ${
-                            stats.percentage > 80 ? 'bg-red-500' :
-                            stats.percentage > 60 ? 'bg-amber-500' :
-                            stats.percentage > 40 ? 'bg-yellow-500' : 'bg-emerald-500'
+                            stats.percentage > 80 ? 'bg-white' :
+                            stats.percentage > 60 ? 'bg-white/80' :
+                            stats.percentage > 40 ? 'bg-white/60' : 'bg-white/40'
                         }`}
                         initial={{ width: 0 }}
                         animate={{ width: `${stats.percentage}%` }}
                         transition={{ duration: 0.5 }}
                     />
                 </div>
-                <div className="flex items-center justify-between mt-2 text-xs text-neutral-400">
+                <div className="flex items-center justify-between mt-2 text-xs text-[#888]">
                     <span>Current: {stats.currentBound.toExponential(2)}</span>
                     <span>Max: {stats.maxBound.toExponential(2)}</span>
                 </div>
@@ -404,23 +404,23 @@ export default function ErrorBoundsViz({
     }
 
     return (
-        <div className={`bg-neutral-900/50 rounded-xl border border-neutral-800 overflow-hidden ${className}`}>
+        <div className={`bg-helix-surface rounded-md border border-helix-border overflow-hidden ${className}`}>
             {/* Header */}
-            <div className="p-4 border-b border-neutral-800">
+            <div className="p-4 border-b border-helix-border">
                 <div className="flex items-center justify-between">
                     <div className="flex items-center gap-3">
-                        <div className={`w-10 h-10 rounded-lg ${statusColors.bg} flex items-center justify-center`}>
+                        <div className={`w-10 h-10 rounded-md ${statusColors.bg} flex items-center justify-center`}>
                             <Shield className={`w-5 h-5 ${statusColors.text}`} />
                         </div>
                         <div>
                             <h3 className="font-semibold text-white">Error Bound Analysis</h3>
-                            <p className="text-sm text-neutral-400">
+                            <p className="text-sm text-[#888]">
                                 Numerical precision tracking across layers
                             </p>
                         </div>
                     </div>
 
-                    <div className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-sm font-medium ${statusColors.bg} ${statusColors.text}`}>
+                    <div className={`flex items-center gap-2 px-3 py-1.5 rounded-md text-sm font-medium ${statusColors.bg} ${statusColors.text}`}>
                         {stats.isHealthy ? (
                             <CheckCircle className="w-4 h-4" />
                         ) : (
@@ -432,29 +432,29 @@ export default function ErrorBoundsViz({
             </div>
 
             {/* Stats */}
-            <div className="p-4 border-b border-neutral-800">
-                <div className="grid grid-cols-4 gap-4">
-                    <div className="bg-neutral-800/30 rounded-lg p-3">
-                        <div className="text-xs text-neutral-400 mb-1">Accumulated</div>
-                        <div className="text-lg font-bold font-mono text-amber-400">
+            <div className="p-4 border-b border-helix-border">
+                <div className="grid grid-cols-4 gap-3">
+                    <div className="bg-neutral-800/30 rounded-md p-3">
+                        <div className="text-xs text-[#888] mb-1">Accumulated</div>
+                        <div className="text-lg font-bold font-mono text-white">
                             {stats.currentBound.toExponential(2)}
                         </div>
                     </div>
-                    <div className="bg-neutral-800/30 rounded-lg p-3">
-                        <div className="text-xs text-neutral-400 mb-1">Max Allowed</div>
+                    <div className="bg-neutral-800/30 rounded-md p-3">
+                        <div className="text-xs text-[#888] mb-1">Max Allowed</div>
                         <div className="text-lg font-bold font-mono text-white">
                             {stats.maxBound.toExponential(2)}
                         </div>
                     </div>
-                    <div className="bg-neutral-800/30 rounded-lg p-3">
-                        <div className="text-xs text-neutral-400 mb-1">Budget Remaining</div>
-                        <div className={`text-lg font-bold font-mono ${stats.remainingBudget > 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                    <div className="bg-neutral-800/30 rounded-md p-3">
+                        <div className="text-xs text-[#888] mb-1">Budget Remaining</div>
+                        <div className="text-lg font-bold font-mono text-white">
                             {stats.remainingBudget.toExponential(2)}
                         </div>
                     </div>
-                    <div className="bg-neutral-800/30 rounded-lg p-3">
-                        <div className="text-xs text-neutral-400 mb-1">Max Amplification</div>
-                        <div className={`text-lg font-bold ${stats.maxAmplification > 1.5 ? 'text-amber-400' : 'text-emerald-400'}`}>
+                    <div className="bg-neutral-800/30 rounded-md p-3">
+                        <div className="text-xs text-[#888] mb-1">Max Amplification</div>
+                        <div className="text-lg font-bold text-white">
                             {stats.maxAmplification.toFixed(2)}x
                         </div>
                     </div>
@@ -463,24 +463,24 @@ export default function ErrorBoundsViz({
                 {/* Progress bar */}
                 <div className="mt-4">
                     <div className="flex items-center justify-between text-xs mb-2">
-                        <span className="text-neutral-400">Error Bound Usage</span>
+                        <span className="text-[#888]">Error Bound Usage</span>
                         <span className={statusColors.text}>{stats.percentage.toFixed(1)}%</span>
                     </div>
                     <div className="h-3 bg-neutral-700 rounded-full overflow-hidden relative">
                         <motion.div
                             className={`h-full rounded-full ${
-                                stats.percentage > 80 ? 'bg-red-500' :
-                                stats.percentage > 60 ? 'bg-amber-500' :
-                                stats.percentage > 40 ? 'bg-yellow-500' : 'bg-emerald-500'
+                                stats.percentage > 80 ? 'bg-white' :
+                                stats.percentage > 60 ? 'bg-white/80' :
+                                stats.percentage > 40 ? 'bg-white/60' : 'bg-white/40'
                             }`}
                             initial={{ width: 0 }}
                             animate={{ width: `${stats.percentage}%` }}
                             transition={{ duration: 0.5 }}
                         />
                         {/* Warning threshold marker */}
-                        <div className="absolute top-0 bottom-0 w-0.5 bg-amber-500/50" style={{ left: '60%' }} />
+                        <div className="absolute top-0 bottom-0 w-0.5 bg-white/50" style={{ left: '60%' }} />
                         {/* Critical threshold marker */}
-                        <div className="absolute top-0 bottom-0 w-0.5 bg-red-500/50" style={{ left: '80%' }} />
+                        <div className="absolute top-0 bottom-0 w-0.5 bg-white/30" style={{ left: '80%' }} />
                     </div>
                 </div>
 
@@ -488,13 +488,13 @@ export default function ErrorBoundsViz({
                 {(stats.criticalLayers > 0 || stats.highRiskLayers > 0) && (
                     <div className="mt-3 flex items-center gap-3 text-sm">
                         {stats.criticalLayers > 0 && (
-                            <div className="flex items-center gap-1 text-red-400">
+                            <div className="flex items-center gap-1 text-white/70">
                                 <AlertTriangle className="w-4 h-4" />
                                 <span>{stats.criticalLayers} critical layer{stats.criticalLayers > 1 ? 's' : ''}</span>
                             </div>
                         )}
                         {stats.highRiskLayers > 0 && (
-                            <div className="flex items-center gap-1 text-amber-400">
+                            <div className="flex items-center gap-1 text-white/70">
                                 <TrendingUp className="w-4 h-4" />
                                 <span>{stats.highRiskLayers} high risk layer{stats.highRiskLayers > 1 ? 's' : ''}</span>
                             </div>
@@ -505,7 +505,7 @@ export default function ErrorBoundsViz({
 
             {/* Timeline */}
             {showTimeline && errorBoundHistory.length > 0 && (
-                <div className="p-4 border-b border-neutral-800">
+                <div className="p-4 border-b border-helix-border">
                     <BoundTimeline
                         history={errorBoundHistory}
                         maxBound={stats.maxBound}
@@ -517,8 +517,8 @@ export default function ErrorBoundsViz({
             {showDetails && (
                 <div className="p-4">
                     <div className="flex items-center justify-between mb-3">
-                        <h4 className="text-sm font-medium text-neutral-300">Layer Breakdown</h4>
-                        <div className="flex items-center gap-1 text-xs text-neutral-500">
+                        <h4 className="text-sm font-medium text-[#aaa]">Layer Breakdown</h4>
+                        <div className="flex items-center gap-1 text-xs text-[#666]">
                             <Info className="w-3 h-3" />
                             <span>Click to expand</span>
                         </div>
@@ -538,8 +538,8 @@ export default function ErrorBoundsViz({
             )}
 
             {/* Footer */}
-            <div className="px-4 py-3 border-t border-neutral-800 bg-neutral-800/30">
-                <div className="flex items-center justify-between text-xs text-neutral-400">
+            <div className="px-4 py-3 border-t border-helix-border bg-neutral-800/30">
+                <div className="flex items-center justify-between text-xs text-[#888]">
                     <div className="flex items-center gap-2">
                         <Zap className="w-3.5 h-3.5" />
                         <span>Error bounds verified via ZK circuits</span>

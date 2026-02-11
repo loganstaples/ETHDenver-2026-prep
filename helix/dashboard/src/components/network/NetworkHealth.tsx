@@ -103,19 +103,26 @@ export default function NetworkHealth() {
         const criticalCount = healthMetrics.filter((m) => m.status === 'critical').length;
         const warningCount = healthMetrics.filter((m) => m.status === 'warning').length;
 
-        if (criticalCount > 0) return { status: 'critical', label: 'Critical Issues', color: '#ef4444' };
-        if (warningCount > 1) return { status: 'warning', label: 'Needs Attention', color: '#f59e0b' };
-        if (warningCount === 1) return { status: 'good', label: 'Minor Issues', color: '#22c55e' };
-        return { status: 'healthy', label: 'All Systems Healthy', color: '#22c55e' };
+        if (criticalCount > 0) return { status: 'critical', label: 'Critical Issues', color: '#ffffff' };
+        if (warningCount > 1) return { status: 'warning', label: 'Needs Attention', color: '#ffffff' };
+        if (warningCount === 1) return { status: 'good', label: 'Minor Issues', color: '#ffffff' };
+        return { status: 'healthy', label: 'All Systems Healthy', color: '#ffffff' };
     }, [healthMetrics]);
 
     const getStatusColor = (status: string) => {
         const colors: Record<string, string> = {
-            healthy: '#22c55e',
-            warning: '#f59e0b',
-            critical: '#ef4444',
+            healthy: '#ffffff',
+            warning: '#a3a3a3',
+            critical: '#737373',
         };
         return colors[status] || '#6b7280';
+    };
+
+    const getMetricBarOpacity = (metric: HealthMetric) => {
+        const percentage = (metric.value / metric.max) * 100;
+        if (percentage >= 80) return 1;
+        if (percentage >= 50) return 0.7;
+        return 0.4;
     };
 
     const getNetworkName = (id: number) => {
@@ -128,327 +135,95 @@ export default function NetworkHealth() {
     };
 
     return (
-        <div className="network-health">
-            <style jsx>{`
-                .network-health {
-                    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-                    border-radius: 16px;
-                    padding: 24px;
-                    color: #fff;
-                    font-family: 'Inter', -apple-system, sans-serif;
-                }
-
-                .header {
-                    display: flex;
-                    justify-content: space-between;
-                    align-items: center;
-                    margin-bottom: 24px;
-                }
-
-                .title {
-                    font-size: 24px;
-                    font-weight: 700;
-                    background: linear-gradient(90deg, #22c55e, #6366f1);
-                    -webkit-background-clip: text;
-                    -webkit-text-fill-color: transparent;
-                }
-
-                .network-badge {
-                    display: flex;
-                    align-items: center;
-                    gap: 8px;
-                    padding: 8px 16px;
-                    background: rgba(99, 102, 241, 0.2);
-                    border-radius: 8px;
-                    font-size: 13px;
-                }
-
-                .network-dot {
-                    width: 8px;
-                    height: 8px;
-                    border-radius: 50%;
-                    background: #22c55e;
-                    animation: pulse 2s infinite;
-                }
-
-                @keyframes pulse {
-                    0%, 100% { opacity: 1; transform: scale(1); }
-                    50% { opacity: 0.7; transform: scale(1.2); }
-                }
-
-                .overall-status {
-                    display: flex;
-                    align-items: center;
-                    gap: 16px;
-                    padding: 20px;
-                    background: rgba(255, 255, 255, 0.03);
-                    border-radius: 16px;
-                    border: 1px solid rgba(255, 255, 255, 0.08);
-                    margin-bottom: 24px;
-                }
-
-                .status-icon {
-                    width: 64px;
-                    height: 64px;
-                    border-radius: 50%;
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                    font-size: 32px;
-                }
-
-                .status-text {
-                    flex: 1;
-                }
-
-                .status-label {
-                    font-size: 24px;
-                    font-weight: 700;
-                    margin-bottom: 4px;
-                }
-
-                .status-detail {
-                    font-size: 14px;
-                    color: #9ca3af;
-                }
-
-                .block-info {
-                    text-align: right;
-                }
-
-                .block-number {
-                    font-size: 20px;
-                    font-weight: 700;
-                    font-family: 'JetBrains Mono', monospace;
-                    color: #6366f1;
-                }
-
-                .block-label {
-                    font-size: 11px;
-                    color: #6b7280;
-                    text-transform: uppercase;
-                }
-
-                .metrics-grid {
-                    display: grid;
-                    grid-template-columns: repeat(3, 1fr);
-                    gap: 16px;
-                    margin-bottom: 24px;
-                }
-
-                .metric-card {
-                    background: rgba(255, 255, 255, 0.03);
-                    border-radius: 12px;
-                    padding: 16px;
-                    border: 1px solid rgba(255, 255, 255, 0.08);
-                }
-
-                .metric-header {
-                    display: flex;
-                    justify-content: space-between;
-                    align-items: center;
-                    margin-bottom: 12px;
-                }
-
-                .metric-name {
-                    font-size: 13px;
-                    font-weight: 600;
-                    color: #d1d5db;
-                }
-
-                .metric-status {
-                    width: 10px;
-                    height: 10px;
-                    border-radius: 50%;
-                }
-
-                .metric-bar-bg {
-                    width: 100%;
-                    height: 6px;
-                    background: rgba(255, 255, 255, 0.1);
-                    border-radius: 3px;
-                    overflow: hidden;
-                    margin-bottom: 8px;
-                }
-
-                .metric-bar {
-                    height: 100%;
-                    border-radius: 3px;
-                    transition: width 0.5s ease;
-                }
-
-                .metric-description {
-                    font-size: 11px;
-                    color: #6b7280;
-                }
-
-                .stats-row {
-                    display: grid;
-                    grid-template-columns: repeat(4, 1fr);
-                    gap: 16px;
-                }
-
-                .stat-card {
-                    background: rgba(0, 0, 0, 0.2);
-                    padding: 16px;
-                    border-radius: 12px;
-                    text-align: center;
-                }
-
-                .stat-value {
-                    font-size: 24px;
-                    font-weight: 700;
-                    margin-bottom: 4px;
-                    font-family: 'JetBrains Mono', monospace;
-                }
-
-                .stat-label {
-                    font-size: 11px;
-                    color: #6b7280;
-                    text-transform: uppercase;
-                }
-
-                .loading {
-                    text-align: center;
-                    padding: 40px;
-                    color: #6b7280;
-                }
-
-                .events-section {
-                    margin-top: 24px;
-                }
-
-                .events-title {
-                    font-size: 14px;
-                    font-weight: 600;
-                    color: #d1d5db;
-                    margin-bottom: 12px;
-                }
-
-                .event-list {
-                    display: flex;
-                    flex-direction: column;
-                    gap: 8px;
-                    max-height: 200px;
-                    overflow-y: auto;
-                }
-
-                .event-item {
-                    display: flex;
-                    align-items: center;
-                    gap: 12px;
-                    padding: 10px 12px;
-                    background: rgba(255, 255, 255, 0.02);
-                    border-radius: 8px;
-                    font-size: 12px;
-                }
-
-                .event-dot {
-                    width: 8px;
-                    height: 8px;
-                    border-radius: 50%;
-                }
-
-                .event-text {
-                    flex: 1;
-                    color: #d1d5db;
-                }
-
-                .event-time {
-                    color: #6b7280;
-                    font-family: 'JetBrains Mono', monospace;
-                }
-            `}</style>
-
-            <div className="header">
-                <h2 className="title">Network Health</h2>
-                <div className="network-badge">
-                    <span className="network-dot" />
+        <div className="bg-helix-surface rounded-md p-4 text-white border border-helix-border">
+            <div className="flex justify-between items-center mb-4">
+                <h2 className="text-white font-semibold text-[15px]">Network Health</h2>
+                <div className="flex items-center gap-2 px-4 py-2 bg-white/5 border border-helix-border rounded-md text-sm">
+                    <span className="w-2 h-2 rounded-full bg-white animate-pulse" />
                     <span>{getNetworkName(chainId)}</span>
                 </div>
             </div>
 
             {isLoading ? (
-                <div className="loading">Loading network status...</div>
+                <div className="text-center py-10 text-[#666]">Loading network status...</div>
             ) : (
                 <>
-                    <div className="overall-status">
+                    <div className="flex items-center gap-3 p-4 bg-white/[0.03] rounded-md border border-helix-border mb-4">
                         <div
-                            className="status-icon"
-                            style={{ backgroundColor: `${overallHealth.color}22`, color: overallHealth.color }}
+                            className="w-16 h-16 rounded-md flex items-center justify-center text-xl bg-white/10 text-white"
                         >
                             {overallHealth.status === 'healthy' ? '✓' :
                              overallHealth.status === 'good' ? '○' :
                              overallHealth.status === 'warning' ? '!' : '✕'}
                         </div>
-                        <div className="status-text">
-                            <div className="status-label" style={{ color: overallHealth.color }}>
+                        <div className="flex-1">
+                            <div className="text-[15px] font-semibold mb-1 text-white">
                                 {overallHealth.label}
                             </div>
-                            <div className="status-detail">
+                            <div className="text-sm text-[#888]">
                                 {healthMetrics.filter((m) => m.status === 'healthy').length} of {healthMetrics.length} metrics healthy
                             </div>
                         </div>
-                        <div className="block-info">
-                            <div className="block-number">#{blockNumber?.toString() || '...'}</div>
-                            <div className="block-label">Latest Block</div>
+                        <div className="text-right">
+                            <div className="text-white font-mono text-xl font-bold">#{blockNumber?.toString() || '...'}</div>
+                            <div className="text-xs text-[#666] uppercase">Latest Block</div>
                         </div>
                     </div>
 
-                    <div className="metrics-grid">
+                    <div className="grid grid-cols-3 gap-3 mb-4">
                         {healthMetrics.map((metric) => (
-                            <div key={metric.name} className="metric-card">
-                                <div className="metric-header">
-                                    <span className="metric-name">{metric.name}</span>
+                            <div key={metric.name} className="bg-white/[0.03] rounded-md p-4 border border-helix-border">
+                                <div className="flex justify-between items-center mb-3">
+                                    <span className="text-sm font-semibold text-[#aaa]">{metric.name}</span>
                                     <div
-                                        className="metric-status"
+                                        className="w-2.5 h-2.5 rounded-full"
                                         style={{ backgroundColor: getStatusColor(metric.status) }}
                                     />
                                 </div>
-                                <div className="metric-bar-bg">
+                                <div className="w-full h-1.5 bg-white/10 rounded-full overflow-hidden mb-2">
                                     <div
-                                        className="metric-bar"
+                                        className="h-full rounded-full bg-white transition-all duration-500"
                                         style={{
                                             width: `${(metric.value / metric.max) * 100}%`,
-                                            backgroundColor: getStatusColor(metric.status),
+                                            opacity: getMetricBarOpacity(metric),
                                         }}
                                     />
                                 </div>
-                                <div className="metric-description">{metric.description}</div>
+                                <div className="text-xs text-[#666]">{metric.description}</div>
                             </div>
                         ))}
                     </div>
 
-                    <div className="stats-row">
-                        <div className="stat-card">
-                            <div className="stat-value" style={{ color: '#6366f1' }}>
+                    <div className="grid grid-cols-4 gap-3">
+                        <div className="bg-white/[0.03] p-4 rounded-md text-center">
+                            <div className="text-[15px] font-semibold text-white mb-1 font-mono">
                                 {nextModelId?.toString() || '0'}
                             </div>
-                            <div className="stat-label">Registered Models</div>
+                            <div className="text-xs text-[#666] uppercase">Registered Models</div>
                         </div>
-                        <div className="stat-card">
-                            <div className="stat-value" style={{ color: '#22c55e' }}>
+                        <div className="bg-white/[0.03] p-4 rounded-md text-center">
+                            <div className="text-[15px] font-semibold text-white mb-1 font-mono">
                                 {proofEvents.length}
                             </div>
-                            <div className="stat-label">Total Proofs</div>
+                            <div className="text-xs text-[#666] uppercase">Total Proofs</div>
                         </div>
-                        <div className="stat-card">
-                            <div className="stat-value" style={{ color: '#a855f7' }}>
+                        <div className="bg-white/[0.03] p-4 rounded-md text-center">
+                            <div className="text-[15px] font-semibold text-white mb-1 font-mono">
                                 {roundCompletedEvents.length}
                             </div>
-                            <div className="stat-label">Completed Rounds</div>
+                            <div className="text-xs text-[#666] uppercase">Completed Rounds</div>
                         </div>
-                        <div className="stat-card">
-                            <div className="stat-value" style={{ color: '#ef4444' }}>
+                        <div className="bg-white/[0.03] p-4 rounded-md text-center">
+                            <div className="text-[15px] font-semibold text-white mb-1 font-mono">
                                 {slashingRecordCount?.toString() || '0'}
                             </div>
-                            <div className="stat-label">Slashing Events</div>
+                            <div className="text-xs text-[#666] uppercase">Slashing Events</div>
                         </div>
                     </div>
 
-                    <div className="events-section">
-                        <div className="events-title">Recent Network Events</div>
-                        <div className="event-list">
+                    <div className="mt-4">
+                        <div className="text-sm font-semibold text-[#aaa] mb-3">Recent Network Events</div>
+                        <div className="flex flex-col gap-2 max-h-[200px] overflow-y-auto">
                             {[...proofEvents, ...roundStartedEvents, ...roundCompletedEvents]
                                 .sort((a, b) => b.timestamp - a.timestamp)
                                 .slice(0, 10)
@@ -456,31 +231,26 @@ export default function NetworkHealth() {
                                     const isProof = 'prover' in event && 'newCommitment' in event;
                                     const isRoundStart = 'deadline' in event && !('newCommitment' in event);
                                     const type = isProof ? 'proof' : isRoundStart ? 'round-start' : 'round-complete';
-                                    const colors: Record<string, string> = {
-                                        'proof': '#22c55e',
-                                        'round-start': '#6366f1',
-                                        'round-complete': '#a855f7',
-                                    };
                                     const labels: Record<string, string> = {
                                         'proof': 'Proof Submitted',
                                         'round-start': 'Round Started',
                                         'round-complete': 'Round Completed',
                                     };
                                     return (
-                                        <div key={`${type}-${idx}`} className="event-item">
-                                            <div className="event-dot" style={{ backgroundColor: colors[type] }} />
-                                            <span className="event-text">
+                                        <div key={`${type}-${idx}`} className="flex items-center gap-3 px-3 py-2.5 bg-white/[0.02] rounded-md text-xs">
+                                            <div className="w-2 h-2 rounded-full bg-white" />
+                                            <span className="flex-1 text-[#aaa]">
                                                 {labels[type]} - Model #{event.modelId.toString()}
                                                 {isProof && ` by ${(event as unknown as { prover: string }).prover.slice(0, 8)}...`}
                                             </span>
-                                            <span className="event-time">
+                                            <span className="text-[#666] font-mono">
                                                 {new Date(event.timestamp * 1000).toLocaleTimeString()}
                                             </span>
                                         </div>
                                     );
                                 })}
                             {proofEvents.length === 0 && roundStartedEvents.length === 0 && (
-                                <div className="event-item" style={{ justifyContent: 'center', color: '#6b7280' }}>
+                                <div className="flex items-center justify-center px-3 py-2.5 bg-white/[0.02] rounded-md text-xs text-[#666]">
                                     No recent events - waiting for network activity...
                                 </div>
                             )}

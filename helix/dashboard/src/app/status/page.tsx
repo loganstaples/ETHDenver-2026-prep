@@ -112,11 +112,11 @@ function generateMockErrorLogs(): ErrorLogEntry[] {
 
 function StatusIndicator({ status }: { status: 'online' | 'offline' | 'syncing' | 'proving' | 'training' }) {
     const colors = {
-        online: 'bg-emerald-500',
-        offline: 'bg-red-500',
-        syncing: 'bg-yellow-500',
-        proving: 'bg-blue-500',
-        training: 'bg-purple-500',
+        online: 'bg-white',
+        offline: 'bg-neutral-600',
+        syncing: 'bg-white/60',
+        proving: 'bg-white/80',
+        training: 'bg-white/80',
     };
 
     const labels = {
@@ -130,7 +130,7 @@ function StatusIndicator({ status }: { status: 'online' | 'offline' | 'syncing' 
     return (
         <span className="flex items-center gap-1.5">
             <span className={`w-2 h-2 rounded-full ${colors[status]}`} />
-            <span className="text-xs text-neutral-400">{labels[status]}</span>
+            <span className="text-xs text-[#888]">{labels[status]}</span>
         </span>
     );
 }
@@ -143,16 +143,16 @@ function RefreshIndicator({ lastRefresh, isRefreshing }: { lastRefresh: number; 
     const secondsAgo = Math.floor((Date.now() - lastRefresh) / 1000);
 
     return (
-        <div className="flex items-center gap-2 text-xs text-neutral-500">
+        <div className="flex items-center gap-2 text-xs text-[#666]">
             {isRefreshing ? (
                 <span className="flex items-center gap-1">
-                    <span className="w-3 h-3 border-2 border-neutral-500 border-t-transparent rounded-full animate-spin" />
+                    <span className="w-3 h-3 border-2 border-[#666] border-t-transparent rounded-full animate-spin" />
                     Refreshing...
                 </span>
             ) : (
                 <span>Updated {secondsAgo}s ago</span>
             )}
-            <span className="text-neutral-600">|</span>
+            <span className="text-[#555]">|</span>
             <span>Auto-refresh: {REFRESH_INTERVAL / 1000}s</span>
         </div>
     );
@@ -164,8 +164,8 @@ function RefreshIndicator({ lastRefresh, isRefreshing }: { lastRefresh: number; 
 
 function SectionCard({ title, children, className = '' }: { title: string; children: React.ReactNode; className?: string }) {
     return (
-        <div className={`bg-neutral-900 border border-neutral-800 rounded-lg p-4 ${className}`}>
-            <h3 className="text-sm font-semibold text-neutral-300 mb-3 uppercase tracking-wide">{title}</h3>
+        <div className={`bg-helix-bg border border-helix-border rounded-md p-4 ${className}`}>
+            <h3 className="text-sm font-semibold text-[#aaa] mb-3 uppercase tracking-wide">{title}</h3>
             {children}
         </div>
     );
@@ -179,7 +179,7 @@ function TrainingSessionsSection({ sessions }: { sessions: TrainingSession[] }) 
     if (sessions.length === 0) {
         return (
             <SectionCard title="Active Training Sessions">
-                <p className="text-neutral-500 text-sm">No active training sessions</p>
+                <p className="text-[#666] text-sm">No active training sessions</p>
             </SectionCard>
         );
     }
@@ -188,23 +188,23 @@ function TrainingSessionsSection({ sessions }: { sessions: TrainingSession[] }) 
         <SectionCard title="Active Training Sessions">
             <div className="space-y-3">
                 {sessions.map((session) => (
-                    <div key={session.id} className="flex items-center justify-between py-2 border-b border-neutral-800 last:border-0">
+                    <div key={session.id} className="flex items-center justify-between py-2 border-b border-helix-border last:border-0">
                         <div>
                             <div className="font-medium text-white">{session.modelName}</div>
-                            <div className="text-xs text-neutral-500">
+                            <div className="text-xs text-[#666]">
                                 Model #{session.modelId.toString()} | Started {new Date(session.startedAt).toLocaleTimeString()}
                             </div>
                         </div>
                         <div className="text-right">
                             <div className={`text-sm font-medium ${
-                                session.status === 'training' ? 'text-emerald-400' :
-                                session.status === 'completed' ? 'text-blue-400' :
-                                session.status === 'paused' ? 'text-yellow-400' :
-                                'text-neutral-400'
+                                session.status === 'training' ? 'text-white' :
+                                session.status === 'completed' ? 'text-[#888]' :
+                                session.status === 'paused' ? 'text-[#666]' :
+                                'text-[#666]'
                             }`}>
                                 {session.status.charAt(0).toUpperCase() + session.status.slice(1)}
                             </div>
-                            <div className="text-xs text-neutral-500">
+                            <div className="text-xs text-[#666]">
                                 Epoch {session.metrics.currentEpoch}/{session.config.totalEpochs}
                             </div>
                         </div>
@@ -226,19 +226,15 @@ function WorkerListSection({ workers }: { workers: NodeInfo[] }) {
         <SectionCard title={`Workers (${onlineCount}/${workers.length} Online)`}>
             <div className="space-y-2 max-h-64 overflow-y-auto">
                 {workers.length === 0 ? (
-                    <p className="text-neutral-500 text-sm">No workers connected</p>
+                    <p className="text-[#666] text-sm">No workers connected</p>
                 ) : (
                     workers.map((worker) => (
-                        <div key={worker.id} className="flex items-center justify-between py-1.5 border-b border-neutral-800/50 last:border-0">
+                        <div key={worker.id} className="flex items-center justify-between py-1.5 border-b border-helix-border last:border-0">
                             <div className="flex items-center gap-2">
-                                <span className="font-mono text-xs text-neutral-300">
+                                <span className="font-mono text-xs text-[#aaa]">
                                     {worker.address.slice(0, 6)}...{worker.address.slice(-4)}
                                 </span>
-                                <span className={`text-xs px-1.5 py-0.5 rounded ${
-                                    worker.type === 'compute' ? 'bg-blue-900/50 text-blue-400' :
-                                    worker.type === 'aggregator' ? 'bg-purple-900/50 text-purple-400' :
-                                    'bg-green-900/50 text-green-400'
-                                }`}>
+                                <span className={`text-xs px-1.5 py-0.5 rounded bg-white/5 border border-white/10 text-[#888]`}>
                                     {worker.type}
                                 </span>
                             </div>
@@ -261,7 +257,7 @@ function RoundStateSection({ modelId }: { modelId: bigint }) {
     if (modelLoading) {
         return (
             <SectionCard title="Current Round State">
-                <p className="text-neutral-500 text-sm">Loading...</p>
+                <p className="text-[#666] text-sm">Loading...</p>
             </SectionCard>
         );
     }
@@ -269,27 +265,27 @@ function RoundStateSection({ modelId }: { modelId: bigint }) {
     if (!model) {
         return (
             <SectionCard title="Current Round State">
-                <p className="text-neutral-500 text-sm">No model data available</p>
+                <p className="text-[#666] text-sm">No model data available</p>
             </SectionCard>
         );
     }
 
     return (
         <SectionCard title="Current Round State">
-            <div className="grid grid-cols-2 gap-4">
+            <div className="grid grid-cols-2 gap-3">
                 <div>
-                    <div className="text-xs text-neutral-500 uppercase">Round Number</div>
-                    <div className="text-2xl font-bold text-white">{model.currentRound.toString()}</div>
+                    <div className="text-xs text-[#666] uppercase">Round Number</div>
+                    <div className="text-[15px] font-bold text-white">{model.currentRound.toString()}</div>
                 </div>
                 <div>
-                    <div className="text-xs text-neutral-500 uppercase">Model Active</div>
-                    <div className={`text-2xl font-bold ${model.active ? 'text-emerald-400' : 'text-red-400'}`}>
+                    <div className="text-xs text-[#666] uppercase">Model Active</div>
+                    <div className={`text-[15px] font-bold ${model.active ? 'text-white' : 'text-[#666]'}`}>
                         {model.active ? 'Yes' : 'No'}
                     </div>
                 </div>
                 <div className="col-span-2">
-                    <div className="text-xs text-neutral-500 uppercase">Model Commitment</div>
-                    <div className="font-mono text-xs text-neutral-300 break-all">
+                    <div className="text-xs text-[#666] uppercase">Model Commitment</div>
+                    <div className="font-mono text-xs text-[#aaa] break-all">
                         0x{model.currentCommitment.toString(16).padStart(64, '0')}
                     </div>
                 </div>
@@ -308,29 +304,29 @@ function ProofSubmissionsSection({ proofs }: { proofs: ProofInfo[] }) {
     return (
         <SectionCard title="Recent Proof Submissions">
             {recentProofs.length === 0 ? (
-                <p className="text-neutral-500 text-sm">No recent proofs</p>
+                <p className="text-[#666] text-sm">No recent proofs</p>
             ) : (
                 <div className="space-y-2 max-h-48 overflow-y-auto">
                     {recentProofs.map((proof) => (
-                        <div key={proof.id} className="flex items-center justify-between py-1.5 border-b border-neutral-800/50 last:border-0">
+                        <div key={proof.id} className="flex items-center justify-between py-1.5 border-b border-helix-border last:border-0">
                             <div>
-                                <div className="font-mono text-xs text-neutral-300">
+                                <div className="font-mono text-xs text-[#aaa]">
                                     {proof.hash.slice(0, 10)}...{proof.hash.slice(-6)}
                                 </div>
-                                <div className="text-xs text-neutral-500">
+                                <div className="text-xs text-[#666]">
                                     Round {proof.roundId.toString()} | {proof.type}
                                 </div>
                             </div>
                             <div className="text-right">
                                 <div className={`text-xs font-medium ${
-                                    proof.status === 'verified' ? 'text-emerald-400' :
-                                    proof.status === 'pending' ? 'text-yellow-400' :
-                                    proof.status === 'failed' ? 'text-red-400' :
-                                    'text-neutral-400'
+                                    proof.status === 'verified' ? 'text-white' :
+                                    proof.status === 'pending' ? 'text-[#888]' :
+                                    proof.status === 'failed' ? 'text-[#666]' :
+                                    'text-[#666]'
                                 }`}>
                                     {proof.status}
                                 </div>
-                                <div className="text-xs text-neutral-500">
+                                <div className="text-xs text-[#666]">
                                     {new Date(proof.createdAt).toLocaleTimeString()}
                                 </div>
                             </div>
@@ -350,37 +346,37 @@ function LossDisplaySection({ metrics }: { metrics: TrainingMetrics | null }) {
     if (!metrics) {
         return (
             <SectionCard title="Training Metrics">
-                <p className="text-neutral-500 text-sm">No metrics available</p>
+                <p className="text-[#666] text-sm">No metrics available</p>
             </SectionCard>
         );
     }
 
     return (
         <SectionCard title="Training Metrics">
-            <div className="grid grid-cols-2 gap-4">
+            <div className="grid grid-cols-2 gap-3">
                 <div>
-                    <div className="text-xs text-neutral-500 uppercase">Current Loss</div>
-                    <div className="text-3xl font-bold text-white">{metrics.loss.toFixed(4)}</div>
+                    <div className="text-xs text-[#666] uppercase">Current Loss</div>
+                    <div className="text-xl font-bold text-white">{metrics.loss.toFixed(4)}</div>
                 </div>
                 <div>
-                    <div className="text-xs text-neutral-500 uppercase">Accuracy</div>
-                    <div className="text-3xl font-bold text-emerald-400">{(metrics.accuracy * 100).toFixed(1)}%</div>
+                    <div className="text-xs text-[#666] uppercase">Accuracy</div>
+                    <div className="text-xl font-bold text-white">{(metrics.accuracy * 100).toFixed(1)}%</div>
                 </div>
                 <div>
-                    <div className="text-xs text-neutral-500 uppercase">Learning Rate</div>
-                    <div className="text-lg font-medium text-neutral-300">{metrics.learningRate.toExponential(2)}</div>
+                    <div className="text-xs text-[#666] uppercase">Learning Rate</div>
+                    <div className="text-lg font-medium text-[#aaa]">{metrics.learningRate.toExponential(2)}</div>
                 </div>
                 <div>
-                    <div className="text-xs text-neutral-500 uppercase">Error Bound</div>
-                    <div className="text-lg font-medium text-neutral-300">{metrics.accumulatedErrorBound.toExponential(2)}</div>
+                    <div className="text-xs text-[#666] uppercase">Error Bound</div>
+                    <div className="text-lg font-medium text-[#aaa]">{metrics.accumulatedErrorBound.toExponential(2)}</div>
                 </div>
                 <div>
-                    <div className="text-xs text-neutral-500 uppercase">Gradient Norm</div>
-                    <div className="text-lg font-medium text-neutral-300">{metrics.gradientNorm.toFixed(4)}</div>
+                    <div className="text-xs text-[#666] uppercase">Gradient Norm</div>
+                    <div className="text-lg font-medium text-[#aaa]">{metrics.gradientNorm.toFixed(4)}</div>
                 </div>
                 <div>
-                    <div className="text-xs text-neutral-500 uppercase">Throughput</div>
-                    <div className="text-lg font-medium text-neutral-300">{metrics.throughput.toFixed(1)} steps/s</div>
+                    <div className="text-xs text-[#666] uppercase">Throughput</div>
+                    <div className="text-lg font-medium text-[#aaa]">{metrics.throughput.toFixed(1)} steps/s</div>
                 </div>
             </div>
         </SectionCard>
@@ -396,22 +392,22 @@ function ErrorLogSection({ logs }: { logs: ErrorLogEntry[] }) {
         <SectionCard title="Error Log">
             <div className="space-y-2 max-h-64 overflow-y-auto font-mono text-xs">
                 {logs.length === 0 ? (
-                    <p className="text-neutral-500">No log entries</p>
+                    <p className="text-[#666]">No log entries</p>
                 ) : (
                     logs.map((log) => (
-                        <div key={log.id} className="flex items-start gap-2 py-1 border-b border-neutral-800/30 last:border-0">
-                            <span className="text-neutral-600 whitespace-nowrap">
+                        <div key={log.id} className="flex items-start gap-2 py-1 border-b border-helix-border last:border-0">
+                            <span className="text-[#555] whitespace-nowrap">
                                 {new Date(log.timestamp).toLocaleTimeString()}
                             </span>
                             <span className={`px-1.5 py-0.5 rounded text-[10px] uppercase font-bold ${
-                                log.level === 'error' ? 'bg-red-900/50 text-red-400' :
-                                log.level === 'warning' ? 'bg-yellow-900/50 text-yellow-400' :
-                                'bg-blue-900/50 text-blue-400'
+                                log.level === 'error' ? 'bg-white/10 text-white' :
+                                log.level === 'warning' ? 'bg-white/5 text-[#888]' :
+                                'bg-white/[0.03] text-[#666]'
                             }`}>
                                 {log.level}
                             </span>
-                            <span className="text-neutral-400">[{log.source}]</span>
-                            <span className="text-neutral-300 flex-1">{log.message}</span>
+                            <span className="text-[#888]">[{log.source}]</span>
+                            <span className="text-[#aaa] flex-1">{log.message}</span>
                         </div>
                     ))
                 )}
@@ -430,32 +426,32 @@ function ContractStateSection() {
     return (
         <SectionCard title="Contract State">
             {contractState.isLoading ? (
-                <p className="text-neutral-500 text-sm">Loading contract state...</p>
+                <p className="text-[#666] text-sm">Loading contract state...</p>
             ) : contractState.error ? (
-                <p className="text-red-400 text-sm">Error: {contractState.error}</p>
+                <p className="text-[#888] text-sm">Error: {contractState.error}</p>
             ) : (
                 <div className="grid grid-cols-2 gap-3 text-sm">
                     <div>
-                        <div className="text-xs text-neutral-500 uppercase">Next Model ID</div>
-                        <div className="text-neutral-300">{contractState.nextModelId?.toString() ?? '-'}</div>
+                        <div className="text-xs text-[#666] uppercase">Next Model ID</div>
+                        <div className="text-[#aaa]">{contractState.nextModelId?.toString() ?? '-'}</div>
                     </div>
                     <div>
-                        <div className="text-xs text-neutral-500 uppercase">Default Min Stake</div>
-                        <div className="text-neutral-300">
+                        <div className="text-xs text-[#666] uppercase">Default Min Stake</div>
+                        <div className="text-[#aaa]">
                             {contractState.defaultMinStake ? formatEther(contractState.defaultMinStake) : '-'} ETH
                         </div>
                     </div>
                     <div>
-                        <div className="text-xs text-neutral-500 uppercase">Slash Percentage</div>
-                        <div className="text-neutral-300">{contractState.slashPercentage?.toString() ?? '-'}%</div>
+                        <div className="text-xs text-[#666] uppercase">Slash Percentage</div>
+                        <div className="text-[#aaa]">{contractState.slashPercentage?.toString() ?? '-'}%</div>
                     </div>
                     <div>
-                        <div className="text-xs text-neutral-500 uppercase">Slashing Records</div>
-                        <div className="text-neutral-300">{contractState.slashingRecordCount?.toString() ?? '-'}</div>
+                        <div className="text-xs text-[#666] uppercase">Slashing Records</div>
+                        <div className="text-[#aaa]">{contractState.slashingRecordCount?.toString() ?? '-'}</div>
                     </div>
                     <div className="col-span-2">
-                        <div className="text-xs text-neutral-500 uppercase">Max Error Bound</div>
-                        <div className="font-mono text-xs text-neutral-300">
+                        <div className="text-xs text-[#666] uppercase">Max Error Bound</div>
+                        <div className="font-mono text-xs text-[#aaa]">
                             {contractState.maxErrorBound?.toString() ?? '-'}
                         </div>
                     </div>
@@ -473,37 +469,37 @@ function NetworkStatsSection({ stats }: { stats: NetworkStats | null }) {
     if (!stats) {
         return (
             <SectionCard title="Network Statistics">
-                <p className="text-neutral-500 text-sm">Loading network stats...</p>
+                <p className="text-[#666] text-sm">Loading network stats...</p>
             </SectionCard>
         );
     }
 
     return (
         <SectionCard title="Network Statistics">
-            <div className="grid grid-cols-3 gap-4 text-center">
+            <div className="grid grid-cols-3 gap-3 text-center">
                 <div>
-                    <div className="text-2xl font-bold text-white">{stats.activeNodes}</div>
-                    <div className="text-xs text-neutral-500">Active Nodes</div>
+                    <div className="text-[15px] font-bold text-white">{stats.activeNodes}</div>
+                    <div className="text-xs text-[#666]">Active Nodes</div>
                 </div>
                 <div>
-                    <div className="text-2xl font-bold text-white">{stats.totalProofs}</div>
-                    <div className="text-xs text-neutral-500">Total Proofs</div>
+                    <div className="text-[15px] font-bold text-white">{stats.totalProofs}</div>
+                    <div className="text-xs text-[#666]">Total Proofs</div>
                 </div>
                 <div>
-                    <div className="text-2xl font-bold text-white">{stats.totalRounds}</div>
-                    <div className="text-xs text-neutral-500">Total Rounds</div>
+                    <div className="text-[15px] font-bold text-white">{stats.totalRounds}</div>
+                    <div className="text-xs text-[#666]">Total Rounds</div>
                 </div>
                 <div>
-                    <div className="text-2xl font-bold text-emerald-400">{(stats.networkUptime * 100).toFixed(1)}%</div>
-                    <div className="text-xs text-neutral-500">Uptime</div>
+                    <div className="text-[15px] font-bold text-white">{(stats.networkUptime * 100).toFixed(1)}%</div>
+                    <div className="text-xs text-[#666]">Uptime</div>
                 </div>
                 <div>
-                    <div className="text-2xl font-bold text-white">{stats.averageProofTime}ms</div>
-                    <div className="text-xs text-neutral-500">Avg Proof Time</div>
+                    <div className="text-[15px] font-bold text-white">{stats.averageProofTime}ms</div>
+                    <div className="text-xs text-[#666]">Avg Proof Time</div>
                 </div>
                 <div>
-                    <div className="text-2xl font-bold text-white">{stats.throughput.toFixed(1)}</div>
-                    <div className="text-xs text-neutral-500">Steps/sec</div>
+                    <div className="text-[15px] font-bold text-white">{stats.throughput.toFixed(1)}</div>
+                    <div className="text-xs text-[#666]">Steps/sec</div>
                 </div>
             </div>
         </SectionCard>
@@ -627,26 +623,26 @@ export default function StatusPage() {
     }, [contractEvents.slashedEvents]);
 
     return (
-        <div className="min-h-screen bg-neutral-950 text-white p-6">
+        <div className="min-h-screen bg-neutral-950 text-white p-4">
             {/* Header */}
-            <div className="flex items-center justify-between mb-6">
+            <div className="flex items-center justify-between mb-4">
                 <div>
-                    <h1 className="text-2xl font-bold">HELIX Status Monitor</h1>
-                    <p className="text-sm text-neutral-500">Real-time training and network status</p>
+                    <h1 className="text-[15px] font-bold">HELIX Status Monitor</h1>
+                    <p className="text-sm text-[#666]">Real-time training and network status</p>
                 </div>
-                <div className="flex items-center gap-4">
+                <div className="flex items-center gap-3">
                     <RefreshIndicator lastRefresh={lastRefresh} isRefreshing={isRefreshing} />
                     <button
                         onClick={fetchData}
                         disabled={isRefreshing}
-                        className="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 rounded text-sm transition-colors disabled:opacity-50"
+                        className="px-3 py-1.5 bg-helix-surface hover:bg-white/[0.07] rounded text-sm transition-colors disabled:opacity-50"
                     >
                         Refresh Now
                     </button>
                     <button
                         onClick={() => setUseMockData(!useMockData)}
                         className={`px-3 py-1.5 rounded text-sm transition-colors ${
-                            useMockData ? 'bg-yellow-900/50 text-yellow-400' : 'bg-emerald-900/50 text-emerald-400'
+                            useMockData ? 'bg-white/10 text-[#888]' : 'bg-white/10 text-white'
                         }`}
                     >
                         {useMockData ? 'Demo Mode' : 'Live Mode'}
@@ -655,7 +651,7 @@ export default function StatusPage() {
             </div>
 
             {/* Main Grid */}
-            <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
                 {/* Left Column */}
                 <div className="space-y-4">
                     <TrainingSessionsSection sessions={data.trainingSessions} />
@@ -678,23 +674,23 @@ export default function StatusPage() {
             </div>
 
             {/* Footer Status Bar */}
-            <div className="fixed bottom-0 left-0 right-0 bg-neutral-900 border-t border-neutral-800 px-6 py-2">
+            <div className="fixed bottom-0 left-0 right-0 bg-helix-bg border-t border-helix-border px-6 py-2">
                 <div className="flex items-center justify-between text-xs">
-                    <div className="flex items-center gap-4">
+                    <div className="flex items-center gap-3">
                         <span className="flex items-center gap-1.5">
-                            <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-                            <span className="text-neutral-400">System Online</span>
+                            <span className="w-2 h-2 rounded-full bg-white animate-pulse" />
+                            <span className="text-[#888]">System Online</span>
                         </span>
-                        <span className="text-neutral-600">|</span>
-                        <span className="text-neutral-400">
+                        <span className="text-[#555]">|</span>
+                        <span className="text-[#888]">
                             Active Sessions: <span className="text-white">{data.trainingSessions.filter(s => s.status === 'training').length}</span>
                         </span>
-                        <span className="text-neutral-600">|</span>
-                        <span className="text-neutral-400">
+                        <span className="text-[#555]">|</span>
+                        <span className="text-[#888]">
                             Workers Online: <span className="text-white">{data.workers.filter(w => w.status !== 'offline').length}/{data.workers.length}</span>
                         </span>
                     </div>
-                    <div className="text-neutral-500">
+                    <div className="text-[#666]">
                         HELIX Protocol v0.1.0
                     </div>
                 </div>

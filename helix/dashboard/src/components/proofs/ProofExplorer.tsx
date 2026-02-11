@@ -91,241 +91,23 @@ export default function ProofExplorer({ proofs }: ProofExplorerProps) {
     };
 
     const getTypeColor = (type: string) => {
-        const colors: Record<string, string> = {
-            training: '#6366f1',
-            aggregation: '#a855f7',
-            gradient: '#22c55e',
-            computation: '#f59e0b',
-        };
-        return colors[type] || '#6b7280';
+        return '#ffffff';
     };
 
     return (
-        <div className="proof-explorer">
-            <style jsx>{`
-        .proof-explorer {
-          background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-          border-radius: 16px;
-          padding: 24px;
-          color: #fff;
-          font-family: 'Inter', -apple-system, sans-serif;
-        }
-
-        .header {
-          display: flex;
-          justify-content: space-between;
-          align-items: center;
-          margin-bottom: 24px;
-        }
-
-        .title {
-          font-size: 24px;
-          font-weight: 700;
-          background: linear-gradient(90deg, #22c55e, #14b8a6);
-          -webkit-background-clip: text;
-          -webkit-text-fill-color: transparent;
-        }
-
-        .filters {
-          display: flex;
-          gap: 8px;
-        }
-
-        .filter-btn {
-          padding: 8px 16px;
-          border-radius: 8px;
-          border: 1px solid rgba(255, 255, 255, 0.1);
-          background: rgba(255, 255, 255, 0.05);
-          color: #9ca3af;
-          font-size: 13px;
-          cursor: pointer;
-          transition: all 0.2s;
-        }
-
-        .filter-btn:hover {
-          background: rgba(255, 255, 255, 0.1);
-        }
-
-        .filter-btn.active {
-          background: rgba(99, 102, 241, 0.2);
-          border-color: rgba(99, 102, 241, 0.5);
-          color: #818cf8;
-        }
-
-        .stats-row {
-          display: grid;
-          grid-template-columns: repeat(4, 1fr);
-          gap: 16px;
-          margin-bottom: 24px;
-        }
-
-        .stat-card {
-          background: rgba(255, 255, 255, 0.03);
-          border-radius: 12px;
-          padding: 16px;
-          border: 1px solid rgba(255, 255, 255, 0.08);
-          text-align: center;
-        }
-
-        .stat-value {
-          font-size: 28px;
-          font-weight: 700;
-          margin-bottom: 4px;
-        }
-
-        .stat-label {
-          font-size: 12px;
-          color: #9ca3af;
-          text-transform: uppercase;
-        }
-
-        .proofs-list {
-          display: flex;
-          flex-direction: column;
-          gap: 12px;
-        }
-
-        .proof-card {
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          padding: 16px 20px;
-          background: rgba(255, 255, 255, 0.03);
-          border-radius: 12px;
-          border: 1px solid rgba(255, 255, 255, 0.08);
-          cursor: pointer;
-          transition: all 0.2s;
-        }
-
-        .proof-card:hover {
-          background: rgba(255, 255, 255, 0.06);
-          border-color: rgba(255, 255, 255, 0.15);
-        }
-
-        .proof-card.selected {
-          border-color: rgba(99, 102, 241, 0.5);
-          background: rgba(99, 102, 241, 0.1);
-        }
-
-        .proof-main {
-          display: flex;
-          align-items: center;
-          gap: 16px;
-        }
-
-        .proof-type {
-          padding: 6px 12px;
-          border-radius: 6px;
-          font-size: 11px;
-          font-weight: 600;
-          text-transform: uppercase;
-        }
-
-        .proof-id {
-          font-family: 'JetBrains Mono', monospace;
-          font-size: 14px;
-          font-weight: 500;
-        }
-
-        .proof-hash {
-          font-family: 'JetBrains Mono', monospace;
-          font-size: 12px;
-          color: #6b7280;
-        }
-
-        .proof-meta {
-          display: flex;
-          align-items: center;
-          gap: 24px;
-        }
-
-        .proof-stat {
-          text-align: right;
-        }
-
-        .proof-stat-value {
-          font-size: 14px;
-          font-weight: 600;
-        }
-
-        .proof-stat-label {
-          font-size: 11px;
-          color: #6b7280;
-        }
-
-        .status-badge {
-          padding: 4px 12px;
-          border-radius: 12px;
-          font-size: 11px;
-          font-weight: 600;
-          text-transform: uppercase;
-        }
-
-        .status-badge.verified {
-          background: rgba(34, 197, 94, 0.2);
-          color: #22c55e;
-        }
-
-        .status-badge.pending {
-          background: rgba(245, 158, 11, 0.2);
-          color: #f59e0b;
-        }
-
-        .status-badge.failed {
-          background: rgba(239, 68, 68, 0.2);
-          color: #ef4444;
-        }
-
-        .detail-panel {
-          margin-top: 24px;
-          padding: 20px;
-          background: rgba(255, 255, 255, 0.03);
-          border-radius: 12px;
-          border: 1px solid rgba(255, 255, 255, 0.08);
-        }
-
-        .detail-title {
-          font-size: 16px;
-          font-weight: 600;
-          margin-bottom: 16px;
-          color: #d1d5db;
-        }
-
-        .detail-grid {
-          display: grid;
-          grid-template-columns: repeat(2, 1fr);
-          gap: 16px;
-        }
-
-        .detail-item {
-          background: rgba(0, 0, 0, 0.2);
-          padding: 12px;
-          border-radius: 8px;
-        }
-
-        .detail-label {
-          font-size: 11px;
-          color: #6b7280;
-          text-transform: uppercase;
-          margin-bottom: 4px;
-        }
-
-        .detail-value {
-          font-family: 'JetBrains Mono', monospace;
-          font-size: 13px;
-          color: #d1d5db;
-          word-break: break-all;
-        }
-      `}</style>
-
-            <div className="header">
-                <h2 className="title">Proof Explorer</h2>
-                <div className="filters">
+        <div className="bg-helix-surface rounded-md p-4 text-white border border-helix-border">
+            <div className="flex justify-between items-center mb-4">
+                <h2 className="text-white font-semibold text-[15px]">Proof Explorer</h2>
+                <div className="flex gap-2">
                     {['all', 'training', 'aggregation', 'gradient', 'computation'].map(
                         (f) => (
                             <button
                                 key={f}
-                                className={`filter-btn ${filter === f ? 'active' : ''}`}
+                                className={`px-4 py-2 rounded-md border text-[13px] cursor-pointer transition-all duration-200 ${
+                                    filter === f
+                                        ? 'bg-white/10 border-white/10 text-white'
+                                        : 'bg-white/[0.04] border-helix-border text-[#666] hover:bg-white/10'
+                                }`}
                                 onClick={() => setFilter(f)}
                             >
                                 {f.charAt(0).toUpperCase() + f.slice(1)}
@@ -335,27 +117,27 @@ export default function ProofExplorer({ proofs }: ProofExplorerProps) {
                 </div>
             </div>
 
-            <div className="stats-row">
-                <div className="stat-card">
-                    <div className="stat-value" style={{ color: '#22c55e' }}>
+            <div className="grid grid-cols-4 gap-3 mb-4">
+                <div className="bg-white/[0.03] rounded-md p-4 border border-helix-border text-center">
+                    <div className="text-lg font-bold mb-1 text-white">
                         {mockProofs.filter((p) => p.status === 'verified').length}
                     </div>
-                    <div className="stat-label">Verified</div>
+                    <div className="text-xs text-[#888] uppercase">Verified</div>
                 </div>
-                <div className="stat-card">
-                    <div className="stat-value" style={{ color: '#f59e0b' }}>
+                <div className="bg-white/[0.03] rounded-md p-4 border border-helix-border text-center">
+                    <div className="text-lg font-bold mb-1 text-white">
                         {mockProofs.filter((p) => p.status === 'pending').length}
                     </div>
-                    <div className="stat-label">Pending</div>
+                    <div className="text-xs text-[#888] uppercase">Pending</div>
                 </div>
-                <div className="stat-card">
-                    <div className="stat-value" style={{ color: '#6366f1' }}>
+                <div className="bg-white/[0.03] rounded-md p-4 border border-helix-border text-center">
+                    <div className="text-lg font-bold mb-1 text-white">
                         {formatSize(mockProofs.reduce((sum, p) => sum + p.size, 0))}
                     </div>
-                    <div className="stat-label">Total Size</div>
+                    <div className="text-xs text-[#888] uppercase">Total Size</div>
                 </div>
-                <div className="stat-card">
-                    <div className="stat-value" style={{ color: '#a855f7' }}>
+                <div className="bg-white/[0.03] rounded-md p-4 border border-helix-border text-center">
+                    <div className="text-lg font-bold mb-1 text-white">
                         {(
                             mockProofs
                                 .filter((p) => p.verificationTime > 0)
@@ -364,46 +146,52 @@ export default function ProofExplorer({ proofs }: ProofExplorerProps) {
                         ).toFixed(2)}
                         s
                     </div>
-                    <div className="stat-label">Avg Verify Time</div>
+                    <div className="text-xs text-[#888] uppercase">Avg Verify Time</div>
                 </div>
             </div>
 
-            <div className="proofs-list">
+            <div className="flex flex-col gap-3">
                 {filteredProofs.map((proof) => (
                     <div
                         key={proof.id}
-                        className={`proof-card ${selectedProof?.id === proof.id ? 'selected' : ''}`}
+                        className={`flex items-center justify-between px-5 py-4 rounded-md border cursor-pointer transition-all duration-200 ${
+                            selectedProof?.id === proof.id
+                                ? 'border-white/10 bg-white/10'
+                                : 'bg-white/[0.03] border-helix-border hover:bg-white/[0.06]'
+                        }`}
                         onClick={() => setSelectedProof(proof)}
                     >
-                        <div className="proof-main">
-                            <span
-                                className="proof-type"
-                                style={{
-                                    background: `${getTypeColor(proof.type)}22`,
-                                    color: getTypeColor(proof.type),
-                                }}
-                            >
+                        <div className="flex items-center gap-3">
+                            <span className="px-3 py-1.5 rounded-md text-[11px] font-semibold uppercase bg-white/[0.04] text-[#888]">
                                 {proof.type}
                             </span>
                             <div>
-                                <div className="proof-id">{proof.id}</div>
-                                <div className="proof-hash">{proof.hash}</div>
+                                <div className="font-mono text-sm font-medium text-white">{proof.id}</div>
+                                <div className="font-mono text-xs text-[#666]">{proof.hash}</div>
                             </div>
                         </div>
-                        <div className="proof-meta">
-                            <div className="proof-stat">
-                                <div className="proof-stat-value">Round #{proof.roundId}</div>
-                                <div className="proof-stat-label">Training Round</div>
+                        <div className="flex items-center gap-3">
+                            <div className="text-right">
+                                <div className="text-sm font-semibold text-white">Round #{proof.roundId}</div>
+                                <div className="text-[11px] text-[#666]">Training Round</div>
                             </div>
-                            <div className="proof-stat">
-                                <div className="proof-stat-value">{formatSize(proof.size)}</div>
-                                <div className="proof-stat-label">Size</div>
+                            <div className="text-right">
+                                <div className="text-sm font-semibold text-white">{formatSize(proof.size)}</div>
+                                <div className="text-[11px] text-[#666]">Size</div>
                             </div>
-                            <div className="proof-stat">
-                                <div className="proof-stat-value">{formatTime(proof.timestamp)}</div>
-                                <div className="proof-stat-label">Created</div>
+                            <div className="text-right">
+                                <div className="text-sm font-semibold text-white">{formatTime(proof.timestamp)}</div>
+                                <div className="text-[11px] text-[#666]">Created</div>
                             </div>
-                            <span className={`status-badge ${proof.status}`}>
+                            <span
+                                className={`px-3 py-1 rounded-md text-[11px] font-semibold uppercase ${
+                                    proof.status === 'verified'
+                                        ? 'bg-white/10 text-white'
+                                        : proof.status === 'pending'
+                                        ? 'bg-white/[0.04] text-[#888]'
+                                        : 'bg-white/[0.04] text-[#666]'
+                                }`}
+                            >
                                 {proof.status}
                             </span>
                         </div>
@@ -412,24 +200,32 @@ export default function ProofExplorer({ proofs }: ProofExplorerProps) {
             </div>
 
             {selectedProof && (
-                <div className="detail-panel">
-                    <h3 className="detail-title">Proof Details: {selectedProof.id}</h3>
-                    <div className="detail-grid">
-                        <div className="detail-item">
-                            <div className="detail-label">Proof Hash</div>
-                            <div className="detail-value">{selectedProof.hash}</div>
+                <div className="mt-4 p-4 bg-white/[0.03] rounded-md border border-helix-border">
+                    <h3 className="text-base font-semibold mb-4 text-[#aaa]">
+                        Proof Details: {selectedProof.id}
+                    </h3>
+                    <div className="grid grid-cols-2 gap-3">
+                        <div className="bg-white/[0.03] rounded-md p-3">
+                            <div className="text-[11px] text-[#666] uppercase mb-1">Proof Hash</div>
+                            <div className="font-mono text-[13px] text-[#aaa] break-all">
+                                {selectedProof.hash}
+                            </div>
                         </div>
-                        <div className="detail-item">
-                            <div className="detail-label">Model Hash</div>
-                            <div className="detail-value">{selectedProof.modelHash}</div>
+                        <div className="bg-white/[0.03] rounded-md p-3">
+                            <div className="text-[11px] text-[#666] uppercase mb-1">Model Hash</div>
+                            <div className="font-mono text-[13px] text-[#aaa] break-all">
+                                {selectedProof.modelHash}
+                            </div>
                         </div>
-                        <div className="detail-item">
-                            <div className="detail-label">Error Bound</div>
-                            <div className="detail-value">{selectedProof.errorBound}</div>
+                        <div className="bg-white/[0.03] rounded-md p-3">
+                            <div className="text-[11px] text-[#666] uppercase mb-1">Error Bound</div>
+                            <div className="font-mono text-[13px] text-[#aaa] break-all">
+                                {selectedProof.errorBound}
+                            </div>
                         </div>
-                        <div className="detail-item">
-                            <div className="detail-label">Verification Time</div>
-                            <div className="detail-value">
+                        <div className="bg-white/[0.03] rounded-md p-3">
+                            <div className="text-[11px] text-[#666] uppercase mb-1">Verification Time</div>
+                            <div className="font-mono text-[13px] text-[#aaa] break-all">
                                 {selectedProof.verificationTime > 0
                                     ? `${selectedProof.verificationTime}s`
                                     : 'Pending'}

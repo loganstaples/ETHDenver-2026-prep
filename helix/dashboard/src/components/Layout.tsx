@@ -1,91 +1,163 @@
 'use client';
 
 import classNames from 'clsx';
-import { motion } from 'framer-motion';
-import { Boxes, LayoutDashboard, MonitorDot, GraduationCap, Server, Zap } from 'lucide-react';
+import { motion, AnimatePresence } from 'framer-motion';
+import {
+    LayoutDashboard,
+    Upload,
+    Database,
+    Boxes,
+    Activity,
+    Wallet,
+    MonitorDot,
+    Server,
+    Zap,
+    ChevronDown,
+} from 'lucide-react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
+import { useState } from 'react';
 import { ConnectButton } from '@rainbow-me/rainbowkit';
 
-const sidebarItems = [
-    { name: 'Overview', href: '/', icon: LayoutDashboard },
+const primaryNav = [
+    { name: 'Dashboard', href: '/', icon: LayoutDashboard },
+    { name: 'Submit Model', href: '/submit', icon: Upload },
+    { name: 'Datasets', href: '/data', icon: Database },
+    { name: 'My Models', href: '/models', icon: Boxes },
+    { name: 'Training', href: '/training', icon: Activity },
+    { name: 'Billing', href: '/billing', icon: Wallet },
+];
+
+const advancedNav = [
     { name: 'Status', href: '/status', icon: MonitorDot },
-    { name: 'Models', href: '/models', icon: Boxes },
-    { name: 'Training', href: '/training', icon: GraduationCap },
     { name: 'Nodes', href: '/nodes', icon: Server },
     { name: 'Proofs', href: '/proofs', icon: Zap },
 ];
 
+const pageMeta: Record<string, { title: string; subtitle: string }> = {
+    '/': { title: 'Dashboard', subtitle: 'Network overview' },
+    '/submit': { title: 'Submit Model', subtitle: 'Upload and register a model' },
+    '/data': { title: 'Datasets', subtitle: 'Training data' },
+    '/models': { title: 'My Models', subtitle: 'Registered models' },
+    '/training': { title: 'Training', subtitle: 'Active jobs' },
+    '/billing': { title: 'Billing', subtitle: 'Staking & costs' },
+    '/status': { title: 'Status', subtitle: 'Network monitor' },
+    '/nodes': { title: 'Nodes', subtitle: 'Node topology' },
+    '/proofs': { title: 'Proofs', subtitle: 'Proof explorer' },
+};
+
 export function Layout({ children }: { children: React.ReactNode }) {
     const pathname = usePathname();
+    const [advancedOpen, setAdvancedOpen] = useState(false);
+    const page = pageMeta[pathname] || { title: 'HELIX', subtitle: '' };
 
     return (
-        <div className="min-h-screen bg-neutral-950 text-white flex">
+        <div className="min-h-screen bg-helix-bg text-white flex">
             {/* Sidebar */}
-            <motion.aside
-                initial={{ x: -100, opacity: 0 }}
-                animate={{ x: 0, opacity: 1 }}
-                className="w-64 border-r border-neutral-800 bg-neutral-900/50 backdrop-blur-xl p-6 flex flex-col fixed h-full z-10"
-            >
-                <div className="flex items-center gap-2 mb-10">
-                    <div className="w-8 h-8 bg-emerald-500 rounded-lg flex items-center justify-center font-bold text-black">
-                        H
-                    </div>
-                    <span className="text-xl font-bold tracking-tight">HELIX</span>
+            <aside className="w-[200px] border-r border-helix-border bg-helix-bg flex flex-col fixed h-full z-10">
+                {/* Logo */}
+                <div className="h-12 flex items-center px-5 border-b border-helix-border">
+                    <Link href="/" className="flex items-center gap-2.5">
+                        <div className="w-5 h-5 border border-white/40 flex items-center justify-center font-mono text-[10px] font-bold tracking-tighter text-white/90">
+                            H
+                        </div>
+                        <span className="text-[13px] font-semibold tracking-tight">HELIX</span>
+                    </Link>
                 </div>
 
-                <nav className="flex-1 space-y-2">
-                    {sidebarItems.map((item) => {
-                        const isActive = pathname === item.href;
+                {/* Nav */}
+                <nav className="flex-1 px-2 pt-3 space-y-0.5">
+                    {primaryNav.map((item) => {
+                        const active = pathname === item.href;
                         return (
                             <Link
                                 key={item.name}
                                 href={item.href}
                                 className={classNames(
-                                    'flex items-center gap-3 px-4 py-3 rounded-xl transition-all duration-200 group',
-                                    isActive
-                                        ? 'bg-emerald-500/10 text-emerald-400 font-medium shadow-[0_0_20px_rgba(16,185,129,0.1)]'
-                                        : 'text-neutral-400 hover:bg-neutral-800/50 hover:text-white'
+                                    'flex items-center gap-2.5 px-3 py-[7px] rounded-[4px] text-[13px] transition-colors relative',
+                                    active
+                                        ? 'bg-white/[0.07] text-white'
+                                        : 'text-[#888] hover:text-white hover:bg-white/[0.04]'
                                 )}
                             >
-                                <item.icon className={classNames("w-5 h-5", isActive ? "stroke-[2.5px]" : "stroke-2")} />
-                                {item.name}
-                                {isActive && (
+                                {active && (
                                     <motion.div
-                                        layoutId="activeTab"
-                                        className="absolute left-0 w-1 h-8 bg-emerald-500 rounded-r-full"
+                                        layoutId="navIndicator"
+                                        className="absolute left-0 w-[2px] h-3.5 bg-white rounded-r-sm"
+                                        transition={{ type: 'spring', stiffness: 500, damping: 35 }}
                                     />
                                 )}
+                                <item.icon className="w-[14px] h-[14px] flex-shrink-0" strokeWidth={1.5} />
+                                {item.name}
                             </Link>
                         );
                     })}
+
+                    {/* Advanced */}
+                    <div className="pt-3 mt-1">
+                        <button
+                            onClick={() => setAdvancedOpen(!advancedOpen)}
+                            className="flex items-center justify-between w-full px-3 py-1.5 text-[11px] text-[#555] uppercase tracking-widest font-medium hover:text-[#888] transition-colors"
+                        >
+                            Advanced
+                            <ChevronDown className={classNames(
+                                'w-3 h-3 transition-transform duration-200',
+                                advancedOpen && 'rotate-180'
+                            )} />
+                        </button>
+                        <AnimatePresence>
+                            {advancedOpen && (
+                                <motion.div
+                                    initial={{ height: 0, opacity: 0 }}
+                                    animate={{ height: 'auto', opacity: 1 }}
+                                    exit={{ height: 0, opacity: 0 }}
+                                    transition={{ duration: 0.15 }}
+                                    className="overflow-hidden space-y-0.5 mt-0.5"
+                                >
+                                    {advancedNav.map((item) => {
+                                        const active = pathname === item.href;
+                                        return (
+                                            <Link
+                                                key={item.name}
+                                                href={item.href}
+                                                className={classNames(
+                                                    'flex items-center gap-2.5 px-3 py-[7px] rounded-[4px] text-[13px] transition-colors',
+                                                    active
+                                                        ? 'bg-white/[0.07] text-white'
+                                                        : 'text-[#888] hover:text-white hover:bg-white/[0.04]'
+                                                )}
+                                            >
+                                                <item.icon className="w-[14px] h-[14px] flex-shrink-0" strokeWidth={1.5} />
+                                                {item.name}
+                                            </Link>
+                                        );
+                                    })}
+                                </motion.div>
+                            )}
+                        </AnimatePresence>
+                    </div>
                 </nav>
 
-                <div className="pt-6 border-t border-neutral-800">
-                    <div className="text-xs text-neutral-500 uppercase font-semibold tracking-wider mb-4">Network Status</div>
-                    <div className="flex items-center gap-2 text-sm text-emerald-400">
-                        <span className="relative flex h-2 w-2">
-                            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                            <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
-                        </span>
+                {/* Footer */}
+                <div className="px-5 py-3 border-t border-helix-border">
+                    <div className="flex items-center gap-1.5 text-[11px] text-[#555]">
+                        <span className="w-1.5 h-1.5 rounded-full bg-white/50 animate-pulse-slow" />
                         Online
                     </div>
                 </div>
-            </motion.aside>
+            </aside>
 
-            {/* Main Content */}
-            <main className="flex-1 ml-64 p-8 relative">
-                <header className="flex justify-between items-center mb-10">
-                    <div>
-                        <h1 className="text-2xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-white to-neutral-500">
-                            Dashboard
-                        </h1>
-                        <p className="text-neutral-400 text-sm">Welcome back, Coordinator.</p>
+            {/* Main */}
+            <main className="flex-1 ml-[200px]">
+                <header className="h-12 border-b border-helix-border flex items-center justify-between px-6 sticky top-0 bg-helix-bg/80 backdrop-blur-sm z-20">
+                    <div className="flex items-baseline gap-3">
+                        <h1 className="text-[13px] font-semibold text-white">{page.title}</h1>
+                        <span className="text-[11px] text-[#555]">{page.subtitle}</span>
                     </div>
                     <ConnectButton />
                 </header>
 
-                <div className="grid gap-6">
+                <div className="p-6">
                     {children}
                 </div>
             </main>

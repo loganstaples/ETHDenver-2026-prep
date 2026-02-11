@@ -1,18 +1,9 @@
 'use client';
 
-/**
- * HELIX Live Loss Curve Component
- * Real-time loss and accuracy visualization with smooth animations and trend analysis.
- */
-
 import React, { useMemo, useRef, useEffect, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { TrendingDown, TrendingUp, Minus, Activity, Zap } from 'lucide-react';
 import { useTrainingStatus } from '@/hooks/useTrainingStatus';
-
-// ============================================================================
-// Types
-// ============================================================================
 
 interface LiveLossCurveProps {
     modelId?: bigint | number;
@@ -29,10 +20,6 @@ interface DataPoint {
     y: number;
     timestamp: number;
 }
-
-// ============================================================================
-// SVG Path Utilities
-// ============================================================================
 
 function createSmoothPath(points: DataPoint[], xScale: number, yScale: number, height: number, yMin: number): string {
     if (points.length < 2) return '';
@@ -67,10 +54,6 @@ function createAreaPath(points: DataPoint[], xScale: number, yScale: number, hei
     return `${linePath} L ${lastX} ${height} L ${firstX} ${height} Z`;
 }
 
-// ============================================================================
-// Component
-// ============================================================================
-
 export default function LiveLossCurve({
     modelId,
     height = 300,
@@ -99,7 +82,6 @@ export default function LiveLossCurve({
         enablePolling,
     });
 
-    // Update dimensions on resize
     useEffect(() => {
         const updateDimensions = () => {
             if (svgRef.current?.parentElement) {
@@ -113,47 +95,39 @@ export default function LiveLossCurve({
         return () => window.removeEventListener('resize', updateDimensions);
     }, [height]);
 
-    // Prepare data
     const chartData = useMemo(() => {
         const padding = { top: 20, right: 60, bottom: 40, left: 60 };
         const chartWidth = dimensions.width - padding.left - padding.right;
         const chartHeight = dimensions.height - padding.top - padding.bottom;
 
-        // Loss data points
         const lossPoints: DataPoint[] = lossHistory.map((h, i) => ({
             x: i,
             y: h.loss,
             timestamp: h.timestamp,
         }));
 
-        // Accuracy data points (scale to match loss range for visualization)
         const accuracyPoints: DataPoint[] = accuracyHistory.map((h, i) => ({
             x: i,
             y: h.accuracy,
             timestamp: h.timestamp,
         }));
 
-        // Error bound points
         const errorPoints: DataPoint[] = errorBoundHistory.map((h, i) => ({
             x: i,
-            y: h.bound * 1000, // Scale up for visibility
+            y: h.bound * 1000,
             timestamp: h.timestamp,
         }));
 
-        // Calculate scales
         const maxX = Math.max(lossPoints.length - 1, 1);
         const xScale = chartWidth / maxX;
 
-        // Loss scale
         const lossValues = lossPoints.map(p => p.y);
         const lossMin = Math.min(...lossValues, 0);
         const lossMax = Math.max(...lossValues, 1) * 1.1;
         const lossYScale = chartHeight / (lossMax - lossMin);
 
-        // Accuracy is always 0-1
         const accYScale = chartHeight;
 
-        // Error bound scale
         const errorValues = errorPoints.map(p => p.y);
         const errorMax = Math.max(...errorValues, 0.01) * 1.2;
         const errorYScale = chartHeight / errorMax;
@@ -176,7 +150,6 @@ export default function LiveLossCurve({
         };
     }, [dimensions, lossHistory, accuracyHistory, errorBoundHistory]);
 
-    // Calculate trend
     const trend = useMemo(() => {
         if (lossHistory.length < 5) return { direction: 'stable' as const, change: 0 };
 
@@ -194,7 +167,6 @@ export default function LiveLossCurve({
         return { direction: 'stable' as const, change };
     }, [lossHistory]);
 
-    // Convergence rate
     const convergenceRate = useMemo(() => {
         if (lossHistory.length < 3) return 0;
         const recent = lossHistory.slice(-3);
@@ -231,57 +203,43 @@ export default function LiveLossCurve({
 
     if (isLoading) {
         return (
-            <div className={`bg-neutral-900/50 rounded-xl border border-neutral-800 p-6 ${className}`}>
+            <div className={`bg-helix-surface rounded-md border border-helix-border p-4 ${className}`}>
                 <div className="animate-pulse">
-                    <div className="h-6 bg-neutral-800 rounded w-1/3 mb-4" />
-                    <div className="h-64 bg-neutral-800 rounded" />
+                    <div className="h-6 bg-white/5 rounded w-1/3 mb-4" />
+                    <div className="h-64 bg-white/5 rounded" />
                 </div>
             </div>
         );
     }
 
     return (
-        <div className={`bg-neutral-900/50 rounded-xl border border-neutral-800 overflow-hidden ${className}`}>
+        <div className={`bg-helix-surface rounded-md border border-helix-border overflow-hidden ${className}`}>
             {/* Header */}
-            <div className="p-4 border-b border-neutral-800">
+            <div className="p-4 border-b border-helix-border">
                 <div className="flex items-center justify-between">
                     <div className="flex items-center gap-3">
-                        <div className="w-10 h-10 rounded-lg bg-emerald-500/20 flex items-center justify-center">
-                            <Activity className="w-5 h-5 text-emerald-400" />
+                        <div className="w-10 h-10 rounded-md bg-white/5 flex items-center justify-center">
+                            <Activity className="w-5 h-5 text-white/70" />
                         </div>
                         <div>
                             <h3 className="font-semibold text-white">Training Progress</h3>
-                            <p className="text-sm text-neutral-400">
+                            <p className="text-sm text-[#666]">
                                 Epoch {metrics?.epoch || 0}/{config?.epochs || 10} | Batch {metrics?.batch || 0}
                             </p>
                         </div>
                     </div>
 
-                    <div className="flex items-center gap-4">
-                        {/* Trend Indicator */}
-                        <div className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-sm font-medium ${
-                            trend.direction === 'improving'
-                                ? 'bg-emerald-500/20 text-emerald-400'
-                                : trend.direction === 'degrading'
-                                    ? 'bg-red-500/20 text-red-400'
-                                    : 'bg-neutral-700/50 text-neutral-400'
-                        }`}>
+                    <div className="flex items-center gap-3">
+                        <div className="flex items-center gap-2 px-3 py-1.5 rounded-md text-sm font-medium bg-white/5 text-[#888]">
                             {trend.direction === 'improving' && <TrendingDown className="w-4 h-4" />}
                             {trend.direction === 'degrading' && <TrendingUp className="w-4 h-4" />}
                             {trend.direction === 'stable' && <Minus className="w-4 h-4" />}
                             <span>{Math.abs(trend.change).toFixed(1)}%</span>
                         </div>
 
-                        {/* Status */}
-                        <div className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-sm ${
-                            status?.status === 'training'
-                                ? 'bg-blue-500/20 text-blue-400'
-                                : status?.status === 'paused'
-                                    ? 'bg-yellow-500/20 text-yellow-400'
-                                    : 'bg-neutral-700/50 text-neutral-400'
-                        }`}>
+                        <div className="flex items-center gap-2 px-3 py-1.5 rounded-md text-sm bg-white/5 text-[#888]">
                             {status?.status === 'training' && (
-                                <span className="w-2 h-2 rounded-full bg-blue-400 animate-pulse" />
+                                <span className="w-2 h-2 rounded-full bg-white animate-pulse" />
                             )}
                             {status?.status || 'Initializing'}
                         </div>
@@ -300,22 +258,19 @@ export default function LiveLossCurve({
                     onMouseLeave={() => setHoveredPoint(null)}
                 >
                     <defs>
-                        {/* Loss gradient */}
                         <linearGradient id="lossGradient" x1="0%" y1="0%" x2="0%" y2="100%">
-                            <stop offset="0%" stopColor="#f43f5e" stopOpacity="0.3" />
-                            <stop offset="100%" stopColor="#f43f5e" stopOpacity="0" />
+                            <stop offset="0%" stopColor="#ffffff" stopOpacity="0.1" />
+                            <stop offset="100%" stopColor="#ffffff" stopOpacity="0" />
                         </linearGradient>
 
-                        {/* Accuracy gradient */}
                         <linearGradient id="accuracyGradient" x1="0%" y1="0%" x2="0%" y2="100%">
-                            <stop offset="0%" stopColor="#22c55e" stopOpacity="0.3" />
-                            <stop offset="100%" stopColor="#22c55e" stopOpacity="0" />
+                            <stop offset="0%" stopColor="#ffffff" stopOpacity="0.05" />
+                            <stop offset="100%" stopColor="#ffffff" stopOpacity="0" />
                         </linearGradient>
 
-                        {/* Error bound gradient */}
                         <linearGradient id="errorGradient" x1="0%" y1="0%" x2="0%" y2="100%">
-                            <stop offset="0%" stopColor="#f59e0b" stopOpacity="0.2" />
-                            <stop offset="100%" stopColor="#f59e0b" stopOpacity="0" />
+                            <stop offset="0%" stopColor="#ffffff" stopOpacity="0.03" />
+                            <stop offset="100%" stopColor="#ffffff" stopOpacity="0" />
                         </linearGradient>
                     </defs>
 
@@ -330,14 +285,14 @@ export default function LiveLossCurve({
                                         y1={y}
                                         x2={chartData.chartWidth}
                                         y2={y}
-                                        stroke="#374151"
+                                        stroke="#262626"
                                         strokeWidth={1}
                                         strokeDasharray={i === 0 || i === 4 ? undefined : "4,4"}
                                     />
                                     <text
                                         x={-8}
                                         y={y + 4}
-                                        fill="#6b7280"
+                                        fill="#525252"
                                         fontSize={11}
                                         textAnchor="end"
                                     >
@@ -392,8 +347,8 @@ export default function LiveLossCurve({
                                     chartData.lossMin
                                 )}
                                 fill="none"
-                                stroke="#f43f5e"
-                                strokeWidth={2.5}
+                                stroke="#ffffff"
+                                strokeWidth={2}
                                 strokeLinecap="round"
                                 initial={{ pathLength: 0 }}
                                 animate={{ pathLength: 1 }}
@@ -401,7 +356,7 @@ export default function LiveLossCurve({
                             />
                         )}
 
-                        {/* Accuracy line */}
+                        {/* Accuracy line (dashed) */}
                         {showAccuracy && chartData.accuracyPoints.length > 1 && (
                             <motion.path
                                 d={createSmoothPath(
@@ -412,16 +367,18 @@ export default function LiveLossCurve({
                                     0
                                 )}
                                 fill="none"
-                                stroke="#22c55e"
-                                strokeWidth={2.5}
+                                stroke="#ffffff"
+                                strokeWidth={1.5}
                                 strokeLinecap="round"
+                                strokeDasharray="6,4"
+                                strokeOpacity={0.5}
                                 initial={{ pathLength: 0 }}
                                 animate={{ pathLength: 1 }}
                                 transition={{ duration: 1, delay: 0.2 }}
                             />
                         )}
 
-                        {/* Error bound line */}
+                        {/* Error bound line (dotted) */}
                         {showErrorBound && chartData.errorPoints.length > 1 && (
                             <motion.path
                                 d={createSmoothPath(
@@ -432,10 +389,11 @@ export default function LiveLossCurve({
                                     0
                                 )}
                                 fill="none"
-                                stroke="#f59e0b"
-                                strokeWidth={2}
+                                stroke="#ffffff"
+                                strokeWidth={1}
                                 strokeLinecap="round"
-                                strokeDasharray="6,3"
+                                strokeDasharray="2,4"
+                                strokeOpacity={0.3}
                                 initial={{ pathLength: 0 }}
                                 animate={{ pathLength: 1 }}
                                 transition={{ duration: 1, delay: 0.4 }}
@@ -447,8 +405,8 @@ export default function LiveLossCurve({
                             <motion.circle
                                 cx={chartData.lossPoints[chartData.lossPoints.length - 1].x * chartData.xScale}
                                 cy={chartData.chartHeight - ((chartData.lossPoints[chartData.lossPoints.length - 1].y - chartData.lossMin) * chartData.lossYScale)}
-                                r={6}
-                                fill="#f43f5e"
+                                r={5}
+                                fill="#ffffff"
                                 initial={{ scale: 0 }}
                                 animate={{ scale: 1 }}
                                 transition={{ type: "spring", stiffness: 500 }}
@@ -459,8 +417,11 @@ export default function LiveLossCurve({
                             <motion.circle
                                 cx={chartData.accuracyPoints[chartData.accuracyPoints.length - 1].x * chartData.xScale}
                                 cy={chartData.chartHeight - (chartData.accuracyPoints[chartData.accuracyPoints.length - 1].y * chartData.accYScale)}
-                                r={6}
-                                fill="#22c55e"
+                                r={4}
+                                fill="none"
+                                stroke="#ffffff"
+                                strokeWidth={2}
+                                strokeOpacity={0.5}
                                 initial={{ scale: 0 }}
                                 animate={{ scale: 1 }}
                                 transition={{ type: "spring", stiffness: 500, delay: 0.2 }}
@@ -481,17 +442,16 @@ export default function LiveLossCurve({
                                         y1={0}
                                         x2={hoveredPoint.x - chartData.padding.left}
                                         y2={chartData.chartHeight}
-                                        stroke="#6b7280"
+                                        stroke="#525252"
                                         strokeWidth={1}
                                         strokeDasharray="4,4"
                                     />
                                     <circle
                                         cx={hoveredPoint.x - chartData.padding.left}
                                         cy={hoveredPoint.y - chartData.padding.top}
-                                        r={8}
-                                        fill="#f43f5e"
-                                        fillOpacity={0.3}
-                                        stroke="#f43f5e"
+                                        r={7}
+                                        fill="rgba(255,255,255,0.1)"
+                                        stroke="#ffffff"
                                         strokeWidth={2}
                                     />
                                 </motion.g>
@@ -510,7 +470,7 @@ export default function LiveLossCurve({
                                     key={i}
                                     x={index * chartData.xScale}
                                     y={0}
-                                    fill="#6b7280"
+                                    fill="#525252"
                                     fontSize={11}
                                     textAnchor="middle"
                                 >
@@ -530,7 +490,7 @@ export default function LiveLossCurve({
                                         key={i}
                                         x={0}
                                         y={y + 4}
-                                        fill="#22c55e"
+                                        fill="#525252"
                                         fontSize={11}
                                     >
                                         {(ratio * 100).toFixed(0)}%
@@ -545,7 +505,7 @@ export default function LiveLossCurve({
                 <AnimatePresence>
                     {hoveredPoint && (
                         <motion.div
-                            className="absolute bg-neutral-800 border border-neutral-700 rounded-lg px-3 py-2 text-sm pointer-events-none z-10"
+                            className="absolute bg-helix-surface border border-helix-border rounded-md px-3 py-2 text-sm pointer-events-none z-10"
                             style={{
                                 left: hoveredPoint.x + 10,
                                 top: hoveredPoint.y - 40,
@@ -554,7 +514,7 @@ export default function LiveLossCurve({
                             animate={{ opacity: 1, y: 0 }}
                             exit={{ opacity: 0, y: 5 }}
                         >
-                            <div className="text-neutral-400">Loss</div>
+                            <div className="text-[#666]">Loss</div>
                             <div className="text-white font-medium">{hoveredPoint.data.y.toFixed(4)}</div>
                         </motion.div>
                     )}
@@ -564,39 +524,37 @@ export default function LiveLossCurve({
             {/* Legend & Stats */}
             <div className="px-4 pb-4">
                 <div className="flex items-center justify-between">
-                    {/* Legend */}
-                    <div className="flex items-center gap-6">
+                    <div className="flex items-center gap-3">
                         <div className="flex items-center gap-2">
-                            <div className="w-3 h-3 rounded-full bg-rose-500" />
-                            <span className="text-sm text-neutral-400">Loss</span>
+                            <div className="w-4 h-0.5 bg-white rounded-full" />
+                            <span className="text-sm text-[#666]">Loss</span>
                             <span className="text-sm font-medium text-white">{metrics?.loss.toFixed(4)}</span>
                         </div>
                         {showAccuracy && (
                             <div className="flex items-center gap-2">
-                                <div className="w-3 h-3 rounded-full bg-emerald-500" />
-                                <span className="text-sm text-neutral-400">Accuracy</span>
+                                <div className="w-4 h-0.5 bg-white/50 rounded-full" style={{ borderTop: '2px dashed rgba(255,255,255,0.5)', height: 0 }} />
+                                <span className="text-sm text-[#666]">Accuracy</span>
                                 <span className="text-sm font-medium text-white">{((metrics?.accuracy || 0) * 100).toFixed(1)}%</span>
                             </div>
                         )}
                         {showErrorBound && (
                             <div className="flex items-center gap-2">
-                                <div className="w-3 h-0.5 bg-amber-500" style={{ borderStyle: 'dashed' }} />
-                                <span className="text-sm text-neutral-400">Error Bound</span>
+                                <div className="w-4 h-0.5 bg-white/30 rounded-full" />
+                                <span className="text-sm text-[#666]">Error Bound</span>
                                 <span className="text-sm font-medium text-white">{((metrics?.errorBound || 0) * 1000).toFixed(3)}</span>
                             </div>
                         )}
                     </div>
 
-                    {/* Stats */}
-                    <div className="flex items-center gap-4">
+                    <div className="flex items-center gap-3">
                         <div className="flex items-center gap-2 text-sm">
-                            <Zap className="w-4 h-4 text-blue-400" />
-                            <span className="text-neutral-400">Throughput:</span>
+                            <Zap className="w-4 h-4 text-white/40" />
+                            <span className="text-[#666]">Throughput:</span>
                             <span className="font-medium text-white">{metrics?.throughput.toFixed(1)} samples/s</span>
                         </div>
                         <div className="flex items-center gap-2 text-sm">
-                            <Activity className="w-4 h-4 text-purple-400" />
-                            <span className="text-neutral-400">Convergence:</span>
+                            <Activity className="w-4 h-4 text-white/40" />
+                            <span className="text-[#666]">Convergence:</span>
                             <span className="font-medium text-white">{(convergenceRate * 100).toFixed(1)}%</span>
                         </div>
                     </div>

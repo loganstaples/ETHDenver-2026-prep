@@ -1,20 +1,19 @@
 'use client';
 
 import { motion } from 'framer-motion';
-import { Cpu, Activity, Zap, Boxes } from 'lucide-react';
-import classNames from 'clsx';
+import { Boxes, Activity, Cpu, Zap } from 'lucide-react';
 import { useAccount } from 'wagmi';
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
 
 const stats = [
-    { name: 'Active Models', value: '12', change: '+2.5%', icon: Boxes, color: 'text-blue-500', bg: 'bg-blue-500/10' },
-    { name: 'Total Rounds', value: '843', change: '+18.2%', icon: Activity, color: 'text-emerald-500', bg: 'bg-emerald-500/10' },
-    { name: 'Compute Nodes', value: '24', change: '-1.4%', icon: Cpu, color: 'text-purple-500', bg: 'bg-purple-500/10' },
-    { name: 'Proofs Verified', value: '1,294', change: '+4.3%', icon: Zap, color: 'text-amber-500', bg: 'bg-amber-500/10' },
+    { label: 'Active Models', value: '12', delta: '+2', icon: Boxes },
+    { label: 'Total Rounds', value: '843', delta: '+18', icon: Activity },
+    { label: 'Compute Nodes', value: '24', delta: '-1', icon: Cpu },
+    { label: 'Proofs Verified', value: '1,294', delta: '+43', icon: Zap },
 ];
 
-const networkActivityData = Array.from({ length: 24 }, (_, i) => ({
-    time: `${String(i).padStart(2, '0')}:00`,
+const chartData = Array.from({ length: 24 }, (_, i) => ({
+    t: `${String(i).padStart(2, '0')}:00`,
     proofs: Math.floor(Math.random() * 40) + 10,
     rounds: Math.floor(Math.random() * 8) + 2,
 }));
@@ -23,98 +22,103 @@ export default function Page() {
     const { isConnected } = useAccount();
 
     return (
-        <div className="space-y-8">
-            {/* Stats Grid */}
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-                {stats.map((stat, i) => (
+        <div className="space-y-4">
+            {/* Stats */}
+            <div className="grid grid-cols-4 gap-3">
+                {stats.map((s, i) => (
                     <motion.div
-                        key={stat.name}
-                        initial={{ opacity: 0, y: 20 }}
+                        key={s.label}
+                        initial={{ opacity: 0, y: 8 }}
                         animate={{ opacity: 1, y: 0 }}
-                        transition={{ delay: i * 0.1 }}
-                        className="bg-neutral-900/50 backdrop-blur-md border border-neutral-800 p-6 rounded-2xl hover:border-neutral-700 transition-colors"
+                        transition={{ delay: i * 0.05, duration: 0.3 }}
+                        className="bg-helix-surface border border-helix-border rounded-md p-4 hover:border-white/[0.08] transition-colors"
                     >
-                        <div className="flex items-center justify-between mb-4">
-                            <div className={classNames("p-3 rounded-xl", stat.bg, stat.color)}>
-                                <stat.icon className="w-6 h-6" />
-                            </div>
-                            <span className={classNames("text-sm font-medium", stat.change.startsWith('+') ? "text-emerald-400" : "text-rose-400")}>
-                                {stat.change}
-                            </span>
+                        <div className="flex items-center justify-between mb-3">
+                            <span className="text-[11px] text-[#666] uppercase tracking-wider">{s.label}</span>
+                            <s.icon className="w-3.5 h-3.5 text-[#444]" strokeWidth={1.5} />
                         </div>
-                        <div className="text-3xl font-bold mb-1">{stat.value}</div>
-                        <div className="text-neutral-500 text-sm">{stat.name}</div>
+                        <div className="flex items-baseline gap-2">
+                            <span className="text-2xl font-semibold tracking-tight font-mono">{s.value}</span>
+                            <span className="text-[11px] text-[#555] font-mono">{s.delta}</span>
+                        </div>
                     </motion.div>
                 ))}
             </div>
 
-            {/* Main Panel */}
+            {/* Chart */}
             <motion.div
-                initial={{ opacity: 0, scale: 0.95 }}
-                animate={{ opacity: 1, scale: 1 }}
-                transition={{ delay: 0.4 }}
-                className="bg-neutral-900/50 backdrop-blur-md border border-neutral-800 rounded-3xl p-8 min-h-[400px]"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                transition={{ delay: 0.2 }}
+                className="bg-helix-surface border border-helix-border rounded-md p-5"
             >
-                <h2 className="text-xl font-bold mb-6">Network Activity</h2>
+                <div className="flex items-center justify-between mb-5">
+                    <span className="text-[13px] font-medium text-white">Network Activity</span>
+                    <span className="text-[11px] text-[#555] font-mono">24h</span>
+                </div>
 
                 {isConnected ? (
-                    <ResponsiveContainer width="100%" height={300}>
-                        <AreaChart data={networkActivityData}>
+                    <ResponsiveContainer width="100%" height={260}>
+                        <AreaChart data={chartData}>
                             <defs>
-                                <linearGradient id="proofGradient" x1="0" y1="0" x2="0" y2="1">
-                                    <stop offset="5%" stopColor="#10b981" stopOpacity={0.3} />
-                                    <stop offset="95%" stopColor="#10b981" stopOpacity={0} />
-                                </linearGradient>
-                                <linearGradient id="roundGradient" x1="0" y1="0" x2="0" y2="1">
-                                    <stop offset="5%" stopColor="#6366f1" stopOpacity={0.3} />
-                                    <stop offset="95%" stopColor="#6366f1" stopOpacity={0} />
+                                <linearGradient id="gProofs" x1="0" y1="0" x2="0" y2="1">
+                                    <stop offset="0%" stopColor="#fff" stopOpacity={0.06} />
+                                    <stop offset="100%" stopColor="#fff" stopOpacity={0} />
                                 </linearGradient>
                             </defs>
                             <XAxis
-                                dataKey="time"
-                                stroke="#525252"
-                                fontSize={12}
+                                dataKey="t"
+                                stroke="#333"
+                                fontSize={10}
                                 tickLine={false}
                                 axisLine={false}
+                                tick={{ fill: '#555', fontFamily: 'var(--font-geist-mono)' }}
+                                interval={5}
                             />
                             <YAxis
-                                stroke="#525252"
-                                fontSize={12}
+                                stroke="#333"
+                                fontSize={10}
                                 tickLine={false}
                                 axisLine={false}
+                                tick={{ fill: '#555', fontFamily: 'var(--font-geist-mono)' }}
+                                width={30}
                             />
                             <Tooltip
                                 contentStyle={{
-                                    backgroundColor: '#171717',
-                                    border: '1px solid #404040',
-                                    borderRadius: '8px',
+                                    backgroundColor: '#111113',
+                                    border: '1px solid #1e1e22',
+                                    borderRadius: '4px',
                                     color: '#fff',
+                                    fontSize: '11px',
+                                    fontFamily: 'var(--font-geist-mono)',
+                                    padding: '6px 10px',
                                 }}
+                                itemStyle={{ color: '#999', fontSize: '11px' }}
+                                labelStyle={{ color: '#fff', fontSize: '11px', marginBottom: '4px' }}
                             />
                             <Area
                                 type="monotone"
                                 dataKey="proofs"
-                                stroke="#10b981"
-                                fill="url(#proofGradient)"
-                                strokeWidth={2}
-                                name="Proof Submissions"
+                                stroke="#fff"
+                                fill="url(#gProofs)"
+                                strokeWidth={1}
+                                name="Proofs"
                             />
                             <Area
                                 type="monotone"
                                 dataKey="rounds"
-                                stroke="#6366f1"
-                                fill="url(#roundGradient)"
-                                strokeWidth={2}
-                                name="Rounds Completed"
+                                stroke="#555"
+                                fill="none"
+                                strokeWidth={1}
+                                strokeDasharray="3 3"
+                                name="Rounds"
                             />
                         </AreaChart>
                     </ResponsiveContainer>
                 ) : (
-                    <div className="flex flex-col items-center justify-center h-64 text-neutral-500 space-y-4">
-                        <div className="p-4 bg-neutral-800 rounded-full">
-                            <Activity className="w-8 h-8 text-neutral-400" />
-                        </div>
-                        <p>Connect wallet to view network stats</p>
+                    <div className="flex flex-col items-center justify-center h-[260px] text-[#444]">
+                        <Activity className="w-6 h-6 mb-3" strokeWidth={1} />
+                        <p className="text-[13px]">Connect wallet to view activity</p>
                     </div>
                 )}
             </motion.div>

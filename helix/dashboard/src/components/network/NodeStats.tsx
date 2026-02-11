@@ -151,10 +151,10 @@ export default function NodeStats() {
 
     const getStatusColor = (status: string) => {
         const colors: Record<string, string> = {
-            active: '#22c55e',
-            idle: '#f59e0b',
-            offline: '#ef4444',
-            syncing: '#6366f1',
+            active: '#ffffff',
+            idle: '#a3a3a3',
+            offline: '#525252',
+            syncing: '#d4d4d4',
         };
         return colors[status] || '#6b7280';
     };
@@ -180,238 +180,42 @@ export default function NodeStats() {
         : 0;
 
     return (
-        <div className="node-stats">
-            <style jsx>{`
-                .node-stats {
-                    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-                    border-radius: 16px;
-                    padding: 24px;
-                    color: #fff;
-                    font-family: 'Inter', -apple-system, sans-serif;
-                }
-
-                .header {
-                    display: flex;
-                    justify-content: space-between;
-                    align-items: center;
-                    margin-bottom: 24px;
-                }
-
-                .title {
-                    font-size: 24px;
-                    font-weight: 700;
-                    background: linear-gradient(90deg, #22c55e, #6366f1);
-                    -webkit-background-clip: text;
-                    -webkit-text-fill-color: transparent;
-                }
-
-                .stats-grid {
-                    display: grid;
-                    grid-template-columns: repeat(4, 1fr);
-                    gap: 16px;
-                    margin-bottom: 24px;
-                }
-
-                .stat-card {
-                    background: rgba(255, 255, 255, 0.03);
-                    border-radius: 12px;
-                    padding: 16px;
-                    border: 1px solid rgba(255, 255, 255, 0.08);
-                    text-align: center;
-                }
-
-                .stat-value {
-                    font-size: 28px;
-                    font-weight: 700;
-                    margin-bottom: 4px;
-                }
-
-                .stat-label {
-                    font-size: 12px;
-                    color: #9ca3af;
-                    text-transform: uppercase;
-                }
-
-                .filters {
-                    display: flex;
-                    gap: 8px;
-                    margin-bottom: 16px;
-                }
-
-                .filter-btn {
-                    padding: 8px 16px;
-                    border-radius: 8px;
-                    border: 1px solid rgba(255, 255, 255, 0.1);
-                    background: rgba(255, 255, 255, 0.05);
-                    color: #9ca3af;
-                    font-size: 12px;
-                    cursor: pointer;
-                    transition: all 0.2s;
-                }
-
-                .filter-btn:hover {
-                    background: rgba(255, 255, 255, 0.1);
-                }
-
-                .filter-btn.active {
-                    background: rgba(34, 197, 94, 0.2);
-                    border-color: rgba(34, 197, 94, 0.5);
-                    color: #22c55e;
-                }
-
-                .worker-list {
-                    display: flex;
-                    flex-direction: column;
-                    gap: 8px;
-                }
-
-                .worker-item {
-                    display: grid;
-                    grid-template-columns: 40px 1fr 120px 100px 100px 80px 60px;
-                    align-items: center;
-                    gap: 16px;
-                    padding: 16px;
-                    background: rgba(255, 255, 255, 0.03);
-                    border-radius: 12px;
-                    border: 1px solid rgba(255, 255, 255, 0.08);
-                    cursor: pointer;
-                    transition: all 0.2s;
-                }
-
-                .worker-item:hover {
-                    background: rgba(255, 255, 255, 0.06);
-                    border-color: rgba(255, 255, 255, 0.15);
-                }
-
-                .worker-item.selected {
-                    border-color: rgba(34, 197, 94, 0.5);
-                    background: rgba(34, 197, 94, 0.1);
-                }
-
-                .status-dot {
-                    width: 12px;
-                    height: 12px;
-                    border-radius: 50%;
-                    animation: pulse 2s infinite;
-                }
-
-                @keyframes pulse {
-                    0%, 100% { opacity: 1; }
-                    50% { opacity: 0.5; }
-                }
-
-                .worker-address {
-                    font-family: 'JetBrains Mono', monospace;
-                    font-size: 14px;
-                }
-
-                .worker-stake {
-                    font-weight: 600;
-                    color: #f59e0b;
-                }
-
-                .worker-proofs {
-                    font-weight: 600;
-                    color: #22c55e;
-                }
-
-                .worker-reputation {
-                    font-weight: 600;
-                }
-
-                .worker-last-seen {
-                    font-size: 12px;
-                    color: #6b7280;
-                }
-
-                .capabilities {
-                    display: flex;
-                    gap: 4px;
-                }
-
-                .cap-badge {
-                    padding: 2px 6px;
-                    border-radius: 4px;
-                    font-size: 10px;
-                    font-weight: 600;
-                }
-
-                .detail-panel {
-                    margin-top: 24px;
-                    padding: 20px;
-                    background: rgba(255, 255, 255, 0.03);
-                    border-radius: 12px;
-                    border: 1px solid rgba(255, 255, 255, 0.08);
-                }
-
-                .detail-title {
-                    font-size: 18px;
-                    font-weight: 600;
-                    margin-bottom: 16px;
-                }
-
-                .detail-grid {
-                    display: grid;
-                    grid-template-columns: repeat(3, 1fr);
-                    gap: 16px;
-                }
-
-                .detail-item {
-                    background: rgba(0, 0, 0, 0.2);
-                    padding: 12px;
-                    border-radius: 8px;
-                }
-
-                .detail-label {
-                    font-size: 11px;
-                    color: #6b7280;
-                    text-transform: uppercase;
-                    margin-bottom: 4px;
-                }
-
-                .detail-value {
-                    font-size: 16px;
-                    font-weight: 600;
-                }
-
-                .loading {
-                    text-align: center;
-                    padding: 40px;
-                    color: #6b7280;
-                }
-            `}</style>
-
-            <div className="header">
-                <h2 className="title">Worker Nodes</h2>
-                <span style={{ color: '#6b7280', fontSize: '14px' }}>
+        <div className="bg-helix-surface rounded-md p-4 text-white border border-helix-border">
+            <div className="flex justify-between items-center mb-4">
+                <h2 className="text-white font-semibold text-[15px]">Worker Nodes</h2>
+                <span className="text-[#666] text-sm">
                     {workers.length} total workers
                 </span>
             </div>
 
-            <div className="stats-grid">
-                <div className="stat-card">
-                    <div className="stat-value" style={{ color: '#22c55e' }}>{activeWorkers}</div>
-                    <div className="stat-label">Active Workers</div>
+            <div className="grid grid-cols-4 gap-3 mb-4">
+                <div className="bg-white/[0.03] rounded-md p-4 border border-helix-border text-center">
+                    <div className="text-white text-xl font-bold mb-1">{activeWorkers}</div>
+                    <div className="text-[#888] text-xs uppercase">Active Workers</div>
                 </div>
-                <div className="stat-card">
-                    <div className="stat-value" style={{ color: '#f59e0b' }}>{formatStake(totalStaked)}</div>
-                    <div className="stat-label">Total Staked</div>
+                <div className="bg-white/[0.03] rounded-md p-4 border border-helix-border text-center">
+                    <div className="text-white text-xl font-bold mb-1">{formatStake(totalStaked)}</div>
+                    <div className="text-[#888] text-xs uppercase">Total Staked</div>
                 </div>
-                <div className="stat-card">
-                    <div className="stat-value" style={{ color: '#6366f1' }}>{totalProofs}</div>
-                    <div className="stat-label">Total Proofs</div>
+                <div className="bg-white/[0.03] rounded-md p-4 border border-helix-border text-center">
+                    <div className="text-white text-xl font-bold mb-1">{totalProofs}</div>
+                    <div className="text-[#888] text-xs uppercase">Total Proofs</div>
                 </div>
-                <div className="stat-card">
-                    <div className="stat-value" style={{ color: '#a855f7' }}>{avgReputation}%</div>
-                    <div className="stat-label">Avg Reputation</div>
+                <div className="bg-white/[0.03] rounded-md p-4 border border-helix-border text-center">
+                    <div className="text-white text-xl font-bold mb-1">{avgReputation}%</div>
+                    <div className="text-[#888] text-xs uppercase">Avg Reputation</div>
                 </div>
             </div>
 
-            <div className="filters">
+            <div className="flex gap-2 mb-4">
                 {(['all', 'active', 'idle', 'offline'] as const).map((f) => (
                     <button
                         key={f}
-                        className={`filter-btn ${filter === f ? 'active' : ''}`}
+                        className={`px-4 py-2 rounded-md border text-xs transition-all ${
+                            filter === f
+                                ? 'bg-white/10 border-white/10 text-white'
+                                : 'bg-white/5 border-helix-border text-[#666] hover:bg-white/10'
+                        }`}
                         onClick={() => setFilter(f)}
                     >
                         {f.charAt(0).toUpperCase() + f.slice(1)}
@@ -420,43 +224,41 @@ export default function NodeStats() {
             </div>
 
             {stateLoading ? (
-                <div className="loading">Loading worker data...</div>
+                <div className="text-center py-10 text-[#666]">Loading worker data...</div>
             ) : (
-                <div className="worker-list">
+                <div className="flex flex-col gap-2">
                     {filteredWorkers.map((worker) => (
                         <div
                             key={worker.id}
-                            className={`worker-item ${selectedWorker?.id === worker.id ? 'selected' : ''}`}
+                            className={`grid grid-cols-[40px_1fr_120px_100px_100px_80px_60px] items-center gap-3 p-4 bg-white/[0.03] rounded-md border cursor-pointer transition-all ${
+                                selectedWorker?.id === worker.id
+                                    ? 'border-white/10 bg-white/10'
+                                    : 'border-helix-border hover:bg-white/[0.06] hover:border-white/[0.15]'
+                            }`}
                             onClick={() => setSelectedWorker(worker)}
                         >
                             <div
-                                className="status-dot"
+                                className="w-3 h-3 rounded-full animate-[pulse_2s_infinite]"
                                 style={{ backgroundColor: getStatusColor(worker.status) }}
                             />
-                            <div className="worker-address">
+                            <div className="font-mono text-sm text-white">
                                 {worker.address.slice(0, 6)}...{worker.address.slice(-4)}
                             </div>
-                            <div className="worker-stake">{formatStake(worker.stakedAmount)}</div>
-                            <div className="worker-proofs">{worker.proofsSubmitted} proofs</div>
-                            <div
-                                className="worker-reputation"
-                                style={{
-                                    color: worker.reputation >= 90 ? '#22c55e' :
-                                           worker.reputation >= 70 ? '#f59e0b' : '#ef4444'
-                                }}
-                            >
+                            <div className="text-white font-semibold">{formatStake(worker.stakedAmount)}</div>
+                            <div className="text-white font-semibold">{worker.proofsSubmitted} proofs</div>
+                            <div className="text-white font-semibold">
                                 {worker.reputation}%
                             </div>
-                            <div className="worker-last-seen">{formatTimeSince(worker.lastSeen)}</div>
-                            <div className="capabilities">
+                            <div className="text-xs text-neutral-600">{formatTimeSince(worker.lastSeen)}</div>
+                            <div className="flex gap-1">
                                 {worker.capabilities.canTrain && (
-                                    <span className="cap-badge" style={{ background: 'rgba(99, 102, 241, 0.3)', color: '#818cf8' }}>T</span>
+                                    <span className="px-1.5 py-0.5 rounded bg-white/10 text-[#888] text-[10px] font-semibold">T</span>
                                 )}
                                 {worker.capabilities.canAggregate && (
-                                    <span className="cap-badge" style={{ background: 'rgba(168, 85, 247, 0.3)', color: '#c084fc' }}>A</span>
+                                    <span className="px-1.5 py-0.5 rounded bg-white/10 text-[#888] text-[10px] font-semibold">A</span>
                                 )}
                                 {worker.capabilities.canProve && (
-                                    <span className="cap-badge" style={{ background: 'rgba(34, 197, 94, 0.3)', color: '#4ade80' }}>P</span>
+                                    <span className="px-1.5 py-0.5 rounded bg-white/10 text-[#888] text-[10px] font-semibold">P</span>
                                 )}
                             </div>
                         </div>
@@ -465,44 +267,44 @@ export default function NodeStats() {
             )}
 
             {selectedWorker && (
-                <div className="detail-panel">
-                    <div className="detail-title">
+                <div className="mt-4 p-4 bg-white/[0.03] rounded-md border border-helix-border">
+                    <div className="text-lg font-semibold mb-4 text-white">
                         Worker Details: {selectedWorker.address.slice(0, 8)}...
                     </div>
-                    <div className="detail-grid">
-                        <div className="detail-item">
-                            <div className="detail-label">Full Address</div>
-                            <div className="detail-value" style={{ fontSize: '12px', fontFamily: 'monospace' }}>
+                    <div className="grid grid-cols-3 gap-3">
+                        <div className="bg-white/[0.03] rounded-md p-3">
+                            <div className="text-[11px] text-neutral-600 uppercase mb-1">Full Address</div>
+                            <div className="text-white text-xs font-semibold font-mono break-all">
                                 {selectedWorker.address}
                             </div>
                         </div>
-                        <div className="detail-item">
-                            <div className="detail-label">Status</div>
-                            <div className="detail-value" style={{ color: getStatusColor(selectedWorker.status) }}>
+                        <div className="bg-white/[0.03] rounded-md p-3">
+                            <div className="text-[11px] text-neutral-600 uppercase mb-1">Status</div>
+                            <div className="text-white text-base font-semibold">
                                 {selectedWorker.status.toUpperCase()}
                             </div>
                         </div>
-                        <div className="detail-item">
-                            <div className="detail-label">Staked Amount</div>
-                            <div className="detail-value" style={{ color: '#f59e0b' }}>
+                        <div className="bg-white/[0.03] rounded-md p-3">
+                            <div className="text-[11px] text-neutral-600 uppercase mb-1">Staked Amount</div>
+                            <div className="text-white text-base font-semibold">
                                 {formatStake(selectedWorker.stakedAmount)}
                             </div>
                         </div>
-                        <div className="detail-item">
-                            <div className="detail-label">Proofs Submitted</div>
-                            <div className="detail-value" style={{ color: '#22c55e' }}>
+                        <div className="bg-white/[0.03] rounded-md p-3">
+                            <div className="text-[11px] text-neutral-600 uppercase mb-1">Proofs Submitted</div>
+                            <div className="text-white text-base font-semibold">
                                 {selectedWorker.proofsSubmitted}
                             </div>
                         </div>
-                        <div className="detail-item">
-                            <div className="detail-label">Rounds Participated</div>
-                            <div className="detail-value" style={{ color: '#6366f1' }}>
+                        <div className="bg-white/[0.03] rounded-md p-3">
+                            <div className="text-[11px] text-neutral-600 uppercase mb-1">Rounds Participated</div>
+                            <div className="text-white text-base font-semibold">
                                 {selectedWorker.roundsParticipated}
                             </div>
                         </div>
-                        <div className="detail-item">
-                            <div className="detail-label">GPU Memory</div>
-                            <div className="detail-value">
+                        <div className="bg-white/[0.03] rounded-md p-3">
+                            <div className="text-[11px] text-neutral-600 uppercase mb-1">GPU Memory</div>
+                            <div className="text-white text-base font-semibold">
                                 {(selectedWorker.capabilities.gpuMemoryMb / 1000).toFixed(0)} GB
                             </div>
                         </div>
