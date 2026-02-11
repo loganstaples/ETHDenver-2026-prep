@@ -338,6 +338,10 @@ async fn rpc_handler(
         "helix_getAggregationResult" => handle_get_aggregation_result(&state, &req.params, &id),
         "helix_getMPCStatus" => handle_get_mpc_status(&state, &id),
         "helix_getTrainingResult" => handle_get_training_result(&state, &req.params, &id),
+        "helix_generateProof" => handle_generate_proof(&state, &req.params, &id),
+        "helix_registerModel" => handle_register_model(&state, &req.params, &id),
+        "helix_stake" => handle_stake(&state, &req.params, &id),
+        "helix_unstake" => handle_unstake(&state, &req.params, &id),
         _ => JsonRpcResponse::method_not_found(id.clone(), &req.method),
     };
 
@@ -543,10 +547,26 @@ fn handle_get_model_state(
     let snap = state.snapshot.read();
     let current_round = snap.current_round.as_ref().map(|r| r.round_id).unwrap_or(0);
 
+    // Use real commitment from round state if available
+    let current_commitment = snap
+        .current_round
+        .as_ref()
+        .and_then(|r| r.commitment_hash.clone())
+        .unwrap_or_else(|| {
+            // Check aggregation results for the latest committed round
+            let agg = state.aggregation_results.read();
+            if let Some(latest) = agg.last() {
+                format!("0x{}", hex::encode(latest.merkle_root))
+            } else {
+                // No data available — return null instead of fake zeros
+                "null".to_string()
+            }
+        });
+
     let result = ModelStateResponse {
         model_id,
         current_round,
-        current_commitment: format!("0x{}", "0".repeat(64)), // Placeholder until on-chain query
+        current_commitment,
         active: snap.current_round.is_some() || snap.completed_rounds > 0,
     };
 
@@ -714,6 +734,29 @@ fn handle_get_mpc_status(state: &RpcState, id: &serde_json::Value) -> JsonRpcRes
     )
 }
 
+/// Response for `helix_generateProof`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GenerateProofResponse {
+    pub accepted: bool,
+    pub message: String,
+    pub round_id: u64,
+}
+
+/// Response for `helix_registerModel`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RegisterModelResponse {
+    pub registered: bool,
+    pub model_id: u64,
+    pub message: String,
+}
+
+/// Response for `helix_stake` / `helix_unstake`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StakeResponse {
+    pub success: bool,
+    pub message: String,
+}
+
 /// Response for `helix_getTrainingResult`.
 ///
 /// Returns the latest training round result including the aggregated weight
@@ -762,6 +805,114 @@ fn handle_get_training_result(
         step_number: round_id,
     };
 
+    JsonRpcResponse::success(
+        id.clone(),
+        serde_json::to_value(result).unwrap_or_default(),
+    )
+}
+
+fn handle_generate_proof(
+    state: &RpcState,
+    params: &serde_json::Value,
+    id: &serde_json::Value,
+) -> JsonRpcResponse {
+    let round_id = params
+        .get("round_id")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    // Trigger a training step which includes proof generation
+    match state.round_trigger_tx.send(()) {
+        Ok(_) => {
+            let result = GenerateProofResponse {
+                accepted: true,
+                message: format!("Proof generation triggered for round {}", round_id),
+                round_id,
+            };
+            JsonRpcResponse::success(
+                id.clone(),
+                serde_json::to_value(result).unwrap_or_default(),
+            )
+        }
+        Err(_) => {
+            let result = GenerateProofResponse {
+                accepted: false,
+                message: "No training orchestrator listening for proof generation".to_string(),
+                round_id,
+            };
+            JsonRpcResponse::success(
+                id.clone(),
+                serde_json::to_value(result).unwrap_or_default(),
+            )
+        }
+    }
+}
+
+fn handle_register_model(
+    state: &RpcState,
+    params: &serde_json::Value,
+    id: &serde_json::Value,
+) -> JsonRpcResponse {
+    let model_id = params
+        .get("model_id")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1);
+
+    // Store the model_id in node state
+    *state.model_id.write() = Some(model_id);
+
+    let result = RegisterModelResponse {
+        registered: true,
+        model_id,
+        message: format!("Model {} registered in node state", model_id),
+    };
+    JsonRpcResponse::success(
+        id.clone(),
+        serde_json::to_value(result).unwrap_or_default(),
+    )
+}
+
+fn handle_stake(
+    _state: &RpcState,
+    params: &serde_json::Value,
+    id: &serde_json::Value,
+) -> JsonRpcResponse {
+    let model_id = match params.get("model_id").and_then(|v| v.as_u64()) {
+        Some(v) => v,
+        None => return JsonRpcResponse::invalid_params(id.clone(), "model_id is required (u64)"),
+    };
+
+    // Staking is handled on-chain; node acknowledges the intent
+    let result = StakeResponse {
+        success: true,
+        message: format!(
+            "Stake request acknowledged for model {}. On-chain staking must be performed via the coordinator contract.",
+            model_id
+        ),
+    };
+    JsonRpcResponse::success(
+        id.clone(),
+        serde_json::to_value(result).unwrap_or_default(),
+    )
+}
+
+fn handle_unstake(
+    _state: &RpcState,
+    params: &serde_json::Value,
+    id: &serde_json::Value,
+) -> JsonRpcResponse {
+    let model_id = match params.get("model_id").and_then(|v| v.as_u64()) {
+        Some(v) => v,
+        None => return JsonRpcResponse::invalid_params(id.clone(), "model_id is required (u64)"),
+    };
+
+    let result = StakeResponse {
+        success: true,
+        message: format!(
+            "Unstake request acknowledged for model {}. On-chain unstaking must be performed via the coordinator contract.",
+            model_id
+        ),
+    };
     JsonRpcResponse::success(
         id.clone(),
         serde_json::to_value(result).unwrap_or_default(),

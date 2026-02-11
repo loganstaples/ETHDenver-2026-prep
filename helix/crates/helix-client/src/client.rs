@@ -31,11 +31,11 @@ impl HelixClient {
     /// Create a new `HelixClient` from a validated configuration.
     ///
     /// The RPC layer starts disconnected. Call [`connect`](Self::connect)
-    /// to establish a real node connection, or use [`new_mock`](Self::new_mock)
-    /// if you explicitly want mock mode for development.
+    /// to establish a real node connection. This will NOT silently fall back
+    /// to mock mode — use [`new_mock`](Self::new_mock) explicitly for testing.
     pub fn new(config: HelixConfig) -> Result<Self> {
         config.validate()?;
-        let rpc = UnifiedRpcClient::new_mock();
+        let rpc = UnifiedRpcClient::new_disconnected();
         Ok(Self {
             config,
             rpc,
@@ -73,23 +73,11 @@ impl HelixClient {
 
     /// Attempt to connect the RPC layer to a real HELIX node.
     ///
-    /// Returns an error if the connection fails. Use [`connect_or_mock`] for
-    /// development scenarios where falling back to mock mode is acceptable.
+    /// Returns an error if the connection fails. For testing/demo scenarios
+    /// where no real node is available, use [`new_mock`](Self::new_mock).
     pub async fn connect(&mut self) -> Result<()> {
         let rpc_cfg = rpc_config_from_helix(&self.config.rpc);
         self.rpc = UnifiedRpcClient::connect(rpc_cfg).await?;
-        Ok(())
-    }
-
-    /// Attempt to connect to a real HELIX node, falling back to mock mode on
-    /// failure.
-    ///
-    /// This is intended for development and demo use only. In production, use
-    /// [`connect`](Self::connect) which returns an error on failure.
-    #[cfg(any(debug_assertions, feature = "mock-fallback"))]
-    pub async fn connect_or_mock(&mut self) -> Result<()> {
-        let rpc_cfg = rpc_config_from_helix(&self.config.rpc);
-        self.rpc = UnifiedRpcClient::connect_or_mock(rpc_cfg).await;
         Ok(())
     }
 

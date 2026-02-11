@@ -778,7 +778,7 @@ impl HelixRpcClient {
 
     /// Get current training status
     pub async fn get_training_status(&self) -> Result<TrainingStatus, RpcError> {
-        self.send_request("training_status", ()).await
+        self.send_request("helix_getTrainingStatus", ()).await
     }
 
     /// Get training result for a completed round (for proof generation).
@@ -806,7 +806,7 @@ impl HelixRpcClient {
         }
 
         self.send_request(
-            "training_start",
+            "helix_startTraining",
             Params {
                 model_id,
                 rounds,
@@ -823,7 +823,7 @@ impl HelixRpcClient {
             model_id: u64,
         }
 
-        self.send_request("training_stop", Params { model_id }).await
+        self.send_request("helix_stopTraining", Params { model_id }).await
     }
 
     /// Get training progress history
@@ -838,14 +838,14 @@ impl HelixRpcClient {
             from_round: u64,
         }
 
-        self.send_request("training_progress", Params { model_id, from_round }).await
+        self.send_request("helix_getTrainingProgress", Params { model_id, from_round }).await
     }
 
     // ==================== Proof Operations ====================
 
     /// Get current proof generation status
     pub async fn get_proof_status(&self) -> Result<ProofStatus, RpcError> {
-        self.send_request("proof_status", ()).await
+        self.send_request("helix_getProofStatus", ()).await
     }
 
     /// Generate proof for current training step
@@ -856,17 +856,17 @@ impl HelixRpcClient {
             round_id: u64,
         }
 
-        self.send_request("proof_generate", Params { model_id, round_id }).await
+        self.send_request("helix_generateProof", Params { model_id, round_id }).await
     }
 
     /// Submit proof to blockchain
     pub async fn submit_proof(&self, submission: &ProofSubmission) -> Result<String, RpcError> {
-        self.send_request("proof_submit", submission).await
+        self.send_request("helix_submitProof", submission).await
     }
 
     /// Verify a proof
     pub async fn verify_proof(&self, submission: &ProofSubmission) -> Result<bool, RpcError> {
-        self.send_request("proof_verify", submission).await
+        self.send_request("helix_verifyProof", submission).await
     }
 
     // ==================== Model Operations ====================
@@ -878,12 +878,12 @@ impl HelixRpcClient {
             model_id: u64,
         }
 
-        self.send_request("model_get", Params { model_id }).await
+        self.send_request("helix_getModelState", Params { model_id }).await
     }
 
     /// List all models
     pub async fn list_models(&self) -> Result<Vec<ModelInfo>, RpcError> {
-        self.send_request("model_list", ()).await
+        self.send_request("helix_listModels", ()).await
     }
 
     /// Register a new model
@@ -901,7 +901,7 @@ impl HelixRpcClient {
         }
 
         self.send_request(
-            "model_register",
+            "helix_registerModel",
             Params {
                 name,
                 ipfs_hash,
@@ -920,7 +920,7 @@ impl HelixRpcClient {
             model_id: u64,
         }
 
-        self.send_request("round_current", Params { model_id }).await
+        self.send_request("helix_getCurrentRound", Params { model_id }).await
     }
 
     /// Get round by ID
@@ -931,14 +931,14 @@ impl HelixRpcClient {
             round_id: u64,
         }
 
-        self.send_request("round_get", Params { model_id, round_id }).await
+        self.send_request("helix_getRound", Params { model_id, round_id }).await
     }
 
     // ==================== Worker Operations ====================
 
     /// Get all workers
     pub async fn get_workers(&self) -> Result<Vec<WorkerInfo>, RpcError> {
-        self.send_request("worker_list", ()).await
+        self.send_request("helix_getWorkers", ()).await
     }
 
     /// Get specific worker
@@ -948,12 +948,12 @@ impl HelixRpcClient {
             worker_id: &'a str,
         }
 
-        self.send_request("worker_get", Params { worker_id }).await
+        self.send_request("helix_getWorker", Params { worker_id }).await
     }
 
     /// Get this node's worker info
     pub async fn get_self_worker(&self) -> Result<WorkerInfo, RpcError> {
-        self.send_request("worker_self", ()).await
+        self.send_request("helix_getSelfWorker", ()).await
     }
 
     // ==================== Staking Operations ====================
@@ -965,7 +965,7 @@ impl HelixRpcClient {
             model_id: u64,
         }
 
-        self.send_request("staking_info", Params { model_id }).await
+        self.send_request("helix_getStakingInfo", Params { model_id }).await
     }
 
     /// Stake tokens for a model
@@ -976,7 +976,7 @@ impl HelixRpcClient {
             amount_eth: f64,
         }
 
-        self.send_request("staking_stake", Params { model_id, amount_eth }).await
+        self.send_request("helix_stake", Params { model_id, amount_eth }).await
     }
 
     /// Unstake tokens
@@ -986,7 +986,7 @@ impl HelixRpcClient {
             model_id: u64,
         }
 
-        self.send_request("staking_unstake", Params { model_id }).await
+        self.send_request("helix_unstake", Params { model_id }).await
     }
 
     /// Claim accumulated rewards
@@ -996,7 +996,7 @@ impl HelixRpcClient {
             model_id: u64,
         }
 
-        self.send_request("staking_claimRewards", Params { model_id }).await
+        self.send_request("helix_claimRewards", Params { model_id }).await
     }
 
     // ==================== Subscription Helpers ====================
@@ -1330,55 +1330,19 @@ impl UnifiedRpcClient {
         })
     }
 
-    /// Try to connect to a real HELIX node, falling back to mock mode on
-    /// failure.
+    /// Create a disconnected client that is NOT in mock mode.
     ///
-    /// Intended for development / demo use only. In production prefer
-    /// [`connect`](Self::connect) which surfaces connection errors.
-    #[cfg(any(debug_assertions, feature = "mock-fallback"))]
-    pub async fn connect_or_mock(config: HelixRpcConfig) -> Self {
-        let mock_client = MockRpcClient::new();
-
-        // Try to connect to real node
-        match HelixRpcClient::new(config.clone()) {
-            Ok(client) => {
-                // Try to connect
-                match client.connect().await {
-                    Ok(()) => {
-                        tracing::info!("Connected to HELIX node at {}", config.endpoint);
-                        Self {
-                            real_client: Some(client),
-                            mock_client,
-                            use_mock: false,
-                            connected: true,
-                            #[cfg(feature = "chain")]
-                            chain_client: None,
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to connect to node: {}, using mock mode", e);
-                        Self {
-                            real_client: None,
-                            mock_client,
-                            use_mock: true,
-                            connected: false,
-                            #[cfg(feature = "chain")]
-                            chain_client: None,
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Failed to create RPC client: {}, using mock mode", e);
-                Self {
-                    real_client: None,
-                    mock_client,
-                    use_mock: true,
-                    connected: false,
-                    #[cfg(feature = "chain")]
-                    chain_client: None,
-                }
-            }
+    /// RPC calls will return `NodeUnavailable` errors until [`connect`] is
+    /// called. This is the correct default for production code — misconfigurations
+    /// surface as errors instead of silently running in mock mode.
+    pub fn new_disconnected() -> Self {
+        Self {
+            real_client: None,
+            mock_client: MockRpcClient::new(),
+            use_mock: false,
+            connected: false,
+            #[cfg(feature = "chain")]
+            chain_client: None,
         }
     }
 

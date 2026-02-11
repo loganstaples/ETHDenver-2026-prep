@@ -1091,8 +1091,8 @@ impl TrainingOrchestrator {
                 Ok(Some(tx_hash))
             }
             Err(e) => {
-                warn!("Round {} proof submission failed: {}", round, e);
-                Ok(None)
+                error!("Round {} proof submission failed: {}", round, e);
+                Err(e.context(format!("proof submission failed for round {}", round)))
             }
         }
     }

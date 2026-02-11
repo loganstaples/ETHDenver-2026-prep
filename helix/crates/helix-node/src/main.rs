@@ -627,6 +627,7 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
                         phase: format!("{:?}", phase),
                         gradients_received: 0,
                         workers_assigned: stats.computing,
+                        commitment_hash: None,
                     });
                 }
 

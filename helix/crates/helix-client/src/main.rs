@@ -640,9 +640,16 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Build a shared RPC client for commands that need it (connect or fall back to mock)
+    // Build a shared RPC client for commands that need it.
+    // Try to connect to a real node; fall back to mock for CLI commands that don't need one.
     let rpc_config = rpc::client::HelixRpcConfig::default();
-    let rpc_client = Arc::new(rpc::client::UnifiedRpcClient::connect_or_mock(rpc_config).await);
+    let rpc_client = Arc::new(match rpc::client::UnifiedRpcClient::connect(rpc_config).await {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::warn!("Could not connect to HELIX node: {}. Using mock mode.", e);
+            rpc::client::UnifiedRpcClient::new_mock()
+        }
+    });
 
     // Execute command
     let result = match &cli.command {

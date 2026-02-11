@@ -699,9 +699,11 @@ impl DemoRunner {
     /// Try to connect to a real node, falling back to mock mode if unavailable
     pub async fn connect(&self) -> Result<bool> {
         let config = self.rpc_config.clone().unwrap_or_default();
-        // Demo code: use mock fallback so demos work without a real node
-        let client = UnifiedRpcClient::connect_or_mock(config).await;
-        let connected = client.is_connected();
+        // Demo code: try real connection, fall back to mock for demos without a real node
+        let (client, connected) = match UnifiedRpcClient::connect(config).await {
+            Ok(c) => (c, true),
+            Err(_) => (UnifiedRpcClient::new_mock(), false),
+        };
 
         *self.rpc_client.write().await = client;
 

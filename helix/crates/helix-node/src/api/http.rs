@@ -140,6 +140,9 @@ pub struct RoundInfo {
     pub phase: String,
     pub gradients_received: usize,
     pub workers_assigned: usize,
+    /// Current model commitment hash (hex-encoded, e.g. "0xabcd...").
+    /// `None` if no commitment has been computed yet.
+    pub commitment_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -375,6 +378,7 @@ mod tests {
                     phase: "Collecting".to_string(),
                     gradients_received: 2,
                     workers_assigned: 5,
+                    commitment_hash: Some("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890".to_string()),
                 }),
                 completed_rounds: 10,
                 workers: vec![

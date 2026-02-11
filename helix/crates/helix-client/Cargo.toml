@@ -111,7 +111,7 @@ zbus = "3.14"
 windows = { version = "0.52", features = ["Win32_Security_Cryptography"] }
 
 [features]
-default = []
+default = ["chain"]
 hardware-wallet = ["hidapi"]
 chain = ["ethers", "dotenv"]
 mock-fallback = []  # Allow silent mock fallback on connection failure (dev only)

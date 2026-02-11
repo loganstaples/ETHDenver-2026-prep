@@ -310,8 +310,11 @@ impl DemoOrchestrator {
         shutdown_rx: watch::Receiver<bool>,
     ) -> Self {
         let config = HelixRpcConfig::with_endpoint(endpoint);
-        // Demo code: use mock fallback so demos work without a real node
-        let client = UnifiedRpcClient::connect_or_mock(config).await;
+        // Demo code: try real connection, fall back to mock for demos without a real node
+        let client = match UnifiedRpcClient::connect(config).await {
+            Ok(c) => c,
+            Err(_) => UnifiedRpcClient::new_mock(),
+        };
 
         Self {
             timing,
