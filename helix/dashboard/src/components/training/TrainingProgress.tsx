@@ -70,320 +70,120 @@ export default function TrainingProgress({
     };
 
     return (
-        <div className="training-progress">
-            <style jsx>{`
-        .training-progress {
-          background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-          border-radius: 16px;
-          padding: 24px;
-          color: #fff;
-          font-family: 'Inter', -apple-system, sans-serif;
-        }
-
-        .header {
-          display: flex;
-          justify-content: space-between;
-          align-items: center;
-          margin-bottom: 24px;
-        }
-
-        .model-name {
-          font-size: 24px;
-          font-weight: 700;
-          background: linear-gradient(90deg, #6366f1, #a855f7);
-          -webkit-background-clip: text;
-          -webkit-text-fill-color: transparent;
-        }
-
-        .status-badge {
-          padding: 6px 16px;
-          border-radius: 20px;
-          font-size: 12px;
-          font-weight: 600;
-          text-transform: uppercase;
-          background: rgba(34, 197, 94, 0.2);
-          color: #22c55e;
-          border: 1px solid rgba(34, 197, 94, 0.3);
-        }
-
-        .metrics-grid {
-          display: grid;
-          grid-template-columns: repeat(4, 1fr);
-          gap: 16px;
-          margin-bottom: 24px;
-        }
-
-        .metric-card {
-          background: rgba(255, 255, 255, 0.05);
-          border-radius: 12px;
-          padding: 16px;
-          border: 1px solid rgba(255, 255, 255, 0.1);
-        }
-
-        .metric-label {
-          font-size: 12px;
-          color: #9ca3af;
-          text-transform: uppercase;
-          letter-spacing: 0.5px;
-          margin-bottom: 8px;
-        }
-
-        .metric-value {
-          font-size: 28px;
-          font-weight: 700;
-        }
-
-        .metric-value.loss {
-          color: #f59e0b;
-        }
-
-        .metric-value.accuracy {
-          color: #22c55e;
-        }
-
-        .metric-value.lr {
-          color: #6366f1;
-        }
-
-        .metric-value.epoch {
-          color: #a855f7;
-        }
-
-        .progress-section {
-          margin-bottom: 24px;
-        }
-
-        .progress-header {
-          display: flex;
-          justify-content: space-between;
-          margin-bottom: 8px;
-          font-size: 14px;
-        }
-
-        .progress-bar {
-          height: 8px;
-          background: rgba(255, 255, 255, 0.1);
-          border-radius: 4px;
-          overflow: hidden;
-          margin-bottom: 16px;
-        }
-
-        .progress-fill {
-          height: 100%;
-          border-radius: 4px;
-          transition: width 0.3s ease;
-        }
-
-        .progress-fill.epoch {
-          background: linear-gradient(90deg, #6366f1, #a855f7);
-        }
-
-        .progress-fill.batch {
-          background: linear-gradient(90deg, #22c55e, #16a34a);
-        }
-
-        .charts-row {
-          display: grid;
-          grid-template-columns: 1fr 1fr;
-          gap: 16px;
-          margin-bottom: 24px;
-        }
-
-        .chart-card {
-          background: rgba(255, 255, 255, 0.03);
-          border-radius: 12px;
-          padding: 16px;
-          border: 1px solid rgba(255, 255, 255, 0.08);
-        }
-
-        .chart-title {
-          font-size: 14px;
-          font-weight: 600;
-          margin-bottom: 12px;
-          color: #d1d5db;
-        }
-
-        .mini-chart {
-          display: flex;
-          align-items: flex-end;
-          height: 60px;
-          gap: 4px;
-        }
-
-        .bar {
-          flex: 1;
-          border-radius: 2px;
-          transition: height 0.3s ease;
-        }
-
-        .bar.loss {
-          background: linear-gradient(0deg, #f59e0b, #fbbf24);
-        }
-
-        .bar.accuracy {
-          background: linear-gradient(0deg, #22c55e, #4ade80);
-        }
-
-        .rounds-section {
-          border-top: 1px solid rgba(255, 255, 255, 0.1);
-          padding-top: 24px;
-        }
-
-        .section-title {
-          font-size: 16px;
-          font-weight: 600;
-          margin-bottom: 16px;
-        }
-
-        .rounds-list {
-          display: flex;
-          flex-direction: column;
-          gap: 8px;
-        }
-
-        .round-item {
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          padding: 12px 16px;
-          background: rgba(255, 255, 255, 0.03);
-          border-radius: 8px;
-          border: 1px solid rgba(255, 255, 255, 0.05);
-        }
-
-        .round-info {
-          display: flex;
-          align-items: center;
-          gap: 16px;
-        }
-
-        .round-id {
-          font-weight: 600;
-          color: #a855f7;
-        }
-
-        .round-status {
-          padding: 4px 10px;
-          border-radius: 12px;
-          font-size: 11px;
-          font-weight: 600;
-          text-transform: uppercase;
-        }
-
-        .round-status.completed {
-          background: rgba(34, 197, 94, 0.2);
-          color: #22c55e;
-        }
-
-        .round-status.in_progress {
-          background: rgba(99, 102, 241, 0.2);
-          color: #818cf8;
-        }
-
-        .round-status.pending {
-          background: rgba(156, 163, 175, 0.2);
-          color: #9ca3af;
-        }
-
-        .round-meta {
-          display: flex;
-          gap: 24px;
-          font-size: 13px;
-          color: #9ca3af;
-        }
-
-        .proof-badge {
-          display: flex;
-          align-items: center;
-          gap: 4px;
-          color: #22c55e;
-        }
-      `}</style>
-
-            <div className="header">
-                <h2 className="model-name">{modelName}</h2>
-                <span className="status-badge">Training Active</span>
+        <div className="bg-helix-surface border border-helix-border rounded-md p-5 text-white">
+            {/* Header */}
+            <div className="flex justify-between items-center mb-5">
+                <h2 className="text-[15px] font-semibold text-white">{modelName}</h2>
+                <span className="text-[10px] font-mono uppercase tracking-wider px-2 py-0.5 rounded-sm bg-white/[0.08] text-white border border-white/[0.12]">
+                    Training Active
+                </span>
             </div>
 
-            <div className="metrics-grid">
-                <div className="metric-card">
-                    <div className="metric-label">Current Loss</div>
-                    <div className="metric-value loss">{metrics.loss.toFixed(4)}</div>
+            {/* Metric Cards */}
+            <div className="grid grid-cols-4 gap-3 mb-5">
+                <div className="bg-white/[0.03] border border-helix-border rounded-md p-3">
+                    <div className="text-[11px] text-[#666] uppercase tracking-wider mb-1.5">
+                        Current Loss
+                    </div>
+                    <div className="text-xl font-mono font-semibold text-white">
+                        {metrics.loss.toFixed(4)}
+                    </div>
                 </div>
-                <div className="metric-card">
-                    <div className="metric-label">Accuracy</div>
-                    <div className="metric-value accuracy">
+                <div className="bg-white/[0.03] border border-helix-border rounded-md p-3">
+                    <div className="text-[11px] text-[#666] uppercase tracking-wider mb-1.5">
+                        Accuracy
+                    </div>
+                    <div className="text-xl font-mono font-semibold text-white">
                         {(metrics.accuracy * 100).toFixed(1)}%
                     </div>
                 </div>
-                <div className="metric-card">
-                    <div className="metric-label">Learning Rate</div>
-                    <div className="metric-value lr">{metrics.learningRate}</div>
+                <div className="bg-white/[0.03] border border-helix-border rounded-md p-3">
+                    <div className="text-[11px] text-[#666] uppercase tracking-wider mb-1.5">
+                        Learning Rate
+                    </div>
+                    <div className="text-xl font-mono font-semibold text-white">
+                        {metrics.learningRate}
+                    </div>
                 </div>
-                <div className="metric-card">
-                    <div className="metric-label">Epoch</div>
-                    <div className="metric-value epoch">
+                <div className="bg-white/[0.03] border border-helix-border rounded-md p-3">
+                    <div className="text-[11px] text-[#666] uppercase tracking-wider mb-1.5">
+                        Epoch
+                    </div>
+                    <div className="text-xl font-mono font-semibold text-white">
                         {metrics.epoch}/{metrics.totalEpochs}
                     </div>
                 </div>
             </div>
 
-            <div className="progress-section">
-                <div className="progress-header">
-                    <span>Epoch Progress</span>
-                    <span>{epochProgress.toFixed(0)}%</span>
+            {/* Progress Bars */}
+            <div className="mb-5">
+                <div className="flex justify-between mb-1.5">
+                    <span className="text-[11px] text-[#666] uppercase tracking-wider">Epoch Progress</span>
+                    <span className="text-[13px] font-mono text-[#888]">{epochProgress.toFixed(0)}%</span>
                 </div>
-                <div className="progress-bar">
+                <div className="h-1 bg-white/[0.06] rounded-sm overflow-hidden mb-4">
                     <div
-                        className="progress-fill epoch"
+                        className="h-1 bg-white rounded-sm transition-all duration-300 ease-in-out"
                         style={{ width: `${epochProgress}%` }}
                     />
                 </div>
 
-                <div className="progress-header">
-                    <span>Batch Progress</span>
-                    <span>
+                <div className="flex justify-between mb-1.5">
+                    <span className="text-[11px] text-[#666] uppercase tracking-wider">Batch Progress</span>
+                    <span className="text-[13px] font-mono text-[#888]">
                         {metrics.batchesCompleted}/{metrics.totalBatches}
                     </span>
                 </div>
-                <div className="progress-bar">
+                <div className="h-1 bg-white/[0.06] rounded-sm overflow-hidden">
                     <div
-                        className="progress-fill batch"
+                        className="h-1 bg-white rounded-sm transition-all duration-300 ease-in-out"
                         style={{ width: `${batchProgress}%` }}
                     />
                 </div>
             </div>
 
-            <div className="charts-row">
-                <div className="chart-card">
-                    <div className="chart-title">Loss Over Epochs</div>
-                    <div className="mini-chart">
+            {/* Charts */}
+            <div className="grid grid-cols-2 gap-3 mb-5">
+                <div className="bg-white/[0.03] border border-helix-border rounded-md p-3">
+                    <div className="text-[13px] font-medium text-white mb-3">
+                        Loss Over Epochs
+                    </div>
+                    <div className="flex items-end h-15 gap-1">
                         {lossHistory.map((loss, i) => (
                             <div
                                 key={i}
-                                className="bar loss"
-                                style={{ height: `${loss * 100}%` }}
+                                className="flex-1 bg-white rounded-none transition-all duration-300 ease-in-out"
+                                style={{
+                                    height: `${loss * 100}%`,
+                                    opacity: 0.4 + (i * 0.15)
+                                }}
                             />
                         ))}
                     </div>
                 </div>
-                <div className="chart-card">
-                    <div className="chart-title">Accuracy Over Epochs</div>
-                    <div className="mini-chart">
+                <div className="bg-white/[0.03] border border-helix-border rounded-md p-3">
+                    <div className="text-[13px] font-medium text-white mb-3">
+                        Accuracy Over Epochs
+                    </div>
+                    <div className="flex items-end h-15 gap-1">
                         {accuracyHistory.map((acc, i) => (
                             <div
                                 key={i}
-                                className="bar accuracy"
-                                style={{ height: `${acc * 100}%` }}
+                                className="flex-1 bg-white rounded-none transition-all duration-300 ease-in-out"
+                                style={{
+                                    height: `${acc * 100}%`,
+                                    opacity: 0.4 + (i * 0.15)
+                                }}
                             />
                         ))}
                     </div>
                 </div>
             </div>
 
-            <div className="rounds-section">
-                <h3 className="section-title">Training Rounds</h3>
-                <div className="rounds-list">
+            {/* Training Rounds */}
+            <div className="border-t border-helix-border pt-5">
+                <h3 className="text-[13px] font-medium text-white mb-3">Training Rounds</h3>
+                <div className="flex flex-col">
                     {[
                         {
                             roundId: 3,
@@ -409,18 +209,33 @@ export default function TrainingProgress({
                             proofGenerated: true,
                         },
                     ].map((round) => (
-                        <div key={round.roundId} className="round-item">
-                            <div className="round-info">
-                                <span className="round-id">Round #{round.roundId}</span>
-                                <span className={`round-status ${round.status}`}>
+                        <div
+                            key={round.roundId}
+                            className="flex items-center justify-between px-0 py-2.5 border-b border-helix-border last:border-b-0"
+                        >
+                            <div className="flex items-center gap-3">
+                                <span className="text-[13px] font-medium text-white">
+                                    Round #{round.roundId}
+                                </span>
+                                <span
+                                    className={`text-[10px] font-mono uppercase tracking-wider px-2 py-0.5 rounded-sm ${
+                                        round.status === 'completed'
+                                            ? 'bg-white/[0.06] text-[#666]'
+                                            : round.status === 'in_progress'
+                                            ? 'bg-white/[0.1] text-white'
+                                            : 'bg-white/[0.06] text-[#666]'
+                                    }`}
+                                >
                                     {round.status.replace('_', ' ')}
                                 </span>
                             </div>
-                            <div className="round-meta">
-                                <span>{round.participants} participants</span>
-                                <span>{formatDuration(round.startTime, round.endTime)}</span>
+                            <div className="flex gap-5 text-[13px] text-[#555]">
+                                <span className="font-mono">{round.participants} participants</span>
+                                <span className="font-mono">{formatDuration(round.startTime, round.endTime)}</span>
                                 {round.proofGenerated && (
-                                    <span className="proof-badge">✓ Proof</span>
+                                    <span className="flex items-center gap-1 text-white text-[13px]">
+                                        &#x2713; Proof
+                                    </span>
                                 )}
                             </div>
                         </div>

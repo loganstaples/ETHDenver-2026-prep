@@ -49,64 +49,64 @@ function getStageInfo(stage: ProofStage): {
         case 'queued':
             return {
                 label: 'Queued',
-                color: 'text-neutral-400',
-                bgColor: 'bg-neutral-500/20',
+                color: 'text-[#666]',
+                bgColor: 'bg-white/[0.04]',
                 icon: <Clock className="w-4 h-4" />,
             };
         case 'witness':
             return {
                 label: 'Witness Generation',
-                color: 'text-blue-400',
-                bgColor: 'bg-blue-500/20',
+                color: 'text-white',
+                bgColor: 'bg-white/10',
                 icon: <Loader2 className="w-4 h-4 animate-spin" />,
             };
         case 'setup':
             return {
                 label: 'Circuit Setup',
-                color: 'text-purple-400',
-                bgColor: 'bg-purple-500/20',
+                color: 'text-white',
+                bgColor: 'bg-white/10',
                 icon: <Loader2 className="w-4 h-4 animate-spin" />,
             };
         case 'proving':
             return {
                 label: 'Generating Proof',
-                color: 'text-amber-400',
-                bgColor: 'bg-amber-500/20',
+                color: 'text-white',
+                bgColor: 'bg-white/10',
                 icon: <Zap className="w-4 h-4 animate-pulse" />,
             };
         case 'submitting':
             return {
                 label: 'Submitting',
-                color: 'text-cyan-400',
-                bgColor: 'bg-cyan-500/20',
+                color: 'text-white',
+                bgColor: 'bg-white/10',
                 icon: <Loader2 className="w-4 h-4 animate-spin" />,
             };
         case 'verifying':
             return {
                 label: 'Verifying',
-                color: 'text-indigo-400',
-                bgColor: 'bg-indigo-500/20',
+                color: 'text-white',
+                bgColor: 'bg-white/10',
                 icon: <Shield className="w-4 h-4 animate-pulse" />,
             };
         case 'verified':
             return {
                 label: 'Verified',
-                color: 'text-emerald-400',
-                bgColor: 'bg-emerald-500/20',
+                color: 'text-white',
+                bgColor: 'bg-white/10',
                 icon: <CheckCircle className="w-4 h-4" />,
             };
         case 'failed':
             return {
                 label: 'Failed',
-                color: 'text-red-400',
-                bgColor: 'bg-red-500/20',
+                color: 'text-[#666]',
+                bgColor: 'bg-white/[0.04]',
                 icon: <XCircle className="w-4 h-4" />,
             };
         default:
             return {
                 label: 'Unknown',
-                color: 'text-neutral-400',
-                bgColor: 'bg-neutral-500/20',
+                color: 'text-[#666]',
+                bgColor: 'bg-white/[0.04]',
                 icon: <Clock className="w-4 h-4" />,
             };
     }
@@ -151,15 +151,15 @@ function ProofCard({
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, x: -100 }}
             transition={{ duration: 0.2 }}
-            className={`bg-neutral-800/50 rounded-lg border ${
-                isActive ? 'border-neutral-600' : 'border-neutral-800'
+            className={`bg-helix-surface rounded-md border ${
+                isActive ? 'border-neutral-600' : 'border-helix-border'
             } hover:border-neutral-600 transition-colors cursor-pointer ${compact ? 'p-3' : 'p-4'}`}
             onClick={() => onSelect?.(proof)}
         >
-            <div className="flex items-center justify-between gap-4">
+            <div className="flex items-center justify-between gap-3">
                 {/* Left: Status and ID */}
                 <div className="flex items-center gap-3 min-w-0">
-                    <div className={`w-10 h-10 rounded-lg ${stageInfo.bgColor} flex items-center justify-center flex-shrink-0`}>
+                    <div className={`w-10 h-10 rounded-md ${stageInfo.bgColor} flex items-center justify-center flex-shrink-0`}>
                         <span className={stageInfo.color}>{stageInfo.icon}</span>
                     </div>
                     <div className="min-w-0">
@@ -171,7 +171,7 @@ function ProofCard({
                                 {stageInfo.label}
                             </span>
                         </div>
-                        <div className="flex items-center gap-2 text-xs text-neutral-400">
+                        <div className="flex items-center gap-2 text-xs text-[#888]">
                             <span>Round #{proof.roundId.toString()}</span>
                             <span>·</span>
                             <span>{proof.type}</span>
@@ -182,49 +182,47 @@ function ProofCard({
                 </div>
 
                 {/* Right: Progress or Stats */}
-                <div className="flex items-center gap-4 flex-shrink-0">
+                <div className="flex items-center gap-3 flex-shrink-0">
                     {isActive ? (
                         <div className="flex items-center gap-3">
                             <div className="w-32 h-2 bg-neutral-700 rounded-full overflow-hidden">
                                 <motion.div
-                                    className={`h-full rounded-full ${
-                                        proof.stage === 'proving' ? 'bg-amber-500' : 'bg-blue-500'
-                                    }`}
+                                    className="h-full rounded-full bg-white"
                                     initial={{ width: 0 }}
                                     animate={{ width: `${proof.progress}%` }}
                                     transition={{ duration: 0.3 }}
                                 />
                             </div>
-                            <span className="text-sm font-medium text-neutral-300 w-12 text-right">
+                            <span className="text-sm font-medium text-[#aaa] w-12 text-right">
                                 {proof.progress.toFixed(0)}%
                             </span>
                         </div>
                     ) : (
-                        <div className="flex items-center gap-4 text-sm">
+                        <div className="flex items-center gap-3 text-sm">
                             {proof.metrics.totalTime && (
-                                <div className="text-neutral-400">
-                                    <span className="text-neutral-500">Time:</span>{' '}
+                                <div className="text-[#888]">
+                                    <span className="text-[#666]">Time:</span>{' '}
                                     <span className="text-white">{formatDuration(proof.metrics.totalTime)}</span>
                                 </div>
                             )}
                             {proof.gasUsed && (
-                                <div className="text-neutral-400">
-                                    <span className="text-neutral-500">Gas:</span>{' '}
+                                <div className="text-[#888]">
+                                    <span className="text-[#666]">Gas:</span>{' '}
                                     <span className="text-white">{(Number(proof.gasUsed) / 1000).toFixed(0)}k</span>
                                 </div>
                             )}
                         </div>
                     )}
 
-                    <ChevronRight className="w-5 h-5 text-neutral-500" />
+                    <ChevronRight className="w-5 h-5 text-[#666]" />
                 </div>
             </div>
 
             {/* On-chain info for verified proofs */}
             {proof.stage === 'verified' && proof.transactionHash && !compact && (
                 <div className="mt-3 pt-3 border-t border-neutral-700/50 flex items-center justify-between">
-                    <div className="flex items-center gap-2 text-xs text-neutral-400">
-                        <CheckCircle className="w-3.5 h-3.5 text-emerald-400" />
+                    <div className="flex items-center gap-2 text-xs text-[#888]">
+                        <CheckCircle className="w-3.5 h-3.5 text-white" />
                         <span>On-chain verified</span>
                         <span>·</span>
                         <span>Block #{proof.blockNumber}</span>
@@ -233,7 +231,7 @@ function ProofCard({
                         href={`https://etherscan.io/tx/${proof.transactionHash}`}
                         target="_blank"
                         rel="noopener noreferrer"
-                        className="flex items-center gap-1 text-xs text-blue-400 hover:text-blue-300"
+                        className="flex items-center gap-1 text-xs text-white/60 hover:text-white"
                         onClick={(e) => e.stopPropagation()}
                     >
                         View transaction
@@ -247,22 +245,22 @@ function ProofCard({
 
 function StatsBar({ stats }: { stats: ReturnType<typeof useProofStream>['stats'] }) {
     return (
-        <div className="grid grid-cols-4 gap-4 p-4 bg-neutral-800/30 rounded-lg border border-neutral-800">
+        <div className="grid grid-cols-4 gap-3 p-4 bg-helix-surface rounded-md border border-helix-border">
             <div className="text-center">
-                <div className="text-2xl font-bold text-emerald-400">{stats.verified}</div>
-                <div className="text-xs text-neutral-400">Verified</div>
+                <div className="font-semibold text-[15px] text-white">{stats.verified}</div>
+                <div className="text-xs text-[#888]">Verified</div>
             </div>
             <div className="text-center">
-                <div className="text-2xl font-bold text-amber-400">{stats.generating}</div>
-                <div className="text-xs text-neutral-400">Generating</div>
+                <div className="font-semibold text-[15px] text-white">{stats.generating}</div>
+                <div className="text-xs text-[#888]">Generating</div>
             </div>
             <div className="text-center">
-                <div className="text-2xl font-bold text-blue-400">{stats.submitting}</div>
-                <div className="text-xs text-neutral-400">Submitting</div>
+                <div className="font-semibold text-[15px] text-white">{stats.submitting}</div>
+                <div className="text-xs text-[#888]">Submitting</div>
             </div>
             <div className="text-center">
-                <div className="text-2xl font-bold text-neutral-400">{stats.queued}</div>
-                <div className="text-xs text-neutral-400">Queued</div>
+                <div className="font-semibold text-[15px] text-white">{stats.queued}</div>
+                <div className="text-xs text-[#888]">Queued</div>
             </div>
         </div>
     );
@@ -274,22 +272,22 @@ function CurrentProofProgress({ proof }: { proof: ProofStreamItem }) {
     const currentIndex = stages.indexOf(proof.stage);
 
     return (
-        <div className="bg-neutral-800/50 rounded-lg border border-neutral-700 p-4">
+        <div className="bg-helix-surface rounded-md border border-neutral-700 p-4">
             <div className="flex items-center justify-between mb-4">
                 <div className="flex items-center gap-3">
-                    <div className={`w-10 h-10 rounded-lg ${stageInfo.bgColor} flex items-center justify-center`}>
+                    <div className={`w-10 h-10 rounded-md ${stageInfo.bgColor} flex items-center justify-center`}>
                         <span className={stageInfo.color}>{stageInfo.icon}</span>
                     </div>
                     <div>
                         <div className="text-sm font-medium text-white">{stageInfo.label}</div>
-                        <div className="text-xs text-neutral-400">
+                        <div className="text-xs text-[#888]">
                             {proof.circuitType} · {(proof.constraintCount / 1000).toFixed(0)}k constraints
                         </div>
                     </div>
                 </div>
                 <div className="text-right">
                     <div className="text-lg font-bold text-white">{proof.progress.toFixed(0)}%</div>
-                    <div className="text-xs text-neutral-400">
+                    <div className="text-xs text-[#888]">
                         {formatDuration(Date.now() - proof.startedAt)} elapsed
                     </div>
                 </div>
@@ -300,22 +298,21 @@ function CurrentProofProgress({ proof }: { proof: ProofStreamItem }) {
                 {stages.slice(0, -1).map((stage, i) => {
                     const isComplete = i < currentIndex;
                     const isCurrent = i === currentIndex;
-                    const info = getStageInfo(stage);
 
                     return (
                         <div
                             key={stage}
                             className={`flex-1 h-2 rounded-full transition-colors ${
                                 isComplete
-                                    ? 'bg-emerald-500'
+                                    ? 'bg-white'
                                     : isCurrent
-                                        ? info.bgColor.replace('/20', '')
+                                        ? 'bg-white/30'
                                         : 'bg-neutral-700'
                             }`}
                         >
                             {isCurrent && (
                                 <motion.div
-                                    className={`h-full rounded-full ${info.bgColor.replace('/20', '')}`}
+                                    className="h-full rounded-full bg-white"
                                     style={{ width: `${proof.progress}%` }}
                                     animate={{ width: `${proof.progress}%` }}
                                     transition={{ duration: 0.3 }}
@@ -327,31 +324,31 @@ function CurrentProofProgress({ proof }: { proof: ProofStreamItem }) {
             </div>
 
             {/* Resource usage */}
-            <div className="grid grid-cols-2 gap-4 text-sm">
+            <div className="grid grid-cols-2 gap-3 text-sm">
                 <div>
-                    <div className="text-neutral-400 text-xs mb-1">Memory Usage</div>
+                    <div className="text-[#888] text-xs mb-1">Memory Usage</div>
                     <div className="flex items-center gap-2">
                         <div className="flex-1 h-1.5 bg-neutral-700 rounded-full overflow-hidden">
                             <div
-                                className="h-full bg-purple-500 rounded-full"
+                                className="h-full bg-white rounded-full"
                                 style={{ width: `${Math.min((proof.metrics.memoryPeak || 0) / 80, 100)}%` }}
                             />
                         </div>
-                        <span className="text-neutral-300 text-xs">
+                        <span className="text-[#aaa] text-xs">
                             {((proof.metrics.memoryPeak || 0) / 1000).toFixed(1)} GB
                         </span>
                     </div>
                 </div>
                 <div>
-                    <div className="text-neutral-400 text-xs mb-1">CPU Usage</div>
+                    <div className="text-[#888] text-xs mb-1">CPU Usage</div>
                     <div className="flex items-center gap-2">
                         <div className="flex-1 h-1.5 bg-neutral-700 rounded-full overflow-hidden">
                             <div
-                                className="h-full bg-blue-500 rounded-full"
+                                className="h-full bg-white rounded-full"
                                 style={{ width: `${proof.metrics.cpuPeak || 0}%` }}
                             />
                         </div>
-                        <span className="text-neutral-300 text-xs">
+                        <span className="text-[#aaa] text-xs">
                             {(proof.metrics.cpuPeak || 0).toFixed(0)}%
                         </span>
                     </div>
@@ -411,9 +408,9 @@ export default function ProofStream({
 
     if (isLoading) {
         return (
-            <div className={`bg-neutral-900/50 rounded-xl border border-neutral-800 p-6 ${className}`}>
+            <div className={`bg-helix-surface rounded-md border border-helix-border p-4 ${className}`}>
                 <div className="flex items-center justify-center h-48">
-                    <Loader2 className="w-8 h-8 text-neutral-500 animate-spin" />
+                    <Loader2 className="w-8 h-8 text-[#666] animate-spin" />
                 </div>
             </div>
         );
@@ -421,8 +418,8 @@ export default function ProofStream({
 
     if (error) {
         return (
-            <div className={`bg-neutral-900/50 rounded-xl border border-neutral-800 p-6 ${className}`}>
-                <div className="flex items-center justify-center h-48 text-red-400">
+            <div className={`bg-helix-surface rounded-md border border-helix-border p-4 ${className}`}>
+                <div className="flex items-center justify-center h-48 text-white/60">
                     <AlertTriangle className="w-6 h-6 mr-2" />
                     <span>{error}</span>
                 </div>
@@ -431,24 +428,24 @@ export default function ProofStream({
     }
 
     return (
-        <div className={`bg-neutral-900/50 rounded-xl border border-neutral-800 overflow-hidden ${className}`}>
+        <div className={`bg-helix-surface rounded-md border border-helix-border overflow-hidden ${className}`}>
             {/* Header */}
-            <div className="p-4 border-b border-neutral-800">
+            <div className="p-4 border-b border-helix-border">
                 <div className="flex items-center justify-between">
                     <div className="flex items-center gap-3">
-                        <div className="w-10 h-10 rounded-lg bg-indigo-500/20 flex items-center justify-center">
-                            <Shield className="w-5 h-5 text-indigo-400" />
+                        <div className="w-10 h-10 rounded-md bg-white/10 flex items-center justify-center">
+                            <Shield className="w-5 h-5 text-white" />
                         </div>
                         <div>
                             <h3 className="font-semibold text-white">Proof Stream</h3>
-                            <p className="text-sm text-neutral-400">
+                            <p className="text-sm text-[#888]">
                                 {activeProofs.length} active · {stats.verified} verified
                             </p>
                         </div>
                     </div>
 
                     {/* Filter tabs */}
-                    <div className="flex items-center gap-1 bg-neutral-800 rounded-lg p-1">
+                    <div className="flex items-center gap-1 bg-neutral-800 rounded-md p-1">
                         {(['all', 'active', 'verified', 'failed'] as const).map((f) => (
                             <button
                                 key={f}
@@ -456,7 +453,7 @@ export default function ProofStream({
                                 className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
                                     filter === f
                                         ? 'bg-neutral-700 text-white'
-                                        : 'text-neutral-400 hover:text-white'
+                                        : 'text-[#888] hover:text-white'
                                 }`}
                             >
                                 {f.charAt(0).toUpperCase() + f.slice(1)}
@@ -468,15 +465,15 @@ export default function ProofStream({
 
             {/* Stats */}
             {showStats && (
-                <div className="p-4 border-b border-neutral-800">
+                <div className="p-4 border-b border-helix-border">
                     <StatsBar stats={stats} />
                 </div>
             )}
 
             {/* Current generating proof */}
             {currentGenerating && filter !== 'verified' && filter !== 'failed' && (
-                <div className="p-4 border-b border-neutral-800">
-                    <div className="text-xs text-neutral-400 uppercase tracking-wide mb-2">
+                <div className="p-4 border-b border-helix-border">
+                    <div className="text-xs text-[#888] uppercase tracking-wide mb-2">
                         Currently Generating
                     </div>
                     <CurrentProofProgress proof={currentGenerating} />
@@ -498,7 +495,7 @@ export default function ProofStream({
                     </AnimatePresence>
 
                     {filteredProofs.length === 0 && (
-                        <div className="text-center py-8 text-neutral-500">
+                        <div className="text-center py-8 text-[#666]">
                             No proofs match the current filter
                         </div>
                     )}
@@ -506,9 +503,9 @@ export default function ProofStream({
             </div>
 
             {/* Footer stats */}
-            <div className="px-4 py-3 border-t border-neutral-800 bg-neutral-800/30">
+            <div className="px-4 py-3 border-t border-helix-border bg-helix-surface">
                 <div className="flex items-center justify-between text-sm">
-                    <div className="flex items-center gap-4 text-neutral-400">
+                    <div className="flex items-center gap-3 text-[#888]">
                         <div className="flex items-center gap-1">
                             <Activity className="w-4 h-4" />
                             <span>Throughput:</span>
@@ -521,11 +518,8 @@ export default function ProofStream({
                         </div>
                     </div>
                     <div className="flex items-center gap-2">
-                        <span className="text-neutral-400">Success Rate:</span>
-                        <span className={`font-medium ${
-                            stats.successRate > 0.95 ? 'text-emerald-400' :
-                            stats.successRate > 0.85 ? 'text-amber-400' : 'text-red-400'
-                        }`}>
+                        <span className="text-[#888]">Success Rate:</span>
+                        <span className="font-medium text-white">
                             {(stats.successRate * 100).toFixed(1)}%
                         </span>
                     </div>

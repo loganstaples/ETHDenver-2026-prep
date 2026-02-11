@@ -54,22 +54,17 @@ export default function NodeNetworkView({
         { from: 'node_04', to: 'node_05', latency: 18, bandwidth: 90 },
     ];
 
-    const getTypeColor = (type: string) => {
-        const colors: Record<string, string> = {
-            aggregator: '#a855f7',
-            compute: '#6366f1',
-            verifier: '#22c55e',
-        };
-        return colors[type] || '#6b7280';
+    const getTypeColor = (_type: string) => {
+        return '#ffffff';
     };
 
     const getStatusColor = (status: string) => {
         const colors: Record<string, string> = {
-            online: '#22c55e',
-            offline: '#ef4444',
-            syncing: '#f59e0b',
+            online: '#ffffff',
+            offline: '#525252',
+            syncing: '#a3a3a3',
         };
-        return colors[status] || '#6b7280';
+        return colors[status] || '#ffffff';
     };
 
     const formatTime = (ts: number) => {
@@ -83,261 +78,26 @@ export default function NodeNetworkView({
     const totalPeers = mockNodes.reduce((sum, n) => sum + n.peers, 0);
 
     return (
-        <div className="node-network">
-            <style jsx>{`
-        .node-network {
-          background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-          border-radius: 16px;
-          padding: 24px;
-          color: #fff;
-          font-family: 'Inter', -apple-system, sans-serif;
-        }
-
-        .header {
-          display: flex;
-          justify-content: space-between;
-          align-items: center;
-          margin-bottom: 24px;
-        }
-
-        .title {
-          font-size: 24px;
-          font-weight: 700;
-          background: linear-gradient(90deg, #6366f1, #a855f7);
-          -webkit-background-clip: text;
-          -webkit-text-fill-color: transparent;
-        }
-
-        .controls {
-          display: flex;
-          gap: 8px;
-        }
-
-        .view-btn {
-          padding: 8px 16px;
-          border-radius: 8px;
-          border: 1px solid rgba(255, 255, 255, 0.1);
-          background: rgba(255, 255, 255, 0.05);
-          color: #9ca3af;
-          font-size: 13px;
-          cursor: pointer;
-          transition: all 0.2s;
-        }
-
-        .view-btn.active {
-          background: rgba(99, 102, 241, 0.2);
-          border-color: rgba(99, 102, 241, 0.5);
-          color: #818cf8;
-        }
-
-        .stats-row {
-          display: grid;
-          grid-template-columns: repeat(4, 1fr);
-          gap: 16px;
-          margin-bottom: 24px;
-        }
-
-        .stat-card {
-          background: rgba(255, 255, 255, 0.03);
-          border-radius: 12px;
-          padding: 16px;
-          border: 1px solid rgba(255, 255, 255, 0.08);
-          text-align: center;
-        }
-
-        .stat-value {
-          font-size: 28px;
-          font-weight: 700;
-          margin-bottom: 4px;
-        }
-
-        .stat-label {
-          font-size: 12px;
-          color: #9ca3af;
-          text-transform: uppercase;
-        }
-
-        .network-graph {
-          position: relative;
-          height: 400px;
-          background: rgba(0, 0, 0, 0.2);
-          border-radius: 12px;
-          overflow: hidden;
-          margin-bottom: 24px;
-        }
-
-        .graph-node {
-          position: absolute;
-          transform: translate(-50%, -50%);
-          cursor: pointer;
-          transition: all 0.2s;
-        }
-
-        .graph-node:hover {
-          transform: translate(-50%, -50%) scale(1.1);
-        }
-
-        .node-circle {
-          width: 48px;
-          height: 48px;
-          border-radius: 50%;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          font-weight: 600;
-          font-size: 12px;
-          border: 3px solid;
-          box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
-        }
-
-        .node-label {
-          position: absolute;
-          bottom: -20px;
-          left: 50%;
-          transform: translateX(-50%);
-          font-size: 10px;
-          white-space: nowrap;
-          color: #9ca3af;
-        }
-
-        .node-status {
-          position: absolute;
-          top: -4px;
-          right: -4px;
-          width: 12px;
-          height: 12px;
-          border-radius: 50%;
-          border: 2px solid #1a1a2e;
-        }
-
-        .connection-line {
-          position: absolute;
-          height: 2px;
-          background: rgba(99, 102, 241, 0.3);
-          transform-origin: left center;
-        }
-
-        .nodes-list {
-          display: flex;
-          flex-direction: column;
-          gap: 8px;
-        }
-
-        .node-item {
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          padding: 16px;
-          background: rgba(255, 255, 255, 0.03);
-          border-radius: 12px;
-          border: 1px solid rgba(255, 255, 255, 0.08);
-          cursor: pointer;
-          transition: all 0.2s;
-        }
-
-        .node-item:hover {
-          background: rgba(255, 255, 255, 0.06);
-        }
-
-        .node-item.selected {
-          border-color: rgba(99, 102, 241, 0.5);
-          background: rgba(99, 102, 241, 0.1);
-        }
-
-        .node-info {
-          display: flex;
-          align-items: center;
-          gap: 16px;
-        }
-
-        .node-type-badge {
-          padding: 6px 12px;
-          border-radius: 6px;
-          font-size: 11px;
-          font-weight: 600;
-          text-transform: uppercase;
-        }
-
-        .node-id {
-          font-weight: 600;
-        }
-
-        .node-address {
-          font-family: 'JetBrains Mono', monospace;
-          font-size: 12px;
-          color: #6b7280;
-        }
-
-        .node-meta {
-          display: flex;
-          gap: 24px;
-          align-items: center;
-        }
-
-        .node-stat {
-          text-align: right;
-        }
-
-        .node-stat-value {
-          font-size: 14px;
-          font-weight: 600;
-        }
-
-        .node-stat-label {
-          font-size: 11px;
-          color: #6b7280;
-        }
-
-        .status-dot {
-          width: 10px;
-          height: 10px;
-          border-radius: 50%;
-        }
-
-        .detail-panel {
-          padding: 20px;
-          background: rgba(255, 255, 255, 0.03);
-          border-radius: 12px;
-          border: 1px solid rgba(255, 255, 255, 0.08);
-        }
-
-        .detail-title {
-          font-size: 16px;
-          font-weight: 600;
-          margin-bottom: 16px;
-        }
-
-        .metrics-row {
-          display: grid;
-          grid-template-columns: repeat(3, 1fr);
-          gap: 16px;
-        }
-
-        .metric-bar {
-          background: rgba(0, 0, 0, 0.3);
-          border-radius: 4px;
-          height: 8px;
-          overflow: hidden;
-          margin-top: 8px;
-        }
-
-        .metric-fill {
-          height: 100%;
-          border-radius: 4px;
-        }
-      `}</style>
-
-            <div className="header">
-                <h2 className="title">Network Nodes</h2>
-                <div className="controls">
+        <div className="bg-helix-surface rounded-md p-4 text-white border border-helix-border">
+            <div className="flex justify-between items-center mb-4">
+                <h2 className="text-white font-semibold text-[15px]">Network Nodes</h2>
+                <div className="flex gap-2">
                     <button
-                        className={`view-btn ${viewMode === 'graph' ? 'active' : ''}`}
+                        className={`px-4 py-2 rounded-md border text-[13px] cursor-pointer transition-all ${
+                            viewMode === 'graph'
+                                ? 'bg-white/10 border-white/10 text-white'
+                                : 'bg-white/5 border-helix-border text-[#666]'
+                        }`}
                         onClick={() => setViewMode('graph')}
                     >
                         Graph
                     </button>
                     <button
-                        className={`view-btn ${viewMode === 'list' ? 'active' : ''}`}
+                        className={`px-4 py-2 rounded-md border text-[13px] cursor-pointer transition-all ${
+                            viewMode === 'list'
+                                ? 'bg-white/10 border-white/10 text-white'
+                                : 'bg-white/5 border-helix-border text-[#666]'
+                        }`}
                         onClick={() => setViewMode('list')}
                     >
                         List
@@ -345,39 +105,39 @@ export default function NodeNetworkView({
                 </div>
             </div>
 
-            <div className="stats-row">
-                <div className="stat-card">
-                    <div className="stat-value" style={{ color: '#22c55e' }}>
+            <div className="grid grid-cols-4 gap-3 mb-4">
+                <div className="bg-white/[0.03] rounded-md p-4 border border-helix-border text-center">
+                    <div className="text-lg font-bold mb-1 text-white">
                         {onlineNodes}
                     </div>
-                    <div className="stat-label">Online Nodes</div>
+                    <div className="text-xs text-[#888] uppercase">Online Nodes</div>
                 </div>
-                <div className="stat-card">
-                    <div className="stat-value" style={{ color: '#6366f1' }}>
+                <div className="bg-white/[0.03] rounded-md p-4 border border-helix-border text-center">
+                    <div className="text-lg font-bold mb-1 text-white">
                         {mockNodes.filter(n => n.type === 'compute').length}
                     </div>
-                    <div className="stat-label">Compute Nodes</div>
+                    <div className="text-xs text-[#888] uppercase">Compute Nodes</div>
                 </div>
-                <div className="stat-card">
-                    <div className="stat-value" style={{ color: '#a855f7' }}>
+                <div className="bg-white/[0.03] rounded-md p-4 border border-helix-border text-center">
+                    <div className="text-lg font-bold mb-1 text-white">
                         {mockNodes.filter(n => n.type === 'aggregator').length}
                     </div>
-                    <div className="stat-label">Aggregators</div>
+                    <div className="text-xs text-[#888] uppercase">Aggregators</div>
                 </div>
-                <div className="stat-card">
-                    <div className="stat-value" style={{ color: '#f59e0b' }}>
+                <div className="bg-white/[0.03] rounded-md p-4 border border-helix-border text-center">
+                    <div className="text-lg font-bold mb-1 text-white">
                         {totalPeers}
                     </div>
-                    <div className="stat-label">Total Peers</div>
+                    <div className="text-xs text-[#888] uppercase">Total Peers</div>
                 </div>
             </div>
 
             {viewMode === 'graph' ? (
-                <div className="network-graph">
+                <div className="relative h-[400px] bg-white/[0.03] rounded-md overflow-hidden mb-4">
                     {mockNodes.map((node) => (
                         <div
                             key={node.id}
-                            className="graph-node"
+                            className="absolute -translate-x-1/2 -translate-y-1/2 cursor-pointer transition-all hover:scale-110"
                             style={{
                                 left: `${node.position.x}%`,
                                 top: `${node.position.y}%`,
@@ -385,58 +145,59 @@ export default function NodeNetworkView({
                             onClick={() => setSelectedNode(node)}
                         >
                             <div
-                                className="node-circle"
-                                style={{
-                                    background: `${getTypeColor(node.type)}33`,
-                                    borderColor: getTypeColor(node.type),
-                                    color: getTypeColor(node.type),
-                                }}
+                                className="w-12 h-12 rounded-full flex items-center justify-center font-semibold text-xs bg-white/10 border-[3px] border-white shadow-[0_4px_12px_rgba(0,0,0,0.3)] text-white"
                             >
                                 {node.type.charAt(0).toUpperCase()}
                             </div>
                             <div
-                                className="node-status"
-                                style={{ background: getStatusColor(node.status) }}
+                                className="absolute -top-1 -right-1 w-3 h-3 rounded-full border-2 border-[#141414]"
+                                style={{
+                                    background: getStatusColor(node.status),
+                                    opacity: node.status === 'online' ? 1 : (node.status === 'syncing' ? 0.7 : 0.4)
+                                }}
                             />
-                            <div className="node-label">{node.id}</div>
+                            <div className="absolute -bottom-5 left-1/2 -translate-x-1/2 text-[10px] whitespace-nowrap text-[#888]">
+                                {node.id}
+                            </div>
                         </div>
                     ))}
                 </div>
             ) : (
-                <div className="nodes-list">
+                <div className="flex flex-col gap-2">
                     {mockNodes.map((node) => (
                         <div
                             key={node.id}
-                            className={`node-item ${selectedNode?.id === node.id ? 'selected' : ''}`}
+                            className={`flex items-center justify-between p-4 bg-white/[0.03] rounded-md border cursor-pointer transition-all hover:bg-white/[0.06] ${
+                                selectedNode?.id === node.id
+                                    ? 'border-white/10 bg-white/10'
+                                    : 'border-helix-border'
+                            }`}
                             onClick={() => setSelectedNode(node)}
                         >
-                            <div className="node-info">
-                                <span
-                                    className="node-type-badge"
-                                    style={{
-                                        background: `${getTypeColor(node.type)}22`,
-                                        color: getTypeColor(node.type),
-                                    }}
-                                >
+                            <div className="flex items-center gap-3">
+                                <span className="px-3 py-1.5 rounded-md text-[11px] font-semibold uppercase bg-white/5 text-[#888]">
                                     {node.type}
                                 </span>
                                 <div>
-                                    <div className="node-id">{node.id}</div>
-                                    <div className="node-address">{node.address}</div>
+                                    <div className="font-semibold">{node.id}</div>
+                                    <div className="font-mono text-xs text-[#666]">{node.address}</div>
                                 </div>
                             </div>
-                            <div className="node-meta">
-                                <div className="node-stat">
-                                    <div className="node-stat-value">{node.peers}</div>
-                                    <div className="node-stat-label">Peers</div>
+                            <div className="flex gap-3 items-center">
+                                <div className="text-right">
+                                    <div className="text-sm font-semibold">{node.peers}</div>
+                                    <div className="text-[11px] text-[#666]">Peers</div>
                                 </div>
-                                <div className="node-stat">
-                                    <div className="node-stat-value">{formatTime(node.lastSeen)}</div>
-                                    <div className="node-stat-label">Last Seen</div>
+                                <div className="text-right">
+                                    <div className="text-sm font-semibold">{formatTime(node.lastSeen)}</div>
+                                    <div className="text-[11px] text-[#666]">Last Seen</div>
                                 </div>
                                 <div
-                                    className="status-dot"
-                                    style={{ background: getStatusColor(node.status) }}
+                                    className="w-2.5 h-2.5 rounded-full"
+                                    style={{
+                                        background: getStatusColor(node.status),
+                                        opacity: node.status === 'online' ? 1 : (node.status === 'syncing' ? 0.7 : 0.4)
+                                    }}
                                 />
                             </div>
                         </div>
@@ -445,44 +206,53 @@ export default function NodeNetworkView({
             )}
 
             {selectedNode && (
-                <div className="detail-panel">
-                    <h3 className="detail-title">{selectedNode.id} Metrics</h3>
-                    <div className="metrics-row">
+                <div className="p-4 bg-white/[0.03] rounded-md border border-helix-border">
+                    <h3 className="text-base font-semibold mb-4">{selectedNode.id} Metrics</h3>
+                    <div className="grid grid-cols-3 gap-3">
                         <div>
-                            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                                <span style={{ fontSize: '12px', color: '#9ca3af' }}>CPU</span>
-                                <span style={{ fontSize: '14px', fontWeight: 600 }}>{selectedNode.metrics.cpu}%</span>
+                            <div className="flex justify-between">
+                                <span className="text-xs text-[#888]">CPU</span>
+                                <span className="text-sm font-semibold">{selectedNode.metrics.cpu}%</span>
                             </div>
-                            <div className="metric-bar">
-                                <div className="metric-fill" style={{
-                                    width: `${selectedNode.metrics.cpu}%`,
-                                    background: selectedNode.metrics.cpu > 80 ? '#ef4444' : '#6366f1'
-                                }} />
+                            <div className="bg-white/[0.03] rounded h-2 overflow-hidden mt-2">
+                                <div
+                                    className="h-full rounded bg-white"
+                                    style={{
+                                        width: `${selectedNode.metrics.cpu}%`,
+                                        opacity: selectedNode.metrics.cpu > 80 ? 1 : 0.7
+                                    }}
+                                />
                             </div>
                         </div>
                         <div>
-                            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                                <span style={{ fontSize: '12px', color: '#9ca3af' }}>Memory</span>
-                                <span style={{ fontSize: '14px', fontWeight: 600 }}>{selectedNode.metrics.memory}%</span>
+                            <div className="flex justify-between">
+                                <span className="text-xs text-[#888]">Memory</span>
+                                <span className="text-sm font-semibold">{selectedNode.metrics.memory}%</span>
                             </div>
-                            <div className="metric-bar">
-                                <div className="metric-fill" style={{
-                                    width: `${selectedNode.metrics.memory}%`,
-                                    background: selectedNode.metrics.memory > 80 ? '#ef4444' : '#22c55e'
-                                }} />
+                            <div className="bg-white/[0.03] rounded h-2 overflow-hidden mt-2">
+                                <div
+                                    className="h-full rounded bg-white"
+                                    style={{
+                                        width: `${selectedNode.metrics.memory}%`,
+                                        opacity: selectedNode.metrics.memory > 80 ? 1 : 0.7
+                                    }}
+                                />
                             </div>
                         </div>
                         {selectedNode.metrics.gpu !== undefined && (
                             <div>
-                                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                                    <span style={{ fontSize: '12px', color: '#9ca3af' }}>GPU</span>
-                                    <span style={{ fontSize: '14px', fontWeight: 600 }}>{selectedNode.metrics.gpu}%</span>
+                                <div className="flex justify-between">
+                                    <span className="text-xs text-[#888]">GPU</span>
+                                    <span className="text-sm font-semibold">{selectedNode.metrics.gpu}%</span>
                                 </div>
-                                <div className="metric-bar">
-                                    <div className="metric-fill" style={{
-                                        width: `${selectedNode.metrics.gpu}%`,
-                                        background: selectedNode.metrics.gpu > 80 ? '#ef4444' : '#a855f7'
-                                    }} />
+                                <div className="bg-white/[0.03] rounded h-2 overflow-hidden mt-2">
+                                    <div
+                                        className="h-full rounded bg-white"
+                                        style={{
+                                            width: `${selectedNode.metrics.gpu}%`,
+                                            opacity: selectedNode.metrics.gpu > 80 ? 1 : 0.7
+                                        }}
+                                    />
                                 </div>
                             </div>
                         )}

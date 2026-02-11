@@ -53,10 +53,10 @@ interface Connection {
 
 function getStatusColor(status: HealthStatus): string {
     switch (status) {
-        case 'healthy': return '#22c55e';
-        case 'degraded': return '#f59e0b';
-        case 'unhealthy': return '#ef4444';
-        case 'offline': return '#6b7280';
+        case 'healthy': return '#ffffff';
+        case 'degraded': return '#a3a3a3';
+        case 'unhealthy': return '#737373';
+        case 'offline': return '#525252';
         default: return '#9ca3af';
     }
 }
@@ -230,7 +230,7 @@ function ConnectionLine({ connection }: { connection: Connection }) {
             {connection.active && (
                 <motion.circle
                     r={3}
-                    fill="#22c55e"
+                    fill="#ffffff"
                     initial={{ offsetDistance: '0%' }}
                     animate={{ offsetDistance: '100%' }}
                     transition={{ duration: 2, repeat: Infinity, ease: 'linear' }}
@@ -249,26 +249,26 @@ function WorkerDetails({ worker, onClose }: { worker: WorkerHealth; onClose: () 
             initial={{ opacity: 0, x: 20 }}
             animate={{ opacity: 1, x: 0 }}
             exit={{ opacity: 0, x: 20 }}
-            className="absolute right-0 top-0 bottom-0 w-80 bg-neutral-900 border-l border-neutral-800 overflow-y-auto"
+            className="absolute right-0 top-0 bottom-0 w-80 bg-neutral-900 border-l border-helix-border overflow-y-auto"
         >
             {/* Header */}
-            <div className="sticky top-0 bg-neutral-900 border-b border-neutral-800 p-4">
+            <div className="sticky top-0 bg-neutral-900 border-b border-helix-border p-4">
                 <div className="flex items-center justify-between">
                     <div className="flex items-center gap-3">
                         <div
-                            className="w-10 h-10 rounded-lg flex items-center justify-center"
+                            className="w-10 h-10 rounded-md flex items-center justify-center"
                             style={{ backgroundColor: `${statusColor}20`, color: statusColor }}
                         >
                             {getRoleIcon(worker.role)}
                         </div>
                         <div>
                             <h3 className="font-semibold text-white capitalize">{worker.role}</h3>
-                            <p className="text-xs text-neutral-400">{formatAddress(worker.address)}</p>
+                            <p className="text-xs text-[#888]">{formatAddress(worker.address)}</p>
                         </div>
                     </div>
                     <button
                         onClick={onClose}
-                        className="p-1 text-neutral-400 hover:text-white"
+                        className="p-1 text-[#888] hover:text-white"
                     >
                         <ChevronRight className="w-5 h-5" />
                     </button>
@@ -276,9 +276,9 @@ function WorkerDetails({ worker, onClose }: { worker: WorkerHealth; onClose: () 
             </div>
 
             {/* Status */}
-            <div className="p-4 border-b border-neutral-800">
+            <div className="p-4 border-b border-helix-border">
                 <div className="flex items-center justify-between mb-3">
-                    <span className="text-sm text-neutral-400">Status</span>
+                    <span className="text-sm text-[#888]">Status</span>
                     <span
                         className="px-2 py-1 rounded text-xs font-medium capitalize"
                         style={{ backgroundColor: `${statusColor}20`, color: statusColor }}
@@ -287,28 +287,28 @@ function WorkerDetails({ worker, onClose }: { worker: WorkerHealth; onClose: () 
                     </span>
                 </div>
                 <div className="flex items-center justify-between">
-                    <span className="text-sm text-neutral-400">Activity</span>
+                    <span className="text-sm text-[#888]">Activity</span>
                     <span className="text-sm text-white capitalize">{worker.activity}</span>
                 </div>
             </div>
 
             {/* Metrics */}
-            <div className="p-4 border-b border-neutral-800">
-                <h4 className="text-sm font-medium text-neutral-300 mb-3">System Metrics</h4>
+            <div className="p-4 border-b border-helix-border">
+                <h4 className="text-sm font-medium text-[#aaa] mb-3">System Metrics</h4>
                 <div className="space-y-3">
-                    <MetricBar label="CPU" value={worker.metrics.cpu} color="#3b82f6" />
-                    <MetricBar label="Memory" value={worker.metrics.memory} color="#8b5cf6" />
+                    <MetricBar label="CPU" value={worker.metrics.cpu} color="#ffffff" />
+                    <MetricBar label="Memory" value={worker.metrics.memory} color="#d4d4d4" />
                     {worker.metrics.gpu && (
-                        <MetricBar label="GPU" value={worker.metrics.gpu} color="#22c55e" />
+                        <MetricBar label="GPU" value={worker.metrics.gpu} color="#a3a3a3" />
                     )}
                     <div className="flex items-center justify-between text-sm">
-                        <span className="text-neutral-400">Latency</span>
+                        <span className="text-[#888]">Latency</span>
                         <span className="text-white">{worker.metrics.latency.toFixed(0)}ms</span>
                     </div>
                     {worker.metrics.temperature && (
                         <div className="flex items-center justify-between text-sm">
-                            <span className="text-neutral-400">Temperature</span>
-                            <span className={worker.metrics.temperature > 75 ? 'text-amber-400' : 'text-white'}>
+                            <span className="text-[#888]">Temperature</span>
+                            <span className="text-white">
                                 {worker.metrics.temperature.toFixed(0)}°C
                             </span>
                         </div>
@@ -317,39 +317,39 @@ function WorkerDetails({ worker, onClose }: { worker: WorkerHealth; onClose: () 
             </div>
 
             {/* Performance */}
-            <div className="p-4 border-b border-neutral-800">
-                <h4 className="text-sm font-medium text-neutral-300 mb-3">Performance</h4>
+            <div className="p-4 border-b border-helix-border">
+                <h4 className="text-sm font-medium text-[#aaa] mb-3">Performance</h4>
                 <div className="grid grid-cols-2 gap-3">
-                    <div className="bg-neutral-800/50 rounded-lg p-3">
+                    <div className="bg-neutral-800/50 rounded-md p-3">
                         <div className="text-lg font-bold text-white">{worker.performance.proofsVerified}</div>
-                        <div className="text-xs text-neutral-400">Proofs Verified</div>
+                        <div className="text-xs text-[#888]">Proofs Verified</div>
                     </div>
-                    <div className="bg-neutral-800/50 rounded-lg p-3">
+                    <div className="bg-neutral-800/50 rounded-md p-3">
                         <div className="text-lg font-bold text-white">{(worker.performance.successRate * 100).toFixed(1)}%</div>
-                        <div className="text-xs text-neutral-400">Success Rate</div>
+                        <div className="text-xs text-[#888]">Success Rate</div>
                     </div>
-                    <div className="bg-neutral-800/50 rounded-lg p-3">
+                    <div className="bg-neutral-800/50 rounded-md p-3">
                         <div className="text-lg font-bold text-white">{worker.performance.averageProofTime.toFixed(0)}ms</div>
-                        <div className="text-xs text-neutral-400">Avg Proof Time</div>
+                        <div className="text-xs text-[#888]">Avg Proof Time</div>
                     </div>
-                    <div className="bg-neutral-800/50 rounded-lg p-3">
+                    <div className="bg-neutral-800/50 rounded-md p-3">
                         <div className="text-lg font-bold text-white">{(worker.performance.uptime * 100).toFixed(1)}%</div>
-                        <div className="text-xs text-neutral-400">Uptime</div>
+                        <div className="text-xs text-[#888]">Uptime</div>
                     </div>
                 </div>
             </div>
 
             {/* Stake */}
-            <div className="p-4 border-b border-neutral-800">
-                <h4 className="text-sm font-medium text-neutral-300 mb-3">Stake</h4>
+            <div className="p-4 border-b border-helix-border">
+                <h4 className="text-sm font-medium text-[#aaa] mb-3">Stake</h4>
                 <div className="space-y-2 text-sm">
                     <div className="flex items-center justify-between">
-                        <span className="text-neutral-400">Amount</span>
+                        <span className="text-[#888]">Amount</span>
                         <span className="text-white font-medium">{worker.stake.amountFormatted} HELIX</span>
                     </div>
                     <div className="flex items-center justify-between">
-                        <span className="text-neutral-400">Status</span>
-                        <span className={worker.stake.slashed ? 'text-red-400' : worker.stake.isLocked ? 'text-amber-400' : 'text-emerald-400'}>
+                        <span className="text-[#888]">Status</span>
+                        <span className={worker.stake.slashed ? 'text-[#666]' : worker.stake.isLocked ? 'text-[#666]' : 'text-white'}>
                             {worker.stake.slashed ? 'Slashed' : worker.stake.isLocked ? 'Locked' : 'Active'}
                         </span>
                     </div>
@@ -359,17 +359,17 @@ function WorkerDetails({ worker, onClose }: { worker: WorkerHealth; onClose: () 
             {/* Issues */}
             {worker.issues.length > 0 && (
                 <div className="p-4">
-                    <h4 className="text-sm font-medium text-neutral-300 mb-3">Issues</h4>
+                    <h4 className="text-sm font-medium text-[#aaa] mb-3">Issues</h4>
                     <div className="space-y-2">
                         {worker.issues.map((issue) => (
                             <div
                                 key={issue.id}
                                 className={`p-2 rounded text-xs ${
                                     issue.severity === 'critical'
-                                        ? 'bg-red-500/20 text-red-400'
+                                        ? 'bg-white/10 text-white'
                                         : issue.severity === 'error'
-                                            ? 'bg-amber-500/20 text-amber-400'
-                                            : 'bg-neutral-700/50 text-neutral-300'
+                                            ? 'bg-white/5 text-[#888]'
+                                            : 'bg-white/5 text-[#888]'
                                 }`}
                             >
                                 {issue.message}
@@ -386,7 +386,7 @@ function MetricBar({ label, value, color }: { label: string; value: number; colo
     return (
         <div>
             <div className="flex items-center justify-between mb-1">
-                <span className="text-sm text-neutral-400">{label}</span>
+                <span className="text-sm text-[#888]">{label}</span>
                 <span className="text-sm text-white">{value.toFixed(0)}%</span>
             </div>
             <div className="h-2 bg-neutral-700 rounded-full overflow-hidden">
@@ -512,9 +512,9 @@ export default function LiveTopology({
 
     if (isLoading) {
         return (
-            <div className={`bg-neutral-900/50 rounded-xl border border-neutral-800 p-6 ${className}`}>
+            <div className={`bg-helix-surface rounded-md border border-helix-border p-4 ${className}`}>
                 <div className="flex items-center justify-center h-96">
-                    <Activity className="w-8 h-8 text-neutral-500 animate-pulse" />
+                    <Activity className="w-8 h-8 text-[#666] animate-pulse" />
                 </div>
             </div>
         );
@@ -523,31 +523,25 @@ export default function LiveTopology({
     return (
         <div
             ref={containerRef}
-            className={`bg-neutral-900/50 rounded-xl border border-neutral-800 overflow-hidden relative ${className}`}
+            className={`bg-helix-surface rounded-md border border-helix-border overflow-hidden relative ${className}`}
         >
             {/* Header */}
-            <div className="p-4 border-b border-neutral-800">
+            <div className="p-4 border-b border-helix-border">
                 <div className="flex items-center justify-between">
                     <div className="flex items-center gap-3">
-                        <div className="w-10 h-10 rounded-lg bg-cyan-500/20 flex items-center justify-center">
-                            <Globe className="w-5 h-5 text-cyan-400" />
+                        <div className="w-10 h-10 rounded-md bg-white/10 flex items-center justify-center">
+                            <Globe className="w-5 h-5 text-white" />
                         </div>
                         <div>
                             <h3 className="font-semibold text-white">Network Topology</h3>
-                            <p className="text-sm text-neutral-400">
+                            <p className="text-sm text-[#888]">
                                 {networkSummary.totalWorkers} nodes · {networkSummary.healthyWorkers} healthy
                             </p>
                         </div>
                     </div>
 
                     {/* Network health indicator */}
-                    <div className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-sm font-medium ${
-                        networkSummary.networkHealth === 'healthy'
-                            ? 'bg-emerald-500/20 text-emerald-400'
-                            : networkSummary.networkHealth === 'degraded'
-                                ? 'bg-amber-500/20 text-amber-400'
-                                : 'bg-red-500/20 text-red-400'
-                    }`}>
+                    <div className="flex items-center gap-2 px-3 py-1.5 rounded-md text-sm font-medium bg-white/10 text-white">
                         {networkSummary.networkHealth === 'healthy' ? (
                             <Wifi className="w-4 h-4" />
                         ) : networkSummary.networkHealth === 'offline' ? (
@@ -612,38 +606,38 @@ export default function LiveTopology({
             </div>
 
             {/* Legend */}
-            <div className="p-4 border-t border-neutral-800 bg-neutral-800/30">
+            <div className="p-4 border-t border-helix-border bg-neutral-800/30">
                 <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-6">
+                    <div className="flex items-center gap-3">
                         <div className="flex items-center gap-2 text-sm">
                             <div className="w-6 h-6 rounded bg-neutral-800 flex items-center justify-center">
-                                <Cpu className="w-3.5 h-3.5 text-neutral-400" />
+                                <Cpu className="w-3.5 h-3.5 text-[#888]" />
                             </div>
-                            <span className="text-neutral-400">Compute ({computeWorkers.length})</span>
+                            <span className="text-[#888]">Compute ({computeWorkers.length})</span>
                         </div>
                         <div className="flex items-center gap-2 text-sm">
                             <div className="w-6 h-6 rounded bg-neutral-800 flex items-center justify-center">
-                                <Layers className="w-3.5 h-3.5 text-neutral-400" />
+                                <Layers className="w-3.5 h-3.5 text-[#888]" />
                             </div>
-                            <span className="text-neutral-400">Aggregator ({aggregators.length})</span>
+                            <span className="text-[#888]">Aggregator ({aggregators.length})</span>
                         </div>
                         <div className="flex items-center gap-2 text-sm">
                             <div className="w-6 h-6 rounded bg-neutral-800 flex items-center justify-center">
-                                <Shield className="w-3.5 h-3.5 text-neutral-400" />
+                                <Shield className="w-3.5 h-3.5 text-[#888]" />
                             </div>
-                            <span className="text-neutral-400">Verifier ({verifiers.length})</span>
+                            <span className="text-[#888]">Verifier ({verifiers.length})</span>
                         </div>
                     </div>
 
-                    <div className="flex items-center gap-4 text-sm">
+                    <div className="flex items-center gap-3 text-sm">
                         <div className="flex items-center gap-2">
-                            <Zap className="w-4 h-4 text-blue-400" />
-                            <span className="text-neutral-400">Avg Latency:</span>
+                            <Zap className="w-4 h-4 text-white/50" />
+                            <span className="text-[#888]">Avg Latency:</span>
                             <span className="text-white">{networkSummary.averageLatency.toFixed(0)}ms</span>
                         </div>
                         <div className="flex items-center gap-2">
-                            <Activity className="w-4 h-4 text-purple-400" />
-                            <span className="text-neutral-400">Uptime:</span>
+                            <Activity className="w-4 h-4 text-white/50" />
+                            <span className="text-[#888]">Uptime:</span>
                             <span className="text-white">{(networkSummary.averageUptime * 100).toFixed(1)}%</span>
                         </div>
                     </div>

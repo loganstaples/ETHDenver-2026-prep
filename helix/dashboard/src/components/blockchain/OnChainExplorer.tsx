@@ -131,19 +131,6 @@ export default function OnChainExplorer() {
         ? displayEvents
         : displayEvents.filter((e) => e.type === filter);
 
-    const getTypeColor = (type: EventType) => {
-        const colors: Record<EventType, string> = {
-            ProofSubmitted: '#22c55e',
-            RoundStarted: '#6366f1',
-            RoundCompleted: '#a855f7',
-            Staked: '#f59e0b',
-            Unstaked: '#94a3b8',
-            Slashed: '#ef4444',
-            ModelRegistered: '#06b6d4',
-        };
-        return colors[type];
-    };
-
     const formatTime = (ts: number) => {
         const diff = Date.now() / 1000 - ts;
         if (diff < 60) return `${Math.floor(diff)}s ago`;
@@ -185,308 +172,46 @@ export default function OnChainExplorer() {
         .reduce((sum, e) => sum + (e.amount || BigInt(0)), BigInt(0));
 
     return (
-        <div className="onchain-explorer">
-            <style jsx>{`
-                .onchain-explorer {
-                    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-                    border-radius: 16px;
-                    padding: 24px;
-                    color: #fff;
-                    font-family: 'Inter', -apple-system, sans-serif;
-                }
-
-                .header {
-                    display: flex;
-                    justify-content: space-between;
-                    align-items: center;
-                    margin-bottom: 24px;
-                }
-
-                .title {
-                    font-size: 24px;
-                    font-weight: 700;
-                    background: linear-gradient(90deg, #f59e0b, #ef4444);
-                    -webkit-background-clip: text;
-                    -webkit-text-fill-color: transparent;
-                }
-
-                .contract-address {
-                    padding: 8px 16px;
-                    background: rgba(0, 0, 0, 0.3);
-                    border-radius: 8px;
-                    font-family: 'JetBrains Mono', monospace;
-                    font-size: 13px;
-                    color: #9ca3af;
-                }
-
-                .state-grid {
-                    display: grid;
-                    grid-template-columns: repeat(4, 1fr);
-                    gap: 16px;
-                    margin-bottom: 24px;
-                }
-
-                .state-card {
-                    background: rgba(255, 255, 255, 0.03);
-                    border-radius: 12px;
-                    padding: 16px;
-                    border: 1px solid rgba(255, 255, 255, 0.08);
-                    text-align: center;
-                }
-
-                .state-value {
-                    font-size: 24px;
-                    font-weight: 700;
-                    margin-bottom: 4px;
-                }
-
-                .state-label {
-                    font-size: 11px;
-                    color: #9ca3af;
-                    text-transform: uppercase;
-                }
-
-                .filters {
-                    display: flex;
-                    gap: 8px;
-                    margin-bottom: 16px;
-                    flex-wrap: wrap;
-                }
-
-                .filter-btn {
-                    padding: 8px 16px;
-                    border-radius: 8px;
-                    border: 1px solid rgba(255, 255, 255, 0.1);
-                    background: rgba(255, 255, 255, 0.05);
-                    color: #9ca3af;
-                    font-size: 12px;
-                    cursor: pointer;
-                    transition: all 0.2s;
-                }
-
-                .filter-btn:hover {
-                    background: rgba(255, 255, 255, 0.1);
-                }
-
-                .filter-btn.active {
-                    background: rgba(99, 102, 241, 0.2);
-                    border-color: rgba(99, 102, 241, 0.5);
-                    color: #818cf8;
-                }
-
-                .event-list {
-                    display: flex;
-                    flex-direction: column;
-                    gap: 8px;
-                    max-height: 400px;
-                    overflow-y: auto;
-                }
-
-                .event-item {
-                    display: flex;
-                    align-items: center;
-                    justify-content: space-between;
-                    padding: 16px;
-                    background: rgba(255, 255, 255, 0.03);
-                    border-radius: 12px;
-                    border: 1px solid rgba(255, 255, 255, 0.08);
-                    cursor: pointer;
-                    transition: all 0.2s;
-                }
-
-                .event-item:hover {
-                    background: rgba(255, 255, 255, 0.06);
-                    border-color: rgba(255, 255, 255, 0.15);
-                }
-
-                .event-item.selected {
-                    border-color: rgba(99, 102, 241, 0.5);
-                    background: rgba(99, 102, 241, 0.1);
-                }
-
-                .event-main {
-                    display: flex;
-                    align-items: center;
-                    gap: 16px;
-                }
-
-                .event-type {
-                    padding: 6px 12px;
-                    border-radius: 6px;
-                    font-size: 11px;
-                    font-weight: 600;
-                    min-width: 120px;
-                    text-align: center;
-                }
-
-                .event-info {
-                    display: flex;
-                    flex-direction: column;
-                    gap: 4px;
-                }
-
-                .event-primary {
-                    font-size: 14px;
-                    font-weight: 500;
-                }
-
-                .event-secondary {
-                    font-family: 'JetBrains Mono', monospace;
-                    font-size: 12px;
-                    color: #6b7280;
-                }
-
-                .event-meta {
-                    display: flex;
-                    align-items: center;
-                    gap: 24px;
-                }
-
-                .event-stat {
-                    text-align: right;
-                }
-
-                .event-stat-value {
-                    font-size: 13px;
-                    font-weight: 600;
-                    font-family: 'JetBrains Mono', monospace;
-                }
-
-                .event-stat-label {
-                    font-size: 10px;
-                    color: #6b7280;
-                }
-
-                .detail-panel {
-                    margin-top: 24px;
-                    padding: 20px;
-                    background: rgba(255, 255, 255, 0.03);
-                    border-radius: 12px;
-                    border: 1px solid rgba(255, 255, 255, 0.08);
-                }
-
-                .detail-title {
-                    font-size: 16px;
-                    font-weight: 600;
-                    margin-bottom: 16px;
-                    display: flex;
-                    align-items: center;
-                    gap: 12px;
-                }
-
-                .detail-grid {
-                    display: grid;
-                    grid-template-columns: repeat(2, 1fr);
-                    gap: 16px;
-                }
-
-                .detail-item {
-                    background: rgba(0, 0, 0, 0.2);
-                    padding: 12px;
-                    border-radius: 8px;
-                }
-
-                .detail-label {
-                    font-size: 11px;
-                    color: #6b7280;
-                    text-transform: uppercase;
-                    margin-bottom: 4px;
-                }
-
-                .detail-value {
-                    font-family: 'JetBrains Mono', monospace;
-                    font-size: 13px;
-                    color: #d1d5db;
-                    word-break: break-all;
-                }
-
-                .explorer-link {
-                    display: inline-flex;
-                    align-items: center;
-                    gap: 6px;
-                    color: #6366f1;
-                    font-size: 13px;
-                    text-decoration: none;
-                    margin-top: 16px;
-                    padding: 8px 16px;
-                    background: rgba(99, 102, 241, 0.1);
-                    border-radius: 8px;
-                    transition: all 0.2s;
-                }
-
-                .explorer-link:hover {
-                    background: rgba(99, 102, 241, 0.2);
-                }
-
-                .loading {
-                    text-align: center;
-                    padding: 40px;
-                    color: #6b7280;
-                }
-
-                .no-events {
-                    text-align: center;
-                    padding: 40px;
-                    color: #6b7280;
-                }
-
-                .live-indicator {
-                    display: flex;
-                    align-items: center;
-                    gap: 8px;
-                    font-size: 12px;
-                    color: #22c55e;
-                }
-
-                .live-dot {
-                    width: 8px;
-                    height: 8px;
-                    border-radius: 50%;
-                    background: #22c55e;
-                    animation: pulse 2s infinite;
-                }
-
-                @keyframes pulse {
-                    0%, 100% { opacity: 1; }
-                    50% { opacity: 0.5; }
-                }
-            `}</style>
-
-            <div className="header">
+        <div className="bg-helix-surface rounded-md p-4 text-white font-sans">
+            <div className="flex justify-between items-center mb-4">
                 <div>
-                    <h2 className="title">On-Chain Explorer</h2>
-                    <div className="live-indicator" style={{ marginTop: '8px' }}>
-                        <span className="live-dot" />
+                    <h2 className="font-semibold text-[15px] text-white mb-2">On-Chain Explorer</h2>
+                    <div className="flex items-center gap-2 text-xs text-white">
+                        <span className="w-2 h-2 rounded-full bg-white animate-pulse" />
                         <span>Live - Watching for events</span>
                     </div>
                 </div>
-                <span className="contract-address">{formatAddress(contractAddress)}</span>
+                <span className="px-4 py-2 bg-white/[0.03] rounded-md font-mono text-[13px] text-[#888]">{formatAddress(contractAddress)}</span>
             </div>
 
-            <div className="state-grid">
-                <div className="state-card">
-                    <div className="state-value" style={{ color: '#6366f1' }}>{nextModelId?.toString() || '0'}</div>
-                    <div className="state-label">Models Registered</div>
+            <div className="grid grid-cols-4 gap-3 mb-4">
+                <div className="bg-white/[0.03] rounded-md p-4 border border-helix-border text-center">
+                    <div className="font-semibold text-[15px] mb-1 text-white">{nextModelId?.toString() || '0'}</div>
+                    <div className="text-[11px] text-[#888] uppercase">Models Registered</div>
                 </div>
-                <div className="state-card">
-                    <div className="state-value" style={{ color: '#22c55e' }}>{totalProofs}</div>
-                    <div className="state-label">Proofs Submitted</div>
+                <div className="bg-white/[0.03] rounded-md p-4 border border-helix-border text-center">
+                    <div className="font-semibold text-[15px] mb-1 text-white">{totalProofs}</div>
+                    <div className="text-[11px] text-[#888] uppercase">Proofs Submitted</div>
                 </div>
-                <div className="state-card">
-                    <div className="state-value" style={{ color: '#a855f7' }}>{totalRounds}</div>
-                    <div className="state-label">Rounds Completed</div>
+                <div className="bg-white/[0.03] rounded-md p-4 border border-helix-border text-center">
+                    <div className="font-semibold text-[15px] mb-1 text-white">{totalRounds}</div>
+                    <div className="text-[11px] text-[#888] uppercase">Rounds Completed</div>
                 </div>
-                <div className="state-card">
-                    <div className="state-value" style={{ color: '#f59e0b' }}>{formatAmount(totalStaked)}</div>
-                    <div className="state-label">Total Staked</div>
+                <div className="bg-white/[0.03] rounded-md p-4 border border-helix-border text-center">
+                    <div className="font-semibold text-[15px] mb-1 text-white">{formatAmount(totalStaked)}</div>
+                    <div className="text-[11px] text-[#888] uppercase">Total Staked</div>
                 </div>
             </div>
 
-            <div className="filters">
+            <div className="flex gap-2 mb-4 flex-wrap">
                 {(['all', 'ProofSubmitted', 'RoundStarted', 'RoundCompleted', 'Staked', 'Slashed'] as const).map((f) => (
                     <button
                         key={f}
-                        className={`filter-btn ${filter === f ? 'active' : ''}`}
+                        className={`px-4 py-2 rounded-md border text-xs cursor-pointer transition-all ${
+                            filter === f
+                                ? 'bg-white/10 border-white/10 text-white'
+                                : 'bg-white/[0.04] border-helix-border text-[#888] hover:bg-white/10'
+                        }`}
                         onClick={() => setFilter(f)}
                     >
                         {f === 'all' ? 'All Events' : f.replace(/([A-Z])/g, ' $1').trim()}
@@ -495,49 +220,47 @@ export default function OnChainExplorer() {
             </div>
 
             {stateLoading ? (
-                <div className="loading">Loading blockchain events...</div>
+                <div className="text-center py-10 text-[#666]">Loading blockchain events...</div>
             ) : filteredEvents.length === 0 ? (
-                <div className="no-events">
+                <div className="text-center py-10 text-[#666]">
                     No events found. Events will appear here as they occur on-chain.
                 </div>
             ) : (
-                <div className="event-list">
+                <div className="flex flex-col gap-2 max-h-[400px] overflow-y-auto">
                     {filteredEvents.map((event) => (
                         <div
                             key={event.id}
-                            className={`event-item ${selectedEvent?.id === event.id ? 'selected' : ''}`}
+                            className={`flex items-center justify-between p-4 rounded-md border cursor-pointer transition-all ${
+                                selectedEvent?.id === event.id
+                                    ? 'border-white/10 bg-white/10'
+                                    : 'bg-white/[0.03] border-helix-border hover:bg-white/[0.06] hover:border-white/15'
+                            }`}
                             onClick={() => setSelectedEvent(event)}
                         >
-                            <div className="event-main">
-                                <span
-                                    className="event-type"
-                                    style={{
-                                        background: `${getTypeColor(event.type)}22`,
-                                        color: getTypeColor(event.type),
-                                    }}
-                                >
+                            <div className="flex items-center gap-3">
+                                <span className="px-3 py-1.5 rounded-md text-[11px] font-semibold min-w-[120px] text-center bg-white/10 text-white">
                                     {event.type.replace(/([A-Z])/g, ' $1').trim()}
                                 </span>
-                                <div className="event-info">
-                                    <span className="event-primary">
+                                <div className="flex flex-col gap-1">
+                                    <span className="text-sm font-medium text-white">
                                         Model #{event.modelId.toString()}
                                         {event.roundId !== undefined && ` / Round #${event.roundId.toString()}`}
                                     </span>
-                                    <span className="event-secondary">
+                                    <span className="font-mono text-xs text-[#666]">
                                         {event.prover && `Prover: ${formatAddress(event.prover)}`}
                                         {event.amount && `Amount: ${formatAmount(event.amount)}`}
                                         {event.commitment && `Commitment: ${formatCommitment(event.commitment)}`}
                                     </span>
                                 </div>
                             </div>
-                            <div className="event-meta">
-                                <div className="event-stat">
-                                    <div className="event-stat-value">#{event.blockNumber.toLocaleString()}</div>
-                                    <div className="event-stat-label">Block</div>
+                            <div className="flex items-center gap-3">
+                                <div className="text-right">
+                                    <div className="text-[13px] font-semibold font-mono text-white">#{event.blockNumber.toLocaleString()}</div>
+                                    <div className="text-[10px] text-[#666]">Block</div>
                                 </div>
-                                <div className="event-stat">
-                                    <div className="event-stat-value">{formatTime(event.timestamp)}</div>
-                                    <div className="event-stat-label">Time</div>
+                                <div className="text-right">
+                                    <div className="text-[13px] font-semibold font-mono text-white">{formatTime(event.timestamp)}</div>
+                                    <div className="text-[10px] text-[#666]">Time</div>
                                 </div>
                             </div>
                         </div>
@@ -546,82 +269,74 @@ export default function OnChainExplorer() {
             )}
 
             {selectedEvent && (
-                <div className="detail-panel">
-                    <div className="detail-title">
-                        <span
-                            style={{
-                                padding: '4px 10px',
-                                borderRadius: '6px',
-                                background: `${getTypeColor(selectedEvent.type)}22`,
-                                color: getTypeColor(selectedEvent.type),
-                                fontSize: '12px',
-                            }}
-                        >
+                <div className="mt-4 p-4 bg-white/[0.03] rounded-md border border-helix-border">
+                    <div className="text-base font-semibold mb-4 flex items-center gap-3">
+                        <span className="px-2.5 py-1 rounded-md bg-white/10 text-white text-xs">
                             {selectedEvent.type}
                         </span>
-                        Event Details
+                        <span className="text-white">Event Details</span>
                     </div>
-                    <div className="detail-grid">
-                        <div className="detail-item">
-                            <div className="detail-label">Transaction Hash</div>
-                            <div className="detail-value">{selectedEvent.transactionHash}</div>
+                    <div className="grid grid-cols-2 gap-3">
+                        <div className="bg-white/[0.03] p-3 rounded-md">
+                            <div className="text-[11px] text-[#666] uppercase mb-1">Transaction Hash</div>
+                            <div className="font-mono text-[13px] text-[#aaa] break-all">{selectedEvent.transactionHash}</div>
                         </div>
-                        <div className="detail-item">
-                            <div className="detail-label">Block Number</div>
-                            <div className="detail-value">{selectedEvent.blockNumber.toLocaleString()}</div>
+                        <div className="bg-white/[0.03] p-3 rounded-md">
+                            <div className="text-[11px] text-[#666] uppercase mb-1">Block Number</div>
+                            <div className="font-mono text-[13px] text-[#aaa] break-all">{selectedEvent.blockNumber.toLocaleString()}</div>
                         </div>
-                        <div className="detail-item">
-                            <div className="detail-label">Model ID</div>
-                            <div className="detail-value">{selectedEvent.modelId.toString()}</div>
+                        <div className="bg-white/[0.03] p-3 rounded-md">
+                            <div className="text-[11px] text-[#666] uppercase mb-1">Model ID</div>
+                            <div className="font-mono text-[13px] text-[#aaa] break-all">{selectedEvent.modelId.toString()}</div>
                         </div>
                         {selectedEvent.roundId !== undefined && (
-                            <div className="detail-item">
-                                <div className="detail-label">Round ID</div>
-                                <div className="detail-value">{selectedEvent.roundId.toString()}</div>
+                            <div className="bg-white/[0.03] p-3 rounded-md">
+                                <div className="text-[11px] text-[#666] uppercase mb-1">Round ID</div>
+                                <div className="font-mono text-[13px] text-[#aaa] break-all">{selectedEvent.roundId.toString()}</div>
                             </div>
                         )}
                         {selectedEvent.prover && (
-                            <div className="detail-item">
-                                <div className="detail-label">Prover Address</div>
-                                <div className="detail-value">{selectedEvent.prover}</div>
+                            <div className="bg-white/[0.03] p-3 rounded-md">
+                                <div className="text-[11px] text-[#666] uppercase mb-1">Prover Address</div>
+                                <div className="font-mono text-[13px] text-[#aaa] break-all">{selectedEvent.prover}</div>
                             </div>
                         )}
                         {selectedEvent.amount && (
-                            <div className="detail-item">
-                                <div className="detail-label">Amount</div>
-                                <div className="detail-value">{formatAmount(selectedEvent.amount)}</div>
+                            <div className="bg-white/[0.03] p-3 rounded-md">
+                                <div className="text-[11px] text-[#666] uppercase mb-1">Amount</div>
+                                <div className="font-mono text-[13px] text-[#aaa] break-all">{formatAmount(selectedEvent.amount)}</div>
                             </div>
                         )}
                         {selectedEvent.commitment && (
-                            <div className="detail-item">
-                                <div className="detail-label">Commitment</div>
-                                <div className="detail-value">{selectedEvent.commitment.toString(16)}</div>
+                            <div className="bg-white/[0.03] p-3 rounded-md">
+                                <div className="text-[11px] text-[#666] uppercase mb-1">Commitment</div>
+                                <div className="font-mono text-[13px] text-[#aaa] break-all">{selectedEvent.commitment.toString(16)}</div>
                             </div>
                         )}
                         {selectedEvent.deadline && (
-                            <div className="detail-item">
-                                <div className="detail-label">Deadline</div>
-                                <div className="detail-value">
+                            <div className="bg-white/[0.03] p-3 rounded-md">
+                                <div className="text-[11px] text-[#666] uppercase mb-1">Deadline</div>
+                                <div className="font-mono text-[13px] text-[#aaa] break-all">
                                     {new Date(Number(selectedEvent.deadline) * 1000).toLocaleString()}
                                 </div>
                             </div>
                         )}
                         {selectedEvent.reason && (
-                            <div className="detail-item">
-                                <div className="detail-label">Slash Reason</div>
-                                <div className="detail-value" style={{ color: '#ef4444' }}>{selectedEvent.reason}</div>
+                            <div className="bg-white/[0.03] p-3 rounded-md">
+                                <div className="text-[11px] text-[#666] uppercase mb-1">Slash Reason</div>
+                                <div className="font-mono text-[13px] text-[#888] break-all">{selectedEvent.reason}</div>
                             </div>
                         )}
-                        <div className="detail-item">
-                            <div className="detail-label">Timestamp</div>
-                            <div className="detail-value">
+                        <div className="bg-white/[0.03] p-3 rounded-md">
+                            <div className="text-[11px] text-[#666] uppercase mb-1">Timestamp</div>
+                            <div className="font-mono text-[13px] text-[#aaa] break-all">
                                 {new Date(selectedEvent.timestamp * 1000).toLocaleString()}
                             </div>
                         </div>
                     </div>
                     {getExplorerUrl(selectedEvent.transactionHash) && (
                         <a
-                            className="explorer-link"
+                            className="inline-flex items-center gap-1.5 text-white text-[13px] no-underline mt-4 px-4 py-2 bg-white/10 rounded-md transition-all hover:bg-white/20"
                             href={getExplorerUrl(selectedEvent.transactionHash)}
                             target="_blank"
                             rel="noopener noreferrer"
