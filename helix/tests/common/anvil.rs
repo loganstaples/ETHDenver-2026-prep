@@ -29,7 +29,6 @@ use ethers::utils::Anvil;
 
 use halo2curves::bn256::Fr;
 use halo2curves::ff::PrimeField;
-use sha2::{Digest, Sha256};
 
 // ============================================================================
 // Type Aliases
@@ -146,40 +145,6 @@ pub fn compute_hash_pair(lo: U256, hi: U256) -> U256 {
     U256::from_big_endian(&hash)
 }
 
-/// Computes the error checksum matching `HelixCoordinatorV2._computeErrorChecksum`.
-///
-/// Layout: SHA256(errorBound_LE64 || stepNumber_LE64 || modelId_32bytes || errorBudget_LE64)
-/// Result: first 8 bytes of SHA256 hash interpreted as LE u64.
-pub fn compute_solidity_error_checksum(
-    error_bound: U256,
-    step_number: U256,
-    model_id: U256,
-    error_budget: U256,
-) -> U256 {
-    let mut data = [0u8; 56];
-
-    // errorBound as LE u64 (first 8 bytes)
-    let eb = error_bound.low_u64();
-    data[0..8].copy_from_slice(&eb.to_le_bytes());
-
-    // stepNumber as LE u64 (next 8 bytes)
-    let sn = step_number.low_u64();
-    data[8..16].copy_from_slice(&sn.to_le_bytes());
-
-    // modelId as 32 bytes big-endian (next 32 bytes)
-    let mut model_bytes = [0u8; 32];
-    model_id.to_big_endian(&mut model_bytes);
-    data[16..48].copy_from_slice(&model_bytes);
-
-    // errorBudget as LE u64 (last 8 bytes)
-    let bg = error_budget.low_u64();
-    data[48..56].copy_from_slice(&bg.to_le_bytes());
-
-    // SHA256 → first 8 bytes as LE u64
-    let hash = Sha256::digest(&data);
-    let checksum = u64::from_le_bytes(hash[..8].try_into().unwrap());
-    U256::from(checksum)
-}
 
 // ============================================================================
 // Test Environment
@@ -567,13 +532,12 @@ pub struct TestEvmProofBundle {
 impl TestEvmProofBundle {
     /// Creates an EVM proof bundle from a Rust proof result.
     ///
-    /// Recomputes PI[7] (error_checksum) to match the Solidity contract's
-    /// `_computeErrorChecksum` algorithm, since the Rust circuit uses a
-    /// different encoding format.
+    /// The circuit's PI[7] (Poseidon-based error checksum) is passed through
+    /// directly — PoseidonHasher.sol now matches the Rust circuit's Poseidon.
     pub fn from_proof_result(
         result: &helix_prover::provers::training_prover_v2::TrainingProofResultV2,
-        model_id: U256,
-        max_error_bound: U256,
+        _model_id: U256,
+        _max_error_bound: U256,
     ) -> Self {
         use helix_circuits::verifier::serialize_proof_for_evm;
 
@@ -581,9 +545,9 @@ impl TestEvmProofBundle {
         let proof_bytes = serialize_proof_for_evm(&result.proof, 3)
             .expect("EVM proof serialization failed");
 
-        // Convert public inputs to U256
+        // Convert public inputs to U256 — PI[7] flows through from circuit unchanged
         let evm_pi_bytes = result.to_evm_public_inputs();
-        let mut public_inputs: Vec<U256> = evm_pi_bytes
+        let public_inputs: Vec<U256> = evm_pi_bytes
             .iter()
             .map(|bytes| U256::from_big_endian(bytes))
             .collect();
@@ -592,15 +556,6 @@ impl TestEvmProofBundle {
 
         let error_bound = public_inputs[5];
         let step_number = public_inputs[6];
-
-        // Recompute error checksum to match Solidity's format
-        let solidity_checksum = compute_solidity_error_checksum(
-            error_bound,
-            step_number,
-            model_id,
-            max_error_bound,
-        );
-        public_inputs[7] = solidity_checksum;
 
         let old_commitment = compute_hash_pair(public_inputs[0], public_inputs[1]);
         let new_commitment = compute_hash_pair(public_inputs[2], public_inputs[3]);

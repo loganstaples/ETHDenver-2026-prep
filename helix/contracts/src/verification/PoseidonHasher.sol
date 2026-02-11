@@ -44,14 +44,14 @@ library PoseidonHasher {
 
         bytes32 hash = sha256(preimage);
 
-        // Convert from LE bytes to uint256, clearing top 3 bits (byte[31] &= 0x1F).
-        // The hash is in big-endian as bytes32. We need to interpret as LE.
-        // hash[0] = MSB in Solidity, but Rust repr[0] = LSB.
-        // So Rust repr[k] = hash[31 - k].
-        // Rust clears repr[31] &= 0x1F, which is hash[0] &= 0x1F.
+        // Convert SHA256 bytes to uint256 matching Rust's little-endian Fr interpretation.
+        // Rust does: repr.copy_from_slice(&hash); repr[31] &= 0x1F; Fr::from_repr(repr)
+        // where Fr::from_repr interprets repr as little-endian (repr[0] = LSB).
+        // In Solidity bytes32, hash[0] is the first SHA256 output byte (same as Rust hash[0]).
+        // So we place hash[b] at bit position b*8 to match Rust's LE interpretation.
         uint256 result = 0;
         for (uint256 b = 0; b < 32; b++) {
-            uint8 byteVal = uint8(hash[31 - b]);
+            uint8 byteVal = uint8(hash[b]);
             if (b == 31) {
                 byteVal &= 0x1F; // Clear top 3 bits (same as Rust repr[31] &= 0x1F)
             }
