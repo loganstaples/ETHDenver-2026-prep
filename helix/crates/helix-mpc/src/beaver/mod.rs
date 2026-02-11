@@ -35,5 +35,5 @@ pub use pool::BeaverPool;
 pub use triple::{BeaverTriple, MatrixBeaverTriple, VectorBeaverTriple};
 pub use pipeline::{
     BeaverPipeline, DemandPredictor, GenerationRequest, PipelineBuilder,
-    PipelineConfig, PipelineStats, Priority,
+    PipelineConfig, PipelineStats, Priority, TripleSource,
 };

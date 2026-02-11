@@ -38,9 +38,20 @@ use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
 use parking_lot::{Mutex, RwLock};
 
 use crate::beaver::dealer::TrustedDealer;
+use crate::beaver::distributed::DistributedTripleGen;
 use crate::beaver::pool::{BeaverPool, MatrixDims};
 use crate::beaver::triple::{BeaverTriple, MatrixBeaverTriple, VectorBeaverTriple};
 use crate::error::{MPCError, MPCResult};
+
+/// Source of Beaver triple generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TripleSource {
+    /// Centralized generation using a trusted dealer (demo/testing).
+    TrustedDealer,
+    /// Distributed generation using the pairwise cross-term protocol in Fr.
+    /// No trusted party required — all arithmetic in BN254 scalar field.
+    Distributed,
+}
 
 /// Configuration for the Beaver triple pipeline.
 #[derive(Debug, Clone)]
@@ -65,6 +76,8 @@ pub struct PipelineConfig {
     pub enable_prediction: bool,
     /// Lookahead steps for demand prediction.
     pub prediction_lookahead: usize,
+    /// Source of triple generation.
+    pub triple_source: TripleSource,
 }
 
 impl Default for PipelineConfig {
@@ -80,6 +93,7 @@ impl Default for PipelineConfig {
             replenishment_interval_ms: 100,
             enable_prediction: true,
             prediction_lookahead: 5,
+            triple_source: TripleSource::TrustedDealer,
         }
     }
 }
@@ -98,6 +112,7 @@ impl PipelineConfig {
             replenishment_interval_ms: 50,
             enable_prediction: true,
             prediction_lookahead: 3,
+            triple_source: TripleSource::TrustedDealer,
         }
     }
 
@@ -114,6 +129,16 @@ impl PipelineConfig {
             replenishment_interval_ms: 200,
             enable_prediction: true,
             prediction_lookahead: 10,
+            triple_source: TripleSource::TrustedDealer,
+        }
+    }
+
+    /// Configuration with distributed (trustless) triple generation.
+    pub fn distributed(num_workers: usize) -> Self {
+        Self {
+            triple_source: TripleSource::Distributed,
+            num_workers,
+            ..Self::default()
         }
     }
 }
@@ -344,9 +369,10 @@ impl BeaverPipeline {
             let num_parties = num_parties;
             let stats = pipeline.stats.clone();
             let shutdown = pipeline.shutdown.clone();
+            let triple_source = config.triple_source;
 
             let handle = thread::spawn(move || {
-                Self::worker_loop(worker_id, rx, tx, num_parties, stats, shutdown);
+                Self::worker_loop(worker_id, rx, tx, num_parties, stats, shutdown, triple_source);
             });
             workers.push(handle);
         }
@@ -379,8 +405,10 @@ impl BeaverPipeline {
         num_parties: usize,
         stats: Arc<PipelineStatsInternal>,
         shutdown: Arc<AtomicBool>,
+        triple_source: TripleSource,
     ) {
         let mut dealer = TrustedDealer::new();
+        let mut distributed_seed: u64 = 0;
         stats.active_workers.fetch_add(1, Ordering::SeqCst);
 
         loop {
@@ -394,7 +422,19 @@ impl BeaverPipeline {
 
                     match request {
                         GenerationRequest::Scalar { count, .. } => {
-                            let triples = dealer.generate_scalar_triples(count, num_parties);
+                            let triples = match triple_source {
+                                TripleSource::TrustedDealer => {
+                                    dealer.generate_scalar_triples(count, num_parties)
+                                }
+                                TripleSource::Distributed => {
+                                    distributed_seed = distributed_seed.wrapping_add(1);
+                                    DistributedTripleGen::simulate_distributed_batch(
+                                        count,
+                                        num_parties,
+                                        distributed_seed,
+                                    )
+                                }
+                            };
                             stats.triples_generated.fetch_add(count as u64, Ordering::SeqCst);
                             let _ = result_tx.send(GeneratedTriples::Scalar(triples));
                         }
@@ -648,6 +688,55 @@ impl BeaverPipeline {
     /// Records matrix triple consumption for prediction.
     pub fn record_matrix_consumption(&self, m: usize, k: usize, n: usize, count: usize) {
         self.predictor.record_matrix_consumption(MatrixDims { m, k, n }, count);
+    }
+
+    /// Blocks until at least `count` scalar triples are available in each
+    /// party's pool, or `timeout` expires.
+    ///
+    /// If the pool is below the threshold, sends a Critical-priority generation
+    /// request and polls until the triples arrive or the deadline passes.
+    pub fn ensure_available(
+        &self,
+        count: usize,
+        timeout: Duration,
+    ) -> MPCResult<()> {
+        let deadline = Instant::now() + timeout;
+        let poll_interval = Duration::from_millis(10);
+
+        loop {
+            // Check minimum across all parties.
+            let min_available: usize = self
+                .pools
+                .iter()
+                .map(|p| p.read().scalar_available())
+                .min()
+                .unwrap_or(0);
+
+            if min_available >= count {
+                return Ok(());
+            }
+
+            if Instant::now() >= deadline {
+                return Err(MPCError::BeaverPoolExhausted {
+                    requested: count,
+                    available: min_available,
+                });
+            }
+
+            // Request urgent generation for the deficit.
+            let deficit = count.saturating_sub(min_available);
+            let _ = self.request_generation(GenerationRequest::Scalar {
+                count: deficit,
+                priority: Priority::Critical,
+            });
+
+            // Process any pending results.
+            while let Ok(generated) = self.result_rx.try_recv() {
+                Self::add_to_pools(&self.pools, generated);
+            }
+
+            thread::sleep(poll_interval);
+        }
     }
 
     /// Shuts down the pipeline.

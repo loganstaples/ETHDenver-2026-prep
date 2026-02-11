@@ -12,6 +12,8 @@
 //! but not weights), consistent with the MPC-ML security model.
 
 use rand::Rng;
+use rand::SeedableRng;
+use rand_chacha::ChaCha20Rng;
 
 use crate::beaver::pool::BeaverPool;
 use crate::error::MPCResult;
@@ -80,29 +82,89 @@ impl SecureAttention {
         )?;
 
         // Step 2: Split into heads and compute attention per head.
-        // For simplicity, we process heads sequentially.
-        let mut head_outputs: Vec<Vec<Vec<Fr>>> =
-            vec![vec![vec![Fr::ZERO; seq_len * dk]; num_parties]; h];
+        // Generate a seed from the caller's rng for reproducible per-head RNGs.
+        let base_seed: u64 = rng.gen();
 
-        for head in 0..h {
-            // Extract head slices from Q, K, V.
-            let q_head = extract_head_shares(&q_shares, seq_len, d, head, dk);
-            let k_head = extract_head_shares(&k_shares, seq_len, d, head, dk);
-            let v_head = extract_head_shares(&v_shares, seq_len, d, head, dk);
+        // Extract all head slices upfront.
+        let head_data: Vec<(Vec<Vec<Fr>>, Vec<Vec<Fr>>, Vec<Vec<Fr>>)> = (0..h)
+            .map(|head| {
+                let q_head = extract_head_shares(&q_shares, seq_len, d, head, dk);
+                let k_head = extract_head_shares(&k_shares, seq_len, d, head, dk);
+                let v_head = extract_head_shares(&v_shares, seq_len, d, head, dk);
+                (q_head, k_head, v_head)
+            })
+            .collect();
 
-            // Compute attention for this head.
-            let head_out = Self::scaled_dot_product_attention(
-                &q_head,
-                &k_head,
-                &v_head,
-                seq_len,
-                dk,
-                pools,
-                rng,
-            )?;
+        // Split pools across heads so each gets its own mutable pool slice.
+        let mut sub_pools: Vec<Vec<BeaverPool>> = pools
+            .iter_mut()
+            .map(|pool| pool.split(h))
+            .collect();
 
-            head_outputs[head] = head_out;
-        }
+        // Transpose: sub_pools[party][head] -> per_head_pools[head][party]
+        let per_head_pools: Vec<Vec<BeaverPool>> = (0..h)
+            .map(|head| {
+                sub_pools
+                    .iter_mut()
+                    .map(|party_subs| {
+                        // Take from the end to avoid index shifting
+                        std::mem::replace(
+                            &mut party_subs[head],
+                            BeaverPool::new(0, num_parties, 1),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // Process heads in parallel using rayon when feature is enabled.
+        #[cfg(feature = "parallel")]
+        let head_results: Vec<MPCResult<Vec<Vec<Fr>>>> = {
+            use rayon::prelude::*;
+            per_head_pools
+                .into_par_iter()
+                .enumerate()
+                .map(|(head_idx, mut head_pools)| {
+                    let mut head_rng = ChaCha20Rng::seed_from_u64(base_seed.wrapping_add(head_idx as u64));
+                    let (ref q_head, ref k_head, ref v_head) = head_data[head_idx];
+                    Self::scaled_dot_product_attention(
+                        q_head,
+                        k_head,
+                        v_head,
+                        seq_len,
+                        dk,
+                        &mut head_pools,
+                        &mut head_rng,
+                    )
+                })
+                .collect()
+        };
+
+        #[cfg(not(feature = "parallel"))]
+        let head_results: Vec<MPCResult<Vec<Vec<Fr>>>> = {
+            per_head_pools
+                .into_iter()
+                .enumerate()
+                .map(|(head_idx, mut head_pools)| {
+                    let mut head_rng = ChaCha20Rng::seed_from_u64(base_seed.wrapping_add(head_idx as u64));
+                    let (ref q_head, ref k_head, ref v_head) = head_data[head_idx];
+                    Self::scaled_dot_product_attention(
+                        q_head,
+                        k_head,
+                        v_head,
+                        seq_len,
+                        dk,
+                        &mut head_pools,
+                        &mut head_rng,
+                    )
+                })
+                .collect()
+        };
+
+        // Collect results, propagating any errors.
+        let head_outputs: Vec<Vec<Vec<Fr>>> = head_results
+            .into_iter()
+            .collect::<MPCResult<Vec<_>>>()?;
 
         // Step 3: Concatenate heads.
         let concat_shares = concat_head_shares(&head_outputs, seq_len, h, dk);
