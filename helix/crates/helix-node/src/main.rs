@@ -252,11 +252,13 @@ async fn run_worker(listen_addr: SocketAddr) -> anyhow::Result<()> {
                                                 hex::encode(&computation.gradient_commitment[..4]),
                                             );
 
+                                            let (hiding_commitment, nonce) = helix_node::training::consensus::compute_hiding_gradient_commitment(&computation.gradient_commitment);
                                             network
                                                 .broadcast(MessagePayload::Gradient(
                                                     GradientMessage::ShareGradient {
                                                         round_id,
-                                                        gradient_commitment: computation.gradient_commitment,
+                                                        gradient_commitment: hiding_commitment,
+                                                        commitment_nonce: nonce,
                                                         error_bound: computation.local_loss * 0.01,
                                                         proof: computation.gradient_commitment.to_vec(),
                                                     },
@@ -322,11 +324,13 @@ async fn run_worker(listen_addr: SocketAddr) -> anyhow::Result<()> {
                                             let proof_bytes = result.evm_proof.unwrap_or(result.proof);
 
                                             // Send gradient + proof back to aggregator
+                                            let (hiding_commitment, nonce) = helix_node::training::consensus::compute_hiding_gradient_commitment(&result.commitment);
                                             network
                                                 .broadcast(MessagePayload::Gradient(
                                                     GradientMessage::ShareGradient {
                                                         round_id,
-                                                        gradient_commitment: result.commitment,
+                                                        gradient_commitment: hiding_commitment,
+                                                        commitment_nonce: nonce,
                                                         error_bound: result.loss * 0.01,
                                                         proof: proof_bytes,
                                                     },

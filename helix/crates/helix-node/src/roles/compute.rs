@@ -211,11 +211,13 @@ impl ComputeNode {
     pub async fn create_gradient_message(&self, round_id: u64) -> Option<NetworkMessage> {
         let result = self.get_result(round_id).await?;
 
+        let (hiding_commitment, nonce) = crate::training::consensus::compute_hiding_gradient_commitment(&result.gradient_commitment);
         Some(NetworkMessage::new(
             self.local_id.clone(),
             MessagePayload::Gradient(GradientMessage::ShareGradient {
                 round_id,
-                gradient_commitment: result.gradient_commitment,
+                gradient_commitment: hiding_commitment,
+                commitment_nonce: nonce,
                 error_bound: result.error_bound,
                 proof: result.proof,
             }),

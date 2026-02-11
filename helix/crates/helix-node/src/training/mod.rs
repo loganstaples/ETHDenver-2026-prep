@@ -132,6 +132,7 @@ pub use consensus::{
     ConsensusConfig, ConsensusPhase, ConsensusProposal, ConsensusVote,
     ConsensusResult, ConsensusEvent, ConsensusRound, ConsensusProtocol,
     compute_aggregated_commitment, compute_binding, verify_bft_threshold,
+    compute_hiding_gradient_commitment, verify_hiding_gradient_commitment,
 };
 
 pub use session_manager::{

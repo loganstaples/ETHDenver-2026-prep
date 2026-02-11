@@ -339,6 +339,14 @@ impl WireCodec {
         // Parse header
         let header = FrameHeader::decode(&buf[..HEADER_SIZE])?;
 
+        // Enforce frame size limit on decode to prevent OOM from malicious headers
+        if header.payload_len as usize > MAX_MESSAGE_SIZE {
+            return Err(WireError::MessageTooLarge {
+                size: header.payload_len as usize,
+                max: MAX_MESSAGE_SIZE,
+            });
+        }
+
         let frame_size = HEADER_SIZE + header.payload_len as usize;
         if buf.len() < frame_size {
             return Ok(None);
@@ -599,6 +607,7 @@ mod tests {
             MessagePayload::Gradient(GradientMessage::ShareGradient {
                 round_id: 42,
                 gradient_commitment: [0xAB; 32],
+                commitment_nonce: [0u8; 16],
                 error_bound: 0.001,
                 proof: vec![1u8; 256],
             }),
@@ -613,6 +622,34 @@ mod tests {
             bincode_bytes.len(),
             json_bytes.len(),
         );
+    }
+
+    #[test]
+    fn test_decode_rejects_oversized_frame() {
+        let codec = WireCodec::new();
+
+        // Build a valid header that claims a payload larger than MAX_MESSAGE_SIZE
+        let header = FrameHeader::new(
+            MessageFlags::new(MessageFlags::NONE),
+            0x0100,
+            (MAX_MESSAGE_SIZE + 1) as u32,
+            0,
+        );
+
+        let mut buf = BytesMut::new();
+        header.encode(&mut buf);
+        // Add some dummy bytes (not the full payload, just enough to have a header)
+        buf.extend_from_slice(&[0u8; 64]);
+
+        let result = codec.decode(&mut buf);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            WireError::MessageTooLarge { size, max } => {
+                assert_eq!(size, MAX_MESSAGE_SIZE + 1);
+                assert_eq!(max, MAX_MESSAGE_SIZE);
+            }
+            e => panic!("Expected MessageTooLarge, got {:?}", e),
+        }
     }
 
     #[test]

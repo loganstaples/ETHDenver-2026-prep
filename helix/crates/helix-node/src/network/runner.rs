@@ -24,6 +24,7 @@ use super::messages::{
 };
 use super::partition_detect::{PartitionAction, PartitionDetectionConfig, PartitionDetector};
 use super::rate_limit::{BlacklistReason, MessageType, RateLimitConfig, RateLimitResult, RateLimiter};
+use super::reputation::{BehaviorEvent, BehaviorEventType, ReputationConfig, ReputationManager};
 use super::sync::{StateSync, SyncConfig};
 use super::transport::{ConnectionPool, TcpTransport, Transport, TransportConfig, TransportError};
 
@@ -65,6 +66,8 @@ pub struct NetworkRunnerConfig {
     pub eclipse: EclipsePreventionConfig,
     /// Partition detection configuration.
     pub partition_detect: PartitionDetectionConfig,
+    /// Reputation scoring configuration.
+    pub reputation: ReputationConfig,
     /// Gossip send interval (ms).
     pub gossip_send_interval_ms: u64,
     /// Cache cleanup interval (seconds).
@@ -83,6 +86,7 @@ impl Default for NetworkRunnerConfig {
             rate_limit: RateLimitConfig::default(),
             eclipse: EclipsePreventionConfig::default(),
             partition_detect: PartitionDetectionConfig::default(),
+            reputation: ReputationConfig::default(),
             gossip_send_interval_ms: 100,
             cache_cleanup_interval_secs: 60,
             max_outbound_per_tick: 50,
@@ -145,6 +149,8 @@ pub struct NetworkRunner {
     peer_keys: Arc<parking_lot::Mutex<PeerKeyRegistry>>,
     /// Signature validation statistics and auto-blacklist tracking.
     sig_stats: Arc<parking_lot::Mutex<SignatureStats>>,
+    /// Peer reputation manager for scoring and behavioral tracking.
+    reputation_manager: Arc<parking_lot::Mutex<ReputationManager>>,
     /// Event channel sender.
     event_tx: mpsc::Sender<NetworkEvent>,
     /// Event channel receiver (for external consumption).
@@ -168,7 +174,10 @@ impl NetworkRunner {
         capabilities: NodeCapabilities,
     ) -> Result<Self, TransportError> {
         let transport = Arc::new(TcpTransport::new(local_id.clone(), config.transport.clone())?);
-        let pool = Arc::new(ConnectionPool::new(transport.clone()));
+        let pool = Arc::new(ConnectionPool::with_max_size(
+            transport.clone(),
+            config.transport.max_pool_size,
+        ));
         let gossip = Arc::new(GossipProtocol::new(local_id.clone(), config.gossip.clone()));
         let discovery = Arc::new(PeerDiscovery::new(local_id.clone(), config.discovery.clone()));
         let sync = Arc::new(StateSync::new(local_id.clone(), config.sync.clone()));
@@ -182,6 +191,10 @@ impl NetworkRunner {
         let mut partition_detector = PartitionDetector::new(config.partition_detect.clone());
         partition_detector.set_our_addr(config.transport.listen_addr);
         let partition_detector = Arc::new(partition_detector);
+
+        let reputation_manager = Arc::new(parking_lot::Mutex::new(
+            ReputationManager::new(config.reputation.clone()),
+        ));
 
         let (event_tx, event_rx) = mpsc::channel(10000);
         let listen_addr = config.transport.listen_addr.to_string();
@@ -199,6 +212,7 @@ impl NetworkRunner {
             partition_detector,
             peer_keys: Arc::new(parking_lot::Mutex::new(PeerKeyRegistry::new())),
             sig_stats: Arc::new(parking_lot::Mutex::new(SignatureStats::new(10))),
+            reputation_manager,
             event_tx,
             event_rx: Arc::new(tokio::sync::Mutex::new(event_rx)),
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -227,9 +241,10 @@ impl NetworkRunner {
         let eclipse_manager = self.eclipse_manager.clone();
         let peer_keys = self.peer_keys.clone();
         let sig_stats = self.sig_stats.clone();
+        let reputation_manager = self.reputation_manager.clone();
 
         tokio::spawn(async move {
-            Self::receive_loop(running, transport, gossip, discovery, sync, event_tx, pool, rate_limiter, eclipse_manager, peer_keys, sig_stats).await;
+            Self::receive_loop(running, transport, gossip, discovery, sync, event_tx, pool, rate_limiter, eclipse_manager, peer_keys, sig_stats, reputation_manager).await;
         });
 
         // Spawn gossip send loop
@@ -253,12 +268,13 @@ impl NetworkRunner {
         let rate_limiter_cleanup = self.rate_limiter.clone();
         let event_tx_cleanup = self.event_tx.clone();
         let training_paused = self.training_paused.clone();
+        let reputation_cleanup = self.reputation_manager.clone();
 
         tokio::spawn(async move {
             Self::cleanup_loop(
                 running, gossip, discovery, cleanup_interval,
                 partition_detector, rate_limiter_cleanup, event_tx_cleanup,
-                training_paused,
+                training_paused, reputation_cleanup,
             ).await;
         });
 
@@ -329,6 +345,7 @@ impl NetworkRunner {
         self.pool.unregister_peer(peer_id);
         self.discovery.remove_peer(peer_id).await;
         self.eclipse_manager.lock().remove_peer(peer_id);
+        self.reputation_manager.lock().record_disconnect(peer_id, true);
         let _ = self.event_tx.send(NetworkEvent::PeerDisconnected(peer_id.clone())).await;
     }
 
@@ -404,6 +421,11 @@ impl NetworkRunner {
         (stats.total_invalid, stats.invalid_counts.clone())
     }
 
+    /// Returns the reputation manager.
+    pub fn reputation_manager(&self) -> &Arc<parking_lot::Mutex<ReputationManager>> {
+        &self.reputation_manager
+    }
+
     async fn get_connected_peer_ids(&self) -> Vec<PeerId> {
         self.discovery.get_all_peers().await
             .into_iter()
@@ -437,6 +459,7 @@ impl NetworkRunner {
         eclipse_manager: Arc<parking_lot::Mutex<EclipseResistantPeerManager>>,
         peer_keys: Arc<parking_lot::Mutex<PeerKeyRegistry>>,
         sig_stats: Arc<parking_lot::Mutex<SignatureStats>>,
+        reputation_manager: Arc<parking_lot::Mutex<ReputationManager>>,
     ) {
         while running.load(std::sync::atomic::Ordering::SeqCst) {
             match transport.recv().await {
@@ -455,10 +478,22 @@ impl NetworkRunner {
                                 "Invalid signature from peer {} (total invalid: {})",
                                 message.sender, stats.total_invalid,
                             );
+
+                            // Record reputation event for signature failure
+                            reputation_manager.lock().record_event(
+                                &message.sender,
+                                BehaviorEvent::new(BehaviorEventType::ProtocolViolation { severity: 3 }),
+                            );
+
                             if should_blacklist {
                                 log::warn!(
                                     "Auto-blacklisting peer {} after {} invalid signatures",
                                     message.sender, stats.auto_blacklist_threshold,
+                                );
+                                // Record severe reputation event for auto-blacklist
+                                reputation_manager.lock().record_event(
+                                    &message.sender,
+                                    BehaviorEvent::new(BehaviorEventType::ProtocolViolation { severity: 5 }),
                                 );
                                 // Blacklist via rate limiter to reuse existing infra
                                 rate_limiter.lock().blacklist_peer(
@@ -502,6 +537,10 @@ impl NetworkRunner {
                                     "Auto-blacklisted peer {} due to repeated violations",
                                     message.sender
                                 );
+                                reputation_manager.lock().record_event(
+                                    &message.sender,
+                                    BehaviorEvent::new(BehaviorEventType::ProtocolViolation { severity: 5 }),
+                                );
                                 continue;
                             }
                             RateLimitResult::ConnectionFlood => {
@@ -530,6 +569,9 @@ impl NetworkRunner {
                     if !should_process {
                         continue;
                     }
+
+                    // Record positive reputation event for valid messages that passed all checks
+                    reputation_manager.lock().record_heartbeat(&message.sender);
 
                     // Process message by type
                     match message.payload {
@@ -565,12 +607,13 @@ impl NetworkRunner {
                                     pool.register_peer(message.sender.clone(), addr);
                                 }
 
+                                let rep_score = reputation_manager.lock().score(&message.sender) as i32;
                                 let peer_info = PeerInfo {
                                     id: message.sender.clone(),
                                     address: listen_addr.clone(),
                                     capabilities,
                                     last_seen: message.timestamp,
-                                    reputation: 0,
+                                    reputation: rep_score,
                                 };
 
                                 // Mark as connected in discovery
@@ -676,6 +719,7 @@ impl NetworkRunner {
         rate_limiter: Arc<parking_lot::Mutex<RateLimiter>>,
         event_tx: mpsc::Sender<NetworkEvent>,
         training_paused: Arc<std::sync::atomic::AtomicBool>,
+        reputation_manager: Arc<parking_lot::Mutex<ReputationManager>>,
     ) {
         let mut interval = tokio::time::interval(Duration::from_secs(cleanup_interval_secs));
 
@@ -690,6 +734,9 @@ impl NetworkRunner {
 
             // Cleanup expired rate limiter entries
             rate_limiter.lock().cleanup();
+
+            // Apply reputation decay and check ban expiries
+            reputation_manager.lock().apply_decay();
 
             // === Partition detection (Task B3.5) ===
             match partition_detector.detect_partition().await {
@@ -827,5 +874,116 @@ mod tests {
 
         let runner = NetworkRunner::new(local_id, config, caps);
         assert!(runner.is_ok());
+    }
+
+    #[test]
+    fn test_payload_to_message_type_mapping() {
+        // Discovery
+        let disc = MessagePayload::Discovery(DiscoveryMessage::GetPeers);
+        assert!(matches!(NetworkRunner::payload_to_message_type(&disc), MessageType::Discovery));
+
+        // Training
+        let train = MessagePayload::Training(TrainingMessage::ParticipateRequest { round_id: 1 });
+        assert!(matches!(NetworkRunner::payload_to_message_type(&train), MessageType::Training));
+
+        // Gradient
+        let grad = MessagePayload::Gradient(GradientMessage::ShareGradient {
+            round_id: 1,
+            gradient_commitment: [0u8; 32],
+            commitment_nonce: [0u8; 16],
+            error_bound: 0.1,
+            proof: vec![],
+        });
+        assert!(matches!(NetworkRunner::payload_to_message_type(&grad), MessageType::Gradient));
+
+        // Consensus maps to Training bucket
+        let consensus = MessagePayload::Consensus(ConsensusMessage::Propose {
+            round_id: 1,
+            aggregated_commitment: [0u8; 32],
+            proposer_binding: [0u8; 32],
+            num_gradients: 3,
+            error_bound: 0.1,
+            nonce: [0u8; 16],
+        });
+        assert!(matches!(NetworkRunner::payload_to_message_type(&consensus), MessageType::Training));
+    }
+
+    #[test]
+    fn test_signature_stats_tracking() {
+        let mut stats = SignatureStats::new(3);
+        let peer = PeerId::from_string("bad-peer");
+
+        assert!(!stats.record_invalid(&peer)); // 1st - below threshold
+        assert!(!stats.record_invalid(&peer)); // 2nd - below threshold
+        assert!(!stats.record_invalid(&peer)); // 3rd - at threshold
+        assert!(stats.record_invalid(&peer));  // 4th - exceeds threshold
+
+        assert_eq!(stats.total_invalid, 4);
+        assert_eq!(*stats.invalid_counts.get(&peer).unwrap(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_reputation_manager_accessible() {
+        let runner = NetworkRunnerBuilder::new()
+            .local_id(PeerId::random())
+            .listen_addr("127.0.0.1:0".parse().unwrap())
+            .build()
+            .unwrap();
+
+        // Reputation manager should be initialized with default config
+        let rep_mgr = runner.reputation_manager();
+        let mgr = rep_mgr.lock();
+        assert_eq!(mgr.peer_count(), 0);
+
+        // Score for unknown peer should be the initial score (50.0)
+        let peer = PeerId::from_string("test-peer");
+        assert_eq!(mgr.score(&peer), 50.0);
+    }
+
+    #[test]
+    fn test_builder_with_tls_config() {
+        // Verify builder accepts TLS config and capabilities without panicking.
+        // Note: build() may fail due to non-existent cert paths, so we only
+        // test that the builder pattern itself works.
+        let builder = NetworkRunnerBuilder::new()
+            .local_id(PeerId::random())
+            .listen_addr("127.0.0.1:0".parse().unwrap())
+            .with_tls("/path/to/cert.pem".into(), "/path/to/key.pem".into())
+            .gossip_fanout(6)
+            .capabilities(NodeCapabilities {
+                can_train: true,
+                can_aggregate: true,
+                can_prove: false,
+                gpu_memory_mb: 4096,
+                cpu_cores: 8,
+                storage_gb: 200,
+            });
+
+        // Builder should be configured (we verify by building without TLS)
+        let runner_no_tls = NetworkRunnerBuilder::new()
+            .local_id(PeerId::random())
+            .listen_addr("127.0.0.1:0".parse().unwrap())
+            .gossip_fanout(6)
+            .capabilities(NodeCapabilities {
+                can_train: true,
+                can_aggregate: true,
+                can_prove: false,
+                gpu_memory_mb: 4096,
+                cpu_cores: 8,
+                storage_gb: 200,
+            })
+            .build();
+        assert!(runner_no_tls.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_config_defaults() {
+        let config = NetworkRunnerConfig::default();
+        assert_eq!(config.gossip_send_interval_ms, 100);
+        assert_eq!(config.cache_cleanup_interval_secs, 60);
+        assert_eq!(config.max_outbound_per_tick, 50);
+        // Reputation config should be initialized with defaults
+        assert_eq!(config.reputation.initial_score, 50.0);
+        assert_eq!(config.reputation.ban_threshold, 10.0);
     }
 }

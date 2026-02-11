@@ -690,6 +690,34 @@ fn generate_nonce() -> [u8; 16] {
     nonce
 }
 
+/// Computes a hiding gradient commitment: SHA-256(gradient_data || nonce).
+///
+/// Returns `(commitment, nonce)`. The nonce must be revealed later so that
+/// peers can verify the commitment by recomputing it. Without the nonce,
+/// the commitment hides the gradient value, preventing pre-computation attacks.
+pub fn compute_hiding_gradient_commitment(gradient_data: &[u8]) -> ([u8; 32], [u8; 16]) {
+    let nonce = generate_nonce();
+    let mut hasher = Sha256::new();
+    hasher.update(b"HELIX-GRADIENT-COMMITMENT-V1");
+    hasher.update(gradient_data);
+    hasher.update(&nonce);
+    (hasher.finalize().into(), nonce)
+}
+
+/// Verifies a hiding gradient commitment against the revealed data and nonce.
+pub fn verify_hiding_gradient_commitment(
+    gradient_data: &[u8],
+    nonce: &[u8; 16],
+    expected: &[u8; 32],
+) -> bool {
+    let mut hasher = Sha256::new();
+    hasher.update(b"HELIX-GRADIENT-COMMITMENT-V1");
+    hasher.update(gradient_data);
+    hasher.update(nonce);
+    let computed: [u8; 32] = hasher.finalize().into();
+    computed == *expected
+}
+
 /// Verifies that the number of participants is sufficient for BFT consensus.
 ///
 /// For `f` Byzantine nodes, we need `n >= 3f + 1` total participants.
@@ -1067,6 +1095,30 @@ mod tests {
         let events = worker.handle_commit(1, agg, 3, 4);
         assert!(!events.is_empty());
         assert_eq!(worker.active_round().unwrap().phase, ConsensusPhase::Committed);
+    }
+
+    #[test]
+    fn test_hiding_gradient_commitment() {
+        let gradient_data = b"some gradient data for round 42";
+
+        // Compute hiding commitment
+        let (commitment, nonce) = super::compute_hiding_gradient_commitment(gradient_data);
+
+        // Verify it
+        assert!(super::verify_hiding_gradient_commitment(gradient_data, &nonce, &commitment));
+
+        // Wrong data should fail
+        assert!(!super::verify_hiding_gradient_commitment(b"wrong data", &nonce, &commitment));
+
+        // Wrong nonce should fail
+        let wrong_nonce = [0xFFu8; 16];
+        assert!(!super::verify_hiding_gradient_commitment(gradient_data, &wrong_nonce, &commitment));
+
+        // Same data should produce different commitments (different nonces)
+        let (commitment2, nonce2) = super::compute_hiding_gradient_commitment(gradient_data);
+        assert_ne!(nonce, nonce2, "Nonces should differ");
+        assert_ne!(commitment, commitment2, "Commitments with different nonces should differ");
+        assert!(super::verify_hiding_gradient_commitment(gradient_data, &nonce2, &commitment2));
     }
 
     #[test]
