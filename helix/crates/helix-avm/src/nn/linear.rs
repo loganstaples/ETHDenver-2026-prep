@@ -195,6 +195,118 @@ impl Linear {
         }
     }
 
+    /// Forward pass returning a `Variable` for automatic differentiation.
+    ///
+    /// Registers the transposed weight matrix (W^T) and bias as parameters on
+    /// the tape. The backward pass will compute gradients w.r.t. W^T (shape
+    /// `[in_features, out_features]`) and bias (shape `[out_features]`).
+    ///
+    /// Returns `(output, wt_node_index, bias_node_index)` so callers can map
+    /// gradients back to the correct parameters.
+    ///
+    /// Input must be 2D `[batch, in_features]` or 1D `[in_features]`.
+    pub fn forward_var(
+        &self,
+        input: &crate::gradient::autodiff::Variable,
+        tape: std::rc::Rc<std::cell::RefCell<crate::gradient::autodiff::GradientTape>>,
+        weight_name: Option<&str>,
+        bias_name: Option<&str>,
+    ) -> Result<
+        (
+            crate::gradient::autodiff::Variable,
+            crate::gradient::autodiff::NodeIndex,
+            Option<crate::gradient::autodiff::NodeIndex>,
+        ),
+        LinearError,
+    > {
+        use crate::gradient::autodiff::Variable;
+
+        // Register W^T as a parameter. Storing the transpose avoids needing a
+        // Transpose op on the tape — the matmul backward for Y = X @ W^T gives
+        // dL/d(W^T) = X^T @ dL/dY directly, which is the correct gradient
+        // shape for SGD updates on the stored W^T tensor.
+        let wt_var = Variable::param(
+            self.weights.transpose(),
+            tape.clone(),
+            Some(weight_name.unwrap_or("weight_t").to_string()),
+        );
+        let wt_idx = wt_var.node_index.unwrap();
+
+        // Handle 1D input — reshape to [1, in_features] for matmul
+        let (input_var, squeeze) = if input.tensor.is_vector() {
+            let len = input.tensor.len();
+            let reshaped = input.tensor.reshape(vec![1, len]);
+            let mut v = Variable::new(reshaped);
+            v.node_index = input.node_index;
+            v.tape = input.tape.clone();
+            (v, true)
+        } else {
+            (input.clone(), false)
+        };
+
+        // Y = input @ W^T
+        let mut output = input_var.matmul(&wt_var);
+
+        // Add bias if present
+        let bias_idx = if let Some(ref bias) = self.bias {
+            let b_var = Variable::param(
+                bias.clone(),
+                tape.clone(),
+                Some(bias_name.unwrap_or("bias").to_string()),
+            );
+            let b_idx = b_var.node_index.unwrap();
+
+            // For 1D output (single sample, squeezed later): shapes match so
+            // Variable::add works directly. For 2D [batch, out]: we broadcast
+            // the 1D bias to [batch, out] by tiling rows.
+            if output.tensor.is_matrix() && output.tensor.shape()[0] > 1 {
+                let rows = output.tensor.shape()[0];
+                let cols = output.tensor.shape()[1];
+                let bias_data = b_var.tensor.data();
+                let mut broadcast_data = Vec::with_capacity(rows * cols);
+                for _ in 0..rows {
+                    broadcast_data.extend_from_slice(bias_data);
+                }
+                let bias_2d = Variable::with_op(
+                    BoundedTensor::new(broadcast_data, vec![rows, cols]),
+                    crate::gradient::autodiff::Operation::Parameter,
+                    Some(tape.clone()),
+                );
+                output = output.add(&bias_2d);
+            } else {
+                // [1, out] + [out] — broadcast_add_bias handles this
+                let biased = crate::gradient::autodiff::broadcast_add_bias(
+                    &output.tensor,
+                    &b_var.tensor,
+                );
+                output = Variable::with_op(
+                    biased,
+                    crate::gradient::autodiff::Operation::Add(
+                        output.node_index.unwrap(),
+                        b_idx,
+                    ),
+                    Some(tape.clone()),
+                );
+            }
+            Some(b_idx)
+        } else {
+            None
+        };
+
+        // Squeeze back to 1D if input was 1D
+        if squeeze {
+            // Wrap in a new Variable that preserves the graph connection.
+            // We keep the same node_index and tape so backward still works.
+            let squeezed_tensor = output.tensor.reshape(vec![self.out_features()]);
+            let mut squeezed = Variable::new(squeezed_tensor);
+            squeezed.node_index = output.node_index;
+            squeezed.tape = output.tape;
+            output = squeezed;
+        }
+
+        Ok((output, wt_idx, bias_idx))
+    }
+
     /// Adds bias to each row of the output.
     fn add_bias(
         &self,
