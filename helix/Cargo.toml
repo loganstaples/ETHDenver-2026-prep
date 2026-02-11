@@ -9,6 +9,7 @@ members = [
     "crates/helix-client",
     "crates/helix-mpc",
     "crates/helix-demo",
+    "desktop/src-tauri",
     "tests",
 ]
 
