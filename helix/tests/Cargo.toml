@@ -157,11 +157,17 @@ name = "on_chain_verification"
 path = "integration/on_chain_verification.rs"
 required-features = ["on-chain"]
 
+[[test]]
+name = "cross_crate_consistency"
+path = "integration/cross_crate_consistency.rs"
+required-features = ["on-chain"]
+
 [features]
 default = []
 parallel = ["rayon"]
 metal = ["helix-prover/metal"]
 on-chain = ["ethers", "hex"]
+full-pipeline = ["on-chain"]
 
 [dependencies.rayon]
 version = "1.10"
