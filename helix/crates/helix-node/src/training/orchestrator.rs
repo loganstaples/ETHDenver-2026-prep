@@ -369,11 +369,24 @@ impl TrainingOrchestrator {
             return Err(OrchestratorError::TrainingPaused);
         }
 
-        // Check we have enough workers
+        // Check we have enough workers (must be available AND meet reputation threshold)
         let available_workers: Vec<PeerId> = {
+            let rep_mgr = self.network.reputation_manager().lock();
             self.workers.read()
                 .iter()
-                .filter(|(_, w)| w.status == WorkerStatus::Available)
+                .filter(|(id, w)| {
+                    if w.status != WorkerStatus::Available {
+                        return false;
+                    }
+                    if !rep_mgr.is_peer_eligible(id) {
+                        log::warn!(
+                            "Worker {} excluded from round: reputation {:.1} below minimum threshold",
+                            id, rep_mgr.score(id),
+                        );
+                        return false;
+                    }
+                    true
+                })
                 .map(|(id, _)| id.clone())
                 .collect()
         };
@@ -489,6 +502,9 @@ impl TrainingOrchestrator {
         ).await;
 
         if !validation.is_valid {
+            // Record negative reputation event for failed verification
+            self.network.reputation_manager().lock().record_invalid_proof(&from);
+
             // Emit rejection event
             let _ = self.event_tx.send(OrchestratorEvent::GradientRejected {
                 round_id,
@@ -546,6 +562,9 @@ impl TrainingOrchestrator {
 
             return Err(OrchestratorError::ValidationFailed(validation.reason));
         }
+
+        // Record positive reputation event for valid proof
+        self.network.reputation_manager().lock().record_valid_proof(&from);
 
         // Store gradient
         let gradient = CollectedGradient {
@@ -1402,6 +1421,7 @@ impl TrainingOrchestrator {
         let max_failures = self.config.max_failures;
         let sc_client_clone = self.sc_client.clone();
         let model_id_clone = self.model_id.clone();
+        let reputation_clone = self.network.reputation_manager().clone();
 
         tokio::spawn(async move {
             while let Some((from, round_id, commitment, error_bound, proof)) = gradient_rx.recv().await {
@@ -1419,6 +1439,8 @@ impl TrainingOrchestrator {
                 if let Some(ref mut round) = *round_guard {
                     if round.id == round_id && round.phase == RoundPhase::Collecting {
                         if validation.is_valid {
+                            reputation_clone.lock().record_valid_proof(&from);
+
                             let gradient = CollectedGradient {
                                 peer_id: from.clone(),
                                 commitment,
@@ -1440,6 +1462,8 @@ impl TrainingOrchestrator {
                                 peer_id: from,
                             });
                         } else {
+                            reputation_clone.lock().record_invalid_proof(&from);
+
                             let mut workers = workers_clone.write();
                             if let Some(worker) = workers.get_mut(&from) {
                                 worker.failures += 1;
