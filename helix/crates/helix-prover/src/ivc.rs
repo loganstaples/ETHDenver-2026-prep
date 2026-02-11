@@ -1194,4 +1194,42 @@ mod tests {
         assert_eq!(prover.state().step, 0);
         assert_eq!(prover.accumulator().num_steps, 0);
     }
+
+    #[test]
+    fn test_ivc_fold_three_plus_steps_valid_proof() {
+        let initial = [0u8; 32];
+        let config = IVCConfig {
+            steps_per_fold: 4, // fold after 4 steps
+            store_intermediates: true,
+            ..Default::default()
+        };
+        let mut prover = IVCProver::with_config(initial, config);
+
+        // Add 4 steps (triggers fold at step 4).
+        let mut current = initial;
+        for i in 1..=4 {
+            let step = make_step(i, current);
+            current = step.output_state;
+            prover.add_step(step).unwrap();
+        }
+
+        assert_eq!(prover.state().step, 4);
+        assert!(prover.state().proof.is_some(), "Proof should exist after fold");
+        assert!(prover.verify(), "Folded proof of 4 steps must verify");
+
+        // The proof should use the A1 fold format.
+        let proof = prover.state().proof.as_ref().unwrap();
+        assert!(
+            proof.starts_with(b"HELIX_IVC_FOLD_A1:"),
+            "Proof should use A1 fold format"
+        );
+
+        // Finalize produces a single proof artifact covering all steps.
+        let finalized = prover.finalize().unwrap();
+        assert!(finalized.starts_with(b"HELIX_IVC_FINAL:"));
+
+        // Structural verification of the finalized chain.
+        let final_commitment = prover.state().state_commitment;
+        assert!(verify_ivc_chain(initial, final_commitment, &finalized));
+    }
 }
