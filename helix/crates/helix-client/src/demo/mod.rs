@@ -13,6 +13,7 @@
 //! - Automatic error recovery
 //! - Precise timing control for 90-second pitch demos
 
+pub mod checkpoint;
 pub mod orchestrator;
 pub mod prewarm;
 pub mod real_training;
@@ -35,6 +36,7 @@ use crate::rpc::{
     UnifiedRpcClient, WorkerInfo, WorkerStatus,
 };
 
+pub use checkpoint::{CheckpointConfig, TrainingCheckpoint};
 pub use orchestrator::{
     DemoOrchestrator, DemoTimingConfig, OrchestratedPhase, OrchestratorEvent,
     OrchestratorSnapshot, PhaseTiming, TimingReport,
@@ -580,7 +582,7 @@ impl DemoRunner {
             multi_progress: MultiProgress::new(),
             prewarmer: Some(DemoPrewarmer::new(PrewarmConfig::demo_mode())),
             recovery_manager,
-            rpc_client: Arc::new(RwLock::new(UnifiedRpcClient::mock_only())),
+            rpc_client: Arc::new(RwLock::new(UnifiedRpcClient::new_mock())),
             proof_tracker: Arc::new(RealTimeProofTracker::new()),
             training_tracker: Arc::new(RealTimeTrainingTracker::new()),
             rpc_config: None,
@@ -602,7 +604,7 @@ impl DemoRunner {
             multi_progress: MultiProgress::new(),
             prewarmer: Some(DemoPrewarmer::new(PrewarmConfig::demo_mode())),
             recovery_manager,
-            rpc_client: Arc::new(RwLock::new(UnifiedRpcClient::mock_only())),
+            rpc_client: Arc::new(RwLock::new(UnifiedRpcClient::new_mock())),
             proof_tracker: Arc::new(RealTimeProofTracker::new()),
             training_tracker: Arc::new(RealTimeTrainingTracker::new()),
             rpc_config: Some(HelixRpcConfig::with_endpoint(endpoint)),

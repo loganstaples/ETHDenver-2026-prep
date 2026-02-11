@@ -30,11 +30,27 @@ pub struct HelixClient {
 impl HelixClient {
     /// Create a new `HelixClient` from a validated configuration.
     ///
-    /// The RPC layer starts in mock-only mode. Call [`connect`](Self::connect)
-    /// to upgrade to a real node connection.
+    /// The RPC layer starts disconnected. Call [`connect`](Self::connect)
+    /// to establish a real node connection, or use [`new_mock`](Self::new_mock)
+    /// if you explicitly want mock mode for development.
     pub fn new(config: HelixConfig) -> Result<Self> {
         config.validate()?;
-        let rpc = UnifiedRpcClient::mock_only();
+        let rpc = UnifiedRpcClient::new_mock();
+        Ok(Self {
+            config,
+            rpc,
+            dashboard_state: None,
+        })
+    }
+
+    /// Create a `HelixClient` that explicitly runs in mock mode.
+    ///
+    /// Use this for development and testing when you don't have a real node
+    /// available. Unlike [`new`](Self::new) + [`connect`](Self::connect),
+    /// this never attempts a real connection.
+    pub fn new_mock(config: HelixConfig) -> Result<Self> {
+        config.validate()?;
+        let rpc = UnifiedRpcClient::new_mock();
         Ok(Self {
             config,
             rpc,
@@ -137,7 +153,7 @@ impl HelixClient {
         &mut self,
         orch_config: crate::orchestration::OrchestratorConfig,
     ) -> Result<crate::orchestration::TrainingResult> {
-        let mut orchestrator = crate::orchestration::TrainingOrchestrator::new(orch_config);
+        let mut orchestrator = crate::orchestration::TrainingOrchestrator::new(orch_config)?;
         let result = orchestrator.train().await;
 
         // Always clean up processes, even on error

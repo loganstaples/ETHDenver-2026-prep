@@ -1584,6 +1584,8 @@ async fn cmd_demo_live(args: &DemoArgs, mut shutdown: broadcast::Receiver<()>) -
         round_timeout: Duration::from_secs(120),
         health_check_interval: Duration::from_secs(5),
         max_restarts: 3,
+        checkpoint: helix_client::demo::checkpoint::CheckpointConfig::default(),
+        resume: false,
     };
 
     // Print banner
@@ -1605,7 +1607,7 @@ async fn cmd_demo_live(args: &DemoArgs, mut shutdown: broadcast::Receiver<()>) -
     println!("  Deploy:        {}", if deploy { "yes (fresh Anvil + forge)" } else { "no (pre-deployed)" });
     println!();
 
-    let mut orchestrator = TrainingOrchestrator::new(config);
+    let mut orchestrator = TrainingOrchestrator::new(config)?;
 
     // Phase 1: Start Anvil
     let mut progress = ProgressDisplay::new();

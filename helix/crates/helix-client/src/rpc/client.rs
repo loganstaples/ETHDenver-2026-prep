@@ -1383,7 +1383,11 @@ impl UnifiedRpcClient {
     }
 
     /// Create in mock-only mode (for demos and tests).
-    pub fn mock_only() -> Self {
+    ///
+    /// Use this when you explicitly want a mock client for development or
+    /// testing. Unlike [`connect`](Self::connect), this never attempts a
+    /// real connection.
+    pub fn new_mock() -> Self {
         Self {
             real_client: None,
             mock_client: MockRpcClient::new(),
@@ -1392,6 +1396,12 @@ impl UnifiedRpcClient {
             #[cfg(feature = "chain")]
             chain_client: None,
         }
+    }
+
+    /// Deprecated alias for [`new_mock`](Self::new_mock).
+    #[deprecated(note = "use `new_mock()` instead")]
+    pub fn mock_only() -> Self {
+        Self::new_mock()
     }
 
     /// Attach an on-chain client for contract interactions.
@@ -1594,10 +1604,7 @@ impl UnifiedRpcClient {
 
     /// Get model information by ID.
     pub async fn get_model(&self, model_id: u64) -> Result<ModelInfo, RpcError> {
-        if let Some(ref client) = self.real_client {
-            client.get_model(model_id).await
-        } else {
-            // Mock fallback
+        if self.use_mock {
             Ok(ModelInfo {
                 id: model_id,
                 name: format!("helix-model-{}", model_id),
@@ -1612,15 +1619,16 @@ impl UnifiedRpcClient {
                 accumulated_error: 45.2,
                 created_at: chrono::Utc::now().timestamp() - 86400,
             })
+        } else if let Some(ref client) = self.real_client {
+            client.get_model(model_id).await
+        } else {
+            Err(RpcError::NodeUnavailable("No client available".into()))
         }
     }
 
     /// Get round information by model and round ID.
     pub async fn get_round(&self, model_id: u64, round_id: u64) -> Result<RoundInfo, RpcError> {
-        if let Some(ref client) = self.real_client {
-            client.get_round(model_id, round_id).await
-        } else {
-            // Mock fallback
+        if self.use_mock {
             Ok(RoundInfo {
                 round_id,
                 model_id,
@@ -1638,6 +1646,10 @@ impl UnifiedRpcClient {
                 loss: Some(0.234),
                 error_delta: Some(5.1),
             })
+        } else if let Some(ref client) = self.real_client {
+            client.get_round(model_id, round_id).await
+        } else {
+            Err(RpcError::NodeUnavailable("No client available".into()))
         }
     }
 
@@ -1649,7 +1661,7 @@ impl UnifiedRpcClient {
 
 impl Default for UnifiedRpcClient {
     fn default() -> Self {
-        Self::mock_only()
+        Self::new_mock()
     }
 }
 

@@ -927,7 +927,7 @@ fn test_chain_circuit_breaker_success_resets() {
 /// Test: UnifiedRpcClient starts in mock mode.
 #[tokio::test]
 async fn test_unified_client_mock_mode() {
-    let client = UnifiedRpcClient::mock_only();
+    let client = UnifiedRpcClient::new_mock();
 
     assert!(client.is_mock(), "Should be in mock mode");
     assert!(!client.is_connected(), "Should not be connected");
@@ -978,7 +978,7 @@ async fn test_mock_client_training_lifecycle() {
 async fn test_unified_client_with_chain_client() {
     let env = TestEnv::setup_on_port(18556).await.expect("Failed to set up test environment");
 
-    let mut unified = UnifiedRpcClient::mock_only();
+    let mut unified = UnifiedRpcClient::new_mock();
 
     // Before attaching chain client — mock operations work
     assert!(unified.is_mock());
@@ -1018,7 +1018,7 @@ async fn test_unified_client_with_chain_client() {
 /// Test: Mock client staking info returns reasonable defaults.
 #[tokio::test]
 async fn test_mock_staking_info() {
-    let client = UnifiedRpcClient::mock_only();
+    let client = UnifiedRpcClient::new_mock();
 
     let info = client.get_staking_info(0).await.unwrap();
     assert!(info.total_staked > 0.0);
@@ -1029,7 +1029,7 @@ async fn test_mock_staking_info() {
 /// Test: Mock client network status returns valid data.
 #[tokio::test]
 async fn test_mock_network_status() {
-    let client = UnifiedRpcClient::mock_only();
+    let client = UnifiedRpcClient::new_mock();
 
     let status = client.get_network_status().await.unwrap();
     assert!(status.peer_count > 0);
@@ -1040,7 +1040,7 @@ async fn test_mock_network_status() {
 /// Test: Mock demo snapshot has all fields populated.
 #[tokio::test]
 async fn test_mock_demo_snapshot() {
-    let client = UnifiedRpcClient::mock_only();
+    let client = UnifiedRpcClient::new_mock();
 
     let snapshot = client.get_demo_snapshot().await.unwrap();
     assert!(snapshot.training.is_some());

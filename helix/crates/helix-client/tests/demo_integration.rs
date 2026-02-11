@@ -574,3 +574,126 @@ async fn test_dashboard_defaults_and_fallback_match() {
     assert_eq!(handler_network["block_height"], 12_345_678);
     assert_eq!(handler_network["chain_id"], 31337);
 }
+
+// ============================================================================
+// Mock fallback elimination tests
+// ============================================================================
+
+/// connect() must return an error when no node is reachable. It must NOT
+/// silently fall back to mock mode.
+#[tokio::test]
+async fn test_connect_fails_without_mock_fallback() {
+    use helix_client::rpc::client::{HelixRpcConfig, UnifiedRpcClient};
+
+    // Point at a port where nothing is listening.
+    let config = HelixRpcConfig {
+        endpoint: "http://127.0.0.1:19999".to_string(),
+        timeout_secs: 1,
+        max_retries: 0,
+        retry_delay_ms: 10,
+        max_backoff_ms: 100,
+        compress: false,
+        auth_token: None,
+    };
+
+    let result = UnifiedRpcClient::connect(config).await;
+    assert!(result.is_err(), "connect() must return Err when node is unreachable");
+}
+
+/// HelixClient::connect() must propagate the error, not silently succeed.
+#[tokio::test]
+async fn test_helix_client_connect_fails_without_mock_fallback() {
+    let mut client = HelixClient::from_profile(ConfigProfile::Local).unwrap();
+    let result = client.connect().await;
+    // Local profile points at localhost:9090 which isn't running, so this
+    // must fail rather than silently falling back.
+    assert!(result.is_err(), "HelixClient::connect() must return Err when node is unreachable");
+}
+
+/// new_mock() explicitly creates a mock client — operations succeed.
+#[tokio::test]
+async fn test_new_mock_explicitly_creates_mock() {
+    use helix_client::rpc::client::UnifiedRpcClient;
+
+    let client = UnifiedRpcClient::new_mock();
+    assert!(client.is_mock());
+    assert!(!client.is_connected());
+
+    // Mock operations should work fine.
+    let status = client.get_training_status().await.unwrap();
+    assert!(!status.active);
+}
+
+// ============================================================================
+// Checkpoint persistence tests
+// ============================================================================
+
+/// Checkpoint save→load roundtrip preserves all fields.
+#[test]
+fn test_checkpoint_save_load_roundtrip() {
+    use helix_client::demo::checkpoint::TrainingCheckpoint;
+    use helix_client::demo::real_training::TrainingState;
+
+    let mut state = TrainingState::new_random(8, 16, 4);
+    state.step = 5;
+    state.loss = 0.42;
+    state.error_bound = 17.3;
+    state.loss_history = vec![2.5, 2.0, 1.5, 1.0, 0.42];
+
+    let ckpt = TrainingCheckpoint::from_state(&state, 99, "0xbeef");
+
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let path = tmp_dir.path().join("model_99").join("checkpoint.json");
+    ckpt.save(&path).unwrap();
+
+    let loaded = TrainingCheckpoint::load(&path).unwrap().unwrap();
+    assert_eq!(loaded.model_id, 99);
+    assert_eq!(loaded.step, 5);
+    assert_eq!(loaded.last_proof_hash, "0xbeef");
+
+    let restored = loaded.to_state().unwrap();
+    assert_eq!(restored.w1, state.w1);
+    assert_eq!(restored.b1, state.b1);
+    assert_eq!(restored.w2, state.w2);
+    assert_eq!(restored.b2, state.b2);
+    assert_eq!(restored.step, 5);
+    assert!((restored.loss - 0.42).abs() < f64::EPSILON);
+    assert!((restored.error_bound - 17.3).abs() < f64::EPSILON);
+    assert_eq!(restored.loss_history, vec![2.5, 2.0, 1.5, 1.0, 0.42]);
+}
+
+/// Training resumes from the correct step after a simulated crash.
+#[test]
+fn test_training_resumes_from_correct_step() {
+    use helix_client::demo::checkpoint::{CheckpointConfig, TrainingCheckpoint};
+    use helix_client::demo::real_training::TrainingState;
+
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let ckpt_config = CheckpointConfig {
+        dir: tmp_dir.path().to_path_buf(),
+        enabled: true,
+    };
+
+    // Simulate training that reached step 7 before crashing.
+    let mut state = TrainingState::new_random(4, 8, 2);
+    state.step = 7;
+    state.loss = 0.15;
+    state.error_bound = 30.0;
+    state.loss_history = vec![2.5, 2.1, 1.8, 1.4, 1.0, 0.5, 0.25, 0.15];
+
+    let model_id = 42;
+    let ckpt = TrainingCheckpoint::from_state(&state, model_id, "0xdeadbeef");
+    let ckpt_path = ckpt_config.checkpoint_path(model_id);
+    ckpt.save(&ckpt_path).unwrap();
+
+    // "Crash" — simulate restart by loading the checkpoint.
+    let loaded = TrainingCheckpoint::load(&ckpt_path).unwrap().unwrap();
+    let restored = loaded.to_state().unwrap();
+
+    // The next round should be step 8 (i.e. start_round = step + 1).
+    let resume_from = (restored.step as u32).saturating_add(1);
+    assert_eq!(resume_from, 8, "Training should resume from step 8");
+    assert!((restored.loss - 0.15).abs() < f64::EPSILON);
+    assert!((restored.error_bound - 30.0).abs() < f64::EPSILON);
+    assert_eq!(restored.loss_history.len(), 8);
+}
