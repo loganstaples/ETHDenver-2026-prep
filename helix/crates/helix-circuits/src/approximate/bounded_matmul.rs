@@ -1,11 +1,13 @@
 //! Bounded Matrix Multiplication Gadget.
 //!
 //! Verifies dot products with error propagation.
+//! All constraints use copy constraints to prevent a malicious prover
+//! from assigning inconsistent values across gate rows.
 
 use crate::gadgets::arithmetic::{ArithmeticChip, ArithmeticConfig};
 use crate::gadgets::range::{RangeChip, RangeConfig};
 use halo2_proofs::{
-    circuit::{Layouter, Value},
+    circuit::{AssignedCell, Layouter, Value},
     plonk::ErrorFront,
 };
 use halo2curves::ff::PrimeField;
@@ -37,8 +39,10 @@ impl<F: PrimeField, const RANGE: usize> BoundedMatMulChip<F, RANGE> {
     /// result = sum(a_i * b_i)
     /// error = sum(|a_i|*e_bi + |b_i|*e_ai + e_ai*e_bi)
     ///
-    /// Note: This is computationally expensive in a circuit (O(K) constraints per cell).
-    /// For Stage 13 we implement the logic for small K.
+    /// Each iteration is assigned in a single region with copy constraints
+    /// binding shared values (va, vb, ea, eb, intermediate products) across
+    /// all gate rows. This prevents a malicious prover from using different
+    /// values in the value computation vs error computation.
     pub fn assign_dot_product(
         &self,
         mut layouter: impl Layouter<F>,
@@ -50,218 +54,187 @@ impl<F: PrimeField, const RANGE: usize> BoundedMatMulChip<F, RANGE> {
         res_err: Value<F>,
     ) -> Result<(), ErrorFront> {
         if row_a_vals.len() != col_b_vals.len() {
-             return Err(ErrorFront::Synthesis);
+            return Err(ErrorFront::Synthesis);
         }
 
-        // 1. Calculate and accumulate values
-        // We will perform naive accumulation in the circuit using Add/Mul gates.
-        // In a real optimized circuit, we'd use a dedicated custom gate for dot products.
-        // Here we chain binary ops.
-        
+        let k = row_a_vals.len();
+        let zero = Value::known(F::ZERO);
+
+        // Track running sums and their last assigned cells for cross-region linking
         let mut running_val = Value::known(F::ZERO);
         let mut running_err = Value::known(F::ZERO);
+        let mut prev_running_val_cell: Option<AssignedCell<F, F>> = None;
+        let mut prev_running_err_cell: Option<AssignedCell<F, F>> = None;
 
-        for i in 0..row_a_vals.len() {
+        for i in 0..k {
             let va = row_a_vals[i];
             let ea = row_a_errs[i];
             let vb = col_b_vals[i];
             let eb = col_b_errs[i];
 
-            // --- Value Accumulation ---
-            // t = va * vb
             let term_val = va * vb;
-            // Assign multiplication: va * vb = term_val
-            // We use the arithmetic chip's raw assignment capability if exposed, 
-            // or we need to use a region. 
-            // Since we are inside a `assign_dot_product` which takes `Layouter`,
-            // we should ideally create a region for this DOT PRODUCT.
-            // Assigning many small regions is inefficient.
-            // Let's use `layouter.assign_region` ONCE for the whole dot product.
-            
-            // However, our ArithmeticChip API expects `assign_region` per operation in its `assign` methods.
-            // Let's assume we can call `arithmetic_chip.mul` and `add` here if they were exposed helpers.
-            // Given they are not, `assign_dot_product` should iterate and call assign logic.
-            
-            // Constraint 1: Multiply term
-            // We need to verify `term_val = va * vb`.
-            // BUT `va` and `vb` are Values. We need them in the circuit.
-            // They are passed as `Value<F>`.
-            
-            layouter.assign_region(
-                || format!("matmul mul step {}", i),
-                |mut region| {
-                    self.arithmetic_chip.config.s_mul.enable(&mut region, 0)?;
-                    region.assign_advice(|| "va", self.arithmetic_chip.config.a, 0, || va)?;
-                    region.assign_advice(|| "vb", self.arithmetic_chip.config.b, 0, || vb)?;
-                    region.assign_advice(|| "term", self.arithmetic_chip.config.c, 0, || term_val)?;
-                    Ok(())
-                }
-            )?;
-
-            // Constraint 2: Add to running sum
-            // run_new = run_old + term
             let next_running_val = running_val + term_val;
-            
-            if i > 0 { // First step running_val is 0, so result is just term.
-                 layouter.assign_region(
-                    || format!("matmul add step {}", i),
-                    |mut region| {
-                        self.arithmetic_chip.config.s_add.enable(&mut region, 0)?;
-                        region.assign_advice(|| "running_prev", self.arithmetic_chip.config.a, 0, || running_val)?;
-                        region.assign_advice(|| "term", self.arithmetic_chip.config.b, 0, || term_val)?;
-                        region.assign_advice(|| "running_new", self.arithmetic_chip.config.c, 0, || next_running_val)?;
-                        Ok(())
-                    }
-                )?;
-            }
-            
-            running_val = next_running_val;
 
-            // --- Error Accumulation ---
-            // err_term = |va|*eb + |vb|*ea + ea*eb
-            // Assuming positive values: va*eb + vb*ea + ea*eb
-            
+            // Error term: va*eb + vb*ea + ea*eb
             let t1 = va * eb;
             let t2 = vb * ea;
             let t3 = ea * eb;
-            let term_err_val = t1 + t2 + t3;
-
-            // We need to prove this calculation. 
-            // This is identical to BoundedMul logic.
-            // Ideally we'd call `BoundedMulChip` here if refactored, but let's inline for now.
-            // Constraints:
-            // 1. t1 = va * eb
-            // 2. t2 = vb * ea
-            // 3. t3 = ea * eb
-            // 4. sum = t1+t2+t3
-            
-            // Assign t1
-            layouter.assign_region(
-                || format!("matmul err t1 step {}", i),
-                |mut region| {
-                    self.arithmetic_chip.config.s_mul.enable(&mut region, 0)?;
-                    region.assign_advice(|| "va", self.arithmetic_chip.config.a, 0, || va)?;
-                    region.assign_advice(|| "eb", self.arithmetic_chip.config.b, 0, || eb)?;
-                    region.assign_advice(|| "t1", self.arithmetic_chip.config.c, 0, || t1)?;
-                    Ok(())
-                }
-            )?;
-
-            // Assign t2
-             layouter.assign_region(
-                || format!("matmul err t2 step {}", i),
-                |mut region| {
-                    self.arithmetic_chip.config.s_mul.enable(&mut region, 0)?;
-                    region.assign_advice(|| "vb", self.arithmetic_chip.config.a, 0, || vb)?;
-                    region.assign_advice(|| "ea", self.arithmetic_chip.config.b, 0, || ea)?;
-                    region.assign_advice(|| "t2", self.arithmetic_chip.config.c, 0, || t2)?;
-                    Ok(())
-                }
-            )?;
-
-            // Assign t3
-             layouter.assign_region(
-                || format!("matmul err t3 step {}", i),
-                |mut region| {
-                    self.arithmetic_chip.config.s_mul.enable(&mut region, 0)?;
-                    region.assign_advice(|| "ea", self.arithmetic_chip.config.a, 0, || ea)?;
-                    region.assign_advice(|| "eb", self.arithmetic_chip.config.b, 0, || eb)?;
-                    region.assign_advice(|| "t3", self.arithmetic_chip.config.c, 0, || t3)?;
-                    Ok(())
-                }
-            )?;
-            
-            // Assign sum of terms (we can do 2 adds)
             let sum_part = t1 + t2;
-             layouter.assign_region(
-                || format!("matmul err sum1 step {}", i),
+            let term_err = sum_part + t3;
+            let next_running_err = running_err + term_err;
+
+            // Each iteration: single region with all gates and copy constraints.
+            // Layout (9 rows per iteration, or 7 if i==0):
+            //   Row 0: s_mul — va * vb = term_val
+            //   Row 1: s_add — running_val + term_val = next_running_val (skip if i==0)
+            //   Row 2: s_mul — va * eb = t1
+            //   Row 3: s_mul — vb * ea = t2
+            //   Row 4: s_mul — ea * eb = t3
+            //   Row 5: s_add — t1 + t2 = sum_part
+            //   Row 6: s_add — sum_part + t3 = term_err
+            //   Row 7: s_add — running_err + term_err = next_running_err (skip if i==0)
+
+            let prev_val_cell = prev_running_val_cell.take();
+            let prev_err_cell = prev_running_err_cell.take();
+            let running_val_capture = running_val;
+            let running_err_capture = running_err;
+
+            let (new_val_cell, new_err_cell) = layouter.assign_region(
+                || format!("matmul_iter_{}", i),
                 |mut region| {
-                    self.arithmetic_chip.config.s_add.enable(&mut region, 0)?;
-                    region.assign_advice(|| "t1", self.arithmetic_chip.config.a, 0, || t1)?;
-                    region.assign_advice(|| "t2", self.arithmetic_chip.config.b, 0, || t2)?;
-                    region.assign_advice(|| "sum_part", self.arithmetic_chip.config.c, 0, || sum_part)?;
-                    Ok(())
-                }
-            )?;
-            
-             layouter.assign_region(
-                || format!("matmul err sum2 step {}", i),
-                |mut region| {
-                    self.arithmetic_chip.config.s_add.enable(&mut region, 0)?;
-                    region.assign_advice(|| "sum_part", self.arithmetic_chip.config.a, 0, || sum_part)?;
-                    region.assign_advice(|| "t3", self.arithmetic_chip.config.b, 0, || t3)?;
-                    region.assign_advice(|| "term_err", self.arithmetic_chip.config.c, 0, || term_err_val)?;
-                    Ok(())
-                }
+                    let mut row = 0;
+
+                    // Row 0: va * vb = term_val
+                    self.config.arithmetic.s_mul.enable(&mut region, row)?;
+                    let va_0 = region.assign_advice(|| "va", self.config.arithmetic.a, row, || va)?;
+                    let vb_0 = region.assign_advice(|| "vb", self.config.arithmetic.b, row, || vb)?;
+                    let term_val_0 = region.assign_advice(|| "term_val", self.config.arithmetic.c, row, || term_val)?;
+                    row += 1;
+
+                    // Row 1: running_val + term_val = next_running_val (if i > 0)
+                    let next_val_cell = if i > 0 {
+                        self.config.arithmetic.s_add.enable(&mut region, row)?;
+                        let prev_cell = region.assign_advice(|| "running_val", self.config.arithmetic.a, row, || running_val_capture)?;
+                        let term_cell = region.assign_advice(|| "term_val_1", self.config.arithmetic.b, row, || term_val)?;
+                        let next_cell = region.assign_advice(|| "next_val", self.config.arithmetic.c, row, || next_running_val)?;
+                        // Copy: term_val from row 0 == term_val at row 1
+                        region.constrain_equal(term_val_0.cell(), term_cell.cell())?;
+                        // Copy: running_val from previous iteration
+                        if let Some(ref prev) = prev_val_cell {
+                            region.constrain_equal(prev.cell(), prev_cell.cell())?;
+                        }
+                        row += 1;
+                        next_cell
+                    } else {
+                        // For i==0, next_running_val == term_val (running starts at 0)
+                        term_val_0.clone()
+                    };
+
+                    // Row 2: va * eb = t1
+                    self.config.arithmetic.s_mul.enable(&mut region, row)?;
+                    let va_2 = region.assign_advice(|| "va_2", self.config.arithmetic.a, row, || va)?;
+                    let eb_2 = region.assign_advice(|| "eb", self.config.arithmetic.b, row, || eb)?;
+                    let t1_2 = region.assign_advice(|| "t1", self.config.arithmetic.c, row, || t1)?;
+                    // Copy: va must be same as row 0
+                    region.constrain_equal(va_0.cell(), va_2.cell())?;
+                    row += 1;
+
+                    // Row 3: vb * ea = t2
+                    self.config.arithmetic.s_mul.enable(&mut region, row)?;
+                    let vb_3 = region.assign_advice(|| "vb_3", self.config.arithmetic.a, row, || vb)?;
+                    let ea_3 = region.assign_advice(|| "ea", self.config.arithmetic.b, row, || ea)?;
+                    let t2_3 = region.assign_advice(|| "t2", self.config.arithmetic.c, row, || t2)?;
+                    // Copy: vb must be same as row 0
+                    region.constrain_equal(vb_0.cell(), vb_3.cell())?;
+                    row += 1;
+
+                    // Row 4: ea * eb = t3
+                    self.config.arithmetic.s_mul.enable(&mut region, row)?;
+                    let ea_4 = region.assign_advice(|| "ea_4", self.config.arithmetic.a, row, || ea)?;
+                    let eb_4 = region.assign_advice(|| "eb_4", self.config.arithmetic.b, row, || eb)?;
+                    let t3_4 = region.assign_advice(|| "t3", self.config.arithmetic.c, row, || t3)?;
+                    // Copy: ea and eb must be same as rows 2-3
+                    region.constrain_equal(ea_3.cell(), ea_4.cell())?;
+                    region.constrain_equal(eb_2.cell(), eb_4.cell())?;
+                    row += 1;
+
+                    // Row 5: t1 + t2 = sum_part
+                    self.config.arithmetic.s_add.enable(&mut region, row)?;
+                    let t1_5 = region.assign_advice(|| "t1_5", self.config.arithmetic.a, row, || t1)?;
+                    let t2_5 = region.assign_advice(|| "t2_5", self.config.arithmetic.b, row, || t2)?;
+                    let sum_5 = region.assign_advice(|| "sum_part", self.config.arithmetic.c, row, || sum_part)?;
+                    // Copy: t1 and t2 from rows 2-3
+                    region.constrain_equal(t1_2.cell(), t1_5.cell())?;
+                    region.constrain_equal(t2_3.cell(), t2_5.cell())?;
+                    row += 1;
+
+                    // Row 6: sum_part + t3 = term_err
+                    self.config.arithmetic.s_add.enable(&mut region, row)?;
+                    let sum_6 = region.assign_advice(|| "sum_6", self.config.arithmetic.a, row, || sum_part)?;
+                    let t3_6 = region.assign_advice(|| "t3_6", self.config.arithmetic.b, row, || t3)?;
+                    let term_err_6 = region.assign_advice(|| "term_err", self.config.arithmetic.c, row, || term_err)?;
+                    // Copy: sum_part and t3 from rows 4-5
+                    region.constrain_equal(sum_5.cell(), sum_6.cell())?;
+                    region.constrain_equal(t3_4.cell(), t3_6.cell())?;
+                    row += 1;
+
+                    // Row 7: running_err + term_err = next_running_err (if i > 0)
+                    let next_err_cell = if i > 0 {
+                        self.config.arithmetic.s_add.enable(&mut region, row)?;
+                        let prev_err = region.assign_advice(|| "running_err", self.config.arithmetic.a, row, || running_err_capture)?;
+                        let term_err_7 = region.assign_advice(|| "term_err_7", self.config.arithmetic.b, row, || term_err)?;
+                        let next_err = region.assign_advice(|| "next_err", self.config.arithmetic.c, row, || next_running_err)?;
+                        // Copy: term_err from row 6
+                        region.constrain_equal(term_err_6.cell(), term_err_7.cell())?;
+                        // Copy: running_err from previous iteration
+                        if let Some(ref prev) = prev_err_cell {
+                            region.constrain_equal(prev.cell(), prev_err.cell())?;
+                        }
+                        next_err
+                    } else {
+                        // For i==0, next_running_err == term_err (running starts at 0)
+                        term_err_6
+                    };
+
+                    Ok((next_val_cell, next_err_cell))
+                },
             )?;
 
-            // Accumulate into running_err
-            let next_running_err = running_err + term_err_val;
-            
-            if i > 0 {
-                layouter.assign_region(
-                    || format!("matmul err accum step {}", i),
-                    |mut region| {
-                        self.arithmetic_chip.config.s_add.enable(&mut region, 0)?;
-                        region.assign_advice(|| "running_err_prev", self.arithmetic_chip.config.a, 0, || running_err)?;
-                        region.assign_advice(|| "term_err", self.arithmetic_chip.config.b, 0, || term_err_val)?;
-                        region.assign_advice(|| "running_err_new", self.arithmetic_chip.config.c, 0, || next_running_err)?;
-                        Ok(())
-                    }
-                )?;
-            } else {
-                // For i=0, running_err (0) + term_err = term_err. 
-                // We implicitly proved term_err is correct above. 
-                // Since `running_err` starts at 0 (known), we can verify consistency if we assigned it,
-                // but effectively `next_running_err` IS `term_err_val`.
-            }
-            
+            prev_running_val_cell = Some(new_val_cell);
+            prev_running_err_cell = Some(new_err_cell);
+            running_val = next_running_val;
             running_err = next_running_err;
         }
 
-        // 2. Verify Result Value
-        // res_val - running_val = 0
+        // Final verification region: check res_val == running_val, res_err == running_err,
+        // and range check res_err. Uses copy constraints to link to last iteration.
         let diff_val = res_val - running_val;
-        let zero = Value::known(F::ZERO);
-        
-        layouter.assign_region(
-             || "verify matmul res_val",
-             |mut region| {
-                 self.arithmetic_chip.config.s_add.enable(&mut region, 0)?;
-                 // diff + 0 = 0 => diff = 0
-                 region.assign_advice(|| "diff", self.arithmetic_chip.config.a, 0, || diff_val)?;
-                 region.assign_advice(|| "zero_b", self.arithmetic_chip.config.b, 0, || zero)?;
-                 region.assign_advice(|| "zero_c", self.arithmetic_chip.config.c, 0, || zero)?;
-                 Ok(())
-             }
-        )?;
-        
-        // 3. Verify Error Value
-        // res_err - running_err = 0
         let diff_err = res_err - running_err;
-        layouter.assign_region(
-             || "verify matmul res_err",
-             |mut region| {
-                 self.arithmetic_chip.config.s_add.enable(&mut region, 0)?;
-                 region.assign_advice(|| "diff", self.arithmetic_chip.config.a, 0, || diff_err)?;
-                 region.assign_advice(|| "zero_b", self.arithmetic_chip.config.b, 0, || zero)?;
-                 region.assign_advice(|| "zero_c", self.arithmetic_chip.config.c, 0, || zero)?;
-                 Ok(())
-             }
-        )?;
 
-        // 4. Range Check Result Error
-        // We verify that the `res_err` is within range.
         layouter.assign_region(
-            || "range check matmul err",
+            || "matmul_verify",
             |mut region| {
-                self.config.range.s_range.enable(&mut region, 0)?;
+                // Row 0: diff_val + 0 = 0 (proves diff_val == 0 => res_val == running_val)
+                self.config.arithmetic.s_add.enable(&mut region, 0)?;
+                region.assign_advice(|| "diff_val", self.config.arithmetic.a, 0, || diff_val)?;
+                region.assign_advice(|| "zero_b", self.config.arithmetic.b, 0, || zero)?;
+                region.assign_advice(|| "zero_c", self.config.arithmetic.c, 0, || zero)?;
+
+                // Row 1: diff_err + 0 = 0 (proves diff_err == 0 => res_err == running_err)
+                self.config.arithmetic.s_add.enable(&mut region, 1)?;
+                region.assign_advice(|| "diff_err", self.config.arithmetic.a, 1, || diff_err)?;
+                region.assign_advice(|| "zero_b1", self.config.arithmetic.b, 1, || zero)?;
+                region.assign_advice(|| "zero_c1", self.config.arithmetic.c, 1, || zero)?;
+
+                // Row 2: range check res_err
+                self.config.range.s_range.enable(&mut region, 2)?;
                 region.assign_advice(
-                    || "res_err",
+                    || "res_err_range",
                     self.config.range.input_column,
-                    0,
+                    2,
                     || res_err,
                 )?;
+
                 Ok(())
             },
         )?;

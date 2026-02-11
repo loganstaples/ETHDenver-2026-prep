@@ -16,8 +16,7 @@ use halo2_proofs::dev::MockProver;
 use halo2curves::bn256::Fr;
 use helix_circuits::{
     params::{
-        HelixSRS, ParameterProfile, CircuitBenchmarkSuite, ModelConfig,
-        ProofSizeEstimator, CircuitOptimizer, CircuitAnalysis,
+        HelixSRS, ParameterProfile,
     },
     ivc::IVCStepCircuit,
     approximate::{
@@ -118,67 +117,6 @@ fn bench_error_accumulation(c: &mut Criterion) {
     group.bench_function("mock_prove_10_ops", |b| {
         b.iter(|| {
             let _prover = MockProver::run(black_box(10), &circuit, vec![vec![]]).unwrap();
-        });
-    });
-
-    group.finish();
-}
-
-/// Benchmark proof size estimation.
-fn bench_proof_size_estimation(c: &mut Criterion) {
-    let mut group = c.benchmark_group("Proof Size Estimation");
-
-    let estimator = ProofSizeEstimator::default();
-
-    group.bench_function("small_model", |b| {
-        let model = ModelConfig::demo_small();
-        b.iter(|| {
-            let _estimate = estimator.estimate_for_model(black_box(&model));
-        });
-    });
-
-    group.bench_function("transformer_model", |b| {
-        let model = ModelConfig::transformer_small();
-        b.iter(|| {
-            let _estimate = estimator.estimate_for_model(black_box(&model));
-        });
-    });
-
-    group.finish();
-}
-
-/// Benchmark circuit optimization analysis.
-fn bench_optimization(c: &mut Criterion) {
-    let mut group = c.benchmark_group("Circuit Optimization");
-
-    let mut analysis = CircuitAnalysis::new("test_circuit");
-    analysis.advice_columns = 12;
-    analysis.total_gates = 5000;
-    analysis.max_degree = 6;
-    analysis.lookup_tables = 5;
-    analysis.required_rows = 32768;
-    analysis.compute_min_k();
-
-    group.bench_function("analyze_and_optimize", |b| {
-        b.iter(|| {
-            let mut optimizer = CircuitOptimizer::new();
-            let _summary = optimizer.optimize(black_box(&analysis));
-        });
-    });
-
-    group.finish();
-}
-
-/// Benchmark the full benchmark suite.
-fn bench_benchmark_suite(c: &mut Criterion) {
-    let mut group = c.benchmark_group("Benchmark Suite");
-    group.sample_size(10);
-    group.measurement_time(Duration::from_secs(5));
-
-    group.bench_function("run_estimates", |b| {
-        b.iter(|| {
-            let mut suite = CircuitBenchmarkSuite::new();
-            let _report = suite.run_estimates();
         });
     });
 
@@ -745,9 +683,6 @@ criterion_group!(
     bench_srs_generation,
     bench_ivc_circuit,
     bench_error_accumulation,
-    bench_proof_size_estimation,
-    bench_optimization,
-    bench_benchmark_suite,
     bench_keygen,
     bench_profiles,
     bench_lookup_table_generation,

@@ -17,7 +17,7 @@ helix-prover = { path = "../helix-prover" }
 helix-circuits = { path = "../helix-circuits" }
 
 # Halo2 for ZK proof types and unified Fr
-halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2", branch = "main" }
+halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2", rev = "198e9ae30d322cd0ad003b6955f91ec095b1490d" }
 halo2curves = "0.7.0"
 
 # Parallelism

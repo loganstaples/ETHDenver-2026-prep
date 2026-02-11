@@ -66,10 +66,6 @@ pub use params::{
     KeygenBenchmark, CircuitConfig, CommitmentScheme, KeyError,
     KEY_FORMAT_VERSION, PK_MAGIC, VK_MAGIC,
 
-    // Optimization
-    CircuitAnalysis, CircuitOptimizer, OptimizationPass, OptimizationResult,
-    OptimizationSummary, ProofSizeEstimator, ProofSizeEstimate,
-    ModelConfig, CircuitBenchmarkSuite, BenchmarkReport,
 };
 
 // Re-export approximate module types

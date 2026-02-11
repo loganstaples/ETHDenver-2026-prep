@@ -1,11 +1,9 @@
 pub mod arithmetic;
-pub mod freivalds;
 pub mod lookup;
 pub mod poseidon;
 pub mod range;
 
 pub use arithmetic::{ArithmeticChip, ArithmeticConfig};
-pub use freivalds::{FreivaldsChip, FreivaldsConfig};
 pub use poseidon::{
     poseidon_hash_two, poseidon_hash_many, poseidon_permutation,
     PoseidonCircuitConfig, synthesize_poseidon_hash,

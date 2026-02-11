@@ -3239,7 +3239,7 @@ dependencies = [
 [[package]]
 name = "halo2_backend"
 version = "0.4.0"
-source = "git+https://github.com/privacy-scaling-explorations/halo2?branch=main#198e9ae30d322cd0ad003b6955f91ec095b1490d"
+source = "git+https://github.com/privacy-scaling-explorations/halo2?rev=198e9ae30d322cd0ad003b6955f91ec095b1490d#198e9ae30d322cd0ad003b6955f91ec095b1490d"
 dependencies = [
  "blake2b_simd",
  "ff",
@@ -3256,7 +3256,7 @@ dependencies = [
 [[package]]
 name = "halo2_frontend"
 version = "0.4.0"
-source = "git+https://github.com/privacy-scaling-explorations/halo2?branch=main#198e9ae30d322cd0ad003b6955f91ec095b1490d"
+source = "git+https://github.com/privacy-scaling-explorations/halo2?rev=198e9ae30d322cd0ad003b6955f91ec095b1490d#198e9ae30d322cd0ad003b6955f91ec095b1490d"
 dependencies = [
  "blake2b_simd",
  "ff",
@@ -3269,7 +3269,7 @@ dependencies = [
 [[package]]
 name = "halo2_middleware"
 version = "0.4.0"
-source = "git+https://github.com/privacy-scaling-explorations/halo2?branch=main#198e9ae30d322cd0ad003b6955f91ec095b1490d"
+source = "git+https://github.com/privacy-scaling-explorations/halo2?rev=198e9ae30d322cd0ad003b6955f91ec095b1490d#198e9ae30d322cd0ad003b6955f91ec095b1490d"
 dependencies = [
  "ff",
  "halo2curves",
@@ -3279,7 +3279,7 @@ dependencies = [
 [[package]]
 name = "halo2_proofs"
 version = "0.4.0"
-source = "git+https://github.com/privacy-scaling-explorations/halo2?branch=main#198e9ae30d322cd0ad003b6955f91ec095b1490d"
+source = "git+https://github.com/privacy-scaling-explorations/halo2?rev=198e9ae30d322cd0ad003b6955f91ec095b1490d#198e9ae30d322cd0ad003b6955f91ec095b1490d"
 dependencies = [
  "group",
  "halo2_backend",

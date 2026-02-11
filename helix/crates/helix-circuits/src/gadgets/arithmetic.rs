@@ -36,6 +36,12 @@ impl<F: Field> ArithmeticChip<F> {
         b: Column<Advice>,
         c: Column<Advice>,
     ) -> ArithmeticConfig {
+        // Enable equality on all advice columns so that copy constraints
+        // (constrain_equal) can be used across regions sharing these columns.
+        meta.enable_equality(a);
+        meta.enable_equality(b);
+        meta.enable_equality(c);
+
         let s_mul = meta.selector();
         let s_add = meta.selector();
 

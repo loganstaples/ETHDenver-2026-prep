@@ -15,7 +15,7 @@ use crate::gadgets::arithmetic::{ArithmeticChip, ArithmeticConfig};
 #[derive(Clone, Debug)]
 pub struct ReLUConfig<F: PrimeField, const RANGE: usize> {
     pub range: RangeConfig<F, RANGE>,
-    pub arithmetic: ArithmeticConfig, 
+    pub arithmetic: ArithmeticConfig,
     pub s_relu: Selector,
 }
 
@@ -31,33 +31,22 @@ impl<F: PrimeField, const RANGE: usize> ReLUChip<F, RANGE> {
         let arithmetic_chip = ArithmeticChip::new(config.arithmetic.clone());
         Self { config, range_chip, arithmetic_chip }
     }
-    
-    fn enforce_sum(&self, mut layouter: impl Layouter<F>, a: Value<F>, b: Value<F>, c: Value<F>) -> Result<(), ErrorFront> {
-        layouter.assign_region(
-            || "enforce sum",
-            |mut region| {
-                self.config.arithmetic.s_add.enable(&mut region, 0)?;
-                region.assign_advice(|| "a", self.config.arithmetic.a, 0, || a)?;
-                region.assign_advice(|| "b", self.config.arithmetic.b, 0, || b)?;
-                region.assign_advice(|| "c", self.config.arithmetic.c, 0, || c)?;
-                Ok(())
-            }
-        )
-    }
 
-    fn enforce_product(&self, mut layouter: impl Layouter<F>, a: Value<F>, b: Value<F>, c: Value<F>) -> Result<(), ErrorFront> {
-        layouter.assign_region(
-            || "enforce product",
-            |mut region| {
-                self.config.arithmetic.s_mul.enable(&mut region, 0)?;
-                region.assign_advice(|| "a", self.config.arithmetic.a, 0, || a)?;
-                region.assign_advice(|| "b", self.config.arithmetic.b, 0, || b)?;
-                region.assign_advice(|| "c", self.config.arithmetic.c, 0, || c)?;
-                Ok(())
-            }
-        )
-    }
-
+    /// Assigns a bounded ReLU activation in a single region.
+    ///
+    /// Sound ReLU decomposition:
+    ///   x + neg = y        (decomposition)
+    ///   y * neg = 0         (exactly one of y, neg is zero)
+    ///   range_check(y)      (y >= 0)
+    ///   range_check(neg)    (neg >= 0)
+    ///
+    /// Error propagation:
+    ///   err_x + err_diff = err_y
+    ///   y * err_diff = 0    (if y != 0, err_diff = 0 => err_y = err_x)
+    ///   range_check(err_y)
+    ///
+    /// All constraints are in a single region with copy constraints binding
+    /// shared values (val_y, neg, err_diff) across different gate rows.
     pub fn assign(
         &self,
         mut layouter: impl Layouter<F>,
@@ -66,77 +55,75 @@ impl<F: PrimeField, const RANGE: usize> ReLUChip<F, RANGE> {
         val_y: Value<F>,
         err_y: Value<F>,
     ) -> Result<(), ErrorFront> {
-        // Sound ReLU decomposition:
-        //   x + neg = y        (decomposition)
-        //   y * neg = 0        (exactly one of y, neg is zero)
-        //   range_check(y)     (y >= 0)
-        //   range_check(neg)   (neg >= 0)
-        //
-        // If x >= 0: y = x, neg = 0
-        // If x < 0:  y = 0, neg = -x
-        //
-        // The old constraint `y * (y - x) = 0` was unsound because
-        // a malicious prover could always set y = x (identity), bypassing ReLU.
-
         let zero = Value::known(F::ZERO);
-
-        // Compute neg = y - x (which equals 0 when x>=0, or -x when x<0)
         let neg = val_y - val_x;
+        let err_diff = err_y - err_x;
 
-        // 1. x + neg = y (decomposition constraint)
-        self.enforce_sum(layouter.namespace(|| "x + neg = y"), val_x, neg, val_y)?;
-
-        // 2. y * neg = 0 (disjointness: at most one is nonzero)
-        self.enforce_product(layouter.namespace(|| "y * neg = 0"), val_y, neg, zero)?;
-
-        // 3. Range check y (ensures y >= 0, prevents prover from using negative y)
         layouter.assign_region(
-            || "range check relu y",
+            || "bounded_relu_all",
             |mut region| {
-                self.config.range.s_range.enable(&mut region, 0)?;
-                region.assign_advice(
-                    || "val_y",
+                // Row 0: x + neg = y (decomposition)
+                self.config.arithmetic.s_add.enable(&mut region, 0)?;
+                region.assign_advice(|| "val_x", self.config.arithmetic.a, 0, || val_x)?;
+                let neg_0 = region.assign_advice(|| "neg", self.config.arithmetic.b, 0, || neg)?;
+                let val_y_0 = region.assign_advice(|| "val_y", self.config.arithmetic.c, 0, || val_y)?;
+
+                // Row 1: y * neg = 0 (disjointness)
+                self.config.arithmetic.s_mul.enable(&mut region, 1)?;
+                let val_y_1 = region.assign_advice(|| "val_y_1", self.config.arithmetic.a, 1, || val_y)?;
+                let neg_1 = region.assign_advice(|| "neg_1", self.config.arithmetic.b, 1, || neg)?;
+                region.assign_advice(|| "zero", self.config.arithmetic.c, 1, || zero)?;
+
+                // Copy constraints: val_y and neg must be consistent across rows 0 and 1
+                region.constrain_equal(val_y_0.cell(), val_y_1.cell())?;
+                region.constrain_equal(neg_0.cell(), neg_1.cell())?;
+
+                // Row 2: range check y (y >= 0)
+                self.config.range.s_range.enable(&mut region, 2)?;
+                let val_y_2 = region.assign_advice(
+                    || "val_y_range",
                     self.config.range.input_column,
-                    0,
+                    2,
                     || val_y,
                 )?;
-                Ok(())
-            },
-        )?;
+                region.constrain_equal(val_y_0.cell(), val_y_2.cell())?;
 
-        // 4. Range check neg (ensures neg >= 0, prevents prover from using negative neg)
-        layouter.assign_region(
-            || "range check relu neg",
-            |mut region| {
-                self.config.range.s_range.enable(&mut region, 0)?;
-                region.assign_advice(
-                    || "neg",
+                // Row 3: range check neg (neg >= 0)
+                self.config.range.s_range.enable(&mut region, 3)?;
+                let neg_3 = region.assign_advice(
+                    || "neg_range",
                     self.config.range.input_column,
-                    0,
+                    3,
                     || neg,
                 )?;
-                Ok(())
-            },
-        )?;
+                region.constrain_equal(neg_0.cell(), neg_3.cell())?;
 
-        // 5. Error propagation: if y != 0 then err_y = err_x, else err_y = 0
-        //    err_x + err_diff = err_y
-        //    y * err_diff = 0 (if y != 0, err_diff must be 0 => err_y = err_x)
-        let err_diff = err_y - err_x;
-        self.enforce_sum(layouter.namespace(|| "err_diff"), err_x, err_diff, err_y)?;
-        self.enforce_product(layouter.namespace(|| "y * err_diff = 0"), val_y, err_diff, zero)?;
+                // Row 4: err_x + err_diff = err_y (error decomposition)
+                self.config.arithmetic.s_add.enable(&mut region, 4)?;
+                region.assign_advice(|| "err_x", self.config.arithmetic.a, 4, || err_x)?;
+                let err_diff_4 = region.assign_advice(|| "err_diff", self.config.arithmetic.b, 4, || err_diff)?;
+                let err_y_4 = region.assign_advice(|| "err_y", self.config.arithmetic.c, 4, || err_y)?;
 
-        // 6. Range check error output
-        layouter.assign_region(
-            || "range check relu err",
-            |mut region| {
-                self.config.range.s_range.enable(&mut region, 0)?;
-                region.assign_advice(
-                    || "err_y",
+                // Row 5: y * err_diff = 0 (if y != 0 then err_diff must be 0)
+                self.config.arithmetic.s_mul.enable(&mut region, 5)?;
+                let val_y_5 = region.assign_advice(|| "val_y_5", self.config.arithmetic.a, 5, || val_y)?;
+                let err_diff_5 = region.assign_advice(|| "err_diff_5", self.config.arithmetic.b, 5, || err_diff)?;
+                region.assign_advice(|| "zero_5", self.config.arithmetic.c, 5, || zero)?;
+
+                // Copy constraints: val_y and err_diff consistent across rows 4-5
+                region.constrain_equal(val_y_0.cell(), val_y_5.cell())?;
+                region.constrain_equal(err_diff_4.cell(), err_diff_5.cell())?;
+
+                // Row 6: range check err_y
+                self.config.range.s_range.enable(&mut region, 6)?;
+                let err_y_6 = region.assign_advice(
+                    || "err_y_range",
                     self.config.range.input_column,
-                    0,
+                    6,
                     || err_y,
                 )?;
+                region.constrain_equal(err_y_4.cell(), err_y_6.cell())?;
+
                 Ok(())
             },
         )?;

@@ -177,9 +177,9 @@ fn bytes_to_fr(bytes: &[u8; 32]) -> Fr {
     repr.copy_from_slice(bytes);
     // Clear top 3 bits to keep value below 2^253, well within BN254 scalar field modulus
     repr[31] &= 0x1F;
-    // Note: after masking, value is < 2^253 < p (BN254 scalar modulus), so this always succeeds.
-    // unwrap_or(ZERO) is a defensive fallback that should never trigger in practice.
-    Fr::from_repr_vartime(repr.into()).unwrap_or(Fr::ZERO)
+    // After masking, value is < 2^253 < p (BN254 scalar modulus), so this always succeeds.
+    Fr::from_repr_vartime(repr.into())
+        .expect("bytes_to_fr: value must be valid Fr (top bits already cleared)")
 }
 
 // ---------------------------------------------------------------------------

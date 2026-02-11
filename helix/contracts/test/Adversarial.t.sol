@@ -783,8 +783,11 @@ contract AdversarialTest is Test {
         coordinator.submitProof(modelId, 1, largeProof, inputs);
         uint256 gasUsed = gasBefore - gasleft();
 
-        // Should use reasonable gas (less than 2M for verification failure path)
-        assertLt(gasUsed, 2_000_000);
+        // Should use reasonable gas (less than 10M for verification failure path).
+        // Poseidon checksum computation is more expensive than SHA-256 (~8M gas
+        // for 65 rounds of on-chain constant derivation), but provides ZK-friendly
+        // hash alignment with the circuit.
+        assertLt(gasUsed, 10_000_000);
     }
 
     // ============ Advanced Slashing Scenarios ============

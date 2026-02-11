@@ -85,13 +85,14 @@ impl<F: PrimeField, const RANGE: usize> ReLULookup<F, RANGE> {
 
     /// Computes ReLU with field representation.
     pub fn compute_field(x: F) -> F {
-        // Check if x is "negative" (in the upper half of the field)
+        // Check if x is "negative" (in the upper half of the field).
+        // For BN254, the modulus p starts with byte 0x30 at repr[31].
+        // Values > p/2 have repr[31] >= 0x19 (since p/2 ≈ 0x18...).
+        // The old check `bytes[31] & 0x80 != 0` was ALWAYS FALSE
+        // because BN254 field elements have repr[31] <= 0x30.
         let repr = x.to_repr();
         let bytes = repr.as_ref();
-
-        // For bn256, check if value > (p-1)/2
-        // Simplified: just check the high bit of the last byte
-        let is_negative = bytes[31] & 0x80 != 0;
+        let is_negative = bytes[31] >= 0x19;
 
         if is_negative {
             F::ZERO

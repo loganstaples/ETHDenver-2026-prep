@@ -3,6 +3,7 @@ pragma solidity ^0.8.19;
 
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "../interfaces/IHelixVerifier.sol";
+import "../verification/PoseidonHasher.sol";
 import "../token/Staking.sol";
 import "../token/Rewards.sol";
 import "../core/ModelRegistry.sol";
@@ -488,53 +489,15 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
     // ============ Error Checksum ============
 
     /// @notice Computes the expected error checksum for verification
-    /// @dev Matches Rust: SHA256(errorBound_LE64 || stepNumber_LE64 || modelId_32bytes || errorBudget_LE64)
+    /// @dev Matches the Rust circuit implementation using Poseidon hash:
+    ///      checksum = Poseidon(Poseidon(errorBound, stepNumber), Poseidon(modelId, errorBudget))
     function _computeErrorChecksum(
         uint256 errorBound,
         uint256 stepNumber,
         uint256 modelId,
         uint256 errorBudget
     ) internal pure returns (uint256) {
-        bytes memory data = new bytes(56);
-        assembly {
-            let ptr := add(data, 32)
-
-            // Write errorBound as LE u64
-            let eb := and(errorBound, 0xFFFFFFFFFFFFFFFF)
-            eb := or(and(shr(8, eb), 0x00FF00FF00FF00FF), shl(8, and(eb, 0x00FF00FF00FF00FF)))
-            eb := or(and(shr(16, eb), 0x0000FFFF0000FFFF), shl(16, and(eb, 0x0000FFFF0000FFFF)))
-            eb := or(shr(32, eb), shl(32, and(eb, 0x00000000FFFFFFFF)))
-            mstore(ptr, shl(192, eb))
-
-            // Write stepNumber as LE u64
-            let sn := and(stepNumber, 0xFFFFFFFFFFFFFFFF)
-            sn := or(and(shr(8, sn), 0x00FF00FF00FF00FF), shl(8, and(sn, 0x00FF00FF00FF00FF)))
-            sn := or(and(shr(16, sn), 0x0000FFFF0000FFFF), shl(16, and(sn, 0x0000FFFF0000FFFF)))
-            sn := or(shr(32, sn), shl(32, and(sn, 0x00000000FFFFFFFF)))
-            mstore(add(ptr, 8), shl(192, sn))
-
-            // Write modelId as 32 bytes
-            mstore(add(ptr, 16), modelId)
-
-            // Write errorBudget as LE u64
-            let bg := and(errorBudget, 0xFFFFFFFFFFFFFFFF)
-            bg := or(and(shr(8, bg), 0x00FF00FF00FF00FF), shl(8, and(bg, 0x00FF00FF00FF00FF)))
-            bg := or(and(shr(16, bg), 0x0000FFFF0000FFFF), shl(16, and(bg, 0x0000FFFF0000FFFF)))
-            bg := or(shr(32, bg), shl(32, and(bg, 0x00000000FFFFFFFF)))
-            mstore(add(ptr, 48), shl(192, bg))
-        }
-
-        bytes32 hash = sha256(data);
-
-        uint256 result;
-        assembly {
-            let be := shr(192, hash)
-            be := or(and(shr(8, be), 0x00FF00FF00FF00FF), shl(8, and(be, 0x00FF00FF00FF00FF)))
-            be := or(and(shr(16, be), 0x0000FFFF0000FFFF), shl(16, and(be, 0x0000FFFF0000FFFF)))
-            be := or(shr(32, be), shl(32, and(be, 0x00000000FFFFFFFF)))
-            result := be
-        }
-        return result;
+        return PoseidonHasher.computeErrorChecksum(errorBound, stepNumber, modelId, errorBudget);
     }
 
     // ============ Internal Helpers ============

@@ -53,7 +53,8 @@ pub fn get_round_constants() -> &'static Vec<[Fr; POSEIDON_WIDTH]> {
                 repr.copy_from_slice(&hash);
                 // Clear top bits to ensure value < BN254 scalar modulus (~254 bits)
                 repr[31] &= 0x1F;
-                rc[i] = Fr::from_repr_vartime(repr.into()).unwrap_or(Fr::ZERO);
+                rc[i] = Fr::from_repr_vartime(repr.into())
+                    .expect("Poseidon round constant must be valid Fr (top bits already cleared)");
             }
             constants.push(rc);
         }

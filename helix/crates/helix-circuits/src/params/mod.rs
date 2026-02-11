@@ -5,7 +5,6 @@
 //! - Proving and verification key management
 //! - Circuit-specific parameter profiles
 //! - Key caching and serialization
-//! - Circuit optimization and proof size estimation
 //!
 //! # Overview
 //!
@@ -26,18 +25,10 @@
 //! │  │  - Verification key extraction and serialization          │  │
 //! │  │  - Key bundles and caching                                │  │
 //! │  └──────────────────────────────────────────────────────────┘  │
-//! │                              ↓                                   │
-//! │  ┌──────────────────────────────────────────────────────────┐  │
-//! │  │                 optimization.rs                           │  │
-//! │  │  - Circuit constraint optimization                        │  │
-//! │  │  - Proof size estimation                                  │  │
-//! │  │  - Benchmark suite for model architectures                │  │
-//! │  └──────────────────────────────────────────────────────────┘  │
 //! └─────────────────────────────────────────────────────────────────┘
 //! ```
 
 pub mod keys;
-pub mod optimization;
 pub mod setup;
 
 // Re-export key types from setup
@@ -105,26 +96,3 @@ pub use keys::{
     VK_MAGIC,
 };
 
-// Re-export optimization types
-pub use optimization::{
-    // Analysis
-    CircuitAnalysis,
-
-    // Optimization
-    CircuitOptimizer,
-    OptimizationPass,
-    OptimizationResult,
-    OptimizationSummary,
-
-    // Proof size estimation
-    ProofSizeEstimator,
-    ProofSizeEstimate,
-
-    // Model configuration
-    ModelConfig,
-
-    // Benchmarking
-    CircuitBenchmarkSuite,
-    BenchmarkResult as OptBenchmarkResult,
-    BenchmarkReport,
-};

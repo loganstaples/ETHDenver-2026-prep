@@ -14,7 +14,7 @@ cuda = []  # CUDA backend - requires NVCC and CUDA Toolkit
 helix-core = { path = "../helix-core" }
 helix-avm = { path = "../helix-avm" }
 helix-circuits = { path = "../helix-circuits" }
-halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2", branch = "main" }
+halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2", rev = "198e9ae30d322cd0ad003b6955f91ec095b1490d" }
 halo2curves = "0.7.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

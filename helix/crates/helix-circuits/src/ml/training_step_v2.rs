@@ -51,7 +51,7 @@ use halo2curves::ff::PrimeField;
 use halo2curves::group::Curve;
 use sha2::{Digest, Sha256};
 
-use crate::gadgets::poseidon::{poseidon_hash_two, poseidon_hash_many, PoseidonCircuitConfig, synthesize_poseidon_hash};
+use crate::gadgets::poseidon::{poseidon_hash_two, poseidon_hash_many, PoseidonCircuitConfig, synthesize_poseidon_hash, POSEIDON_CIRCUIT_ROWS};
 
 use crate::verifier::{
     EvmProof, EvmPublicInputsArray,
@@ -455,7 +455,8 @@ impl MLTrainingStepV2Witness {
         let mut repr = [0u8; 32];
         repr.copy_from_slice(&self.model_id);
         repr[31] &= 0x1F;
-        let model_id_fr = Fr::from_repr_vartime(repr.into()).unwrap_or(Fr::ZERO);
+        let model_id_fr = Fr::from_repr_vartime(repr.into())
+            .expect("model_id must be valid Fr element (top bits already cleared)");
 
         let h1 = poseidon_hash_two(self.total_error, step_number_fr);
         let h2 = poseidon_hash_two(model_id_fr, self.error_budget);
@@ -753,6 +754,82 @@ impl MLTrainingStepV2Circuit {
             self.exp_range, self.exp_scale,
             w.d_in * w.d_hid + w.d_hid + w.d_out * w.d_hid + w.d_out
         )
+    }
+
+    /// Estimates the minimum k (log2 of circuit rows) required for this model size.
+    ///
+    /// The circuit row count depends on:
+    /// - Public inputs: NUM_PUBLIC_INPUTS rows
+    /// - Forward pass: matmul + bias + ReLU per layer
+    /// - Loss computation: d_out * 3 rows
+    /// - Backward pass: gradient computations
+    /// - Weight updates: 2 rows per weight
+    /// - Error checksum: 3 Poseidon hashes (~2,292 rows)
+    /// - Lookup tables: 2 * relu_range + 2 * exp_range rows
+    /// - Margin: 20% overhead for region padding
+    pub fn minimum_k(&self) -> u32 {
+        let w = &self.witness;
+        let d_in = w.d_in;
+        let d_hid = w.d_hid;
+        let d_out = w.d_out;
+
+        // Forward pass layer 1
+        let fwd_l1 = if self.use_freivalds {
+            d_hid // Freivalds equality checks (1 row each)
+        } else {
+            d_hid * d_in + d_hid * (d_in - 1) // dot products: muls + adds
+        };
+        let bias_relu_l1 = d_hid * 2; // bias add + relu per hidden unit
+
+        // Forward pass layer 2
+        let fwd_l2 = if self.use_freivalds {
+            d_out
+        } else {
+            d_out * d_hid + d_out * (d_hid - 1)
+        };
+        let bias_l2 = d_out;
+
+        // Loss computation
+        let loss_rows = d_out * 3 + d_out.saturating_sub(1) + 1; // sub + sq + acc + eq
+
+        // Backward pass
+        let backward_dy = d_out * 2; // scale + eq
+        let backward_dw2 = d_out * d_hid * 2; // mul + eq
+        let backward_db2 = d_out;
+        let backward_dh = d_hid * d_out + d_hid * d_out.saturating_sub(1); // mul + add
+        let backward_relu_mask = d_hid;
+        let backward_dw1 = d_hid * d_in * 2;
+        let backward_db1 = d_hid;
+
+        // Weight updates
+        let total_weights = d_hid * d_in + d_hid + d_out * d_hid + d_out;
+        let weight_update_rows = total_weights * 2; // mul (lr * grad) + sub (w - update)
+
+        // Error checksum (3 Poseidon hashes)
+        let poseidon_rows = 3 * POSEIDON_CIRCUIT_ROWS;
+
+        // Lookup tables
+        let lookup_rows = 2 * self.relu_range + 2 * self.exp_range;
+
+        // PI binding
+        let pi_rows = NUM_PUBLIC_INPUTS;
+
+        let total = pi_rows + fwd_l1 + bias_relu_l1 + fwd_l2 + bias_l2
+            + loss_rows + backward_dy + backward_dw2 + backward_db2
+            + backward_dh + backward_relu_mask + backward_dw1 + backward_db1
+            + weight_update_rows + poseidon_rows + lookup_rows;
+
+        // Add 20% margin for region padding and unused rows
+        let with_margin = (total as f64 * 1.2) as usize;
+
+        // k = ceil(log2(with_margin))
+        let mut k = 1u32;
+        while (1usize << k) < with_margin {
+            k += 1;
+        }
+
+        // Minimum k=10 for halo2 basic operation
+        k.max(10)
     }
 
     /// Returns the public inputs in EVM-compatible format.
@@ -1341,8 +1418,14 @@ pub(crate) fn verify_matmul_freivalds(
 /// Full fix (in-circuit error accumulation across all ops) would approximately
 /// double the circuit size and is out of scope for the current implementation.
 ///
-/// The ReLU lookup range check below ensures the value is at least within
-/// [0, RELU_HALF_RANGE), preventing clearly bogus values like 0 or huge numbers.
+/// PI[5] (total_error) is indirectly constrained via PI[7]'s Poseidon hash:
+/// changing total_error changes the checksum, which is fully constrained
+/// in-circuit by `verify_error_checksum`. A prover cannot modify PI[5]
+/// without also computing a valid Poseidon hash for PI[7].
+///
+/// The previous ReLU lookup range check has been removed because it
+/// restricted total_error to [0, 128), which is too small for models
+/// larger than 2x2x1 where accumulated error routinely exceeds 128.
 pub(crate) fn verify_error_bound(
     config: &MLTrainingStepV2Config,
     layouter: &mut impl Layouter<Fr>,
@@ -1352,15 +1435,8 @@ pub(crate) fn verify_error_bound(
     layouter.assign_region(
         || label.to_string(),
         |mut region| {
-            // Assign the total_error witness value
+            // Assign the total_error witness value to advice for PI binding.
             region.assign_advice(|| "total_error", config.advice[0], 0, || Value::known(total_error))?;
-
-            // Enable ReLU lookup on the cell to enforce it's within [0, RELU_HALF_RANGE).
-            // This prevents a malicious prover from setting PI[5] to 0 or an absurdly
-            // large value. It does NOT prove the value equals the real accumulated error.
-            config.s_relu.enable(&mut region, 0)?;
-            region.assign_advice(|| "total_error_relu_out", config.advice[1], 0, || Value::known(total_error))?;
-
             Ok(())
         },
     )
@@ -1393,7 +1469,8 @@ pub(crate) fn verify_error_checksum(
     let mut repr = [0u8; 32];
     repr.copy_from_slice(&witness.model_id);
     repr[31] &= 0x1F;
-    let model_id_fr = Fr::from_repr_vartime(repr.into()).unwrap_or(Fr::ZERO);
+    let model_id_fr = Fr::from_repr_vartime(repr.into())
+        .expect("model_id must be valid Fr element (top bits already cleared)");
 
     // Synthesize h1 = Poseidon(total_error, step_number)
     let _h1 = synthesize_poseidon_hash(
@@ -1652,7 +1729,8 @@ pub fn generate_freivalds_challenge(seed: u64, len: usize) -> Vec<Fr> {
         let mut repr = [0u8; 32];
         repr.copy_from_slice(&hash);
         repr[31] &= 0x1F;
-        let val = Fr::from_repr_vartime(repr.into()).unwrap_or(Fr::from((i + 1) as u64));
+        let val = Fr::from_repr_vartime(repr.into())
+            .expect("Freivalds challenge must be valid Fr (top bits already cleared)");
         result.push(val);
     }
 
@@ -2162,5 +2240,137 @@ mod tests {
         >(&verifier_params, &vk, &[vec![bad_pi]], &mut verifier_transcript);
 
         assert!(!verified, "proof must reject tampered public inputs");
+    }
+
+    #[test]
+    fn test_v2_wrong_error_bound_rejected() {
+        let (circuit, mut pi) = make_tiny_circuit_v2();
+        // Tamper with PI[5] (total_error / error bound)
+        pi[5] = Fr::from(0u64); // Claim zero error when there is nonzero error
+        let prover = MockProver::run(14, &circuit, vec![pi]).unwrap();
+        assert!(prover.verify().is_err(), "wrong error_bound PI[5] must be rejected");
+    }
+
+    #[test]
+    fn test_v2_wrong_step_number_rejected() {
+        let (circuit, mut pi) = make_tiny_circuit_v2();
+        // Tamper with PI[6] (step_number)
+        pi[6] = Fr::from(999u64); // Wrong step number
+        let prover = MockProver::run(14, &circuit, vec![pi]).unwrap();
+        assert!(prover.verify().is_err(), "wrong step_number PI[6] must be rejected");
+    }
+
+    #[test]
+    fn test_v2_wrong_old_hash_rejected() {
+        let (circuit, mut pi) = make_tiny_circuit_v2();
+        // Tamper with PI[0] (old state hash lo)
+        pi[0] = Fr::from(42u64);
+        let prover = MockProver::run(14, &circuit, vec![pi]).unwrap();
+        assert!(prover.verify().is_err(), "wrong old_hash PI[0] must be rejected");
+    }
+
+    #[test]
+    fn test_v2_wrong_new_hash_rejected() {
+        let (circuit, mut pi) = make_tiny_circuit_v2();
+        // Tamper with PI[2] (new state hash lo)
+        pi[2] = Fr::from(42u64);
+        let prover = MockProver::run(14, &circuit, vec![pi]).unwrap();
+        assert!(prover.verify().is_err(), "wrong new_hash PI[2] must be rejected");
+    }
+
+    #[test]
+    fn test_v2_wrong_loss_rejected() {
+        let (circuit, mut pi) = make_tiny_circuit_v2();
+        // Tamper with PI[4] (loss)
+        pi[4] = Fr::from(0u64); // Claim zero loss
+        let prover = MockProver::run(14, &circuit, vec![pi]).unwrap();
+        assert!(prover.verify().is_err(), "wrong loss PI[4] must be rejected");
+    }
+
+    #[test]
+    fn test_v2_minimum_k() {
+        let (circuit, _) = make_tiny_circuit_v2();
+        let k = circuit.minimum_k();
+        // For 2x2x1 model, k should be reasonable (10-14 range)
+        assert!(k >= 10, "minimum_k must be at least 10, got {}", k);
+        assert!(k <= 15, "minimum_k for tiny model should be <= 15, got {}", k);
+
+        // Verify the circuit actually works with this k
+        let (circuit2, pi) = make_tiny_circuit_v2();
+        let prover = MockProver::run(k, &circuit2, vec![pi]).unwrap();
+        prover.assert_satisfied();
+    }
+
+    #[test]
+    fn test_v2_3x3x2_model() {
+        let d_in = 3;
+        let d_hid = 3;
+        let d_out = 2;
+
+        let w1: Vec<Fr> = (0..d_hid * d_in).map(|i| Fr::from((i % 3 + 1) as u64)).collect();
+        let b1 = vec![Fr::from(0); d_hid];
+        let w2: Vec<Fr> = (0..d_out * d_hid).map(|i| Fr::from((i % 2 + 1) as u64)).collect();
+        let b2 = vec![Fr::from(0); d_out];
+
+        let x: Vec<Fr> = (0..d_in).map(|i| Fr::from((i + 1) as u64)).collect();
+        let target: Vec<Fr> = (0..d_out).map(|_| Fr::from(10u64)).collect();
+        let lr = Fr::from(1);
+        let base_error = Fr::from(1);
+
+        let old_hash = compute_state_hash_v2(&w1, &b1, &w2, &b2);
+        let witness = compute_witness_v2(
+            d_in, d_hid, d_out, &x, &target, &w1, &b1, &w2, &b2, lr,
+            old_hash, (Fr::ZERO, Fr::ZERO), 1, base_error,
+        );
+        let new_hash = compute_state_hash_v2(&witness.w1_new, &witness.b1_new, &witness.w2_new, &witness.b2_new);
+        let witness = compute_witness_v2(
+            d_in, d_hid, d_out, &x, &target, &w1, &b1, &w2, &b2, lr,
+            old_hash, new_hash, 1, base_error,
+        );
+
+        let pi = witness.public_inputs();
+        let circuit = MLTrainingStepV2Circuit {
+            witness,
+            relu_range: 128,
+            exp_range: 64,
+            exp_scale: 32,
+            use_freivalds: true,
+        };
+
+        let k = circuit.minimum_k().max(14);
+        let prover = MockProver::run(k, &circuit, vec![pi]).unwrap();
+        prover.assert_satisfied();
+    }
+
+    #[test]
+    fn test_v2_minimum_k_scaling() {
+        // Verify minimum_k increases with model size
+        let make_circuit = |d_in: usize, d_hid: usize, d_out: usize| -> MLTrainingStepV2Circuit {
+            let w1: Vec<Fr> = (0..d_hid * d_in).map(|i| Fr::from((i % 3 + 1) as u64)).collect();
+            let b1 = vec![Fr::from(0); d_hid];
+            let w2: Vec<Fr> = (0..d_out * d_hid).map(|i| Fr::from((i % 2 + 1) as u64)).collect();
+            let b2 = vec![Fr::from(0); d_out];
+            let x: Vec<Fr> = (0..d_in).map(|i| Fr::from((i + 1) as u64)).collect();
+            let target: Vec<Fr> = (0..d_out).map(|_| Fr::from(10u64)).collect();
+            let old_hash = compute_state_hash_v2(&w1, &b1, &w2, &b2);
+            let witness = compute_witness_v2(
+                d_in, d_hid, d_out, &x, &target, &w1, &b1, &w2, &b2,
+                Fr::from(1), old_hash, (Fr::ZERO, Fr::ZERO), 1, Fr::from(1),
+            );
+            MLTrainingStepV2Circuit {
+                witness,
+                relu_range: 128,
+                exp_range: 64,
+                exp_scale: 32,
+                use_freivalds: true,
+            }
+        };
+
+        let k_small = make_circuit(2, 2, 1).minimum_k();
+        let k_medium = make_circuit(4, 4, 2).minimum_k();
+        let k_large = make_circuit(8, 8, 4).minimum_k();
+
+        assert!(k_medium >= k_small, "medium model k ({}) >= small k ({})", k_medium, k_small);
+        assert!(k_large >= k_medium, "large model k ({}) >= medium k ({})", k_large, k_medium);
     }
 }

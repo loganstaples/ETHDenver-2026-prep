@@ -37,7 +37,11 @@ impl<F: PrimeField, const RANGE: usize> BoundedAddChip<F, RANGE> {
     }
 
     /// Assigns a bounded addition operation.
-    /// Returns the output value and error cells (though simplified here to just Result).
+    ///
+    /// All constraints are in a single region to ensure copy constraints
+    /// bind shared values across all gates. Previously, 3 separate regions
+    /// assigned err_c independently, allowing a malicious prover to use
+    /// different values for err_c in the error addition vs range check.
     pub fn assign(
         &self,
         mut layouter: impl Layouter<F>,
@@ -48,57 +52,35 @@ impl<F: PrimeField, const RANGE: usize> BoundedAddChip<F, RANGE> {
         val_c: Value<F>,
         err_c: Value<F>,
     ) -> Result<(), ErrorFront> {
-        // 1. Constrain value addition: val_a + val_b = val_c
         layouter.assign_region(
-            || "bounded add values",
+            || "bounded_add_all",
             |mut region| {
-                // Enable Addition selector
+                // Row 0: val_a + val_b = val_c
                 self.config.arithmetic.s_add.enable(&mut region, 0)?;
-
-                // Assign inputs/output
                 region.assign_advice(|| "val_a", self.config.arithmetic.a, 0, || val_a)?;
                 region.assign_advice(|| "val_b", self.config.arithmetic.b, 0, || val_b)?;
                 region.assign_advice(|| "val_c", self.config.arithmetic.c, 0, || val_c)?;
-                
-                Ok(())
-            },
-        )?;
 
-        // 2. Constrain error addition: err_a + err_b = err_c
-        layouter.assign_region(
-            || "bounded add errors",
-            |mut region| {
-                // Enable Addition selector
-                self.config.arithmetic.s_add.enable(&mut region, 0)?;
+                // Row 1: err_a + err_b = err_c
+                self.config.arithmetic.s_add.enable(&mut region, 1)?;
+                region.assign_advice(|| "err_a", self.config.arithmetic.a, 1, || err_a)?;
+                region.assign_advice(|| "err_b", self.config.arithmetic.b, 1, || err_b)?;
+                let err_c_1 = region.assign_advice(|| "err_c", self.config.arithmetic.c, 1, || err_c)?;
 
-                region.assign_advice(|| "err_a", self.config.arithmetic.a, 0, || err_a)?;
-                region.assign_advice(|| "err_b", self.config.arithmetic.b, 0, || err_b)?;
-                region.assign_advice(|| "err_c", self.config.arithmetic.c, 0, || err_c)?;
-                
-                Ok(())
-            },
-        )?;
-
-        // 3. Constrain error range
-        // We reuse the RangeChip logic.
-        // RangeChip usually expects to assign a cell itself or verify an existing one.
-        // My RangeChip impl uses a lookup.
-        // `RangeChip::load` loads the table.
-        // We need to make sure `err_c` is in the table.
-        // The current RangeConfig does: `meta.lookup(|meta| { let value = query_advice(input_column)... })`.
-        // This implies `input_column` is FIXED in the config.
-        // So we MUST put `err_c` into `input_column` to trigger the check.
-        
-        layouter.assign_region(
-            || "range check err_c",
-            |mut region| {
-                self.config.range.s_range.enable(&mut region, 0)?;
-                region.assign_advice(
-                    || "err_c copy for range",
+                // Row 2: range check err_c
+                self.config.range.s_range.enable(&mut region, 2)?;
+                let err_c_2 = region.assign_advice(
+                    || "err_c_range",
                     self.config.range.input_column,
-                    0,
+                    2,
                     || err_c,
                 )?;
+
+                // Copy constraint: err_c at row 1 (arithmetic output) must equal
+                // err_c at row 2 (range check input). This prevents a malicious
+                // prover from using different values.
+                region.constrain_equal(err_c_1.cell(), err_c_2.cell())?;
+
                 Ok(())
             },
         )?;
