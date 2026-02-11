@@ -1338,30 +1338,23 @@ pub(crate) fn verify_matmul_freivalds(
     r: &[Fr],       // Random vector of length n
     label: &str,
 ) -> Result<(), ErrorFront> {
-    // For the common case of matrix-vector multiplication (n=1),
-    // b is the vector and we verify A * b = c directly
+    // For the matrix-vector case (n=1), Freivalds randomness provides no
+    // benefit: the "random vector" r would be a scalar, and the check
+    // collapses to verifying each dot product directly. The old code
+    // computed y = A*b in witness-land and only constrained y[i] == c[i],
+    // which is circular when both sides come from the unconstrained witness.
+    //
+    // Fix: use verify_dot_product for each row, which creates real s_mul
+    // and s_add gates that constrain every multiplication and accumulation
+    // step. This is O(m*k) constraints — the same cost Freivalds would
+    // give for n=1 — but with full soundness instead of a vacuous check.
     if n == 1 {
-        // x = b (already a vector)
-        let x = b;
-
-        // Compute y = A * x (witness computation)
-        let mut y = vec![Fr::ZERO; m];
         for i in 0..m {
-            for j in 0..k {
-                y[i] += a[i * k + j] * x[j];
-            }
-        }
-
-        // Verify y[i] == c[i] for all i
-        for i in 0..m {
-            layouter.assign_region(
-                || format!("{}_freivalds_check_{}", label, i),
-                |mut region| {
-                    config.s_freivalds.enable(&mut region, 0)?;
-                    region.assign_advice(|| "y", config.advice[0], 0, || Value::known(y[i]))?;
-                    region.assign_advice(|| "c", config.advice[1], 0, || Value::known(c[i]))?;
-                    Ok(())
-                },
+            verify_dot_product(
+                config, layouter,
+                &a[i * k..(i + 1) * k], b,
+                c[i],
+                &format!("{}_n1_dot_{}", label, i),
             )?;
         }
     } else {

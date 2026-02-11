@@ -12,6 +12,9 @@ pub mod proof_aggregation;
 pub mod training_step_v2;
 pub mod transformer;
 
+#[cfg(test)]
+mod adversarial;
+
 pub use config::{
     TransformerConfig, TransformerConfigBuilder, TransformerBlockConfig,
     QuantizationConfig, QuantizationPrecision,
