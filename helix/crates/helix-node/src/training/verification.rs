@@ -155,7 +155,18 @@ pub struct VerificationStats {
 
 impl ProofVerifier {
     /// Creates a new proof verifier.
+    ///
+    /// Logs a loud warning if `StructuralOnly` policy is selected, since it
+    /// provides no cryptographic guarantees and should only be used in
+    /// development/testing with an explicit configuration override.
     pub fn new(config: VerificationConfig) -> Self {
+        if matches!(config.policy, VerificationPolicy::StructuralOnly) {
+            log::warn!(
+                "⚠ VerificationPolicy::StructuralOnly is active — proofs are NOT cryptographically \
+                 verified! This provides ZERO security and must only be used for development/testing. \
+                 Set policy to VerifyAll (the default) for production use."
+            );
+        }
         Self {
             config,
             prover: Arc::new(RwLock::new(None)),
@@ -166,6 +177,13 @@ impl ProofVerifier {
 
     /// Creates a proof verifier with a pre-initialized prover for the given model dimensions.
     pub fn with_model_dims(config: VerificationConfig, d_in: usize, d_hid: usize, d_out: usize) -> Self {
+        if matches!(config.policy, VerificationPolicy::StructuralOnly) {
+            log::warn!(
+                "⚠ VerificationPolicy::StructuralOnly is active — proofs are NOT cryptographically \
+                 verified! This provides ZERO security and must only be used for development/testing. \
+                 Set policy to VerifyAll (the default) for production use."
+            );
+        }
         let prover = MLTrainingProverV2::new(d_in, d_hid, d_out);
         Self {
             config,
@@ -1207,5 +1225,62 @@ mod tests {
         let results = filter.filter_gradients(&submissions);
         // All should be accepted when Krum can't run
         assert!(results.iter().all(|(_, r)| r.accepted));
+    }
+
+    #[test]
+    fn test_default_policy_is_verify_all() {
+        let policy = VerificationPolicy::default();
+        assert!(matches!(policy, VerificationPolicy::VerifyAll));
+
+        let config = VerificationConfig::default();
+        assert!(matches!(config.policy, VerificationPolicy::VerifyAll));
+    }
+
+    #[tokio::test]
+    async fn test_structural_only_requires_explicit_config() {
+        // Default config should NOT be StructuralOnly
+        let default_config = VerificationConfig::default();
+        assert!(
+            !matches!(default_config.policy, VerificationPolicy::StructuralOnly),
+            "Default policy must not be StructuralOnly"
+        );
+
+        // StructuralOnly can only be set via explicit config override
+        let explicit_config = VerificationConfig {
+            policy: VerificationPolicy::StructuralOnly,
+            ..Default::default()
+        };
+        assert!(matches!(explicit_config.policy, VerificationPolicy::StructuralOnly));
+
+        // Verify StructuralOnly actually accepts structural-only proofs (no Halo2)
+        let verifier = ProofVerifier::new(explicit_config);
+        let result = verifier.verify_gradient_proof(
+            &PeerId::random(),
+            1,
+            [1u8; 32],
+            0.05,
+            &[0xAB; 64], // Any 64+ byte blob passes structural checks
+        ).await;
+        assert!(result.is_valid, "StructuralOnly should accept any 64+ byte blob");
+    }
+
+    #[tokio::test]
+    async fn test_verify_all_rejects_random_blob() {
+        // With VerifyAll (default), random bytes should fail even if >= 64 bytes
+        let config = VerificationConfig {
+            model_dims: Some((4, 8, 2)),
+            ..Default::default()
+        };
+        assert!(matches!(config.policy, VerificationPolicy::VerifyAll));
+
+        let verifier = ProofVerifier::new(config);
+        let result = verifier.verify_gradient_proof(
+            &PeerId::random(),
+            1,
+            [1u8; 32],
+            0.05,
+            &[0xAB; 512], // Random bytes — not a valid Halo2 proof
+        ).await;
+        assert!(!result.is_valid, "VerifyAll must reject random bytes");
     }
 }

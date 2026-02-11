@@ -26,6 +26,10 @@ pub struct ReputationConfig {
     pub good_threshold: f64,
     /// Score threshold below which peer is banned.
     pub ban_threshold: f64,
+    /// Minimum reputation score required to participate in a training round.
+    /// Peers below this threshold are excluded from the current round but not
+    /// banned — they can recover reputation and rejoin later rounds.
+    pub min_round_reputation: f64,
     /// Decay rate per hour.
     pub decay_rate: f64,
     /// Recovery rate per hour when behaving well.
@@ -52,6 +56,7 @@ impl Default for ReputationConfig {
             max_score: 100.0,
             good_threshold: 60.0,
             ban_threshold: 10.0,
+            min_round_reputation: 50.0,
             decay_rate: 0.5,
             recovery_rate: 1.0,
             responsiveness_weight: 0.25,
@@ -300,6 +305,13 @@ impl PeerReputation {
         self.score >= self.config.good_threshold && !self.is_banned
     }
 
+    /// Returns whether this peer meets the minimum reputation to participate
+    /// in a training round. Unlike `is_good()`, this uses the stricter
+    /// `min_round_reputation` threshold and also checks ban status.
+    pub fn is_eligible_for_round(&self) -> bool {
+        !self.is_banned && self.score >= self.config.min_round_reputation
+    }
+
     /// Returns average latency.
     pub fn average_latency(&self) -> Option<Duration> {
         if self.recent_latencies.is_empty() {
@@ -491,6 +503,29 @@ impl ReputationManager {
             .filter(|(_, rep)| rep.is_good())
             .map(|(id, _)| id.clone())
             .collect()
+    }
+
+    /// Returns peers eligible to participate in the current training round.
+    /// A peer must meet `min_round_reputation` and not be banned.
+    pub fn eligible_for_round(&self) -> Vec<PeerId> {
+        self.reputations
+            .iter()
+            .filter(|(_, rep)| rep.is_eligible_for_round())
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// Checks whether a specific peer is eligible for the current training round.
+    /// Unknown peers are treated as eligible (they start at `initial_score` which
+    /// meets the default threshold).
+    pub fn is_peer_eligible(&self, peer_id: &PeerId) -> bool {
+        match self.reputations.get(peer_id) {
+            Some(rep) => rep.is_eligible_for_round(),
+            None => {
+                // Unknown peer — initial_score meets threshold by default
+                self.config.initial_score >= self.config.min_round_reputation
+            }
+        }
     }
 
     /// Returns peers sorted by reputation score.
@@ -695,5 +730,116 @@ mod tests {
 
         let avg = rep.average_latency().unwrap();
         assert_eq!(avg, Duration::from_millis(150));
+    }
+
+    #[test]
+    fn test_round_eligibility_default_threshold() {
+        let config = ReputationConfig::default();
+        assert_eq!(config.min_round_reputation, 50.0);
+
+        let mut manager = ReputationManager::new(config);
+
+        // New peer starts at 50.0 (= min_round_reputation), so eligible
+        let peer = PeerId::from_string("new-peer");
+        assert!(manager.is_peer_eligible(&peer));
+
+        // Unknown peer is also eligible (defaults to initial_score)
+        let unknown = PeerId::from_string("unknown");
+        assert!(manager.is_peer_eligible(&unknown));
+
+        // After one InvalidProof (-10 to validity, weighted 0.35 → score drops ~3.5)
+        manager.record_invalid_proof(&peer);
+        let score = manager.score(&peer);
+        assert!(score < 50.0, "Score should drop below 50 after InvalidProof, got {}", score);
+        assert!(!manager.is_peer_eligible(&peer),
+            "Peer with score {:.1} should be ineligible (threshold 50.0)", score);
+
+        // Peer should not be in eligible_for_round list
+        assert!(!manager.eligible_for_round().contains(&peer));
+    }
+
+    #[test]
+    fn test_round_eligibility_with_custom_threshold() {
+        let config = ReputationConfig {
+            min_round_reputation: 40.0,
+            ..Default::default()
+        };
+        let mut manager = ReputationManager::new(config);
+
+        let peer = PeerId::from_string("peer1");
+
+        // One InvalidProof: validity drops by 10, score drops ~3.5 (from 50.0 to ~46.5)
+        manager.record_invalid_proof(&peer);
+        assert!(manager.is_peer_eligible(&peer),
+            "With threshold 40, peer at score {:.1} should still be eligible",
+            manager.score(&peer));
+
+        // Multiple InvalidProof events: score keeps dropping
+        // After 5 events: validity dimension = 50 - 5*10 = 0, score = 0*0.35 + 50*0.65 = 32.5
+        for _ in 0..4 {
+            manager.record_invalid_proof(&peer);
+        }
+        let score = manager.score(&peer);
+        assert!(!manager.is_peer_eligible(&peer),
+            "After 5 InvalidProof events, peer at score {:.1} should be ineligible (threshold 40)", score);
+    }
+
+    #[test]
+    fn test_failed_verification_decreases_reputation() {
+        let config = ReputationConfig::default();
+        let mut manager = ReputationManager::new(config);
+
+        let peer = PeerId::from_string("bad-prover");
+        let initial_score = manager.score(&peer);
+
+        // Record invalid proof
+        manager.record_invalid_proof(&peer);
+        let score_after_one = manager.score(&peer);
+        assert!(score_after_one < initial_score,
+            "Score should decrease after InvalidProof: {} -> {}", initial_score, score_after_one);
+
+        // Record another invalid proof
+        manager.record_invalid_proof(&peer);
+        let score_after_two = manager.score(&peer);
+        assert!(score_after_two < score_after_one,
+            "Score should keep decreasing: {} -> {}", score_after_one, score_after_two);
+    }
+
+    #[test]
+    fn test_valid_proof_increases_reputation() {
+        let config = ReputationConfig::default();
+        let mut manager = ReputationManager::new(config);
+
+        let peer = PeerId::from_string("good-prover");
+        let initial_score = manager.score(&peer);
+
+        manager.record_valid_proof(&peer);
+        let score_after = manager.score(&peer);
+        assert!(score_after > initial_score,
+            "Score should increase after ValidProof: {} -> {}", initial_score, score_after);
+    }
+
+    #[test]
+    fn test_banned_peer_not_eligible_for_round() {
+        let config = ReputationConfig {
+            ban_threshold: 35.0,
+            ..Default::default()
+        };
+        let mut manager = ReputationManager::new(config);
+
+        let peer = PeerId::from_string("will-be-banned");
+
+        // Drive reputation below ban threshold with many InvalidProof events
+        for _ in 0..10 {
+            manager.record_invalid_proof(&peer);
+        }
+
+        // Peer should be banned
+        let rep = manager.get(&peer).unwrap();
+        assert!(rep.is_banned, "Peer should be banned after many invalid proofs");
+
+        // Banned peer should not be eligible for rounds
+        assert!(!manager.is_peer_eligible(&peer));
+        assert!(!manager.eligible_for_round().contains(&peer));
     }
 }
