@@ -462,6 +462,7 @@ fn test_benchmark_results_nan_safety() {
         5,
         0,
         samples,
+        false,
     );
     // Mean will be NaN due to NaN inputs, but the important thing is no panic
     assert!(!results.p50_ms.is_infinite());
@@ -476,6 +477,7 @@ fn test_benchmark_percentile_sorted() {
         10,
         0,
         samples,
+        false,
     );
 
     assert_eq!(results.min_ms, 1.0);

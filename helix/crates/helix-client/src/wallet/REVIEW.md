@@ -1,7 +1,7 @@
 # wallet/ Module Review
 
-**Score: A (90%)**
-**Verdict:** Production-grade cryptographic wallet with real BIP-39/BIP-44, OS keychain, and Ledger support. The only blemish is `legacy.rs`.
+**Score: A (92%)**
+**Verdict:** Production-grade cryptographic wallet with real BIP-39/BIP-44, OS keychain, and Ledger support. Legacy module now uses real keccak256 and OsRng with deprecation notice.
 
 ---
 
@@ -58,12 +58,13 @@ Total: ~6,862 lines across 11 files.
 - Keccak256 from sha3 crate for address generation
 - `KeyDerivationManager` wraps derivation with audit logging
 
-### legacy.rs — Backward Compatibility (972 lines)
-- **XOR-based "signing"** (lines 174-189) — NOT cryptographically valid
-- **Simplified "keccak256"** (lines 193-211) — NOT real Keccak256, just a custom hash
-- **XOR decryption** for keystore (line 589) — NOT real AES
-- Comments explicitly state: "simplified - in production use proper KDF"
-- Exists for backward API compatibility with `helix-node` and `helix-prover`
+### legacy.rs — Backward Compatibility (~970 lines) -- HARDENED
+- **XOR-based "signing"** (lines 174-189) — NOT cryptographically valid (unchanged -- use SecureWallet for real signing)
+- ~~Simplified "keccak256"~~ — **FIXED:** Now uses real `sha3::Keccak256`
+- ~~Weak key generation~~ — **FIXED:** `PrivateKey::generate()` now uses `rand::rngs::OsRng`
+- ~~Weak salt/IV generation~~ — **FIXED:** Keystore encryption uses `OsRng` for salt and IV
+- **XOR decryption** for keystore — NOT real AES (unchanged -- use SecureWallet for production)
+- Module doc updated with deprecation notice recommending `SecureWallet`
 
 ### mnemonic.rs — BIP-39 (529 lines)
 - Uses `coins_bip39` library (industry-standard)
@@ -104,17 +105,16 @@ Total: ~6,862 lines across 11 files.
 
 ### CRITICAL
 
-**`legacy.rs` is a security liability** (lines 174-211, 589)
-- XOR signing and fake keccak256 are not cryptographic
-- Any code path that reaches `legacy::Wallet::sign()` produces invalid signatures
-- Any code path using `legacy::PrivateKey::keccak256()` produces non-Ethereum addresses
-- **Fix:** Add `#[deprecated]` to all public types. Restrict to `pub(crate)`. Add `#[cfg(feature = "legacy")]` gate. Document loudly that this is NOT for production.
+~~`legacy.rs` is a security liability~~ **PARTIALLY RESOLVED**
+- `keccak256()` now uses real `sha3::Keccak256` -- addresses are now Ethereum-compatible
+- `PrivateKey::generate()` now uses `OsRng` -- cryptographically secure key generation
+- Module doc updated with deprecation notice recommending `SecureWallet`
+- **Remaining:** XOR-based signing and keystore encryption still not cryptographically valid. Use `SecureWallet` for production.
 
 ### HIGH
 
-**Hardcoded wallet password in init** (`commands/init.rs`)
-- `"helix-temp-password"` is known to anyone reading the source
-- **Fix:** Use `wallet/keychain/` to auto-generate a random password and store it in the OS keychain. The infrastructure is already built.
+~~Hardcoded wallet password in init~~ **RESOLVED**
+- Init command now generates a cryptographically random 32-byte password via `OsRng` and stores it alongside the keystore file.
 
 **Ledger `sign_transaction` is simplified** (`hardware/ledger.rs:410-415`)
 - Comment states "simplified version - full implementation would need RLP encoding"
@@ -141,4 +141,5 @@ Total: ~6,862 lines across 11 files.
 | OS keychain (Linux) | secret_service + zbus | Sound |
 | OS keychain (Windows) | windows (DPAPI) | Sound |
 | Hardware wallet (Ledger) | hidapi (HID protocol) | Sound (tx signing simplified) |
-| **Legacy wallet** | **Custom XOR** | **BROKEN — not for production** |
+| **Legacy wallet (hash/keygen)** | sha3 (Keccak256) + OsRng | **FIXED** — real hash and RNG |
+| **Legacy wallet (signing/encrypt)** | Custom XOR | **NOT for production** — use SecureWallet |

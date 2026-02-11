@@ -640,13 +640,17 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Build a shared RPC client for commands that need it (connect or fall back to mock)
+    let rpc_config = rpc::client::HelixRpcConfig::default();
+    let rpc_client = Arc::new(rpc::client::UnifiedRpcClient::connect_or_mock(rpc_config).await);
+
     // Execute command
     let result = match &cli.command {
         Commands::Init(args) => cmd_init(args, &cli).await,
-        Commands::Join(args) => cmd_join(args, &cli).await,
-        Commands::Status(args) => cmd_status(args, &cli).await,
-        Commands::Query(args) => cmd_query(args, &cli).await,
-        Commands::Export(args) => cmd_export(args, &cli).await,
+        Commands::Join(args) => cmd_join(args, &cli, &rpc_client).await,
+        Commands::Status(args) => cmd_status(args, &cli, &rpc_client).await,
+        Commands::Query(args) => cmd_query(args, &cli, &rpc_client).await,
+        Commands::Export(args) => cmd_export(args, &cli, &rpc_client).await,
         Commands::Train(args) => cmd_train(args, &cli, shutdown_tx.subscribe()).await,
         Commands::Demo(args) => cmd_demo(args, &cli, shutdown_tx.subscribe()).await,
         Commands::Orchestrate(args) => cmd_orchestrate(args, &cli).await,
@@ -748,30 +752,97 @@ async fn cmd_init(args: &InitArgs, cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_join(args: &JoinArgs, _cli: &Cli) -> Result<()> {
+async fn cmd_join(args: &JoinArgs, _cli: &Cli, rpc: &rpc::client::UnifiedRpcClient) -> Result<()> {
     let mut progress = ProgressDisplay::new();
 
     println!("{}", "Joining HELIX training network...".cyan().bold());
     println!("  Coordinator: {}", args.coordinator);
     println!("  Model ID: {}", args.model_id);
 
-    if let Some(stake) = args.stake {
-        progress.start_spinner(&format!("Staking {} ETH...", stake));
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        progress.finish_spinner(&format!("Staked {} ETH successfully", stake));
+    // Connect and verify network
+    progress.start_spinner("Connecting to coordinator...");
+    let net_status = rpc.get_network_status().await;
+    match &net_status {
+        Ok(net) => {
+            progress.finish_spinner(&format!(
+                "Connected to coordinator (chain_id={}, block={})",
+                net.chain_id, net.block_height
+            ));
+        }
+        Err(_) => {
+            progress.finish_spinner("Connected to coordinator (mock mode)");
+        }
     }
 
-    progress.start_spinner("Connecting to coordinator...");
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    progress.finish_spinner("Connected to coordinator");
+    // Query model info
+    progress.start_spinner("Querying model info...");
+    let model = rpc.get_model(args.model_id).await;
+    match &model {
+        Ok(m) => {
+            progress.finish_spinner(&format!(
+                "Model '{}' found (round {}, min_stake {} ETH)",
+                m.name, m.current_round, m.min_stake
+            ));
+        }
+        Err(_) => {
+            progress.finish_spinner("Model info retrieved (mock mode)");
+        }
+    }
 
+    // Stake if requested
+    if let Some(stake) = args.stake {
+        progress.start_spinner(&format!("Staking {} ETH...", stake));
+        #[cfg(feature = "chain")]
+        {
+            if let Some(chain) = rpc.chain_client() {
+                match chain.stake(args.model_id, ethers::types::U256::from((stake * 1e18) as u64)).await {
+                    Ok(receipt) => {
+                        progress.finish_spinner(&format!(
+                            "Staked {} ETH (tx: 0x{}...)",
+                            stake,
+                            hex::encode(&receipt.transaction_hash.as_bytes()[..4])
+                        ));
+                    }
+                    Err(e) => {
+                        progress.finish_spinner(&format!("Stake simulated ({} ETH) — chain error: {}", stake, e));
+                    }
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                progress.finish_spinner(&format!("Staked {} ETH (mock)", stake));
+            }
+        }
+        #[cfg(not(feature = "chain"))]
+        {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            progress.finish_spinner(&format!("Staked {} ETH (mock)", stake));
+        }
+    }
+
+    // Discover peers
     progress.start_spinner("Discovering peers...");
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    progress.finish_spinner("Found 3 peers");
+    let workers = rpc.get_workers().await;
+    match &workers {
+        Ok(w) => {
+            let active = w.iter().filter(|w| w.status == rpc::client::WorkerStatus::Training || w.status == rpc::client::WorkerStatus::Idle).count();
+            progress.finish_spinner(&format!("Found {} peers ({} active)", w.len(), active));
+        }
+        Err(_) => {
+            progress.finish_spinner("Found peers (mock mode)");
+        }
+    }
 
+    // Sync model state
     progress.start_spinner("Syncing model state...");
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    progress.finish_spinner("Model state synced");
+    match &model {
+        Ok(m) => {
+            progress.finish_spinner(&format!("Model state synced (commitment: {}...)", &m.current_commitment[..18.min(m.current_commitment.len())]));
+        }
+        Err(_) => {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            progress.finish_spinner("Model state synced (mock)");
+        }
+    }
 
     println!("\n{}", "Successfully joined the training network!".green().bold());
     println!("  Capabilities: {:?}", args.capabilities);
@@ -780,188 +851,386 @@ async fn cmd_join(args: &JoinArgs, _cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_status(args: &StatusArgs, _cli: &Cli) -> Result<()> {
-    let display_status = || {
+async fn cmd_status(args: &StatusArgs, _cli: &Cli, rpc: &rpc::client::UnifiedRpcClient) -> Result<()> {
+    let display_status = |training: &Option<rpc::client::TrainingStatus>,
+                          network: &Option<rpc::client::NetworkStatus>,
+                          proof: &Option<rpc::client::ProofStatus>,
+                          staking: &Option<rpc::client::StakingInfo>,
+                          workers: &Option<Vec<rpc::client::WorkerInfo>>| {
         println!("{}", "═".repeat(60).cyan());
         println!("{}", " HELIX Network Status".cyan().bold());
         println!("{}", "═".repeat(60).cyan());
 
+        // Node / Network Status
         println!("\n{}", "Node Status:".yellow().bold());
-        println!("  Node ID:     helix-node-a1b2c3d4");
-        println!("  Status:      {} Online", "●".green());
-        println!("  Uptime:      2h 34m 12s");
-        println!("  Peers:       4 connected");
+        if let Some(net) = network {
+            println!("  Status:      {} {}", "●".green(), if net.blockchain_connected { "Online" } else { "Degraded" });
+            println!("  Peers:       {} connected", net.peer_count);
+            println!("  Chain:       {} (block {})", net.chain_id, net.block_height);
+            println!("  Latency:     {} ms", net.avg_latency_ms);
+        } else {
+            println!("  Status:      {} Online (mock)", "●".green());
+            println!("  Peers:       — (no RPC connection)");
+        }
 
+        // Training Status
         println!("\n{}", "Training Status:".yellow().bold());
         if let Some(model_id) = args.model_id {
             println!("  Model ID:    {}", model_id);
         }
-        println!("  Current Round:  42");
-        println!("  Round Status:   {} In Progress (67%)", "●".blue());
-        println!("  Proofs:         127 submitted, 125 verified");
-        println!("  Error Bound:    45.2 / 1000 max");
+        if let Some(t) = training {
+            let progress_pct = if t.total_rounds > 0 {
+                (t.current_round as f64 / t.total_rounds as f64) * 100.0
+            } else { 0.0 };
+            println!("  Active:         {} {}", if t.active { "●".green() } else { "●".red() }, if t.active { "Yes" } else { "No" });
+            println!("  Current Round:  {}/{}", t.current_round, t.total_rounds);
+            println!("  Round Status:   {} In Progress ({:.0}%)", "●".blue(), progress_pct);
+            println!("  Phase:          {}", t.phase.name());
+            println!("  Current Loss:   {:.4}", t.current_loss);
+            println!("  Error Bound:    {:.1} / {:.0} max", t.accumulated_error, t.max_error_bound);
+        } else {
+            println!("  (no training data available)");
+        }
 
+        // Proof Status
+        if let Some(p) = proof {
+            println!("\n{}", "Proof Status:".yellow().bold());
+            println!("  Phase:          {}", p.phase.name());
+            println!("  Progress:       {}%", p.progress_percent);
+            println!("  Constraints:    {}/{}", p.constraints_satisfied, p.total_constraints);
+            println!("  Error Bound:    {:.2}", p.error_bound);
+        }
+
+        // Staking
         println!("\n{}", "Staking:".yellow().bold());
-        println!("  Your Stake:     1.5 ETH");
-        println!("  Lock Status:    {} Locked (5d 12h remaining)", "●".yellow());
-        println!("  Reputation:     98%");
+        if let Some(s) = staking {
+            println!("  Your Stake:     {:.4} ETH", s.your_stake);
+            println!("  Total Staked:   {:.4} ETH", s.total_staked);
+            if s.is_locked {
+                println!("  Lock Status:    {} Locked", "●".yellow());
+            } else {
+                println!("  Lock Status:    {} Unlocked", "●".green());
+            }
+            println!("  Rewards:        {:.4} ETH pending", s.pending_rewards);
+        } else {
+            println!("  (no staking data available)");
+        }
 
+        // Detailed worker table
         if args.detailed {
-            println!("\n{}", "Connected Peers:".yellow().bold());
-            println!("  ┌─────────────────┬──────────┬────────────┐");
-            println!("  │ Peer ID         │ Status   │ Role       │");
-            println!("  ├─────────────────┼──────────┼────────────┤");
-            println!("  │ helix-node-e5f6 │ {} Active │ Worker     │", "●".green());
-            println!("  │ helix-node-g7h8 │ {} Active │ Worker     │", "●".green());
-            println!("  │ helix-node-i9j0 │ {} Active │ Aggregator │", "●".green());
-            println!("  │ helix-node-k1l2 │ {} Idle   │ Worker     │", "●".yellow());
-            println!("  └─────────────────┴──────────┴────────────┘");
+            if let Some(w) = workers {
+                println!("\n{}", "Connected Peers:".yellow().bold());
+                println!("  ┌─────────────────┬──────────┬────────────┬───────────┐");
+                println!("  │ Worker ID       │ Status   │ Stake      │ Reputation│");
+                println!("  ├─────────────────┼──────────┼────────────┼───────────┤");
+                for worker in w.iter().take(10) {
+                    let status_icon = match worker.status {
+                        rpc::client::WorkerStatus::Training | rpc::client::WorkerStatus::Idle => "●".green(),
+                        rpc::client::WorkerStatus::Faulted | rpc::client::WorkerStatus::Slashed => "●".red(),
+                        _ => "●".yellow(),
+                    };
+                    println!(
+                        "  │ {:15} │ {} {:6} │ {:>8.3} ETH│ {:>6.0}%   │",
+                        &worker.id[..15.min(worker.id.len())],
+                        status_icon,
+                        format!("{:?}", worker.status),
+                        worker.stake,
+                        worker.reputation * 100.0
+                    );
+                }
+                println!("  └─────────────────┴──────────┴────────────┴───────────┘");
+            }
         }
 
         println!("{}", "═".repeat(60).cyan());
     };
 
+    // Fetch all data from RPC (with graceful fallback)
+    let model_id = args.model_id.unwrap_or(0);
+    let fetch_all = || async {
+        let training = rpc.get_training_status().await.ok();
+        let network = rpc.get_network_status().await.ok();
+        let proof = rpc.get_proof_status().await.ok();
+        let staking = rpc.get_staking_info(model_id).await.ok();
+        let workers = rpc.get_workers().await.ok();
+        (training, network, proof, staking, workers)
+    };
+
     if args.watch {
         loop {
             print!("\x1B[2J\x1B[1;1H"); // Clear screen
-            display_status();
+            let (training, network, proof, staking, workers) = fetch_all().await;
+            display_status(&training, &network, &proof, &staking, &workers);
             println!("\nRefreshing every {}s... (Ctrl+C to stop)", args.interval);
             tokio::time::sleep(Duration::from_secs(args.interval)).await;
         }
     } else {
-        display_status();
+        let (training, network, proof, staking, workers) = fetch_all().await;
+        display_status(&training, &network, &proof, &staking, &workers);
     }
 
     Ok(())
 }
 
-async fn cmd_query(args: &QueryArgs, _cli: &Cli) -> Result<()> {
+async fn cmd_query(args: &QueryArgs, _cli: &Cli, rpc: &rpc::client::UnifiedRpcClient) -> Result<()> {
     match args.query_type {
         QueryType::Model => {
+            let model = rpc.get_model(args.model_id).await?;
             println!("{}", "Model Information".cyan().bold());
-            println!("  Model ID:          {}", args.model_id);
-            println!("  IPFS Hash:         QmXoYP...abc123");
-            println!("  Current Round:     42");
-            println!("  Current Commitment: 0x1234567890abcdef...");
-            println!("  Min Stake:         0.1 ETH");
-            println!("  Active:            {} Yes", "●".green());
-            println!("  Owner:             0x742d35Cc6634C053...");
+            println!("  Model ID:          {}", model.id);
+            println!("  Name:              {}", model.name);
+            println!("  IPFS Hash:         {}", model.ipfs_hash);
+            println!("  Architecture:      {}", model.architecture);
+            println!("  Parameters:        {}", model.parameter_count);
+            println!("  Current Round:     {}", model.current_round);
+            println!("  Current Commitment: {}...", &model.current_commitment[..20.min(model.current_commitment.len())]);
+            println!("  Min Stake:         {} ETH", model.min_stake);
+            println!("  Active:            {} {}", if model.training_active { "●".green() } else { "●".red() }, if model.training_active { "Yes" } else { "No" });
+            println!("  Owner:             {}...", &model.owner[..20.min(model.owner.len())]);
+            println!("  Error Bound:       {:.1}", model.accumulated_error);
         }
         QueryType::Round => {
-            let round_id = args.round_id.unwrap_or(42);
+            let round_id = args.round_id.unwrap_or(0);
+            let round = rpc.get_round(args.model_id, round_id).await?;
             println!("{}", "Round Information".cyan().bold());
-            println!("  Model ID:          {}", args.model_id);
-            println!("  Round ID:          {}", round_id);
-            println!("  Model Commitment:  0x1234567890abcdef...");
-            println!("  New Commitment:    0xfedcba0987654321...");
-            println!("  Completed:         {} Yes", "●".green());
-            println!("  Deadline:          2024-01-15 14:30:00 UTC");
-            println!("  Prover:            0x8626f6940E2eb289...");
+            println!("  Model ID:          {}", round.model_id);
+            println!("  Round ID:          {}", round.round_id);
+            println!("  Prev Commitment:   {}...", &round.prev_commitment[..20.min(round.prev_commitment.len())]);
+            if let Some(ref new_c) = round.new_commitment {
+                println!("  New Commitment:    {}...", &new_c[..20.min(new_c.len())]);
+            }
+            println!("  Completed:         {} {}", if round.completed { "●".green() } else { "●".blue() }, if round.completed { "Yes" } else { "In Progress" });
+            println!("  Proofs:            {} submitted, {} verified", round.proofs_submitted, round.proofs_verified);
+            println!("  Participants:      {}", round.participants.len());
+            if let Some(loss) = round.loss {
+                println!("  Loss:              {:.4}", loss);
+            }
+            if let Some(err) = round.error_delta {
+                println!("  Error Delta:       {:.2}", err);
+            }
         }
         QueryType::Stake => {
+            let staking = rpc.get_staking_info(args.model_id).await?;
             println!("{}", "Stake Information".cyan().bold());
             println!("  Model ID:          {}", args.model_id);
-            println!("  Your Address:      0x742d35Cc6634C053...");
-            println!("  Amount:            1.5 ETH");
-            println!("  Locked Until:      2024-01-20 12:00:00 UTC");
-            println!("  Slashed:           {} No", "●".green());
+            println!("  Your Stake:        {:.4} ETH", staking.your_stake);
+            println!("  Total Staked:      {:.4} ETH", staking.total_staked);
+            println!("  Locked:            {} {}", if staking.is_locked { "●".yellow() } else { "●".green() }, if staking.is_locked { "Yes" } else { "No" });
+            println!("  Pending Rewards:   {:.4} ETH", staking.pending_rewards);
+            println!("  Claimed Rewards:   {:.4} ETH", staking.total_rewards_claimed);
+            if !staking.slashing_events.is_empty() {
+                println!("  Slashing Events:   {}", staking.slashing_events.len());
+            } else {
+                println!("  Slashed:           {} No", "●".green());
+            }
         }
         QueryType::Proof => {
+            let proof = rpc.get_proof_status().await?;
             println!("{}", "Proof Information".cyan().bold());
             println!("  Model ID:          {}", args.model_id);
-            println!("  Round ID:          {}", args.round_id.unwrap_or(42));
-            println!("  Proof Hash:        0xabcdef1234567890...");
-            println!("  Prover:            0x8626f6940E2eb289...");
-            println!("  Verified:          {} Yes", "●".green());
-            println!("  Submitted:         2024-01-15 14:25:30 UTC");
+            println!("  Phase:             {}", proof.phase.name());
+            println!("  Generating:        {} {}", if proof.generating { "●".blue() } else { "●".green() }, if proof.generating { "Yes" } else { "No" });
+            println!("  Progress:          {}%", proof.progress_percent);
+            println!("  Constraints:       {}/{}", proof.constraints_satisfied, proof.total_constraints);
+            println!("  Elapsed:           {} ms", proof.elapsed_ms);
+            println!("  Error Bound:       {:.2}", proof.error_bound);
+            println!("  GPU Accelerated:   {}", if proof.gpu_accelerated { "Yes" } else { "No" });
         }
         QueryType::Error => {
+            let training = rpc.get_training_status().await?;
             println!("{}", "Error Bound Information".cyan().bold());
-            println!("  Model ID:          {}", args.model_id);
-            println!("  Accumulated Error: 45.2");
-            println!("  Max Allowed:       1000");
-            println!("  Status:            {} Acceptable", "●".green());
-            println!("  Rounds Tracked:    42");
+            println!("  Model ID:          {}", training.model_id);
+            println!("  Accumulated Error: {:.1}", training.accumulated_error);
+            println!("  Max Allowed:       {:.0}", training.max_error_bound);
+            let status = if training.accumulated_error < training.max_error_bound * 0.5 {
+                ("●".green(), "Acceptable")
+            } else if training.accumulated_error < training.max_error_bound * 0.9 {
+                ("●".yellow(), "Warning")
+            } else {
+                ("●".red(), "Critical")
+            };
+            println!("  Status:            {} {}", status.0, status.1);
+            println!("  Current Round:     {}", training.current_round);
         }
         QueryType::Worker => {
+            let workers = rpc.get_workers().await?;
             println!("{}", "Worker Information".cyan().bold());
-            println!("  Worker ID:         helix-node-a1b2c3d4");
-            println!("  Address:           0x742d35Cc6634C053...");
-            println!("  Status:            {} Active", "●".green());
-            println!("  Models:            [{}, ...]", args.model_id);
-            println!("  Total Stake:       2.5 ETH");
-            println!("  Reputation:        98%");
-            println!("  Proofs Verified:   125 / 127");
-            println!("  Total Rewards:     0.15 ETH");
+            if workers.is_empty() {
+                println!("  No workers found.");
+            }
+            for (i, w) in workers.iter().enumerate() {
+                if i > 0 { println!(); }
+                let status_icon = match w.status {
+                    rpc::client::WorkerStatus::Training | rpc::client::WorkerStatus::Idle => "●".green(),
+                    rpc::client::WorkerStatus::Faulted | rpc::client::WorkerStatus::Slashed => "●".red(),
+                    _ => "●".yellow(),
+                };
+                println!("  Worker ID:         {}", w.id);
+                println!("  Address:           {}...", &w.address[..20.min(w.address.len())]);
+                println!("  Status:            {} {:?}", status_icon, w.status);
+                println!("  Stake:             {:.4} ETH", w.stake);
+                println!("  Reputation:        {:.0}%", w.reputation * 100.0);
+                println!("  Proofs:            {} submitted, {} verified, {} rejected", w.proofs_submitted, w.proofs_verified, w.proofs_rejected);
+            }
         }
         QueryType::Aggregator => {
+            // Aggregator info comes from workers with aggregator role
+            let workers = rpc.get_workers().await?;
+            let network = rpc.get_network_status().await.ok();
             println!("{}", "Aggregator Information".cyan().bold());
-            println!("  Aggregator ID:     helix-agg-01");
-            println!("  Address:           0x5FbDB2315678...");
-            println!("  Status:            {} Active", "●".green());
-            println!("  Rounds Aggregated: 42");
-            println!("  Success Rate:      100%");
-            println!("  Avg Time:          150 ms");
-            println!("  Fees Collected:    0.042 ETH");
+            println!("  Active Aggregators: {}", network.map(|n| n.active_aggregators).unwrap_or(0));
+            for w in workers.iter().filter(|w| w.id.contains("agg")) {
+                println!("  ID:                {}", w.id);
+                println!("  Address:           {}...", &w.address[..20.min(w.address.len())]);
+                println!("  Status:            {} {:?}", "●".green(), w.status);
+            }
+            if workers.iter().filter(|w| w.id.contains("agg")).count() == 0 {
+                println!("  No aggregators found in worker list.");
+            }
         }
         QueryType::Metrics => {
+            let training = rpc.get_training_status().await.ok();
+            let proof = rpc.get_proof_status().await.ok();
+            let staking = rpc.get_staking_info(args.model_id).await.ok();
+            let network = rpc.get_network_status().await.ok();
+
             println!("{}", "Training Metrics".cyan().bold());
             println!("  Model ID:          {}", args.model_id);
             println!();
+
             println!("{}", "Training:".yellow());
-            println!("  Progress:          42/100 (42.0%)");
-            println!("  Avg Loss:          0.312 (improving)");
-            println!("  Avg Round Time:    2500 ms");
+            if let Some(t) = &training {
+                let pct = if t.total_rounds > 0 { (t.current_round as f64 / t.total_rounds as f64) * 100.0 } else { 0.0 };
+                println!("  Progress:          {}/{} ({:.1}%)", t.current_round, t.total_rounds, pct);
+                println!("  Current Loss:      {:.4}", t.current_loss);
+                println!("  Phase:             {}", t.phase.name());
+                println!("  Error Bound:       {:.1} / {:.0}", t.accumulated_error, t.max_error_bound);
+            } else {
+                println!("  (no training data)");
+            }
             println!();
+
             println!("{}", "Proofs:".yellow());
-            println!("  Generated:         127");
-            println!("  Verified:          125 (98.4%)");
-            println!("  Avg Proof Time:    1200 ms");
+            if let Some(p) = &proof {
+                println!("  Phase:             {}", p.phase.name());
+                println!("  Progress:          {}%", p.progress_percent);
+                println!("  Constraints:       {}/{}", p.constraints_satisfied, p.total_constraints);
+            } else {
+                println!("  (no proof data)");
+            }
             println!();
+
+            println!("{}", "Network:".yellow());
+            if let Some(n) = &network {
+                println!("  Peers:             {}", n.peer_count);
+                println!("  Workers:           {}", n.active_workers);
+                println!("  Aggregators:       {}", n.active_aggregators);
+                println!("  Avg Latency:       {} ms", n.avg_latency_ms);
+            } else {
+                println!("  (no network data)");
+            }
+            println!();
+
             println!("{}", "Economics:".yellow());
-            println!("  Total Stake:       6.0 ETH");
-            println!("  Total Rewards:     0.15 ETH");
-            println!("  Slashing Events:   0");
+            if let Some(s) = &staking {
+                println!("  Total Staked:      {:.4} ETH", s.total_staked);
+                println!("  Your Stake:        {:.4} ETH", s.your_stake);
+                println!("  Pending Rewards:   {:.4} ETH", s.pending_rewards);
+                println!("  Slashing Events:   {}", s.slashing_events.len());
+            } else {
+                println!("  (no staking data)");
+            }
         }
     }
 
     Ok(())
 }
 
-async fn cmd_export(args: &ExportArgs, _cli: &Cli) -> Result<()> {
+async fn cmd_export(args: &ExportArgs, _cli: &Cli, rpc: &rpc::client::UnifiedRpcClient) -> Result<()> {
     let mut progress = ProgressDisplay::new();
 
     std::fs::create_dir_all(&args.output)?;
 
     match args.export_type {
         ExportType::Model => {
-            progress.start_spinner("Exporting model weights...");
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            let path = args.output.join(format!("model_{}.pt", args.model_id));
+            progress.start_spinner("Fetching model data...");
+            let model = rpc.get_model(args.model_id).await.ok();
+            let training = rpc.get_training_status().await.ok();
+            let path = args.output.join(format!("model_{}.json", args.model_id));
+            let export_data = serde_json::json!({
+                "model": model,
+                "training_status": training,
+                "exported_at": chrono::Utc::now().to_rfc3339(),
+            });
+            std::fs::write(&path, serde_json::to_string_pretty(&export_data)?)?;
             progress.finish_spinner(&format!("Model exported to {}", path.display()));
         }
         ExportType::Proofs => {
-            progress.start_spinner("Exporting proofs...");
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            let path = args.output.join(format!("proofs_{}.{}", args.model_id, args.format));
+            progress.start_spinner("Fetching proof data...");
+            let proof = rpc.get_proof_status().await.ok();
+            let path = args.output.join(format!("proofs_{}.json", args.model_id));
+            let export_data = serde_json::json!({
+                "model_id": args.model_id,
+                "proof_status": proof,
+                "exported_at": chrono::Utc::now().to_rfc3339(),
+            });
+            std::fs::write(&path, serde_json::to_string_pretty(&export_data)?)?;
             progress.finish_spinner(&format!("Proofs exported to {}", path.display()));
         }
         ExportType::Metrics => {
-            progress.start_spinner("Exporting training metrics...");
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            let path = args.output.join(format!("metrics_{}.{}", args.model_id, args.format));
+            progress.start_spinner("Fetching training metrics...");
+            let training = rpc.get_training_status().await.ok();
+            let proof = rpc.get_proof_status().await.ok();
+            let network = rpc.get_network_status().await.ok();
+            let staking = rpc.get_staking_info(args.model_id).await.ok();
+            let workers = rpc.get_workers().await.ok();
+            let history = rpc.get_progress_history().await;
+            let path = args.output.join(format!("metrics_{}.json", args.model_id));
+            let export_data = serde_json::json!({
+                "model_id": args.model_id,
+                "training": training,
+                "proof": proof,
+                "network": network,
+                "staking": staking,
+                "workers": workers,
+                "progress_history": history,
+                "exported_at": chrono::Utc::now().to_rfc3339(),
+            });
+            std::fs::write(&path, serde_json::to_string_pretty(&export_data)?)?;
             progress.finish_spinner(&format!("Metrics exported to {}", path.display()));
         }
         ExportType::Logs => {
             progress.start_spinner("Exporting logs...");
-            tokio::time::sleep(Duration::from_secs(1)).await;
             let path = args.output.join("logs.txt");
+            // Logs are local — write placeholder if no log file exists
+            if !path.exists() {
+                std::fs::write(&path, format!("# HELIX training logs — exported {}\n", chrono::Utc::now().to_rfc3339()))?;
+            }
             progress.finish_spinner(&format!("Logs exported to {}", path.display()));
         }
         ExportType::All => {
             progress.start_spinner("Exporting all artifacts...");
-            tokio::time::sleep(Duration::from_secs(3)).await;
-            progress.finish_spinner(&format!("All artifacts exported to {}", args.output.display()));
+            let model = rpc.get_model(args.model_id).await.ok();
+            let training = rpc.get_training_status().await.ok();
+            let proof = rpc.get_proof_status().await.ok();
+            let network = rpc.get_network_status().await.ok();
+            let staking = rpc.get_staking_info(args.model_id).await.ok();
+            let workers = rpc.get_workers().await.ok();
+            let history = rpc.get_progress_history().await;
+            let export_data = serde_json::json!({
+                "model_id": args.model_id,
+                "model": model,
+                "training": training,
+                "proof": proof,
+                "network": network,
+                "staking": staking,
+                "workers": workers,
+                "progress_history": history,
+                "exported_at": chrono::Utc::now().to_rfc3339(),
+            });
+            let path = args.output.join(format!("helix_export_{}.json", args.model_id));
+            std::fs::write(&path, serde_json::to_string_pretty(&export_data)?)?;
+            progress.finish_spinner(&format!("All artifacts exported to {}", path.display()));
         }
     }
 

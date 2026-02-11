@@ -1,6 +1,8 @@
 //! HELIX Benchmark Module
 //!
 //! Performance benchmarking for proof generation, verification, and aggregation.
+//! Supports both simulated benchmarks (for quick testing) and real ZK proof
+//! generation benchmarks via `RealTrainingExecutor`.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -37,7 +39,7 @@ impl BenchmarkType {
         }
     }
 
-    /// Get expected duration for simulation
+    /// Get expected duration for simulation fallback
     pub fn expected_duration(&self) -> Duration {
         match self {
             BenchmarkType::ProofGen => Duration::from_millis(10),
@@ -84,11 +86,14 @@ pub struct BenchmarkResults {
     pub p99_ms: f64,
     pub throughput_ops_s: f64,
     pub samples: Vec<f64>,
+    /// Whether this benchmark used real ZK proof generation
+    #[serde(default)]
+    pub real_proofs: bool,
 }
 
 impl BenchmarkResults {
     /// Calculate statistics from samples
-    pub fn from_samples(benchmark_type: BenchmarkType, iterations: u32, warmup: u32, samples: Vec<f64>) -> Self {
+    pub fn from_samples(benchmark_type: BenchmarkType, iterations: u32, warmup: u32, samples: Vec<f64>, real_proofs: bool) -> Self {
         let n = samples.len() as f64;
         let mean = samples.iter().sum::<f64>() / n;
 
@@ -119,6 +124,7 @@ impl BenchmarkResults {
             p99_ms: p99,
             throughput_ops_s: 1000.0 / mean,
             samples,
+            real_proofs,
         }
     }
 
@@ -140,43 +146,122 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
     sorted[idx]
 }
 
-/// Benchmark runner
+/// Benchmark runner supporting both simulated and real ZK proof benchmarks.
 pub struct BenchmarkRunner {
     config: BenchmarkConfig,
+    /// When true, use `RealTrainingExecutor` for ProofGen/E2e benchmarks.
+    use_real_proofs: bool,
 }
 
 impl BenchmarkRunner {
-    /// Create a new benchmark runner
+    /// Create a new benchmark runner (simulated mode)
     pub fn new(config: BenchmarkConfig) -> Self {
-        Self { config }
+        Self { config, use_real_proofs: false }
+    }
+
+    /// Create a benchmark runner that uses real ZK proof generation.
+    ///
+    /// For `ProofGen` and `E2e` benchmarks, this will generate actual halo2 ZK proofs
+    /// using `RealTrainingExecutor` with `spawn_blocking()`. Each proof takes ~300ms-2s
+    /// depending on circuit parameters.
+    ///
+    /// Recommended: use fewer iterations (5-10) since real proofs are expensive.
+    pub fn with_real_proofs(config: BenchmarkConfig) -> Self {
+        Self { config, use_real_proofs: true }
     }
 
     /// Run the benchmark
     pub async fn run(&self) -> Result<BenchmarkResults> {
+        let is_real = self.use_real_proofs && matches!(
+            self.config.benchmark_type,
+            BenchmarkType::ProofGen | BenchmarkType::E2e
+        );
+
         println!("{}", "Running HELIX Benchmarks".cyan().bold());
         println!("  Type:       {}", self.config.benchmark_type.name());
         println!("  Iterations: {}", self.config.iterations);
         println!("  Warmup:     {}", self.config.warmup);
+        if is_real {
+            println!("  Mode:       {} Real ZK Proofs", "●".green());
+        } else {
+            println!("  Mode:       {} Simulated", "●".yellow());
+        }
         println!();
 
-        // Warmup
-        self.run_warmup().await?;
+        if is_real {
+            self.run_real_benchmark().await
+        } else {
+            self.run_simulated_benchmark().await
+        }
+    }
 
-        // Run benchmark
-        let samples = self.run_iterations().await?;
+    /// Run benchmark with real ZK proof generation
+    async fn run_real_benchmark(&self) -> Result<BenchmarkResults> {
+        use crate::demo::real_training::{RealTrainingConfig, RealTrainingExecutor};
 
-        // Calculate results
+        // Initialize prover (expensive — this is the warmup)
+        println!("{}", "  Initializing prover (this may take a few seconds)...".dimmed());
+        let real_config = RealTrainingConfig::quick_demo();
+        let (mut executor, init_time) = tokio::task::spawn_blocking(move || {
+            let mut exec = RealTrainingExecutor::new(real_config);
+            let time = exec.initialize().unwrap_or(Duration::ZERO);
+            (exec, time)
+        }).await?;
+        println!("  Prover initialized in {:.1}s", init_time.as_secs_f64());
+
+        // Warmup iterations
+        let warmup_count = self.config.warmup;
+        if warmup_count > 0 {
+            let pb = ProgressBar::new(warmup_count as u64);
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template("{spinner:.blue} Warmup [{bar:40.blue/cyan}] {pos}/{len}")
+                    .expect("static progress template")
+                    .progress_chars("#>-"),
+            );
+            for _ in 0..warmup_count {
+                executor = tokio::task::spawn_blocking(move || {
+                    let _ = executor.train_step();
+                    executor
+                }).await?;
+                pb.inc(1);
+            }
+            pb.finish_with_message("Warmup complete");
+        }
+
+        // Benchmark iterations
+        let iter_count = self.config.iterations;
+        let pb = ProgressBar::new(iter_count as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
+                .expect("static progress template")
+                .progress_chars("#>-"),
+        );
+
+        let mut samples = Vec::with_capacity(iter_count as usize);
+        for _ in 0..iter_count {
+            let start = Instant::now();
+            executor = tokio::task::spawn_blocking(move || {
+                let _ = executor.train_step();
+                executor
+            }).await?;
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            samples.push(elapsed);
+            pb.inc(1);
+        }
+        pb.finish_and_clear();
+
         let results = BenchmarkResults::from_samples(
             self.config.benchmark_type,
             self.config.iterations,
             self.config.warmup,
             samples,
+            true,
         );
 
-        // Display results
         self.display_results(&results);
 
-        // Save if output specified
         if let Some(path) = &self.config.output {
             results.save(path)?;
             println!("\nResults saved to: {}", path.display());
@@ -185,7 +270,33 @@ impl BenchmarkRunner {
         Ok(results)
     }
 
-    /// Run warmup iterations
+    /// Run benchmark with simulated timing (fallback)
+    async fn run_simulated_benchmark(&self) -> Result<BenchmarkResults> {
+        // Warmup
+        self.run_warmup().await?;
+
+        // Run benchmark
+        let samples = self.run_iterations().await?;
+
+        let results = BenchmarkResults::from_samples(
+            self.config.benchmark_type,
+            self.config.iterations,
+            self.config.warmup,
+            samples,
+            false,
+        );
+
+        self.display_results(&results);
+
+        if let Some(path) = &self.config.output {
+            results.save(path)?;
+            println!("\nResults saved to: {}", path.display());
+        }
+
+        Ok(results)
+    }
+
+    /// Run warmup iterations (simulated mode)
     async fn run_warmup(&self) -> Result<()> {
         let pb = ProgressBar::new(self.config.warmup as u64);
         pb.set_style(
@@ -196,7 +307,7 @@ impl BenchmarkRunner {
         );
 
         for _ in 0..self.config.warmup {
-            self.run_single_iteration().await;
+            self.run_single_iteration_simulated().await;
             pb.inc(1);
         }
 
@@ -204,7 +315,7 @@ impl BenchmarkRunner {
         Ok(())
     }
 
-    /// Run benchmark iterations
+    /// Run benchmark iterations (simulated mode)
     async fn run_iterations(&self) -> Result<Vec<f64>> {
         let pb = ProgressBar::new(self.config.iterations as u64);
         pb.set_style(
@@ -218,7 +329,7 @@ impl BenchmarkRunner {
 
         for _ in 0..self.config.iterations {
             let start = Instant::now();
-            self.run_single_iteration().await;
+            self.run_single_iteration_simulated().await;
             let elapsed = start.elapsed().as_secs_f64() * 1000.0;
             samples.push(elapsed);
             pb.inc(1);
@@ -228,15 +339,19 @@ impl BenchmarkRunner {
         Ok(samples)
     }
 
-    /// Run a single iteration
-    async fn run_single_iteration(&self) {
-        // Simulate work based on benchmark type
+    /// Run a single simulated iteration
+    async fn run_single_iteration_simulated(&self) {
         tokio::time::sleep(self.config.benchmark_type.expected_duration()).await;
     }
 
     /// Display benchmark results
     fn display_results(&self, results: &BenchmarkResults) {
         println!("\n{}", "Results:".yellow().bold());
+        if results.real_proofs {
+            println!("  {}", "(real ZK proof generation)".green());
+        } else {
+            println!("  {}", "(simulated — use --real for actual proofs)".dimmed());
+        }
         println!("  ┌────────────┬────────────────┐");
         println!("  │ Metric     │ Value          │");
         println!("  ├────────────┼────────────────┤");
@@ -288,6 +403,7 @@ where
         p99_ms: percentile(&sorted, 99.0),
         throughput_ops_s: 1000.0 / mean,
         samples,
+        real_proofs: false,
     }
 }
 

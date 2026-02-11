@@ -247,8 +247,18 @@ impl InitCommand {
             let addr = wallet.address();
             let wallet_file = wallets_dir.join(format!("{}.json", node_name));
 
+            // Generate a secure random password for the keystore
+            let mut pw_bytes = [0u8; 32];
+            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut pw_bytes);
+            let keystore_password = hex::encode(pw_bytes);
+
+            // Save the password alongside the keystore for local dev convenience.
+            // In production, use OS keychain via `wallet::keychain` instead.
+            let pw_path = wallets_dir.join(format!("{}.password", node_name));
+            std::fs::write(&pw_path, &keystore_password)?;
+
             // Save wallet to keystore
-            wallet.save_keystore(&wallet_file, "helix-temp-password")?;
+            wallet.save_keystore(&wallet_file, &keystore_password)?;
 
             self.progress.finish_spinner(&format!("Wallet created: {}", addr));
 

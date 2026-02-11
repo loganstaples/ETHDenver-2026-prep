@@ -1,14 +1,21 @@
-//! HELIX Wallet Module
+//! Legacy HELIX Wallet Module
 //!
-//! Provides secure key management, transaction signing, and Ethereum wallet functionality
-//! for HELIX network participants. Supports both in-memory and file-based key storage.
+//! Provides basic key management and transaction signing for HELIX network
+//! participants. For production use, prefer `wallet::SecureWallet` which
+//! offers HD derivation, hardware wallet support, and audited encryption.
+//!
+//! **Deprecation notice:** The XOR-based keystore encryption in this module
+//! is NOT cryptographically secure. Use `SecureWallet` with AES-256-GCM for
+//! any real-world key storage.
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use sha3::{Digest, Keccak256};
 use tokio::sync::RwLock;
 
 /// Ethereum address type (20 bytes)
@@ -106,32 +113,11 @@ impl std::fmt::Display for TxHash {
 pub struct PrivateKey([u8; 32]);
 
 impl PrivateKey {
-    /// Generate a new random private key
+    /// Generate a new random private key using OS-level CSPRNG.
     pub fn generate() -> Self {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        // Use a combination of time and random bytes for entropy
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock before UNIX epoch")
-            .as_nanos();
-
         let mut key = [0u8; 32];
-
-        // Mix timestamp bytes into the key
-        for (i, byte) in timestamp.to_le_bytes().iter().enumerate() {
-            key[i % 32] ^= *byte;
-        }
-
-        // Add more entropy from system
-        let ptr = &key as *const _ as usize;
-        for (i, byte) in ptr.to_le_bytes().iter().enumerate() {
-            key[(i + 8) % 32] ^= *byte;
-        }
-
-        // Hash to get final key (simplified - in production use proper KDF)
-        let hash = Self::keccak256(&key);
-        Self(hash)
+        rand::rngs::OsRng.fill_bytes(&mut key);
+        Self(key)
     }
 
     /// Create from bytes
@@ -189,25 +175,11 @@ impl PrivateKey {
         Signature { r, s, v: 27 }
     }
 
-    /// Simple keccak256 implementation (placeholder)
+    /// Keccak256 hash using the `sha3` crate.
     fn keccak256(data: &[u8]) -> [u8; 32] {
-        // This is a simplified hash function for demo purposes
-        // In production, use a proper keccak256 implementation
-        let mut result = [0u8; 32];
-        for (i, byte) in data.iter().enumerate() {
-            result[i % 32] = result[i % 32].wrapping_add(*byte);
-            result[(i + 1) % 32] = result[(i + 1) % 32].wrapping_mul(31).wrapping_add(*byte);
-        }
-        // Additional mixing
-        for i in 0..4 {
-            for j in 0..32 {
-                result[j] = result[j]
-                    .wrapping_add(result[(j + 1) % 32])
-                    .wrapping_mul(17)
-                    .wrapping_add(i);
-            }
-        }
-        result
+        let mut hasher = Keccak256::new();
+        hasher.update(data);
+        hasher.finalize().into()
     }
 }
 
@@ -597,9 +569,11 @@ impl Wallet {
 
     /// Encrypt wallet for keystore (simplified)
     fn encrypt_keystore(&self, password: &str) -> Result<EncryptedKeystore> {
-        // Generate random salt and IV
-        let salt = PrivateKey::generate().0[..16].to_vec();
-        let iv = PrivateKey::generate().0[..16].to_vec();
+        // Generate random salt and IV using CSPRNG
+        let mut salt = vec![0u8; 16];
+        let mut iv = vec![0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut salt);
+        rand::rngs::OsRng.fill_bytes(&mut iv);
 
         // Derive key from password (simplified)
         let mut key = [0u8; 32];

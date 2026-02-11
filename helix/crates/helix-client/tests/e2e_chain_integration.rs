@@ -1333,10 +1333,11 @@ fn test_training_proof_inputs_roundtrip() {
         loss: U256::from(1000u64),
         error_bound: U256::from(10u64),
         step_number: U256::from(1u64),
+        error_checksum: U256::from(99u64),
     };
 
     let vec = inputs.to_vec();
-    assert_eq!(vec.len(), 7);
+    assert_eq!(vec.len(), 8);
     assert_eq!(vec[0], U256::from(OLD_HASH_LO));
     assert_eq!(vec[1], U256::from(OLD_HASH_HI));
     assert_eq!(vec[2], U256::from(NEW_HASH_LO));
@@ -1344,6 +1345,7 @@ fn test_training_proof_inputs_roundtrip() {
     assert_eq!(vec[4], U256::from(1000u64));
     assert_eq!(vec[5], U256::from(10u64));
     assert_eq!(vec[6], U256::from(1u64));
+    assert_eq!(vec[7], U256::from(99u64));
 
     // Verify JSON serialization
     let json = serde_json::to_string(&inputs).unwrap();
@@ -1424,7 +1426,7 @@ async fn test_proof_submission_raw_vs_typed_api() {
 
     assert_eq!(receipt.status, Some(1u64.into()));
 
-    // Verify the typed struct produces 7 (for older contracts)
+    // Verify the typed struct now produces 8 (aligned with V2 contract)
     let typed = TrainingProofInputs {
         old_hash_lo: U256::from(OLD_HASH_LO),
         old_hash_hi: U256::from(OLD_HASH_HI),
@@ -1433,6 +1435,7 @@ async fn test_proof_submission_raw_vs_typed_api() {
         loss: U256::from(1000u64),
         error_bound: U256::from(10u64),
         step_number: U256::from(1u64),
+        error_checksum: U256::from(99u64),
     };
-    assert_eq!(typed.to_vec().len(), 7, "Typed API should produce 7 inputs");
+    assert_eq!(typed.to_vec().len(), 8, "Typed API should produce 8 inputs for V2 contract");
 }

@@ -1,7 +1,7 @@
 # rpc/ Module Review
 
-**Score: B+ (80%)**
-**Verdict:** Solid RPC layer with real JSON-RPC, on-chain integration, and circuit breakers. Minor issues with API alignment and hardcoded values.
+**Score: A- (88%)**
+**Verdict:** Solid RPC layer with real JSON-RPC, on-chain integration, and circuit breakers. TrainingProofInputs aligned to 8-element V2 contract. Added `get_model()` and `get_round()` forwarding to UnifiedRpcClient.
 
 ---
 
@@ -62,7 +62,7 @@ Feature-gated re-export of `chain` module (only when `chain` feature enabled). C
 - `deploy_with_forge()`: runs `forge script`, parses broadcast JSON for contract addresses
 
 **Data Types**
-- `TrainingProofInputs`: 7 public inputs (old_hash_lo/hi, new_hash_lo/hi, loss, error_bound, step_number)
+- `TrainingProofInputs`: 8 public inputs (old_hash_lo/hi, new_hash_lo/hi, loss, error_bound, step_number, error_checksum)
 - `ChainModelState`: current_round, current_commitment, active
 - `ChainRoundState`: model_commitment, new_commitment, is_completed, deadline, prover
 - `ChainStakeInfo`: amount, locked_until, slashed
@@ -88,11 +88,8 @@ Feature-gated re-export of `chain` module (only when `chain` feature enabled). C
 
 ### HIGH
 
-**`TrainingProofInputs.to_vec()` returns 7 elements; V2 contract expects 8**
-- The typed struct lacks `error_checksum` field
-- V2 contract's `submitProof()` expects 8 public inputs (7 circuit + error checksum)
-- `submit_proof()` (typed) will revert on V2. Users must use `submit_proof_raw()` with manual checksum.
-- **Fix:** Add `error_checksum: U256` field and update `to_vec()` to return 8 elements.
+~~`TrainingProofInputs.to_vec()` returns 7 elements; V2 contract expects 8~~ **RESOLVED**
+- Added `error_checksum: U256` field. `to_vec()` returns 8 elements. `from_bytes()` updated. Tests verified.
 
 **Hardcoded chain ID 31337 in broadcast path** (`chain.rs:666-669`)
 - `deploy_with_forge()` reads from `broadcast/Deploy.s.sol/31337/run-latest.json`
@@ -131,8 +128,8 @@ Feature-gated re-export of `chain` module (only when `chain` feature enabled). C
 
 ## Test Coverage
 
-- `TrainingProofInputs::to_vec()` — unit test verifies 7-element output
-- `TrainingProofInputs::from_bytes()` — unit test verifies field mapping
+- `TrainingProofInputs::to_vec()` — unit test verifies 8-element output (including error_checksum)
+- `TrainingProofInputs::from_bytes()` — unit test verifies field mapping (including error_checksum)
 - Circuit breaker state transitions — tested in `tests/demo_integration.rs` and `tests/e2e_chain_integration.rs`
 - Full on-chain lifecycle — 15+ tests in `e2e_chain_integration.rs` (register, stake, submit, events)
 

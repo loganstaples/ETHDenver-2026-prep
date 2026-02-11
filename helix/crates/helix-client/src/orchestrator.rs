@@ -462,6 +462,8 @@ pub struct LiveTrainingOrchestrator {
     pub rounds: u32,
     /// HTTP API base URL for polling aggregator.
     pub aggregator_url: String,
+    /// Reusable HTTP client (shares connection pool across calls).
+    http_client: reqwest::Client,
 }
 
 impl LiveTrainingOrchestrator {
@@ -484,6 +486,7 @@ impl LiveTrainingOrchestrator {
             orchestrator,
             rounds,
             aggregator_url: format!("http://127.0.0.1:{}", http_port),
+            http_client: reqwest::Client::new(),
         }
     }
 
@@ -500,22 +503,21 @@ impl LiveTrainingOrchestrator {
     /// Poll the aggregator's /health endpoint.
     pub async fn poll_health(&self) -> Result<serde_json::Value> {
         let url = format!("{}/health", self.aggregator_url);
-        let resp = reqwest::get(&url).await?.json::<serde_json::Value>().await?;
+        let resp = self.http_client.get(&url).send().await?.json::<serde_json::Value>().await?;
         Ok(resp)
     }
 
     /// Poll the aggregator's /round/status endpoint.
     pub async fn poll_round_status(&self) -> Result<serde_json::Value> {
         let url = format!("{}/round/status", self.aggregator_url);
-        let resp = reqwest::get(&url).await?.json::<serde_json::Value>().await?;
+        let resp = self.http_client.get(&url).send().await?.json::<serde_json::Value>().await?;
         Ok(resp)
     }
 
     /// Trigger a round start via POST /round/start.
     pub async fn trigger_round(&self) -> Result<serde_json::Value> {
         let url = format!("{}/round/start", self.aggregator_url);
-        let client = reqwest::Client::new();
-        let resp = client.post(&url).send().await?.json::<serde_json::Value>().await?;
+        let resp = self.http_client.post(&url).send().await?.json::<serde_json::Value>().await?;
         Ok(resp)
     }
 

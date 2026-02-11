@@ -88,10 +88,12 @@ pub struct TrainingProofInputs {
     pub loss: U256,
     pub error_bound: U256,
     pub step_number: U256,
+    /// SHA-256 commitment to the accumulated error state (8th public input for V2 contract).
+    pub error_checksum: U256,
 }
 
 impl TrainingProofInputs {
-    /// Converts to the format expected by the contract.
+    /// Converts to the 8-element format expected by the V2 contract.
     pub fn to_vec(&self) -> Vec<U256> {
         vec![
             self.old_hash_lo,
@@ -101,6 +103,7 @@ impl TrainingProofInputs {
             self.loss,
             self.error_bound,
             self.step_number,
+            self.error_checksum,
         ]
     }
 
@@ -113,6 +116,7 @@ impl TrainingProofInputs {
         loss: [u8; 32],
         error_bound: [u8; 32],
         step_number: u64,
+        error_checksum: [u8; 32],
     ) -> Self {
         Self {
             old_hash_lo: U256::from_big_endian(&old_hash_lo),
@@ -122,6 +126,7 @@ impl TrainingProofInputs {
             loss: U256::from_big_endian(&loss),
             error_bound: U256::from_big_endian(&error_bound),
             step_number: U256::from(step_number),
+            error_checksum: U256::from_big_endian(&error_checksum),
         }
     }
 }
@@ -741,11 +746,13 @@ mod tests {
             loss: U256::from(100),
             error_bound: U256::from(10),
             step_number: U256::from(1),
+            error_checksum: U256::from(42),
         };
         let vec = inputs.to_vec();
-        assert_eq!(vec.len(), 7);
+        assert_eq!(vec.len(), 8);
         assert_eq!(vec[0], U256::from(1));
         assert_eq!(vec[6], U256::from(1));
+        assert_eq!(vec[7], U256::from(42));
     }
 
     #[test]
@@ -753,7 +760,7 @@ mod tests {
         let mut lo = [0u8; 32];
         lo[31] = 42;
         let hi = [0u8; 32];
-        let inputs = TrainingProofInputs::from_bytes(lo, hi, lo, hi, lo, lo, 5);
+        let inputs = TrainingProofInputs::from_bytes(lo, hi, lo, hi, lo, lo, 5, [0u8; 32]);
         assert_eq!(inputs.old_hash_lo, U256::from(42));
         assert_eq!(inputs.step_number, U256::from(5));
     }

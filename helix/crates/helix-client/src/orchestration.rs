@@ -87,8 +87,10 @@ impl Default for OrchestratorConfig {
             base_port: 9000,
             http_port: 9001,
             eth_rpc_url: "http://localhost:8545".to_string(),
-            private_key: "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
-                .to_string(),
+            private_key: std::env::var("HELIX_PRIVATE_KEY").unwrap_or_else(|_| {
+                eprintln!("WARNING: Using default Anvil private key. Set HELIX_PRIVATE_KEY for non-local networks.");
+                "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".to_string()
+            }),
             contracts_dir: PathBuf::from("contracts"),
             deploy_contracts: true,
             coordinator_address: String::new(),
@@ -99,6 +101,36 @@ impl Default for OrchestratorConfig {
             health_check_interval: Duration::from_secs(5),
             max_restarts: 3,
         }
+    }
+}
+
+/// Known Anvil/Hardhat default private keys (first 4).
+const KNOWN_DEV_KEYS: &[&str] = &[
+    "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+    "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
+    "5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a",
+    "7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6",
+];
+
+impl OrchestratorConfig {
+    /// Validate the configuration for production safety.
+    ///
+    /// Rejects known dev private keys when the RPC URL points to a non-local network.
+    pub fn validate(&self) -> Result<()> {
+        let is_local = self.eth_rpc_url.contains("localhost")
+            || self.eth_rpc_url.contains("127.0.0.1");
+
+        let stripped_key = self.private_key.strip_prefix("0x").unwrap_or(&self.private_key);
+
+        if !is_local && KNOWN_DEV_KEYS.contains(&stripped_key) {
+            return Err(anyhow!(
+                "Refusing to use a well-known Anvil/Hardhat private key with non-local RPC '{}'. \
+                 Set HELIX_PRIVATE_KEY to a real key.",
+                self.eth_rpc_url,
+            ));
+        }
+
+        Ok(())
     }
 }
 

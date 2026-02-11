@@ -1592,6 +1592,55 @@ impl UnifiedRpcClient {
         }
     }
 
+    /// Get model information by ID.
+    pub async fn get_model(&self, model_id: u64) -> Result<ModelInfo, RpcError> {
+        if let Some(ref client) = self.real_client {
+            client.get_model(model_id).await
+        } else {
+            // Mock fallback
+            Ok(ModelInfo {
+                id: model_id,
+                name: format!("helix-model-{}", model_id),
+                ipfs_hash: "QmXoYP...mock".to_string(),
+                architecture: "MLP".to_string(),
+                parameter_count: 4096,
+                current_commitment: format!("0x{}", "ab".repeat(32)),
+                owner: format!("0x{}", "42".repeat(20)),
+                min_stake: 0.1,
+                training_active: true,
+                current_round: 42,
+                accumulated_error: 45.2,
+                created_at: chrono::Utc::now().timestamp() - 86400,
+            })
+        }
+    }
+
+    /// Get round information by model and round ID.
+    pub async fn get_round(&self, model_id: u64, round_id: u64) -> Result<RoundInfo, RpcError> {
+        if let Some(ref client) = self.real_client {
+            client.get_round(model_id, round_id).await
+        } else {
+            // Mock fallback
+            Ok(RoundInfo {
+                round_id,
+                model_id,
+                started_at: chrono::Utc::now().timestamp() - 300,
+                deadline: chrono::Utc::now().timestamp() + 300,
+                completed: false,
+                proofs_submitted: 3,
+                proofs_verified: 2,
+                participants: vec![
+                    format!("0x{}", "11".repeat(20)),
+                    format!("0x{}", "22".repeat(20)),
+                ],
+                prev_commitment: format!("0x{}", "ab".repeat(32)),
+                new_commitment: None,
+                loss: Some(0.234),
+                error_delta: Some(5.1),
+            })
+        }
+    }
+
     /// Get the mock client for direct access (when in mock mode)
     pub fn mock(&self) -> &MockRpcClient {
         &self.mock_client

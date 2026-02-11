@@ -4,8 +4,10 @@ pub mod commands;
 pub mod config;
 pub mod dashboard;
 pub mod demo;
+pub mod health;
 pub mod help;
 pub mod orchestration;
+pub mod orchestrator;
 pub mod progress;
 pub mod rpc;
 pub mod visualization;
@@ -17,3 +19,4 @@ pub use dashboard::{DashboardConfig, DashboardState};
 pub use orchestration::{
     DeploymentResult, OrchestratorConfig, ProcessHealthReport, TrainingOrchestrator, TrainingResult,
 };
+pub use orchestrator::{LiveTrainingOrchestrator, NetworkOrchestrator};
