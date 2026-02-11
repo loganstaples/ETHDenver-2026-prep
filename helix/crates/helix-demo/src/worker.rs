@@ -13,24 +13,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use helix_node::trainer::{MlpModel, Trainer};
-
-/// EVM-ready proof bundle from a worker.
-#[derive(Debug, Clone)]
-pub struct EvmBundle {
-    /// 320-byte EVM-formatted proof.
-    pub proof_bytes: Vec<u8>,
-    /// 8 x 32-byte big-endian public inputs.
-    pub public_inputs_u256: Vec<[u8; 32]>,
-    /// Step number.
-    #[allow(dead_code)]
-    pub step: u64,
-    /// Loss at this step.
-    #[allow(dead_code)]
-    pub loss: f64,
-    /// Gas used for on-chain submission (filled in after submission).
-    #[allow(dead_code)]
-    pub gas_used: Option<u64>,
-}
+use helix_prover::EvmProofBundle;
+use helix_prover::VkData;
 
 /// Results from a single worker's training run.
 #[derive(Debug)]
@@ -50,8 +34,8 @@ pub struct WorkerResult {
     pub cache_hits: usize,
     /// Total proof generation time.
     pub total_prove_time: Duration,
-    /// EVM bundles for on-chain submission.
-    pub evm_bundles: Vec<EvmBundle>,
+    /// EVM bundles for on-chain submission (using the canonical prover type).
+    pub evm_bundles: Vec<EvmProofBundle>,
 }
 
 /// Creates a regression dataset scaled for circuit compatibility.
@@ -157,6 +141,9 @@ fn run_single_worker(
     let quantized_lr = lr * 0.001;
     let mut trainer = Trainer::with_model(model, quantized_lr);
 
+    // Extract VK data for creating EvmProofBundle instances
+    let vk_data: VkData = trainer.export_vk_data()?;
+
     let mut losses = Vec::with_capacity(num_steps);
     let mut evm_bundles = Vec::new();
     let mut total_prove_time = Duration::ZERO;
@@ -164,8 +151,8 @@ fn run_single_worker(
     let mut proofs_verified = 0;
     let mut cache_hits = 0;
 
-    // Simple proof cache: maps cache_key → EvmBundle
-    let mut proof_cache: HashMap<u64, EvmBundle> = HashMap::new();
+    // Simple proof cache: maps cache_key → EvmProofBundle
+    let mut proof_cache: HashMap<u64, EvmProofBundle> = HashMap::new();
 
     for step in 0..num_steps {
         let dataset_idx = step % dataset.len();
@@ -192,23 +179,26 @@ fn run_single_worker(
             if let Some(cached) = proof_cache.get(&cache_key) {
                 evm_bundles.push(cached.clone());
                 cache_hits += 1;
-            } else if let Some(ref evm_proof) = result.evm_proof {
-                // Validate EVM proof format: must be exactly 320 bytes
-                if evm_proof.len() >= 320 {
-                    let bundle = EvmBundle {
-                        proof_bytes: evm_proof.clone(),
-                        public_inputs_u256: result.evm_public_inputs.clone(),
-                        step: result.step,
-                        loss: result.loss,
-                        gas_used: None,
-                    };
-                    proof_cache.insert(cache_key, bundle.clone());
-                    evm_bundles.push(bundle);
-                } else {
-                    tracing::warn!(
-                        "Worker {}: step {} produced undersized proof ({} bytes, expected >=320)",
-                        worker_id, step, evm_proof.len(),
-                    );
+            } else {
+                match EvmProofBundle::from_proof_result(&result.proof_result, vk_data.clone()) {
+                    Ok(bundle) => {
+                        // Validate EVM proof format: must be at least 320 bytes
+                        if bundle.evm_proof.len() >= 320 {
+                            proof_cache.insert(cache_key, bundle.clone());
+                            evm_bundles.push(bundle);
+                        } else {
+                            tracing::warn!(
+                                "Worker {}: step {} produced undersized proof ({} bytes, expected >=320)",
+                                worker_id, step, bundle.evm_proof.len(),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Worker {}: step {} EVM bundle creation failed: {}",
+                            worker_id, step, e,
+                        );
+                    }
                 }
             }
         }

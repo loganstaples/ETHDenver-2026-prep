@@ -163,7 +163,7 @@ fn test_e2e_batch_training() {
     // Check proof chain consistency (each step's new hash should match next step's old hash)
     let phase_start = Instant::now();
     let mut chain_valid = true;
-    // Guard against empty proofs (batch prover known issue)
+    // Need at least 2 proofs to check chain consistency
     if batch_result.proofs.len() > 1 {
         for i in 0..batch_result.proofs.len() - 1 {
             let current_new = batch_result.proofs[i].new_state_hash;
@@ -353,14 +353,12 @@ fn test_e2e_loss_convergence() {
 
     let batch_result = prover.prove_batch(training_weights, &samples, Fr::from(1u64));
 
-    // Skip if batch prover doesn't return expected number of proofs (known issue)
-    if batch_result.proofs.len() != 3 {
-        println!(
-            "WARNING: Batch prover returned {} proofs instead of 3 - skipping loss convergence test",
-            batch_result.proofs.len()
-        );
-        return;
-    }
+    assert_eq!(
+        batch_result.proofs.len(), 3,
+        "Batch prover should return exactly 3 proofs for 3 training samples (got {}, failed: {:?})",
+        batch_result.proofs.len(),
+        batch_result.failed_steps,
+    );
 
     // Extract losses
     let losses: Vec<Fr> = batch_result.proofs.iter().map(|p| p.loss).collect();

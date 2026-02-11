@@ -375,12 +375,12 @@ async fn test_evm_bundle_accepted_on_chain() {
     env.start_round(model_id, U256::from(3600u64)).await;
 
     // Create bundle — this bridges helix-prover output to Solidity expectations
-    let bundle = EvmProofBundle::from_proof_result(&proof_result, model_id, env.max_error_bound);
+    let bundle = TestEvmProofBundle::from_proof_result(&proof_result, model_id, env.max_error_bound);
 
     // The bundle's old commitment must match what we registered
     assert_eq!(
         bundle.old_commitment, initial_commitment,
-        "EvmProofBundle old commitment must match registered commitment"
+        "TestEvmProofBundle old commitment must match registered commitment"
     );
 
     // Submit and verify acceptance

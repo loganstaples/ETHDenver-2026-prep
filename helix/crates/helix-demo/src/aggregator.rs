@@ -90,7 +90,7 @@ pub async fn run_aggregator_demo(
 
     for (i, result) in worker_results.iter().enumerate() {
         for bundle in &result.evm_bundles {
-            let commitment = compute_proof_commitment(&bundle.proof_bytes);
+            let commitment = compute_proof_commitment(&bundle.evm_proof);
             let peer_id = worker_peer_ids[i].clone();
 
             let accepted = aggregator
@@ -99,7 +99,7 @@ pub async fn run_aggregator_demo(
                     1, // round_id
                     commitment,
                     0.001, // error_bound
-                    bundle.proof_bytes.clone(),
+                    bundle.evm_proof.clone(),
                 )
                 .await;
 

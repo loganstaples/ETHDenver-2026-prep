@@ -169,7 +169,7 @@ async fn test_anvil_full_pipeline() {
 
     // 5. Format proof for EVM and submit
     let bundle =
-        EvmProofBundle::from_proof_result(&proof_result, model_id, env.max_error_bound);
+        TestEvmProofBundle::from_proof_result(&proof_result, model_id, env.max_error_bound);
 
     // Verify old commitment matches what we registered
     assert_eq!(
@@ -253,7 +253,7 @@ async fn test_multi_step_commitment_chaining() {
 
         // Format and submit
         let bundle =
-            EvmProofBundle::from_proof_result(&proof_result, model_id, env.max_error_bound);
+            TestEvmProofBundle::from_proof_result(&proof_result, model_id, env.max_error_bound);
 
         // Verify commitment chaining: this round's old commitment should match
         // the previous round's new commitment (or initial commitment for step 1)
@@ -322,7 +322,7 @@ async fn test_adversarial_tampered_inputs() {
         prove_step(&weights, &[Fr::from(1u64), Fr::from(1u64)], &[Fr::from(5u64)], 1);
 
     let bundle =
-        EvmProofBundle::from_proof_result(&proof_result, model_id, env.max_error_bound);
+        TestEvmProofBundle::from_proof_result(&proof_result, model_id, env.max_error_bound);
 
     // Make the mock verifier reject proofs
     env.set_mock_accept(false).await;
@@ -435,7 +435,7 @@ async fn test_cross_verification_rust_and_solidity() {
     env.start_round(model_id, U256::from(3600u64)).await;
 
     let bundle =
-        EvmProofBundle::from_proof_result(&proof_result, model_id, env.max_error_bound);
+        TestEvmProofBundle::from_proof_result(&proof_result, model_id, env.max_error_bound);
     let receipt = env
         .submit_proof(
             model_id,
@@ -500,7 +500,7 @@ async fn test_error_bound_accumulation() {
         env.start_round(model_id, U256::from(3600u64)).await;
 
         let bundle =
-            EvmProofBundle::from_proof_result(&proof_result, model_id, env.max_error_bound);
+            TestEvmProofBundle::from_proof_result(&proof_result, model_id, env.max_error_bound);
 
         let step_error = bundle.error_bound;
         step_errors.push(step_error);
@@ -574,7 +574,7 @@ async fn test_real_verifier_full_pipeline() {
     env.start_round(model_id, U256::from(3600u64)).await;
 
     // Format proof for EVM
-    let bundle = EvmProofBundle::from_proof_result(&proof_result, model_id, env.max_error_bound);
+    let bundle = TestEvmProofBundle::from_proof_result(&proof_result, model_id, env.max_error_bound);
 
     // Verify the proof directly against the real Halo2Verifier
     let direct_result = env
@@ -647,7 +647,7 @@ async fn test_real_verifier_corrupted_proof_rejected() {
     let (proof_result, _) =
         prove_step(&weights, &[Fr::from(1u64), Fr::from(1u64)], &[Fr::from(5u64)], 1);
 
-    let bundle = EvmProofBundle::from_proof_result(
+    let bundle = TestEvmProofBundle::from_proof_result(
         &proof_result,
         U256::zero(),
         env.max_error_bound,
@@ -729,7 +729,7 @@ async fn test_real_verifier_corrupted_proof_slashes() {
     let (proof_result, _) =
         prove_step(&weights, &[Fr::from(1u64), Fr::from(1u64)], &[Fr::from(5u64)], 1);
 
-    let bundle = EvmProofBundle::from_proof_result(&proof_result, model_id, env.max_error_bound);
+    let bundle = TestEvmProofBundle::from_proof_result(&proof_result, model_id, env.max_error_bound);
 
     // Corrupt the proof bytes
     let mut corrupted = bundle.proof_bytes.clone();
@@ -810,7 +810,7 @@ async fn test_real_verifier_multi_step_chain() {
 
         // Start round and format proof
         env.start_round(model_id, U256::from(3600u64)).await;
-        let bundle = EvmProofBundle::from_proof_result(&proof_result, model_id, env.max_error_bound);
+        let bundle = TestEvmProofBundle::from_proof_result(&proof_result, model_id, env.max_error_bound);
 
         // Verify commitment chain
         if let Some(prev_commitment) = prev_new_commitment {
@@ -892,7 +892,7 @@ async fn test_real_verifier_gas_measurement() {
     env.stake(model_id, stake_amount).await;
     env.start_round(model_id, U256::from(3600u64)).await;
 
-    let bundle = EvmProofBundle::from_proof_result(&proof_result, model_id, env.max_error_bound);
+    let bundle = TestEvmProofBundle::from_proof_result(&proof_result, model_id, env.max_error_bound);
 
     // Submit proof and measure gas
     let receipt = env

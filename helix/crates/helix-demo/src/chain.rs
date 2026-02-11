@@ -17,7 +17,7 @@ use ethers::types::{Address, Bytes, TransactionReceipt, U256};
 use ethers::utils::Anvil;
 use helix_circuits::verifier::VkData;
 
-use crate::worker::EvmBundle;
+use helix_prover::EvmProofBundle;
 
 type SignedClient = Arc<SignerMiddleware<Provider<Http>, LocalWallet>>;
 
@@ -265,10 +265,10 @@ pub async fn start_round(env: &ChainEnv, model_id: U256) -> Result<()> {
 }
 
 /// Submits a proof on-chain. Returns gas used.
-pub async fn submit_proof(env: &ChainEnv, bundle: &EvmBundle) -> Result<u64> {
-    let proof_bytes = Bytes::from(bundle.proof_bytes.clone());
+pub async fn submit_proof(env: &ChainEnv, bundle: &EvmProofBundle) -> Result<u64> {
+    let proof_bytes = Bytes::from(bundle.evm_proof.clone());
     let public_inputs: Vec<U256> = bundle
-        .public_inputs_u256
+        .evm_public_inputs
         .iter()
         .map(|pi| U256::from_big_endian(pi))
         .collect();

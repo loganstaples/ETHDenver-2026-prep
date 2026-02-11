@@ -226,8 +226,8 @@ pub struct BatchResult {
 /// Aggregated proof for a batch of training steps.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AggregatedBatchProof {
-    /// Aggregated proof bytes (KZG proof when KZG aggregation succeeds,
-    /// concatenated bytes as fallback).
+    /// Aggregated proof bytes (KZG proof when aggregation succeeds,
+    /// first individual proof as representative when fallback).
     pub proof: Vec<u8>,
     /// Merkle root of all step commitments.
     pub merkle_root: [u8; 32],
@@ -245,6 +245,10 @@ pub struct AggregatedBatchProof {
     /// KZG aggregated proof (O(1) size, present when KZG aggregation succeeds).
     #[serde(default)]
     pub kzg_proof: Option<KZGAggregatedProof>,
+    /// Individual proof bytes when KZG aggregation is unavailable.
+    /// Each entry is one step's proof bytes, preserving them for independent verification.
+    #[serde(default)]
+    pub individual_proofs: Option<Vec<Vec<u8>>>,
 }
 
 /// Checkpoint for resumable batch proving.
@@ -702,13 +706,23 @@ impl BatchProver {
             None
         };
 
-        // Use KZG proof bytes if available, otherwise fall back to concatenation.
-        let aggregated_proof_bytes = match &kzg_result {
-            Some(kzg) => kzg.proof.clone(),
-            None => proofs
-                .iter()
-                .flat_map(|p| p.proof.iter().cloned())
-                .collect(),
+        // Use KZG proof bytes if available, otherwise preserve individual proofs.
+        let (aggregated_proof_bytes, individual_proofs) = match &kzg_result {
+            Some(kzg) => (kzg.proof.clone(), None),
+            None => {
+                tracing::warn!(
+                    num_proofs = proofs.len(),
+                    "KZG aggregation unavailable, preserving {} individual proofs",
+                    proofs.len(),
+                );
+                let individual: Vec<Vec<u8>> = proofs
+                    .iter()
+                    .map(|p| p.proof.clone())
+                    .collect();
+                // Use first proof as the representative proof bytes
+                let representative = individual.first().cloned().unwrap_or_default();
+                (representative, Some(individual))
+            }
         };
 
         AggregatedBatchProof {
@@ -720,6 +734,7 @@ impl BatchProver {
             total_error_bound: total_error,
             rlc_commitment: Some(rlc_commitment),
             kzg_proof: kzg_result,
+            individual_proofs,
         }
     }
 

@@ -11,6 +11,7 @@
 //! The model is a 2-layer MLP: `x → W1·x + b1 → ReLU → W2·h + b2 → output`.
 
 use helix_prover::halo2curves::bn256::Fr;
+use helix_prover::provers::training_prover_v2::TrainingProofResultV2;
 use helix_prover::MLTrainingProverV2;
 use sha2::{Digest, Sha256};
 
@@ -301,6 +302,8 @@ pub struct ProvedStep {
     pub public_inputs: Vec<Fr>,
     /// Whether the proof was self-verified by the prover.
     pub verified: bool,
+    /// The full prover result, for creating `EvmProofBundle` or other downstream uses.
+    pub proof_result: TrainingProofResultV2,
 }
 
 /// Metrics collected during a training run.
@@ -371,6 +374,25 @@ impl Trainer {
     /// Returns the current learning rate.
     pub fn learning_rate(&self) -> f64 {
         self.lr
+    }
+
+    /// Exports VK data from the prover (initializing it if needed).
+    ///
+    /// The VK data is needed for creating `EvmProofBundle` instances and
+    /// deploying the on-chain verifier contract.
+    pub fn export_vk_data(&mut self) -> anyhow::Result<helix_prover::VkData> {
+        if self.prover.is_none() {
+            self.prover = Some(MLTrainingProverV2::new(
+                self.model.d_in,
+                self.model.d_hid,
+                self.model.d_out,
+            ));
+        }
+        self.prover
+            .as_ref()
+            .unwrap()
+            .export_vk_data()
+            .map_err(|e| anyhow::anyhow!("Failed to export VK data: {}", e))
     }
 
     /// Runs a single training step and generates a ZK proof.
@@ -450,14 +472,15 @@ impl Trainer {
         let commitment = self.model.commitment();
 
         Ok(ProvedStep {
-            proof: proof_result.proof,
+            proof: proof_result.proof.clone(),
             evm_proof,
             evm_public_inputs,
             commitment,
             loss,
             step: self.step_count,
-            public_inputs: proof_result.public_inputs,
+            public_inputs: proof_result.public_inputs.clone(),
             verified: proof_result.verified,
+            proof_result,
         })
     }
 

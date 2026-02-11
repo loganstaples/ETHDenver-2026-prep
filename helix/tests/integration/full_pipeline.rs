@@ -2325,7 +2325,7 @@ mod distributed_pipeline {
 
             // Format for EVM
             let bundle =
-                EvmProofBundle::from_proof_result(proof_result, model_id, env.max_error_bound);
+                TestEvmProofBundle::from_proof_result(proof_result, model_id, env.max_error_bound);
 
             // Verify commitment chaining
             if let Some(prev) = prev_new_commitment {
@@ -2394,7 +2394,7 @@ mod distributed_pipeline {
             (STEPS_PER_WORKER + 1) as u64,
         );
 
-        let bundle = EvmProofBundle::from_proof_result(
+        let bundle = TestEvmProofBundle::from_proof_result(
             &valid_proof,
             model_id,
             env.max_error_bound,

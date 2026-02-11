@@ -59,6 +59,7 @@ pub mod serialization;
 // Re-export from helix-circuits
 pub use helix_circuits::halo2_proofs;
 pub use helix_circuits::halo2curves;
+pub use helix_circuits::verifier::VkData;
 
 // Re-export commonly used types
 pub use aggregation::{AggregatedProof, AggregationId, CommitmentTree, KZGAggregatedProof, KZGBatchAggregator, ProofAggregator, SmartAggregationResult};

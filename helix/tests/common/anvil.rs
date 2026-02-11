@@ -549,7 +549,7 @@ pub fn extract_s_g2_from_prover(
 /// The public inputs are adjusted so that PI[7] (error_checksum) matches
 /// the Solidity `_computeErrorChecksum` computation for the given model_id
 /// and max_error_bound.
-pub struct EvmProofBundle {
+pub struct TestEvmProofBundle {
     /// 320-byte EVM-formatted proof.
     pub proof_bytes: Vec<u8>,
     /// 8 public inputs as U256 values.
@@ -564,7 +564,7 @@ pub struct EvmProofBundle {
     pub step_number: U256,
 }
 
-impl EvmProofBundle {
+impl TestEvmProofBundle {
     /// Creates an EVM proof bundle from a Rust proof result.
     ///
     /// Recomputes PI[7] (error_checksum) to match the Solidity contract's

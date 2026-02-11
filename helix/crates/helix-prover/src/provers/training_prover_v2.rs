@@ -296,6 +296,24 @@ pub struct EvmProofBundle {
 }
 
 impl EvmProofBundle {
+    /// Creates an `EvmProofBundle` from a proof result and VK data.
+    ///
+    /// Converts the raw Halo2 transcript proof to EVM format and packages
+    /// it with public inputs and VK deployment data for on-chain submission.
+    pub fn from_proof_result(
+        result: &TrainingProofResultV2,
+        vk: VkData,
+    ) -> Result<Self, ProofFormatError> {
+        let evm_proof = result.to_evm_proof()?;
+        let evm_public_inputs = result.to_evm_public_inputs();
+        Ok(Self {
+            evm_proof,
+            evm_public_inputs,
+            vk_deployment_args: vk,
+            result: result.clone(),
+        })
+    }
+
     /// Returns the EVM proof as a hex-encoded string (no `0x` prefix).
     pub fn evm_proof_hex(&self) -> String {
         self.evm_proof.iter().map(|b| format!("{:02x}", b)).collect()
