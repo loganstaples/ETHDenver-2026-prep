@@ -93,8 +93,8 @@ fn test_beaver_triple_correctness_trusted_dealer_10000() {
                 .map(|p| batch[p][triple_idx].c.clone())
                 .fold(Fr::ZERO, |acc, v| Fr::add(&acc, &v));
 
-            // TrustedDealer uses fixed_mul (fixed-point with 2^64 scaling).
-            let ab = a.fixed_mul(&b);
+            // TrustedDealer uses mpc_scale (field-exact fixed-point scaling).
+            let ab = a.mpc_scale(&b);
             assert!(
                 ab.ct_eq(&c).to_bool(),
                 "Beaver triple a*b != c for triple {}",
@@ -126,7 +126,7 @@ fn test_beaver_triple_correctness_distributed_1000() {
                 .map(|p| batch[p][triple_idx].c.clone())
                 .fold(Fr::ZERO, |acc, v| Fr::add(&acc, &v));
 
-            let ab = Fr::mul(&a, &b);
+            let ab = a.mpc_scale(&b);
             assert!(
                 ab.ct_eq(&c).to_bool(),
                 "Distributed triple a*b != c for seed={}, idx={}",
@@ -297,19 +297,19 @@ fn test_shared_multiplication_1000() {
         let e = reconstruct_fr(&e_shares);
 
         // z_i = c_i + d*b_i + e*a_i + (i==0 ? d*e : 0)
-        // TrustedDealer uses fixed_mul, so the Beaver protocol must too.
+        // TrustedDealer uses mpc_scale, so the Beaver protocol must too.
         let mut z_shares = Vec::with_capacity(num_parties);
         for i in 0..num_parties {
             let mut z = triples[i][0].c.clone();
-            z = Fr::add(&z, &d.fixed_mul(&triples[i][0].b));
-            z = Fr::add(&z, &e.fixed_mul(&triples[i][0].a));
+            z = Fr::add(&z, &d.mpc_scale(&triples[i][0].b));
+            z = Fr::add(&z, &e.mpc_scale(&triples[i][0].a));
             if i == 0 {
-                z = Fr::add(&z, &d.fixed_mul(&e));
+                z = Fr::add(&z, &d.mpc_scale(&e));
             }
             z_shares.push(z);
         }
 
-        let xy = x.fixed_mul(&y);
+        let xy = x.mpc_scale(&y);
         let reconstructed = reconstruct_fr(&z_shares);
 
         // Compare in f64 domain with tolerance since shares are fixed-point

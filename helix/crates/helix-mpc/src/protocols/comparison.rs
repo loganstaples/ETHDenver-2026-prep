@@ -55,10 +55,17 @@ impl Default for ComparisonConfig {
 
 // ============================================================================
 // Garbled Circuit Engine
+//
+// These primitives implement a complete garbled circuit protocol for secure
+// comparison. They are currently unused because sign_bit/secure_less_than
+// use reconstruct-compare-reshare (the simulated OT provides no additional
+// security). When a real OT protocol is integrated, these functions should
+// be re-enabled.
 // ============================================================================
 
 /// Encrypts a message under two wire labels using SHA-256 as the hash function.
 /// H(k_a || k_b || gate_id) ⊕ msg
+#[allow(dead_code)]
 fn gc_encrypt(k_a: &[u8; 16], k_b: &[u8; 16], gate_id: u64, msg: &[u8; 16]) -> [u8; 16] {
     let mut hasher = Sha256::new();
     hasher.update(k_a);
@@ -74,17 +81,20 @@ fn gc_encrypt(k_a: &[u8; 16], k_b: &[u8; 16], gate_id: u64, msg: &[u8; 16]) -> [
 
 /// Decrypts a garbled gate entry (same operation as encrypt, since XOR is its own inverse).
 #[inline]
+#[allow(dead_code)]
 fn gc_decrypt(k_a: &[u8; 16], k_b: &[u8; 16], gate_id: u64, ct: &[u8; 16]) -> [u8; 16] {
     gc_encrypt(k_a, k_b, gate_id, ct)
 }
 
 /// Get the point-and-permute bit (LSB of the label).
 #[inline]
+#[allow(dead_code)]
 fn permute_bit(label: &[u8; 16]) -> usize {
     (label[0] & 1) as usize
 }
 
 /// Generate a random 128-bit wire label.
+#[allow(dead_code)]
 fn random_label(rng: &mut impl RngCore) -> [u8; 16] {
     let mut label = [0u8; 16];
     rng.fill_bytes(&mut label);
@@ -94,6 +104,7 @@ fn random_label(rng: &mut impl RngCore) -> [u8; 16] {
 /// Generate a pair of wire labels with guaranteed different permute bits.
 /// The zero-label has LSB=0, the one-label has LSB=1.
 /// This is required for point-and-permute to work correctly.
+#[allow(dead_code)]
 fn random_label_pair(rng: &mut impl RngCore) -> ([u8; 16], [u8; 16]) {
     let mut l0 = random_label(rng);
     let mut l1 = random_label(rng);
@@ -107,6 +118,7 @@ fn random_label_pair(rng: &mut impl RngCore) -> ([u8; 16], [u8; 16]) {
 // ============================================================================
 
 /// Get the bits of the BN254 scalar field modulus (little-endian).
+#[allow(dead_code)]
 fn modulus_bits() -> Vec<bool> {
     let modulus: [u64; 4] = [
         0x43e1f593f0000001,
@@ -118,6 +130,7 @@ fn modulus_bits() -> Vec<bool> {
 }
 
 /// Get the bits of HALF_MODULUS (little-endian).
+#[allow(dead_code)]
 fn half_modulus_bits() -> Vec<bool> {
     let half: [u64; 4] = [
         0xa1f0fac9f8000000,
@@ -129,6 +142,7 @@ fn half_modulus_bits() -> Vec<bool> {
 }
 
 /// Convert u64 limbs to little-endian bits.
+#[allow(dead_code)]
 fn u64_limbs_to_bits(limbs: &[u64; 4]) -> Vec<bool> {
     let mut bits = Vec::with_capacity(256);
     for limb in limbs {
@@ -140,6 +154,7 @@ fn u64_limbs_to_bits(limbs: &[u64; 4]) -> Vec<bool> {
 }
 
 /// Convert a field element to 256 little-endian bits.
+#[allow(dead_code)]
 fn fr_to_bits(x: &Fr) -> Vec<bool> {
     let bytes = x.to_bytes_le();
     let mut bits = Vec::with_capacity(256);
@@ -157,6 +172,7 @@ fn fr_to_bits(x: &Fr) -> Vec<bool> {
 
 /// Garbled circuit protocol state for the garbler.
 /// Contains all wire label pairs (private to the garbler).
+#[allow(dead_code)]
 struct GarblerState {
     /// (zero_label, one_label) for each wire
     wire_labels: Vec<([u8; 16], [u8; 16])>,
@@ -192,10 +208,14 @@ impl GarblerState {
 /// receives exactly one of the two labels without the garbler learning
 /// which was chosen.
 ///
-/// This uses a hash-based simulation of OT that maintains the security
-/// property: the evaluator only sees the chosen label, and the garbler
-/// does not learn the choice bits.
-fn ot_transfer_labels(
+/// **SECURITY WARNING**: This is a SIMULATED OT, not a real oblivious transfer.
+/// In a real deployment, this must be replaced with a proper OT protocol
+/// (e.g., Chou-Orlandi or IKNP extension).
+///
+/// The simulation directly selects the chosen label without cryptographic
+/// transfer. It maintains the structural property that only chosen labels
+/// are returned, but provides no cryptographic OT guarantees.
+fn simulated_ot_transfer_labels(
     label_pairs: &[([u8; 16], [u8; 16])],
     choice_bits: &[bool],
     rng: &mut impl RngCore,
@@ -254,6 +274,7 @@ fn ot_transfer_labels(
 ///
 /// Creates a garbled table for a 2-input AND gate, then evaluates it
 /// using the evaluator's active labels. Returns the output wire index.
+#[allow(dead_code)]
 fn gc_and_gate(
     garbler: &mut GarblerState,
     in1: usize,
@@ -297,6 +318,7 @@ fn gc_and_gate(
 ///
 /// Creates a garbled table for a 2-input XOR gate, then evaluates it
 /// using the evaluator's active labels. Returns the output wire index.
+#[allow(dead_code)]
 fn gc_xor_gate(
     garbler: &mut GarblerState,
     in1: usize,
@@ -363,6 +385,7 @@ fn gc_xor_gate(
 /// 5. Output is decoded to get sign(x)
 ///
 /// Returns: true if x is non-negative (x < p/2), false if negative (x >= p/2)
+#[allow(dead_code)]
 fn garbled_sign_protocol_impl(
     garbler_bits: &[bool],   // garbler's private input (256 bits)
     evaluator_bits: &[bool], // evaluator's private input (256 bits)
@@ -384,7 +407,7 @@ fn garbled_sign_protocol_impl(
 
     // Evaluator's input labels via OT
     let eval_pairs = garbler.evaluator_label_pairs(256, 256);
-    let ot_labels = ot_transfer_labels(&eval_pairs, evaluator_bits, rng);
+    let ot_labels = simulated_ot_transfer_labels(&eval_pairs, evaluator_bits, rng);
     for label in &ot_labels {
         eval_labels.push(*label);
     }
@@ -549,17 +572,20 @@ impl SecureComparison {
         Self { config }
     }
 
-    /// Computes sign([x]) using garbled circuits.
+    /// Computes sign([x]) → shares of 1 if x ≥ 0, shares of 0 if x < 0.
     ///
-    /// Returns shares of 1 if x ≥ 0, shares of 0 if x < 0.
+    /// # Security Warning
     ///
-    /// # Security
+    /// This implementation reconstructs the secret value to determine the
+    /// sign bit, then re-shares the result. This means the sign computation
+    /// itself reveals x to the computing party. In a production multi-party
+    /// deployment, this should be replaced with a proper garbled circuit
+    /// protocol using real oblivious transfer (e.g., Chou-Orlandi OT).
     ///
-    /// This implementation uses a garbled circuit protocol with OT to compute
-    /// the sign bit without any party reconstructing the secret value x.
-    /// Party 0 acts as the garbler and parties 1..n-1 combine into the evaluator.
-    /// Neither side learns the other's share.
-    #[cfg(not(feature = "simulation"))]
+    /// The garbled circuit infrastructure (`garbled_sign_protocol_impl`) is
+    /// available in this module but currently uses simulated OT, so both
+    /// paths have equivalent security properties. We use the direct
+    /// reconstruct-compare-reshare approach for clarity and performance.
     pub fn sign_bit(
         &self,
         x_shares: &[Fr],
@@ -573,47 +599,7 @@ impl SecureComparison {
             });
         }
 
-        // Step 1: Party 0 is the garbler.
-        // Parties 1..n-1 combine their shares into a single evaluator share.
-        let garbler_share = x_shares[0].clone();
-        let mut evaluator_share = Fr::ZERO;
-        for share in &x_shares[1..] {
-            evaluator_share = Fr::add(&evaluator_share, share);
-        }
-
-        // Step 2: Convert shares to bits (each party only sees their own bits)
-        let garbler_bits = fr_to_bits(&garbler_share);
-        let evaluator_bits = fr_to_bits(&evaluator_share);
-
-        // Step 3: Run the garbled circuit protocol
-        let mut rng = ChaCha20Rng::from_entropy();
-        let is_non_negative = garbled_sign_protocol_impl(&garbler_bits, &evaluator_bits, &mut rng);
-
-        // Step 4: Create shares of the result
-        let sign = if is_non_negative {
-            Fr::from_f64(1.0)
-        } else {
-            Fr::ZERO
-        };
-
-        self.reshare_bit(&sign, num_parties)
-    }
-
-    /// Simulation-only sign_bit that reconstructs secrets in the clear.
-    ///
-    /// # WARNING: SIMULATION ONLY — NOT SECURE
-    ///
-    /// This implementation reconstructs the secret value in the clear to
-    /// determine the sign. It is suitable only for correctness testing.
-    #[cfg(feature = "simulation")]
-    pub fn sign_bit(
-        &self,
-        x_shares: &[Fr],
-        _pools: &mut [BeaverPool],
-    ) -> MPCResult<Vec<Fr>> {
-        let num_parties = x_shares.len();
-
-        // WARNING: Reconstructs secret value — breaks privacy!
+        // Reconstruct the secret value (reveals x — see security warning above)
         let mut x = Fr::ZERO;
         for share in x_shares {
             x = Fr::add(&x, share);
@@ -726,7 +712,7 @@ impl SecureComparison {
 
         let scaled_sign: Vec<Fr> = sign_shares
             .iter()
-            .map(|s| s.fixed_mul(&one_minus_alpha))
+            .map(|s| s.mpc_scale(&one_minus_alpha))
             .collect();
 
         let multiplier: Vec<Fr> = scaled_sign
@@ -777,7 +763,7 @@ impl SecureComparison {
 
         let result: Vec<Fr> = x_shares
             .iter()
-            .map(|xi| xi.fixed_mul(&inv_abs_x))
+            .map(|xi| xi.mpc_scale(&inv_abs_x))
             .collect();
 
         Ok(result)
@@ -892,14 +878,14 @@ impl GarbledComparison {
         output
     }
 
-    /// Securely computes x < y using garbled circuits with OT.
+    /// Computes x < y, returning shares of 1 if x < y, shares of 0 otherwise.
     ///
-    /// # Security
+    /// # Security Warning
     ///
-    /// Uses a garbled circuit protocol where party 0 is the garbler and
-    /// the combined shares of parties 1..n-1 form the evaluator's input.
-    /// Neither party reconstructs the secret values x or y.
-    #[cfg(not(feature = "simulation"))]
+    /// This implementation reconstructs the secret values to perform the
+    /// comparison, then re-shares the result. See `SecureComparison::sign_bit`
+    /// for details on the security trade-off. In production, this should use
+    /// a garbled circuit protocol with real oblivious transfer.
     pub fn secure_less_than(
         &self,
         x_shares: &[Fr],
@@ -914,60 +900,7 @@ impl GarbledComparison {
             });
         }
 
-        // Compute [x - y] locally (no communication needed)
-        let diff_shares: Vec<Fr> = x_shares
-            .iter()
-            .zip(y_shares.iter())
-            .map(|(x, y)| Fr::sub(x, y))
-            .collect();
-
-        // Party 0 is garbler, parties 1..n-1 combine for evaluator
-        let garbler_share = diff_shares[0].clone();
-        let mut evaluator_share = Fr::ZERO;
-        for share in &diff_shares[1..] {
-            evaluator_share = Fr::add(&evaluator_share, share);
-        }
-
-        let garbler_bits = fr_to_bits(&garbler_share);
-        let evaluator_bits = fr_to_bits(&evaluator_share);
-
-        let mut rng = ChaCha20Rng::from_seed(self.seed);
-        let is_non_negative = garbled_sign_protocol_impl(&garbler_bits, &evaluator_bits, &mut rng);
-
-        // x < y iff (x - y) is negative iff NOT is_non_negative
-        let result = if !is_non_negative {
-            Fr::from_f64(1.0)
-        } else {
-            Fr::ZERO
-        };
-
-        // Re-share the result
-        let mut rng = ChaCha20Rng::from_entropy();
-        let mut shares = Vec::with_capacity(num_parties);
-        let mut sum = Fr::ZERO;
-        for _ in 0..num_parties - 1 {
-            let r = Fr::random(&mut rng);
-            shares.push(r.clone());
-            sum = Fr::add(&sum, &r);
-        }
-        shares.push(Fr::sub(&result, &sum));
-
-        Ok(shares)
-    }
-
-    /// Simulation-only secure_less_than that reconstructs secrets in the clear.
-    ///
-    /// # WARNING: SIMULATION ONLY — NOT SECURE
-    #[cfg(feature = "simulation")]
-    pub fn secure_less_than(
-        &self,
-        x_shares: &[Fr],
-        y_shares: &[Fr],
-        _pools: &mut [BeaverPool],
-    ) -> MPCResult<Vec<Fr>> {
-        let num_parties = x_shares.len();
-
-        // WARNING: Reconstructs secret values — breaks privacy!
+        // Reconstruct secret values (reveals x, y — see security warning above)
         let mut x = Fr::ZERO;
         let mut y = Fr::ZERO;
         for (xs, ys) in x_shares.iter().zip(y_shares) {
@@ -984,6 +917,7 @@ impl GarbledComparison {
             Fr::ZERO
         };
 
+        // Re-share the result
         let mut rng = ChaCha20Rng::from_entropy();
         let mut shares = Vec::with_capacity(num_parties);
         let mut sum = Fr::ZERO;
@@ -1016,18 +950,16 @@ impl BitDecomposition {
         Self { bit_length }
     }
 
-    /// Decomposes a secret-shared value into shared bits using OT-based protocol.
-    ///
-    /// # Security
-    ///
-    /// Uses a garbled circuit to compute the bit decomposition of
-    /// (garbler_share + evaluator_share) without either party learning
-    /// the other's share. Each output bit is additively shared between
-    /// the garbler and evaluator.
+    /// Decomposes a secret-shared value into shared bits.
     ///
     /// Returns: bit_shares[bit_index][party_index], where the sum of
     /// party shares for each bit equals the actual bit of x.
-    #[cfg(not(feature = "simulation"))]
+    ///
+    /// # Security Warning
+    ///
+    /// This implementation reconstructs the secret value to extract its
+    /// bits, then re-shares each bit. See `SecureComparison::sign_bit`
+    /// for details on the security trade-off.
     pub fn decompose(&self, x_shares: &[Fr], _pools: &mut [BeaverPool]) -> MPCResult<Vec<Vec<Fr>>> {
         let num_parties = x_shares.len();
         if num_parties < 2 {
@@ -1037,59 +969,7 @@ impl BitDecomposition {
             });
         }
 
-        // Party 0 is garbler, parties 1..n-1 combine for evaluator
-        let garbler_share = x_shares[0].clone();
-        let mut evaluator_share = Fr::ZERO;
-        for share in &x_shares[1..] {
-            evaluator_share = Fr::add(&evaluator_share, share);
-        }
-
-        let garbler_bits = fr_to_bits(&garbler_share);
-        let evaluator_bits = fr_to_bits(&evaluator_share);
-
-        let mut rng = ChaCha20Rng::from_entropy();
-
-        // Run garbled circuit protocol to compute x = garbler_share + evaluator_share mod p
-        // and extract its bits, with output shared between garbler and evaluator.
-        let (garbler_bit_shares, evaluator_bit_shares) =
-            garbled_decompose_protocol(&garbler_bits, &evaluator_bits, self.bit_length, &mut rng);
-
-        // Distribute shares among all parties
-        let mut result = Vec::with_capacity(self.bit_length);
-        for bit_idx in 0..self.bit_length {
-            let mut bit_party_shares = Vec::with_capacity(num_parties);
-
-            // Party 0 gets the garbler's share
-            bit_party_shares.push(garbler_bit_shares[bit_idx].clone());
-
-            if num_parties == 2 {
-                // Party 1 gets the evaluator's share directly
-                bit_party_shares.push(evaluator_bit_shares[bit_idx].clone());
-            } else {
-                // For n > 2 parties, split the evaluator's share among parties 1..n-1
-                let mut sum = Fr::ZERO;
-                for _ in 1..num_parties - 1 {
-                    let r = Fr::random(&mut rng);
-                    bit_party_shares.push(r.clone());
-                    sum = Fr::add(&sum, &r);
-                }
-                bit_party_shares.push(Fr::sub(&evaluator_bit_shares[bit_idx], &sum));
-            }
-
-            result.push(bit_party_shares);
-        }
-
-        Ok(result)
-    }
-
-    /// Simulation-only decompose that reconstructs secrets in the clear.
-    ///
-    /// # WARNING: SIMULATION ONLY — NOT SECURE
-    #[cfg(feature = "simulation")]
-    pub fn decompose(&self, x_shares: &[Fr], _pools: &mut [BeaverPool]) -> MPCResult<Vec<Vec<Fr>>> {
-        let num_parties = x_shares.len();
-
-        // WARNING: Reconstructs secret value — breaks privacy!
+        // Reconstruct the secret value (reveals x — see security warning above)
         let mut x = Fr::ZERO;
         for share in x_shares {
             x = Fr::add(&x, share);
@@ -1128,7 +1008,7 @@ impl BitDecomposition {
         for (i, bit_sh) in bit_shares.iter().enumerate() {
             let scale = Fr::from_f64((1u64 << i) as f64);
             for (j, bit) in bit_sh.iter().enumerate() {
-                result[j] = Fr::add(&result[j], &bit.fixed_mul(&scale));
+                result[j] = Fr::add(&result[j], &bit.mpc_scale(&scale));
             }
         }
 
@@ -1142,6 +1022,7 @@ impl BitDecomposition {
 /// with output bits shared between garbler and evaluator.
 ///
 /// Returns (garbler_bit_shares, evaluator_bit_shares) for each output bit.
+#[allow(dead_code)]
 fn garbled_decompose_protocol(
     garbler_bits: &[bool],
     evaluator_bits: &[bool],
@@ -1162,7 +1043,7 @@ fn garbled_decompose_protocol(
 
     // Evaluator's input labels via OT
     let eval_pairs = garbler.evaluator_label_pairs(256, 256);
-    let ot_labels = ot_transfer_labels(&eval_pairs, evaluator_bits, rng);
+    let ot_labels = simulated_ot_transfer_labels(&eval_pairs, evaluator_bits, rng);
     for label in &ot_labels {
         eval_labels.push(*label);
     }
@@ -1564,7 +1445,7 @@ mod tests {
             .collect();
 
         // OT transfer: evaluator gets labels for their bits
-        let transferred = ot_transfer_labels(&label_pairs, &b_bits, &mut rng);
+        let transferred = simulated_ot_transfer_labels(&label_pairs, &b_bits, &mut rng);
 
         // Verify: evaluator got exactly the labels corresponding to their bits
         for (i, &bit) in b_bits.iter().enumerate() {

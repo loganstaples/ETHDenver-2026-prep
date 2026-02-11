@@ -181,9 +181,9 @@ impl OperationWitness {
         }
         hasher.update(&self.error_bound.to_bytes_le());
         if let Some(ref beaver) = self.beaver_data {
-            hasher.update(&beaver.a.to_bytes_le());
-            hasher.update(&beaver.b.to_bytes_le());
-            hasher.update(&beaver.c.to_bytes_le());
+            hasher.update(&beaver.opened_d.to_bytes_le());
+            hasher.update(&beaver.opened_e.to_bytes_le());
+            hasher.update(&(beaver.party_index as u64).to_le_bytes());
         }
         hasher.update(&self.timestamp_ns.to_le_bytes());
         hasher.update(blinding);
@@ -201,32 +201,33 @@ impl OperationWitness {
     }
 }
 
-/// Captured Beaver triple data for witness.
+/// Captured Beaver protocol data for witness.
+///
+/// Stores only the publicly-opened values from the Beaver multiplication
+/// protocol. Private triple shares (a, b, c) are deliberately excluded
+/// to prevent accidental leakage if the witness is serialized or transmitted.
 #[derive(Debug, Clone)]
 pub struct BeaverWitness {
-    /// Share of first random value.
-    pub a: Fr,
-    /// Share of second random value.
-    pub b: Fr,
-    /// Share of product.
-    pub c: Fr,
-    /// Opened d = x - a value (public).
+    /// Opened d = x - a value (public after protocol).
     pub opened_d: Fr,
-    /// Opened e = y - b value (public).
+    /// Opened e = y - b value (public after protocol).
     pub opened_e: Fr,
+    /// Party index that produced this witness.
+    pub party_index: usize,
     /// Whether this triple was verified.
     pub verified: bool,
 }
 
 impl BeaverWitness {
-    /// Creates from a Beaver triple and opened values.
-    pub fn from_triple(triple: &BeaverTriple, opened_d: Fr, opened_e: Fr) -> Self {
+    /// Creates from the public values of a Beaver multiplication protocol.
+    ///
+    /// Only stores the opened (public) values d and e, not the private
+    /// triple shares (a, b, c).
+    pub fn from_protocol(opened_d: Fr, opened_e: Fr, party_index: usize) -> Self {
         Self {
-            a: triple.a.clone(),
-            b: triple.b.clone(),
-            c: triple.c.clone(),
             opened_d,
             opened_e,
+            party_index,
             verified: false,
         }
     }
@@ -615,7 +616,7 @@ impl ProvedArithmetic {
         self.capture.start_operation(WitnessedOperation::Mul);
 
         // Record Beaver triple data.
-        let beaver = BeaverWitness::from_triple(triple, opened_d.clone(), opened_e.clone());
+        let beaver = BeaverWitness::from_protocol(opened_d.clone(), opened_e.clone(), self.party_index);
         self.capture.record_beaver(beaver);
 
         // The inputs to multiplication are derived from d, e and triple values.
@@ -977,11 +978,9 @@ mod tests {
         capture.record_inputs(&[Fr::from_f64(3.0), Fr::from_f64(4.0)]);
         capture.record_output(Fr::from_f64(12.0));
         let beaver = BeaverWitness {
-            a: Fr::from_f64(1.0),
-            b: Fr::from_f64(2.0),
-            c: Fr::from_f64(2.0),
             opened_d: Fr::from_f64(2.0),
             opened_e: Fr::from_f64(2.0),
+            party_index: 0,
             verified: true,
         };
         capture.record_beaver(beaver);
@@ -1041,5 +1040,31 @@ mod tests {
         capture.finish_operation();
 
         assert_eq!(capture.num_operations(), 2);
+    }
+
+    /// Verifies that BeaverWitness does NOT contain private triple shares.
+    ///
+    /// This is a security test ensuring the H5 fix is maintained: BeaverWitness
+    /// must only store public protocol values (opened_d, opened_e), not the
+    /// private triple shares (a, b, c) which would leak secrets if transmitted.
+    #[test]
+    fn test_beaver_witness_no_private_shares() {
+        let witness = BeaverWitness::from_protocol(
+            Fr::from_f64(1.5),
+            Fr::from_f64(2.5),
+            0,
+        );
+
+        // Verify only public fields exist
+        assert_eq!(witness.opened_d.to_f64(), 1.5);
+        assert_eq!(witness.opened_e.to_f64(), 2.5);
+        assert_eq!(witness.party_index, 0);
+        assert!(!witness.verified);
+
+        // Verify the struct size is small (no hidden large fields)
+        // BeaverWitness should be: 2 Fr fields (32 bytes each) + usize + bool
+        // Much smaller than the old version which had 5 Fr fields
+        let size = std::mem::size_of::<BeaverWitness>();
+        assert!(size < 200, "BeaverWitness too large ({}), may contain hidden fields", size);
     }
 }

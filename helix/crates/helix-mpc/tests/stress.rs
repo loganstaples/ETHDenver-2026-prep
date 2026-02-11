@@ -110,8 +110,8 @@ fn test_100k_triples_correctness() {
             .map(|p| batch[p][idx].c.clone())
             .fold(Fr::ZERO, |acc, v| Fr::add(&acc, &v));
 
-        // TrustedDealer uses fixed_mul (fixed-point with 2^64 scaling).
-        let ab = a.fixed_mul(&b);
+        // TrustedDealer uses mpc_scale (field-exact fixed-point scaling).
+        let ab = a.mpc_scale(&b);
         assert!(
             ab.ct_eq(&c).to_bool(),
             "Triple {} failed: a*b != c",

@@ -355,7 +355,9 @@ impl<T: MPCTransport> MPCTrainer<T> {
             let b_i = Fr::random(&mut self.rng);
 
             // Start with the diagonal term: c_i = a_i * b_i.
-            let mut c_i = Fr::mul(&a_i, &b_i);
+            // Use mpc_scale for fixed-point multiplication, consistent with
+            // multiply_shares() which also uses mpc_scale for Beaver protocol.
+            let mut c_i = a_i.mpc_scale(&b_i);
 
             let peers = self.transport.peers();
 
@@ -389,7 +391,8 @@ impl<T: MPCTransport> MPCTrainer<T> {
 
                     // Cross-term: a_j * b_i - r_ji
                     // peer_a[0] = a_j, peer_r[0] = r_ji (their random for us)
-                    let cross = Fr::sub(&Fr::mul(&peer_a[0], &b_i), &peer_r[0]);
+                    // Use mpc_scale for fixed-point multiplication consistency.
+                    let cross = Fr::sub(&peer_a[0].mpc_scale(&b_i), &peer_r[0]);
                     c_i = Fr::add(&c_i, &cross);
                 }
             }
@@ -1423,7 +1426,7 @@ mod tests {
                 &all_triples.iter().map(|p| p[t].c.clone()).collect::<Vec<_>>(),
             );
 
-            let expected = Fr::mul(&a, &b);
+            let expected = a.mpc_scale(&b);
             assert!(
                 c.ct_eq(&expected).to_bool(),
                 "Triple {} incorrect: c={}, expected={}",

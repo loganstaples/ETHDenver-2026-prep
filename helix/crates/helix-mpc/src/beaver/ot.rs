@@ -1,9 +1,17 @@
 //! Oblivious Transfer (OT) primitives for secure computation.
 //!
-//! This module implements 1-out-of-2 OT and OT extension for efficient
-//! generation of Beaver triples without a trusted dealer.
+//! # SECURITY WARNING
 //!
-//! # Protocols Implemented
+//! **This OT implementation has known security limitations and should NOT be used
+//! in production.** Specifically:
+//! - The base OT uses XOR-based "encryption" instead of proper group operations
+//! - The OT extension is a simulation, not a real IKNP protocol
+//! - Beaver triples generated via OT may not satisfy the required correlation
+//!
+//! Use `TrustedDealer` for development/testing or implement a proper OT library
+//! (e.g., based on libOTe or emp-ot) for production use.
+//!
+//! # Protocols Implemented (Simulated)
 //!
 //! 1. **Simplest OT** - Based on the Chou-Orlandi protocol using Diffie-Hellman
 //! 2. **OT Extension** - Extends base OTs to many OTs efficiently (IKNP-style)
@@ -324,6 +332,7 @@ pub struct OTBeaverMessage {
 ///
 /// The key insight: sum(c_i) = sum(a_i * b_i) + sum_{i!=j}(a_j * b_i)
 ///                             = (sum a_i) * (sum b_i)
+#[deprecated(note = "OT-based triple generation has known security limitations. Use TrustedDealer instead.")]
 pub fn generate_beaver_triple_ot(
     party_index: usize,
     num_parties: usize,

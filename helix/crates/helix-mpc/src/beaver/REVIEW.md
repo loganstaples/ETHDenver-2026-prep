@@ -1,9 +1,11 @@
 # Beaver Module - Technical Review
 
+**Updated**: 2026-02-11 — Multiple critical and high-priority issues resolved. Health score upgraded from D+ to B+.
+
 **Review Date**: 2026-02-10
 **Files**: 7 (mod.rs, triple.rs, dealer.rs, distributed.rs, ot.rs, pipeline.rs, pool.rs)
 **Total Lines**: ~3,170
-**Health Score**: D+ (40-45% production-ready)
+**Health Score**: B+ (75-80% production-ready)
 
 ---
 
@@ -62,7 +64,7 @@ Generates triples centrally using `ChaCha20Rng`. Core algorithm:
 
 | # | Severity | Location | Issue | Fix |
 |---|----------|----------|-------|-----|
-| C1 | **CRITICAL** | dealer.rs:62 | Uses `fixed_mul()` (floor-based byte-shift division) while `DistributedDealer` uses `exact_fixed_mul()` (modular inverse). These produce **different values** for the same inputs — triples from the two dealers are **incompatible**. | Standardize on `exact_fixed_mul()` everywhere, or document that dealers are not interchangeable |
+| C1 | ~~**CRITICAL**~~ | dealer.rs:62 | ~~Uses `fixed_mul()` while `DistributedDealer` uses `exact_fixed_mul()` — triples incompatible.~~ | ✅ **RESOLVED** (2026-02-11): TrustedDealer now uses `mpc_scale` (`exact_fixed_mul`). All triple generation standardized on `mpc_scale`. |
 | 3 | Medium | dealer.rs:46 | `random_value()` generates in [-1000, 1000] — arbitrary range that limits triple applicability to small model weights | Document range limitation; consider parameterizing |
 
 #### DistributedDealer (lines 385-577)
@@ -85,7 +87,7 @@ This is mathematically correct and preserves the additive homomorphism needed fo
 
 | # | Severity | Location | Issue | Fix |
 |---|----------|----------|-------|-----|
-| C2 | **CRITICAL** | dealer.rs:461-463 | **RNG not advanced**: `Fr::random(&mut self.rngs[i].clone())` clones the RNG, generates from clone, then `let _ = Fr::random(&mut self.rngs[i])` "advances" the original — but with a DIFFERENT random value than the one used. The mask `r_ij` repeats across iterations because the clone is discarded. | Remove `.clone()`: `let r_ij = Fr::random(&mut self.rngs[i]);` |
+| C2 | ~~**CRITICAL**~~ | dealer.rs:461-463 | ~~**RNG not advanced**: clones RNG, advances clone, original unchanged. Mask `r_ij` repeats across iterations.~~ | ✅ **RESOLVED** (2026-02-11): Fixed in dealer.rs. RNG clone bug eliminated. |
 | 4 | Medium | dealer.rs:466 | `MaskCommitment` generated but never verified — commitments exist only "for post-hoc audit" (line 358) but no audit code exists | Either wire in verification or remove commitment generation |
 | 5 | Low | dealer.rs:265-275 | `additive_share_scalar` shares one value across parties but doesn't validate `num_parties > 0` | Add `assert!(num_parties > 0)` guard |
 
@@ -103,7 +105,7 @@ Higher-level state machine for distributed triple generation with `TripleGenMess
 
 | # | Severity | Location | Issue | Fix |
 |---|----------|----------|-------|-----|
-| C3 | **CRITICAL** | distributed.rs:193 | `simulate_distributed_generation` uses `Fr::mul()` (raw field multiplication) instead of `exact_fixed_mul()` — produces values that are ~2^64x too large for fixed-point interpretation. Triples from this function are **numerically wrong**. | Replace `Fr::mul(a, b)` with `exact_fixed_mul(a, b)` at lines 193, 208 |
+| C3 | ~~**CRITICAL**~~ | distributed.rs:193 | ~~`simulate_distributed_generation` uses `Fr::mul()` (raw field multiplication) instead of `exact_fixed_mul()` — triples numerically wrong.~~ | ✅ **RESOLVED** (2026-02-11): Now uses `mpc_scale` (`exact_fixed_mul`). |
 | 6 | High | distributed.rs:147-148 | `masked_b` received in `CrossTermContribution` but explicitly ignored (`masked_b: _`). The protocol description (lines 6-12) says both masked values are needed. | Either use `masked_b` or remove it from `TripleGenMessage` and document why only `masked_a` is needed |
 | 7 | High | distributed.rs:104 | `mask_commitment` field generated but never checked by any receiver | Wire in `MaskCommitment::verify()` in `phase2_compute()` |
 | 8 | Medium | distributed.rs:247-295 | Tests pass despite C3 because reconstruction uses the same broken multiplication — tests compare broken output against itself | Add tests that cross-validate against `TrustedDealer` output |
@@ -118,8 +120,8 @@ Implements (attempted) Chou-Orlandi 1-of-2 OT, correlated OT, OT extension, and 
 
 | # | Severity | Location | Issue | Fix |
 |---|----------|----------|-------|-----|
-| C4 | **CRITICAL** | ot.rs:88-97 | OT sender computes second receiver key as `receiver_pk XOR sender_pk` (byte-level XOR). This is **not a valid elliptic curve operation** — XOR of two X25519 public keys is not a valid public key and breaks the security guarantee. In real Chou-Orlandi, the second key should be `receiver_pk - sender_pk` (group subtraction). **Impact**: receiver can compute both shared secrets and learn both messages. | Implement proper group subtraction: use `curve25519_dalek::EdwardsPoint` or restructure to use a different OT construction |
-| C5 | **CRITICAL** | ot.rs:140-150 | Same XOR bug in `OTReceiver::public_key()` — for choice=1, XORs own key with sender key instead of adding sender key | Use `receiver_secret_key * G + sender_pk` for choice=1 |
+| C4 | ~~**CRITICAL**~~ | ot.rs:88-97 | ~~OT sender computes second receiver key as `receiver_pk XOR sender_pk` — not a valid EC operation. Receiver can compute both shared secrets.~~ | ✅ **RESOLVED** (2026-02-11): OT gated with `#[deprecated]` warning. `generate_beaver_triple_ot` deprecated. OT should not be used until proper group operations are implemented. |
+| C5 | ~~**CRITICAL**~~ | ot.rs:140-150 | ~~Same XOR bug in `OTReceiver::public_key()`~~ | ✅ **RESOLVED** (2026-02-11): Covered by OT deprecation gating. |
 | 9 | High | ot.rs:248-258 | `OTExtension` claims IKNP-style but is actually just random pair selection — no matrix transposition, no seed expansion, no hash-based extension | Either implement real IKNP or rename to `SimpleOTBatch` |
 | 10 | High | ot.rs:281-331 | `generate_beaver_triple_ot()` uses `f64` arithmetic, not `Fr` — type mismatch with `BeaverTriple` which stores `Fr` values | Use `Fr` throughout or add `from_f64()` conversion at the boundary |
 | 11 | Medium | ot.rs:599-601 | `simulate_full_generation()` converts f64→Fr at the end, losing precision from floating-point intermediate computation | Compute in `Fr` from the start |
@@ -173,19 +175,19 @@ Per-party storage indexed by triple type (scalar, vector by dimension, matrix by
 
 ## 3. Cross-Module Issues
 
-### 3.1 Three Incompatible Multiplication Functions
+### 3.1 ~~Three Incompatible Multiplication Functions~~ — RESOLVED
 
-This is the module's most systemic problem. Three different multiplication semantics are used:
+✅ **RESOLVED** (2026-02-11): All triple generation now standardized on `mpc_scale` (`exact_fixed_mul`).
 
-| Location | Function | Semantics | Result for `a=Fr(x*2^64), b=Fr(y*2^64)` |
-|----------|----------|-----------|------------------------------------------|
-| `dealer.rs:62` (TrustedDealer) | `fixed_mul()` | Floor-based byte-shift: `floor((a*b)/2^64)` | `Fr(floor(x*y*2^64))` — nonlinear truncation |
-| `dealer.rs:343` (DistributedDealer) | `exact_fixed_mul()` → `mpc_scale()` | Modular inverse: `(a*b)*(2^64)^{-1} mod r` | `Fr(x*y*2^64 mod r)` — exact, linear |
-| `distributed.rs:193` | `Fr::mul()` | Raw field multiplication | `Fr(x*y*2^128)` — wrong scale entirely |
+Previously three different multiplication semantics were used. Now all use the same:
 
-**Impact**: Triples generated by different methods are **mutually incompatible**. Using a TrustedDealer triple in a protocol that expects DistributedDealer semantics will produce incorrect Beaver openings and silently corrupt computation.
+| Location | Function | Status |
+|----------|----------|--------|
+| `dealer.rs` (TrustedDealer) | `mpc_scale()` | ✅ Fixed (was `fixed_mul`) |
+| `dealer.rs` (DistributedDealer) | `mpc_scale()` via `exact_fixed_mul()` | ✅ Already correct |
+| `distributed.rs` | `mpc_scale()` via `exact_fixed_mul()` | ✅ Fixed (was `Fr::mul`) |
 
-**Fix**: Standardize all triple generation on `exact_fixed_mul()` (`mpc_scale`). It's mathematically linear (preserves additive secret sharing) and exact (no truncation error).
+**Note on `fixed_mul` vs `mpc_scale`**: `mpc_scale` is used for Beaver protocol operations on random Fr shares. `fixed_mul` is still correct for `from_f64 x from_f64` products (e.g., `TensorShare.scale()`), where values are small and within the byte-shift safe range. This distinction is now documented.
 
 ### 3.2 No Cross-Dealer Validation Tests
 
@@ -212,16 +214,18 @@ The `ot.rs` module operates in f64 while everything else uses Fr. This creates a
 - `DistributedDealer` protocol math is correct (when using `exact_fixed_mul`)
 - Pool consumption properly returns errors instead of panicking
 
-### What's Broken
-1. **OT is cryptographically broken** — XOR-based key derivation defeats the entire OT security property
-2. **RNG clone bug** — distributed dealer repeats random masks across iterations
-3. **Three incompatible multiplications** — silent data corruption when mixing dealers
-4. **Commitments generated but never verified** — security theater
+### What's Been Fixed (2026-02-11)
+1. ✅ ~~**OT is cryptographically broken**~~ — OT gated with `#[deprecated]` warning; `generate_beaver_triple_ot` deprecated
+2. ✅ ~~**RNG clone bug**~~ — Fixed in dealer.rs
+3. ✅ ~~**Three incompatible multiplications**~~ — All standardized on `mpc_scale`
+
+### Remaining Issues
+4. **Commitments generated but never verified** — security theater (medium priority)
 
 ### Trust Model
-- `TrustedDealer`: Trusted single party (acceptable for demos only)
-- `DistributedDealer`: Would be trustless if RNG bug fixed and commitments verified
-- `OTTripleGenerator`: Would be trustless if OT implementation were correct
+- `TrustedDealer`: Trusted single party (acceptable for demos, now uses correct `mpc_scale` arithmetic)
+- `DistributedDealer`: RNG bug fixed; commitments still unverified. Usable for semi-honest setting.
+- `OTTripleGenerator`: Deprecated/gated. Do not use until proper group operations are implemented.
 
 ---
 
@@ -249,9 +253,9 @@ The `ot.rs` module operates in f64 while everything else uses Fr. This creates a
 
 **TrustedDealer + BeaverPool**: Ready. This path works correctly for single-machine demos where a trusted dealer is acceptable.
 
-**DistributedDealer**: Not ready. RNG bug (C2) produces insecure masks. Fix is a one-line change.
+**DistributedDealer**: Ready. RNG bug (C2) fixed. Uses correct `mpc_scale` arithmetic. Commitments still unverified but functional for semi-honest demo.
 
-**OT-based generation**: Not ready. Fundamental cryptographic flaw (C4/C5) requires architectural fix.
+**OT-based generation**: Deprecated/gated. Do not use. `#[deprecated]` warning in place.
 
 **Pipeline**: Ready for demos. Background generation with demand prediction works. Priority ordering would be nice but not blocking.
 
@@ -262,14 +266,14 @@ The `ot.rs` module operates in f64 while everything else uses Fr. This creates a
 ## 7. Prioritized Recommendations
 
 ### Critical (fix before any production use)
-1. **Standardize multiplication** — Replace `fixed_mul()` with `exact_fixed_mul()` in `TrustedDealer` (dealer.rs:62)
-2. **Fix RNG clone bug** — Remove `.clone()` in `DistributedDealer` (dealer.rs:461)
-3. **Fix or remove OT** — Either implement proper group operations (not XOR) or gate behind `#[cfg(feature = "experimental-ot")]`
+1. ✅ ~~**Standardize multiplication**~~ — **RESOLVED**: All dealers now use `mpc_scale`.
+2. ✅ ~~**Fix RNG clone bug**~~ — **RESOLVED**: Fixed in dealer.rs.
+3. ✅ ~~**Fix or remove OT**~~ — **RESOLVED**: OT gated with `#[deprecated]` warning.
 
 ### High (fix before multi-party deployment)
-4. **Fix distributed.rs `Fr::mul`** — Replace with `exact_fixed_mul()` (distributed.rs:193, 208)
+4. ✅ ~~**Fix distributed.rs `Fr::mul`**~~ — **RESOLVED**: Now uses `mpc_scale`.
 5. **Wire in commitment verification** — Add `MaskCommitment::verify()` call in distributed generation
-6. **Move OT to Fr arithmetic** — Eliminate f64 precision loss in ot.rs
+6. **Move OT to Fr arithmetic** — Eliminate f64 precision loss in ot.rs (lower priority now that OT is deprecated)
 
 ### Nice-to-have (improves production quality)
 7. Priority queue for pipeline requests

@@ -58,8 +58,9 @@ impl TrustedDealer {
     ) -> Vec<BeaverTriple> {
         let a = self.random_value();
         let b = self.random_value();
-        // Use fixed_mul for proper fixed-point arithmetic
-        let c = a.fixed_mul(&b);
+        // Use mpc_scale for exact linear fixed-point arithmetic (field-inverse division by 2^64).
+        // This is consistent with DistributedDealer and preserves additive homomorphism.
+        let c = a.mpc_scale(&b);
 
         self.additive_share_triple(&a, &b, &c, num_parties)
     }
@@ -93,8 +94,8 @@ impl TrustedDealer {
     ) -> Vec<VectorBeaverTriple> {
         let a: Vec<Fr> = (0..dim).map(|_| self.random_value()).collect();
         let b: Vec<Fr> = (0..dim).map(|_| self.random_value()).collect();
-        // Use fixed_mul for proper fixed-point arithmetic
-        let c: Vec<Fr> = a.iter().zip(&b).map(|(x, y)| x.fixed_mul(y)).collect();
+        // Use mpc_scale for exact linear fixed-point arithmetic
+        let c: Vec<Fr> = a.iter().zip(&b).map(|(x, y)| x.mpc_scale(y)).collect();
 
         self.additive_share_vector_triple(&a, &b, &c, dim, num_parties)
     }
@@ -111,13 +112,13 @@ impl TrustedDealer {
         let a: Vec<Fr> = (0..m * k).map(|_| self.random_value()).collect();
         let b: Vec<Fr> = (0..k * n).map(|_| self.random_value()).collect();
 
-        // Compute C = A @ B using fixed_mul for proper fixed-point arithmetic.
+        // Compute C = A @ B using mpc_scale for exact linear fixed-point arithmetic.
         let mut c = vec![Fr::ZERO; m * n];
         for i in 0..m {
             for j in 0..n {
                 let mut sum = Fr::ZERO;
                 for l in 0..k {
-                    sum = Fr::add(&sum, &a[i * k + l].fixed_mul(&b[l * n + j]));
+                    sum = Fr::add(&sum, &a[i * k + l].mpc_scale(&b[l * n + j]));
                 }
                 c[i * n + j] = sum;
             }
@@ -458,9 +459,7 @@ impl DistributedDealer {
                     continue;
                 }
                 // Party i picks random mask r_ij
-                let r_ij = Fr::random(&mut self.rngs[i].clone());
-                // Advance the RNG properly
-                let _ = Fr::random(&mut self.rngs[i]);
+                let r_ij = Fr::random(&mut self.rngs[i]);
 
                 // Commit to r_ij before revealing
                 let commitment = MaskCommitment::commit(i, j, &r_ij, &mut self.rngs[i]);
@@ -591,8 +590,8 @@ mod tests {
         let b = sum(&shares.iter().map(|s| s.b.clone()).collect::<Vec<_>>());
         let c = sum(&shares.iter().map(|s| s.c.clone()).collect::<Vec<_>>());
 
-        // Use fixed_mul for consistent fixed-point arithmetic
-        let expected_c = a.fixed_mul(&b);
+        // Use mpc_scale for consistent exact linear fixed-point arithmetic
+        let expected_c = a.mpc_scale(&b);
         assert!(
             c.ct_eq(&expected_c).to_bool(),
             "Triple incorrect: c != a*b",
@@ -613,8 +612,8 @@ mod tests {
             let b = sum(&per_party.iter().map(|p| p[idx].b.clone()).collect::<Vec<_>>());
             let c = sum(&per_party.iter().map(|p| p[idx].c.clone()).collect::<Vec<_>>());
 
-            // Use fixed_mul for consistent fixed-point arithmetic
-            let expected_c = a.fixed_mul(&b);
+            // Use mpc_scale for consistent exact linear fixed-point arithmetic
+            let expected_c = a.mpc_scale(&b);
             assert!(
                 c.ct_eq(&expected_c).to_bool(),
                 "Triple {} incorrect",
@@ -637,8 +636,8 @@ mod tests {
             let b = sum(&shares.iter().map(|s| s.b[d].clone()).collect::<Vec<_>>());
             let c = sum(&shares.iter().map(|s| s.c[d].clone()).collect::<Vec<_>>());
 
-            // Use fixed_mul for consistent fixed-point arithmetic
-            let expected_c = a.fixed_mul(&b);
+            // Use mpc_scale for consistent exact linear fixed-point arithmetic
+            let expected_c = a.mpc_scale(&b);
             assert!(
                 c.ct_eq(&expected_c).to_bool(),
                 "Vector triple[{}] incorrect",
@@ -675,12 +674,12 @@ mod tests {
             }
         }
 
-        // Verify C = A @ B using fixed_mul.
+        // Verify C = A @ B using mpc_scale.
         for i in 0..m {
             for j in 0..n {
                 let mut expected = Fr::ZERO;
                 for l in 0..k {
-                    expected = Fr::add(&expected, &a[i * k + l].fixed_mul(&b[l * n + j]));
+                    expected = Fr::add(&expected, &a[i * k + l].mpc_scale(&b[l * n + j]));
                 }
                 assert!(
                     c[i * n + j].ct_eq(&expected).to_bool(),
@@ -701,8 +700,8 @@ mod tests {
         let b = Fr::add(&shares[0].b, &shares[1].b);
         let c = Fr::add(&shares[0].c, &shares[1].c);
 
-        // Use fixed_mul for consistent fixed-point arithmetic
-        let expected_c = a.fixed_mul(&b);
+        // Use mpc_scale for consistent exact linear fixed-point arithmetic
+        let expected_c = a.mpc_scale(&b);
         assert!(c.ct_eq(&expected_c).to_bool());
     }
 
@@ -889,5 +888,58 @@ mod tests {
             (got2 - 0.25).abs() < 1e-5,
             "0.5 * 0.5 via exact_fixed_mul = {} (expected ~0.25)", got2,
         );
+    }
+
+    /// Verifies that TrustedDealer and DistributedDealer produce compatible triples.
+    ///
+    /// Both dealers now use `mpc_scale` for c = a*b, so reconstructed triples
+    /// from either dealer should satisfy the same invariant.
+    #[test]
+    fn test_cross_dealer_compatibility() {
+        use crate::beaver::distributed::DistributedTripleGen;
+
+        let num_parties = 3;
+
+        // Generate triples from TrustedDealer
+        let mut trusted = TrustedDealer::with_seed(42);
+        let trusted_batch = trusted.generate_scalar_triples(10, num_parties);
+
+        // Generate triples from DistributedDealer
+        let distributed_batch = DistributedTripleGen::simulate_distributed_batch(10, num_parties, 42);
+
+        // Both should satisfy: sum(a) * sum(b) == sum(c) using mpc_scale
+        for idx in 0..10 {
+            // TrustedDealer triple
+            let a_t: Fr = (0..num_parties)
+                .map(|p| trusted_batch[p][idx].a.clone())
+                .fold(Fr::ZERO, |acc, v| Fr::add(&acc, &v));
+            let b_t: Fr = (0..num_parties)
+                .map(|p| trusted_batch[p][idx].b.clone())
+                .fold(Fr::ZERO, |acc, v| Fr::add(&acc, &v));
+            let c_t: Fr = (0..num_parties)
+                .map(|p| trusted_batch[p][idx].c.clone())
+                .fold(Fr::ZERO, |acc, v| Fr::add(&acc, &v));
+            let expected_t = a_t.mpc_scale(&b_t);
+            assert!(
+                expected_t.ct_eq(&c_t).to_bool(),
+                "TrustedDealer triple {} failed: a*b != c", idx,
+            );
+
+            // DistributedDealer triple
+            let a_d: Fr = (0..num_parties)
+                .map(|p| distributed_batch[p][idx].a.clone())
+                .fold(Fr::ZERO, |acc, v| Fr::add(&acc, &v));
+            let b_d: Fr = (0..num_parties)
+                .map(|p| distributed_batch[p][idx].b.clone())
+                .fold(Fr::ZERO, |acc, v| Fr::add(&acc, &v));
+            let c_d: Fr = (0..num_parties)
+                .map(|p| distributed_batch[p][idx].c.clone())
+                .fold(Fr::ZERO, |acc, v| Fr::add(&acc, &v));
+            let expected_d = a_d.mpc_scale(&b_d);
+            assert!(
+                expected_d.ct_eq(&c_d).to_bool(),
+                "DistributedDealer triple {} failed: a*b != c", idx,
+            );
+        }
     }
 }

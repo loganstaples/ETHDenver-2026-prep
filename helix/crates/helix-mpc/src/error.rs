@@ -100,6 +100,12 @@ pub enum MPCError {
 
     #[error("channel multiplexing error: {0}")]
     MultiplexError(String),
+
+    #[error("message too large: {size} bytes exceeds maximum {max_size} bytes")]
+    MessageTooLarge { size: usize, max_size: usize },
+
+    #[error("replay attack detected: duplicate sequence {sequence} from party {party}")]
+    ReplayAttack { sequence: u64, party: PartyId },
 }
 
 /// Result type for MPC operations.

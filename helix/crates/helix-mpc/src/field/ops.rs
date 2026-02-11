@@ -26,6 +26,7 @@ pub fn inner_product(a: &[Fr], b: &[Fr]) -> Fr {
 }
 
 /// Computes the inner product using fixed-point multiplication.
+/// Both inputs should be from_f64 encoded vectors.
 #[inline]
 pub fn inner_product_fixed(a: &[Fr], b: &[Fr]) -> Fr {
     assert_eq!(a.len(), b.len(), "Vector lengths must match");
@@ -62,6 +63,7 @@ pub fn mul_vec(a: &[Fr], b: &[Fr]) -> Vec<Fr> {
 }
 
 /// Multiplies two vectors element-wise using fixed-point multiplication.
+/// Both inputs should be from_f64 encoded vectors.
 #[inline]
 pub fn mul_vec_fixed(a: &[Fr], b: &[Fr]) -> Vec<Fr> {
     assert_eq!(a.len(), b.len(), "Vector lengths must match");
@@ -98,6 +100,7 @@ pub fn matmul(a: &[Fr], b: &[Fr], m: usize, k: usize, n: usize) -> Vec<Fr> {
 }
 
 /// Matrix multiplication using fixed-point arithmetic.
+/// Both inputs should be from_f64 encoded matrices.
 #[inline]
 pub fn matmul_fixed(a: &[Fr], b: &[Fr], m: usize, k: usize, n: usize) -> Vec<Fr> {
     assert_eq!(a.len(), m * k, "A must be [{}x{}]", m, k);
