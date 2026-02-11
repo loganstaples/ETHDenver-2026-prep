@@ -289,7 +289,7 @@ impl DemoOrchestrator {
             worker_count,
             simulate_slashing: false,
             slashing_round: None,
-            rpc_client: Arc::new(RwLock::new(UnifiedRpcClient::mock_only())),
+            rpc_client: Arc::new(RwLock::new(UnifiedRpcClient::new_mock())),
             proof_tracker: Arc::new(RealTimeProofTracker::new()),
             training_tracker: Arc::new(RealTimeTrainingTracker::new()),
             current_phase: Arc::new(RwLock::new(OrchestratedPhase::PreStart)),

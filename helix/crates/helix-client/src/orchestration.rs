@@ -73,6 +73,12 @@ pub struct OrchestratorConfig {
     pub health_check_interval: Duration,
     /// Maximum number of automatic restarts per node before giving up.
     pub max_restarts: u32,
+
+    // -- Checkpointing --
+    /// Checkpoint configuration for training state persistence.
+    pub checkpoint: crate::demo::checkpoint::CheckpointConfig,
+    /// Whether to resume from an existing checkpoint on startup.
+    pub resume: bool,
 }
 
 impl Default for OrchestratorConfig {
@@ -100,6 +106,8 @@ impl Default for OrchestratorConfig {
             round_timeout: Duration::from_secs(120),
             health_check_interval: Duration::from_secs(5),
             max_restarts: 3,
+            checkpoint: crate::demo::checkpoint::CheckpointConfig::default(),
+            resume: false,
         }
     }
 }
@@ -223,13 +231,16 @@ pub struct TrainingOrchestrator {
 
 impl TrainingOrchestrator {
     /// Create a new orchestrator from configuration.
-    pub fn new(config: OrchestratorConfig) -> Self {
+    ///
+    /// Returns an error if the internal HTTP client cannot be constructed
+    /// (should only happen if TLS backends are misconfigured).
+    pub fn new(config: OrchestratorConfig) -> Result<Self> {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .pool_max_idle_per_host(4)
             .build()
-            .expect("static HTTP client config");
-        Self {
+            .context("failed to build HTTP client")?;
+        Ok(Self {
             config,
             anvil_process: None,
             node_processes: Vec::new(),
@@ -240,7 +251,7 @@ impl TrainingOrchestrator {
             prover: None,
             training_state: None,
             http_client,
-        }
+        })
     }
 
     /// Set a progress callback that is invoked after each phase.
@@ -291,6 +302,24 @@ impl TrainingOrchestrator {
         self.initialize_prover()
             .context("Failed to initialize ZK prover")?;
 
+        // Phase 3.6: Resume from checkpoint (if configured)
+        let mut start_round = 1u32;
+        if self.config.resume && self.config.checkpoint.enabled {
+            let model_id = self.model_id.unwrap_or(0);
+            let ckpt_path = self.config.checkpoint.checkpoint_path(model_id);
+            if let Some(ckpt) = crate::demo::checkpoint::TrainingCheckpoint::load(&ckpt_path)
+                .context("Failed to load checkpoint")?
+            {
+                let restored = ckpt.to_state().context("Failed to restore training state from checkpoint")?;
+                info!(
+                    "Resuming training from checkpoint: step={}, loss={:.4}, error={:.2}",
+                    restored.step, restored.loss, restored.error_bound
+                );
+                start_round = (restored.step as u32).saturating_add(1);
+                self.training_state = Some(restored);
+            }
+        }
+
         // Phase 4: Start network
         self.start_network().await
             .context("Failed to start network")?;
@@ -304,7 +333,7 @@ impl TrainingOrchestrator {
         let mut accumulated_error = 0.0;
         let mut rounds_completed = 0u32;
 
-        for round in 1..=self.config.rounds {
+        for round in start_round..=self.config.rounds {
             let round_start = Instant::now();
             info!("Starting round {}/{}", round, self.config.rounds);
 
@@ -351,6 +380,21 @@ impl TrainingOrchestrator {
                     tx_hash: tx_hashes.last().cloned(),
                     elapsed_ms: elapsed,
                 });
+            }
+
+            // Save checkpoint after successful round
+            if self.config.checkpoint.enabled {
+                if let Some(ref state) = self.training_state {
+                    let model_id = self.model_id.unwrap_or(0);
+                    let proof_hash = tx_hashes.last().cloned().unwrap_or_default();
+                    let ckpt = crate::demo::checkpoint::TrainingCheckpoint::from_state(
+                        state, model_id, &proof_hash,
+                    );
+                    let ckpt_path = self.config.checkpoint.checkpoint_path(model_id);
+                    if let Err(e) = ckpt.save(&ckpt_path) {
+                        warn!("Failed to save checkpoint for round {}: {}", round, e);
+                    }
+                }
             }
 
             info!(
