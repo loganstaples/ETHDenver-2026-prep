@@ -1434,7 +1434,6 @@ impl TrainingOrchestrator {
                     &proof,
                     None,
                 ).await;
-
                 let mut round_guard = round_clone.write();
                 if let Some(ref mut round) = *round_guard {
                     if round.id == round_id && round.phase == RoundPhase::Collecting {
@@ -1461,6 +1460,42 @@ impl TrainingOrchestrator {
                                 round_id,
                                 peer_id: from,
                             });
+
+                            // Check if all expected gradients have been collected.
+                            // This mirrors the check in handle_gradient() (line 597)
+                            // and triggers aggregation when all workers have submitted.
+                            let gradients_count = round.gradients.len();
+                            let workers_count = round.workers.len();
+                            if gradients_count >= workers_count {
+                                log::info!(
+                                    "All gradients collected for round {} ({}/{}), triggering aggregation",
+                                    round_id, gradients_count, workers_count,
+                                );
+                                round.phase = RoundPhase::Aggregating;
+                                round.phase_started = Instant::now();
+
+                                // Compute aggregated commitment
+                                let mut commitments: Vec<[u8; 32]> = round.gradients.values()
+                                    .map(|g| g.commitment)
+                                    .collect();
+                                commitments.sort();
+                                let result_hash = compute_aggregated_commitment(&commitments);
+
+                                round.phase = RoundPhase::Completed;
+
+                                // Update worker states
+                                for pid in &round.workers {
+                                    if let Some(w) = workers.get_mut(pid) {
+                                        w.rounds_completed += 1;
+                                        w.status = WorkerStatus::Available;
+                                    }
+                                }
+
+                                let _ = event_tx_clone.send(OrchestratorEvent::RoundCompleted {
+                                    round_id,
+                                    result_hash,
+                                });
+                            }
                         } else {
                             reputation_clone.lock().record_invalid_proof(&from);
 
