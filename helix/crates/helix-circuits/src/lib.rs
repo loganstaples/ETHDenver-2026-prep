@@ -18,8 +18,10 @@ pub use benchmark::{BenchmarkResult, BenchmarkSuite, OverheadAnalysis};
 pub use ivc::{
     IVCAccumulator, IVCChain, IVCStepCircuit, IVCStepWitness,
     IVCFoldingCircuit, IVCFoldingWitness, IVCMultiStepCircuit, IVCMultiStepWitness,
-    IVCProofStep, FoldResult, fold_accumulators, generate_folding_challenge,
-    IVC_PUBLIC_INPUTS, FOLDING_PUBLIC_INPUTS, MAX_MULTI_STEPS,
+    IVCDeciderCircuit, IVCDeciderWitness,
+    IVCProofStep, FoldResult, fold_accumulators, generate_folding_challenge, commit_vector,
+    IVC_PUBLIC_INPUTS, FOLDING_PUBLIC_INPUTS, MAX_MULTI_STEPS, DECIDER_PUBLIC_INPUTS,
+    DECIDER_MAX_VECTOR_SIZE,
 };
 pub use ml::training_step_v2::{
     MLTrainingStepV2Circuit, MLTrainingStepV2Witness, compute_witness_v2, compute_state_hash_v2,

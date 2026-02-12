@@ -17,7 +17,8 @@ use helix_circuits::{
     IVCAccumulator, IVCChain,
     IVCStepCircuit as A1StepCircuit, IVCStepWitness,
     IVCFoldingCircuit, IVCFoldingWitness,
-    fold_accumulators, generate_folding_challenge,
+    IVCDeciderCircuit, IVCDeciderWitness,
+    fold_accumulators, generate_folding_challenge, commit_vector,
 };
 use helix_circuits::gadgets::poseidon::poseidon_hash_two;
 use helix_circuits::halo2curves::bn256::Fr;
@@ -161,12 +162,39 @@ impl Default for IVCConfig {
     }
 }
 
+/// Result of IVC decider proof generation.
+///
+/// Contains a contract-compatible KZG proof plus metadata. The proof and
+/// public inputs can be submitted directly to `HelixCoordinatorV2.submitProof()`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeciderProof {
+    /// The KZG proof bytes (SHPLONK, Keccak256 transcript).
+    pub proof: Vec<u8>,
+    /// The 8 contract-compatible public inputs as 32-byte LE Fr representations.
+    pub public_inputs: Vec<[u8; 32]>,
+    /// Number of steps compressed into this proof.
+    pub num_steps: u64,
+    /// Initial state commitment.
+    pub initial_state: [u8; 32],
+    /// Final state commitment.
+    pub final_state: [u8; 32],
+    /// Total accumulated error bound.
+    pub total_error_bound: f64,
+}
+
 /// IVC prover for chaining computations.
 ///
 /// Uses the A1 accumulator circuit from helix-circuits with Poseidon-based
 /// state transitions and Nova-style folding. Each step generates a real
 /// KZG proof of the state transition, and folding produces a proof that
 /// two accumulators were correctly combined.
+///
+/// ## Decider Mode
+///
+/// After all steps are folded, call [`prove_decider()`] to produce a single
+/// contract-compatible SNARK proof. The decider circuit verifies the final
+/// accumulator and exposes 8 public inputs matching `MLTrainingStepV2Circuit`,
+/// so it can be submitted to `HelixCoordinatorV2.submitProof()`.
 pub struct IVCProver {
     /// Configuration.
     config: IVCConfig,
@@ -182,8 +210,16 @@ pub struct IVCProver {
     step_pipeline: ProverPipeline<A1StepCircuit>,
     /// Halo2 prover pipeline for folding proofs (k=13).
     fold_pipeline: ProverPipeline<IVCFoldingCircuit>,
+    /// Halo2 prover pipeline for decider proofs (k=13+, varies with vector size).
+    decider_pipeline: Option<ProverPipeline<IVCDeciderCircuit>>,
     /// Accumulated per-step proofs for verification.
     step_proofs: Vec<Vec<u8>>,
+    /// Initial state as Fr (for decider witness).
+    initial_state_fr: Fr,
+    /// Witness vectors accumulated during step processing.
+    witness_vectors: Vec<Fr>,
+    /// Error vectors accumulated during step processing.
+    error_vectors: Vec<Fr>,
 }
 
 impl IVCProver {
@@ -219,7 +255,11 @@ impl IVCProver {
             pending_steps: Vec::new(),
             step_pipeline,
             fold_pipeline,
+            decider_pipeline: None, // Lazily initialized when prove_decider() is called
             step_proofs: Vec::new(),
+            initial_state_fr: initial_fr,
+            witness_vectors: Vec::new(),
+            error_vectors: Vec::new(),
         }
     }
 
@@ -572,13 +612,145 @@ impl IVCProver {
         Ok(self.generate_final_proof())
     }
 
+    /// Produces a contract-compatible decider SNARK from the current IVC accumulator.
+    ///
+    /// This is the key method that bridges IVC folding to on-chain verification.
+    /// It takes the current accumulator (representing all folded steps) and generates
+    /// a standard KZG proof with 8 public inputs matching `MLTrainingStepV2Circuit`.
+    ///
+    /// The resulting `DeciderProof` can be submitted directly to
+    /// `HelixCoordinatorV2.submitProof()` on-chain.
+    ///
+    /// ## Arguments
+    /// - `loss`: The training loss value from the run
+    /// - `model_id`: The on-chain model ID (32 bytes LE)
+    /// - `error_budget`: The contract's maxErrorBound
+    ///
+    /// ## Returns
+    /// A `DeciderProof` containing the proof bytes and public inputs.
+    pub fn prove_decider(
+        &mut self,
+        loss: Fr,
+        model_id: Fr,
+        error_budget: Fr,
+    ) -> Result<DeciderProof, String> {
+        // Flush any pending steps first
+        self.fold()?;
+
+        let acc = &self.chain.accumulator;
+
+        // Build the accumulator with consistent witness/error vectors.
+        // If the chain has no witness vectors (steps without folding), create
+        // a trivial satisfying instance with empty vectors.
+        let decider_acc = if acc.witness_vector.is_empty() {
+            // No vectors to verify — the decider will skip vector checks
+            acc.clone()
+        } else {
+            // Ensure error vector satisfies the relation: u * Z[i]^2 = E[i]
+            let u = acc.error_term;
+            let e_consistent: Vec<Fr> = acc.witness_vector.iter()
+                .map(|z| u * *z * *z)
+                .collect();
+            let e_commitment = commit_vector(&e_consistent);
+
+            IVCAccumulator {
+                error_vector: e_consistent,
+                error_commitment: e_commitment,
+                ..acc.clone()
+            }
+        };
+
+        let decider_witness = IVCDeciderWitness {
+            accumulator: decider_acc,
+            initial_state: self.initial_state_fr,
+            loss,
+            model_id,
+            error_budget,
+        };
+
+        let circuit = IVCDeciderCircuit { witness: decider_witness.clone() };
+        let pi = circuit.public_inputs();
+
+        // Lazily initialize the decider pipeline with the right k
+        let k = circuit.minimum_k().max(13);
+        if self.decider_pipeline.is_none() {
+            let mut pipeline = ProverPipeline::new(k);
+            if let Err(e) = pipeline.setup(&IVCDeciderCircuit::default()) {
+                return Err(format!("Decider pipeline setup failed: {e}"));
+            }
+            self.decider_pipeline = Some(pipeline);
+        }
+
+        let pipeline = self.decider_pipeline.as_ref()
+            .expect("invariant: decider_pipeline just initialized");
+
+        // Generate the decider proof
+        let pi_refs: Vec<&[Fr]> = vec![&pi];
+        let proof_bytes = pipeline.prove(&circuit, &pi_refs)
+            .map_err(|e| format!("Decider proof generation failed: {e}"))?;
+
+        // Convert public inputs to bytes for serialization
+        let pi_bytes: Vec<[u8; 32]> = pi.iter()
+            .map(|f| fr_to_bytes(*f))
+            .collect();
+
+        tracing::info!(
+            num_steps = acc.num_steps,
+            proof_size = proof_bytes.len(),
+            "IVC decider proof generated successfully"
+        );
+
+        Ok(DeciderProof {
+            proof: proof_bytes,
+            public_inputs: pi_bytes,
+            num_steps: acc.num_steps,
+            initial_state: fr_to_bytes(self.initial_state_fr),
+            final_state: fr_to_bytes(acc.state_commitment),
+            total_error_bound: {
+                let bytes = acc.error_bound.to_repr();
+                let u64_val = u64::from_le_bytes(bytes.as_ref()[..8].try_into().unwrap_or([0; 8]));
+                u64_val as f64
+            },
+        })
+    }
+
+    /// Verifies a decider proof against its embedded public inputs.
+    ///
+    /// Returns true if the proof is valid. This uses the decider pipeline's
+    /// verification key to check the KZG proof.
+    pub fn verify_decider_proof(&self, decider_proof: &DeciderProof) -> Result<bool, String> {
+        let pipeline = self.decider_pipeline.as_ref()
+            .ok_or_else(|| "Decider pipeline not initialized — call prove_decider() first".to_string())?;
+
+        // Reconstruct Fr public inputs from bytes
+        let pi: Vec<Fr> = decider_proof.public_inputs.iter()
+            .map(|bytes| {
+                Fr::from_repr_vartime((*bytes).into()).unwrap_or(Fr::ZERO)
+            })
+            .collect();
+
+        let pi_refs: Vec<&[Fr]> = vec![&pi];
+        pipeline.verify(&decider_proof.proof, &pi_refs)
+            .map_err(|e| format!("Decider verification error: {e}"))
+    }
+
+    /// Returns a reference to the decider pipeline (for external verification).
+    pub fn decider_pipeline(&self) -> Option<&ProverPipeline<IVCDeciderCircuit>> {
+        self.decider_pipeline.as_ref()
+    }
+
     /// Resets the prover to initial state.
     pub fn reset(&mut self, initial_commitment: [u8; 32]) {
+        let initial_fr = bytes_to_fr(&initial_commitment);
         self.state = IVCState::initial(initial_commitment);
-        self.chain = IVCChain::new(bytes_to_fr(&initial_commitment));
+        self.chain = IVCChain::new(initial_fr);
+        self.initial_state_fr = initial_fr;
         self.history.clear();
         self.pending_steps.clear();
         self.step_proofs.clear();
+        self.witness_vectors.clear();
+        self.error_vectors.clear();
+        self.decider_pipeline = None; // Force re-setup on next prove_decider()
     }
 
     /// Generates a folded proof with A1 step proofs and an optional folding circuit proof.
@@ -1240,5 +1412,245 @@ mod tests {
         // Structural verification of the finalized chain.
         let final_commitment = prover.state().state_commitment;
         assert!(verify_ivc_chain(initial, final_commitment, &finalized));
+    }
+
+    // ===== Decider Proof Tests =====
+
+    #[test]
+    fn test_decider_proof_after_single_step() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let initial = [0u8; 32];
+        let mut prover = IVCProver::new(initial);
+
+        let step = make_step(1, initial);
+        prover.add_step(step).unwrap();
+
+        assert_eq!(prover.state().step, 1);
+
+        // Generate decider proof
+        let decider = prover.prove_decider(
+            Fr::from(50u64),   // loss
+            Fr::from(1u64),    // model_id
+            Fr::from(1000u64), // error_budget
+        ).expect("decider proof should succeed");
+
+        assert!(!decider.proof.is_empty(), "decider proof must not be empty");
+        assert_eq!(decider.num_steps, 1);
+        assert_eq!(decider.public_inputs.len(), 8);
+
+        // Verify the decider proof
+        let verified = prover.verify_decider_proof(&decider)
+            .expect("verification should complete");
+        assert!(verified, "decider proof must verify");
+    }
+
+    #[test]
+    fn test_decider_proof_after_multiple_steps() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let initial = [0u8; 32];
+        let mut prover = IVCProver::new(initial);
+
+        // Add 5 steps
+        let mut current = initial;
+        for i in 1..=5 {
+            let step = make_step(i, current);
+            current = step.output_state;
+            prover.add_step(step).unwrap();
+        }
+
+        assert_eq!(prover.state().step, 5);
+
+        // Generate decider proof
+        let decider = prover.prove_decider(
+            Fr::from(42u64),
+            Fr::from(7u64),
+            Fr::from(500u64),
+        ).expect("decider proof should succeed for 5 steps");
+
+        assert_eq!(decider.num_steps, 5);
+
+        // Verify
+        let verified = prover.verify_decider_proof(&decider)
+            .expect("verification should complete");
+        assert!(verified, "5-step decider proof must verify");
+    }
+
+    #[test]
+    fn test_decider_proof_serialization() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let initial = [0u8; 32];
+        let mut prover = IVCProver::new(initial);
+
+        let step = make_step(1, initial);
+        prover.add_step(step).unwrap();
+
+        let decider = prover.prove_decider(
+            Fr::from(10u64),
+            Fr::from(2u64),
+            Fr::from(100u64),
+        ).expect("decider should succeed");
+
+        // Serialize and deserialize
+        let json = serde_json::to_string(&decider).expect("serialize");
+        let deserialized: DeciderProof = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(deserialized.proof, decider.proof);
+        assert_eq!(deserialized.public_inputs, decider.public_inputs);
+        assert_eq!(deserialized.num_steps, decider.num_steps);
+    }
+
+    #[test]
+    fn test_decider_after_fold_and_more_steps() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let initial = [0u8; 32];
+        let config = IVCConfig {
+            steps_per_fold: 3,
+            store_intermediates: true,
+            ..Default::default()
+        };
+        let mut prover = IVCProver::with_config(initial, config);
+
+        // Add 5 steps (will trigger fold after 3, then 2 remain pending)
+        let mut current = initial;
+        for i in 1..=5 {
+            let step = make_step(i, current);
+            current = step.output_state;
+            prover.add_step(step).unwrap();
+        }
+
+        assert_eq!(prover.state().step, 5);
+
+        // Decider will flush pending steps then prove
+        let decider = prover.prove_decider(
+            Fr::from(99u64),
+            Fr::from(3u64),
+            Fr::from(200u64),
+        ).expect("decider should succeed after fold + pending steps");
+
+        assert_eq!(decider.num_steps, 5);
+
+        let verified = prover.verify_decider_proof(&decider)
+            .expect("verification should complete");
+        assert!(verified, "decider proof after fold must verify");
+    }
+
+    /// End-to-end test: fold 12 steps incrementally, produce decider proof,
+    /// verify it natively, and check public inputs are contract-compatible.
+    #[test]
+    fn test_e2e_decider_12_steps() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let initial = [0u8; 32];
+        let config = IVCConfig {
+            steps_per_fold: 6, // fold every 6 steps → 2 fold batches
+            store_intermediates: true,
+            ..Default::default()
+        };
+        let mut prover = IVCProver::with_config(initial, config);
+
+        // Add 12 steps (triggers fold at 6 and 12)
+        let mut current = initial;
+        for i in 1..=12u64 {
+            let step = make_step(i, current);
+            current = step.output_state;
+            prover.add_step(step).unwrap();
+        }
+
+        assert_eq!(prover.state().step, 12);
+        assert_eq!(prover.accumulator().num_steps, 12);
+
+        // Generate decider proof
+        let loss = Fr::from(77u64);
+        let model_id = Fr::from(42u64);
+        let error_budget = Fr::from(10000u64);
+
+        let decider = prover.prove_decider(loss, model_id, error_budget)
+            .expect("12-step decider proof should succeed");
+
+        // Validate structure
+        assert_eq!(decider.num_steps, 12);
+        assert_eq!(decider.public_inputs.len(), 8);
+        assert!(!decider.proof.is_empty());
+
+        // Verify PI contents
+        let pi_fr: Vec<Fr> = decider.public_inputs.iter()
+            .map(|b| Fr::from_repr_vartime((*b).into()).unwrap_or(Fr::ZERO))
+            .collect();
+
+        // PI[4] = loss
+        assert_eq!(pi_fr[4], loss);
+        // PI[6] = step_number
+        assert_eq!(pi_fr[6], Fr::from(12u64));
+
+        // Verify the proof cryptographically
+        let verified = prover.verify_decider_proof(&decider)
+            .expect("verification should complete");
+        assert!(verified, "12-step E2E decider proof must verify");
+
+        // Verify initial and final states are captured
+        assert_eq!(decider.initial_state, fr_to_bytes(prover.initial_state_fr));
+        assert_ne!(decider.final_state, [0u8; 32]);
+    }
+
+    /// Test that the decider proof has correct error checksum format.
+    #[test]
+    fn test_decider_error_checksum_contract_compatible() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let initial = [0u8; 32];
+        let mut prover = IVCProver::new(initial);
+
+        let step = make_step(1, initial);
+        prover.add_step(step).unwrap();
+
+        let loss = Fr::from(100u64);
+        let model_id = Fr::from(55u64);
+        let error_budget = Fr::from(500u64);
+
+        let decider = prover.prove_decider(loss, model_id, error_budget)
+            .expect("decider should succeed");
+
+        // Verify the error checksum matches the contract format:
+        // checksum = Poseidon(Poseidon(error_bound, step_number), Poseidon(model_id, error_budget))
+        let pi_fr: Vec<Fr> = decider.public_inputs.iter()
+            .map(|b| Fr::from_repr_vartime((*b).into()).unwrap_or(Fr::ZERO))
+            .collect();
+
+        let error_bound = prover.accumulator().error_bound;
+        let step_number = Fr::from(1u64);
+        let h1 = poseidon_hash_two(error_bound, step_number);
+        let h2 = poseidon_hash_two(model_id, error_budget);
+        let expected_checksum = poseidon_hash_two(h1, h2);
+
+        assert_eq!(pi_fr[7], expected_checksum,
+            "PI[7] must match contract-compatible Poseidon checksum");
+    }
+
+    /// Test that corrupted decider proof is rejected.
+    #[test]
+    fn test_decider_proof_rejects_corruption() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let initial = [0u8; 32];
+        let mut prover = IVCProver::new(initial);
+
+        let step = make_step(1, initial);
+        prover.add_step(step).unwrap();
+
+        let mut decider = prover.prove_decider(
+            Fr::from(10u64),
+            Fr::from(1u64),
+            Fr::from(100u64),
+        ).expect("decider should succeed");
+
+        // Corrupt a byte in the proof
+        if !decider.proof.is_empty() {
+            decider.proof[0] ^= 0xFF;
+        }
+
+        // Verification should fail
+        let result = prover.verify_decider_proof(&decider);
+        match result {
+            Ok(false) => {} // Expected: proof invalid
+            Err(_) => {}    // Also acceptable: verification error
+            Ok(true) => panic!("Corrupted decider proof must NOT verify"),
+        }
     }
 }

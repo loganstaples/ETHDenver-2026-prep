@@ -102,7 +102,7 @@ pub use benchmarks::{
 pub use chunking::{ChunkId, ChunkingConfig, ComputationChunk, ComputationChunker};
 
 // Re-export IVC types
-pub use ivc::{AccumulatorSnapshot, IVCConfig, IVCProver, IVCState, IVCStep};
+pub use ivc::{AccumulatorSnapshot, DeciderProof, IVCConfig, IVCProver, IVCState, IVCStep};
 
 // Re-export key management types
 pub use keys::{CircuitKeys, FileKeyStore, InMemoryKeyStore, KeyId, KeyMetadata, HELIX_SRS_SEED};
