@@ -133,6 +133,11 @@ pub enum TrainingMessage {
         w2: Vec<u8>,
         b2: Vec<u8>,
     },
+    /// Weight shares for proof reconstruction (old + new).
+    ProofShares {
+        /// Concatenated old + new weight shares.
+        shares: Vec<u8>,
+    },
 }
 
 impl TrainingMessage {
@@ -163,6 +168,11 @@ pub struct MPCTrainingStepResult {
     pub share_validity_proof: Option<ShareValidityProof>,
     /// Aggregation proof (if proof generation is enabled, party 0 only).
     pub aggregation_proof: Option<AggregationProof>,
+    /// On-chain ZK proof generated from reconstructed weights (party 0 only).
+    /// This is the real Halo2 KZG proof that can be submitted to the smart
+    /// contract. Only the designated prover party (party 0) generates this;
+    /// other parties get None.
+    pub on_chain_proof: Option<Halo2ProofResult>,
 }
 
 /// Per-party MPC trainer state.
@@ -847,15 +857,22 @@ impl<T: MPCTransport> MPCTrainer<T> {
             false
         };
 
-        // ---- ZK proof generation ----
-        let proof = if self.config.generate_proofs {
-            Some(self.generate_proof(
+        // ---- On-chain ZK proof generation (with share reconstruction) ----
+        // All parties participate in the reconstruction protocol. Party 0
+        // collects all shares, reconstructs the full old+new weights, and
+        // generates a real Halo2 KZG proof. Other parties send their shares
+        // and receive None.
+        let on_chain_proof = if self.config.generate_proofs {
+            self.reconstruct_and_prove(
                 &old_w1, &old_b1, &old_w2, &old_b2,
                 input, target, step,
-            )?)
+            ).await?
         } else {
             None
         };
+
+        // ---- Legacy proof (from local shares only, for backward compat) ----
+        let proof = None;
 
         // ---- Share validity proof generation ----
         let sv_proof = if self.config.generate_proofs {
@@ -887,7 +904,7 @@ impl<T: MPCTransport> MPCTrainer<T> {
             party = self.party_index,
             loss = loss,
             reshared = reshared,
-            has_proof = proof.is_some(),
+            has_on_chain_proof = on_chain_proof.is_some(),
             has_sv_proof = sv_proof.is_some(),
             has_agg_proof = agg_proof.is_some(),
             "Training step completed"
@@ -901,6 +918,7 @@ impl<T: MPCTransport> MPCTrainer<T> {
             total_error,
             share_validity_proof: sv_proof,
             aggregation_proof: agg_proof,
+            on_chain_proof,
         })
     }
 
@@ -1070,6 +1088,201 @@ impl<T: MPCTransport> MPCTrainer<T> {
             b1_new: self.b1.clone(),
             w2_new: self.w2.clone(),
             b2_new: self.b2.clone(),
+            lr: Fr::from_f64(self.config.learning_rate),
+            old_state_hash: old_hash,
+            new_state_hash: new_hash,
+            step_number: step,
+            total_error: Fr::from_f64(self.config.base_error * 100.0),
+            freivalds_r1,
+            freivalds_r2,
+        };
+
+        bridge.prove(&witness)
+    }
+
+    // ========================================================================
+    // Phase 6b: Reconstruct weights and generate on-chain proof
+    // ========================================================================
+
+    /// Reconstructs full weights from all parties' shares and generates a
+    /// real Halo2 KZG proof that can be submitted on-chain.
+    ///
+    /// Protocol:
+    /// 1. Non-prover parties (index > 0) send their old+new weight shares
+    ///    to party 0 via point-to-point transport.
+    /// 2. Party 0 receives all shares, sums them with its own to reconstruct
+    ///    the full old and new weights.
+    /// 3. Party 0 generates the ZK proof using CircuitBridge.
+    /// 4. Returns `Some(proof)` for party 0, `None` for other parties.
+    ///
+    /// Security: Only party 0 sees the full weights. The resulting proof is
+    /// zero-knowledge — it reveals nothing about the weights beyond the
+    /// committed state hashes in the public inputs.
+    #[instrument(skip(self, old_w1, old_b1, old_w2, old_b2, input, target), level = "info", fields(
+        party = self.party_index,
+        step = step,
+    ))]
+    async fn reconstruct_and_prove(
+        &mut self,
+        old_w1: &[Fr],
+        old_b1: &[Fr],
+        old_w2: &[Fr],
+        old_b2: &[Fr],
+        input: &[f64],
+        target: &[f64],
+        step: u64,
+    ) -> MPCResult<Option<Halo2ProofResult>> {
+        let prover_party = PartyId::from_index(0);
+        let peers = self.transport.peers();
+
+        // Serialize old + new weight shares into a single message.
+        // Layout: [old_w1, old_b1, old_w2, old_b2, new_w1, new_b1, new_w2, new_b2]
+        let all_shares: Vec<Fr> = old_w1.iter()
+            .chain(old_b1.iter())
+            .chain(old_w2.iter())
+            .chain(old_b2.iter())
+            .chain(self.w1.iter())
+            .chain(self.b1.iter())
+            .chain(self.w2.iter())
+            .chain(self.b2.iter())
+            .cloned()
+            .collect();
+        let msg = TrainingMessage::ProofShares {
+            shares: SecureArithmetic::serialize_share_batch(&all_shares),
+        };
+
+        if self.party_index != 0 {
+            // Non-prover: send shares to party 0 and return None.
+            debug!(party = self.party_index, "Sending weight shares to prover party");
+            self.transport.send(&prover_party, &msg.encode()).await?;
+            return Ok(None);
+        }
+
+        // Party 0: receive shares from all peers and accumulate.
+        let mut accumulated = all_shares;
+
+        for peer in &peers {
+            let data = self.transport.recv(peer).await?;
+            let peer_msg = TrainingMessage::decode(&data)?;
+
+            let peer_shares = match peer_msg {
+                TrainingMessage::ProofShares { shares } => {
+                    SecureArithmetic::deserialize_share_batch(&shares)?
+                }
+                _ => {
+                    return Err(MPCError::ProtocolError(
+                        "Expected ProofShares message during reconstruction".into(),
+                    ));
+                }
+            };
+
+            if peer_shares.len() != accumulated.len() {
+                return Err(MPCError::ProtocolError(format!(
+                    "Share length mismatch: expected {}, got {}",
+                    accumulated.len(),
+                    peer_shares.len(),
+                )));
+            }
+
+            for (acc, peer_val) in accumulated.iter_mut().zip(peer_shares.iter()) {
+                *acc = Fr::add(acc, peer_val);
+            }
+        }
+
+        // Split accumulated vector back into old/new weight components.
+        let w1_len = old_w1.len();
+        let b1_len = old_b1.len();
+        let w2_len = old_w2.len();
+        let b2_len = old_b2.len();
+        let half = w1_len + b1_len + w2_len + b2_len;
+
+        let (old_flat, new_flat) = accumulated.split_at(half);
+
+        let recon_old_w1 = &old_flat[..w1_len];
+        let recon_old_b1 = &old_flat[w1_len..w1_len + b1_len];
+        let recon_old_w2 = &old_flat[w1_len + b1_len..w1_len + b1_len + w2_len];
+        let recon_old_b2 = &old_flat[w1_len + b1_len + w2_len..];
+
+        let recon_new_w1 = &new_flat[..w1_len];
+        let recon_new_b1 = &new_flat[w1_len..w1_len + b1_len];
+        let recon_new_w2 = &new_flat[w1_len + b1_len..w1_len + b1_len + w2_len];
+        let recon_new_b2 = &new_flat[w1_len + b1_len + w2_len..];
+
+        info!(
+            step = step,
+            "Prover party: weights reconstructed, generating on-chain proof"
+        );
+
+        // Generate proof from reconstructed weights.
+        self.generate_proof_from_reconstructed(
+            recon_old_w1,
+            recon_old_b1,
+            recon_old_w2,
+            recon_old_b2,
+            recon_new_w1,
+            recon_new_b1,
+            recon_new_w2,
+            recon_new_b2,
+            input,
+            target,
+            step,
+        )
+        .map(Some)
+    }
+
+    /// Generates a Halo2 proof from fully reconstructed (cleartext) weights.
+    ///
+    /// This is called by the prover party (party 0) after reconstructing the
+    /// full old and new weights from all parties' shares.
+    fn generate_proof_from_reconstructed(
+        &mut self,
+        old_w1: &[Fr],
+        old_b1: &[Fr],
+        old_w2: &[Fr],
+        old_b2: &[Fr],
+        new_w1: &[Fr],
+        new_b1: &[Fr],
+        new_w2: &[Fr],
+        new_b2: &[Fr],
+        input: &[f64],
+        target: &[f64],
+        step: u64,
+    ) -> MPCResult<Halo2ProofResult> {
+        let d_in = self.config.d_in;
+        let d_hid = self.config.d_hid;
+        let d_out = self.config.d_out;
+
+        // Initialize circuit bridge lazily.
+        if self.circuit_bridge.is_none() {
+            self.circuit_bridge = Some(CircuitBridge::new(
+                CircuitBridgeConfig::for_model(d_in, d_hid, d_out)
+                    .with_base_error(self.config.base_error),
+            ));
+        }
+        let bridge = self.circuit_bridge.as_ref().unwrap();
+
+        let input_fr: Vec<Fr> = input.iter().map(|&v| Fr::from_f64(v)).collect();
+        let target_fr: Vec<Fr> = target.iter().map(|&v| Fr::from_f64(v)).collect();
+
+        let old_hash = compute_compatible_state_hash(old_w1, old_b1, old_w2, old_b2);
+        let new_hash = compute_compatible_state_hash(new_w1, new_b1, new_w2, new_b2);
+
+        let (freivalds_r1, freivalds_r2) = generate_freivalds_challenges(step, d_hid, d_out);
+
+        let witness = ReconstructedWitness {
+            d_in,
+            d_hid,
+            d_out,
+            input: input_fr,
+            target: target_fr,
+            w1: old_w1.to_vec(),
+            b1: old_b1.to_vec(),
+            w2: old_w2.to_vec(),
+            b2: old_b2.to_vec(),
+            w1_new: new_w1.to_vec(),
+            b1_new: new_b1.to_vec(),
+            w2_new: new_w2.to_vec(),
+            b2_new: new_b2.to_vec(),
             lr: Fr::from_f64(self.config.learning_rate),
             old_state_hash: old_hash,
             new_state_hash: new_hash,
@@ -1676,6 +1889,7 @@ mod tests {
                     total_error: 0.0,
                     share_validity_proof: Some(sv_proof),
                     aggregation_proof: agg_proof,
+                    on_chain_proof: None,
                 };
 
                 (i, result_with_proofs)
@@ -1791,5 +2005,177 @@ mod tests {
             losses.first().unwrap(),
             losses.last().unwrap()
         );
+    }
+
+    /// Tests that MPC training with `generate_proofs: true` produces a valid
+    /// on-chain Halo2 KZG proof via the weight reconstruction protocol.
+    ///
+    /// This is the key integration test: it verifies that after N parties
+    /// complete an MPC training step, the prover party (party 0) can
+    /// reconstruct the full weights and produce a verifiable ZK proof.
+    ///
+    /// NOTE: This test is marked #[ignore] because it involves actual Halo2
+    /// proof generation which takes several seconds. Run with:
+    ///   cargo test -p helix-mpc --release -- --ignored test_reconstruct_and_prove
+    #[tokio::test]
+    #[ignore]
+    async fn test_reconstruct_and_prove() {
+        let num_parties = 3;
+        let parties = test_parties(num_parties);
+        let transports = LocalTransport::create_mesh(&parties);
+
+        let config = MPCTrainerConfig {
+            d_in: 2,
+            d_hid: 2,
+            d_out: 1,
+            learning_rate: 0.001,
+            num_parties,
+            reshare_interval: 0,
+            beaver_batch_size: 512,
+            generate_proofs: true, // Enable on-chain proof generation
+            base_error: 1e-6,
+        };
+
+        // Use tiny weights in the 0.001 range so they quantize to small Fr
+        // values that stay within the circuit's ReLU lookup range (±128).
+        let initial_weights = ModelWeights::from_f64(
+            &[0.001, 0.002, 0.001, 0.002], // w1: 2x2
+            &[0.001, 0.001],                // b1: 2
+            &[0.001, 0.002],                // w2: 1x2
+            &[0.001],                       // b2: 1
+        );
+
+        let input = vec![0.001, 0.002];
+        let target = vec![0.001];
+
+        let mut handles = Vec::new();
+        for (i, transport) in transports.into_iter().enumerate() {
+            let cfg = config.clone();
+            let weights = if i == 0 {
+                Some(initial_weights.clone())
+            } else {
+                None
+            };
+            let inp = input.clone();
+            let tgt = target.clone();
+
+            let handle = tokio::spawn(async move {
+                let mut trainer = MPCTrainer::new(cfg, transport, i, 42);
+                trainer.share_weights(weights).await.unwrap();
+                trainer.generate_beaver_triples(512).await.unwrap();
+                let result = trainer.training_step(&inp, &tgt).await.unwrap();
+                (i, result.on_chain_proof, result.loss, result.step)
+            });
+            handles.push(handle);
+        }
+
+        let mut party0_proof = None;
+        let mut all_losses = Vec::new();
+
+        for handle in handles {
+            let (party_index, proof, loss, step) = handle.await.unwrap();
+            all_losses.push(loss);
+
+            if party_index == 0 {
+                // Party 0 (prover) should have a proof.
+                assert!(
+                    proof.is_some(),
+                    "Party 0 should generate an on-chain proof"
+                );
+                let p = proof.unwrap();
+                assert!(!p.proof.is_empty(), "Proof bytes should not be empty");
+                assert!(
+                    p.public_inputs.len() >= 7,
+                    "Proof should have at least 7 public inputs, got {}",
+                    p.public_inputs.len()
+                );
+                assert_eq!(p.step_number, 0, "Step number should be 0");
+                assert!(p.proof_size_bytes > 0, "Proof size should be > 0");
+                party0_proof = Some(p);
+            } else {
+                // Non-prover parties should NOT have a proof (they sent
+                // their shares to party 0).
+                assert!(
+                    proof.is_none(),
+                    "Party {} should not generate an on-chain proof",
+                    party_index
+                );
+            }
+        }
+
+        // Verify party 0's proof using CircuitBridge.
+        let bridge = crate::integration::circuit_bridge::CircuitBridge::for_model(2, 2, 1);
+        let proof = party0_proof.unwrap();
+        let verified = bridge.verify(&proof).unwrap();
+        assert!(verified, "On-chain proof should verify");
+
+        // All parties should agree on loss.
+        for i in 1..all_losses.len() {
+            assert!(
+                (all_losses[i] - all_losses[0]).abs() < 0.01,
+                "Loss mismatch: party 0 = {}, party {} = {}",
+                all_losses[0], i, all_losses[i]
+            );
+        }
+    }
+
+    /// Tests that the on_chain_proof field is None when generate_proofs is false.
+    #[tokio::test]
+    async fn test_no_proof_when_disabled() {
+        let num_parties = 3;
+        let parties = test_parties(num_parties);
+        let transports = LocalTransport::create_mesh(&parties);
+
+        let config = MPCTrainerConfig {
+            d_in: 2,
+            d_hid: 2,
+            d_out: 1,
+            learning_rate: 0.01,
+            num_parties,
+            reshare_interval: 0,
+            beaver_batch_size: 512,
+            generate_proofs: false, // Proofs disabled
+            base_error: 1e-6,
+        };
+
+        let initial_weights = ModelWeights::from_f64(
+            &[0.1, 0.2, 0.3, 0.4],
+            &[0.01, 0.02],
+            &[0.5, 0.6],
+            &[0.03],
+        );
+
+        let input = vec![1.0, 0.5];
+        let target = vec![1.0];
+
+        let mut handles = Vec::new();
+        for (i, transport) in transports.into_iter().enumerate() {
+            let cfg = config.clone();
+            let weights = if i == 0 {
+                Some(initial_weights.clone())
+            } else {
+                None
+            };
+            let inp = input.clone();
+            let tgt = target.clone();
+
+            let handle = tokio::spawn(async move {
+                let mut trainer = MPCTrainer::new(cfg, transport, i, 42);
+                trainer.share_weights(weights).await.unwrap();
+                trainer.generate_beaver_triples(512).await.unwrap();
+                let result = trainer.training_step(&inp, &tgt).await.unwrap();
+                (i, result.on_chain_proof)
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            let (party_index, proof) = handle.await.unwrap();
+            assert!(
+                proof.is_none(),
+                "Party {} should not have a proof when generate_proofs=false",
+                party_index
+            );
+        }
     }
 }

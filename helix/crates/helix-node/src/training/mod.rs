@@ -81,7 +81,9 @@ pub use mpc::{
     MPCTrainingConfig, MPCTrainingRound, MPCStepResult,
     WorkerComputation, AdversarialDetector, SlashingEvent, SlashingReason,
     MPCWorkerHandle,
+    MPCProvedTrainingRound, MPCProvedStep,
     model_to_flat, flat_to_model,
+    mpc_proof_to_bytes, mpc_proof_public_inputs_hex,
 };
 
 pub use orchestrator::{

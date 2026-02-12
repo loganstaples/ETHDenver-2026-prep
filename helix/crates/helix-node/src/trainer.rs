@@ -257,13 +257,53 @@ pub fn sgd_update(model: &mut MlpModel, grads: &Gradients, lr: f64) {
 // Quantisation: f64 → Fr
 // ──────────────────────────────────────────────────────────────
 
-/// Quantisation scale factor.  Values are mapped as:
-/// `Fr_val = round(f64_val * QUANT_SCALE)` (mod p for negatives).
-const QUANT_SCALE: f64 = 1000.0;
+/// Default ReLU half-range matching `V2ProverConfig::default().relu_range`.
+const DEFAULT_RELU_RANGE: usize = 128;
 
-/// Quantises an f64 to Fr, handling negatives via p - |v|.
-fn quantize(val: f64) -> Fr {
-    let scaled = (val * QUANT_SCALE).round();
+/// Computes the maximum safe quantization scale for the given model and input.
+///
+/// The circuit constrains `h_pre = W1·x + b1` values to lie within the ReLU
+/// lookup table range `[-relu_range, relu_range)`.  Since quantized matmul
+/// produces S²-scaled products (`weight*S × input*S`), we need:
+///
+///   `d_in × S² × max_w × max_x + S × max_b < relu_range`
+///
+/// Returns a scale ≥ 1 that guarantees h_pre stays within the lookup range.
+fn compute_quant_scale(model: &MlpModel, x: &[f64], relu_range: usize) -> f64 {
+    let max_w = model.w1.iter()
+        .map(|v| v.abs())
+        .fold(0.0f64, f64::max);
+    let max_x = x.iter()
+        .map(|v| v.abs())
+        .fold(0.0f64, f64::max);
+    let max_b = model.b1.iter()
+        .map(|v| v.abs())
+        .fold(0.0f64, f64::max);
+
+    // Use 50% of the range as safety margin (rounding, bias accumulation).
+    let safe_range = relu_range as f64 * 0.5;
+
+    // The dominant constraint: d_in × S² × max_w × max_x < safe_range
+    let matmul_denom = model.d_in as f64 * max_w.max(1e-12) * max_x.max(1e-12);
+    let s_from_matmul = (safe_range / matmul_denom).sqrt();
+
+    // If biases are non-zero, also check S × max_b < safe_range/4
+    // (reserve 75% of the range for the matmul term).
+    let s_from_bias = if max_b > 1e-12 {
+        (safe_range * 0.25) / max_b
+    } else {
+        f64::MAX
+    };
+
+    let scale = s_from_matmul.min(s_from_bias);
+
+    // Clamp: at least 1 (no point scaling below 1), cap at 10000.
+    scale.floor().clamp(1.0, 10000.0)
+}
+
+/// Quantises an f64 to Fr with the given scale, handling negatives via p - |v|.
+fn quantize(val: f64, scale: f64) -> Fr {
+    let scaled = (val * scale).round();
     if scaled >= 0.0 {
         Fr::from(scaled as u64)
     } else {
@@ -273,9 +313,9 @@ fn quantize(val: f64) -> Fr {
     }
 }
 
-/// Quantises a slice of f64 values.
-fn quantize_vec(vals: &[f64]) -> Vec<Fr> {
-    vals.iter().map(|&v| quantize(v)).collect()
+/// Quantises a slice of f64 values with the given scale.
+fn quantize_vec(vals: &[f64], scale: f64) -> Vec<Fr> {
+    vals.iter().map(|&v| quantize(v, scale)).collect()
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -365,6 +405,11 @@ impl Trainer {
         &self.model
     }
 
+    /// Replaces the current model state (for MPC proof generation).
+    pub fn set_model(&mut self, model: MlpModel) {
+        self.model = model;
+    }
+
     /// Returns the current step count.
     pub fn step_count(&self) -> u64 {
         self.step_count
@@ -435,13 +480,19 @@ impl Trainer {
         sgd_update(&mut self.model, &grads, self.lr);
 
         // 5. Quantise to Fr.
-        let x_fr = quantize_vec(x);
-        let target_fr = quantize_vec(target);
-        let w1_fr = quantize_vec(&old_w1);
-        let b1_fr = quantize_vec(&old_b1);
-        let w2_fr = quantize_vec(&old_w2);
-        let b2_fr = quantize_vec(&old_b2);
-        let lr_fr = quantize(self.lr);
+        //    Compute a safe scale that keeps h_pre within the ReLU lookup range.
+        let old_model_snapshot = MlpModel::new(
+            self.model.d_in, self.model.d_hid, self.model.d_out,
+            old_w1.clone(), old_b1.clone(), old_w2.clone(), old_b2.clone(),
+        );
+        let scale = compute_quant_scale(&old_model_snapshot, x, DEFAULT_RELU_RANGE);
+        let x_fr = quantize_vec(x, scale);
+        let target_fr = quantize_vec(target, scale);
+        let w1_fr = quantize_vec(&old_w1, scale);
+        let b1_fr = quantize_vec(&old_b1, scale);
+        let w2_fr = quantize_vec(&old_w2, scale);
+        let b2_fr = quantize_vec(&old_b2, scale);
+        let lr_fr = quantize(self.lr, scale);
 
         // 6. Generate ZK proof via V2 prover.
         self.ensure_prover();
@@ -649,17 +700,48 @@ mod tests {
 
     #[test]
     fn test_quantize_round_trip() {
+        let scale = 100.0;
+
         // Positive values.
-        let v = quantize(3.14);
-        // 3.14 * 1000 = 3140 → Fr(3140)
-        assert_eq!(v, Fr::from(3140u64));
+        let v = quantize(3.14, scale);
+        // 3.14 * 100 = 314 → Fr(314)
+        assert_eq!(v, Fr::from(314u64));
 
         // Zero.
-        assert_eq!(quantize(0.0), Fr::from(0u64));
+        assert_eq!(quantize(0.0, scale), Fr::from(0u64));
 
-        // Negative: should produce p - 1000.
-        let neg = quantize(-1.0);
-        assert_eq!(neg, Fr::from(0) - Fr::from(1000u64));
+        // Negative: should produce p - 100.
+        let neg = quantize(-1.0, scale);
+        assert_eq!(neg, Fr::from(0) - Fr::from(100u64));
+    }
+
+    #[test]
+    fn test_compute_quant_scale_adapts_to_weights() {
+        // Tiny weights → large scale (up to cap)
+        let tiny_model = MlpModel::new(
+            2, 2, 1,
+            vec![0.001, 0.002, 0.003, 0.001],
+            vec![0.0, 0.0],
+            vec![0.001, 0.001],
+            vec![0.0],
+        );
+        let tiny_x = vec![0.001, 0.001];
+        let s_tiny = compute_quant_scale(&tiny_model, &tiny_x, DEFAULT_RELU_RANGE);
+        assert!(s_tiny >= 100.0, "tiny weights should yield large scale, got {}", s_tiny);
+
+        // Large Xavier-init weights → small scale
+        let big_model = MlpModel::new_random(2, 2, 1, 42);
+        let big_x = vec![1.0, 1.0];
+        let s_big = compute_quant_scale(&big_model, &big_x, DEFAULT_RELU_RANGE);
+        assert!(s_big >= 1.0, "scale should be at least 1, got {}", s_big);
+        assert!(s_big < 20.0, "Xavier weights ~0.7 with d_in=2 should need small scale, got {}", s_big);
+
+        // Scale should guarantee h_pre is within range
+        let max_w = big_model.w1.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+        let max_x = big_x.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+        let worst_case = big_model.d_in as f64 * (s_big * max_w).ceil() * (s_big * max_x).ceil();
+        assert!(worst_case < DEFAULT_RELU_RANGE as f64,
+            "h_pre worst case {} should be < {}", worst_case, DEFAULT_RELU_RANGE);
     }
 
     #[test]

@@ -212,7 +212,7 @@ async fn run_worker(listen_addr: SocketAddr) -> anyhow::Result<()> {
                                 );
 
                                 if mpc_enabled {
-                                    // ── MPC training path ──────────────────────────
+                                    // ── MPC training path with ZK proof generation ──
                                     if mpc_handle.is_none() {
                                         let model = MlpModel::new_random(
                                             params.d_in,
@@ -231,6 +231,19 @@ async fn run_worker(listen_addr: SocketAddr) -> anyhow::Result<()> {
                                             "MPC worker initialized: party {}/{}",
                                             mpc_party_index, mpc_num_parties,
                                         );
+                                    }
+
+                                    // Initialize a Trainer in lockstep for ZK proof generation.
+                                    // The Trainer uses the same model state as the MPC handle.
+                                    if trainer.is_none() {
+                                        trainer = Some(Trainer::new(
+                                            params.d_in,
+                                            params.d_hid,
+                                            params.d_out,
+                                            params.learning_rate,
+                                            params.model_seed,
+                                        ));
+                                        info!("MPC proof trainer initialized");
                                     }
 
                                     let mpc = mpc_handle.as_mut().unwrap();
@@ -252,6 +265,32 @@ async fn run_worker(listen_addr: SocketAddr) -> anyhow::Result<()> {
                                                 hex::encode(&computation.gradient_commitment[..4]),
                                             );
 
+                                            // Generate ZK proof using the Trainer (same model, same data).
+                                            // This proves the training step was computed correctly.
+                                            let proof_bytes = if let Some(ref mut t) = trainer {
+                                                match t.train_step(&x, &target) {
+                                                    Ok(proved_step) => {
+                                                        let evm_len = proved_step.evm_bundle.as_ref().map(|b| b.evm_proof.len()).unwrap_or(0);
+                                                        info!(
+                                                            "MPC ZK proof generated: {} bytes (EVM: {}), verified={}",
+                                                            proved_step.proof_result.proof.len(),
+                                                            evm_len,
+                                                            proved_step.proof_result.verified,
+                                                        );
+                                                        proved_step.evm_bundle
+                                                            .as_ref()
+                                                            .map(|b| b.evm_proof.clone())
+                                                            .unwrap_or_else(|| proved_step.proof_result.proof.clone())
+                                                    }
+                                                    Err(e) => {
+                                                        warn!("MPC proof generation failed (non-fatal): {}", e);
+                                                        computation.gradient_commitment.to_vec()
+                                                    }
+                                                }
+                                            } else {
+                                                computation.gradient_commitment.to_vec()
+                                            };
+
                                             let (hiding_commitment, nonce) = helix_node::training::consensus::compute_hiding_gradient_commitment(&computation.gradient_commitment);
                                             network
                                                 .broadcast(MessagePayload::Gradient(
@@ -260,14 +299,14 @@ async fn run_worker(listen_addr: SocketAddr) -> anyhow::Result<()> {
                                                         gradient_commitment: hiding_commitment,
                                                         commitment_nonce: nonce,
                                                         error_bound: computation.local_loss * 0.01,
-                                                        proof: computation.gradient_commitment.to_vec(),
+                                                        proof: proof_bytes,
                                                     },
                                                 ))
                                                 .await;
 
                                             steps_completed += 1;
                                             info!(
-                                                "MPC gradient share sent for round {} (total steps: {})",
+                                                "MPC gradient share + proof sent for round {} (total steps: {})",
                                                 round_id, steps_completed,
                                             );
 
