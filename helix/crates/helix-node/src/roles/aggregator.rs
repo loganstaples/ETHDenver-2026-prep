@@ -19,6 +19,7 @@ use crate::network::messages::{
     TrainingParams,
 };
 use crate::network::partition_detect::{PartitionDetector, PartitionAction};
+use crate::on_chain_pipeline::OnChainPipeline;
 use crate::training::aggregation::{
     AggregationStrategy, AggregationConfig as ByzantineAggregationConfig,
     GradientAggregator, WeightedGradient,
@@ -121,6 +122,9 @@ pub struct CollectedGradient {
     /// When present, the aggregator can run Krum/Median/TrimmedMean
     /// to exclude outliers before computing the aggregated commitment.
     pub gradient_data: Option<ModelGradient>,
+    /// Optional public inputs (8 hex strings) for ZK proof aggregation.
+    /// Required for RLC aggregation when on-chain pipeline is active.
+    pub public_inputs_hex: Option<Vec<String>>,
 }
 
 /// Aggregated result.
@@ -160,6 +164,8 @@ pub struct AggregatorNode {
     stats: Arc<RwLock<AggregatorStats>>,
     /// Optional partition detector to gate aggregation on network health.
     partition_detector: Option<Arc<PartitionDetector>>,
+    /// Optional on-chain pipeline for proof aggregation and submission.
+    on_chain_pipeline: Option<Arc<OnChainPipeline>>,
 }
 
 /// Aggregator statistics.
@@ -188,12 +194,19 @@ impl AggregatorNode {
             completed_rounds: Arc::new(RwLock::new(HashMap::new())),
             stats: Arc::new(RwLock::new(AggregatorStats::default())),
             partition_detector: None,
+            on_chain_pipeline: None,
         }
     }
 
     /// Sets the partition detector for network health gating.
     pub fn with_partition_detector(mut self, detector: Arc<PartitionDetector>) -> Self {
         self.partition_detector = Some(detector);
+        self
+    }
+
+    /// Sets the on-chain pipeline for proof aggregation and submission.
+    pub fn with_on_chain_pipeline(mut self, pipeline: Arc<OnChainPipeline>) -> Self {
+        self.on_chain_pipeline = Some(pipeline);
         self
     }
 
@@ -361,10 +374,11 @@ impl AggregatorNode {
         error_bound: f64,
         proof: Vec<u8>,
     ) -> bool {
-        self.handle_gradient_share_with_data(from, round_id, commitment, error_bound, proof, None).await
+        self.handle_gradient_share_with_data(from, round_id, commitment, error_bound, proof, None, None).await
     }
 
-    /// Handles a gradient share with optional raw gradient data for Byzantine filtering.
+    /// Handles a gradient share with optional raw gradient data for Byzantine filtering
+    /// and optional public inputs for ZK proof aggregation.
     pub async fn handle_gradient_share_with_data(
         &self,
         from: PeerId,
@@ -373,6 +387,7 @@ impl AggregatorNode {
         error_bound: f64,
         proof: Vec<u8>,
         gradient_data: Option<ModelGradient>,
+        public_inputs_hex: Option<Vec<String>>,
     ) -> bool {
         let current_round = *self.current_round.read().await;
         if round_id != current_round {
@@ -398,6 +413,7 @@ impl AggregatorNode {
             proof,
             received_at: now,
             gradient_data,
+            public_inputs_hex,
         };
 
         {
@@ -646,7 +662,114 @@ impl AggregatorNode {
             *state = AggregatorState::Complete { round_id };
         }
 
+        // On-chain submission: if pipeline is set and workers have public inputs,
+        // aggregate proofs via RLC and submit the single proof on-chain.
+        if let Some(ref pipeline) = self.on_chain_pipeline {
+            let worker_proofs = Self::build_training_proof_results(&included_gradients);
+            if !worker_proofs.is_empty() {
+                let pipeline = Arc::clone(pipeline);
+                let round = round_id;
+                tokio::spawn(async move {
+                    match pipeline.submit_aggregated_round(round, worker_proofs).await {
+                        Ok(Some(submission)) => {
+                            log::info!(
+                                "On-chain submission for round {}: tx={}, gas={}, proofs={}",
+                                round,
+                                submission.tx_hash,
+                                submission.gas_used,
+                                submission.proofs_aggregated,
+                            );
+                        }
+                        Ok(None) => {
+                            log::warn!("On-chain submission returned None for round {}", round);
+                        }
+                        Err(e) => {
+                            log::error!("On-chain submission failed for round {}: {}", round, e);
+                        }
+                    }
+                });
+            } else {
+                log::debug!(
+                    "Round {}: no worker proofs with public inputs for RLC aggregation",
+                    round_id,
+                );
+            }
+        }
+
         Some(result)
+    }
+
+    /// Builds `TrainingProofResultV2` values from collected gradients.
+    ///
+    /// Only includes gradients that have both proof bytes and public inputs.
+    fn build_training_proof_results(
+        gradients: &[&CollectedGradient],
+    ) -> Vec<helix_prover::TrainingProofResultV2> {
+        use helix_prover::halo2curves::bn256::Fr;
+        use helix_prover::halo2curves::ff::PrimeField;
+
+        gradients
+            .iter()
+            .filter(|g| !g.proof.is_empty() && g.public_inputs_hex.is_some())
+            .filter_map(|g| {
+                let hex_inputs = g.public_inputs_hex.as_ref()?;
+                if hex_inputs.len() < 8 {
+                    return None;
+                }
+
+                // Convert hex public inputs to Fr
+                let pis: Vec<Fr> = hex_inputs
+                    .iter()
+                    .map(|hex_str| {
+                        let stripped = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+                        let bytes = hex::decode(stripped).unwrap_or_default();
+                        if bytes.len() == 32 {
+                            let mut repr = [0u8; 32];
+                            repr.copy_from_slice(&bytes);
+                            Option::from(Fr::from_repr(repr.into())).unwrap_or(Fr::from(0u64))
+                        } else {
+                            Fr::from(0u64)
+                        }
+                    })
+                    .collect();
+
+                let old_hash = if pis.len() >= 2 {
+                    (pis[0], pis[1])
+                } else {
+                    (Fr::from(0u64), Fr::from(0u64))
+                };
+                let new_hash = if pis.len() >= 4 {
+                    (pis[2], pis[3])
+                } else {
+                    (Fr::from(0u64), Fr::from(0u64))
+                };
+                let loss = if pis.len() >= 5 { pis[4] } else { Fr::from(0u64) };
+                let total_error = if pis.len() >= 6 { pis[5] } else { Fr::from(0u64) };
+                let step_number = if pis.len() >= 7 {
+                    // Extract step number from Fr
+                    let repr = pis[6].to_repr();
+                    u64::from_le_bytes(repr.as_ref()[..8].try_into().unwrap_or([0; 8]))
+                } else {
+                    0
+                };
+
+                Some(helix_prover::TrainingProofResultV2 {
+                    proof: g.proof.clone(),
+                    public_inputs: pis,
+                    loss,
+                    total_error,
+                    step_number,
+                    old_state_hash: old_hash,
+                    new_state_hash: new_hash,
+                    verified: true,
+                    generation_time: std::time::Duration::from_millis(0),
+                    verification_time: None,
+                    attempts: 1,
+                    from_cache: false,
+                    witness_hash: None,
+                })
+            })
+            .collect()
     }
 
     /// Generates a domain-separated Poseidon commitment proof.
@@ -937,6 +1060,7 @@ mod tests {
                 0.01,
                 vec![1],
                 Some(make_simple_gradient(i as f32 * 0.1)),
+                None,
             ).await;
         }
         // 1 outlier with extreme values
@@ -947,6 +1071,7 @@ mod tests {
             0.01,
             vec![1],
             Some(make_simple_gradient(1000.0)),
+            None,
         ).await;
 
         let result = node.aggregate().await.expect("aggregation should succeed");

@@ -140,6 +140,78 @@ pub struct NodeConfig {
     /// HTTP API configuration.
     #[serde(default)]
     pub api: ApiConfig,
+
+    /// On-chain pipeline configuration for aggregator nodes.
+    /// When set, the aggregator will register models, stake, submit proofs on-chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain: Option<ChainConfig>,
+}
+
+/// On-chain pipeline configuration for aggregator nodes.
+///
+/// When an aggregator starts with this config, it will:
+/// 1. Register the model on-chain (if `model_id` is None)
+/// 2. Stake tokens for proof submission rights
+/// 3. Start training rounds on-chain
+/// 4. Submit aggregated proofs via the coordinator contract
+/// 5. Use VerifyAll verification with real Halo2 KZG checks
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainConfig {
+    /// Deployed HelixCoordinatorV2 contract address (hex, with 0x prefix).
+    pub coordinator_address: String,
+
+    /// IPFS hash for the model metadata.
+    #[serde(default = "default_model_ipfs_hash")]
+    pub model_ipfs_hash: String,
+
+    /// Pre-registered model ID. If None, a new model is registered on startup.
+    #[serde(default)]
+    pub model_id: Option<u64>,
+
+    /// Minimum stake required for the model (in wei).
+    #[serde(default = "default_min_stake_wei")]
+    pub min_stake_wei: String,
+
+    /// Amount to stake (in wei).
+    #[serde(default = "default_stake_amount_wei")]
+    pub stake_amount_wei: String,
+
+    /// Round duration in seconds.
+    #[serde(default = "default_round_duration_secs")]
+    pub round_duration_secs: u64,
+
+    /// Model input dimension.
+    pub d_in: usize,
+
+    /// Model hidden dimension.
+    pub d_hid: usize,
+
+    /// Model output dimension.
+    pub d_out: usize,
+
+    /// Interval in seconds for processing the proof queue.
+    #[serde(default = "default_proof_queue_interval_secs")]
+    pub proof_queue_interval_secs: u64,
+}
+
+fn default_model_ipfs_hash() -> String {
+    "QmDefault".to_string()
+}
+
+fn default_min_stake_wei() -> String {
+    "1000000000000000000".to_string() // 1 ETH
+}
+
+fn default_stake_amount_wei() -> String {
+    "1000000000000000000".to_string() // 1 ETH
+}
+
+fn default_round_duration_secs() -> u64 {
+    600 // 10 minutes
+}
+
+fn default_proof_queue_interval_secs() -> u64 {
+    5
 }
 
 fn default_listen_addr() -> String {
@@ -188,6 +260,7 @@ impl Default for NodeConfig {
             max_outbound_per_tick: default_max_outbound(),
             rate_limit: RateLimitConfig::default(),
             api: ApiConfig::default(),
+            chain: None,
         }
     }
 }

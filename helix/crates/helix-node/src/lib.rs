@@ -3,6 +3,7 @@ pub mod config;
 pub mod data;
 pub mod identity;
 pub mod network;
+pub mod on_chain_pipeline;
 pub mod roles;
 pub mod storage;
 pub mod trainer;
