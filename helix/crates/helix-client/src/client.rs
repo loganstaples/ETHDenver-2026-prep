@@ -14,7 +14,8 @@ use crate::dashboard::DashboardState;
 use crate::error::HelixError;
 use crate::model::{ModelHandle, SdkModelConfig, TrainingParams};
 use crate::rpc::client::{
-    HealthStatus, HelixRpcConfig, ModelInfo, NetworkStatus, UnifiedRpcClient,
+    HealthStatus, HelixRpcConfig, ModelInfo, NetworkStatus, RoundInfo, TrainingResultData,
+    TrainingStatus, UnifiedRpcClient,
 };
 use crate::session::TrainingSession;
 
@@ -271,6 +272,26 @@ impl HelixClient {
     /// Health check.
     pub async fn health(&self) -> Result<HealthStatus, HelixError> {
         Ok(self.rpc.health_check().await?)
+    }
+
+    /// Get the current training status from the connected node.
+    pub async fn training_status(&self) -> Result<TrainingStatus, HelixError> {
+        Ok(self.rpc.get_training_status().await?)
+    }
+
+    /// Get the training result for a completed round.
+    pub async fn get_training_result(&self, round_id: u64) -> Result<TrainingResultData, HelixError> {
+        Ok(self.rpc.get_training_result(round_id).await?)
+    }
+
+    /// Get the current round information for a model.
+    pub async fn get_current_round(&self, model_id: u64) -> Result<RoundInfo, HelixError> {
+        Ok(self.rpc.get_current_round(model_id).await?)
+    }
+
+    /// Get a specific round's information.
+    pub async fn get_round(&self, model_id: u64, round_id: u64) -> Result<RoundInfo, HelixError> {
+        Ok(self.rpc.get_round(model_id, round_id).await?)
     }
 
     /// Clone the underlying RPC client (for use by TrainingSession etc.).

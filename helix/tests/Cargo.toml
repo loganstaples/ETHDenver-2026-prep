@@ -170,6 +170,10 @@ required-features = ["on-chain"]
 name = "rpc_alignment"
 path = "integration/rpc_alignment.rs"
 
+[[test]]
+name = "client_node_integration"
+path = "integration/client_node_integration.rs"
+
 # ============================================================================
 # E2E Integration Tests (Stage 10)
 # ============================================================================

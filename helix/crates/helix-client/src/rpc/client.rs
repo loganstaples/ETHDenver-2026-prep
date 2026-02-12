@@ -1711,6 +1711,17 @@ impl UnifiedRpcClient {
         }
     }
 
+    /// Get the current round for a model.
+    pub async fn get_current_round(&self, model_id: u64) -> Result<RoundInfo, RpcError> {
+        if self.use_mock {
+            self.get_round(model_id, 0).await
+        } else if let Some(ref client) = self.real_client {
+            client.get_current_round(model_id).await
+        } else {
+            Err(RpcError::NodeUnavailable("No client available".into()))
+        }
+    }
+
     /// Get the mock client for direct access (when in mock mode)
     pub fn mock(&self) -> &MockRpcClient {
         &self.mock_client
@@ -1849,7 +1860,7 @@ impl Clone for UnifiedRpcClient {
 
 impl Default for UnifiedRpcClient {
     fn default() -> Self {
-        Self::new_mock()
+        Self::new_disconnected()
     }
 }
 

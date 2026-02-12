@@ -100,7 +100,7 @@ impl TrainingSession {
     /// Background polling loop.
     async fn poll_loop(
         rpc: UnifiedRpcClient,
-        _model_id: u64,
+        model_id: u64,
         params: TrainingParams,
         event_tx: mpsc::Sender<TrainingEvent>,
         mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
@@ -109,6 +109,12 @@ impl TrainingSession {
     ) {
         let mut last_round: u64 = 0;
         let mut last_phase = TrainingPhase::Initializing;
+        let mut consecutive_errors: u32 = 0;
+        const MAX_CONSECUTIVE_ERRORS: u32 = 10;
+
+        // Note: start_training_for() is called by HelixClient::start_training()
+        // before creating this session. The poll_loop only needs to poll status.
+        let _ = (model_id, &params); // suppress unused warnings
 
         loop {
             tokio::select! {
@@ -148,15 +154,30 @@ impl TrainingSession {
                 }
             }
 
-            // Poll status
+            // Poll status from the node
             let status = match rpc.get_training_status().await {
-                Ok(s) => s,
+                Ok(s) => {
+                    consecutive_errors = 0;
+                    s
+                }
                 Err(e) => {
+                    consecutive_errors += 1;
                     let _ = event_tx
                         .send(TrainingEvent::Error {
                             message: e.to_string(),
                         })
                         .await;
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                        let _ = event_tx
+                            .send(TrainingEvent::Error {
+                                message: format!(
+                                    "Aborting after {} consecutive RPC errors",
+                                    MAX_CONSECUTIVE_ERRORS
+                                ),
+                            })
+                            .await;
+                        return;
+                    }
                     continue;
                 }
             };
@@ -218,7 +239,7 @@ impl TrainingSession {
                     let _ = event_tx
                         .send(TrainingEvent::ProofSubmitted {
                             round: status.current_round,
-                            tx_hash: format!("0xmock_{}", status.current_round),
+                            tx_hash: format!("0xnode_{}", status.current_round),
                         })
                         .await;
                 }
