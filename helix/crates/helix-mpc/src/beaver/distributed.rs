@@ -11,15 +11,21 @@
 //! 3. Each party computes their c share:
 //!    c_i = a_i * b_i + (their share of cross-terms)
 //!
-//! This implementation uses a simplified version suitable for the demo,
-//! simulating the cross-term computation locally.
+//! Two implementations:
+//! - `DistributedTripleGen::simulate_distributed_generation`: Single-process
+//!   simulation (for testing). All parties run in one process.
+//! - `NetworkDistributedDealer`: Real distributed generation over [`MPCTransport`].
+//!   Each party runs independently, exchanging cross-term messages over the network.
 
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 use sha2::{Digest, Sha256};
+use serde::{Deserialize, Serialize};
 
-use crate::error::MPCResult;
+use crate::error::{MPCError, MPCResult};
 use crate::field::Fr;
+use crate::protocols::arithmetic::SecureArithmetic;
+use crate::session::transport::MPCTransport;
 use crate::types::PartyId;
 
 use super::triple::BeaverTriple;
@@ -258,6 +264,174 @@ impl DistributedTripleGen {
     }
 }
 
+// ============================================================================
+// NetworkDistributedDealer — real distributed generation over MPCTransport
+// ============================================================================
+
+/// Message types for the networked distributed triple generation protocol.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DistributedTripleMessage {
+    /// Phase 1: party sends (a_i, r_ij) to peer j for cross-term computation.
+    /// peer j will compute: cross_term = a_i * b_j - r_ij
+    CrossTermShare {
+        /// The sender's a value (one per triple in the batch).
+        a_values: Vec<Vec<u8>>,
+        /// Random masks r_ij (one per triple).
+        r_values: Vec<Vec<u8>>,
+    },
+}
+
+impl DistributedTripleMessage {
+    fn encode(&self) -> Vec<u8> {
+        bincode::serialize(self).expect("DistributedTripleMessage serialization should not fail")
+    }
+
+    fn decode(data: &[u8]) -> MPCResult<Self> {
+        bincode::deserialize(data).map_err(|e| {
+            MPCError::CommunicationError(format!("decode distributed triple message: {}", e))
+        })
+    }
+}
+
+/// Real distributed Beaver triple generator that communicates over [`MPCTransport`].
+///
+/// Unlike [`DistributedTripleGen::simulate_distributed_generation`] which runs all
+/// parties in a single process, this struct runs as one party and exchanges
+/// cross-term messages with peers over the transport.
+///
+/// # Protocol (per triple)
+///
+/// 1. Each party i samples random `a_i`, `b_i`, sets `c_i = a_i * b_i` (mpc_scale).
+/// 2. For each peer j, party i:
+///    - Picks random `r_ij`
+///    - Sends `(a_i, r_ij)` to peer j
+///    - Adds `r_ij` to `c_i`
+/// 3. Upon receiving `(a_j, r_ji)` from peer j, party i:
+///    - Computes cross-term = `a_j * b_i - r_ji`
+///    - Adds cross-term to `c_i`
+///
+/// # Correctness
+///
+/// ```text
+/// sum(c_i) = sum(a_i*b_i) + sum_{i!=j}(r_ij - r_ij + a_i*b_j)
+///          = sum(a_i*b_i) + sum_{i!=j}(a_i*b_j)
+///          = (sum a_i) * (sum b_j)
+/// ```
+///
+/// The random masks `r_ij` cancel out across the two parties that hold them.
+pub struct NetworkDistributedDealer<'t, T: MPCTransport> {
+    transport: &'t T,
+    party_index: usize,
+    rng: ChaCha20Rng,
+}
+
+impl<'t, T: MPCTransport> NetworkDistributedDealer<'t, T> {
+    /// Creates a new network-distributed dealer for one party.
+    ///
+    /// # Arguments
+    ///
+    /// * `transport` - The MPC transport for communicating with peers
+    /// * `party_index` - This party's index (0..num_parties)
+    /// * `seed` - RNG seed (should differ per party; use entropy in production)
+    pub fn new(transport: &'t T, party_index: usize, seed: u64) -> Self {
+        let party_seed = seed.wrapping_add((party_index as u64).wrapping_mul(0x9E3779B97F4A7C15));
+        Self {
+            transport,
+            party_index,
+            rng: ChaCha20Rng::seed_from_u64(party_seed),
+        }
+    }
+
+    /// Generates `count` Beaver triples distributedly over the transport.
+    ///
+    /// All parties must call this method concurrently with the same `count`.
+    /// Communication pattern: 2 rounds per batch (send cross-terms, receive cross-terms).
+    ///
+    /// Returns the local party's shares of each triple.
+    pub async fn generate(&mut self, count: usize) -> MPCResult<Vec<BeaverTriple>> {
+        let peers = self.transport.peers();
+
+        // Phase 1: Sample local (a_i, b_i) for each triple. Compute c_i = a_i * b_i.
+        let mut a_values: Vec<Fr> = Vec::with_capacity(count);
+        let mut b_values: Vec<Fr> = Vec::with_capacity(count);
+        let mut c_values: Vec<Fr> = Vec::with_capacity(count);
+
+        for _ in 0..count {
+            let a_i = Fr::random(&mut self.rng);
+            let b_i = Fr::random(&mut self.rng);
+            let c_i = a_i.mpc_scale(&b_i);
+            a_values.push(a_i);
+            b_values.push(b_i);
+            c_values.push(c_i);
+        }
+
+        // Phase 2: For each peer, generate random masks and send (a_i, r_ij) for all triples.
+        // Also accumulate r_ij into c_i.
+        //
+        // We batch all triples into a single message per peer for efficiency.
+        for peer in &peers {
+            let mut a_bytes_batch = Vec::with_capacity(count);
+            let mut r_bytes_batch = Vec::with_capacity(count);
+
+            for t in 0..count {
+                let r_ij = Fr::random(&mut self.rng);
+
+                // Serialize a_i and r_ij for this triple
+                a_bytes_batch.push(SecureArithmetic::serialize_share_batch(&[a_values[t].clone()]));
+                r_bytes_batch.push(SecureArithmetic::serialize_share_batch(&[r_ij.clone()]));
+
+                // Party i adds r_ij to c_i
+                c_values[t] = Fr::add(&c_values[t], &r_ij);
+            }
+
+            let msg = DistributedTripleMessage::CrossTermShare {
+                a_values: a_bytes_batch,
+                r_values: r_bytes_batch,
+            };
+            self.transport.send(peer, &msg.encode()).await?;
+        }
+
+        // Phase 3: Receive (a_j, r_ji) from each peer. Compute cross-terms.
+        for peer in &peers {
+            let data = self.transport.recv(peer).await?;
+            let msg = DistributedTripleMessage::decode(&data)?;
+
+            match msg {
+                DistributedTripleMessage::CrossTermShare { a_values: a_batch, r_values: r_batch } => {
+                    if a_batch.len() != count || r_batch.len() != count {
+                        return Err(MPCError::CommunicationError(format!(
+                            "expected {} triples from {}, got {} a-values and {} r-values",
+                            count, peer, a_batch.len(), r_batch.len()
+                        )));
+                    }
+
+                    for t in 0..count {
+                        let peer_a = SecureArithmetic::deserialize_share_batch(&a_batch[t])?;
+                        let peer_r = SecureArithmetic::deserialize_share_batch(&r_batch[t])?;
+
+                        if peer_a.is_empty() || peer_r.is_empty() {
+                            return Err(MPCError::CommunicationError(
+                                "empty a or r value in cross-term message".into(),
+                            ));
+                        }
+
+                        // Cross-term: a_j * b_i - r_ji
+                        let cross = Fr::sub(&peer_a[0].mpc_scale(&b_values[t]), &peer_r[0]);
+                        c_values[t] = Fr::add(&c_values[t], &cross);
+                    }
+                }
+            }
+        }
+
+        // Assemble triples
+        let triples: Vec<BeaverTriple> = (0..count)
+            .map(|t| BeaverTriple::new(a_values[t].clone(), b_values[t].clone(), c_values[t].clone()))
+            .collect();
+
+        Ok(triples)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,5 +480,124 @@ mod tests {
         let c = Fr::add(&shares[0].c, &shares[1].c);
         let expected = a.mpc_scale(&b);
         assert!(c.ct_eq(&expected).to_bool());
+    }
+
+    // ========== NetworkDistributedDealer tests ==========
+
+    #[tokio::test]
+    async fn test_network_distributed_triple_3party() {
+        use crate::session::transport::LocalTransport;
+
+        let num_parties = 3;
+        let count = 10;
+        let parties: Vec<PartyId> = (0..num_parties).map(PartyId::from_index).collect();
+        let transports = LocalTransport::create_mesh(&parties);
+
+        // Spawn each party as a concurrent task
+        let mut handles = Vec::new();
+        for (i, transport) in transports.into_iter().enumerate() {
+            let handle = tokio::spawn(async move {
+                let mut dealer = NetworkDistributedDealer::new(&transport, i, 42);
+                dealer.generate(count).await.unwrap()
+            });
+            handles.push(handle);
+        }
+
+        // Collect results
+        let mut all_triples: Vec<Vec<BeaverTriple>> = Vec::new();
+        for handle in handles {
+            all_triples.push(handle.await.unwrap());
+        }
+
+        assert_eq!(all_triples.len(), num_parties);
+        assert_eq!(all_triples[0].len(), count);
+
+        // Verify each triple: sum(a) * sum(b) == sum(c)
+        for t in 0..count {
+            let a = sum(&all_triples.iter().map(|p| p[t].a.clone()).collect::<Vec<_>>());
+            let b = sum(&all_triples.iter().map(|p| p[t].b.clone()).collect::<Vec<_>>());
+            let c = sum(&all_triples.iter().map(|p| p[t].c.clone()).collect::<Vec<_>>());
+
+            let expected = a.mpc_scale(&b);
+            assert!(
+                c.ct_eq(&expected).to_bool(),
+                "Network distributed triple {} incorrect",
+                t,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_network_distributed_triple_2party() {
+        use crate::session::transport::LocalTransport;
+
+        let num_parties = 2;
+        let count = 20;
+        let parties: Vec<PartyId> = (0..num_parties).map(PartyId::from_index).collect();
+        let transports = LocalTransport::create_mesh(&parties);
+
+        let mut handles = Vec::new();
+        for (i, transport) in transports.into_iter().enumerate() {
+            let handle = tokio::spawn(async move {
+                let mut dealer = NetworkDistributedDealer::new(&transport, i, 100);
+                dealer.generate(count).await.unwrap()
+            });
+            handles.push(handle);
+        }
+
+        let mut all_triples: Vec<Vec<BeaverTriple>> = Vec::new();
+        for handle in handles {
+            all_triples.push(handle.await.unwrap());
+        }
+
+        for t in 0..count {
+            let a = Fr::add(&all_triples[0][t].a, &all_triples[1][t].a);
+            let b = Fr::add(&all_triples[0][t].b, &all_triples[1][t].b);
+            let c = Fr::add(&all_triples[0][t].c, &all_triples[1][t].c);
+
+            let expected = a.mpc_scale(&b);
+            assert!(
+                c.ct_eq(&expected).to_bool(),
+                "2-party network distributed triple {} incorrect",
+                t,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_network_distributed_triple_5party() {
+        use crate::session::transport::LocalTransport;
+
+        let num_parties = 5;
+        let count = 5;
+        let parties: Vec<PartyId> = (0..num_parties).map(PartyId::from_index).collect();
+        let transports = LocalTransport::create_mesh(&parties);
+
+        let mut handles = Vec::new();
+        for (i, transport) in transports.into_iter().enumerate() {
+            let handle = tokio::spawn(async move {
+                let mut dealer = NetworkDistributedDealer::new(&transport, i, 777);
+                dealer.generate(count).await.unwrap()
+            });
+            handles.push(handle);
+        }
+
+        let mut all_triples: Vec<Vec<BeaverTriple>> = Vec::new();
+        for handle in handles {
+            all_triples.push(handle.await.unwrap());
+        }
+
+        for t in 0..count {
+            let a = sum(&all_triples.iter().map(|p| p[t].a.clone()).collect::<Vec<_>>());
+            let b = sum(&all_triples.iter().map(|p| p[t].b.clone()).collect::<Vec<_>>());
+            let c = sum(&all_triples.iter().map(|p| p[t].c.clone()).collect::<Vec<_>>());
+
+            let expected = a.mpc_scale(&b);
+            assert!(
+                c.ct_eq(&expected).to_bool(),
+                "5-party network distributed triple {} incorrect",
+                t,
+            );
+        }
     }
 }

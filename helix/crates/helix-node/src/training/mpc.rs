@@ -1008,6 +1008,162 @@ pub fn mpc_proof_public_inputs_hex(
 }
 
 // ──────────────────────────────────────────────────────────────
+// ConnectionPoolBridge: Node ↔ MPC Transport
+// ──────────────────────────────────────────────────────────────
+
+use crate::network::messages::{MpcDataMessage, MessagePayload, NetworkMessage, PeerId};
+use crate::network::transport::ConnectionPool;
+use async_trait::async_trait;
+use helix_mpc::session::node_transport::NodeConnectionBridge;
+use std::sync::Arc;
+use tokio::sync::{mpsc, Mutex as TokioMutex};
+
+/// Bridges the node's [`ConnectionPool`] with the MPC transport layer.
+///
+/// Implements [`NodeConnectionBridge`] so that [`NodeTransport`](helix_mpc::session::node_transport::NodeTransport)
+/// can send and receive MPC messages through the node's existing TCP/TLS
+/// connections instead of establishing separate ones.
+///
+/// # How it works
+///
+/// **Outgoing messages**: `send_to_peer()` wraps raw MPC bytes in a
+/// [`NetworkMessage`] with an [`MpcData`](MessagePayload::MpcData) payload
+/// and sends it via the [`ConnectionPool`].
+///
+/// **Incoming messages**: The node's receive loop should detect
+/// `MpcData` payloads and call [`route_incoming()`](Self::route_incoming)
+/// with the sender's peer ID and the raw data. This dispatches to the
+/// correct per-peer mpsc channel, which `recv_from_peer()` reads from.
+///
+/// # Example
+///
+/// ```ignore
+/// let bridge = ConnectionPoolBridge::new(
+///     pool.clone(),
+///     local_peer_id,
+///     "session-123".into(),
+///     &["peer-a".into(), "peer-b".into()],
+/// );
+///
+/// // In the node's receive loop:
+/// if let MessagePayload::MpcData(mpc_msg) = &message.payload {
+///     bridge.route_incoming(&message.sender.0, mpc_msg.data.clone()).await?;
+/// }
+/// ```
+pub struct ConnectionPoolBridge {
+    /// The node's connection pool.
+    pool: Arc<ConnectionPool>,
+    /// Our node peer ID.
+    local_peer_id: PeerId,
+    /// Session ID for message tagging.
+    session_id: String,
+    /// Incoming message receivers per peer (peer_id string -> receiver).
+    receivers: HashMap<String, TokioMutex<mpsc::Receiver<Vec<u8>>>>,
+    /// Incoming message senders (held for routing incoming messages).
+    senders: HashMap<String, mpsc::Sender<Vec<u8>>>,
+}
+
+impl ConnectionPoolBridge {
+    /// Creates a new bridge with receiver channels for each expected MPC peer.
+    ///
+    /// # Arguments
+    ///
+    /// * `pool` - The node's connection pool (must already have peers registered)
+    /// * `local_peer_id` - This node's peer ID
+    /// * `session_id` - MPC session identifier for message tagging
+    /// * `mpc_peer_ids` - Peer IDs of the other MPC participants
+    pub fn new(
+        pool: Arc<ConnectionPool>,
+        local_peer_id: PeerId,
+        session_id: String,
+        mpc_peer_ids: &[String],
+    ) -> Self {
+        let mut receivers = HashMap::new();
+        let mut senders = HashMap::new();
+
+        for peer_id in mpc_peer_ids {
+            let (tx, rx) = mpsc::channel(4096);
+            receivers.insert(peer_id.clone(), TokioMutex::new(rx));
+            senders.insert(peer_id.clone(), tx);
+        }
+
+        Self {
+            pool,
+            local_peer_id,
+            session_id,
+            receivers,
+            senders,
+        }
+    }
+
+    /// Returns the sender channel for a specific peer.
+    ///
+    /// Used by the node's incoming message handler to get the channel
+    /// for dispatching received MPC messages.
+    pub fn sender_for_peer(&self, peer_id: &str) -> Option<&mpsc::Sender<Vec<u8>>> {
+        self.senders.get(peer_id)
+    }
+
+    /// Routes an incoming MPC message to the correct peer receiver channel.
+    ///
+    /// The node's receive loop should call this when it receives a
+    /// [`MessagePayload::MpcData`] message. The `from_peer_id` should be
+    /// the sender's peer ID string from the `NetworkMessage`.
+    pub async fn route_incoming(&self, from_peer_id: &str, data: Vec<u8>) -> Result<(), String> {
+        let tx = self
+            .senders
+            .get(from_peer_id)
+            .ok_or_else(|| format!("no receiver channel for peer {}", from_peer_id))?;
+        tx.send(data)
+            .await
+            .map_err(|e| format!("failed to route MPC message from {}: {}", from_peer_id, e))
+    }
+
+    /// Returns the session ID.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// Returns the local peer ID.
+    pub fn local_peer_id(&self) -> &PeerId {
+        &self.local_peer_id
+    }
+}
+
+#[async_trait]
+impl NodeConnectionBridge for ConnectionPoolBridge {
+    async fn send_to_peer(&self, peer_id: &str, data: &[u8]) -> Result<(), String> {
+        let node_peer_id = PeerId::from_string(peer_id);
+
+        let message = NetworkMessage::new(
+            self.local_peer_id.clone(),
+            MessagePayload::MpcData(MpcDataMessage {
+                session_id: self.session_id.clone(),
+                data: data.to_vec(),
+            }),
+        );
+
+        self.pool
+            .send(&node_peer_id, message)
+            .await
+            .map_err(|e| format!("ConnectionPool send to {} failed: {}", peer_id, e))
+    }
+
+    async fn recv_from_peer(&self, peer_id: &str) -> Result<Vec<u8>, String> {
+        let rx = self
+            .receivers
+            .get(peer_id)
+            .ok_or_else(|| format!("no receiver channel for peer {}", peer_id))?;
+
+        let mut rx_guard = rx.lock().await;
+        rx_guard
+            .recv()
+            .await
+            .ok_or_else(|| format!("MPC channel from {} closed", peer_id))
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
 // Tests
 // ──────────────────────────────────────────────────────────────
 
@@ -1427,5 +1583,180 @@ mod tests {
 
         let hex_inputs = mpc_proof_public_inputs_hex(&proof);
         assert_eq!(hex_inputs.len(), 1);
+    }
+
+    // ── ConnectionPoolBridge tests ──────────────────────────────
+
+    /// Helper to create a ConnectionPool for testing (no real TCP needed).
+    fn create_test_pool() -> Arc<ConnectionPool> {
+        use crate::network::transport::{TcpTransport, TransportConfig};
+
+        let local_id = PeerId::random();
+        let config = TransportConfig::default();
+        let transport = Arc::new(TcpTransport::new(local_id, config).unwrap());
+        Arc::new(ConnectionPool::new(transport))
+    }
+
+    #[test]
+    fn test_connection_pool_bridge_creation() {
+        let pool = create_test_pool();
+        let local_id = PeerId::from_string("local-node");
+        let peers = vec!["peer-a".to_string(), "peer-b".to_string()];
+
+        let bridge = ConnectionPoolBridge::new(
+            pool,
+            local_id.clone(),
+            "session-1".to_string(),
+            &peers,
+        );
+
+        assert_eq!(bridge.session_id(), "session-1");
+        assert_eq!(bridge.local_peer_id(), &local_id);
+        assert!(bridge.sender_for_peer("peer-a").is_some());
+        assert!(bridge.sender_for_peer("peer-b").is_some());
+        assert!(bridge.sender_for_peer("peer-c").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_connection_pool_bridge_route_incoming() {
+        let pool = create_test_pool();
+        let local_id = PeerId::from_string("local-node");
+        let peers = vec!["peer-a".to_string()];
+
+        let bridge = ConnectionPoolBridge::new(
+            pool,
+            local_id,
+            "session-1".to_string(),
+            &peers,
+        );
+
+        // Route a message from peer-a.
+        let data = b"hello from peer-a".to_vec();
+        bridge.route_incoming("peer-a", data.clone()).await.unwrap();
+
+        // Receive via the bridge.
+        let received = bridge.recv_from_peer("peer-a").await.unwrap();
+        assert_eq!(received, data);
+    }
+
+    #[tokio::test]
+    async fn test_connection_pool_bridge_route_unknown_peer() {
+        let pool = create_test_pool();
+        let local_id = PeerId::from_string("local-node");
+        let peers = vec!["peer-a".to_string()];
+
+        let bridge = ConnectionPoolBridge::new(
+            pool,
+            local_id,
+            "session-1".to_string(),
+            &peers,
+        );
+
+        // Routing from an unknown peer should fail.
+        let result = bridge.route_incoming("unknown-peer", vec![1, 2, 3]).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("no receiver channel"));
+    }
+
+    #[tokio::test]
+    async fn test_connection_pool_bridge_recv_unknown_peer() {
+        let pool = create_test_pool();
+        let local_id = PeerId::from_string("local-node");
+        let peers = vec!["peer-a".to_string()];
+
+        let bridge = ConnectionPoolBridge::new(
+            pool,
+            local_id,
+            "session-1".to_string(),
+            &peers,
+        );
+
+        // Receiving from an unknown peer should fail.
+        let result = bridge.recv_from_peer("unknown-peer").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("no receiver channel"));
+    }
+
+    #[tokio::test]
+    async fn test_connection_pool_bridge_multiple_messages() {
+        let pool = create_test_pool();
+        let local_id = PeerId::from_string("local-node");
+        let peers = vec!["peer-a".to_string(), "peer-b".to_string()];
+
+        let bridge = ConnectionPoolBridge::new(
+            pool,
+            local_id,
+            "session-1".to_string(),
+            &peers,
+        );
+
+        // Route multiple messages from different peers.
+        bridge.route_incoming("peer-a", b"msg-1-from-a".to_vec()).await.unwrap();
+        bridge.route_incoming("peer-b", b"msg-1-from-b".to_vec()).await.unwrap();
+        bridge.route_incoming("peer-a", b"msg-2-from-a".to_vec()).await.unwrap();
+
+        // Messages should be received in order per peer.
+        let recv_a1 = bridge.recv_from_peer("peer-a").await.unwrap();
+        assert_eq!(recv_a1, b"msg-1-from-a");
+
+        let recv_b1 = bridge.recv_from_peer("peer-b").await.unwrap();
+        assert_eq!(recv_b1, b"msg-1-from-b");
+
+        let recv_a2 = bridge.recv_from_peer("peer-a").await.unwrap();
+        assert_eq!(recv_a2, b"msg-2-from-a");
+    }
+
+    #[tokio::test]
+    async fn test_connection_pool_bridge_send_constructs_mpc_message() {
+        // Verify that send_to_peer creates the right NetworkMessage payload.
+        // Since the ConnectionPool will fail (no real TCP connection to the peer),
+        // we check that the error comes from the pool, not from message construction.
+        let pool = create_test_pool();
+        let local_id = PeerId::from_string("local-node");
+        let peers = vec!["peer-a".to_string()];
+
+        let bridge = ConnectionPoolBridge::new(
+            pool,
+            local_id,
+            "session-1".to_string(),
+            &peers,
+        );
+
+        // send_to_peer should fail because peer-a is not registered in the pool,
+        // but it should get as far as calling pool.send() (which returns PeerNotFound).
+        let result = bridge.send_to_peer("peer-a", b"test data").await;
+        assert!(result.is_err());
+        // The error should come from the ConnectionPool (PeerNotFound),
+        // not from message construction.
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("ConnectionPool send to peer-a failed"),
+            "Expected ConnectionPool error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_mpc_data_message_serialization() {
+        // Test that MpcDataMessage can be serialized/deserialized through NetworkMessage.
+        let msg = NetworkMessage::new(
+            PeerId::from_string("sender"),
+            MessagePayload::MpcData(MpcDataMessage {
+                session_id: "session-42".to_string(),
+                data: vec![1, 2, 3, 4, 5],
+            }),
+        );
+
+        let bytes = crate::network::messages::serialize_message(&msg).unwrap();
+        let decoded = crate::network::messages::deserialize_message(&bytes).unwrap();
+
+        assert_eq!(msg.id, decoded.id);
+        match decoded.payload {
+            MessagePayload::MpcData(mpc_msg) => {
+                assert_eq!(mpc_msg.session_id, "session-42");
+                assert_eq!(mpc_msg.data, vec![1, 2, 3, 4, 5]);
+            }
+            other => panic!("Expected MpcData payload, got {:?}", other),
+        }
     }
 }

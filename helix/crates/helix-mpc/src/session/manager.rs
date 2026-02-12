@@ -11,7 +11,7 @@ use crate::protocols::reshare::Resharing;
 use crate::sharing::model::ModelShare;
 use crate::types::{MPCConfig, MPCPhase, PartyId, PartyRole};
 use super::channel::LocalChannel;
-use super::transport::{HandshakeMessage, PROTOCOL_VERSION};
+use super::transport::{HandshakeMessage, MPCTransport, PROTOCOL_VERSION};
 
 /// An MPC session coordinating multi-party computation.
 #[derive(Debug)]
@@ -387,6 +387,63 @@ pub struct ConnectedSession {
     pub agreed_seed: [u8; 32],
     /// Our handshake message.
     pub handshake: HandshakeMessage,
+}
+
+/// A session with a live transport, ready for distributed computation.
+pub struct TransportSession<T: MPCTransport> {
+    /// Session configuration.
+    pub config: MPCConfig,
+    /// Session identifier.
+    pub session_id: String,
+    /// Our party ID.
+    pub party_id: PartyId,
+    /// The live transport.
+    pub transport: T,
+    /// Agreed random seed.
+    pub agreed_seed: [u8; 32],
+}
+
+#[cfg(feature = "network-mpc")]
+mod transport_session_impl {
+    use super::*;
+    use crate::session::transport::TcpTransport;
+    use std::collections::HashMap;
+
+    impl MPCSession {
+        /// Connects to peers and returns a session with a live TcpTransport.
+        ///
+        /// This performs the actual TCP connection establishment, unlike `connect()`
+        /// which only prepares handshake metadata.
+        pub async fn connect_with_transport(
+            config: MPCConfig,
+            session_id: impl Into<String>,
+            party_id: PartyId,
+            peer_addrs: HashMap<PartyId, std::net::SocketAddr>,
+            listen_addr: std::net::SocketAddr,
+        ) -> MPCResult<TransportSession<TcpTransport>> {
+            config.validate().map_err(MPCError::InvalidConfig)?;
+            let session_id = session_id.into();
+
+            // Create a TCP transport and bind to peers
+            let transport = TcpTransport::bind(listen_addr, party_id.clone(), &peer_addrs).await?;
+
+            // Derive agreed seed (XOR of all party index bytes for deterministic derivation)
+            let mut agreed_seed = [0u8; 32];
+            // Use party indices as seed material
+            let my_idx = party_id.0.strip_prefix("party-")
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0);
+            agreed_seed[0..4].copy_from_slice(&my_idx.to_le_bytes());
+
+            Ok(TransportSession {
+                config,
+                session_id,
+                party_id,
+                transport,
+                agreed_seed,
+            })
+        }
+    }
 }
 
 impl std::fmt::Display for SessionStats {

@@ -43,7 +43,7 @@ pub use establishment::{
     AuthenticationMessage, EstablishedSession, KeyExchangeMessage, SessionConfig,
     SessionEstablishment, SessionPhase, simulate_session_establishment,
 };
-pub use manager::{ConnectedSession, MPCSession};
+pub use manager::{ConnectedSession, MPCSession, TransportSession};
 pub use network::{AsyncMPCChannel, ConnectionState, NetworkChannel, NetworkConfig, TlsConfig};
 pub use key_rotation::{
     KeyRotationConfig, KeyRotationManager, KeyRotationStats, PFSManager,

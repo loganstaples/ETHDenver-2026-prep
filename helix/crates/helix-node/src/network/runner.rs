@@ -45,6 +45,8 @@ pub enum NetworkEvent {
     Heartbeat { from: PeerId, message: HeartbeatMessage },
     /// BFT consensus message received (2-phase commit for gradient aggregation).
     ConsensusMessage { from: PeerId, message: ConsensusMessage },
+    /// MPC protocol data received (Beaver triples, secret shares, etc.)
+    MpcDataMessage { from: PeerId, message: super::messages::MpcDataMessage },
     /// Network error.
     Error { peer: Option<PeerId>, error: String },
 }
@@ -444,6 +446,8 @@ impl NetworkRunner {
             // Consensus messages use the Training rate limit bucket
             // since they are part of the training coordination flow.
             MessagePayload::Consensus(_) => MessageType::Training,
+            // MPC messages use the Training rate limit bucket.
+            MessagePayload::MpcData(_) => MessageType::Training,
         }
     }
 
@@ -658,6 +662,12 @@ impl NetworkRunner {
                             let _ = event_tx.send(NetworkEvent::ConsensusMessage {
                                 from: message.sender,
                                 message: consensus_msg,
+                            }).await;
+                        }
+                        MessagePayload::MpcData(mpc_msg) => {
+                            let _ = event_tx.send(NetworkEvent::MpcDataMessage {
+                                from: message.sender,
+                                message: mpc_msg,
                             }).await;
                         }
                     }

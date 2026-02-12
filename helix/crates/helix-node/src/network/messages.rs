@@ -375,6 +375,22 @@ pub enum MessagePayload {
     Heartbeat(HeartbeatMessage),
     /// BFT consensus messages (2-phase commit for gradient aggregation).
     Consensus(ConsensusMessage),
+    /// MPC protocol messages (Beaver triples, secret sharing, etc.)
+    MpcData(MpcDataMessage),
+}
+
+/// MPC data message carrying raw bytes for the MPC layer.
+///
+/// Used to tunnel MPC protocol messages (secret shares, Beaver triples,
+/// garbled circuits, etc.) through the node's existing TCP/TLS connections.
+/// The `session_id` enables multiplexing multiple concurrent MPC sessions
+/// over the same peer connections.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MpcDataMessage {
+    /// Session ID for multiplexing multiple MPC sessions.
+    pub session_id: String,
+    /// Raw MPC payload bytes.
+    pub data: Vec<u8>,
 }
 
 /// Peer discovery messages.

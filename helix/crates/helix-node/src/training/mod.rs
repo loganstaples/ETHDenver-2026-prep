@@ -84,6 +84,7 @@ pub use mpc::{
     MPCProvedTrainingRound, MPCProvedStep,
     model_to_flat, flat_to_model,
     mpc_proof_to_bytes, mpc_proof_public_inputs_hex,
+    ConnectionPoolBridge,
 };
 
 pub use orchestrator::{
