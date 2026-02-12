@@ -553,6 +553,25 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
         emit RoundFinalized(modelId, roundId, ext.bestProver, ext.bestLoss);
     }
 
+    /// @notice Finalize multiple rounds in one transaction
+    function batchFinalizeRounds(
+        uint256 modelId,
+        uint256[] calldata roundIds
+    ) external whenNotPaused nonReentrant {
+        for (uint256 i = 0; i < roundIds.length; i++) {
+            RoundExt storage ext = roundsExt[modelId][roundIds[i]];
+            Round storage round = rounds[modelId][roundIds[i]];
+
+            // Skip rounds that can't be finalized
+            if (round.isCompleted || ext.finalized) continue;
+            if (block.timestamp <= ext.disputeDeadline) continue;
+            if (ext.validProofs < ext.minParticipants) continue;
+
+            _finalizeRound(modelId, roundIds[i]);
+            emit RoundFinalized(modelId, roundIds[i], ext.bestProver, ext.bestLoss);
+        }
+    }
+
     /// @notice Expire a round that didn't meet participant threshold
     function expireRound(uint256 modelId, uint256 roundId) external whenNotPaused nonReentrant {
         Round storage round = rounds[modelId][roundId];

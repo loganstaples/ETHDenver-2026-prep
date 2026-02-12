@@ -1063,3 +1063,360 @@ contract ComputeRewardsTest is Test {
         rewards.setPoolSplit(8000, 1000, 1000);
     }
 }
+
+/// @title E2EContractHardeningTest
+/// @notice End-to-end integration tests exercising the full hardened V3 contract flow
+contract E2EContractHardeningTest is Test {
+    HelixCoordinatorV3 public coordinator;
+    HelixToken public token;
+    Staking public staking;
+    Rewards public rewards;
+    ModelRegistry public registry;
+    MockVerifierForRoundTest public mockVerifier;
+
+    address public modelOwner;
+    address public treasuryAddr;
+    address public prover1;
+    address public prover2;
+    address public prover3;
+    address public prover4;
+
+    uint256 constant STAKE_AMOUNT = 200e18;
+    uint256 constant MIN_STAKE = 100e18;
+    uint256 constant ROUND_DURATION = 2 hours;
+
+    uint256 constant OLD_HASH_LO = 12345;
+    uint256 constant OLD_HASH_HI = 67890;
+
+    function setUp() public {
+        modelOwner = makeAddr("e2eModelOwner");
+        treasuryAddr = makeAddr("e2eTreasury");
+        prover1 = makeAddr("e2eProver1");
+        prover2 = makeAddr("e2eProver2");
+        prover3 = makeAddr("e2eProver3");
+        prover4 = makeAddr("e2eProver4");
+
+        // Deploy token
+        token = new HelixToken(treasuryAddr);
+
+        // Deploy mock verifier
+        mockVerifier = new MockVerifierForRoundTest();
+
+        // Deploy staking
+        staking = new Staking(address(token), MIN_STAKE, 7 days, 5000);
+
+        // Deploy rewards
+        rewards = new Rewards(address(token));
+
+        // Deploy registry
+        registry = new ModelRegistry();
+
+        // Deploy coordinator
+        coordinator = new HelixCoordinatorV3(
+            address(mockVerifier),
+            address(staking),
+            address(rewards),
+            address(registry),
+            treasuryAddr
+        );
+
+        // Wire contracts
+        staking.setOperator(address(coordinator));
+        rewards.setCoordinator(address(coordinator));
+        rewards.setStakingContract(address(staking));
+        registry.setCoordinator(address(coordinator));
+
+        // Fund and stake all provers
+        _fundAndStake(prover1);
+        _fundAndStake(prover2);
+        _fundAndStake(prover3);
+        _fundAndStake(prover4);
+
+        // Fund model owner for training jobs
+        token.mint(modelOwner, 100000e18);
+    }
+
+    function _fundAndStake(address prover) internal {
+        token.mint(prover, 10000e18);
+        vm.startPrank(prover);
+        token.approve(address(staking), type(uint256).max);
+        staking.stake(STAKE_AMOUNT);
+        vm.stopPrank();
+    }
+
+    function _correctCommitment() internal pure returns (uint256) {
+        return uint256(keccak256(abi.encodePacked(OLD_HASH_LO, OLD_HASH_HI)));
+    }
+
+    function _computeChecksum(
+        uint256 errorBound, uint256 stepNumber, uint256 modelId, uint256 errorBudget
+    ) internal pure returns (uint256) {
+        return ProofFixtureHardcoded.computeErrorChecksum(errorBound, stepNumber, modelId, errorBudget);
+    }
+
+    function _buildPublicInputs(
+        uint256 oldLo, uint256 oldHi,
+        uint256 newHashLo, uint256 newHashHi,
+        uint256 loss, uint256 errorBound,
+        uint256 step, uint256 modelId
+    ) internal view returns (uint256[] memory) {
+        uint256[] memory inputs = new uint256[](8);
+        inputs[0] = oldLo;
+        inputs[1] = oldHi;
+        inputs[2] = newHashLo;
+        inputs[3] = newHashHi;
+        inputs[4] = loss;
+        inputs[5] = errorBound;
+        inputs[6] = step;
+        inputs[7] = _computeChecksum(errorBound, step, modelId, coordinator.maxErrorBound());
+        return inputs;
+    }
+
+    function _createUniqueProof(uint256 nonce) internal pure returns (bytes memory) {
+        bytes memory base = ProofFixtureHardcoded.createValidProof();
+        return abi.encodePacked(base, nonce);
+    }
+
+    // ============ Test 1: Full Flow Multi-Round with Compute Rewards ============
+
+    function test_FullFlow_MultiRound_ComputeRewards() public {
+        // --- Step 1: Register model ---
+        vm.prank(modelOwner);
+        uint256 modelId = coordinator.registerModel("E2EModel", "Full E2E test", "ipfs://e2e", _correctCommitment());
+
+        // --- Step 2: Create training job (500e18 for 5 rounds = 100e18/round) ---
+        vm.startPrank(modelOwner);
+        token.approve(address(coordinator), 500e18);
+        uint256 jobId = coordinator.createTrainingJob(modelId, 5, 500e18);
+        vm.stopPrank();
+
+        // --- Step 3: Fund reward pool ---
+        token.mint(address(this), 1000e18);
+        token.approve(address(rewards), 1000e18);
+        rewards.fundRewardPool(1000e18, 100e18, 365 days);
+
+        // --- Step 4: Start round 1 with threshold=2 ---
+        vm.prank(modelOwner);
+        coordinator.startRoundWithThreshold(modelId, ROUND_DURATION, 2);
+
+        // --- Step 5: 4 workers submit proofs with different losses ---
+        // prover1: loss=50 (best)
+        uint256[] memory inputs1 = _buildPublicInputs(OLD_HASH_LO, OLD_HASH_HI, 11111, 22222, 50, 10, 1, modelId);
+        vm.prank(prover1);
+        coordinator.submitProof(modelId, 1, _createUniqueProof(50001), inputs1);
+
+        // prover2: loss=100
+        uint256[] memory inputs2 = _buildPublicInputs(OLD_HASH_LO, OLD_HASH_HI, 33333, 44444, 100, 10, 1, modelId);
+        vm.prank(prover2);
+        coordinator.submitProof(modelId, 1, _createUniqueProof(50002), inputs2);
+
+        // prover3: loss=150
+        uint256[] memory inputs3 = _buildPublicInputs(OLD_HASH_LO, OLD_HASH_HI, 55555, 66666, 150, 10, 1, modelId);
+        vm.prank(prover3);
+        coordinator.submitProof(modelId, 1, _createUniqueProof(50003), inputs3);
+
+        // prover4: loss=200
+        uint256[] memory inputs4 = _buildPublicInputs(OLD_HASH_LO, OLD_HASH_HI, 77777, 88888, 200, 10, 1, modelId);
+        vm.prank(prover4);
+        coordinator.submitProof(modelId, 1, _createUniqueProof(50004), inputs4);
+
+        // --- Step 6: Warp past dispute period ---
+        vm.warp(block.timestamp + ROUND_DURATION + coordinator.DISPUTE_PERIOD() + 1);
+
+        // --- Step 7: Finalize round 1 ---
+        coordinator.finalizeRound(modelId, 1);
+
+        // --- Step 8: Verify after finalization ---
+
+        // 8a: Model commitment updated to best prover's (lowest loss=50, prover1)
+        uint256 expectedCommitment = uint256(keccak256(abi.encodePacked(uint256(11111), uint256(22222))));
+        (, uint256 commitment,) = coordinator.getModelState(modelId);
+        assertEq(commitment, expectedCommitment, "Model commitment should match best prover's new commitment");
+
+        // 8b: Error bound accumulated
+        assertEq(coordinator.getAccumulatedErrorBound(modelId), 10, "Error bound should accumulate from best prover");
+
+        // 8c: ModelRegistry has 2 checkpoints (initial + round 1)
+        assertEq(registry.getCheckpointCount(modelId), 2, "Registry should have 2 checkpoints");
+
+        // 8d: Training job: completedRounds=1, remainingBalance=400e18
+        (,,,, uint256 completedRounds,, uint256 remainingBalance, bool active) = coordinator.trainingJobs(jobId);
+        assertEq(completedRounds, 1, "Job should have 1 completed round");
+        assertEq(remainingBalance, 400e18, "Job should have 400e18 remaining");
+        assertTrue(active, "Job should still be active");
+
+        // 8e: Each worker has pending rewards
+        uint256 reward1 = rewards.pendingRewards(modelId, 1, prover1);
+        uint256 reward2 = rewards.pendingRewards(modelId, 1, prover2);
+        uint256 reward3 = rewards.pendingRewards(modelId, 1, prover3);
+        uint256 reward4 = rewards.pendingRewards(modelId, 1, prover4);
+        assertGt(reward1, 0, "Prover1 should have pending rewards");
+        assertGt(reward2, 0, "Prover2 should have pending rewards");
+        assertGt(reward3, 0, "Prover3 should have pending rewards");
+        assertGt(reward4, 0, "Prover4 should have pending rewards");
+
+        // 8f: Worker with lowest loss (prover1, loss=50) has highest reward (quality bonus)
+        assertGt(reward1, reward4, "Best prover should earn more than worst prover");
+
+        // --- Step 9: Workers claim rewards ---
+        uint256[] memory modelIds = new uint256[](1);
+        modelIds[0] = modelId;
+        uint256[] memory roundIds = new uint256[](1);
+        roundIds[0] = 1;
+
+        uint256 prover1BalBefore = token.balanceOf(prover1);
+        vm.prank(prover1);
+        rewards.claimRoundRewards(modelIds, roundIds);
+        uint256 prover1BalAfter = token.balanceOf(prover1);
+        assertEq(prover1BalAfter - prover1BalBefore, reward1, "Prover1 should receive claimed rewards");
+
+        // Verify rewards marked as claimed (can't claim again)
+        vm.prank(prover1);
+        vm.expectRevert("No rewards to claim");
+        rewards.claimRoundRewards(modelIds, roundIds);
+
+        // Other provers claim too
+        vm.prank(prover2);
+        rewards.claimRoundRewards(modelIds, roundIds);
+        vm.prank(prover3);
+        rewards.claimRoundRewards(modelIds, roundIds);
+        vm.prank(prover4);
+        rewards.claimRoundRewards(modelIds, roundIds);
+
+        // --- Step 10: Verify version chain ---
+        // Registry has 2 checkpoints: index 0 (initial) and index 1 (round 1)
+        ModelRegistry.Checkpoint[] memory chain = registry.getVersionChain(modelId, 1, 10);
+        assertEq(chain.length, 2, "Version chain should have 2 entries");
+        assertEq(chain[0].commitment, bytes32(expectedCommitment), "Chain[0] should be round 1 commitment");
+        assertEq(chain[1].commitment, bytes32(_correctCommitment()), "Chain[1] should be initial commitment");
+        assertEq(chain[0].parentVersion, 0, "Round 1 checkpoint parent should be version 0");
+    }
+
+    // ============ Test 2: Batch Finalize Multiple Rounds ============
+
+    function test_BatchFinalizeMultipleRounds() public {
+        // --- Register model ---
+        vm.prank(modelOwner);
+        uint256 modelId = coordinator.registerModel("BatchModel", "Batch test", "ipfs://batch", _correctCommitment());
+
+        // Fund reward pool
+        token.mint(address(this), 10000e18);
+        token.approve(address(rewards), 10000e18);
+        rewards.fundRewardPool(10000e18, 100e18, 365 days);
+
+        // --- Round 1: threshold=1 (auto-finalizes) ---
+        vm.prank(modelOwner);
+        coordinator.startRound(modelId, ROUND_DURATION);
+
+        uint256[] memory inputs1 = _buildPublicInputs(OLD_HASH_LO, OLD_HASH_HI, 11111, 22222, 100, 10, 1, modelId);
+        vm.prank(prover1);
+        coordinator.submitProof(modelId, 1, _createUniqueProof(60001), inputs1);
+
+        // Verify round 1 is auto-completed
+        (,,,bool r1Completed,) = coordinator.rounds(modelId, 1);
+        assertTrue(r1Completed, "Round 1 should be auto-completed");
+
+        // --- Round 2: threshold=2 (requires manual finalization) ---
+        // After round 1 finalized, model commitment changed to hash(11111, 22222)
+        uint256 newCommitment1Lo = 11111;
+        uint256 newCommitment1Hi = 22222;
+
+        vm.prank(modelOwner);
+        coordinator.startRoundWithThreshold(modelId, ROUND_DURATION, 2);
+
+        // Submit 2 proofs to round 2
+        uint256[] memory inputs2a = _buildPublicInputs(newCommitment1Lo, newCommitment1Hi, 33333, 44444, 80, 8, 2, modelId);
+        vm.prank(prover1);
+        coordinator.submitProof(modelId, 2, _createUniqueProof(60002), inputs2a);
+
+        uint256[] memory inputs2b = _buildPublicInputs(newCommitment1Lo, newCommitment1Hi, 55555, 66666, 120, 12, 2, modelId);
+        vm.prank(prover2);
+        coordinator.submitProof(modelId, 2, _createUniqueProof(60003), inputs2b);
+
+        // Round 2 should NOT be completed yet
+        (,,,bool r2Completed,) = coordinator.rounds(modelId, 2);
+        assertFalse(r2Completed, "Round 2 should not be auto-completed");
+
+        // --- Warp past dispute period ---
+        vm.warp(block.timestamp + ROUND_DURATION + coordinator.DISPUTE_PERIOD() + 1);
+
+        // --- Batch finalize [1, 2] --- round 1 should be skipped (already done), round 2 finalized
+        uint256[] memory roundIds = new uint256[](2);
+        roundIds[0] = 1;
+        roundIds[1] = 2;
+        coordinator.batchFinalizeRounds(modelId, roundIds);
+
+        // Verify round 2 is now finalized
+        (,,,bool r2CompletedAfter,) = coordinator.rounds(modelId, 2);
+        assertTrue(r2CompletedAfter, "Round 2 should be completed after batch finalize");
+
+        (,,,, bool r2Finalized, address r2BestProver,) = coordinator.getRoundExt(modelId, 2);
+        assertTrue(r2Finalized, "Round 2 ext should be finalized");
+        assertEq(r2BestProver, prover1, "Best prover for round 2 should be prover1 (lower loss=80)");
+
+        // Verify model commitment updated to round 2's best
+        uint256 expectedR2Commitment = uint256(keccak256(abi.encodePacked(uint256(33333), uint256(44444))));
+        (, uint256 currentCommitment,) = coordinator.getModelState(modelId);
+        assertEq(currentCommitment, expectedR2Commitment, "Model commitment should reflect round 2 best");
+
+        // Verify registry has 3 checkpoints (initial + round 1 + round 2)
+        assertEq(registry.getCheckpointCount(modelId), 3, "Registry should have 3 checkpoints");
+    }
+
+    // ============ Test 3: Expire and Refund ============
+
+    function test_ExpireAndRefund() public {
+        // --- Register model ---
+        vm.prank(modelOwner);
+        uint256 modelId = coordinator.registerModel("ExpireModel", "Expire test", "ipfs://expire", _correctCommitment());
+
+        // --- Create training job ---
+        vm.startPrank(modelOwner);
+        token.approve(address(coordinator), 500e18);
+        uint256 jobId = coordinator.createTrainingJob(modelId, 5, 500e18);
+        vm.stopPrank();
+
+        // Fund reward pool
+        token.mint(address(this), 1000e18);
+        token.approve(address(rewards), 1000e18);
+        rewards.fundRewardPool(1000e18, 100e18, 365 days);
+
+        // --- Start round with threshold=3 ---
+        vm.prank(modelOwner);
+        coordinator.startRoundWithThreshold(modelId, ROUND_DURATION, 3);
+
+        // Only 1 worker submits (need 3)
+        uint256[] memory inputs = _buildPublicInputs(OLD_HASH_LO, OLD_HASH_HI, 11111, 22222, 100, 10, 1, modelId);
+        vm.prank(prover1);
+        coordinator.submitProof(modelId, 1, _createUniqueProof(70001), inputs);
+
+        // Verify cannot expire while submission still open
+        vm.expectRevert("Submission still open");
+        coordinator.expireRound(modelId, 1);
+
+        // --- Warp past deadline ---
+        vm.warp(block.timestamp + ROUND_DURATION + 1);
+
+        // --- Expire the round ---
+        coordinator.expireRound(modelId, 1);
+
+        // --- Verify round expired ---
+        (,,,bool isCompleted,) = coordinator.rounds(modelId, 1);
+        assertTrue(isCompleted, "Expired round should be marked completed");
+
+        (,,,, bool finalized,,) = coordinator.getRoundExt(modelId, 1);
+        assertTrue(finalized, "Expired round should be marked finalized");
+
+        // Model commitment unchanged
+        (, uint256 commitment,) = coordinator.getModelState(modelId);
+        assertEq(commitment, _correctCommitment(), "Model commitment should be unchanged after expire");
+
+        // Error bound should NOT have been accumulated
+        assertEq(coordinator.getAccumulatedErrorBound(modelId), 0, "Error bound should not accumulate on expired round");
+
+        // Training job balance preserved (fees stay for next round)
+        (,,,, uint256 completedRounds,, uint256 remainingBalance,) = coordinator.trainingJobs(jobId);
+        assertEq(completedRounds, 0, "No rounds should be completed");
+        assertEq(remainingBalance, 500e18, "Training job balance should be fully preserved");
+    }
+}
