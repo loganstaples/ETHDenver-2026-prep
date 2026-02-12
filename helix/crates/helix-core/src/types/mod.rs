@@ -120,8 +120,8 @@ pub use witness::{TrainingStepWitnessData, verify_pi_error_checksum};
 
 // Re-export coordination types
 pub use coordination::{
-    GradientCommitment, NodeId, RoundDescriptor, SessionId, TrainingParams,
-    TrainingStepReceipt,
+    DatasetSource, GradientCommitment, ModelArchitecture, NodeId, RoundDescriptor,
+    SessionId, TrainingParams, TrainingRoundConfig, TrainingStepReceipt,
 };
 
 // Re-export attestation types

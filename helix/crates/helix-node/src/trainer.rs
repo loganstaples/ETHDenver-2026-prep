@@ -10,10 +10,12 @@
 //!
 //! The model is a 2-layer MLP: `x → W1·x + b1 → ReLU → W2·h + b2 → output`.
 
+use helix_core::{CheckpointLayer, CheckpointTensor, ModelArchitecture, ModelCheckpoint};
 use helix_prover::halo2curves::bn256::Fr;
 use helix_prover::provers::training_prover_v2::TrainingProofResultV2;
 use helix_prover::{EvmProofBundle, MLTrainingProverV2, VkData};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 
 // ──────────────────────────────────────────────────────────────
 // Model representation (f64 for native computation)
@@ -112,6 +114,122 @@ impl MlpModel {
             h.update(v.to_le_bytes());
         }
         h.finalize().into()
+    }
+
+    /// Returns the `ModelArchitecture` descriptor for this model.
+    pub fn architecture(&self) -> ModelArchitecture {
+        ModelArchitecture {
+            d_in: self.d_in,
+            d_hid: self.d_hid,
+            d_out: self.d_out,
+            activation: "relu".to_string(),
+            num_layers: 1,
+        }
+    }
+
+    /// Serializes this model into a `ModelCheckpoint`.
+    pub fn to_checkpoint(&self, step_number: u64) -> ModelCheckpoint {
+        let fc1_weight = CheckpointTensor {
+            name: "weight".to_string(),
+            shape: vec![self.d_hid, self.d_in],
+            data: self.w1.iter().map(|&v| v as f32).collect(),
+        };
+        let fc1_bias = CheckpointTensor {
+            name: "bias".to_string(),
+            shape: vec![self.d_hid],
+            data: self.b1.iter().map(|&v| v as f32).collect(),
+        };
+        let fc2_weight = CheckpointTensor {
+            name: "weight".to_string(),
+            shape: vec![self.d_out, self.d_hid],
+            data: self.w2.iter().map(|&v| v as f32).collect(),
+        };
+        let fc2_bias = CheckpointTensor {
+            name: "bias".to_string(),
+            shape: vec![self.d_out],
+            data: self.b2.iter().map(|&v| v as f32).collect(),
+        };
+
+        let mut metadata = HashMap::new();
+        metadata.insert("d_in".to_string(), self.d_in.to_string());
+        metadata.insert("d_hid".to_string(), self.d_hid.to_string());
+        metadata.insert("d_out".to_string(), self.d_out.to_string());
+
+        ModelCheckpoint {
+            model_id: [0u8; 32],
+            step_number,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            weight_hash: self.commitment(),
+            layers: vec![
+                CheckpointLayer {
+                    name: "fc1".to_string(),
+                    tensors: vec![fc1_weight, fc1_bias],
+                },
+                CheckpointLayer {
+                    name: "fc2".to_string(),
+                    tensors: vec![fc2_weight, fc2_bias],
+                },
+            ],
+            error_state: None,
+            metadata,
+        }
+    }
+
+    /// Reconstructs an `MlpModel` from a `ModelCheckpoint`.
+    ///
+    /// Expects exactly 2 layers (fc1, fc2) with weight and bias tensors each.
+    pub fn from_checkpoint(checkpoint: &ModelCheckpoint) -> anyhow::Result<Self> {
+        if checkpoint.layers.len() != 2 {
+            anyhow::bail!(
+                "Expected 2 layers (fc1, fc2), got {}",
+                checkpoint.layers.len()
+            );
+        }
+
+        let fc1 = &checkpoint.layers[0];
+        let fc2 = &checkpoint.layers[1];
+
+        let fc1_weight = fc1.tensors.iter().find(|t| t.name == "weight")
+            .ok_or_else(|| anyhow::anyhow!("fc1 missing weight tensor"))?;
+        let fc1_bias = fc1.tensors.iter().find(|t| t.name == "bias")
+            .ok_or_else(|| anyhow::anyhow!("fc1 missing bias tensor"))?;
+        let fc2_weight = fc2.tensors.iter().find(|t| t.name == "weight")
+            .ok_or_else(|| anyhow::anyhow!("fc2 missing weight tensor"))?;
+        let fc2_bias = fc2.tensors.iter().find(|t| t.name == "bias")
+            .ok_or_else(|| anyhow::anyhow!("fc2 missing bias tensor"))?;
+
+        // Infer dimensions from tensor shapes
+        if fc1_weight.shape.len() != 2 {
+            anyhow::bail!("fc1 weight should be 2D, got {:?}", fc1_weight.shape);
+        }
+        let d_hid = fc1_weight.shape[0];
+        let d_in = fc1_weight.shape[1];
+
+        if fc2_weight.shape.len() != 2 {
+            anyhow::bail!("fc2 weight should be 2D, got {:?}", fc2_weight.shape);
+        }
+        let d_out = fc2_weight.shape[0];
+        let d_hid2 = fc2_weight.shape[1];
+
+        if d_hid != d_hid2 {
+            anyhow::bail!(
+                "Hidden dim mismatch: fc1 output={}, fc2 input={}",
+                d_hid, d_hid2
+            );
+        }
+
+        Ok(Self {
+            d_in,
+            d_hid,
+            d_out,
+            w1: fc1_weight.data.iter().map(|&v| v as f64).collect(),
+            b1: fc1_bias.data.iter().map(|&v| v as f64).collect(),
+            w2: fc2_weight.data.iter().map(|&v| v as f64).collect(),
+            b2: fc2_bias.data.iter().map(|&v| v as f64).collect(),
+        })
     }
 }
 
@@ -861,5 +979,81 @@ mod tests {
         assert!(r2.is_ok(), "step 2 failed: {:?}", r2.err());
         let r2 = r2.unwrap();
         eprintln!("Step 2: loss={:.6}, proof_len={}, verified={}", r2.loss, r2.proof_result.proof.len(), r2.proof_result.verified);
+    }
+
+    #[test]
+    fn test_checkpoint_roundtrip() {
+        let model = MlpModel::new(
+            3, 4, 2,
+            vec![0.1, 0.2, 0.3, -0.1, -0.2, -0.3, 0.4, 0.5, 0.6, -0.4, -0.5, -0.6],
+            vec![0.01, 0.02, 0.03, 0.04],
+            vec![0.5, -0.5, 0.3, -0.3, 0.1, -0.1, 0.2, -0.2],
+            vec![0.001, -0.001],
+        );
+
+        let ckpt = model.to_checkpoint(42);
+        assert_eq!(ckpt.step_number, 42);
+        assert_eq!(ckpt.layers.len(), 2);
+        assert_eq!(ckpt.layers[0].name, "fc1");
+        assert_eq!(ckpt.layers[1].name, "fc2");
+
+        let restored = MlpModel::from_checkpoint(&ckpt).unwrap();
+        assert_eq!(restored.d_in, 3);
+        assert_eq!(restored.d_hid, 4);
+        assert_eq!(restored.d_out, 2);
+
+        // f64→f32→f64 roundtrip has small precision loss
+        for (orig, rest) in model.w1.iter().zip(restored.w1.iter()) {
+            assert!((orig - rest).abs() < 1e-6, "w1 mismatch: {} vs {}", orig, rest);
+        }
+        for (orig, rest) in model.b1.iter().zip(restored.b1.iter()) {
+            assert!((orig - rest).abs() < 1e-6, "b1 mismatch: {} vs {}", orig, rest);
+        }
+    }
+
+    #[test]
+    fn test_checkpoint_bytes_roundtrip() {
+        let model = MlpModel::new(
+            2, 2, 1,
+            vec![0.001, 0.002, 0.003, 0.001],
+            vec![0.0, 0.0],
+            vec![0.001, 0.001],
+            vec![0.0],
+        );
+
+        let ckpt = model.to_checkpoint(0);
+        let bytes = ckpt.to_bytes().expect("to_bytes failed");
+        let ckpt2 = ModelCheckpoint::from_bytes(&bytes).expect("from_bytes failed");
+        let model2 = MlpModel::from_checkpoint(&ckpt2).unwrap();
+
+        assert_eq!(model2.d_in, 2);
+        assert_eq!(model2.d_hid, 2);
+        assert_eq!(model2.d_out, 1);
+        assert_eq!(model2.w1.len(), model.w1.len());
+    }
+
+    #[test]
+    fn test_checkpoint_bad_layers() {
+        let ckpt = ModelCheckpoint {
+            model_id: [0u8; 32],
+            step_number: 0,
+            timestamp: 0,
+            weight_hash: [0u8; 32],
+            layers: vec![], // empty
+            error_state: None,
+            metadata: HashMap::new(),
+        };
+        assert!(MlpModel::from_checkpoint(&ckpt).is_err());
+    }
+
+    #[test]
+    fn test_architecture() {
+        let model = MlpModel::new_random(3, 5, 2, 42);
+        let arch = model.architecture();
+        assert_eq!(arch.d_in, 3);
+        assert_eq!(arch.d_hid, 5);
+        assert_eq!(arch.d_out, 2);
+        assert_eq!(arch.activation, "relu");
+        assert_eq!(arch.num_layers, 1);
     }
 }

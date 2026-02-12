@@ -11,7 +11,8 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
+use helix_core::DatasetSource;
 use helix_node::trainer::{MlpModel, Trainer};
 use helix_prover::EvmProofBundle;
 
@@ -53,6 +54,77 @@ pub fn make_dataset() -> Vec<(Vec<f64>, Vec<f64>)> {
         (vec![0.003, 0.002], vec![0.005]),
         (vec![0.002, 0.003], vec![0.005]),
     ]
+}
+
+/// Loads a dataset from a `DatasetSource`.
+///
+/// - `Builtin` → returns the hardcoded synthetic regression dataset
+/// - `LocalCsv` → reads the CSV file and extracts feature/label columns
+/// - `Ipfs`/`Http` → not implemented in the demo binary
+pub fn load_dataset(source: &DatasetSource) -> Result<Vec<(Vec<f64>, Vec<f64>)>> {
+    match source {
+        DatasetSource::Builtin => Ok(make_dataset()),
+        DatasetSource::LocalCsv { path, feature_columns, label_columns } => {
+            load_csv_dataset(path, feature_columns, label_columns)
+        }
+        DatasetSource::Ipfs { cid } => {
+            bail!("IPFS dataset loading not implemented in demo (CID: {})", cid)
+        }
+        DatasetSource::Http { url } => {
+            bail!("HTTP dataset loading not implemented in demo (URL: {})", url)
+        }
+    }
+}
+
+/// Loads a CSV file as a dataset of (features, labels) pairs.
+fn load_csv_dataset(
+    path: &str,
+    feature_columns: &[usize],
+    label_columns: &[usize],
+) -> Result<Vec<(Vec<f64>, Vec<f64>)>> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("Failed to read CSV file '{}': {}", path, e))?;
+
+    let mut dataset = Vec::new();
+
+    for (line_num, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        // Skip header row if it contains non-numeric values
+        if line_num == 0 {
+            let first_field = line.split(',').next().unwrap_or("").trim();
+            if first_field.parse::<f64>().is_err() {
+                continue; // skip header
+            }
+        }
+
+        let values: Vec<f64> = line
+            .split(',')
+            .map(|s| s.trim().parse::<f64>())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| anyhow::anyhow!("CSV parse error at line {}: {}", line_num + 1, e))?;
+
+        let max_col = feature_columns.iter().chain(label_columns.iter()).max().copied().unwrap_or(0);
+        if values.len() <= max_col {
+            bail!(
+                "CSV line {} has {} columns, but column index {} was requested",
+                line_num + 1, values.len(), max_col
+            );
+        }
+
+        let features: Vec<f64> = feature_columns.iter().map(|&c| values[c]).collect();
+        let labels: Vec<f64> = label_columns.iter().map(|&c| values[c]).collect();
+        dataset.push((features, labels));
+    }
+
+    if dataset.is_empty() {
+        bail!("CSV file '{}' produced no data rows", path);
+    }
+
+    Ok(dataset)
 }
 
 /// Creates an initial model with small weights for circuit compatibility (public).

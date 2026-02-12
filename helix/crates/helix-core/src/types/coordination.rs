@@ -238,6 +238,106 @@ impl TrainingStepReceipt {
     }
 }
 
+// ──────────────────────────────────────────────────────────────
+// Model architecture and training round configuration
+// ──────────────────────────────────────────────────────────────
+
+/// Describes a model's architecture (layer dimensions, activation, depth).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelArchitecture {
+    /// Input feature dimension.
+    pub d_in: usize,
+    /// Hidden layer dimension.
+    pub d_hid: usize,
+    /// Output dimension.
+    pub d_out: usize,
+    /// Activation function name (e.g., "relu", "gelu").
+    pub activation: String,
+    /// Number of hidden layers.
+    pub num_layers: usize,
+}
+
+impl Default for ModelArchitecture {
+    fn default() -> Self {
+        Self {
+            d_in: 2,
+            d_hid: 2,
+            d_out: 1,
+            activation: "relu".to_string(),
+            num_layers: 1,
+        }
+    }
+}
+
+impl ModelArchitecture {
+    /// Computes a deterministic SHA-256 hash of this architecture configuration.
+    pub fn config_hash(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(self.d_in.to_le_bytes());
+        hasher.update(self.d_hid.to_le_bytes());
+        hasher.update(self.d_out.to_le_bytes());
+        hasher.update(self.activation.as_bytes());
+        hasher.update(self.num_layers.to_le_bytes());
+        let result = hasher.finalize();
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&result);
+        hash
+    }
+}
+
+/// Source of training data for a training round.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum DatasetSource {
+    /// Built-in synthetic dataset (default for demos).
+    Builtin,
+    /// Local CSV file with specified feature and label columns.
+    LocalCsv {
+        path: String,
+        feature_columns: Vec<usize>,
+        label_columns: Vec<usize>,
+    },
+    /// IPFS-hosted dataset identified by CID.
+    Ipfs { cid: String },
+    /// HTTP-hosted dataset.
+    Http { url: String },
+}
+
+impl Default for DatasetSource {
+    fn default() -> Self {
+        Self::Builtin
+    }
+}
+
+/// Full configuration for a training round.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrainingRoundConfig {
+    /// Model architecture.
+    pub architecture: ModelArchitecture,
+    /// Dataset source.
+    pub dataset: DatasetSource,
+    /// Learning rate for SGD.
+    pub learning_rate: f64,
+    /// Batch size per step.
+    pub batch_size: usize,
+    /// IPFS CID of the serialized model (populated after upload).
+    pub model_ipfs_cid: Option<String>,
+    /// SHA-256 commitment of initial model weights.
+    pub initial_commitment: [u8; 32],
+}
+
+impl Default for TrainingRoundConfig {
+    fn default() -> Self {
+        Self {
+            architecture: ModelArchitecture::default(),
+            dataset: DatasetSource::default(),
+            learning_rate: 0.01,
+            batch_size: 32,
+            model_ipfs_cid: None,
+            initial_commitment: [0u8; 32],
+        }
+    }
+}
+
 /// Encodes bytes as lowercase hex string.
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
@@ -373,5 +473,95 @@ mod tests {
         let params = TrainingParams::default();
         assert!((params.learning_rate - 0.001).abs() < 1e-15);
         assert_eq!(params.batch_size, 32);
+    }
+
+    #[test]
+    fn test_model_architecture_default() {
+        let arch = ModelArchitecture::default();
+        assert_eq!(arch.d_in, 2);
+        assert_eq!(arch.d_hid, 2);
+        assert_eq!(arch.d_out, 1);
+        assert_eq!(arch.activation, "relu");
+        assert_eq!(arch.num_layers, 1);
+    }
+
+    #[test]
+    fn test_model_architecture_config_hash_deterministic() {
+        let arch = ModelArchitecture::default();
+        let h1 = arch.config_hash();
+        let h2 = arch.config_hash();
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn test_model_architecture_config_hash_changes() {
+        let a = ModelArchitecture::default();
+        let b = ModelArchitecture { d_hid: 4, ..a.clone() };
+        assert_ne!(a.config_hash(), b.config_hash());
+    }
+
+    #[test]
+    fn test_model_architecture_serde_roundtrip() {
+        let arch = ModelArchitecture {
+            d_in: 10,
+            d_hid: 64,
+            d_out: 3,
+            activation: "gelu".to_string(),
+            num_layers: 4,
+        };
+        let json = serde_json::to_string(&arch).unwrap();
+        let arch2: ModelArchitecture = serde_json::from_str(&json).unwrap();
+        assert_eq!(arch, arch2);
+    }
+
+    #[test]
+    fn test_dataset_source_default() {
+        let ds = DatasetSource::default();
+        assert_eq!(ds, DatasetSource::Builtin);
+    }
+
+    #[test]
+    fn test_dataset_source_serde_roundtrip() {
+        let sources = vec![
+            DatasetSource::Builtin,
+            DatasetSource::LocalCsv {
+                path: "/data/train.csv".to_string(),
+                feature_columns: vec![0, 1],
+                label_columns: vec![2],
+            },
+            DatasetSource::Ipfs { cid: "QmTest123".to_string() },
+            DatasetSource::Http { url: "https://example.com/data.csv".to_string() },
+        ];
+        for src in &sources {
+            let json = serde_json::to_string(src).unwrap();
+            let src2: DatasetSource = serde_json::from_str(&json).unwrap();
+            assert_eq!(src, &src2);
+        }
+    }
+
+    #[test]
+    fn test_training_round_config_default() {
+        let cfg = TrainingRoundConfig::default();
+        assert_eq!(cfg.architecture, ModelArchitecture::default());
+        assert_eq!(cfg.dataset, DatasetSource::Builtin);
+        assert!((cfg.learning_rate - 0.01).abs() < 1e-15);
+        assert_eq!(cfg.batch_size, 32);
+        assert!(cfg.model_ipfs_cid.is_none());
+        assert_eq!(cfg.initial_commitment, [0u8; 32]);
+    }
+
+    #[test]
+    fn test_training_round_config_serde_roundtrip() {
+        let cfg = TrainingRoundConfig {
+            architecture: ModelArchitecture { d_in: 5, d_hid: 10, d_out: 2, activation: "relu".into(), num_layers: 2 },
+            dataset: DatasetSource::LocalCsv { path: "train.csv".into(), feature_columns: vec![0, 1, 2], label_columns: vec![3] },
+            learning_rate: 0.005,
+            batch_size: 16,
+            model_ipfs_cid: Some("QmFoo".to_string()),
+            initial_commitment: [42u8; 32],
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let cfg2: TrainingRoundConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg, cfg2);
     }
 }

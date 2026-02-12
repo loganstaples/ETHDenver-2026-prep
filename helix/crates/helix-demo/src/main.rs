@@ -24,6 +24,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::Parser;
+use helix_core::{DatasetSource, ModelArchitecture};
 use helix_prover::provers::training_prover_v2::MLTrainingProverV2;
 use tracing_subscriber::EnvFilter;
 
@@ -82,6 +83,64 @@ struct Args {
     /// Path to benchmark baseline for regression detection
     #[arg(long)]
     bench_baseline: Option<PathBuf>,
+
+    /// Dataset source: "builtin" or path to a CSV file
+    #[arg(long, default_value = "builtin")]
+    dataset: String,
+
+    /// Feature column indices (comma-separated, for CSV datasets)
+    #[arg(long, default_value = "0,1")]
+    feature_cols: String,
+
+    /// Label column indices (comma-separated, for CSV datasets)
+    #[arg(long, default_value = "2")]
+    label_cols: String,
+
+    /// Path to model architecture config (JSON file)
+    #[arg(long)]
+    model_config: Option<PathBuf>,
+}
+
+/// Parses CLI dataset args into a `DatasetSource`.
+fn parse_dataset_source(args: &Args) -> DatasetSource {
+    if args.dataset == "builtin" {
+        DatasetSource::Builtin
+    } else {
+        let feature_columns: Vec<usize> = args
+            .feature_cols
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+        let label_columns: Vec<usize> = args
+            .label_cols
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+        DatasetSource::LocalCsv {
+            path: args.dataset.clone(),
+            feature_columns,
+            label_columns,
+        }
+    }
+}
+
+/// Loads model architecture from JSON file or returns default from CLI args.
+fn load_model_config(args: &Args) -> anyhow::Result<ModelArchitecture> {
+    if let Some(ref path) = args.model_config {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("Failed to read model config '{}': {}", path.display(), e))?;
+        let arch: ModelArchitecture = serde_json::from_str(&content)
+            .map_err(|e| anyhow::anyhow!("Failed to parse model config: {}", e))?;
+        Ok(arch)
+    } else {
+        Ok(ModelArchitecture {
+            d_in: 2,
+            d_hid: args.d_hid,
+            d_out: 1,
+            activation: "relu".to_string(),
+            num_layers: 1,
+        })
+    }
 }
 
 #[tokio::main]
@@ -113,10 +172,14 @@ async fn main() -> anyhow::Result<()> {
         srs_start.elapsed().as_secs_f64()
     ));
 
+    // Parse dataset source and model architecture from CLI args
+    let dataset_source = parse_dataset_source(&args);
+    let arch = load_model_config(&args)?;
+
     // ── Phase 1b: Extract VK for on-chain deployment ─────────────────────
     let vk_data = if !args.offline {
         display::info("Initializing prover to extract VK for on-chain verifier...");
-        let prover = MLTrainingProverV2::new(2, args.d_hid, 1);
+        let prover = MLTrainingProverV2::new(arch.d_in, arch.d_hid, arch.d_out);
         let vk = prover.export_vk_data()
             .map_err(|e| anyhow::anyhow!("Failed to export VK data: {}", e))?;
         display::success(&format!(
@@ -145,9 +208,13 @@ async fn main() -> anyhow::Result<()> {
             display::short_addr(&env.coordinator_addr)
         ));
 
-        // Register model
-        let model_id = chain::register_model(&env).await?;
-        display::success(&format!("Model registered (ID: {})", model_id));
+        // Register model with real serialized weights and IPFS CID
+        let init_model = worker::create_small_model_pub(arch.d_in, arch.d_hid, arch.d_out, args.seed);
+        let ckpt_bytes = init_model.to_checkpoint(0).to_bytes()
+            .map_err(|e| anyhow::anyhow!("Failed to serialize model checkpoint: {}", e))?;
+        let initial_commitment = init_model.commitment();
+        let (model_id, cid) = chain::register_model_with_weights(&env, &ckpt_bytes, initial_commitment).await?;
+        display::success(&format!("Model registered (ID: {}, CID: {})", model_id, cid));
 
         // Stake for workers
         chain::stake_for_workers(&env, model_id, args.workers).await?;
@@ -172,22 +239,28 @@ async fn main() -> anyhow::Result<()> {
         3,
         "DISTRIBUTED TRAINING",
         &format!(
-            "{} workers x {} steps (lr={}, d_hid={})",
-            args.workers, args.steps, args.lr, args.d_hid
+            "{} workers x {} steps (lr={}, arch={}x{}x{})",
+            args.workers, args.steps, args.lr, arch.d_in, arch.d_hid, arch.d_out
         ),
     );
 
-    let dataset = worker::make_dataset();
+    let dataset = worker::load_dataset(&dataset_source)?;
+    let dataset_desc = match &dataset_source {
+        DatasetSource::Builtin => "builtin (y = x1 + x2 regression)".to_string(),
+        DatasetSource::LocalCsv { path, .. } => format!("CSV: {}", path),
+        DatasetSource::Ipfs { cid } => format!("IPFS: {}", cid),
+        DatasetSource::Http { url } => format!("HTTP: {}", url),
+    };
     display::info(&format!(
-        "Dataset: {} samples (y = x1 + x2 regression)",
-        dataset.len()
+        "Dataset: {} samples ({})",
+        dataset.len(), dataset_desc
     ));
 
     // Run workers
     let worker_results = worker::run_workers(
         args.workers,
         args.steps,
-        args.d_hid,
+        arch.d_hid,
         args.lr,
         args.seed,
         &dataset,
@@ -300,7 +373,7 @@ async fn main() -> anyhow::Result<()> {
 
         match mpc::run_mpc_training(
             args.mpc_parties,
-            args.d_hid,
+            arch.d_hid,
             args.lr,
             args.seed,
             &dataset,
@@ -394,7 +467,7 @@ async fn main() -> anyhow::Result<()> {
             "PERFORMANCE BENCHMARK",
             "Comprehensive ZK overhead analysis with regression detection",
         );
-        let mut bench_result = bench::run_overhead_benchmark(args.d_hid, &dataset)?;
+        let mut bench_result = bench::run_overhead_benchmark(arch.d_hid, &dataset)?;
 
         // Add gas costs from on-chain submissions
         if !gas_costs.is_empty() {

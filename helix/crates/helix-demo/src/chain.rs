@@ -196,7 +196,8 @@ pub async fn setup_chain(vk_data: &VkData) -> Result<ChainEnv> {
     })
 }
 
-/// Registers a model on-chain and returns the model ID.
+/// Registers a model on-chain with a placeholder URI. Returns the model ID.
+#[allow(dead_code)]
 pub async fn register_model(env: &ChainEnv) -> Result<U256> {
     let next_id: u32 = env
         .coordinator
@@ -226,6 +227,55 @@ pub async fn register_model(env: &ChainEnv) -> Result<U256> {
         .context("registerModel receipt missing")?;
 
     Ok(model_id)
+}
+
+/// Registers a model on-chain with real serialized weights.
+///
+/// Uploads the model bytes to local IPFS storage, gets a real CID,
+/// and registers with `ipfs://{cid}` as the model URI.
+/// Returns `(model_id, cid)`.
+pub async fn register_model_with_weights(
+    env: &ChainEnv,
+    model_bytes: &[u8],
+    initial_commitment: [u8; 32],
+) -> Result<(U256, String)> {
+    use helix_core::data::sources::ipfs::{IpfsDataSource, IpfsSourceConfig};
+
+    // Upload to local IPFS storage and get a real CID
+    let mut ipfs = IpfsDataSource::new(IpfsSourceConfig::default());
+    let cid = ipfs.upload_local(model_bytes.to_vec());
+
+    let next_id: u32 = env
+        .coordinator
+        .method::<_, u32>("nextModelId", ())
+        .context("nextModelId method")?
+        .call()
+        .await
+        .context("nextModelId call failed")?;
+    let model_id = U256::from(next_id);
+
+    // Convert commitment to U256 (take first 32 bytes as big-endian)
+    let commitment = U256::from_big_endian(&initial_commitment);
+
+    let _receipt: TransactionReceipt = env
+        .coordinator
+        .method::<_, ()>(
+            "registerModel",
+            (
+                format!("ipfs://{}", cid),
+                commitment,
+                U256::zero(),
+            ),
+        )
+        .context("registerModel method")?
+        .send()
+        .await
+        .context("registerModel send failed")?
+        .await
+        .context("registerModel confirm failed")?
+        .context("registerModel receipt missing")?;
+
+    Ok((model_id, cid))
 }
 
 /// Stakes ETH for workers.

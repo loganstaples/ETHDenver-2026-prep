@@ -68,8 +68,9 @@ pub use data::{DataLoader, InMemoryDataLoader, ShardedDataLoader};
 
 // Coordination types for distributed training
 pub use types::{
-    AttestationChain, GradientCommitment, NodeId, RoundDescriptor, SessionId,
-    TrainingAttestation, TrainingParams, TrainingStepReceipt,
+    AttestationChain, DatasetSource, GradientCommitment, ModelArchitecture, NodeId,
+    RoundDescriptor, SessionId, TrainingAttestation, TrainingParams, TrainingRoundConfig,
+    TrainingStepReceipt,
 };
 
 // Training session orchestration

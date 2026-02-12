@@ -390,6 +390,20 @@ impl IpfsDataSource {
         cid.0
     }
 
+    /// Uploads data to local in-memory storage and returns the CID.
+    ///
+    /// This is a convenience method for demo/test scenarios where no real
+    /// IPFS node is available. The data is stored in the `storage` HashMap
+    /// and can be retrieved with `fetch_local`.
+    pub fn upload_local(&mut self, data: Vec<u8>) -> String {
+        self.store_and_get_cid(data)
+    }
+
+    /// Retrieves data from local in-memory storage by CID.
+    pub fn fetch_local(&self, cid: &str) -> Option<Vec<u8>> {
+        self.storage.get(cid).cloned()
+    }
+
     /// Stores chunked content for large files.
     pub fn store_chunked(&mut self, data: &[u8], chunk_size: usize) -> ChunkedContent {
         let total_size = data.len() as u64;
