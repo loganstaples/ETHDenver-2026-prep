@@ -15,6 +15,9 @@ pub mod assertions;
 #[cfg(feature = "on-chain")]
 pub mod anvil;
 
+#[cfg(feature = "integration")]
+pub mod e2e;
+
 pub use fixtures::*;
 pub use harness::*;
 pub use mocks::*;

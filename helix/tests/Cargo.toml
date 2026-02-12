@@ -170,12 +170,47 @@ required-features = ["on-chain"]
 name = "rpc_alignment"
 path = "integration/rpc_alignment.rs"
 
+# ============================================================================
+# E2E Integration Tests (Stage 10)
+# ============================================================================
+
+[[test]]
+name = "e2e_full_round"
+path = "integration/e2e_full_round.rs"
+required-features = ["integration"]
+
+[[test]]
+name = "e2e_mpc_training"
+path = "integration/e2e_mpc_training.rs"
+required-features = ["integration"]
+
+[[test]]
+name = "e2e_byzantine"
+path = "integration/e2e_byzantine.rs"
+required-features = ["integration"]
+
+[[test]]
+name = "e2e_multi_round"
+path = "integration/e2e_multi_round.rs"
+required-features = ["integration"]
+
+[[test]]
+name = "e2e_client_sdk"
+path = "integration/e2e_client_sdk.rs"
+required-features = ["integration"]
+
+[[test]]
+name = "e2e_failure_recovery"
+path = "integration/e2e_failure_recovery.rs"
+required-features = ["integration"]
+
 [features]
 default = []
 parallel = ["rayon"]
 metal = ["helix-prover/metal"]
 on-chain = ["ethers", "hex"]
 full-pipeline = ["on-chain"]
+integration = ["on-chain"]
 
 [dependencies.rayon]
 version = "1.10"
