@@ -954,7 +954,8 @@ mod full_pipeline_extended {
         // lr=0: multi-step batch proving with lr=1 causes weight explosion beyond
         // the ReLU lookup range (±128). Field arithmetic has no fractional lr.
         // This tests batch infrastructure (proof count, chain, verification).
-        let batch_result = prover.prove_batch(training_weights, &samples, Fr::zero());
+        let batch_result = prover.prove_batch(training_weights, &samples, Fr::zero())
+            .expect("Batch proving should succeed");
 
         // Batch prover MUST return proofs — assert instead of skipping
         assert!(
@@ -1171,7 +1172,8 @@ mod full_pipeline_extended {
         let start = Instant::now();
         // lr=0: multi-step batch proving with lr=1 causes weight explosion beyond
         // the ReLU lookup range (±128). Field arithmetic has no fractional lr.
-        let batch_result = prover.prove_batch(training_weights, &samples, Fr::zero());
+        let batch_result = prover.prove_batch(training_weights, &samples, Fr::zero())
+            .expect("Batch proving should succeed");
         let total_time = start.elapsed();
 
         // Batch prover MUST return proofs — assert instead of skipping
@@ -1309,7 +1311,8 @@ mod full_pipeline_extended {
         let samples = dataset.to_tuples();
         let training_weights = weights.to_training_weights();
         // lr=0: prevents weight explosion beyond ReLU lookup range in multi-step
-        let batch_result = batch_prover.prove_batch(training_weights, &samples, Fr::zero());
+        let batch_result = batch_prover.prove_batch(training_weights, &samples, Fr::zero())
+            .expect("Batch proving should succeed");
 
         // Batch prover must return proofs
         if batch_result.proofs.is_empty() {
@@ -1383,10 +1386,12 @@ mod full_pipeline_extended {
 
         // Generate batch proofs twice with the same inputs
         let prover1 = BatchTrainingProverV2::new(dims.d_in, dims.d_hid, dims.d_out);
-        let result1 = prover1.prove_batch(weights.to_training_weights(), &samples, Fr::from(1u64));
+        let result1 = prover1.prove_batch(weights.to_training_weights(), &samples, Fr::from(1u64))
+            .expect("Batch proving should succeed (run 1)");
 
         let prover2 = BatchTrainingProverV2::new(dims.d_in, dims.d_hid, dims.d_out);
-        let result2 = prover2.prove_batch(weights.to_training_weights(), &samples, Fr::from(1u64));
+        let result2 = prover2.prove_batch(weights.to_training_weights(), &samples, Fr::from(1u64))
+            .expect("Batch proving should succeed (run 2)");
 
         // Both runs must produce proofs
         assert!(
@@ -1505,14 +1510,17 @@ mod full_pipeline_extended {
         }));
 
         match result {
-            Ok(batch_result) => {
-                // If it didn't panic, the batch should report failure
+            Ok(Ok(batch_result)) => {
+                // If it didn't panic and returned Ok, the batch should report failure
                 assert!(
                     batch_result.proofs.is_empty() || !batch_result.failed_steps.is_empty(),
                     "Dimension-mismatched witness should fail: got {} proofs, {} failures",
                     batch_result.proofs.len(),
                     batch_result.failed_steps.len()
                 );
+            }
+            Ok(Err(_)) => {
+                // Returning an error is the expected behavior for invalid dimensions
             }
             Err(_) => {
                 // Panicking is acceptable for invalid input dimensions
@@ -1610,14 +1618,22 @@ mod full_pipeline_extended {
 
         let batch_result = prover.prove_batch(training_weights, &empty_samples, Fr::from(1u64));
 
-        assert!(
-            batch_result.proofs.is_empty(),
-            "Empty dataset should produce 0 proofs"
-        );
-        assert!(
-            batch_result.failed_steps.is_empty(),
-            "Empty dataset should have no failed steps"
-        );
+        // Empty dataset may return Err or Ok with empty proofs
+        match batch_result {
+            Ok(result) => {
+                assert!(
+                    result.proofs.is_empty(),
+                    "Empty dataset should produce 0 proofs"
+                );
+                assert!(
+                    result.failed_steps.is_empty(),
+                    "Empty dataset should have no failed steps"
+                );
+            }
+            Err(_) => {
+                // Returning an error for empty input is also acceptable behavior
+            }
+        }
     }
 }
 
@@ -1772,10 +1788,6 @@ mod distributed_pipeline {
         let lo = fr_to_u256(&hash.0);
         let hi = fr_to_u256(&hash.1);
         compute_hash_pair(lo, hi)
-    }
-
-    fn get_s_g2() -> [U256; 4] {
-        extract_s_g2_from_prover(get_prover())
     }
 
     // ────────────────────────────────────────────────────────

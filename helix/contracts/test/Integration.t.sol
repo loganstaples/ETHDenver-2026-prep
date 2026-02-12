@@ -54,7 +54,7 @@ contract IntegrationTest is Test {
         attacker = makeAddr("attacker");
 
         // Deploy core contracts
-        verifier = new Halo2Verifier(Halo2VKDefaults.g2Generator());
+        verifier = new Halo2Verifier();
         mockVerifier = new MockVerifier();
         coordinator = new HelixCoordinatorV2(address(mockVerifier), treasury);
         trainingRound = new TrainingRound();

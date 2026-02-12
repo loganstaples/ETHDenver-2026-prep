@@ -1663,10 +1663,11 @@ mod tests {
                 strategy::SingleStrategy,
             },
             transcript::{
-                Blake2bRead, Blake2bWrite, Challenge255,
+                Challenge255,
                 TranscriptReadBuffer, TranscriptWriterBuffer,
             },
         };
+        use halo2_backend::transcript::{Keccak256Read, Keccak256Write};
         use halo2curves::bn256::{Bn256, G1Affine};
         use rand_core::OsRng;
 
@@ -1700,7 +1701,7 @@ mod tests {
 
         // Prove
         let instances = vec![pi.clone()];
-        let mut transcript = Blake2bWrite::<Vec<u8>, G1Affine, Challenge255<_>>::init(vec![]);
+        let mut transcript = Keccak256Write::<Vec<u8>, G1Affine, Challenge255<_>>::init(vec![]);
 
         create_proof::<
             KZGCommitmentScheme<Bn256>,
@@ -1724,7 +1725,7 @@ mod tests {
 
         // Verify
         let mut verifier_transcript =
-            Blake2bRead::<_, G1Affine, Challenge255<_>>::init(proof.as_slice());
+            Keccak256Read::<_, G1Affine, Challenge255<_>>::init(proof.as_slice());
         let verifier_params = params.verifier_params();
         let verified = verify_proof_multi::<
             KZGCommitmentScheme<Bn256>,
@@ -1994,10 +1995,11 @@ mod tests {
                 strategy::SingleStrategy,
             },
             transcript::{
-                Blake2bRead, Blake2bWrite, Challenge255,
+                Challenge255,
                 TranscriptReadBuffer, TranscriptWriterBuffer,
             },
         };
+        use halo2_backend::transcript::{Keccak256Read, Keccak256Write};
         use halo2curves::bn256::{Bn256, G1Affine};
         use rand_core::OsRng;
 
@@ -2019,7 +2021,7 @@ mod tests {
         let pk = keygen_pk(&params, vk.clone(), &circuit).expect("keygen_pk failed");
 
         let instances = vec![pi.clone()];
-        let mut transcript = Blake2bWrite::<Vec<u8>, G1Affine, Challenge255<_>>::init(vec![]);
+        let mut transcript = Keccak256Write::<Vec<u8>, G1Affine, Challenge255<_>>::init(vec![]);
 
         create_proof::<
             KZGCommitmentScheme<Bn256>,
@@ -2033,7 +2035,7 @@ mod tests {
         let proof = transcript.finalize();
         assert!(!proof.is_empty());
 
-        let mut vt = Blake2bRead::<_, G1Affine, Challenge255<_>>::init(proof.as_slice());
+        let mut vt = Keccak256Read::<_, G1Affine, Challenge255<_>>::init(proof.as_slice());
         let vp = params.verifier_params();
         let verified = verify_proof_multi::<
             KZGCommitmentScheme<Bn256>,
@@ -2055,10 +2057,11 @@ mod tests {
                 strategy::SingleStrategy,
             },
             transcript::{
-                Blake2bRead, Blake2bWrite, Challenge255,
+                Challenge255,
                 TranscriptReadBuffer, TranscriptWriterBuffer,
             },
         };
+        use halo2_backend::transcript::{Keccak256Read, Keccak256Write};
         use halo2curves::bn256::{Bn256, G1Affine};
         use rand_core::OsRng;
 
@@ -2086,7 +2089,7 @@ mod tests {
 
         // Prove
         let instances = vec![pi.clone()];
-        let mut transcript = Blake2bWrite::<Vec<u8>, G1Affine, Challenge255<_>>::init(vec![]);
+        let mut transcript = Keccak256Write::<Vec<u8>, G1Affine, Challenge255<_>>::init(vec![]);
 
         create_proof::<
             KZGCommitmentScheme<Bn256>,
@@ -2110,7 +2113,7 @@ mod tests {
 
         // Verify
         let mut verifier_transcript =
-            Blake2bRead::<_, G1Affine, Challenge255<_>>::init(proof.as_slice());
+            Keccak256Read::<_, G1Affine, Challenge255<_>>::init(proof.as_slice());
         let verifier_params = params.verifier_params();
         let verified = verify_proof_multi::<
             KZGCommitmentScheme<Bn256>,

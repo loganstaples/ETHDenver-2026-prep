@@ -13,12 +13,10 @@ import "../src/token/Rewards.sol";
 /// @title DeployScript
 /// @notice Deploys the HELIX verification infrastructure to Anvil/testnet
 /// @dev Usage:
-///   V2 Default (G2 generator):  forge script script/Deploy.s.sol --broadcast
-///   V2 With real VK:            forge script script/Deploy.s.sol --sig "runWithVK()" --broadcast
-///   V2 With mock verifier:      forge script script/Deploy.s.sol --sig "runWithMock()" --broadcast
-///   V3 Full stack:              forge script script/Deploy.s.sol --sig "deployV3()" --broadcast
-///   V3 With real VK:            forge script script/Deploy.s.sol --sig "deployV3WithVK()" --broadcast
-///   V3 With mock:               forge script script/Deploy.s.sol --sig "deployV3WithMock()" --broadcast
+///   V2 Default:                  forge script script/Deploy.s.sol --broadcast
+///   V2 With mock verifier:       forge script script/Deploy.s.sol --sig "runWithMock()" --broadcast
+///   V3 Full stack:               forge script script/Deploy.s.sol --sig "deployV3()" --broadcast
+///   V3 With mock:                forge script script/Deploy.s.sol --sig "deployV3WithMock()" --broadcast
 contract DeployScript is Script {
     // Deployed contract addresses (set after deployment)
     address public verifier;
@@ -29,36 +27,19 @@ contract DeployScript is Script {
     address public rewardsAddr;
     address public registryAddr;
 
-    // ============ V2 Deployment (Legacy) ============
+    // ============ V2 Deployment ============
 
-    /// @notice Deploy V2 with default SRS (G2 generator, s=1)
-    /// @dev Trivial SRS (s=1) allows proof forgery. Requires ALLOW_TRIVIAL_SRS=true env var.
-    ///      For production, use runWithVK() with real SRS parameters.
+    /// @notice Deploy V2 with real PSE-generated Halo2Verifier
+    /// @dev VK is embedded in the Halo2VerifyingKey contract (circuit-specific).
+    ///      To update the VK, regenerate Halo2VerifierCore.sol and Halo2VerifyingKey.sol
+    ///      from the Rust pipeline and redeploy.
     function run() public returns (address, address) {
-        bool allowTrivial = vm.envOr("ALLOW_TRIVIAL_SRS", false);
-        require(allowTrivial, "Trivial SRS deployment blocked. Set ALLOW_TRIVIAL_SRS=true or use runWithVK()");
-        console.log("NOTICE: Deploying with trivial SRS (s=1). Proofs are forgeable.");
-        return deployWithVK(Halo2VKDefaults.g2Generator());
-    }
-
-    /// @notice Deploy V2 with VK parameters from environment variables
-    function runWithVK() public returns (address, address) {
-        uint256[4] memory sG2;
-        sG2[0] = vm.envUint("VK_S_G2_X0");
-        sG2[1] = vm.envUint("VK_S_G2_X1");
-        sG2[2] = vm.envUint("VK_S_G2_Y0");
-        sG2[3] = vm.envUint("VK_S_G2_Y1");
-        return deployWithVK(sG2);
-    }
-
-    /// @notice Deploy V2 with explicit VK parameters
-    function deployWithVK(uint256[4] memory sG2) public returns (address, address) {
         uint256 deployerPrivateKey = vm.envOr("PRIVATE_KEY", uint256(0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80));
         treasury = vm.envOr("TREASURY", vm.addr(deployerPrivateKey));
 
         vm.startBroadcast(deployerPrivateKey);
 
-        Halo2Verifier halo2Verifier = new Halo2Verifier(sG2);
+        Halo2Verifier halo2Verifier = new Halo2Verifier();
         verifier = address(halo2Verifier);
 
         HelixCoordinatorV2 helixCoordinator = new HelixCoordinatorV2(verifier, treasury);
@@ -68,10 +49,8 @@ contract DeployScript is Script {
 
         console.log("=== HELIX V2 Deployment Complete ===");
         console.log("Halo2Verifier:", verifier);
-        console.log("  VK_S_G2_X0:", sG2[0]);
-        console.log("  VK_S_G2_X1:", sG2[1]);
-        console.log("  VK_S_G2_Y0:", sG2[2]);
-        console.log("  VK_S_G2_Y1:", sG2[3]);
+        console.log("  Core:", address(halo2Verifier.core()));
+        console.log("  VK:", halo2Verifier.vk());
         console.log("HelixCoordinatorV2:", coordinator);
         console.log("Treasury:", treasury);
         console.log("====================================");
@@ -104,24 +83,56 @@ contract DeployScript is Script {
 
     // ============ V3 Full Stack Deployment ============
 
-    /// @notice Deploy V3 full stack with default SRS (G2 generator, s=1)
-    /// @dev Trivial SRS (s=1) allows proof forgery. Requires ALLOW_TRIVIAL_SRS=true env var.
-    ///      For production, use deployV3WithVK() with real SRS parameters.
+    /// @notice Deploy V3 full stack with real PSE-generated Halo2Verifier
     function deployV3() public {
-        bool allowTrivial = vm.envOr("ALLOW_TRIVIAL_SRS", false);
-        require(allowTrivial, "Trivial SRS deployment blocked. Set ALLOW_TRIVIAL_SRS=true or use deployV3WithVK()");
-        console.log("NOTICE: Deploying V3 with trivial SRS (s=1). Proofs are forgeable.");
-        _deployV3Stack(Halo2VKDefaults.g2Generator());
-    }
+        uint256 deployerPrivateKey = vm.envOr("PRIVATE_KEY", uint256(0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80));
+        address deployer = vm.addr(deployerPrivateKey);
+        treasury = vm.envOr("TREASURY", deployer);
 
-    /// @notice Deploy V3 full stack with real VK from environment variables
-    function deployV3WithVK() public {
-        uint256[4] memory sG2;
-        sG2[0] = vm.envUint("VK_S_G2_X0");
-        sG2[1] = vm.envUint("VK_S_G2_X1");
-        sG2[2] = vm.envUint("VK_S_G2_Y0");
-        sG2[3] = vm.envUint("VK_S_G2_Y1");
-        _deployV3Stack(sG2);
+        vm.startBroadcast(deployerPrivateKey);
+
+        // 1. Deploy HelixToken
+        HelixToken token = new HelixToken(treasury);
+        helixToken = address(token);
+
+        // 2. Deploy Halo2Verifier (deploys core verifier + VK internally)
+        Halo2Verifier halo2Verifier = new Halo2Verifier();
+        verifier = address(halo2Verifier);
+
+        // 3. Deploy Staking (100 HELIX min stake, 7 day unbonding, 50% slash rate)
+        Staking staking = new Staking(helixToken, 100e18, 7 days, 5000);
+        stakingAddr = address(staking);
+
+        // 4. Deploy Rewards
+        Rewards rewards = new Rewards(helixToken);
+        rewardsAddr = address(rewards);
+
+        // 5. Deploy ModelRegistry
+        ModelRegistry registry = new ModelRegistry();
+        registryAddr = address(registry);
+
+        // 6. Deploy HelixCoordinatorV3
+        HelixCoordinatorV3 v3 = new HelixCoordinatorV3(
+            verifier,
+            stakingAddr,
+            rewardsAddr,
+            registryAddr,
+            treasury
+        );
+        coordinator = address(v3);
+
+        // 7. Wire contracts: set coordinator as operator/coordinator
+        staking.setOperator(coordinator);
+        rewards.setCoordinator(coordinator);
+        rewards.setStakingContract(stakingAddr);
+        registry.setCoordinator(coordinator);
+
+        // 8. Grant minter role to Rewards for token distribution
+        token.addMinter(rewardsAddr);
+
+        vm.stopBroadcast();
+
+        _logV3Deployment("Halo2");
     }
 
     /// @notice Deploy V3 full stack with mock verifier for testing
@@ -174,62 +185,6 @@ contract DeployScript is Script {
         vm.stopBroadcast();
 
         _logV3Deployment("Mock");
-    }
-
-    /// @notice Internal: deploy full V3 stack with given VK
-    function _deployV3Stack(uint256[4] memory sG2) internal {
-        uint256 deployerPrivateKey = vm.envOr("PRIVATE_KEY", uint256(0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80));
-        address deployer = vm.addr(deployerPrivateKey);
-        treasury = vm.envOr("TREASURY", deployer);
-
-        vm.startBroadcast(deployerPrivateKey);
-
-        // 1. Deploy HelixToken
-        HelixToken token = new HelixToken(treasury);
-        helixToken = address(token);
-
-        // 2. Deploy Halo2Verifier with real VK
-        Halo2Verifier halo2Verifier = new Halo2Verifier(sG2);
-        verifier = address(halo2Verifier);
-
-        // 3. Deploy Staking (100 HELIX min stake, 7 day unbonding, 50% slash rate)
-        Staking staking = new Staking(helixToken, 100e18, 7 days, 5000);
-        stakingAddr = address(staking);
-
-        // 4. Deploy Rewards
-        Rewards rewards = new Rewards(helixToken);
-        rewardsAddr = address(rewards);
-
-        // 5. Deploy ModelRegistry
-        ModelRegistry registry = new ModelRegistry();
-        registryAddr = address(registry);
-
-        // 6. Deploy HelixCoordinatorV3
-        HelixCoordinatorV3 v3 = new HelixCoordinatorV3(
-            verifier,
-            stakingAddr,
-            rewardsAddr,
-            registryAddr,
-            treasury
-        );
-        coordinator = address(v3);
-
-        // 7. Wire contracts: set coordinator as operator/coordinator
-        staking.setOperator(coordinator);
-        rewards.setCoordinator(coordinator);
-        rewards.setStakingContract(stakingAddr);
-        registry.setCoordinator(coordinator);
-
-        // 8. Grant minter role to Rewards for token distribution
-        token.addMinter(rewardsAddr);
-
-        vm.stopBroadcast();
-
-        _logV3Deployment("Halo2");
-        console.log("  VK_S_G2_X0:", sG2[0]);
-        console.log("  VK_S_G2_X1:", sG2[1]);
-        console.log("  VK_S_G2_Y0:", sG2[2]);
-        console.log("  VK_S_G2_Y1:", sG2[3]);
     }
 
     function _logV3Deployment(string memory verifierType) internal view {

@@ -25,8 +25,8 @@ contract RealProofVerificationTest is Test {
     uint256 constant P = 21888242871839275222246405745257275088696311157297823662689037894645226208583;
 
     function setUp() public {
-        // Deploy verifier with G2 generator (trivial SRS, s=1)
-        verifier = new Halo2Verifier(Halo2VKDefaults.g2Generator());
+        // Deploy verifier (deploys core verifier + VK internally)
+        verifier = new Halo2Verifier();
     }
 
     // ============ Proof Format Tests ============
@@ -378,7 +378,7 @@ contract RealProofVerificationTest is Test {
     function _deployV3WithRealVerifier() internal returns (HelixCoordinatorV3, Staking, HelixToken) {
         address treasury = makeAddr("treasury");
         HelixToken token = new HelixToken(treasury);
-        Halo2Verifier realVerifier = new Halo2Verifier(Halo2VKDefaults.g2Generator());
+        Halo2Verifier realVerifier = new Halo2Verifier();
         Staking staking = new Staking(address(token), 100e18, 7 days, 5000);
         Rewards rewards = new Rewards(address(token));
         ModelRegistry reg = new ModelRegistry();

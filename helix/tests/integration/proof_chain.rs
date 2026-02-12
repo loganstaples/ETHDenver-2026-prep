@@ -55,7 +55,8 @@ fn test_proof_chain_three_steps() {
 
     // Generate batch proofs
     let phase_start = Instant::now();
-    let batch_result = prover.prove_batch(training_weights, &samples, Fr::from(1u64));
+    let batch_result = prover.prove_batch(training_weights, &samples, Fr::from(1u64))
+        .expect("Batch proving should succeed");
     result.add_phase(PhaseResult::success("batch_generation", phase_start.elapsed()));
 
     // Verify we got exactly 3 proofs
@@ -155,7 +156,8 @@ fn test_proof_chain_error_bound_accumulation() {
     let dataset = TestDataset::new(dims.d_in, dims.d_out, 3, 42);
     let samples = dataset.to_tuples();
 
-    let batch_result = prover.prove_batch(training_weights, &samples, Fr::from(1u64));
+    let batch_result = prover.prove_batch(training_weights, &samples, Fr::from(1u64))
+        .expect("Batch proving should succeed");
 
     // Skip if batch prover returns 0 proofs (known issue)
     if batch_result.proofs.is_empty() {
@@ -195,7 +197,8 @@ fn test_proof_chain_detects_reordering() {
     let dataset = TestDataset::new(dims.d_in, dims.d_out, 3, 42);
     let samples = dataset.to_tuples();
 
-    let batch_result = prover.prove_batch(training_weights, &samples, Fr::from(1u64));
+    let batch_result = prover.prove_batch(training_weights, &samples, Fr::from(1u64))
+        .expect("Batch proving should succeed");
 
     // Create a "reordered" chain by swapping proofs 1 and 2
     if batch_result.proofs.len() >= 3 {
@@ -229,7 +232,8 @@ fn test_proof_chain_initial_state_hash() {
     let dataset = TestDataset::new(dims.d_in, dims.d_out, 1, 42);
     let samples = dataset.to_tuples();
 
-    let batch_result = prover.prove_batch(training_weights, &samples, Fr::from(1u64));
+    let batch_result = prover.prove_batch(training_weights, &samples, Fr::from(1u64))
+        .expect("Batch proving should succeed");
 
     // Skip if batch prover returns 0 proofs (known issue)
     if batch_result.proofs.is_empty() {
@@ -260,7 +264,8 @@ fn test_proof_chain_final_state_differs_from_initial() {
     let dataset = TestDataset::new(dims.d_in, dims.d_out, 3, 42);
     let samples = dataset.to_tuples();
 
-    let batch_result = prover.prove_batch(training_weights, &samples, Fr::from(1u64));
+    let batch_result = prover.prove_batch(training_weights, &samples, Fr::from(1u64))
+        .expect("Batch proving should succeed");
 
     // Skip if batch prover returns 0 proofs (known issue)
     if batch_result.proofs.is_empty() {
@@ -293,7 +298,8 @@ fn test_proof_chain_five_steps() {
     let dataset = TestDataset::new(dims.d_in, dims.d_out, 5, 42);
     let samples = dataset.to_tuples();
 
-    let batch_result = prover.prove_batch(training_weights, &samples, Fr::from(1u64));
+    let batch_result = prover.prove_batch(training_weights, &samples, Fr::from(1u64))
+        .expect("Batch proving should succeed");
 
     // Skip if batch prover returns 0 proofs (known issue)
     if batch_result.proofs.is_empty() {
@@ -333,7 +339,8 @@ fn test_proof_chain_public_inputs_format() {
     let dataset = TestDataset::new(dims.d_in, dims.d_out, 3, 42);
     let samples = dataset.to_tuples();
 
-    let batch_result = prover.prove_batch(training_weights, &samples, Fr::from(1u64));
+    let batch_result = prover.prove_batch(training_weights, &samples, Fr::from(1u64))
+        .expect("Batch proving should succeed");
 
     // Skip if batch prover returns 0 proofs (known issue)
     if batch_result.proofs.is_empty() {
@@ -404,12 +411,14 @@ fn test_proof_chain_varying_learning_rates() {
     let samples = dataset.to_tuples();
 
     // Small learning rate
-    let batch_small_lr = prover.prove_batch(training_weights1, &samples, Fr::from(1u64));
+    let batch_small_lr = prover.prove_batch(training_weights1, &samples, Fr::from(1u64))
+        .expect("Batch proving should succeed");
 
     // Large learning rate
     let weights2 = TestModelWeights::known(dims);
     let training_weights2 = weights2.to_training_weights();
-    let batch_large_lr = prover.prove_batch(training_weights2, &samples, Fr::from(10u64));
+    let batch_large_lr = prover.prove_batch(training_weights2, &samples, Fr::from(10u64))
+        .expect("Batch proving should succeed");
 
     // Skip if batch prover returns 0 proofs (known issue)
     if batch_small_lr.proofs.is_empty() || batch_large_lr.proofs.is_empty() {
@@ -449,7 +458,8 @@ fn test_proof_chain_serialization_for_contract() {
     let dataset = TestDataset::new(dims.d_in, dims.d_out, 3, 42);
     let samples = dataset.to_tuples();
 
-    let batch_result = prover.prove_batch(training_weights, &samples, Fr::from(1u64));
+    let batch_result = prover.prove_batch(training_weights, &samples, Fr::from(1u64))
+        .expect("Batch proving should succeed");
 
     // Skip if batch prover returns 0 proofs (known issue)
     if batch_result.proofs.is_empty() {
@@ -514,7 +524,8 @@ fn test_proof_chain_mock_evm_verification() {
     let dataset = TestDataset::new(dims.d_in, dims.d_out, 3, 42);
     let samples = dataset.to_tuples();
 
-    let batch_result = prover.prove_batch(training_weights, &samples, Fr::from(1u64));
+    let batch_result = prover.prove_batch(training_weights, &samples, Fr::from(1u64))
+        .expect("Batch proving should succeed");
 
     // Skip if batch prover returns 0 proofs (known issue)
     if batch_result.proofs.is_empty() {
@@ -564,10 +575,12 @@ fn test_proof_chain_deterministic() {
 
     // Generate chain twice with same inputs
     let training_weights1 = weights.to_training_weights();
-    let batch1 = prover.prove_batch(training_weights1, &samples, Fr::from(1u64));
+    let batch1 = prover.prove_batch(training_weights1, &samples, Fr::from(1u64))
+        .expect("Batch proving should succeed");
 
     let training_weights2 = weights.to_training_weights();
-    let batch2 = prover.prove_batch(training_weights2, &samples, Fr::from(1u64));
+    let batch2 = prover.prove_batch(training_weights2, &samples, Fr::from(1u64))
+        .expect("Batch proving should succeed");
 
     // Skip if batch prover returns 0 proofs (known issue)
     if batch1.proofs.is_empty() || batch2.proofs.is_empty() {
@@ -605,10 +618,12 @@ fn test_proof_chain_different_seeds() {
     let samples = vec![(sample.x.clone(), sample.target.clone())];
 
     let training_weights1 = weights1.to_training_weights();
-    let batch1 = prover.prove_batch(training_weights1, &samples, Fr::from(1u64));
+    let batch1 = prover.prove_batch(training_weights1, &samples, Fr::from(1u64))
+        .expect("Batch proving should succeed");
 
     let training_weights2 = weights2.to_training_weights();
-    let batch2 = prover.prove_batch(training_weights2, &samples, Fr::from(1u64));
+    let batch2 = prover.prove_batch(training_weights2, &samples, Fr::from(1u64))
+        .expect("Batch proving should succeed");
 
     // Skip if batch prover returns 0 proofs (known issue)
     if batch1.proofs.is_empty() || batch2.proofs.is_empty() {

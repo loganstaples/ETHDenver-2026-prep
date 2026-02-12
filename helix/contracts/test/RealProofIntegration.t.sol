@@ -68,7 +68,7 @@ contract RealProofIntegrationTest is Test {
         maliciousProver = makeAddr("maliciousProver");
 
         // Deploy real verifier
-        verifier = new Halo2Verifier(Halo2VKDefaults.g2Generator());
+        verifier = new Halo2Verifier();
 
         // Deploy coordinator with real verifier
         coordinator = new HelixCoordinatorV2(address(verifier), treasury);
@@ -545,7 +545,7 @@ contract RealProofGasBenchmark is Test {
     Halo2Verifier public verifier;
 
     function setUp() public {
-        verifier = new Halo2Verifier(Halo2VKDefaults.g2Generator());
+        verifier = new Halo2Verifier();
     }
 
     /// @notice Benchmark single proof verification gas

@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 helix-core = { path = "../helix-core" }
 halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2", rev = "198e9ae30d322cd0ad003b6955f91ec095b1490d" }
+halo2_backend = { git = "https://github.com/privacy-scaling-explorations/halo2", rev = "198e9ae30d322cd0ad003b6955f91ec095b1490d" }
 halo2curves = "0.7.0"
 sha2 = "0.10"
 sha3 = "0.10"    # Keccak256 for EVM compatibility

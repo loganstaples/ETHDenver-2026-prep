@@ -46,7 +46,8 @@ fn test_convergence_tiny_model() {
         (vec![Fr::from(1u64), Fr::from(2u64)], vec![Fr::from(7u64)]),
     ];
 
-    let batch_result = prover.prove_batch(weights, &samples, Fr::from(1u64));
+    let batch_result = prover.prove_batch(weights, &samples, Fr::from(1u64))
+        .expect("Batch proving should succeed");
 
     // All proofs should verify
     assert!(prover.verify_batch(&batch_result), "All proofs should verify");
@@ -271,7 +272,8 @@ fn test_convergence_proof_chain() {
         (vec![Fr::from(1u64), Fr::from(2u64)], vec![Fr::from(7u64)]),
     ];
 
-    let batch_result = prover.prove_batch(training_weights, &samples, Fr::from(1u64));
+    let batch_result = prover.prove_batch(training_weights, &samples, Fr::from(1u64))
+        .expect("Batch proving should succeed");
 
     // Verify proof chain: each step's new hash should match next step's old hash
     for i in 0..batch_result.proofs.len() - 1 {
@@ -314,7 +316,8 @@ fn test_convergence_final_weights() {
         (vec![Fr::from(1u64), Fr::from(1u64)], vec![Fr::from(5u64)]),
     ];
 
-    let batch_result = prover.prove_batch(initial_weights, &samples, Fr::from(1u64));
+    let batch_result = prover.prove_batch(initial_weights, &samples, Fr::from(1u64))
+        .expect("Batch proving should succeed");
 
     // Final weights should be different from initial (training happened)
     let final_weights = &batch_result.final_weights;
@@ -426,7 +429,8 @@ fn test_convergence_comprehensive() {
     // Phase 3: Run training
     let phase_start = Instant::now();
     let prover = BatchTrainingProverV2::new(dims.d_in, dims.d_hid, dims.d_out);
-    let batch_result = prover.prove_batch(initial_weights, &samples, Fr::from(1u64));
+    let batch_result = prover.prove_batch(initial_weights, &samples, Fr::from(1u64))
+        .expect("Batch proving should succeed");
     harness.record_duration("training_time", phase_start.elapsed());
     harness.record_metric("num_proofs", batch_result.proofs.len() as f64, "count");
     result.add_phase(PhaseResult::success("training", phase_start.elapsed()));
@@ -551,7 +555,8 @@ fn test_convergence_single_step() {
         (vec![Fr::from(1u64), Fr::from(1u64)], vec![Fr::from(5u64)]),
     ];
 
-    let batch_result = prover.prove_batch(training_weights, &samples, Fr::from(1u64));
+    let batch_result = prover.prove_batch(training_weights, &samples, Fr::from(1u64))
+        .expect("Batch proving should succeed");
 
     assert_eq!(batch_result.num_steps, 1, "Should complete 1 step");
     assert_eq!(batch_result.proofs.len(), 1, "Should have 1 proof");

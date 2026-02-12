@@ -48,7 +48,7 @@ contract AdversarialTest is Test {
         frontrunner = makeAddr("frontrunner");
 
         // Deploy contracts
-        realVerifier = new Halo2Verifier(Halo2VKDefaults.g2Generator());
+        realVerifier = new Halo2Verifier();
         mockVerifier = new MockVerifier();
         coordinator = new HelixCoordinatorV2(address(mockVerifier), treasury);
         trainingRound = new TrainingRound();
@@ -355,7 +355,7 @@ contract AdversarialTest is Test {
 
     /// @notice Test replay attack with Halo2Verifier's verifyAndRecord
     function test_ReplayPreventionVerifier() public {
-        Halo2Verifier verifier = new Halo2Verifier(Halo2VKDefaults.g2Generator());
+        Halo2Verifier verifier = new Halo2Verifier();
 
         bytes memory proof = new bytes(320);
         uint256[] memory inputs = new uint256[](8);

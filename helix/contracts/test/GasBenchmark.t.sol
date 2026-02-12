@@ -36,7 +36,7 @@ contract GasBenchmark is Test {
         // Deploy contracts
         mockVerifier = new MockVerifier();
         coordinator = new HelixCoordinatorV2(address(mockVerifier), treasury);
-        halo2Verifier = new Halo2Verifier(Halo2VKDefaults.g2Generator());
+        halo2Verifier = new Halo2Verifier();
 
         // Fund provers
         vm.deal(prover1, 100 ether);

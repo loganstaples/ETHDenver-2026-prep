@@ -682,7 +682,8 @@ fn test_native_vs_evm_batch_consistency() {
     let dataset = TestDataset::new(dims.d_in, dims.d_out, 3, 42);
     let samples = dataset.to_tuples();
 
-    let batch_result = prover.prove_batch(training_weights, &samples, Fr::from(1u64));
+    let batch_result = prover.prove_batch(training_weights, &samples, Fr::from(1u64))
+        .expect("Batch proving should succeed");
 
     let mock_evm = MockEVMVerifier::new();
 

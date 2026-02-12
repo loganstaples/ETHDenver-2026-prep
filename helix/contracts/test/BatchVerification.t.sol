@@ -58,7 +58,7 @@ contract BatchVerificationTest is Test {
 
         // Deploy contracts
         mockVerifier = new MockVerifier();
-        realVerifier = new Halo2Verifier(Halo2VKDefaults.g2Generator());
+        realVerifier = new Halo2Verifier();
         batchVerifier = new BatchVerifier(address(mockVerifier));
     }
 

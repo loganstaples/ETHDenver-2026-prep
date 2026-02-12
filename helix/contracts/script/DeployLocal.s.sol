@@ -70,7 +70,7 @@ contract DeployLocalScript is Script {
         console.log("Phase 1: Deploying Core Infrastructure...");
 
         // Deploy Verifier
-        verifier = new Halo2Verifier(Halo2VKDefaults.g2Generator());
+        verifier = new Halo2Verifier();
         console.log("  Halo2Verifier:", address(verifier));
 
         // Deploy Coordinator
@@ -336,7 +336,7 @@ contract LocalIntegrationTest is Script {
 
         // 1. Deploy contracts
         console.log("\n[1/6] Deploying Verifier and Coordinator...");
-        verifier = new Halo2Verifier(Halo2VKDefaults.g2Generator());
+        verifier = new Halo2Verifier();
         coordinator = new HelixCoordinatorV2(address(verifier), treasury);
         console.log("  Halo2Verifier:", address(verifier));
         console.log("  Coordinator:", address(coordinator));
@@ -413,7 +413,7 @@ contract LocalIntegrationTest is Script {
 
         vm.startBroadcast(deployerPrivateKey);
 
-        verifier = new Halo2Verifier(Halo2VKDefaults.g2Generator());
+        verifier = new Halo2Verifier();
         console.log("Halo2Verifier deployed:", address(verifier));
 
         bytes memory validProof = _createValidProof();
@@ -473,7 +473,7 @@ contract LocalIntegrationTest is Script {
 
         vm.startBroadcast(deployerPrivateKey);
 
-        verifier = new Halo2Verifier(Halo2VKDefaults.g2Generator());
+        verifier = new Halo2Verifier();
         coordinator = new HelixCoordinatorV2(address(verifier), treasury);
 
         // Setup

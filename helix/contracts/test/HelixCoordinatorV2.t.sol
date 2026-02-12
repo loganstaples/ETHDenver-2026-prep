@@ -32,7 +32,7 @@ contract HelixCoordinatorV2Test is Test {
         prover2 = makeAddr("prover2");
 
         // Deploy verifier and coordinator
-        verifier = new Halo2Verifier(Halo2VKDefaults.g2Generator());
+        verifier = new Halo2Verifier();
         coordinator = new HelixCoordinatorV2(address(verifier), treasury);
 
         // Fund provers

@@ -325,7 +325,7 @@ impl OnChainTestEnv {
                 (model_id, round_id, proof_bytes, public_inputs),
             )
             .expect("submitProof method")
-            .gas(5_000_000u64) // generous gas limit for proof verification
+            .gas(30_000_000u64) // high gas limit: Poseidon checksum (65 rounds × SHA-256) is gas-heavy
             .send()
             .await
             .expect("submitProof send failed")
@@ -404,10 +404,12 @@ impl OnChainTestEnv {
 
     /// Creates a test environment with the **real** Halo2Verifier.sol deployed.
     ///
-    /// Extracts the SRS `[s]₂` G2 point from the Rust prover's KZG parameters
-    /// and passes it to the Halo2Verifier constructor. This means the on-chain
-    /// verifier will perform real BN254 pairing checks against the same SRS.
-    pub async fn new_with_real_verifier(s_g2: [U256; 4]) -> Self {
+    /// The Halo2Verifier wrapper deploys Halo2VerifierCore + Halo2VerifyingKey
+    /// internally (no-arg constructor). The VK is baked into the contract at
+    /// code-generation time using the same deterministic SRS (HELIX_SRS_SEED)
+    /// that the Rust prover uses. This means the on-chain verifier performs
+    /// real BN254 pairing checks against the same SRS.
+    pub async fn new_with_real_verifier() -> Self {
         let out_dir = ensure_contracts_compiled();
 
         // Spawn Anvil
@@ -421,18 +423,13 @@ impl OnChainTestEnv {
         let deployer = wallet.address();
         let client = Arc::new(SignerMiddleware::new(provider, wallet));
 
-        // Deploy real Halo2Verifier with the SRS [s]₂ point
+        // Deploy real Halo2Verifier (no-arg constructor — deploys core + VK internally)
         let (verifier_abi, verifier_bytecode) =
             load_contract_artifact(&out_dir, "Halo2Verifier.sol", "Halo2Verifier");
         let verifier_factory =
             ContractFactory::new(verifier_abi.clone(), verifier_bytecode, client.clone());
         let verifier_contract = verifier_factory
-            .deploy(Token::FixedArray(vec![
-                Token::Uint(s_g2[0]),
-                Token::Uint(s_g2[1]),
-                Token::Uint(s_g2[2]),
-                Token::Uint(s_g2[3]),
-            ]))
+            .deploy(())
             .expect("Halo2Verifier deploy args")
             .send()
             .await
@@ -491,20 +488,6 @@ impl OnChainTestEnv {
     }
 }
 
-/// Extracts the SRS `[s]₂` G2 point from an `MLTrainingProverV2` as 4 `U256` values
-/// suitable for deploying `Halo2Verifier.sol`.
-pub fn extract_s_g2_from_prover(
-    prover: &helix_prover::MLTrainingProverV2,
-) -> [U256; 4] {
-    let vk_data = prover.export_vk_data().expect("VK not initialized");
-    [
-        U256::from_dec_str(&vk_data.s_g2.0).expect("Invalid s_g2[0]"),
-        U256::from_dec_str(&vk_data.s_g2.1).expect("Invalid s_g2[1]"),
-        U256::from_dec_str(&vk_data.s_g2.2).expect("Invalid s_g2[2]"),
-        U256::from_dec_str(&vk_data.s_g2.3).expect("Invalid s_g2[3]"),
-    ]
-}
-
 // ============================================================================
 // Proof Formatting Helpers
 // ============================================================================
@@ -546,22 +529,20 @@ impl TestEvmProofBundle {
         Self::from_evm_bundle(bundle)
     }
 
-    /// Creates a test bundle from a proof result using legacy test signature.
+    /// Creates a test bundle from a proof result.
     ///
+    /// Uses the raw proof bytes from the Keccak256 transcript directly,
+    /// which is what the PSE-generated Halo2VerifierCore expects.
     /// The `_model_id` and `_max_error_bound` parameters are retained for
-    /// backwards compatibility but are no longer used — the canonical
-    /// `EvmProofBundle` handles all formatting internally.
+    /// backwards compatibility but are no longer used.
     pub fn from_proof_result(
         result: &helix_prover::provers::training_prover_v2::TrainingProofResultV2,
         _model_id: U256,
         _max_error_bound: U256,
     ) -> Self {
-        use helix_circuits::verifier::serialize_proof_for_evm;
-
-        // For backwards compat: manually build the EVM proof since we don't
-        // have VkData in the legacy call signature.
-        let evm_proof = serialize_proof_for_evm(&result.proof, 3)
-            .expect("EVM proof serialization failed");
+        // Use raw proof bytes from the Keccak256 transcript.
+        // The PSE-generated Halo2VerifierCore.sol reads this format directly.
+        let evm_proof = result.proof.clone();
 
         let evm_pi_bytes = result.to_evm_public_inputs();
         let public_inputs: Vec<U256> = evm_pi_bytes
@@ -577,8 +558,6 @@ impl TestEvmProofBundle {
         let old_commitment = compute_hash_pair(public_inputs[0], public_inputs[1]);
         let new_commitment = compute_hash_pair(public_inputs[2], public_inputs[3]);
 
-        // Build a minimal EvmProofBundle (without VK data, tests that need
-        // VK should use from_proof_result_with_vk instead).
         let bundle = helix_prover::EvmProofBundle {
             evm_proof,
             evm_public_inputs: evm_pi_bytes,

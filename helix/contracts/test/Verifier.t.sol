@@ -17,7 +17,7 @@ contract VerifierTest is Test {
     uint256 constant R = 21888242871839275222246405745257275088548364400416034343698204186575808495617;
 
     function setUp() public {
-        halo2Verifier = new Halo2Verifier(Halo2VKDefaults.g2Generator());
+        halo2Verifier = new Halo2Verifier();
         mockVerifier = new MockVerifier();
     }
 

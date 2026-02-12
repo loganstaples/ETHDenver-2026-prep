@@ -468,6 +468,19 @@ impl MLTrainingStepV2Witness {
         self.error_checksum = self.compute_error_checksum();
     }
 
+    /// Sets the model_id and error_budget, then recomputes the error checksum.
+    ///
+    /// Call this before proof generation to ensure PI[7] matches the on-chain
+    /// `PoseidonHasher.computeErrorChecksum(errorBound, stepNumber, modelId, maxErrorBound)`.
+    ///
+    /// - `model_id`: The on-chain model ID as a 32-byte LE representation
+    /// - `error_budget`: The contract's `maxErrorBound` value (e.g. 1e18)
+    pub fn set_error_params(&mut self, model_id: [u8; 32], error_budget: Fr) {
+        self.model_id = model_id;
+        self.error_budget = error_budget;
+        self.finalize_error_checksum();
+    }
+
     /// Validates that all witness vectors have dimensions consistent with
     /// `d_in`, `d_hid`, and `d_out`. Returns `Ok(())` if valid, or an
     /// error string describing the first mismatch found.
@@ -2185,10 +2198,11 @@ mod tests {
                 strategy::SingleStrategy,
             },
             transcript::{
-                Blake2bRead, Blake2bWrite, Challenge255,
+                Challenge255,
                 TranscriptReadBuffer, TranscriptWriterBuffer,
             },
         };
+        use halo2_backend::transcript::{Keccak256Read, Keccak256Write};
         use halo2curves::bn256::Bn256;
         use rand_core::OsRng;
 
@@ -2204,7 +2218,7 @@ mod tests {
 
         // 3. Generate a real proof
         let instances = vec![pi.clone()];
-        let mut transcript = Blake2bWrite::<Vec<u8>, G1Affine, Challenge255<_>>::init(vec![]);
+        let mut transcript = Keccak256Write::<Vec<u8>, G1Affine, Challenge255<_>>::init(vec![]);
 
         create_proof::<
             KZGCommitmentScheme<Bn256>,
@@ -2228,7 +2242,7 @@ mod tests {
 
         // 4. Verify the proof
         let mut verifier_transcript =
-            Blake2bRead::<_, G1Affine, Challenge255<_>>::init(proof.as_slice());
+            Keccak256Read::<_, G1Affine, Challenge255<_>>::init(proof.as_slice());
         let verifier_params = params.verifier_params();
         let verified = verify_proof_multi::<
             KZGCommitmentScheme<Bn256>,
@@ -2252,10 +2266,11 @@ mod tests {
                 strategy::SingleStrategy,
             },
             transcript::{
-                Blake2bRead, Blake2bWrite, Challenge255,
+                Challenge255,
                 TranscriptReadBuffer, TranscriptWriterBuffer,
             },
         };
+        use halo2_backend::transcript::{Keccak256Read, Keccak256Write};
         use halo2curves::bn256::Bn256;
         use rand_core::OsRng;
 
@@ -2267,7 +2282,7 @@ mod tests {
         let pk = keygen_pk(&params, vk.clone(), &circuit).expect("keygen_pk failed");
 
         let instances = vec![pi.clone()];
-        let mut transcript = Blake2bWrite::<Vec<u8>, G1Affine, Challenge255<_>>::init(vec![]);
+        let mut transcript = Keccak256Write::<Vec<u8>, G1Affine, Challenge255<_>>::init(vec![]);
 
         create_proof::<
             KZGCommitmentScheme<Bn256>,
@@ -2293,7 +2308,7 @@ mod tests {
         bad_pi[4] = Fr::from(999u64); // Wrong loss
 
         let mut verifier_transcript =
-            Blake2bRead::<_, G1Affine, Challenge255<_>>::init(proof.as_slice());
+            Keccak256Read::<_, G1Affine, Challenge255<_>>::init(proof.as_slice());
         let verifier_params = params.verifier_params();
         let verified = verify_proof_multi::<
             KZGCommitmentScheme<Bn256>,

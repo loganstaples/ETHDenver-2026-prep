@@ -33,8 +33,8 @@ use helix_circuits::ml::training_step_v2::{
 };
 use helix_circuits::verifier::{
     SolidityGenerator, VkData,
-    fr_to_evm_bytes, serialize_proof_for_evm, validate_proof_format,
-    ProofFormatError, NUM_ADVICE_COMMITS,
+    fr_to_evm_bytes,
+    ProofFormatError,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -248,16 +248,16 @@ pub struct TrainingProofResultV2 {
 }
 
 impl TrainingProofResultV2 {
-    /// Converts the raw Halo2 transcript proof to EVM-compatible format.
+    /// Returns the proof bytes in EVM-compatible format.
     ///
-    /// Returns 320 bytes structured as:
-    /// - 192 bytes: 3 x G1 advice commitments (big-endian coordinates)
-    /// - 64 bytes: Opening proof W point
-    /// - 64 bytes: Opening proof W' point
-    ///
-    /// All coordinates are 32-byte big-endian for Solidity `uint256`.
+    /// The pipeline uses PSE's `Keccak256Transcript` which writes EC points as
+    /// 64-byte uncompressed (x, y) in big-endian — exactly the format expected
+    /// by the PSE-generated Halo2VerifierCore.sol. No conversion needed.
     pub fn to_evm_proof(&self) -> Result<Vec<u8>, ProofFormatError> {
-        serialize_proof_for_evm(&self.proof, NUM_ADVICE_COMMITS)
+        if self.proof.is_empty() {
+            return Err(ProofFormatError::TooShort { got: 0, min: 32 });
+        }
+        Ok(self.proof.clone())
     }
 
     /// Converts public inputs to big-endian `uint256` byte arrays for Solidity.
@@ -667,6 +667,37 @@ impl MLTrainingProverV2 {
         )
     }
 
+    /// Builds a witness with on-chain parameters for error checksum matching.
+    ///
+    /// This is the same as `build_witness` but sets `model_id` and `error_budget`
+    /// so that PI[7] (error checksum) matches the contract's
+    /// `PoseidonHasher.computeErrorChecksum(errorBound, stepNumber, modelId, maxErrorBound)`.
+    ///
+    /// - `model_id`: The on-chain model ID (stored as 32-byte LE Fr representation)
+    /// - `error_budget`: The contract's `maxErrorBound` value (e.g. Fr::from(10u64.pow(18)))
+    pub fn build_witness_with_params(
+        d_in: usize,
+        d_hid: usize,
+        d_out: usize,
+        x: &[Fr],
+        target: &[Fr],
+        w1: &[Fr],
+        b1: &[Fr],
+        w2: &[Fr],
+        b2: &[Fr],
+        lr: Fr,
+        step_number: u64,
+        base_error: Fr,
+        model_id: [u8; 32],
+        error_budget: Fr,
+    ) -> MLTrainingStepV2Witness {
+        let mut witness = Self::build_witness(
+            d_in, d_hid, d_out, x, target, w1, b1, w2, b2, lr, step_number, base_error,
+        );
+        witness.set_error_params(model_id, error_budget);
+        witness
+    }
+
     /// Computes the witness hash for caching.
     pub fn compute_witness_hash(witness: &MLTrainingStepV2Witness) -> WitnessHash {
         WitnessHashBuilder::new()
@@ -833,17 +864,23 @@ impl MLTrainingProverV2 {
                 return Err(TrainingProverError::SelfVerificationFailed);
             }
 
-            // 2. EVM format verification — serialize to EVM format and validate
-            //    structure before returning, catching serialization bugs early.
-            //    Now using KZG commitment scheme (PSE fork), EVM serialization must succeed.
-            let evm_proof = serialize_proof_for_evm(&proof, NUM_ADVICE_COMMITS)
-                .map_err(TrainingProverError::EvmSerializationFailed)?;
-            validate_proof_format(&evm_proof)
-                .map_err(TrainingProverError::EvmSerializationFailed)?;
+            // 2. EVM format sanity check — the PSE Keccak256Transcript already
+            //    produces proofs with 64-byte uncompressed EC points matching
+            //    the Solidity verifier. Just validate non-empty + size multiple of 32.
+            if proof.is_empty() {
+                return Err(TrainingProverError::EvmSerializationFailed(
+                    ProofFormatError::TooShort { got: 0, min: 32 },
+                ));
+            }
+            if proof.len() % 32 != 0 {
+                return Err(TrainingProverError::EvmSerializationFailed(
+                    ProofFormatError::TooShort { got: proof.len(), min: proof.len() + (32 - proof.len() % 32) },
+                ));
+            }
 
             if self.config.enable_tracing {
                 tracing::debug!(
-                    evm_proof_size = evm_proof.len(),
+                    evm_proof_size = proof.len(),
                     "EVM proof format validated successfully"
                 );
             }
@@ -1700,10 +1737,10 @@ mod tests {
         let result = prover.prove(&witness).expect("prove should succeed");
         assert!(!result.proof.is_empty());
 
-        // With KZG commitment scheme, EVM proof serialization must succeed
+        // With PSE Keccak256Transcript, proof is already in EVM format (uncompressed points)
         let evm_proof = result.to_evm_proof().expect("EVM proof serialization should succeed with KZG");
-        assert_eq!(evm_proof.len(), 320, "EVM proof must be exactly 320 bytes");
-        validate_proof_format(&evm_proof).expect("EVM proof should be valid format");
+        assert!(evm_proof.len() > 0, "EVM proof must not be empty");
+        assert_eq!(evm_proof.len() % 32, 0, "EVM proof length must be a multiple of 32");
         assert!(prover.verify_result(&result));
     }
 
@@ -1770,9 +1807,10 @@ mod tests {
         assert!(result.verified);
         assert!(prover.verify_result(&result));
 
-        // Verify EVM proof format independently
+        // Verify EVM proof format independently — PSE transcript already produces EVM format
         let evm_proof = result.to_evm_proof().expect("EVM serialization should succeed");
-        assert_eq!(evm_proof.len(), 320, "KZG EVM proof must be exactly 320 bytes");
+        assert!(evm_proof.len() > 0, "EVM proof must not be empty");
+        assert_eq!(evm_proof.len() % 32, 0, "EVM proof length must be a multiple of 32");
     }
 
     #[test]
