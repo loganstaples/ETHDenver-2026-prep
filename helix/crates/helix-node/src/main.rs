@@ -3,7 +3,7 @@ mod sc_client;
 use helix_node::sc_client::SCClient;
 use helix_node::api::http::{ApiRateLimiter, ApiState, MetricsSnapshot, OrchestratorSnapshot, PeerSnapshot, RoundInfo};
 use helix_node::api::rpc::{
-    ProofStatusEntry, RpcState, start_rpc_server,
+    ProofStatusEntry, RpcRateLimiter, RpcState, start_rpc_server,
     NodeConfigSnapshot, MPCStatusSnapshot,
 };
 use helix_node::network::messages::{
@@ -152,6 +152,7 @@ async fn run_worker(listen_addr: SocketAddr) -> anyhow::Result<()> {
         mpc_status: Arc::new(RwLock::new(MPCStatusSnapshot::default())),
         model_id: Arc::new(RwLock::new(None)),
         rpc_addr: format!("0.0.0.0:{}", rpc_port),
+        rate_limiter: Arc::new(RwLock::new(RpcRateLimiter::default())),
     });
 
     // Start JSON-RPC server
@@ -573,6 +574,7 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
         mpc_status: Arc::new(RwLock::new(MPCStatusSnapshot::default())),
         model_id: Arc::new(RwLock::new(None)),
         rpc_addr: format!("0.0.0.0:{}", rpc_port),
+        rate_limiter: Arc::new(RwLock::new(RpcRateLimiter::default())),
     });
     let rpc_addr: SocketAddr = format!("0.0.0.0:{}", rpc_port).parse().unwrap();
     let rpc_state_clone = rpc_state.clone();

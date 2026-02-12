@@ -161,6 +161,72 @@ fn map_worker_status(status: &str) -> &'static str {
 // RPC Server State
 // ============================================================================
 
+/// Maximum proof size in bytes (10 MB). Proofs larger than this are rejected.
+const MAX_PROOF_SIZE: usize = 10 * 1024 * 1024;
+
+/// Maximum number of proofs in the submission queue before rejecting new ones.
+const MAX_PROOF_QUEUE_SIZE: usize = 1000;
+
+/// Maximum number of public inputs per proof submission.
+const MAX_PUBLIC_INPUTS: usize = 64;
+
+/// RPC-layer rate limiter for proof submissions.
+///
+/// Uses a simple sliding-window token bucket: each caller gets `burst` tokens
+/// that refill at `rate_per_sec` tokens/second. Proof submissions cost 1 token.
+pub struct RpcRateLimiter {
+    /// Per-caller token state: (tokens_remaining, last_refill_time).
+    callers: std::collections::HashMap<String, (f64, std::time::Instant)>,
+    /// Tokens per second refill rate.
+    pub rate_per_sec: f64,
+    /// Maximum burst size (bucket capacity).
+    pub burst: f64,
+}
+
+impl RpcRateLimiter {
+    /// Creates a new RPC rate limiter.
+    pub fn new(rate_per_sec: f64, burst: f64) -> Self {
+        Self {
+            callers: std::collections::HashMap::new(),
+            rate_per_sec,
+            burst,
+        }
+    }
+
+    /// Checks if a caller is allowed to submit. Returns true if allowed.
+    pub fn check(&mut self, caller_id: &str) -> bool {
+        let now = std::time::Instant::now();
+        let (tokens, last) = self
+            .callers
+            .entry(caller_id.to_string())
+            .or_insert((self.burst, now));
+
+        // Refill tokens
+        let elapsed = now.duration_since(*last).as_secs_f64();
+        *tokens = (*tokens + elapsed * self.rate_per_sec).min(self.burst);
+        *last = now;
+
+        if *tokens >= 1.0 {
+            *tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Number of tracked callers.
+    pub fn caller_count(&self) -> usize {
+        self.callers.len()
+    }
+}
+
+impl Default for RpcRateLimiter {
+    fn default() -> Self {
+        // 10 proof submissions per second, burst of 20
+        Self::new(10.0, 20.0)
+    }
+}
+
 /// Shared state for the RPC server.
 pub struct RpcState {
     /// Snapshot of orchestrator state (updated periodically by main loop).
@@ -187,6 +253,8 @@ pub struct RpcState {
     pub model_id: Arc<RwLock<Option<u64>>>,
     /// RPC listen address (for config reporting).
     pub rpc_addr: String,
+    /// Rate limiter for proof submissions.
+    pub rate_limiter: Arc<RwLock<RpcRateLimiter>>,
 }
 
 /// Tracks proof status per round.
@@ -480,6 +548,37 @@ fn handle_submit_proof(
     params: &serde_json::Value,
     id: &serde_json::Value,
 ) -> JsonRpcResponse {
+    // === Rate limiting ===
+    // Use model_id as caller identity (or "anonymous" if not provided yet)
+    let caller_id = params
+        .get("model_id")
+        .and_then(|v| v.as_u64())
+        .map(|m| format!("model-{}", m))
+        .unwrap_or_else(|| "anonymous".to_string());
+
+    {
+        let mut limiter = state.rate_limiter.write();
+        if !limiter.check(&caller_id) {
+            return JsonRpcResponse::error(
+                id.clone(),
+                -32005,
+                "Rate limit exceeded: too many proof submissions. Try again later.".to_string(),
+            );
+        }
+    }
+
+    // === Queue size check ===
+    {
+        let queue = state.proof_queue.read();
+        if queue.len() >= MAX_PROOF_QUEUE_SIZE {
+            return JsonRpcResponse::error(
+                id.clone(),
+                -32006,
+                format!("Proof queue full ({} pending). Try again later.", MAX_PROOF_QUEUE_SIZE),
+            );
+        }
+    }
+
     let model_id = match params.get("model_id").and_then(|v| v.as_u64()) {
         Some(v) => v,
         None => return JsonRpcResponse::invalid_params(id.clone(), "model_id is required (u64)"),
@@ -502,8 +601,25 @@ fn handle_submit_proof(
         return JsonRpcResponse::invalid_params(id.clone(), "proof is required (hex string or byte array)");
     };
 
+    // === Proof size validation ===
+    let proof_stripped = proof_hex.strip_prefix("0x").unwrap_or(&proof_hex);
+    let proof_byte_len = proof_stripped.len() / 2;
+    if proof_byte_len > MAX_PROOF_SIZE {
+        return JsonRpcResponse::invalid_params(
+            id.clone(),
+            &format!("proof too large: {} bytes (max {})", proof_byte_len, MAX_PROOF_SIZE),
+        );
+    }
+
     let public_inputs: Vec<String> = match params.get("public_inputs") {
         Some(serde_json::Value::Array(arr)) => {
+            // === Public inputs count validation ===
+            if arr.len() > MAX_PUBLIC_INPUTS {
+                return JsonRpcResponse::invalid_params(
+                    id.clone(),
+                    &format!("too many public inputs: {} (max {})", arr.len(), MAX_PUBLIC_INPUTS),
+                );
+            }
             arr.iter()
                 .filter_map(|v| v.as_str().map(|s| s.to_string()))
                 .collect()
@@ -512,7 +628,6 @@ fn handle_submit_proof(
     };
 
     // Validate hex encoding
-    let proof_stripped = proof_hex.strip_prefix("0x").unwrap_or(&proof_hex);
     if hex::decode(proof_stripped).is_err() {
         return JsonRpcResponse::invalid_params(id.clone(), "proof is not valid hex");
     }
@@ -1142,6 +1257,7 @@ pub fn create_default_rpc_state(
         mpc_status: Arc::new(RwLock::new(MPCStatusSnapshot::default())),
         model_id: Arc::new(RwLock::new(None)),
         rpc_addr: rpc_addr.to_string(),
+        rate_limiter: Arc::new(RwLock::new(RpcRateLimiter::default())),
     })
 }
 
@@ -1196,6 +1312,7 @@ mod tests {
             })),
             model_id: Arc::new(RwLock::new(Some(1))),
             rpc_addr: "127.0.0.1:9002".to_string(),
+            rate_limiter: Arc::new(RwLock::new(RpcRateLimiter::default())),
         })
     }
 
@@ -1709,5 +1826,113 @@ mod tests {
         let v1 = r1.result.unwrap();
         assert_eq!(v1["peer_count"], 3);
         assert_eq!(v1["active_workers"], 2);
+    }
+
+    // ---- Rate limiting and DoS protection tests ----
+
+    #[test]
+    fn test_rpc_rate_limiter_allows_within_burst() {
+        let mut limiter = RpcRateLimiter::new(10.0, 5.0);
+        // First 5 should succeed (burst)
+        for _ in 0..5 {
+            assert!(limiter.check("caller-1"));
+        }
+        // 6th should fail
+        assert!(!limiter.check("caller-1"));
+    }
+
+    #[test]
+    fn test_rpc_rate_limiter_independent_callers() {
+        let mut limiter = RpcRateLimiter::new(10.0, 2.0);
+        assert!(limiter.check("caller-1"));
+        assert!(limiter.check("caller-1"));
+        assert!(!limiter.check("caller-1")); // exhausted
+        // Different caller should still work
+        assert!(limiter.check("caller-2"));
+    }
+
+    #[test]
+    fn test_submit_proof_rate_limited() {
+        // Create state with very restrictive rate limiter
+        let state = create_test_state();
+        *state.rate_limiter.write() = RpcRateLimiter::new(0.001, 1.0);
+
+        let params = serde_json::json!({
+            "model_id": 1,
+            "round_id": 1,
+            "proof": "0xdeadbeef",
+            "public_inputs": ["0x01"]
+        });
+
+        // First request succeeds
+        let r1 = handle_submit_proof(&state, &params, &null_id());
+        assert!(r1.result.is_some(), "first submit should succeed");
+
+        // Second request should be rate limited
+        let r2 = handle_submit_proof(&state, &params, &null_id());
+        assert!(r2.error.is_some(), "second submit should be rate limited");
+        assert_eq!(r2.error.unwrap().code, -32005);
+    }
+
+    #[test]
+    fn test_submit_proof_queue_full_rejected() {
+        let state = create_test_state();
+        // Fill the queue to capacity
+        {
+            let mut queue = state.proof_queue.write();
+            for i in 0..MAX_PROOF_QUEUE_SIZE {
+                queue.push(QueuedProof {
+                    model_id: 1,
+                    round_id: i as u64,
+                    proof_hex: "0xab".to_string(),
+                    public_inputs_hex: vec![],
+                    submitted: false,
+                    tx_hash: None,
+                });
+            }
+        }
+
+        let params = serde_json::json!({
+            "model_id": 1,
+            "round_id": 1,
+            "proof": "0xdeadbeef",
+            "public_inputs": ["0x01"]
+        });
+        let response = handle_submit_proof(&state, &params, &null_id());
+        assert!(response.error.is_some());
+        assert_eq!(response.error.unwrap().code, -32006);
+    }
+
+    #[test]
+    fn test_submit_proof_oversized_rejected() {
+        let state = create_test_state();
+        // Create a proof that exceeds MAX_PROOF_SIZE (10MB)
+        let huge_proof = format!("0x{}", "ab".repeat(MAX_PROOF_SIZE + 1));
+        let params = serde_json::json!({
+            "model_id": 1,
+            "round_id": 1,
+            "proof": huge_proof,
+            "public_inputs": ["0x01"]
+        });
+        let response = handle_submit_proof(&state, &params, &null_id());
+        assert!(response.error.is_some());
+        assert_eq!(response.error.unwrap().code, -32602); // invalid params
+    }
+
+    #[test]
+    fn test_submit_proof_too_many_public_inputs() {
+        let state = create_test_state();
+        let many_inputs: Vec<String> = (0..MAX_PUBLIC_INPUTS + 1)
+            .map(|i| format!("0x{:02x}", i % 256))
+            .collect();
+        let params = serde_json::json!({
+            "model_id": 1,
+            "round_id": 1,
+            "proof": "0xdeadbeef",
+            "public_inputs": many_inputs
+        });
+        let response = handle_submit_proof(&state, &params, &null_id());
+        assert!(response.error.is_some());
+        assert_eq!(response.error.unwrap().code, -32602);
     }
 }

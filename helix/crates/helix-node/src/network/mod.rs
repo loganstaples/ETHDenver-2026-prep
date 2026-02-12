@@ -29,9 +29,9 @@ pub use discovery::{ConnectedPeer, DiscoveryConfig, PeerDiscovery};
 pub use gossip::{GossipConfig, GossipProtocol, GossipStats};
 pub use mdns_discovery::{CombinedDiscovery, MdnsConfig, MdnsDiscovery, MdnsEvent, MdnsError};
 pub use messages::{
-    ConsensusMessage, DiscoveryMessage, GradientMessage, HeartbeatMessage, MessagePayload,
-    NetworkMessage, NodeCapabilities, PeerId, PeerInfo, SyncMessage, TrainingMessage,
-    TrainingParams,
+    ConsensusMessage, DiscoveryMessage, GradientMessage, HeartbeatMessage, MessageDedup,
+    MessagePayload, MessageRejectReason, NetworkMessage, NodeCapabilities, PeerId, PeerInfo,
+    PeerKeyRegistry, SyncMessage, TrainingMessage, TrainingParams,
 };
 pub use runner::{NetworkEvent, NetworkRunner, NetworkRunnerBuilder, NetworkRunnerConfig};
 pub use sync::{Checkpoint, NetworkState, StateSync, SyncConfig, SyncStatus};

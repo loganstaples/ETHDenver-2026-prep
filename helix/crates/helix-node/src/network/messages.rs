@@ -27,6 +27,14 @@ impl std::fmt::Display for PeerId {
     }
 }
 
+/// Maximum age (in seconds) for a message to be accepted.
+/// Messages older than this are considered stale and rejected.
+pub const MESSAGE_MAX_AGE_SECS: u64 = 300; // 5 minutes
+
+/// Maximum clock skew tolerance (in seconds).
+/// Messages from slightly in the future (within this margin) are still accepted.
+pub const MESSAGE_CLOCK_SKEW_SECS: u64 = 30;
+
 /// Network message envelope.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkMessage {
@@ -34,8 +42,10 @@ pub struct NetworkMessage {
     pub id: String,
     /// Sender peer ID.
     pub sender: PeerId,
-    /// Message timestamp.
+    /// Message timestamp (Unix seconds).
     pub timestamp: u64,
+    /// Cryptographic nonce for replay protection (16 random bytes).
+    pub nonce: [u8; 16],
     /// Message payload.
     pub payload: MessagePayload,
     /// Hop count (for gossip limiting).
@@ -45,8 +55,13 @@ pub struct NetworkMessage {
 }
 
 impl NetworkMessage {
-    /// Creates a new message.
+    /// Creates a new message with a random nonce.
     pub fn new(sender: PeerId, payload: MessagePayload) -> Self {
+        let mut nonce = [0u8; 16];
+        // Use OsRng for cryptographic nonce to prevent prediction
+        use rand::RngCore;
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             sender,
@@ -54,6 +69,7 @@ impl NetworkMessage {
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
+            nonce,
             payload,
             hops: 0,
             signature: None,
@@ -65,13 +81,39 @@ impl NetworkMessage {
         self.hops = self.hops.saturating_add(1);
     }
 
+    /// Returns the message age in seconds relative to the given current time.
+    /// Returns `None` if the message timestamp is in the future beyond clock skew.
+    pub fn age_secs(&self, now_secs: u64) -> Option<u64> {
+        if self.timestamp > now_secs + MESSAGE_CLOCK_SKEW_SECS {
+            None // too far in the future
+        } else if self.timestamp > now_secs {
+            Some(0) // within clock skew tolerance
+        } else {
+            Some(now_secs - self.timestamp)
+        }
+    }
+
+    /// Checks if this message is stale (too old to accept).
+    pub fn is_stale(&self) -> bool {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        match self.age_secs(now) {
+            Some(age) => age > MESSAGE_MAX_AGE_SECS,
+            None => true, // future message beyond clock skew
+        }
+    }
+
     /// Computes the signing hash for this message (SHA-256 of canonical fields).
+    /// Includes all fields except the signature itself to prevent malleability.
     fn signing_hash(&self) -> [u8; 32] {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(self.id.as_bytes());
         hasher.update(self.sender.0.as_bytes());
         hasher.update(self.timestamp.to_le_bytes());
+        hasher.update(self.nonce);
         // Serialize payload deterministically with bincode
         if let Ok(payload_bytes) = bincode::serialize(&self.payload) {
             hasher.update(&payload_bytes);
@@ -198,6 +240,123 @@ impl PeerKeyRegistry {
     #[cfg(not(feature = "crypto-sign"))]
     pub fn has_key(&self, _peer_id: &PeerId) -> bool {
         false
+    }
+}
+
+/// Message deduplication and replay detection cache.
+///
+/// Tracks recently seen message IDs + nonces to reject replayed messages.
+/// Also enforces timestamp freshness (staleness check).
+pub struct MessageDedup {
+    /// Set of recently seen message IDs.
+    seen_ids: std::collections::HashSet<String>,
+    /// Maximum entries before eviction.
+    max_entries: usize,
+    /// Whether to enforce timestamp freshness.
+    enforce_freshness: bool,
+}
+
+impl MessageDedup {
+    /// Creates a new dedup cache with the given capacity.
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            seen_ids: std::collections::HashSet::with_capacity(max_entries),
+            max_entries,
+            enforce_freshness: true,
+        }
+    }
+
+    /// Creates a dedup cache that doesn't enforce freshness (for testing).
+    pub fn permissive(max_entries: usize) -> Self {
+        Self {
+            seen_ids: std::collections::HashSet::with_capacity(max_entries),
+            max_entries,
+            enforce_freshness: false,
+        }
+    }
+
+    /// Checks if a message should be accepted (not a replay, not stale).
+    ///
+    /// Returns `Ok(())` if the message is fresh and not a duplicate.
+    /// Returns `Err(reason)` if the message should be rejected.
+    pub fn check(&mut self, msg: &NetworkMessage) -> Result<(), MessageRejectReason> {
+        // Check staleness
+        if self.enforce_freshness && msg.is_stale() {
+            return Err(MessageRejectReason::Stale {
+                timestamp: msg.timestamp,
+            });
+        }
+
+        // Check for future messages
+        if self.enforce_freshness {
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            if msg.timestamp > now + MESSAGE_CLOCK_SKEW_SECS {
+                return Err(MessageRejectReason::FutureTimestamp {
+                    timestamp: msg.timestamp,
+                    now,
+                });
+            }
+        }
+
+        // Build dedup key from message ID + nonce (nonce prevents ID reuse across restarts)
+        let dedup_key = format!("{}:{}", msg.id, hex::encode(msg.nonce));
+
+        // Check duplicate
+        if self.seen_ids.contains(&dedup_key) {
+            return Err(MessageRejectReason::Duplicate {
+                message_id: msg.id.clone(),
+            });
+        }
+
+        // Evict if at capacity (simple clear strategy)
+        if self.seen_ids.len() >= self.max_entries {
+            self.seen_ids.clear();
+        }
+
+        self.seen_ids.insert(dedup_key);
+        Ok(())
+    }
+
+    /// Number of tracked messages.
+    pub fn len(&self) -> usize {
+        self.seen_ids.len()
+    }
+
+    /// Whether the cache is empty.
+    pub fn is_empty(&self) -> bool {
+        self.seen_ids.is_empty()
+    }
+}
+
+impl Default for MessageDedup {
+    fn default() -> Self {
+        Self::new(10_000)
+    }
+}
+
+/// Reason a message was rejected by the dedup/freshness check.
+#[derive(Debug, Clone)]
+pub enum MessageRejectReason {
+    /// Message timestamp is too old.
+    Stale { timestamp: u64 },
+    /// Message timestamp is too far in the future.
+    FutureTimestamp { timestamp: u64, now: u64 },
+    /// Message ID + nonce was already seen.
+    Duplicate { message_id: String },
+}
+
+impl std::fmt::Display for MessageRejectReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stale { timestamp } => write!(f, "stale message (timestamp={})", timestamp),
+            Self::FutureTimestamp { timestamp, now } => {
+                write!(f, "future message (timestamp={}, now={})", timestamp, now)
+            }
+            Self::Duplicate { message_id } => write!(f, "duplicate message (id={})", message_id),
+        }
     }
 }
 
@@ -644,5 +803,147 @@ mod tests {
             load: 0,
         });
         assert!(!registry.verify_message(&msg));
+    }
+
+    // ---- Nonce and replay protection tests ----
+
+    #[test]
+    fn test_message_has_nonce() {
+        let msg = NetworkMessage::new(
+            PeerId::random(),
+            MessagePayload::Heartbeat(HeartbeatMessage { seq: 1, is_pong: false, load: 50 }),
+        );
+        // Nonce should be non-zero (random)
+        assert_ne!(msg.nonce, [0u8; 16]);
+    }
+
+    #[test]
+    fn test_two_messages_have_different_nonces() {
+        let sender = PeerId::random();
+        let payload = MessagePayload::Heartbeat(HeartbeatMessage { seq: 1, is_pong: false, load: 50 });
+        let msg1 = NetworkMessage::new(sender.clone(), payload.clone());
+        let msg2 = NetworkMessage::new(sender, payload);
+        assert_ne!(msg1.nonce, msg2.nonce, "each message must have a unique nonce");
+    }
+
+    #[test]
+    fn test_nonce_included_in_signing_hash() {
+        let sender = PeerId::random();
+        let payload = MessagePayload::Heartbeat(HeartbeatMessage { seq: 1, is_pong: false, load: 50 });
+
+        let mut msg1 = NetworkMessage::new(sender.clone(), payload.clone());
+        let mut msg2 = msg1.clone();
+        msg2.nonce = [0xFF; 16]; // different nonce
+
+        let hash1 = msg1.signing_hash();
+        let hash2 = msg2.signing_hash();
+        assert_ne!(hash1, hash2, "different nonces must produce different signing hashes");
+    }
+
+    #[test]
+    fn test_fresh_message_not_stale() {
+        let msg = NetworkMessage::new(
+            PeerId::random(),
+            MessagePayload::Heartbeat(HeartbeatMessage { seq: 1, is_pong: false, load: 50 }),
+        );
+        assert!(!msg.is_stale());
+    }
+
+    #[test]
+    fn test_old_message_is_stale() {
+        let mut msg = NetworkMessage::new(
+            PeerId::random(),
+            MessagePayload::Heartbeat(HeartbeatMessage { seq: 1, is_pong: false, load: 50 }),
+        );
+        // Set timestamp to 10 minutes ago
+        msg.timestamp = msg.timestamp.saturating_sub(MESSAGE_MAX_AGE_SECS + 60);
+        assert!(msg.is_stale());
+    }
+
+    #[test]
+    fn test_future_message_is_stale() {
+        let mut msg = NetworkMessage::new(
+            PeerId::random(),
+            MessagePayload::Heartbeat(HeartbeatMessage { seq: 1, is_pong: false, load: 50 }),
+        );
+        // Set timestamp 5 minutes in the future (beyond clock skew tolerance)
+        msg.timestamp += MESSAGE_CLOCK_SKEW_SECS + 300;
+        assert!(msg.is_stale());
+    }
+
+    #[test]
+    fn test_dedup_rejects_replayed_message() {
+        let mut dedup = MessageDedup::permissive(100);
+        let msg = NetworkMessage::new(
+            PeerId::random(),
+            MessagePayload::Heartbeat(HeartbeatMessage { seq: 1, is_pong: false, load: 50 }),
+        );
+
+        // First time: accepted
+        assert!(dedup.check(&msg).is_ok());
+        // Second time: rejected as duplicate
+        let result = dedup.check(&msg);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), MessageRejectReason::Duplicate { .. }));
+    }
+
+    #[test]
+    fn test_dedup_accepts_different_messages() {
+        let mut dedup = MessageDedup::permissive(100);
+        let sender = PeerId::random();
+
+        let msg1 = NetworkMessage::new(
+            sender.clone(),
+            MessagePayload::Heartbeat(HeartbeatMessage { seq: 1, is_pong: false, load: 50 }),
+        );
+        let msg2 = NetworkMessage::new(
+            sender,
+            MessagePayload::Heartbeat(HeartbeatMessage { seq: 2, is_pong: false, load: 50 }),
+        );
+
+        assert!(dedup.check(&msg1).is_ok());
+        assert!(dedup.check(&msg2).is_ok());
+    }
+
+    #[test]
+    fn test_dedup_rejects_stale_message() {
+        let mut dedup = MessageDedup::new(100); // with freshness enforcement
+        let mut msg = NetworkMessage::new(
+            PeerId::random(),
+            MessagePayload::Heartbeat(HeartbeatMessage { seq: 1, is_pong: false, load: 50 }),
+        );
+        msg.timestamp = msg.timestamp.saturating_sub(MESSAGE_MAX_AGE_SECS + 60);
+
+        let result = dedup.check(&msg);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), MessageRejectReason::Stale { .. }));
+    }
+
+    #[cfg(feature = "crypto-sign")]
+    #[test]
+    fn test_replayed_signed_message_rejected() {
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let verifying_key = signing_key.verifying_key();
+
+        let peer_id = PeerId::random();
+        let mut registry = PeerKeyRegistry::new();
+        registry.register(peer_id.clone(), verifying_key);
+
+        let mut msg = NetworkMessage::new(
+            peer_id,
+            MessagePayload::Heartbeat(HeartbeatMessage { seq: 1, is_pong: false, load: 50 }),
+        );
+        msg.sign(&signing_key);
+
+        // Signature is valid
+        assert!(registry.verify_message(&msg));
+
+        // But dedup rejects the replay
+        let mut dedup = MessageDedup::permissive(100);
+        assert!(dedup.check(&msg).is_ok());
+        assert!(dedup.check(&msg).is_err(), "replayed message must be rejected");
     }
 }

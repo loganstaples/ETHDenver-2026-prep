@@ -124,8 +124,17 @@ fn test_verifier_config_demo_sets_verify_all() {
 }
 
 #[test]
-fn test_default_verifier_is_structural() {
+fn test_default_verifier_is_verify_all() {
+    // Secure-by-default: VerifierConfig::default() now uses VerifyAll
     let config = VerifierConfig::default();
+    assert_eq!(config.policy, VerificationPolicy::VerifyAll);
+    assert!(config.model_dims.is_some());
+}
+
+#[test]
+fn test_structural_constructor_for_testing() {
+    // Use VerifierConfig::structural() for test environments
+    let config = VerifierConfig::structural();
     assert_eq!(config.policy, VerificationPolicy::Structural);
     assert!(config.model_dims.is_none());
 }

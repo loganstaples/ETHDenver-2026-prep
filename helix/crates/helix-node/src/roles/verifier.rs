@@ -73,7 +73,27 @@ pub struct VerifierConfig {
 }
 
 impl Default for VerifierConfig {
+    /// Secure-by-default: uses full Halo2 KZG verification with demo model dimensions.
+    ///
+    /// In production, always use `VerifierConfig::for_model(d_in, d_hid, d_out)` with
+    /// the actual model dimensions. Use `VerifierConfig::structural()` only for testing.
     fn default() -> Self {
+        Self {
+            max_concurrent: 4,
+            timeout_secs: 60,
+            policy: VerificationPolicy::VerifyAll,
+            model_dims: Some((2, 2, 1)),
+        }
+    }
+}
+
+impl VerifierConfig {
+    /// Creates a config for testing that uses structural validation only.
+    ///
+    /// **WARNING**: This should NEVER be used in production. Structural validation
+    /// only checks proof size and public input ranges — it does NOT verify the
+    /// cryptographic proof. Any data that meets the size requirements will be accepted.
+    pub fn structural() -> Self {
         Self {
             max_concurrent: 4,
             timeout_secs: 60,
@@ -81,9 +101,7 @@ impl Default for VerifierConfig {
             model_dims: None,
         }
     }
-}
 
-impl VerifierConfig {
     /// Creates a config for production use with full Halo2 KZG verification.
     ///
     /// Requires model dimensions to initialize the prover circuit.
@@ -401,10 +419,7 @@ mod tests {
     /// Returns a `VerifierConfig` using `Structural` policy so unit tests that
     /// fabricate proof bytes don't need a real Halo2 prover.
     fn structural_config() -> VerifierConfig {
-        VerifierConfig {
-            policy: VerificationPolicy::Structural,
-            ..Default::default()
-        }
+        VerifierConfig::structural()
     }
 
     fn make_valid_inputs() -> TrainingProofInputs {
@@ -433,8 +448,15 @@ mod tests {
     }
 
     #[test]
-    fn test_default_policy_is_structural() {
+    fn test_default_policy_is_verify_all() {
         let config = VerifierConfig::default();
+        assert_eq!(config.policy, VerificationPolicy::VerifyAll);
+        assert!(config.model_dims.is_some(), "default must include model_dims for VerifyAll");
+    }
+
+    #[test]
+    fn test_structural_constructor_for_testing() {
+        let config = VerifierConfig::structural();
         assert_eq!(config.policy, VerificationPolicy::Structural);
         assert!(config.model_dims.is_none());
     }

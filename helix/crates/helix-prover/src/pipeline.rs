@@ -1216,6 +1216,46 @@ mod tests {
         assert_eq!(config.proof_timeout, Some(Duration::from_secs(60)));
     }
 
+    #[test]
+    fn test_default_config_uses_osrng() {
+        // Default pipeline config must NOT have a deterministic seed,
+        // which means the production path uses OsRng for cryptographic randomness.
+        let config = PipelineConfig::default();
+        assert!(
+            config.deterministic_seed.is_none(),
+            "Production default must use OsRng (no deterministic seed)"
+        );
+    }
+
+    #[test]
+    fn test_deterministic_seed_produces_reproducible_rng() {
+        // When deterministic_seed is set, the same seed should produce
+        // the same StdRng output.
+        let seed = [42u8; 32];
+        let mut rng1 = StdRng::from_seed(seed);
+        let mut rng2 = StdRng::from_seed(seed);
+
+        let mut buf1 = [0u8; 32];
+        let mut buf2 = [0u8; 32];
+        rng1.fill_bytes(&mut buf1);
+        rng2.fill_bytes(&mut buf2);
+        assert_eq!(buf1, buf2, "same seed must produce identical randomness");
+    }
+
+    #[test]
+    fn test_osrng_produces_unique_randomness() {
+        // When using OsRng (production path), each seeding should produce
+        // different randomness — proving non-determinism.
+        let mut seed1 = [0u8; 32];
+        let mut seed2 = [0u8; 32];
+        OsRng.fill_bytes(&mut seed1);
+        OsRng.fill_bytes(&mut seed2);
+        assert_ne!(
+            seed1, seed2,
+            "OsRng must produce different seeds on each call"
+        );
+    }
+
     /// Generate a correct Halo2 SHPLONK Solidity verifier from our circuit VK.
     /// Writes the verifier to contracts/src/verification/Halo2Verifier.sol
     #[test]
