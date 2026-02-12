@@ -401,3 +401,280 @@ contract RoundLifecycleTest is Test {
         assertEq(coordinator.getAccumulatedErrorBound(modelId), 10);
     }
 }
+
+/// @title TrainingJobTest
+/// @notice Tests for the training fee mechanism (createTrainingJob, cancelTrainingJob, fee distribution)
+contract TrainingJobTest is Test {
+    HelixCoordinatorV3 public coordinator;
+    HelixToken public token;
+    Staking public staking;
+    Rewards public rewards;
+    ModelRegistry public registry;
+    MockVerifierForRoundTest public mockVerifier;
+
+    address public modelOwner;
+    address public treasuryAddr;
+    address public prover1;
+    address public prover2;
+    address public nonOwner;
+
+    uint256 constant STAKE_AMOUNT = 200e18;
+    uint256 constant MIN_STAKE = 100e18;
+    uint256 constant ROUND_DURATION = 2 hours;
+
+    uint256 constant OLD_HASH_LO = 12345;
+    uint256 constant OLD_HASH_HI = 67890;
+
+    function setUp() public {
+        modelOwner = makeAddr("jobModelOwner");
+        treasuryAddr = makeAddr("treasury");
+        prover1 = makeAddr("jobProver1");
+        prover2 = makeAddr("jobProver2");
+        nonOwner = makeAddr("nonOwner");
+
+        // Deploy token
+        token = new HelixToken(treasuryAddr);
+
+        // Deploy mock verifier
+        mockVerifier = new MockVerifierForRoundTest();
+
+        // Deploy staking
+        staking = new Staking(address(token), MIN_STAKE, 7 days, 5000);
+
+        // Deploy rewards
+        rewards = new Rewards(address(token));
+
+        // Deploy registry
+        registry = new ModelRegistry();
+
+        // Deploy coordinator
+        coordinator = new HelixCoordinatorV3(
+            address(mockVerifier),
+            address(staking),
+            address(rewards),
+            address(registry),
+            treasuryAddr
+        );
+
+        // Wire contracts
+        staking.setOperator(address(coordinator));
+        rewards.setCoordinator(address(coordinator));
+        rewards.setStakingContract(address(staking));
+        registry.setCoordinator(address(coordinator));
+
+        // Fund and stake provers
+        _fundAndStake(prover1);
+        _fundAndStake(prover2);
+
+        // Fund reward pool
+        token.mint(address(this), 10000e18);
+        token.approve(address(rewards), type(uint256).max);
+        rewards.fundRewardPool(10000e18, 100e18, 365 days);
+
+        // Fund model owner so they can deposit for training jobs
+        token.mint(modelOwner, 100000e18);
+    }
+
+    function _fundAndStake(address prover) internal {
+        token.mint(prover, 1000e18);
+        vm.startPrank(prover);
+        token.approve(address(staking), type(uint256).max);
+        staking.stake(STAKE_AMOUNT);
+        vm.stopPrank();
+    }
+
+    function _correctCommitment() internal pure returns (uint256) {
+        return uint256(keccak256(abi.encodePacked(OLD_HASH_LO, OLD_HASH_HI)));
+    }
+
+    function _computeChecksum(
+        uint256 errorBound, uint256 stepNumber, uint256 modelId, uint256 errorBudget
+    ) internal pure returns (uint256) {
+        return ProofFixtureHardcoded.computeErrorChecksum(errorBound, stepNumber, modelId, errorBudget);
+    }
+
+    function _buildPublicInputs(
+        uint256 newHashLo, uint256 newHashHi,
+        uint256 loss, uint256 errorBound,
+        uint256 step, uint256 modelId
+    ) internal view returns (uint256[] memory) {
+        uint256[] memory inputs = new uint256[](8);
+        inputs[0] = OLD_HASH_LO;
+        inputs[1] = OLD_HASH_HI;
+        inputs[2] = newHashLo;
+        inputs[3] = newHashHi;
+        inputs[4] = loss;
+        inputs[5] = errorBound;
+        inputs[6] = step;
+        inputs[7] = _computeChecksum(errorBound, step, modelId, coordinator.maxErrorBound());
+        return inputs;
+    }
+
+    function _createUniqueProof(uint256 nonce) internal pure returns (bytes memory) {
+        bytes memory base = ProofFixtureHardcoded.createValidProof();
+        return abi.encodePacked(base, nonce);
+    }
+
+    /// @notice Register a model as modelOwner and return the modelId
+    function _registerModel() internal returns (uint256 modelId) {
+        vm.prank(modelOwner);
+        modelId = coordinator.registerModel("TestModel", "desc", "hash", _correctCommitment());
+    }
+
+    // ============ Test 1: Create training job ============
+
+    function test_CreateTrainingJob() public {
+        uint256 modelId = _registerModel();
+
+        uint256 depositAmount = 1000e18;
+        uint256 numRounds = 10;
+
+        // Model owner approves coordinator to spend tokens
+        vm.startPrank(modelOwner);
+        token.approve(address(coordinator), depositAmount);
+        uint256 jobId = coordinator.createTrainingJob(modelId, numRounds, depositAmount);
+        vm.stopPrank();
+
+        // Verify job state
+        (
+            uint256 jModelId,
+            address jOwner,
+            uint256 jTotalDeposit,
+            uint256 jTotalRounds,
+            uint256 jCompletedRounds,
+            uint256 jFeePerRound,
+            uint256 jRemainingBalance,
+            bool jActive
+        ) = coordinator.trainingJobs(jobId);
+
+        assertEq(jModelId, modelId);
+        assertEq(jOwner, modelOwner);
+        assertEq(jTotalDeposit, depositAmount);
+        assertEq(jTotalRounds, numRounds);
+        assertEq(jCompletedRounds, 0);
+        assertEq(jFeePerRound, depositAmount / numRounds);
+        assertEq(jRemainingBalance, depositAmount);
+        assertTrue(jActive);
+
+        // Verify activeModelJob
+        assertEq(coordinator.activeModelJob(modelId), jobId);
+
+        // Verify tokens transferred to coordinator
+        assertEq(token.balanceOf(address(coordinator)), depositAmount);
+    }
+
+    // ============ Test 2: Fee distribution on round completion ============
+
+    function test_TrainingJob_DistributesFees() public {
+        uint256 modelId = _registerModel();
+
+        uint256 depositAmount = 1000e18;
+        uint256 numRounds = 10;
+        uint256 feePerRound = depositAmount / numRounds; // 100e18
+
+        // Create training job
+        vm.startPrank(modelOwner);
+        token.approve(address(coordinator), depositAmount);
+        uint256 jobId = coordinator.createTrainingJob(modelId, numRounds, depositAmount);
+
+        // Start a single-participant round (auto-finalizes on proof submission)
+        coordinator.startRound(modelId, ROUND_DURATION);
+        vm.stopPrank();
+
+        // Record prover1 balance before
+        uint256 prover1BalanceBefore = token.balanceOf(prover1);
+
+        // Submit proof as prover1 — this auto-finalizes and distributes fees
+        uint256[] memory inputs = _buildPublicInputs(99999, 88888, 100, 10, 1, modelId);
+        bytes memory proof = _createUniqueProof(7001);
+
+        vm.prank(prover1);
+        coordinator.submitProof(modelId, 1, proof, inputs);
+
+        // Verify prover1 received fee (1 participant, so they get the full feePerRound)
+        uint256 prover1BalanceAfter = token.balanceOf(prover1);
+        assertEq(prover1BalanceAfter - prover1BalanceBefore, feePerRound);
+
+        // Verify job state updated
+        (,,,, uint256 completedRounds,, uint256 remainingBalance, bool active) = coordinator.trainingJobs(jobId);
+        assertEq(completedRounds, 1);
+        assertEq(remainingBalance, depositAmount - feePerRound);
+        assertTrue(active);
+    }
+
+    // ============ Test 3: Cancel training job and refund ============
+
+    function test_CancelTrainingJob_RefundsRemaining() public {
+        uint256 modelId = _registerModel();
+
+        uint256 depositAmount = 1000e18;
+        uint256 numRounds = 10;
+        uint256 feePerRound = depositAmount / numRounds; // 100e18
+
+        // Create training job
+        vm.startPrank(modelOwner);
+        token.approve(address(coordinator), depositAmount);
+        uint256 jobId = coordinator.createTrainingJob(modelId, numRounds, depositAmount);
+
+        // Start round and submit proof (completes 1 round)
+        coordinator.startRound(modelId, ROUND_DURATION);
+        vm.stopPrank();
+
+        uint256[] memory inputs = _buildPublicInputs(99999, 88888, 100, 10, 1, modelId);
+        bytes memory proof = _createUniqueProof(7002);
+
+        vm.prank(prover1);
+        coordinator.submitProof(modelId, 1, proof, inputs);
+
+        // Record model owner balance before cancel
+        uint256 ownerBalanceBefore = token.balanceOf(modelOwner);
+
+        // Cancel the job
+        vm.prank(modelOwner);
+        coordinator.cancelTrainingJob(jobId);
+
+        // Verify refund: depositAmount - 1 round of fees
+        uint256 expectedRefund = depositAmount - feePerRound;
+        uint256 ownerBalanceAfter = token.balanceOf(modelOwner);
+        assertEq(ownerBalanceAfter - ownerBalanceBefore, expectedRefund);
+
+        // Verify job deactivated
+        (,,,,,,, bool active) = coordinator.trainingJobs(jobId);
+        assertFalse(active);
+
+        // Verify activeModelJob cleared
+        assertEq(coordinator.activeModelJob(modelId), 0);
+    }
+
+    // ============ Test 4: Only model owner can create job ============
+
+    function test_TrainingJob_OnlyModelOwner() public {
+        uint256 modelId = _registerModel();
+
+        // Fund nonOwner with tokens
+        token.mint(nonOwner, 1000e18);
+
+        vm.startPrank(nonOwner);
+        token.approve(address(coordinator), 1000e18);
+        vm.expectRevert("Only model owner");
+        coordinator.createTrainingJob(modelId, 10, 1000e18);
+        vm.stopPrank();
+    }
+
+    // ============ Test 5: Cannot create duplicate job for same model ============
+
+    function test_TrainingJob_CannotCreateDuplicate() public {
+        uint256 modelId = _registerModel();
+
+        vm.startPrank(modelOwner);
+        token.approve(address(coordinator), 2000e18);
+
+        // First job succeeds
+        coordinator.createTrainingJob(modelId, 10, 1000e18);
+
+        // Second job for same model should revert
+        vm.expectRevert("Model already has active job");
+        coordinator.createTrainingJob(modelId, 10, 1000e18);
+        vm.stopPrank();
+    }
+}

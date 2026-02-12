@@ -2,6 +2,8 @@
 pragma solidity ^0.8.19;
 
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "../interfaces/IHelixVerifier.sol";
 import "../verification/PoseidonHasher.sol";
 import "../token/Staking.sol";
@@ -19,6 +21,8 @@ import "../core/ModelRegistry.sol";
 ///   - Treasury zero-address validation
 ///   - Reentrancy-safe challenger rewards (state updates before external calls)
 contract HelixCoordinatorV3 is ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
     // ============ Structs ============
 
     /// @notice Internal model tracking (gas-efficient access to round/commitment state)
@@ -77,6 +81,18 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
         address bestProver;
         uint256 bestLoss;
         uint256 bestNewCommitment;
+    }
+
+    /// @notice Training job — model owner deposits tokens to pay workers
+    struct TrainingJob {
+        uint256 modelId;
+        address jobOwner;
+        uint256 totalDeposit;
+        uint256 totalRounds;
+        uint256 completedRounds;
+        uint256 feePerRound;
+        uint256 remainingBalance;
+        bool active;
     }
 
     // ============ Constants ============
@@ -172,6 +188,15 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
     /// @notice List of participants per round
     mapping(uint256 => mapping(uint256 => address[])) internal roundParticipantList;
 
+    /// @notice Counter for training job IDs
+    uint256 public nextJobId;
+
+    /// @notice Training jobs: jobId => TrainingJob
+    mapping(uint256 => TrainingJob) public trainingJobs;
+
+    /// @notice Active job per model: modelId => jobId (0 = no job)
+    mapping(uint256 => uint256) public activeModelJob;
+
     // ============ Events ============
 
     event ModelRegistered(
@@ -232,6 +257,10 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
     event RoundDataCommitted(uint256 indexed modelId, uint256 indexed roundId, bytes32 dataRoot);
     event RoundExpired(uint256 indexed modelId, uint256 indexed roundId, uint32 validProofs, uint32 required);
     event RoundFinalized(uint256 indexed modelId, uint256 indexed roundId, address indexed bestProver, uint256 bestLoss);
+    event TrainingJobCreated(uint256 indexed modelId, uint256 indexed jobId, uint256 deposit, uint256 rounds);
+    event TrainingJobFunded(uint256 indexed modelId, uint256 indexed roundId, uint256 feeAmount);
+    event TrainingJobRefunded(uint256 indexed modelId, uint256 indexed roundId, uint256 refundAmount);
+    event TrainingJobCancelled(uint256 indexed jobId, uint256 refundAmount);
 
     // ============ Modifiers ============
 
@@ -537,6 +566,8 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
         round.isCompleted = true;
         ext.finalized = true;
 
+        _refundRoundFees(modelId, roundId);
+
         emit RoundExpired(modelId, roundId, ext.validProofs, ext.minParticipants);
     }
 
@@ -569,7 +600,104 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
         }
         try rewardsContract.allocateRoundRewards(modelId, roundId) {} catch {}
 
+        _distributeRoundFees(modelId, roundId);
+
         emit RoundCompleted(modelId, roundId, newCommitment, newAccumulatedError);
+    }
+
+    // ============ Training Jobs ============
+
+    /// @notice Create a training job with token deposit to pay workers
+    function createTrainingJob(
+        uint256 modelId,
+        uint256 rounds,
+        uint256 depositAmount
+    ) external whenNotPaused nonReentrant modelExists(modelId) returns (uint256 jobId) {
+        require(msg.sender == models[modelId].owner, "Only model owner");
+        require(rounds > 0, "Must fund at least 1 round");
+        require(depositAmount > 0, "Deposit must be positive");
+        require(activeModelJob[modelId] == 0, "Model already has active job");
+
+        IERC20 feeToken = stakingContract.helixToken();
+        feeToken.safeTransferFrom(msg.sender, address(this), depositAmount);
+
+        jobId = ++nextJobId;
+        trainingJobs[jobId] = TrainingJob({
+            modelId: modelId,
+            jobOwner: msg.sender,
+            totalDeposit: depositAmount,
+            totalRounds: rounds,
+            completedRounds: 0,
+            feePerRound: depositAmount / rounds,
+            remainingBalance: depositAmount,
+            active: true
+        });
+        activeModelJob[modelId] = jobId;
+
+        emit TrainingJobCreated(modelId, jobId, depositAmount, rounds);
+    }
+
+    /// @notice Cancel a training job and refund remaining balance
+    function cancelTrainingJob(uint256 jobId) external nonReentrant {
+        TrainingJob storage job = trainingJobs[jobId];
+        require(job.active, "Job not active");
+        require(msg.sender == job.jobOwner, "Only job owner");
+
+        uint256 refund = job.remainingBalance;
+        job.active = false;
+        job.remainingBalance = 0;
+        activeModelJob[job.modelId] = 0;
+
+        if (refund > 0) {
+            IERC20 feeToken = stakingContract.helixToken();
+            feeToken.safeTransfer(msg.sender, refund);
+        }
+
+        emit TrainingJobCancelled(jobId, refund);
+    }
+
+    /// @dev Distribute training job fees for a completed round
+    function _distributeRoundFees(uint256 modelId, uint256 roundId) internal {
+        uint256 jobId = activeModelJob[modelId];
+        if (jobId == 0) return;
+
+        TrainingJob storage job = trainingJobs[jobId];
+        if (!job.active || job.remainingBalance == 0) return;
+
+        uint256 fee = job.feePerRound;
+        if (fee > job.remainingBalance) {
+            fee = job.remainingBalance;
+        }
+
+        job.remainingBalance -= fee;
+        job.completedRounds++;
+
+        // Distribute fee equally among round participants
+        address[] storage participants = roundParticipantList[modelId][roundId];
+        uint256 count = participants.length;
+        if (count == 0 || fee == 0) return;
+
+        IERC20 feeToken = stakingContract.helixToken();
+        uint256 perWorker = fee / count;
+        for (uint256 i = 0; i < count; i++) {
+            if (perWorker > 0) {
+                feeToken.safeTransfer(participants[i], perWorker);
+            }
+        }
+
+        // Deactivate job if fully used
+        if (job.completedRounds >= job.totalRounds || job.remainingBalance == 0) {
+            job.active = false;
+            activeModelJob[modelId] = 0;
+        }
+
+        emit TrainingJobFunded(modelId, roundId, fee);
+    }
+
+    /// @dev Called on round expiry — fees stay in pool for next round
+    function _refundRoundFees(uint256 modelId, uint256 roundId) internal {
+        // No-op: fees remain available for subsequent rounds
+        emit TrainingJobRefunded(modelId, roundId, 0);
     }
 
     // ============ Challenge ============
