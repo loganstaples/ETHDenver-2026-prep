@@ -1,5 +1,33 @@
 //! Nova-Style Incrementally Verifiable Computation (IVC) Circuit.
 //!
+//! # Status: Future Optimization (not used in the current proof pipeline)
+//!
+//! The current production aggregation path uses `SHPLONKAggregationCircuit`
+//! (in `ml/proof_aggregation.rs`) wrapped by `RLCAggregationProver` in
+//! helix-prover. That path produces a single KZG proof with 8 public
+//! inputs matching the on-chain contract interface, supports up to 32
+//! steps per batch, and is fully wired into `BatchProver` and the node
+//! aggregator.
+//!
+//! # Why IVC is a Future Optimization
+//!
+//! IVC folding can compress an *unbounded* number of steps into a single
+//! constant-size accumulator, whereas the current `SHPLONKAggregationCircuit`
+//! is bounded to `MAX_AGGREGATION_BATCH` (32) steps per proof. For training
+//! runs with hundreds or thousands of steps, IVC would:
+//!
+//! 1. Eliminate the need to batch proofs into groups of 32
+//! 2. Produce O(1)-size state regardless of training length
+//! 3. Enable streaming verification (each fold is incremental)
+//!
+//! However, IVC requires a "decider" circuit to convert the final
+//! accumulator into a SNARK proof the EVM can verify. This decider is not
+//! yet implemented, so IVC cannot currently produce contract-compatible
+//! proofs. The folding math below is correct and tested, but end-to-end
+//! integration awaits the decider.
+//!
+//! # Architecture
+//!
 //! This module implements a proper IVC scheme inspired by Nova folding.
 //! Instead of concatenating proofs, we use a folding-based approach where:
 //!

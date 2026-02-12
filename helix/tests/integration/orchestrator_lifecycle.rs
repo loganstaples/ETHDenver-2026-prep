@@ -89,6 +89,8 @@ fn make_aggregation_result(
         total_stake: (num_contributors * 1000) as u64,
         num_contributors,
         excluded_participants: Vec::new(),
+        aggregated_proof: vec![],
+        aggregated_proof_public_inputs: vec![],
     }
 }
 

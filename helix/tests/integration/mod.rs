@@ -36,6 +36,9 @@ pub mod full_pipeline;
 /// Multi-step proof chain tests
 pub mod proof_chain;
 
+/// Proof aggregation pipeline tests
+pub mod proof_aggregation;
+
 /// On-chain verification tests (Anvil + real contracts)
 #[cfg(feature = "on-chain")]
 pub mod on_chain_verification;

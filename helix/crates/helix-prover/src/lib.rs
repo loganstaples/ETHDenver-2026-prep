@@ -62,7 +62,7 @@ pub use helix_circuits::halo2curves;
 pub use helix_circuits::verifier::VkData;
 
 // Re-export commonly used types
-pub use aggregation::{AggregatedProof, AggregationId, CommitmentTree, KZGAggregatedProof, KZGBatchAggregator, ProofAggregator, SmartAggregationResult};
+pub use aggregation::{AggregatedProof, AggregationId, CommitmentTree, KZGAggregatedProof, KZGBatchAggregator, ProofAggregator, SmartAggregationResult, RLCAggregationProver, AggregatedTrainingProof};
 
 // Re-export GKR prover types
 pub use gkr::{
@@ -122,7 +122,7 @@ pub use serialization::{ProofFormat, ProofSerializer, SerializedProof};
 
 // Re-export batch prover types
 pub use provers::batch_prover::{
-    BatchProveError, BatchProver, BatchConfig, BatchResult, BatchStatus,
+    AggregatedBatchProof, BatchProveError, BatchProver, BatchConfig, BatchResult, BatchStatus,
     EpochProver, EpochProofResult, StreamingBatchResult,
 };
 

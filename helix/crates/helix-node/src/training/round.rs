@@ -170,6 +170,14 @@ pub struct AggregationResult {
     pub num_contributors: usize,
     /// IDs of excluded participants (Byzantine detection).
     pub excluded_participants: Vec<String>,
+    /// Aggregated ZK proof bytes (single proof covering all participants' proofs).
+    /// When present, this is a real KZG proof from the SHPLONKAggregationCircuit
+    /// with 8 public inputs matching the on-chain contract interface.
+    #[serde(default)]
+    pub aggregated_proof: Vec<u8>,
+    /// Public inputs for the aggregated proof (8 × 32 bytes when present).
+    #[serde(default)]
+    pub aggregated_proof_public_inputs: Vec<[u8; 32]>,
 }
 
 /// A training round.
@@ -649,6 +657,8 @@ mod tests {
             total_stake: 3000,
             num_contributors: 2,
             excluded_participants: vec![],
+            aggregated_proof: vec![],
+            aggregated_proof_public_inputs: vec![],
         }).unwrap();
         assert_eq!(round.state, RoundState::Committing);
 
@@ -689,6 +699,8 @@ mod tests {
             total_stake: 1000,
             num_contributors: 1,
             excluded_participants: vec![],
+            aggregated_proof: vec![],
+            aggregated_proof_public_inputs: vec![],
         }).unwrap();
         round.complete([3u8; 32]).unwrap();
 

@@ -22,7 +22,8 @@ use sha2::{Digest, Sha256};
 
 use crate::parallel::{ChunkProof, ParallelConfig, ParallelProver, ProofStatus};
 use crate::chunking::{ChunkId, ComputationChunk, ComputationType};
-use crate::aggregation::{KZGAggregatedProof, KZGBatchAggregator};
+use crate::aggregation::{KZGAggregatedProof, KZGBatchAggregator, RLCAggregationProver, AggregatedTrainingProof};
+use crate::provers::training_prover_v2::TrainingProofResultV2;
 use thiserror::Error;
 
 /// Errors from batch proving operations.
@@ -249,6 +250,10 @@ pub struct AggregatedBatchProof {
     /// Each entry is one step's proof bytes, preserving them for independent verification.
     #[serde(default)]
     pub individual_proofs: Option<Vec<Vec<u8>>>,
+    /// RLC aggregated proof (SHPLONKAggregationCircuit-based, 8 PIs matching contract).
+    /// This is the preferred aggregation format for on-chain submission.
+    #[serde(skip)]
+    pub rlc_proof: Option<AggregatedTrainingProof>,
 }
 
 /// Checkpoint for resumable batch proving.
@@ -677,52 +682,97 @@ impl BatchProver {
         // Compute RLC commitment (retained for backward compat).
         let rlc_commitment = Self::compute_rlc_commitment(proofs);
 
-        // Convert StepProofs to ChunkProofs for KZG aggregation.
+        // ====================================================================
+        // Primary aggregation path: RLCAggregationProver (SHPLONKAggregationCircuit).
+        // Produces a single KZG proof with 8 public inputs matching the
+        // contract interface. This is what gets submitted on-chain.
+        // ====================================================================
+        let training_results = Self::step_proofs_to_training_results(proofs);
+        let rlc_result = if proofs.len() <= helix_circuits::MAX_AGGREGATION_BATCH
+            && proofs.iter().all(|p| p.public_inputs.len() >= 8)
+        {
+            // Check PI chaining before attempting aggregation
+            let chain_valid = training_results.windows(2).all(|w| {
+                w[0].new_state_hash == w[1].old_state_hash
+            });
+
+            if chain_valid {
+                match Self::try_rlc_aggregation(&training_results) {
+                    Ok(agg) => {
+                        tracing::info!(
+                            num_steps = agg.num_steps,
+                            proof_size = agg.proof.len(),
+                            "RLC aggregation succeeded (8-PI contract-compatible proof)"
+                        );
+                        Some(agg)
+                    }
+                    Err(e) => {
+                        tracing::warn!("RLC aggregation failed, falling back to KZG: {e}");
+                        None
+                    }
+                }
+            } else {
+                tracing::warn!("PI chain broken, skipping RLC aggregation");
+                None
+            }
+        } else {
+            tracing::info!(
+                num_proofs = proofs.len(),
+                "Skipping RLC aggregation (proofs have < 8 PIs or batch too large)"
+            );
+            None
+        };
+
+        // ====================================================================
+        // Fallback: KZGBatchAggregator (4-PI simple aggregation).
+        // ====================================================================
         let chunk_proofs: Vec<ChunkProof> = proofs
             .iter()
             .cloned()
             .map(ChunkProof::from)
             .collect();
 
-        // Attempt real KZG aggregation (O(1) proof size).
-        let aggregator = KZGBatchAggregator::new();
-        let kzg_result = if aggregator.is_ready() {
-            match aggregator.aggregate(&chunk_proofs) {
-                Ok(kzg_agg) => {
-                    tracing::info!(
-                        num_proofs = kzg_agg.num_proofs,
-                        proof_size = kzg_agg.proof.len(),
-                        "KZG batch aggregation succeeded"
-                    );
-                    Some(kzg_agg)
+        let kzg_result = if rlc_result.is_none() {
+            let aggregator = KZGBatchAggregator::new();
+            if aggregator.is_ready() {
+                match aggregator.aggregate(&chunk_proofs) {
+                    Ok(kzg_agg) => {
+                        tracing::info!(
+                            num_proofs = kzg_agg.num_proofs,
+                            proof_size = kzg_agg.proof.len(),
+                            "KZG batch aggregation succeeded (fallback)"
+                        );
+                        Some(kzg_agg)
+                    }
+                    Err(e) => {
+                        tracing::warn!("KZG aggregation also failed: {e}");
+                        None
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!("KZG aggregation failed, using concatenation fallback: {e}");
-                    None
-                }
+            } else {
+                None
             }
         } else {
-            tracing::warn!("KZG aggregator not ready, using concatenation fallback");
             None
         };
 
-        // Use KZG proof bytes if available, otherwise preserve individual proofs.
-        let (aggregated_proof_bytes, individual_proofs) = match &kzg_result {
-            Some(kzg) => (kzg.proof.clone(), None),
-            None => {
-                tracing::warn!(
-                    num_proofs = proofs.len(),
-                    "KZG aggregation unavailable, preserving {} individual proofs",
-                    proofs.len(),
-                );
-                let individual: Vec<Vec<u8>> = proofs
-                    .iter()
-                    .map(|p| p.proof.clone())
-                    .collect();
-                // Use first proof as the representative proof bytes
-                let representative = individual.first().cloned().unwrap_or_default();
-                (representative, Some(individual))
-            }
+        // Use RLC proof > KZG proof > individual proofs.
+        let (aggregated_proof_bytes, individual_proofs) = if let Some(ref rlc) = rlc_result {
+            (rlc.proof.clone(), None)
+        } else if let Some(ref kzg) = kzg_result {
+            (kzg.proof.clone(), None)
+        } else {
+            tracing::warn!(
+                num_proofs = proofs.len(),
+                "All aggregation unavailable, preserving {} individual proofs",
+                proofs.len(),
+            );
+            let individual: Vec<Vec<u8>> = proofs
+                .iter()
+                .map(|p| p.proof.clone())
+                .collect();
+            let representative = individual.first().cloned().unwrap_or_default();
+            (representative, Some(individual))
         };
 
         AggregatedBatchProof {
@@ -735,7 +785,71 @@ impl BatchProver {
             rlc_commitment: Some(rlc_commitment),
             kzg_proof: kzg_result,
             individual_proofs,
+            rlc_proof: rlc_result,
         }
+    }
+
+    /// Attempts RLC aggregation using SHPLONKAggregationCircuit.
+    ///
+    /// This is the primary aggregation path producing 8 public inputs
+    /// matching the on-chain contract interface.
+    fn try_rlc_aggregation(
+        proofs: &[TrainingProofResultV2],
+    ) -> Result<AggregatedTrainingProof, String> {
+        // k=14 is needed for up to 32 steps (MAX_AGGREGATION_BATCH)
+        let prover = RLCAggregationProver::new(
+            helix_circuits::MAX_AGGREGATION_BATCH,
+            14,
+        );
+        prover.aggregate(proofs)
+    }
+
+    /// Converts StepProofs to TrainingProofResultV2 for RLC aggregation.
+    fn step_proofs_to_training_results(proofs: &[StepProof]) -> Vec<TrainingProofResultV2> {
+        use helix_circuits::halo2curves::bn256::Fr;
+        use helix_circuits::halo2curves::ff::PrimeField;
+        use helix_circuits::halo2_proofs::arithmetic::Field;
+
+        proofs.iter().map(|step| {
+            let pis: Vec<Fr> = step.public_inputs.iter().map(|bytes| {
+                let mut repr = [0u8; 32];
+                repr.copy_from_slice(bytes);
+                repr[31] &= 0x1F;
+                Fr::from_repr_vartime(repr.into()).unwrap_or(Fr::ZERO)
+            }).collect();
+
+            let old_hash = if pis.len() >= 2 { (pis[0], pis[1]) } else { (Fr::ZERO, Fr::ZERO) };
+            let new_hash = if pis.len() >= 4 { (pis[2], pis[3]) } else { (Fr::ZERO, Fr::ZERO) };
+            let loss = if pis.len() >= 5 { pis[4] } else { Fr::ZERO };
+            let total_error = if pis.len() >= 6 { pis[5] } else { Fr::ZERO };
+
+            TrainingProofResultV2 {
+                proof: step.proof.clone(),
+                public_inputs: pis,
+                loss,
+                total_error,
+                step_number: step.step_index,
+                old_state_hash: old_hash,
+                new_state_hash: new_hash,
+                verified: true,
+                generation_time: Duration::from_millis(step.generation_time_ms),
+                verification_time: None,
+                attempts: 1,
+                from_cache: false,
+                witness_hash: None,
+            }
+        }).collect()
+    }
+
+    /// Aggregates training proof results directly (no StepProof conversion needed).
+    ///
+    /// This is the preferred API when you already have `TrainingProofResultV2` values
+    /// (e.g., from `MLTrainingProverV2`). Produces a single aggregated proof with
+    /// 8 public inputs matching the on-chain contract interface.
+    pub fn aggregate_training_proofs(
+        proofs: &[TrainingProofResultV2],
+    ) -> Result<AggregatedTrainingProof, String> {
+        Self::try_rlc_aggregation(proofs)
     }
 
     /// Computes the RLC commitment from step proofs using Poseidon hashing.
