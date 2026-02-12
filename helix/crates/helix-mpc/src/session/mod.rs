@@ -22,12 +22,16 @@
 //! - Session key derivation
 
 pub mod channel;
+pub mod checkpoint;
 pub mod establishment;
+pub mod health;
 pub mod key_rotation;
 pub mod manager;
 pub mod multiplexer;
 pub mod network;
+pub mod node_transport;
 pub mod party_selection;
+pub mod registry;
 pub mod secure_channel;
 pub mod transport;
 
@@ -56,3 +60,10 @@ pub use party_selection::{
 pub use transport::{HandshakeMessage, LocalTransport, MPCTransport};
 #[cfg(feature = "network-mpc")]
 pub use transport::TcpTransport;
+pub use checkpoint::{SessionCheckpoint, SessionPersistence};
+pub use health::{HealthConfig, HealthEvent, HealthStatus, PartyHealthMonitor};
+pub use node_transport::{MPCMessageRouter, NodeTransport, PeerMapping, TaggedMessage};
+pub use registry::{
+    PartyCapabilities, PartyRegistry, PartyStatus, RegisteredParty, RegistryConfig,
+    SelectionCriteria,
+};

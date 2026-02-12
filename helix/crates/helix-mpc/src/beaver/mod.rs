@@ -21,6 +21,7 @@
 //! - `DistributedTripleGen`: Simulated distributed generation
 //! - `OTTripleGenerator`: OT-based distributed generation (no trusted party)
 
+pub mod async_pool;
 pub mod dealer;
 pub mod distributed;
 pub mod ot;
@@ -37,3 +38,4 @@ pub use pipeline::{
     BeaverPipeline, DemandPredictor, GenerationRequest, PipelineBuilder,
     PipelineConfig, PipelineStats, Priority, TripleSource,
 };
+pub use async_pool::{AsyncPoolConfig, AsyncTriplePool};
