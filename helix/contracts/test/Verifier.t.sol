@@ -2,7 +2,6 @@
 pragma solidity ^0.8.19;
 
 import "forge-std/Test.sol";
-import "../src/verification/HelixVerifier.sol";
 import "../src/verification/Halo2Verifier.sol";
 import "../src/mocks/MockVerifier.sol";
 import "./ProofFixtures.t.sol";
@@ -146,13 +145,6 @@ contract VerifierTest is Test {
         (uint256 gasUsed, uint256 perProofGas) = halo2Verifier.estimateBatchVerifyGas(proofs, inputs);
         assertGt(gasUsed, 0);
         assertEq(perProofGas, gasUsed / 3);
-    }
-
-    // ============ HelixVerifier Tests ============
-
-    function test_HelixVerifier_ConstructorReverts_Deprecated() public {
-        vm.expectRevert("DEPRECATED: Use Halo2Verifier instead");
-        new HelixVerifier();
     }
 
     // ============ MockVerifier Tests ============

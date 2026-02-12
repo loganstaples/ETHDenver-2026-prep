@@ -297,41 +297,33 @@ impl TestEnv {
 
 /// Compute the error checksum matching HelixCoordinatorV2._computeErrorChecksum.
 ///
-/// SHA256(errorBound_LE64 || stepNumber_LE64 || modelId_32bytes || errorBudget_LE64)
-/// Returns the first 8 bytes interpreted as LE u64.
+/// Uses Poseidon hash matching both the Rust circuit (training_step_v2.rs) and
+/// the Solidity contract (PoseidonHasher.sol):
+///   h1 = Poseidon(errorBound, stepNumber)
+///   h2 = Poseidon(modelId, errorBudget)
+///   checksum = Poseidon(h1, h2)
 fn compute_error_checksum(
     error_bound: u64,
     step_number: u64,
     model_id: u64,
     max_error_bound: U256,
 ) -> U256 {
-    use sha2::{Digest, Sha256};
+    use ff::PrimeField;
+    use helix_circuits::gadgets::poseidon_hash_two;
+    use helix_circuits::halo2curves::bn256::Fr;
 
-    let mut data = Vec::with_capacity(56);
+    let error_bound_fr = Fr::from(error_bound);
+    let step_number_fr = Fr::from(step_number);
+    let model_id_fr = Fr::from(model_id);
+    let error_budget_fr = Fr::from(max_error_bound.as_u64());
 
-    // errorBound as LE u64
-    data.extend_from_slice(&error_bound.to_le_bytes());
+    let h1 = poseidon_hash_two(error_bound_fr, step_number_fr);
+    let h2 = poseidon_hash_two(model_id_fr, error_budget_fr);
+    let checksum = poseidon_hash_two(h1, h2);
 
-    // stepNumber as LE u64
-    data.extend_from_slice(&step_number.to_le_bytes());
-
-    // modelId as 32 bytes (big-endian U256)
-    let mut model_id_bytes = [0u8; 32];
-    U256::from(model_id).to_big_endian(&mut model_id_bytes);
-    data.extend_from_slice(&model_id_bytes);
-
-    // errorBudget as LE u64
-    let budget = max_error_bound.as_u64();
-    data.extend_from_slice(&budget.to_le_bytes());
-
-    assert_eq!(data.len(), 56);
-
-    let hash = Sha256::digest(&data);
-
-    // Take first 8 bytes of hash as BE, then interpret as LE u64
-    let first_8: [u8; 8] = hash[..8].try_into().unwrap();
-    let result = u64::from_le_bytes(first_8);
-    U256::from(result)
+    // Convert Fr (little-endian repr) to ethers U256
+    let repr = checksum.to_repr();
+    U256::from_little_endian(repr.as_ref())
 }
 
 /// Compute keccak256(abi.encodePacked(lo, hi)) matching Solidity's _hashPair.
@@ -1353,7 +1345,7 @@ fn test_training_proof_inputs_roundtrip() {
     assert_eq!(parsed.to_vec(), vec);
 }
 
-/// Test: Error checksum computation matches Solidity implementation.
+/// Test: Error checksum (Poseidon) matches both Rust circuit and Solidity PoseidonHasher.
 #[test]
 fn test_error_checksum_computation() {
     // Test known values

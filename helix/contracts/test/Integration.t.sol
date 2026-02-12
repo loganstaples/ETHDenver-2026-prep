@@ -6,7 +6,6 @@ import "../src/core/HelixCoordinatorV2.sol";
 import "../src/core/TrainingRound.sol";
 import "../src/verification/Halo2Verifier.sol";
 import "../src/verification/AggregationVerifier.sol";
-import "../src/verification/BoundsChecker.sol";
 import "../src/mocks/MockVerifier.sol";
 import "./ProofFixtures.t.sol";
 
@@ -20,7 +19,6 @@ contract IntegrationTest is Test {
     MockVerifier public mockVerifier;
     TrainingRound public trainingRound;
     AggregationVerifier public aggregationVerifier;
-    BoundsChecker public boundsChecker;
 
     // ============ Actors ============
     address public owner;
@@ -61,7 +59,6 @@ contract IntegrationTest is Test {
         coordinator = new HelixCoordinatorV2(address(mockVerifier), treasury);
         trainingRound = new TrainingRound();
         aggregationVerifier = new AggregationVerifier(address(mockVerifier));
-        boundsChecker = new BoundsChecker(1000);
 
         // Set up coordinator as TrainingRound coordinator
         trainingRound.setCoordinator(address(coordinator));

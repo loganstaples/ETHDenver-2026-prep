@@ -32,7 +32,10 @@ contract DeployScript is Script {
     // ============ V2 Deployment (Legacy) ============
 
     /// @notice Deploy V2 with default SRS (G2 generator, s=1)
+    /// @dev WARNING: Trivial SRS (s=1) allows proof forgery. Use only for testing.
     function run() public returns (address, address) {
+        console.log("WARNING: Deploying with trivial SRS (s=1). Anyone can forge proofs.");
+        console.log("         For production, use runWithVK() with real SRS parameters.");
         return deployWithVK(Halo2VKDefaults.g2Generator());
     }
 
@@ -100,8 +103,10 @@ contract DeployScript is Script {
     // ============ V3 Full Stack Deployment ============
 
     /// @notice Deploy V3 full stack with default SRS (G2 generator, s=1)
-    /// @dev Deploys: HelixToken, Staking, Rewards, ModelRegistry, Halo2Verifier, HelixCoordinatorV3
+    /// @dev WARNING: Trivial SRS (s=1) allows proof forgery. Use only for testing.
     function deployV3() public {
+        console.log("WARNING: Deploying V3 with trivial SRS (s=1). Anyone can forge proofs.");
+        console.log("         For production, use deployV3WithVK() with real SRS parameters.");
         _deployV3Stack(Halo2VKDefaults.g2Generator());
     }
 

@@ -9,7 +9,6 @@ import "../src/verification/Halo2Verifier.sol";
 import "../src/verification/DataVerifier.sol";
 import "../src/verification/SlashingEvidence.sol";
 import "../src/verification/AggregationVerifier.sol";
-import "../src/verification/BoundsChecker.sol";
 import "../src/token/HelixToken.sol";
 import "../src/token/Staking.sol";
 import "../src/token/Rewards.sol";
@@ -33,7 +32,6 @@ contract DeployLocalScript is Script {
     SlashingEvidence public slashingEvidence;
     TrainingRound public trainingRound;
     AggregationVerifier public aggregationVerifier;
-    BoundsChecker public boundsChecker;
     HelixToken public helixToken;
     Staking public staking;
     Rewards public rewards;
@@ -102,10 +100,6 @@ contract DeployLocalScript is Script {
         aggregationVerifier = new AggregationVerifier(address(verifier));
         console.log("  AggregationVerifier:", address(aggregationVerifier));
 
-        // Deploy Bounds Checker (max error 1000)
-        boundsChecker = new BoundsChecker(1000);
-        console.log("  BoundsChecker:", address(boundsChecker));
-
         // ========== Phase 3: Deploy Token Infrastructure ==========
         console.log("\nPhase 3: Deploying Token Infrastructure...");
 
@@ -156,7 +150,6 @@ contract DeployLocalScript is Script {
         console.log("\nTraining:");
         console.log("  TrainingRound:     ", address(trainingRound));
         console.log("  AggregationVerifier:", address(aggregationVerifier));
-        console.log("  BoundsChecker:     ", address(boundsChecker));
         console.log("\nTokens:");
         console.log("  HelixToken:", address(helixToken));
         console.log("  Staking:   ", address(staking));

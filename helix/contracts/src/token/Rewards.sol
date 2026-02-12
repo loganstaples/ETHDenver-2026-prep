@@ -226,6 +226,7 @@ contract Rewards is ReentrancyGuard {
     }
     
     /// @notice Award a bonus to a participant (e.g., for early adoption)
+    /// @dev Transfers tokens directly to recipient to avoid unreachable pending rewards.
     function awardBonus(
         address recipient,
         uint256 amount,
@@ -237,10 +238,13 @@ contract Rewards is ReentrancyGuard {
             rewardPool.totalRewards - rewardPool.distributedRewards >= amount,
             "Insufficient reward pool"
         );
-        
+
         rewardPool.distributedRewards += amount;
         claimInfo[recipient].totalEarned += amount;
-        
+        claimInfo[recipient].totalClaimed += amount;
+
+        helixToken.safeTransfer(recipient, amount);
+
         emit BonusAwarded(recipient, amount, reason);
     }
     

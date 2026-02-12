@@ -60,7 +60,7 @@ cargo test --test verification_consistency
 ### Smart Contracts (helix/contracts/src/)
 
 - **core/**: `HelixCoordinatorV2` (main coordinator), `ModelRegistry`, `TrainingRound`
-- **verification/**: `Halo2Verifier` (BN254 pairing-based KZG verification), `BoundsChecker`, `AggregationVerifier`
+- **verification/**: `Halo2Verifier` (BN254 pairing-based KZG verification), `PoseidonHasher` (error checksum), `AggregationVerifier`
 - **token/**: `HelixToken` (ERC20), `Staking`, `Rewards`
 - **governance/**: `TrainingDAO`
 

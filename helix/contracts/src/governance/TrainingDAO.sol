@@ -270,7 +270,7 @@ contract TrainingDAO is ReentrancyGuard {
         require(!proposal.cancelled, "Already cancelled");
         require(
             msg.sender == proposal.proposer ||
-            votesToken.getVotes(proposal.proposer) < govConfig.proposalThreshold,
+            votesToken.getPastVotes(proposal.proposer, proposal.snapshotBlock) < govConfig.proposalThreshold,
             "Cannot cancel"
         );
 

@@ -67,12 +67,25 @@ contract Halo2Verifier is IHelixVerifier {
     /// @notice Deploys the verifier with the given SRS [s]₂ point
     /// @param sG2 The SRS G2 point coordinates: [x0, x1, y0, y1]
     ///        For testing with trivial SRS (s=1), pass the G2 generator via Halo2VKDefaults.g2Generator()
+    /// @dev WARNING: A trivial SRS (s=1, i.e. the G2 generator) allows anyone to forge proofs.
+    ///      Only use Halo2VKDefaults.g2Generator() in test environments.
+    ///      Production deployments MUST use a real [s]₂ from a trusted setup ceremony.
     constructor(uint256[4] memory sG2) {
         owner = msg.sender;
         VK_S_G2_X0 = sG2[0];
         VK_S_G2_X1 = sG2[1];
         VK_S_G2_Y0 = sG2[2];
         VK_S_G2_Y1 = sG2[3];
+    }
+
+    /// @notice Returns true if the verifier was deployed with trivial SRS (s=1)
+    /// @dev Production systems should check this and reject trivial SRS deployments
+    function isTrivialSRS() external view returns (bool) {
+        uint256[4] memory gen = Halo2VKDefaults.g2Generator();
+        return VK_S_G2_X0 == gen[0] &&
+               VK_S_G2_X1 == gen[1] &&
+               VK_S_G2_Y0 == gen[2] &&
+               VK_S_G2_Y1 == gen[3];
     }
 
     // ============ External Functions ============

@@ -44,8 +44,7 @@ npm run build                                  # Production build
 
 **ZK Verification** (`src/verification/`):
 - `Halo2Verifier.sol` - BN254 pairing-based KZG proof verification (production)
-- `HelixVerifier.sol` - Alternative Halo2-compatible verifier
-- `BoundsChecker.sol` - Error bound claim verification
+- `PoseidonHasher.sol` - Poseidon hash matching Rust circuit (error checksum verification)
 - `AggregationVerifier.sol` - Gradient aggregation proof verification
 
 **Token & Incentives** (`src/token/`):
