@@ -25,6 +25,11 @@ pub use ml::training_step_v2::{
     MLTrainingStepV2Circuit, MLTrainingStepV2Witness, compute_witness_v2, compute_state_hash_v2,
     ErrorTracker, ToEvmProof, ToEvmPublicInputs,
 };
+pub use ml::training_step_v3::{
+    MLTrainingStepV3Circuit, MLTrainingStepV3Witness, LayerWitness,
+    compute_witness_v3, compute_state_hash_v3, create_zero_v3_witness,
+};
+pub use ml::config::{CircuitActivation, LossFunction, LayerSpec, MLPArchitecture};
 pub use ml::batch::{MLBatchCircuit, BatchProofResult, MAX_BATCH_SIZE};
 pub use ml::proof_aggregation::{
     SHPLONKAggregationCircuit, SHPLONKAggregationWitness, SHPLONKAggConfig,

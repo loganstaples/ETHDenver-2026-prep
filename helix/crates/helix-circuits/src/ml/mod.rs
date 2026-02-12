@@ -10,6 +10,7 @@ pub mod softmax;
 pub mod batch;
 pub mod proof_aggregation;
 pub mod training_step_v2;
+pub mod training_step_v3;
 pub mod transformer;
 
 #[cfg(test)]
@@ -19,4 +20,5 @@ pub use config::{
     TransformerConfig, TransformerConfigBuilder, TransformerBlockConfig,
     QuantizationConfig, QuantizationPrecision,
     ActivationType, PositionalEncodingType, AttentionType,
+    CircuitActivation, LossFunction, LayerSpec, MLPArchitecture,
 };

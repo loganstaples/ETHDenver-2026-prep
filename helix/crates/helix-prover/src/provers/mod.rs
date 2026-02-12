@@ -9,3 +9,4 @@ pub mod state_prover;
 pub mod step_prover;
 pub mod training_prover;
 pub mod training_prover_v2;
+pub mod training_prover_v3;

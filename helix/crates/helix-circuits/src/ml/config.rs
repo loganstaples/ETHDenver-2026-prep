@@ -652,6 +652,189 @@ impl TransformerConfigBuilder {
     }
 }
 
+// ============================================================================
+// MLP Architecture Configuration (for V3 N-layer circuit)
+// ============================================================================
+
+/// Activation function for a circuit layer.
+///
+/// These map directly to in-circuit constraint strategies:
+/// - `ReLU`: verified via lookup table (existing relu_table)
+/// - `Identity`: no constraints (pass-through)
+/// - `Tanh`: verified via lookup table (tanh_table)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CircuitActivation {
+    /// Rectified Linear Unit: max(0, x). Verified via ReLU lookup table.
+    ReLU,
+    /// Identity (no activation). No constraints needed.
+    Identity,
+    /// Hyperbolic tangent. Verified via tanh lookup table.
+    Tanh,
+}
+
+/// Loss function for the training step circuit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LossFunction {
+    /// Mean Squared Error: L = sum((y - target)^2).
+    MSE,
+    /// Cross-entropy loss: L = -sum(target * log(softmax(y))).
+    /// Uses log-sum-exp trick for numerical stability.
+    CrossEntropy,
+}
+
+/// Specification for a single layer in the MLP.
+#[derive(Clone, Debug)]
+pub struct LayerSpec {
+    /// Input dimension for this layer.
+    pub input_dim: usize,
+    /// Output dimension for this layer.
+    pub output_dim: usize,
+    /// Activation function applied after the affine transform.
+    pub activation: CircuitActivation,
+}
+
+/// N-layer MLP architecture configuration for the V3 circuit.
+///
+/// Describes the full network topology: layer dimensions, activations,
+/// and loss function. Used by `MLTrainingStepV3Circuit` and `compute_witness_v3`.
+///
+/// # Example
+/// ```
+/// use helix_circuits::ml::config::{MLPArchitecture, CircuitActivation, LossFunction};
+///
+/// // 3-layer MLP: 4 -> 8 (ReLU) -> 4 (ReLU) -> 2 (Identity)
+/// let arch = MLPArchitecture::from_dims(
+///     &[4, 8, 4, 2],
+///     &[CircuitActivation::ReLU, CircuitActivation::ReLU, CircuitActivation::Identity],
+///     LossFunction::MSE,
+/// );
+/// assert_eq!(arch.num_layers(), 3);
+/// assert_eq!(arch.input_dim(), 4);
+/// assert_eq!(arch.output_dim(), 2);
+/// ```
+#[derive(Clone, Debug)]
+pub struct MLPArchitecture {
+    /// Layer specifications in forward order.
+    pub layers: Vec<LayerSpec>,
+    /// Loss function for the training step.
+    pub loss: LossFunction,
+}
+
+impl MLPArchitecture {
+    /// Creates a legacy 2-layer MLP matching the V2 circuit.
+    ///
+    /// Architecture: `d_in -> d_hid (ReLU) -> d_out (Identity)`
+    pub fn two_layer_mlp(d_in: usize, d_hid: usize, d_out: usize) -> Self {
+        Self {
+            layers: vec![
+                LayerSpec {
+                    input_dim: d_in,
+                    output_dim: d_hid,
+                    activation: CircuitActivation::ReLU,
+                },
+                LayerSpec {
+                    input_dim: d_hid,
+                    output_dim: d_out,
+                    activation: CircuitActivation::Identity,
+                },
+            ],
+            loss: LossFunction::MSE,
+        }
+    }
+
+    /// Convenience builder from dimension list and activations.
+    ///
+    /// `dims` must have `activations.len() + 1` elements.
+    /// `dims[0]` is the input dimension, `dims[N]` is the output dimension.
+    pub fn from_dims(
+        dims: &[usize],
+        activations: &[CircuitActivation],
+        loss: LossFunction,
+    ) -> Self {
+        assert!(
+            dims.len() >= 2,
+            "Need at least 2 dimensions (input + output)"
+        );
+        assert_eq!(
+            dims.len() - 1,
+            activations.len(),
+            "Need exactly one activation per layer"
+        );
+
+        let layers = dims
+            .windows(2)
+            .zip(activations.iter())
+            .map(|(pair, &act)| LayerSpec {
+                input_dim: pair[0],
+                output_dim: pair[1],
+                activation: act,
+            })
+            .collect();
+
+        Self { layers, loss }
+    }
+
+    /// Validates that consecutive layer dimensions match.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.layers.is_empty() {
+            return Err("Architecture must have at least one layer".to_string());
+        }
+
+        for i in 1..self.layers.len() {
+            if self.layers[i].input_dim != self.layers[i - 1].output_dim {
+                return Err(format!(
+                    "Dimension mismatch between layer {} output ({}) and layer {} input ({})",
+                    i - 1,
+                    self.layers[i - 1].output_dim,
+                    i,
+                    self.layers[i].input_dim,
+                ));
+            }
+        }
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            if layer.input_dim == 0 || layer.output_dim == 0 {
+                return Err(format!("Layer {} has zero dimension", i));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Returns the network input dimension.
+    pub fn input_dim(&self) -> usize {
+        self.layers.first().map_or(0, |l| l.input_dim)
+    }
+
+    /// Returns the network output dimension.
+    pub fn output_dim(&self) -> usize {
+        self.layers.last().map_or(0, |l| l.output_dim)
+    }
+
+    /// Returns the number of layers.
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Returns the total number of weight parameters (weights + biases).
+    pub fn total_weight_count(&self) -> usize {
+        self.layers
+            .iter()
+            .map(|l| l.input_dim * l.output_dim + l.output_dim)
+            .sum()
+    }
+
+    /// Returns whether any layer uses Tanh activation.
+    pub fn uses_tanh(&self) -> bool {
+        self.layers.iter().any(|l| l.activation == CircuitActivation::Tanh)
+    }
+
+    /// Returns whether the loss function is cross-entropy.
+    pub fn uses_cross_entropy(&self) -> bool {
+        self.loss == LossFunction::CrossEntropy
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -777,5 +960,64 @@ mod tests {
         let summary = config.summary();
         assert!(summary.contains("d_model: 128"));
         assert!(summary.contains("Layers: 4"));
+    }
+
+    // ---- MLPArchitecture tests ----
+
+    #[test]
+    fn test_two_layer_mlp() {
+        let arch = MLPArchitecture::two_layer_mlp(4, 8, 2);
+        assert_eq!(arch.num_layers(), 2);
+        assert_eq!(arch.input_dim(), 4);
+        assert_eq!(arch.output_dim(), 2);
+        assert_eq!(arch.layers[0].activation, CircuitActivation::ReLU);
+        assert_eq!(arch.layers[1].activation, CircuitActivation::Identity);
+        assert!(arch.validate().is_ok());
+    }
+
+    #[test]
+    fn test_from_dims() {
+        let arch = MLPArchitecture::from_dims(
+            &[4, 8, 4, 2],
+            &[CircuitActivation::ReLU, CircuitActivation::Tanh, CircuitActivation::Identity],
+            LossFunction::MSE,
+        );
+        assert_eq!(arch.num_layers(), 3);
+        assert_eq!(arch.input_dim(), 4);
+        assert_eq!(arch.output_dim(), 2);
+        assert!(arch.uses_tanh());
+        assert!(!arch.uses_cross_entropy());
+        assert!(arch.validate().is_ok());
+    }
+
+    #[test]
+    fn test_total_weight_count() {
+        let arch = MLPArchitecture::two_layer_mlp(2, 3, 1);
+        // Layer 1: 2*3 + 3 = 9
+        // Layer 2: 3*1 + 1 = 4
+        assert_eq!(arch.total_weight_count(), 13);
+    }
+
+    #[test]
+    fn test_validate_dimension_mismatch() {
+        let arch = MLPArchitecture {
+            layers: vec![
+                LayerSpec { input_dim: 4, output_dim: 8, activation: CircuitActivation::ReLU },
+                LayerSpec { input_dim: 6, output_dim: 2, activation: CircuitActivation::Identity },
+            ],
+            loss: LossFunction::MSE,
+        };
+        assert!(arch.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_zero_dimension() {
+        let arch = MLPArchitecture {
+            layers: vec![
+                LayerSpec { input_dim: 0, output_dim: 4, activation: CircuitActivation::ReLU },
+            ],
+            loss: LossFunction::MSE,
+        };
+        assert!(arch.validate().is_err());
     }
 }
