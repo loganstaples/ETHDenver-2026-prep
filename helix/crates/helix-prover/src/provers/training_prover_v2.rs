@@ -1513,6 +1513,7 @@ mod tests {
 
     #[test]
     fn test_v2_prover_init() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Use minimal config (k=12) instead of default (k=14) to avoid
         // a 40-120s SRS generation that makes tests appear stuck.
         let config = V2ProverConfig::minimal();
@@ -1586,6 +1587,7 @@ mod tests {
 
     #[test]
     fn test_v2_prove_and_verify() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let config = V2ProverConfig::minimal();
         let prover = MLTrainingProverV2::with_config(2, 2, 1, config);
         let weights = small_model_weights();
@@ -1613,6 +1615,7 @@ mod tests {
 
     #[test]
     fn test_batch_proving() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let config = V2ProverConfig::minimal();
         let prover = BatchTrainingProverV2::with_config(2, 2, 1, config);
         let weights = small_model_weights();
@@ -1629,6 +1632,7 @@ mod tests {
 
     #[test]
     fn test_wrong_public_inputs_rejected() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let config = V2ProverConfig::minimal();
         let prover = MLTrainingProverV2::with_config(2, 2, 1, config);
         let weights = small_model_weights();
@@ -1680,6 +1684,7 @@ mod tests {
 
     #[test]
     fn test_to_evm_proof() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let config = V2ProverConfig::minimal();
         let prover = MLTrainingProverV2::with_config(2, 2, 1, config);
         let weights = small_model_weights();
@@ -1704,6 +1709,7 @@ mod tests {
 
     #[test]
     fn test_to_evm_public_inputs() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let config = V2ProverConfig::minimal();
         let prover = MLTrainingProverV2::with_config(2, 2, 1, config);
         let weights = small_model_weights();
@@ -1730,6 +1736,7 @@ mod tests {
 
     #[test]
     fn test_export_vk_data() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let config = V2ProverConfig::minimal();
         let prover = MLTrainingProverV2::with_config(2, 2, 1, config);
 
@@ -1742,6 +1749,7 @@ mod tests {
 
     #[test]
     fn test_evm_self_verification() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // With self_verify=true and KZG commitment scheme, prove performs:
         // 1. Native Halo2 verification
         // 2. Hard-fail EVM proof serialization and format validation
@@ -1769,6 +1777,7 @@ mod tests {
 
     #[test]
     fn test_deterministic_seed_produces_consistent_proofs() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let seed = [42u8; 32];
         let config = V2ProverConfig::minimal().deterministic(seed);
         let prover = MLTrainingProverV2::with_config(2, 2, 1, config);

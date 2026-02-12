@@ -288,6 +288,7 @@ mod tests {
 
     #[test]
     fn test_rlc_aggregation_two_steps() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prover = RLCAggregationProver::new(16, 14);
         assert!(prover.is_ready());
 
@@ -305,6 +306,7 @@ mod tests {
 
     #[test]
     fn test_rlc_aggregation_single_step() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prover = RLCAggregationProver::new(16, 14);
 
         let proofs = make_chained_proofs(1);
@@ -317,6 +319,7 @@ mod tests {
 
     #[test]
     fn test_rlc_chain_integrity() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prover = RLCAggregationProver::new(16, 14);
 
         // Create proofs with broken chain
@@ -331,6 +334,7 @@ mod tests {
 
     #[test]
     fn test_rlc_error_accumulation() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prover = RLCAggregationProver::new(16, 14);
 
         let proofs = make_chained_proofs(3);
@@ -344,6 +348,7 @@ mod tests {
 
     #[test]
     fn test_rlc_rejects_empty() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prover = RLCAggregationProver::new(16, 14);
         let result = prover.aggregate(&[]);
         assert!(result.is_err());
@@ -351,6 +356,7 @@ mod tests {
 
     #[test]
     fn test_rlc_boundary_hashes() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prover = RLCAggregationProver::new(16, 14);
 
         let proofs = make_chained_proofs(3);

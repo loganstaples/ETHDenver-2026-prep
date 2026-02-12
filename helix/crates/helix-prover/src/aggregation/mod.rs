@@ -1373,6 +1373,7 @@ mod tests {
 
     #[test]
     fn test_kzg_aggregator_basic() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let aggregator = KZGBatchAggregator::new();
         assert!(aggregator.is_ready());
 
@@ -1384,6 +1385,7 @@ mod tests {
 
     #[test]
     fn test_kzg_aggregator_verify() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let aggregator = KZGBatchAggregator::new();
         let proofs: Vec<ChunkProof> = (0..4).map(|i| make_test_proof(i)).collect();
         let agg = aggregator.aggregate(&proofs).expect("KZG aggregation should succeed");
@@ -1393,6 +1395,7 @@ mod tests {
 
     #[test]
     fn test_kzg_aggregator_empty_batch() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let aggregator = KZGBatchAggregator::new();
         let result = aggregator.aggregate(&[]);
         assert!(result.is_err(), "Empty batch should fail");
@@ -1408,6 +1411,7 @@ mod tests {
 
     #[test]
     fn test_kzg_circuit_mock_prover() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use helix_circuits::halo2_proofs::dev::MockProver;
 
         // Build the same circuit that the aggregator would build

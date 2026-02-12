@@ -614,6 +614,7 @@ mod tests {
 
     #[test]
     fn test_gradient_prover_basic() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prover = GradientProver::new();
         let data = make_test_gradient_data(0);
 
@@ -626,6 +627,7 @@ mod tests {
 
     #[test]
     fn test_gradient_verify() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prover = GradientProver::new();
         let data = make_test_gradient_data(0);
 
@@ -635,6 +637,7 @@ mod tests {
 
     #[test]
     fn test_gradient_batch() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prover = GradientProver::new();
         let batch: Vec<GradientData> = (0..3).map(make_test_gradient_data).collect();
 
@@ -648,6 +651,7 @@ mod tests {
 
     #[test]
     fn test_gradient_caching() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prover = GradientProver::new();
         let data = make_test_gradient_data(5);
 
@@ -664,6 +668,7 @@ mod tests {
 
     #[test]
     fn test_gradient_aggregation() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prover = GradientProver::new();
         let batch: Vec<GradientData> = (0..3).map(make_test_gradient_data).collect();
         let results = prover.prove_batch(&batch);
@@ -706,6 +711,7 @@ mod tests {
 
     #[test]
     fn test_distributed_prover() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prover = DistributedGradientProver::new(0, 3);
         let data = make_test_gradient_data(0);
 
@@ -717,6 +723,7 @@ mod tests {
 
     #[test]
     fn test_prover_stats() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prover = GradientProver::new();
         let data = make_test_gradient_data(0);
 
@@ -730,6 +737,7 @@ mod tests {
 
     #[test]
     fn test_error_bound_computation() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prover = GradientProver::new();
         let data = make_test_gradient_data(0);
 

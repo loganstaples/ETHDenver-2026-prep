@@ -192,6 +192,21 @@ pub mod prelude {
 }
 
 // =============================================================================
+// Test Serialization for Heavy Proof Tests
+// =============================================================================
+
+/// Shared lock to serialize heavy proof-generation tests.
+///
+/// Halo2 proof generation (k=12-14) uses significant memory (~100MB+ per SRS)
+/// and internally parallelizes via rayon. When cargo test runs many such tests
+/// concurrently (default = num_cpus threads), they contend for memory and CPU,
+/// causing OOM or extreme slowdown. This lock ensures at most one heavy proof
+/// test runs at a time.
+#[cfg(test)]
+pub(crate) static PROOF_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+// =============================================================================
 // Full Pipeline Integration Tests
 // =============================================================================
 
@@ -209,6 +224,7 @@ mod pipeline_integration_tests {
     /// through to a compressed, serialized proof artifact.
     #[test]
     fn test_full_pipeline_chunks_to_compressed() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Step 1: Create computation chunks representing training steps.
         let chunks: Vec<ComputationChunk> = (0..4).map(|i| {
             let mut input = [0u8; 32];
@@ -319,6 +335,7 @@ mod pipeline_integration_tests {
     /// Test that chunk proofs from parallel proving can be verified individually.
     #[test]
     fn test_pipeline_proof_verification() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use crate::pipeline::ProverPipeline;
         use crate::provers::ivc_circuit::IVCStepCircuit;
         use helix_circuits::halo2curves::bn256::Fr;
@@ -401,6 +418,7 @@ mod pipeline_integration_tests {
     /// Test compression modes with real proof data.
     #[test]
     fn test_pipeline_all_compression_modes() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Generate a real proof to compress (short timeout to prevent hangs)
         let prover = ParallelProver::with_config(ParallelConfig {
             num_threads: 1,

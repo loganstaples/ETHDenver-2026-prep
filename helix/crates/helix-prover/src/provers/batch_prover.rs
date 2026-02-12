@@ -655,8 +655,22 @@ impl BatchProver {
     }
 
     fn wait_with_progress(&self, total: usize) -> Vec<ChunkProof> {
+        let start = Instant::now();
+        let timeout = Duration::from_secs(300);
+
         loop {
-            let (completed, _) = self.parallel_prover.progress();
+            // Check timeout to prevent infinite hang.
+            if start.elapsed() > timeout {
+                tracing::error!(
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    total,
+                    "wait_with_progress timed out"
+                );
+                break;
+            }
+
+            let (completed, failed, _) = self.parallel_prover.completion_summary();
+            let finished = completed + failed;
 
             // Update status.
             {
@@ -665,7 +679,8 @@ impl BatchProver {
                 }
             }
 
-            if completed >= total {
+            // Break when all tasks have reached a terminal state (Complete or Failed).
+            if finished >= total {
                 break;
             }
 
@@ -1184,6 +1199,7 @@ mod tests {
 
     #[test]
     fn test_batch_prover_basic() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prover = BatchProver::new(BatchConfig {
             num_threads: 2,
             ..Default::default()
@@ -1199,6 +1215,7 @@ mod tests {
 
     #[test]
     fn test_batch_prover_builder() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prover = BatchProverBuilder::new()
             .threads(2)
             .max_memory_proofs(100)
@@ -1222,6 +1239,7 @@ mod tests {
 
     #[test]
     fn test_batch_status() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prover = BatchProver::new(BatchConfig::default());
 
         assert_eq!(prover.status(), BatchStatus::Pending);
@@ -1234,6 +1252,7 @@ mod tests {
 
     #[test]
     fn test_streaming_batch() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prover = BatchProver::new(BatchConfig {
             num_threads: 2,
             max_memory_proofs: 2,
@@ -1249,6 +1268,7 @@ mod tests {
 
     #[test]
     fn test_aggregated_proof() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prover = BatchProver::new(BatchConfig {
             num_threads: 2,
             aggregate_proofs: true,
@@ -1290,6 +1310,7 @@ mod tests {
 
     #[test]
     fn test_epoch_prover() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let config = BatchConfig {
             num_threads: 2,
             ..Default::default()
@@ -1306,6 +1327,7 @@ mod tests {
 
     #[test]
     fn test_batch_stats() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prover = BatchProver::new(BatchConfig {
             num_threads: 2,
             ..Default::default()
@@ -1321,6 +1343,7 @@ mod tests {
 
     #[test]
     fn test_kzg_aggregated_proof_smaller_than_sum() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prover = BatchProver::new(BatchConfig {
             num_threads: 2,
             aggregate_proofs: true,
@@ -1347,6 +1370,7 @@ mod tests {
 
     #[test]
     fn test_kzg_aggregation_produces_verifiable_proof() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prover = BatchProver::new(BatchConfig {
             num_threads: 2,
             aggregate_proofs: true,

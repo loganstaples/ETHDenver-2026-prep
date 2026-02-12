@@ -781,7 +781,7 @@ impl ParallelProver {
     }
 
     /// Returns (completed, failed, total) counts.
-    fn completion_summary(&self) -> (usize, usize, usize) {
+    pub(crate) fn completion_summary(&self) -> (usize, usize, usize) {
         let status = self.status.read().unwrap_or_else(|e| e.into_inner());
         let total = status.len();
         let completed = status.values().filter(|s| matches!(s, ProofStatus::Complete)).count();
@@ -1368,6 +1368,7 @@ mod tests {
 
     #[test]
     fn test_parallel_prover_prove() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prover = ParallelProver::with_config(test_config(2));
 
         for i in 0..4 {
@@ -1436,6 +1437,7 @@ mod tests {
 
     #[test]
     fn test_parallel_prover_with_dependencies() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prover = ParallelProver::with_config(ParallelConfig {
             task_affinity: true,
             ..test_config(2)
@@ -1461,6 +1463,7 @@ mod tests {
 
     #[test]
     fn test_batch_proof_with_dependencies() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let chunks: Vec<_> = (0..4).map(|i| make_test_chunk(i)).collect();
 
         let result = prove_batch_with_dependencies(
@@ -1477,6 +1480,7 @@ mod tests {
 
     #[test]
     fn test_proof_bytes_are_valid_halo2() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Verify that the generated proofs are actual Halo2 KZG proofs
         // that pass verification with the correct public inputs.
         let prover = ParallelProver::with_config(test_config(1));
@@ -1516,6 +1520,7 @@ mod tests {
 
     #[test]
     fn test_shared_pipeline_consistency() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // All proofs from different workers should be verifiable with the same VK
         let prover = ParallelProver::with_config(test_config(3));
 
@@ -1557,6 +1562,7 @@ mod tests {
 
     #[test]
     fn test_work_stealing_actually_steals() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Force all tasks to one worker, then verify stealing happens
         let prover = ParallelProver::with_config(ParallelConfig {
             work_stealing: true,
@@ -1597,6 +1603,7 @@ mod tests {
 
     #[test]
     fn test_progress_tracking() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prover = ParallelProver::with_config(test_config(2));
 
         for i in 0..4 {
@@ -1618,6 +1625,7 @@ mod tests {
 
     #[test]
     fn test_prove_batch_function() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let chunks: Vec<_> = (0..3).map(|i| make_test_chunk(i)).collect();
         let result = prove_batch(chunks, test_config(2)).expect("batch should succeed");
 

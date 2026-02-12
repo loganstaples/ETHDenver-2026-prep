@@ -353,12 +353,14 @@ mod tests {
 
     #[test]
     fn test_training_step_prover_init() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prover = TrainingStepProver::new([0u8; 32]);
         assert_eq!(prover.step_count(), 0);
     }
 
     #[test]
     fn test_prove_single_training_step() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let config = TrainingStepConfig {
             num_layers: 4,
             num_parameters: 100,
@@ -387,6 +389,7 @@ mod tests {
 
     #[test]
     fn test_prove_ml_training_step() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let data = TrainingStepData {
             d_in: 2,
             d_hid: 2,
@@ -412,6 +415,7 @@ mod tests {
 
     #[test]
     fn test_ml_proof_chains_into_ivc() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Verify that a single ML step correctly anchors into IVC state.
         let data = TrainingStepData {
             d_in: 2,
@@ -443,6 +447,7 @@ mod tests {
 
     #[test]
     fn test_ml_proof_independent_verification() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Generate an ML proof and verify it using the prover's own pipeline.
         // KZG verification requires the same SRS/VK, so we verify through the
         // step prover rather than creating a separate prover instance.

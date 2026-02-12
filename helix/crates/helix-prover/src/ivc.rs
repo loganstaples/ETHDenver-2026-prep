@@ -980,6 +980,7 @@ mod tests {
 
     #[test]
     fn test_ivc_single_step() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let initial = [0u8; 32];
         let mut prover = IVCProver::new(initial);
 
@@ -993,6 +994,7 @@ mod tests {
 
     #[test]
     fn test_ivc_multiple_steps() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let initial = [0u8; 32];
         let mut prover = IVCProver::new(initial);
 
@@ -1010,6 +1012,7 @@ mod tests {
 
     #[test]
     fn test_ivc_finalize() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let initial = [0u8; 32];
         let mut prover = IVCProver::new(initial);
 
@@ -1023,6 +1026,7 @@ mod tests {
 
     #[test]
     fn test_ivc_a1_step_proof_verify() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Verify that the A1 step pipeline can generate and verify a proof
         let initial = [0u8; 32];
         let prover = IVCProver::new(initial);
@@ -1051,6 +1055,7 @@ mod tests {
 
     #[test]
     fn test_ivc_folding_proof() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use helix_circuits::IVCFoldingWitness;
 
         // Verify that the fold pipeline can prove accumulator folding
@@ -1096,6 +1101,7 @@ mod tests {
 
     #[test]
     fn test_ivc_chain_tracks_accumulator() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let initial = [0u8; 32];
         let mut prover = IVCProver::new(initial);
 
@@ -1110,6 +1116,7 @@ mod tests {
 
     #[test]
     fn test_ivc_fold_and_verify() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let initial = [0u8; 32];
         let config = IVCConfig {
             steps_per_fold: 2,  // fold after 2 steps
@@ -1183,6 +1190,7 @@ mod tests {
 
     #[test]
     fn test_ivc_reset() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let initial = [0u8; 32];
         let mut prover = IVCProver::new(initial);
 
@@ -1197,6 +1205,7 @@ mod tests {
 
     #[test]
     fn test_ivc_fold_three_plus_steps_valid_proof() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let initial = [0u8; 32];
         let config = IVCConfig {
             steps_per_fold: 4, // fold after 4 steps
