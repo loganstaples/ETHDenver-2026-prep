@@ -57,6 +57,28 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
         uint256[] publicInputs;
     }
 
+    /// @notice Per-round participant proof data
+    struct RoundParticipant {
+        uint256 newCommitmentLo;
+        uint256 newCommitmentHi;
+        uint256 loss;
+        uint256 errorBound;
+        uint40 submittedAt;
+        bytes32 proofHash;
+    }
+
+    /// @notice Extended round data for multi-participant rounds
+    struct RoundExt {
+        uint32 minParticipants;
+        uint32 validProofs;
+        uint40 disputeDeadline;
+        uint40 startedAt;
+        bool finalized;
+        address bestProver;
+        uint256 bestLoss;
+        uint256 bestNewCommitment;
+    }
+
     // ============ Constants ============
 
     uint256 public constant DEFAULT_MAX_ERROR_BOUND = 1e18;
@@ -67,6 +89,8 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
     uint8 public constant EXPECTED_PUBLIC_INPUTS = 8;
     uint256 public constant MIN_RECOVERY_TIMELOCK = 1 hours;
     uint256 public constant MAX_RECOVERY_TIMELOCK = 30 days;
+    uint256 public constant DISPUTE_PERIOD = 1 hours;
+    uint32 public constant DEFAULT_MIN_PARTICIPANTS = 1;
 
     // ============ External Contracts ============
 
@@ -139,6 +163,15 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
     /// @notice Data root per round
     mapping(uint256 => mapping(uint256 => bytes32)) public roundDataRoot;
 
+    /// @notice Extended round data for multi-participant rounds
+    mapping(uint256 => mapping(uint256 => RoundExt)) public roundsExt;
+
+    /// @notice Per-round participant proof data
+    mapping(uint256 => mapping(uint256 => mapping(address => RoundParticipant))) public roundParticipants;
+
+    /// @notice List of participants per round
+    mapping(uint256 => mapping(uint256 => address[])) internal roundParticipantList;
+
     // ============ Events ============
 
     event ModelRegistered(
@@ -197,6 +230,8 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
     event ChallengerConfigUpdated(uint16 rewardPercentage, bool enabled);
     event DataCommitmentSet(uint256 indexed modelId, bytes32 indexed dataRoot, address indexed setBy);
     event RoundDataCommitted(uint256 indexed modelId, uint256 indexed roundId, bytes32 dataRoot);
+    event RoundExpired(uint256 indexed modelId, uint256 indexed roundId, uint32 validProofs, uint32 required);
+    event RoundFinalized(uint256 indexed modelId, uint256 indexed roundId, address indexed bestProver, uint256 bestLoss);
 
     // ============ Modifiers ============
 
@@ -291,11 +326,25 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
         emit ModelRegistered(modelId, msg.sender, initialCommitment, ipfsHash);
     }
 
-    /// @notice Starts a new training round
+    /// @notice Starts a new training round (backward compatible, single-participant auto-finalize)
     function startRound(
         uint256 modelId,
         uint256 duration
     ) external whenNotPaused nonReentrant modelExists(modelId) {
+        _startRound(modelId, duration, DEFAULT_MIN_PARTICIPANTS);
+    }
+
+    /// @notice Starts a new training round requiring multiple participants
+    function startRoundWithThreshold(
+        uint256 modelId,
+        uint256 duration,
+        uint32 minParticipants
+    ) external whenNotPaused nonReentrant modelExists(modelId) {
+        require(minParticipants > 0, "Min participants must be > 0");
+        _startRound(modelId, duration, minParticipants);
+    }
+
+    function _startRound(uint256 modelId, uint256 duration, uint32 minParticipants) internal {
         Model storage model = models[modelId];
         require(msg.sender == model.owner, "Only model owner");
         require(model.active, "Model not active");
@@ -309,6 +358,17 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
             deadline: deadline,
             isCompleted: false,
             prover: address(0)
+        });
+
+        roundsExt[modelId][roundId] = RoundExt({
+            minParticipants: minParticipants,
+            validProofs: 0,
+            disputeDeadline: uint40(block.timestamp + duration + DISPUTE_PERIOD),
+            startedAt: uint40(block.timestamp),
+            finalized: false,
+            bestProver: address(0),
+            bestLoss: type(uint256).max,
+            bestNewCommitment: 0
         });
 
         emit RoundStarted(modelId, roundId, deadline, model.currentCommitment);
@@ -358,6 +418,7 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
 
         Model storage model = models[modelId];
         Round storage round = rounds[modelId][roundId];
+        RoundExt storage ext = roundsExt[modelId][roundId];
 
         // Validate round
         require(roundId == model.currentRound, "Invalid round");
@@ -417,35 +478,97 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
             return;
         }
 
-        // Extract new commitment
-        uint256 newCommitment = _hashPair(publicInputs[2], publicInputs[3]);
+        // Record participant data
+        uint256 loss = publicInputs[4];
+        roundParticipants[modelId][roundId][prover] = RoundParticipant({
+            newCommitmentLo: publicInputs[2],
+            newCommitmentHi: publicInputs[3],
+            loss: loss,
+            errorBound: stepErrorBound,
+            submittedAt: uint40(block.timestamp),
+            proofHash: proofHash
+        });
+        roundParticipantList[modelId][roundId].push(prover);
+        ext.validProofs++;
 
-        // Update state
+        // Track best (lowest) loss
+        if (loss < ext.bestLoss) {
+            ext.bestLoss = loss;
+            ext.bestProver = prover;
+            ext.bestNewCommitment = _hashPair(publicInputs[2], publicInputs[3]);
+        }
+
+        uint256 newCommitment = _hashPair(publicInputs[2], publicInputs[3]);
+        emit ProofSubmitted(modelId, roundId, prover, newCommitment, stepErrorBound);
+
+        // For single-participant rounds (backward compat), auto-finalize
+        if (ext.minParticipants <= 1) {
+            _finalizeRound(modelId, roundId);
+        }
+    }
+
+    // ============ Round Finalization ============
+
+    /// @notice Finalize a multi-participant round after dispute period
+    function finalizeRound(uint256 modelId, uint256 roundId) external whenNotPaused nonReentrant {
+        RoundExt storage ext = roundsExt[modelId][roundId];
+        Round storage round = rounds[modelId][roundId];
+
+        require(!round.isCompleted, "Round already completed");
+        require(!ext.finalized, "Round already finalized");
+        require(ext.minParticipants > 1, "Use submitProof for single-participant rounds");
+        require(block.timestamp > ext.disputeDeadline, "Dispute period not ended");
+        require(ext.validProofs >= ext.minParticipants, "Insufficient participants");
+
+        _finalizeRound(modelId, roundId);
+        emit RoundFinalized(modelId, roundId, ext.bestProver, ext.bestLoss);
+    }
+
+    /// @notice Expire a round that didn't meet participant threshold
+    function expireRound(uint256 modelId, uint256 roundId) external whenNotPaused nonReentrant {
+        Round storage round = rounds[modelId][roundId];
+        RoundExt storage ext = roundsExt[modelId][roundId];
+
+        require(!round.isCompleted, "Round already completed");
+        require(!ext.finalized, "Round already finalized");
+        require(block.timestamp > round.deadline, "Submission still open");
+        require(ext.validProofs < ext.minParticipants, "Threshold met, use finalizeRound");
+
+        round.isCompleted = true;
+        ext.finalized = true;
+
+        emit RoundExpired(modelId, roundId, ext.validProofs, ext.minParticipants);
+    }
+
+    /// @dev Internal finalization - updates model commitment, registry, rewards
+    function _finalizeRound(uint256 modelId, uint256 roundId) internal {
+        Model storage model = models[modelId];
+        Round storage round = rounds[modelId][roundId];
+        RoundExt storage ext = roundsExt[modelId][roundId];
+
+        address bestProver = ext.bestProver;
+        uint256 newCommitment = ext.bestNewCommitment;
+        RoundParticipant storage best = roundParticipants[modelId][roundId][bestProver];
+
         model.currentCommitment = newCommitment;
         round.newCommitment = newCommitment;
         round.isCompleted = true;
-        round.prover = prover;
+        round.prover = bestProver;
+        ext.finalized = true;
 
-        // Track accumulated error bound
+        uint256 stepErrorBound = best.errorBound;
         uint256 newAccumulatedError = accumulatedErrorBound[modelId] + stepErrorBound;
         accumulatedErrorBound[modelId] = newAccumulatedError;
 
-        // Update ModelRegistry with checkpoint
-        modelRegistry.updateModel(
-            modelId,
-            bytes32(newCommitment),
-            roundId,
-            "",
-            stepErrorBound,
-            proofHash
-        );
+        modelRegistry.updateModel(modelId, bytes32(newCommitment), roundId, "", stepErrorBound, best.proofHash);
 
-        // Register participant for rewards and allocate round rewards
-        rewardsContract.registerParticipant(modelId, roundId, prover);
-        // Attempt to allocate rewards (may fail if pool is empty, which is OK)
+        // Register all round participants for rewards
+        address[] storage participants = roundParticipantList[modelId][roundId];
+        for (uint256 i = 0; i < participants.length; i++) {
+            rewardsContract.registerParticipant(modelId, roundId, participants[i]);
+        }
         try rewardsContract.allocateRoundRewards(modelId, roundId) {} catch {}
 
-        emit ProofSubmitted(modelId, roundId, prover, newCommitment, stepErrorBound);
         emit RoundCompleted(modelId, roundId, newCommitment, newAccumulatedError);
     }
 
@@ -531,6 +654,19 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
 
     function isProofUsed(bytes32 proofHash) external view returns (bool) {
         return usedProofHashes[proofHash];
+    }
+
+    function getRoundParticipants(uint256 modelId, uint256 roundId) external view returns (address[] memory) {
+        return roundParticipantList[modelId][roundId];
+    }
+
+    function getRoundExt(uint256 modelId, uint256 roundId) external view returns (
+        uint32 minParticipants, uint32 validProofs, uint40 disputeDeadline,
+        uint40 startedAt, bool finalized, address bestProver, uint256 bestLoss
+    ) {
+        RoundExt storage ext = roundsExt[modelId][roundId];
+        return (ext.minParticipants, ext.validProofs, ext.disputeDeadline,
+                ext.startedAt, ext.finalized, ext.bestProver, ext.bestLoss);
     }
 
     // ============ Admin Functions ============
