@@ -363,19 +363,29 @@ impl FileKeyStore {
     }
 }
 
-/// Generates a key set for a circuit (stub — returns deterministic placeholder bytes).
+/// Generates a placeholder key set for testing (NOT real cryptographic keys).
 ///
-/// For real Halo2 key generation use [`generate_keys_for_circuit`].
+/// Uses OS randomness for key material, but these are NOT real Halo2 proving/verification
+/// keys. For real Halo2 key generation use [`generate_keys_for_circuit`].
+#[deprecated(
+    since = "0.1.0",
+    note = "Use generate_keys_for_circuit() for real Halo2 keys. This function produces random bytes, not valid proving/verification keys."
+)]
 pub fn generate_keys<C>(
     circuit_name: &str,
     version: u32,
     k: u32,
 ) -> (KeyId, Vec<u8>, Vec<u8>, KeyMetadata) {
+    use rand_core::{OsRng, RngCore};
+
     let id = KeyId::new(circuit_name, version);
 
-    // Deterministic placeholder keys derived from circuit identity
-    let pk = format!("HELIX_PK:{}:k={}", id.0, k).into_bytes();
-    let vk = format!("HELIX_VK:{}:k={}", id.0, k).into_bytes();
+    // Random placeholder keys (NOT real cryptographic keys — use
+    // generate_keys_for_circuit() for production).
+    let mut pk = vec![0u8; 64];
+    let mut vk = vec![0u8; 64];
+    OsRng.fill_bytes(&mut pk);
+    OsRng.fill_bytes(&mut vk);
 
     let pk_hash = FileKeyStore::hash_bytes(&pk);
     let vk_hash = FileKeyStore::hash_bytes(&vk);
@@ -498,11 +508,16 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_generate_keys() {
         let (id, pk, vk, metadata) = generate_keys::<()>("test", 1, 10);
-        
-        assert!(pk.len() > 0);
-        assert!(vk.len() > 0);
+
+        assert_eq!(pk.len(), 64);
+        assert_eq!(vk.len(), 64);
         assert_eq!(metadata.k, 10);
+
+        // Verify keys are random (not deterministic placeholders)
+        let (_id2, pk2, _vk2, _meta2) = generate_keys::<()>("test", 1, 10);
+        assert_ne!(pk, pk2, "Keys should be random, not deterministic");
     }
 }

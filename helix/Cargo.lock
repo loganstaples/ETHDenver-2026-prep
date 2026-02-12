@@ -3698,6 +3698,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "criterion",
+ "ed25519-dalek",
  "flate2",
  "halo2_proofs",
  "halo2curves",

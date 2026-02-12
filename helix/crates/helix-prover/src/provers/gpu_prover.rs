@@ -537,13 +537,21 @@ impl CpuFallback {
         }
     }
 
-    /// Pairing implementation (placeholder - requires full pairing library).
+    /// Pairing implementation — PLACEHOLDER, NOT CRYPTOGRAPHICALLY VALID.
+    ///
+    /// This does NOT compute a real BN254 pairing. It returns a dummy value.
+    /// Real pairing verification happens through `halo2_proofs::verify_proof_multi`
+    /// which uses the halo2curves pairing engine, NOT this GPU code path.
+    ///
+    /// DO NOT use this for proof verification in production.
     fn pairing_internal(&self, _g1: &[u8], _g2: &[u8], result: &mut [u8]) {
-        // Full pairing implementation requires arkworks or similar library
-        // Return a non-zero placeholder to indicate operation was attempted
+        tracing::warn!(
+            "GPU pairing_internal called — this is a PLACEHOLDER, not a real pairing computation. \
+             Do not use for proof verification."
+        );
         result.fill(0);
         if !result.is_empty() {
-            result[0] = 1; // Non-identity marker
+            result[0] = 1; // Non-identity marker (placeholder)
         }
     }
 }
@@ -864,6 +872,9 @@ impl GpuBackend for CudaBackendImpl {
     }
 
     fn pairing(&self, _g1: &[u8], _g2: &[u8], result: &mut [u8]) -> GpuResult<()> {
+        tracing::warn!(
+            "CUDA pairing called — PLACEHOLDER, not a real pairing computation"
+        );
         let start = Instant::now();
 
         result.fill(0);
@@ -1025,6 +1036,9 @@ impl GpuBackend for MetalBackendImpl {
     }
 
     fn pairing(&self, _g1: &[u8], _g2: &[u8], result: &mut [u8]) -> GpuResult<()> {
+        tracing::warn!(
+            "Metal pairing called — PLACEHOLDER, not a real pairing computation"
+        );
         let start = Instant::now();
 
         result.fill(0);

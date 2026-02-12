@@ -30,7 +30,7 @@ use helix_circuits::halo2curves::{
     CurveAffine,
 };
 use rand::{rngs::StdRng, SeedableRng};
-use rand_core::OsRng;
+use rand_core::{OsRng, RngCore};
 use sha2::Digest;
 use std::fmt;
 use std::marker::PhantomData;
@@ -773,10 +773,13 @@ impl<C: Circuit<Fr> + Clone> ProverPipeline<C> {
         // Create transcript
         let mut transcript = Blake2bWrite::<_, _, Challenge255<_>>::init(vec![]);
 
-        // Get RNG based on configuration: StdRng::from_seed() always (never OsRng).
+        // Get RNG based on configuration.
         // When deterministic_seed is set, derive a per-proof seed by XORing
         // the base seed with the proof counter so each call gets unique but
-        // reproducible randomness.
+        // reproducible randomness. This is ONLY for reproducible testing.
+        //
+        // For production (deterministic_seed = None), use OsRng which provides
+        // cryptographically secure randomness from the OS entropy pool.
         let rng = if let Some(base_seed) = self.config.deterministic_seed {
             let mut seed = base_seed;
             let count = self.proof_count.load(Ordering::Relaxed);
@@ -786,18 +789,12 @@ impl<C: Circuit<Fr> + Clone> ProverPipeline<C> {
             }
             StdRng::from_seed(seed)
         } else {
-            // Use a seed derived from timestamp for some randomness
-            // while still being more controlled than OsRng in error cases
+            // Production path: seed StdRng from OsRng (cryptographic entropy).
+            // We use StdRng seeded from OsRng rather than OsRng directly because
+            // create_proof requires an rng implementing RngCore, and StdRng
+            // seeded from OsRng provides equivalent security guarantees.
             let mut seed = [0u8; 32];
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            seed[..16].copy_from_slice(&now.to_le_bytes());
-            // Use a hash of thread id for the remaining bytes
-            let thread_id = format!("{:?}", std::thread::current().id());
-            let hash = sha2::Sha256::digest(thread_id.as_bytes());
-            seed[16..32].copy_from_slice(&hash[..16]);
+            OsRng.fill_bytes(&mut seed);
             StdRng::from_seed(seed)
         };
 

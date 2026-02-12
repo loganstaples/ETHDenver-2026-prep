@@ -223,14 +223,36 @@ impl ProofBundle {
         self
     }
 
-    /// Signs the bundle with a private key (placeholder).
+    /// Signs the bundle with an ed25519 signing key.
+    ///
+    /// The signature covers the bundle hash (SHA-256 of header + public inputs + proof data).
+    /// The verifying key is embedded in the signature for verification.
+    #[cfg(feature = "crypto-sign")]
+    pub fn sign(mut self, signer_id: String, signing_key: &ed25519_dalek::SigningKey) -> Self {
+        use ed25519_dalek::Signer;
+        let bundle_hash = self.compute_hash();
+        let signature = signing_key.sign(&bundle_hash);
+        let verifying_key = signing_key.verifying_key();
+        self.signature = Some(BundleSignature {
+            signer_id,
+            signature: signature.to_bytes().to_vec(),
+            verifying_key: verifying_key.to_bytes().to_vec(),
+            timestamp: timestamp_now(),
+        });
+        self
+    }
+
+    /// Signs the bundle (no-op without `crypto-sign` feature).
+    #[cfg(not(feature = "crypto-sign"))]
     pub fn sign(mut self, signer_id: String, _private_key: &[u8]) -> Self {
         let bundle_hash = self.compute_hash();
         self.signature = Some(BundleSignature {
             signer_id,
-            signature: bundle_hash.to_vec(), // Placeholder - real impl would use EC signature
+            signature: bundle_hash.to_vec(),
+            verifying_key: vec![],
             timestamp: timestamp_now(),
         });
+        tracing::warn!("Bundle signed without crypto-sign feature — signature is NOT cryptographic");
         self
     }
 
@@ -261,15 +283,44 @@ impl ProofBundle {
         hasher.finalize().into()
     }
 
-    /// Verifies the bundle integrity.
+    /// Verifies the bundle's ed25519 signature.
+    ///
+    /// Returns `true` if the signature is valid, or if no signature is present.
+    /// Returns `false` if the signature fails verification.
+    #[cfg(feature = "crypto-sign")]
+    pub fn verify_integrity(&self) -> bool {
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+        let computed_hash = self.compute_hash();
+
+        if let Some(ref sig) = self.signature {
+            let vk_bytes: [u8; 32] = match sig.verifying_key.as_slice().try_into() {
+                Ok(b) => b,
+                Err(_) => return false,
+            };
+            let verifying_key = match VerifyingKey::from_bytes(&vk_bytes) {
+                Ok(vk) => vk,
+                Err(_) => return false,
+            };
+            let signature = match Signature::from_slice(&sig.signature) {
+                Ok(s) => s,
+                Err(_) => return false,
+            };
+            verifying_key.verify(&computed_hash, &signature).is_ok()
+        } else {
+            true // No signature to verify
+        }
+    }
+
+    /// Verifies the bundle integrity (hash-only fallback without `crypto-sign` feature).
+    #[cfg(not(feature = "crypto-sign"))]
     pub fn verify_integrity(&self) -> bool {
         let computed_hash = self.compute_hash();
 
         if let Some(ref sig) = self.signature {
-            // Verify signature matches hash
             sig.signature == computed_hash.to_vec()
         } else {
-            true // No signature to verify
+            true
         }
     }
 
@@ -530,8 +581,10 @@ pub struct BundleMetadata {
 pub struct BundleSignature {
     /// Signer identifier.
     pub signer_id: String,
-    /// Signature bytes.
+    /// Ed25519 signature bytes (64 bytes).
     pub signature: Vec<u8>,
+    /// Ed25519 verifying key bytes (32 bytes) for signature verification.
+    pub verifying_key: Vec<u8>,
     /// Signing timestamp.
     pub timestamp: u64,
 }
@@ -691,10 +744,35 @@ mod tests {
     #[test]
     fn test_bundle_integrity() {
         let proof = make_test_chunk_proof();
-        let bundle = ProofBundle::from_chunk_proof(&proof)
-            .sign("test_signer".into(), &[]);
 
-        assert!(bundle.verify_integrity());
+        #[cfg(feature = "crypto-sign")]
+        {
+            use ed25519_dalek::SigningKey;
+            use rand_core::OsRng;
+
+            let signing_key = SigningKey::generate(&mut OsRng);
+            let bundle = ProofBundle::from_chunk_proof(&proof)
+                .sign("test_signer".into(), &signing_key);
+            assert!(bundle.verify_integrity());
+
+            // Verify that a different key's signature fails
+            let wrong_key = SigningKey::generate(&mut OsRng);
+            let mut tampered = bundle.clone();
+            // Re-sign with wrong key but keep original verifying_key
+            let wrong_sig = {
+                use ed25519_dalek::Signer;
+                wrong_key.sign(&tampered.compute_hash())
+            };
+            tampered.signature.as_mut().unwrap().signature = wrong_sig.to_bytes().to_vec();
+            assert!(!tampered.verify_integrity());
+        }
+
+        #[cfg(not(feature = "crypto-sign"))]
+        {
+            let bundle = ProofBundle::from_chunk_proof(&proof)
+                .sign("test_signer".into(), &[]);
+            assert!(bundle.verify_integrity());
+        }
     }
 
     #[test]

@@ -5,10 +5,11 @@ edition = "2021"
 build = "build.rs"
 
 [features]
-default = ["parallel"]
+default = ["parallel", "crypto-sign"]
 parallel = ["rayon"]
 metal = ["metal-rs", "objc"]
 cuda = []  # CUDA backend - requires NVCC and CUDA Toolkit
+crypto-sign = ["ed25519-dalek"]
 
 [dependencies]
 helix-core = { path = "../helix-core" }
@@ -25,6 +26,7 @@ sha2 = "0.10"
 num-bigint = "0.4"
 rayon = { version = "1.8", optional = true }
 blake3 = "1.5"
+ed25519-dalek = { version = "2.1", features = ["rand_core"], optional = true }
 thiserror = "1.0"
 tracing = "0.1"
 flate2 = "1.0"
