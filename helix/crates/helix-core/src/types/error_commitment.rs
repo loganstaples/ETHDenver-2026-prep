@@ -25,7 +25,8 @@
 //!     .step_number(42)
 //!     .model_id([1u8; 32])
 //!     .budget_limit(0.01)
-//!     .build();
+//!     .build()
+//!     .unwrap();
 //!
 //! let checksum = commitment.compute_checksum();
 //! assert!(commitment.verify_within_budget());
@@ -124,8 +125,13 @@ impl ErrorCommitment {
     pub fn checksum_split(&self) -> (u128, u128) {
         let checksum = self.compute_checksum();
 
-        let lo = u128::from_le_bytes(checksum[0..16].try_into().unwrap());
-        let hi = u128::from_le_bytes(checksum[16..32].try_into().unwrap());
+        // Safety: checksum is [u8; 32], so these slices are always exactly 16 bytes
+        let mut lo_bytes = [0u8; 16];
+        let mut hi_bytes = [0u8; 16];
+        lo_bytes.copy_from_slice(&checksum[0..16]);
+        hi_bytes.copy_from_slice(&checksum[16..32]);
+        let lo = u128::from_le_bytes(lo_bytes);
+        let hi = u128::from_le_bytes(hi_bytes);
 
         (lo, hi)
     }
@@ -137,7 +143,9 @@ impl ErrorCommitment {
     /// verification in the context of a larger ZK proof.
     pub fn checksum_compact(&self) -> u64 {
         let checksum = self.compute_checksum();
-        u64::from_le_bytes(checksum[0..8].try_into().unwrap())
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&checksum[0..8]);
+        u64::from_le_bytes(bytes)
     }
 
     /// Verifies that the accumulated error is within the budget limit.
@@ -172,7 +180,14 @@ impl ErrorCommitment {
     }
 
     /// Scales a f64 value to u64 for deterministic hashing.
+    ///
+    /// Handles edge cases: NaN and Infinity saturate to u64::MAX to ensure
+    /// deterministic behavior and to flag obviously-wrong error values rather
+    /// than silently mapping them to 0.
     fn scale_to_u64(value: f64) -> u64 {
+        if value.is_nan() || value.is_infinite() {
+            return u64::MAX;
+        }
         let scaled = (value.abs() * ERROR_SCALE).min(u64::MAX as f64);
         scaled as u64
     }
@@ -380,15 +395,14 @@ impl ErrorCommitmentBuilder {
 
     /// Builds the ErrorCommitment.
     ///
-    /// # Panics
-    /// Panics if any required field is not set.
-    pub fn build(self) -> ErrorCommitment {
-        ErrorCommitment::new(
-            self.accumulated_error.expect("accumulated_error is required"),
-            self.step_number.expect("step_number is required"),
-            self.model_id.expect("model_id is required"),
-            self.budget_limit.expect("budget_limit is required"),
-        )
+    /// Returns an error if any required field is not set.
+    pub fn build(self) -> Result<ErrorCommitment, String> {
+        Ok(ErrorCommitment::new(
+            self.accumulated_error.ok_or("accumulated_error is required")?,
+            self.step_number.ok_or("step_number is required")?,
+            self.model_id.ok_or("model_id is required")?,
+            self.budget_limit.ok_or("budget_limit is required")?,
+        ))
     }
 
     /// Builds the ErrorCommitment, returning None if any field is missing.
@@ -561,7 +575,9 @@ impl ErrorCommitmentTracker {
     /// Returns the compact checksum (64-bit).
     pub fn checksum_compact(&mut self) -> u64 {
         let checksum = self.checksum();
-        u64::from_le_bytes(checksum[0..8].try_into().unwrap())
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&checksum[0..8]);
+        u64::from_le_bytes(bytes)
     }
 
     /// Returns the incremental Merkle root of all recorded step errors.
@@ -588,8 +604,8 @@ impl ErrorCommitmentTracker {
                     Some(existing) => Self::hash_merkle_nodes(&hash, &existing),
                     None => hash,
                 });
-            } else if result.is_some() {
-                result = Some(Self::hash_merkle_nodes(&result.unwrap(), &zero));
+            } else if let Some(existing) = result {
+                result = Some(Self::hash_merkle_nodes(&existing, &zero));
             }
         }
 
@@ -736,7 +752,8 @@ mod tests {
             .step_number(100)
             .model_id([42u8; 32])
             .budget_limit(0.01)
-            .build();
+            .build()
+            .unwrap();
 
         assert!((commitment.accumulated_error - 0.005).abs() < 1e-15);
         assert_eq!(commitment.step_number, 100);

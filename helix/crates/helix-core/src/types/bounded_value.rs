@@ -633,21 +633,31 @@ impl Div for BoundedValue<f64> {
     type Output = Self;
 
     fn div(self, rhs: Self) -> Self::Output {
+        // Guard against division by near-zero — cap error at MAX_ERROR_BOUND
+        // instead of producing Infinity which corrupts downstream computations
+        let b_abs = rhs.value.abs();
+        if b_abs < DIVISION_THRESHOLD {
+            let value = if rhs.value == 0.0 { 0.0 } else { self.value / rhs.value };
+            let value = if value.is_finite() { value } else { 0.0 };
+            return BoundedValue::new(value, ErrorMargin::absolute(MAX_ERROR_BOUND));
+        }
+
         let value = self.value / rhs.value;
+        // Handle NaN/Inf results from the division itself
+        if !value.is_finite() {
+            return BoundedValue::new(0.0, ErrorMargin::absolute(MAX_ERROR_BOUND));
+        }
+
         // Division error: ε(a/b) ≈ |a/b| * (εa/|a| + εb/|b|) for small relative errors
         let eps_a = self.error.to_absolute(self.value);
         let eps_b = rhs.error.to_absolute(rhs.value);
 
-        // Guard against division by near-zero
-        let b_abs = rhs.value.abs();
-        if b_abs < DIVISION_THRESHOLD {
-            return BoundedValue::new(value, ErrorMargin::absolute(f64::INFINITY));
-        }
-
         let rel_error = eps_a / self.value.abs().max(DIVISION_THRESHOLD) + eps_b / b_abs;
         let abs_error = value.abs() * rel_error + eps_a / b_abs;
 
-        BoundedValue::new(value, ErrorMargin::absolute(abs_error))
+        // Cap at MAX_ERROR_BOUND to prevent infinite error propagation
+        let capped_error = if abs_error.is_finite() { abs_error.min(MAX_ERROR_BOUND) } else { MAX_ERROR_BOUND };
+        BoundedValue::new(value, ErrorMargin::absolute(capped_error))
     }
 }
 
@@ -803,9 +813,9 @@ mod tests {
         let b = BoundedValue::exact(0.0);
         assert!(a.checked_div(b).is_err());
 
-        // Regular division returns infinity error
+        // Regular division caps error at MAX_ERROR_BOUND instead of Infinity
         let result = a / b;
-        assert!(result.absolute_error().is_infinite());
+        assert_eq!(result.absolute_error(), MAX_ERROR_BOUND);
     }
 
     #[test]

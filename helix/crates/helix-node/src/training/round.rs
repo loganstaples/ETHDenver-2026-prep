@@ -539,12 +539,14 @@ impl RoundManager {
 
     /// Starts a new training round.
     pub fn start_round(&mut self, initial_commitment: [u8; 32]) -> Result<RoundId, RoundError> {
-        if self.current_round.as_ref().map_or(false, |r| !r.is_terminal()) {
-            // There's an active round - can't start a new one
-            return Err(RoundError::WrongState {
-                expected: RoundState::Completed,
-                actual: self.current_round.as_ref().unwrap().state,
-            });
+        if let Some(round) = self.current_round.as_ref() {
+            if !round.is_terminal() {
+                // There's an active round - can't start a new one
+                return Err(RoundError::WrongState {
+                    expected: RoundState::Completed,
+                    actual: round.state,
+                });
+            }
         }
 
         // Archive the old round if present

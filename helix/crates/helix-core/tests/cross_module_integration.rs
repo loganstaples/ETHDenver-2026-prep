@@ -163,7 +163,8 @@ fn test_full_types_pipeline_no_mocking() {
         .step_number(1)
         .model_id(model_id)
         .budget_limit(0.01)
-        .build();
+        .build()
+        .unwrap();
 
     assert!(
         commitment.verify_within_budget(),

@@ -46,9 +46,9 @@ abigen!(
         function unstake(uint256 modelId) external
         function submitProof(uint256 modelId, uint256 roundId, bytes proof, uint256[] publicInputs) external
         function challengeProof(uint256 modelId, uint256 roundId, bytes proof, uint256[] publicInputs) external
-        event ProofSubmitted(uint256 indexed modelId, uint256 indexed roundId, address indexed prover, uint256 newCommitment)
-        event Slashed(address indexed prover, uint256 indexed modelId, uint256 amount, string reason)
-        event RoundCompleted(uint256 indexed modelId, uint256 indexed roundId, uint256 newCommitment)
+        event ProofSubmitted(uint256 indexed modelId, uint256 indexed roundId, address indexed prover, uint256 newCommitment, uint256 errorBound)
+        event Slashed(address indexed prover, uint256 indexed modelId, uint256 roundId, uint256 amount, uint256 remainingStake, string reason)
+        event RoundCompleted(uint256 indexed modelId, uint256 indexed roundId, uint256 newCommitment, uint256 totalErrorBound)
     ]"#
 );
 

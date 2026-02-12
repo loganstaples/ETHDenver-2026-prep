@@ -49,20 +49,21 @@ pub struct ChainEnv {
 }
 
 /// Returns the path to the contracts directory.
-fn contracts_dir() -> PathBuf {
+fn contracts_dir() -> Result<PathBuf> {
     // Navigate from crates/helix-demo to contracts
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest
+    let contracts = manifest
         .parent()
-        .expect("crates dir")
+        .context("could not find parent (crates) dir")?
         .parent()
-        .expect("helix dir")
-        .join("contracts")
+        .context("could not find grandparent (helix) dir")?
+        .join("contracts");
+    Ok(contracts)
 }
 
 /// Ensures contracts are compiled, returns the output directory.
 fn ensure_compiled() -> Result<PathBuf> {
-    let dir = contracts_dir();
+    let dir = contracts_dir()?;
     let out = dir.join("out");
 
     let coord_artifact = out
@@ -229,7 +230,7 @@ pub async fn register_model(env: &ChainEnv) -> Result<U256> {
 
 /// Stakes ETH for workers.
 pub async fn stake_for_workers(env: &ChainEnv, model_id: U256, num_workers: usize) -> Result<()> {
-    let stake_amount = ethers::utils::parse_ether(1u64).unwrap();
+    let stake_amount = ethers::utils::parse_ether(1u64).context("failed to parse ether amount")?;
 
     for _ in 0..num_workers {
         let _receipt: TransactionReceipt = env

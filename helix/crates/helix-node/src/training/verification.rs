@@ -450,7 +450,17 @@ impl ProofVerifier {
 
             // 5. Perform real Halo2 KZG verification
             let prover_guard = self.prover.read();
-            let prover = prover_guard.as_ref().unwrap();
+            let prover = match prover_guard.as_ref() {
+                Some(p) => p,
+                None => {
+                    return VerificationResult {
+                        is_valid: false,
+                        verification_time_ms: start.elapsed().as_millis() as u64,
+                        error: Some("Prover unavailable after initialization".to_string()),
+                        public_inputs: None,
+                    };
+                }
+            };
 
             let is_valid = if let Some(ref pi) = public_inputs_fr {
                 prover.verify(&proof_bytes, pi)
@@ -548,7 +558,7 @@ impl ProofVerifier {
         if let Some(cached) = cache.get(proof_hash) {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs();
 
             if now - cached.timestamp < self.config.cache_ttl_secs {

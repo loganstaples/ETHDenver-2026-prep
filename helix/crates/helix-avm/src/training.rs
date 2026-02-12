@@ -145,7 +145,7 @@ struct MnistModel {
 
 impl MnistModel {
     /// Creates a new MNIST model with Xavier-initialized weights.
-    fn new(hidden_dim: usize, seed: u64) -> Self {
+    fn new(hidden_dim: usize, seed: u64) -> Result<Self, String> {
         let d_in = 784;
         let d_out = 10;
         let mut rng = StdRng::seed_from_u64(seed);
@@ -164,23 +164,23 @@ impl MnistModel {
         let b2 = vec![0.0; d_out];
 
         let layer1 = Linear::from_raw(w1, vec![hidden_dim, d_in], Some(b1), Precision::F32)
-            .expect("valid layer1 dims");
+            .map_err(|e| format!("layer1 init failed: {e}"))?;
         let layer2 = Linear::from_raw(w2, vec![d_out, hidden_dim], Some(b2), Precision::F32)
-            .expect("valid layer2 dims");
+            .map_err(|e| format!("layer2 init failed: {e}"))?;
 
-        Self {
+        Ok(Self {
             layer1,
             layer2,
             precision: Precision::F32,
-        }
+        })
     }
 
     /// Forward pass: layer1 → ReLU → layer2
     #[allow(dead_code)]
-    fn forward(&self, input: &BoundedTensor) -> BoundedTensor {
-        let h = self.layer1.forward(input).expect("layer1 forward");
+    fn forward(&self, input: &BoundedTensor) -> Result<BoundedTensor, String> {
+        let h = self.layer1.forward(input).map_err(|e| format!("layer1 forward: {e}"))?;
         let h = h.relu();
-        self.layer2.forward(&h).expect("layer2 forward")
+        self.layer2.forward(&h).map_err(|e| format!("layer2 forward: {e}"))
     }
 
     /// SGD step using automatic differentiation.
@@ -193,7 +193,7 @@ impl MnistModel {
         input: &[f64],
         target: &[f64],
         lr: f64,
-    ) -> f64 {
+    ) -> Result<f64, String> {
         let d_in = self.layer1.in_features();
         let d_hid = self.layer1.out_features();
         let d_out = self.layer2.out_features();
@@ -209,7 +209,7 @@ impl MnistModel {
         let (h_pre, w1t_idx, b1_idx) = self
             .layer1
             .forward_var(&x_var, tape.clone(), Some("w1t"), Some("b1"))
-            .expect("layer1 forward_var");
+            .map_err(|e| format!("layer1 forward_var: {e}"))?;
 
         // ReLU activation
         let h = h_pre.relu();
@@ -218,7 +218,7 @@ impl MnistModel {
         let (y, w2t_idx, b2_idx) = self
             .layer2
             .forward_var(&h, tape.clone(), Some("w2t"), Some("b2"))
-            .expect("layer2 forward_var");
+            .map_err(|e| format!("layer2 forward_var: {e}"))?;
 
         // Compute MSE loss as a Variable operation:
         // loss = mean((y - target)^2)
@@ -231,7 +231,7 @@ impl MnistModel {
         let loss_value = loss_var.tensor.data()[0].value();
 
         // Backward pass — automatically computes all gradients
-        let grads = backward(&loss_var).expect("backward pass");
+        let grads = backward(&loss_var).map_err(|e| format!("backward pass: {e}"))?;
 
         // Extract gradients and apply SGD updates
         // W1^T gradient → update W1^T, then store as W1
@@ -257,7 +257,7 @@ impl MnistModel {
                 self.layer1.bias().map(|b| b.values()).unwrap_or_else(|| vec![0.0; d_hid])
             };
             self.layer1 = Linear::from_raw(w1_new_vals, vec![d_hid, d_in], Some(b1_new), self.precision)
-                .expect("valid dims");
+                .map_err(|e| format!("layer1 weight update: {e}"))?;
         }
 
         if let Some(grad_w2t) = grads.get(&w2t_idx) {
@@ -281,10 +281,10 @@ impl MnistModel {
                 self.layer2.bias().map(|b| b.values()).unwrap_or_else(|| vec![0.0; d_out])
             };
             self.layer2 = Linear::from_raw(w2_new_vals, vec![d_out, d_hid], Some(b2_new), self.precision)
-                .expect("valid dims");
+                .map_err(|e| format!("layer2 weight update: {e}"))?;
         }
 
-        loss_value
+        Ok(loss_value)
     }
 
     /// Manual SGD step on the model weights (reference/fallback implementation).
@@ -303,7 +303,7 @@ impl MnistModel {
         input: &[f64],
         target: &[f64],
         lr: f64,
-    ) -> f64 {
+    ) -> Result<f64, String> {
         let d_in = self.layer1.in_features();
         let d_hid = self.layer1.out_features();
         let d_out = self.layer2.out_features();
@@ -311,11 +311,11 @@ impl MnistModel {
         let x = BoundedTensor::from_exact(input.to_vec(), vec![d_in]);
 
         // Forward pass
-        let h_pre = self.layer1.forward(&x).expect("layer1 forward");
+        let h_pre = self.layer1.forward(&x).map_err(|e| format!("layer1 forward: {e}"))?;
         let h_pre_vals = h_pre.values();
         let h = h_pre.relu();
         let h_vals = h.values();
-        let y = self.layer2.forward(&h).expect("layer2 forward");
+        let y = self.layer2.forward(&h).map_err(|e| format!("layer2 forward: {e}"))?;
         let y_vals = y.values();
 
         // Compute MSE loss
@@ -374,11 +374,11 @@ impl MnistModel {
         let b2_new: Vec<f64> = b2_old.iter().zip(db2.iter()).map(|(b, g)| b - lr * g).collect();
 
         self.layer1 = Linear::from_raw(w1_new, vec![d_hid, d_in], Some(b1_new), self.precision)
-            .expect("valid dims");
+            .map_err(|e| format!("layer1 weight update: {e}"))?;
         self.layer2 = Linear::from_raw(w2_new, vec![d_out, d_hid], Some(b2_new), self.precision)
-            .expect("valid dims");
+            .map_err(|e| format!("layer2 weight update: {e}"))?;
 
-        loss
+        Ok(loss)
     }
 
     /// Creates a checkpoint of the current model state.
@@ -423,7 +423,7 @@ impl MnistModel {
 /// # Returns
 /// Training results including loss history and proof count
 pub fn train_mnist(config: MnistTrainingConfig) -> Result<MnistTrainingResult, String> {
-    let mut model = MnistModel::new(config.hidden_dim, config.seed);
+    let mut model = MnistModel::new(config.hidden_dim, config.seed)?;
 
     let loader = create_mnist_like_loader(config.num_samples, config.batch_size, config.seed);
     let pipeline_config = PipelineConfig::new(config.batch_size)
@@ -477,7 +477,7 @@ pub fn train_mnist(config: MnistTrainingConfig) -> Result<MnistTrainingResult, S
                 let sample_input = &input_vals[x_start..x_end];
                 let sample_target = &target_vals[t_start..t_end];
 
-                let loss = model.train_step(sample_input, sample_target, lr);
+                let loss = model.train_step(sample_input, sample_target, lr)?;
                 batch_loss += loss;
 
                 // Generate proof if configured
@@ -594,7 +594,7 @@ mod tests {
 
     #[test]
     fn test_mnist_model_creation() {
-        let model = MnistModel::new(32, 42);
+        let model = MnistModel::new(32, 42).unwrap();
         assert_eq!(model.layer1.in_features(), 784);
         assert_eq!(model.layer1.out_features(), 32);
         assert_eq!(model.layer2.in_features(), 32);
@@ -603,20 +603,20 @@ mod tests {
 
     #[test]
     fn test_mnist_model_forward() {
-        let model = MnistModel::new(32, 42);
+        let model = MnistModel::new(32, 42).unwrap();
         let input = BoundedTensor::from_exact(vec![0.5; 784], vec![784]);
-        let output = model.forward(&input);
+        let output = model.forward(&input).unwrap();
         assert_eq!(output.shape(), &vec![10]);
     }
 
     #[test]
     fn test_mnist_train_step() {
-        let mut model = MnistModel::new(8, 42);
+        let mut model = MnistModel::new(8, 42).unwrap();
         let input = vec![0.5; 784];
         let mut target = vec![0.0; 10];
         target[3] = 1.0; // Class 3
 
-        let loss = model.train_step(&input, &target, 0.01);
+        let loss = model.train_step(&input, &target, 0.01).unwrap();
         assert!(loss > 0.0);
         assert!(loss.is_finite());
     }
@@ -713,7 +713,7 @@ mod tests {
 
     #[test]
     fn test_mnist_model_checkpoint_roundtrip() {
-        let model = MnistModel::new(8, 42);
+        let model = MnistModel::new(8, 42).unwrap();
         let checkpoint = model.checkpoint(0, 1.0);
 
         let serializer = ModelSerializer::new();
@@ -755,7 +755,7 @@ mod tests {
 
         let hidden_dim = 8;
         let seed = 42;
-        let model = MnistModel::new(hidden_dim, seed);
+        let model = MnistModel::new(hidden_dim, seed).unwrap();
 
         let d_in = model.layer1.in_features();
         let d_hid = model.layer1.out_features();

@@ -975,7 +975,7 @@ impl ProfileManager {
             self.configs.insert(profile, config);
         }
 
-        Ok(self.configs.get(&profile).expect("profile was just inserted"))
+        self.configs.get(&profile).ok_or_else(|| anyhow::anyhow!("profile {profile:?} not found after insertion"))
     }
 
     /// Save current configuration to disk

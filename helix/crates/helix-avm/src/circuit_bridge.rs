@@ -500,7 +500,7 @@ pub fn model_to_circuit_weights(
 /// Reconstructs two AVM `Linear` layers from flat circuit-weight vectors.
 pub fn circuit_weights_to_model(
     cw: &CircuitWeights,
-) -> (crate::nn::Linear, crate::nn::Linear) {
+) -> Result<(crate::nn::Linear, crate::nn::Linear), String> {
     use helix_core::types::Precision;
 
     let layer1 = crate::nn::Linear::from_raw(
@@ -509,7 +509,7 @@ pub fn circuit_weights_to_model(
         Some(cw.b1.clone()),
         Precision::F32,
     )
-    .expect("valid layer1 dimensions");
+    .map_err(|e| format!("layer1 from circuit weights: {e}"))?;
 
     let layer2 = crate::nn::Linear::from_raw(
         cw.w2.clone(),
@@ -517,9 +517,9 @@ pub fn circuit_weights_to_model(
         Some(cw.b2.clone()),
         Precision::F32,
     )
-    .expect("valid layer2 dimensions");
+    .map_err(|e| format!("layer2 from circuit weights: {e}"))?;
 
-    (layer1, layer2)
+    Ok((layer1, layer2))
 }
 
 // ---------------------------------------------------------------------------
@@ -931,7 +931,7 @@ mod tests {
         .unwrap();
 
         let cw = model_to_circuit_weights(&l1, &l2).unwrap();
-        let (r1, r2) = circuit_weights_to_model(&cw);
+        let (r1, r2) = circuit_weights_to_model(&cw).unwrap();
 
         assert_eq!(r1.in_features(), 2);
         assert_eq!(r1.out_features(), 2);
