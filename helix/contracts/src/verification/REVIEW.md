@@ -11,9 +11,8 @@ The verification directory contains the on-chain verification infrastructure for
 ```
 verification/
 ├── Halo2Verifier.sol      # Gas-optimized BN254 pairing verifier (production)
-├── HelixVerifier.sol      # Simplified KZG verifier (demo/legacy)
+├── PoseidonHasher.sol     # Poseidon hash matching Rust circuit (error checksum verification)
 ├── BatchVerifier.sol      # Batch verification with error tracking
-├── BoundsChecker.sol      # Error bound validation and propagation
 ├── AggregationVerifier.sol # Federated learning gradient aggregation
 ├── DataVerifier.sol       # Merkle proof verification for training data
 └── SlashingEvidence.sol   # Slashing evidence with disputes/appeals
@@ -24,9 +23,8 @@ verification/
 | Contract | Key Types | Purpose |
 |----------|-----------|---------|
 | `Halo2Verifier` | None (stateless logic) | BN254 pairing-based ZK proof verification |
-| `HelixVerifier` | `VerificationKey`, `Proof` | Simplified verification with initialization |
+| `PoseidonHasher` | None (pure library) | Poseidon hash matching Rust circuit for error checksums |
 | `BatchVerifier` | `VerificationResult`, `BatchResult`, `ProofSubmission` | Batch operations with detailed error codes |
-| `BoundsChecker` | `BoundRecord`, `ModelErrorConfig`, `OperationType` | Error bound algebra and tracking |
 | `AggregationVerifier` | `AggregationRound`, `Contribution`, `AggregationConfig` | Federated gradient aggregation |
 | `DataVerifier` | `ProofRecord`, `BatchProofRequest`, `SparseMerkleProof` | Merkle tree verification |
 | `SlashingEvidence` | `Evidence`, `CryptoEvidence`, `WarningRecord`, `Dispute`, `Appeal` | Complete slashing lifecycle |
@@ -42,8 +40,8 @@ verification/
                                   │
                                   ▼
                           ┌──────────────────┐
-                          │ BoundsChecker    │
-                          │ (validateBound)  │
+                          │ PoseidonHasher   │
+                          │ (errorChecksum)  │
                           └──────────────────┘
 
 2. Aggregation Flow
@@ -101,22 +99,16 @@ verification/
 - Single verification: O(1) with ~113K gas for pairing precompile
 - Batch verification: O(n) EC operations + O(1) pairing = amortized savings
 
-### 2. HelixVerifier.sol (339 lines)
+### 2. PoseidonHasher.sol (library)
 
-**Purpose:** Simplified KZG verifier for hackathon demo purposes. Less complete than Halo2Verifier.
+**Purpose:** Solidity implementation of Poseidon hash matching the Rust circuit (`helix-circuits::gadgets::poseidon`). Used by HelixCoordinatorV2/V3 to verify error checksums on-chain.
 
 **Key Components:**
-- `initialize()`: Set verification key (one-time setup)
-- `verifyProof()`: Simplified verification logic
-- `_verifyPairing()`: **STUB - always returns true**
+- `hashTwo(left, right)`: Poseidon hash of two field elements (width=3, rate=2)
+- `computeErrorChecksum(errorBound, stepNumber, modelId, errorBudget)`: Computes `hashTwo(hashTwo(errorBound, stepNumber), hashTwo(modelId, errorBudget))`
+- `_poseidonPermutation(state)`: Full permutation (8 full rounds + 57 partial rounds, x^5 S-box, MDS [[2,1,1],[1,2,1],[1,1,2]])
 
-**Algorithm:**
-Incomplete implementation - validates structure but `_verifyPairing()` is stubbed.
-
-**Issues:**
-- **CRITICAL:** `_verifyPairing()` returns `true` unconditionally (line 288)
-- Missing actual pairing verification
-- Should not be used in production
+**Cross-language verification:** Test vectors verified identical between Rust and Solidity in `PoseidonCrossLanguage.t.sol`.
 
 ### 3. BatchVerifier.sol (587 lines)
 
@@ -145,29 +137,7 @@ Incomplete implementation - validates structure but `_verifyPairing()` is stubbe
 - Batch verification: O(n) where n = number of proofs
 - Pre-validation: O(1) per proof
 
-### 4. BoundsChecker.sol (348 lines)
-
-**Purpose:** Validates error bounds for approximate computation proofs. Implements error propagation algebra.
-
-**Key Components:**
-- `OperationType` enum: Add, Subtract, Multiply, Divide, MatMul, ReLU, Softmax, LayerNorm
-- `calculateExpectedError()`: Error propagation formulas
-- `verifyBound()`: Check claimed error is valid
-- `verifyCumulativeError()`: Track error across operations
-- `ModelErrorConfig`: Per-model error limits
-
-**Error Propagation Formulas:**
-| Operation | Formula |
-|-----------|---------|
-| Add/Subtract | err_out = err_a + err_b |
-| Multiply | err_out = |a|*err_b + |b|*err_a + err_a*err_b |
-| MatMul | err_out = 2 * (|a|*err_b + |b|*err_a) |
-| ReLU | err_out = err_in (preserved) |
-| Softmax | err_out = 2 * err_in |
-
-**Complexity:** O(1) per operation check, O(n) for cumulative verification
-
-### 5. AggregationVerifier.sol (680 lines)
+### 4. AggregationVerifier.sol (680 lines)
 
 **Purpose:** Verifies federated learning gradient aggregation with cryptographic commitments.
 
@@ -191,7 +161,7 @@ Incomplete implementation - validates structure but `_verifyPairing()` is stubbe
 - Hash-to-point could fail after 256 iterations (though unlikely)
 - Merkle tree building in `_computeMerkleRoot()` allocates memory in loop
 
-### 6. DataVerifier.sol (357 lines)
+### 5. DataVerifier.sol (357 lines)
 
 **Purpose:** Efficient Merkle proof verification for training data integrity.
 
@@ -210,7 +180,7 @@ Incomplete implementation - validates structure but `_verifyPairing()` is stubbe
 
 **Complexity:** O(log n) per proof where n = tree leaves
 
-### 7. SlashingEvidence.sol (1162 lines)
+### 6. SlashingEvidence.sol (1162 lines)
 
 **Purpose:** Production-grade slashing evidence management with disputes, appeals, and gradual slashing.
 
@@ -275,7 +245,7 @@ Incomplete implementation - validates structure but `_verifyPairing()` is stubbe
 
 ### Novel Approaches
 
-1. **Error Bound Algebra** (`BoundsChecker.sol:200-234`) - On-chain error propagation tracking is unique to approximate ZK
+1. **Error Checksum Verification** (`PoseidonHasher.sol`) - On-chain Poseidon hash matches Rust circuit for cross-language error tracking
 2. **Gradual Slashing with Escalation** - Warning system before penalties is user-friendly
 3. **Challenger Rewards** - Economic incentive for detecting fraud
 
@@ -303,26 +273,21 @@ Incomplete implementation - validates structure but `_verifyPairing()` is stubbe
 
 ### Code Quality Issues
 
-1. **Stubbed Pairing Verification** (`HelixVerifier.sol:278-289`)
-   - Location: `_verifyPairing()`
-   - Issue: Returns `true` unconditionally
-   - Fix: Either complete implementation or remove/deprecate contract
-
-2. **XOR Commitment Aggregation** (`AggregationVerifier.sol:534-558`)
+1. **XOR Commitment Aggregation** (`AggregationVerifier.sol:534-558`)
    - Location: `_computeAggregatedCommitment()`
    - Issue: XOR is not cryptographically sound for commitment aggregation
    - Fix: Use proper EC point addition for Pedersen-style aggregation
 
-3. **Typo in Function Name** (`SlashingEvidence.sol:588`)
+2. **Typo in Function Name** (`SlashingEvidence.sol:588`)
    - Location: `distributesChallengerReward()`
    - Issue: Should be `distributeChallengerReward()` (no 's')
    - Fix: Rename function
 
-4. **Inconsistent Owner Pattern** (Multiple files)
+3. **Inconsistent Owner Pattern** (Multiple files)
    - Issue: Some use `modifier onlyOwner()`, some use custom errors
    - Fix: Standardize on OpenZeppelin Ownable2Step for all contracts
 
-5. **Missing ReentrancyGuard** (`SlashingEvidence.sol:605-620`, `729`, `811`)
+4. **Missing ReentrancyGuard** (`SlashingEvidence.sol:605-620`, `729`, `811`)
    - Location: ETH transfers in reward/stake distribution
    - Issue: External calls before state changes in some paths
    - Fix: Add OpenZeppelin ReentrancyGuard
@@ -370,11 +335,7 @@ Incomplete implementation - validates structure but `_verifyPairing()` is stubbe
    - Cost: Maintenance burden, inconsistency risk
    - Fix: Create shared `BN254.sol` library
 
-2. **Two Verifier Implementations** - `Halo2Verifier` and `HelixVerifier`
-   - Cost: Confusion about which to use
-   - Fix: Deprecate `HelixVerifier`, mark with comments
-
-3. **Inconsistent Event Patterns** - Some events indexed, some not
+2. **Inconsistent Event Patterns** - Some events indexed, some not
    - Cost: Harder to filter events
    - Fix: Standardize indexed fields
 
@@ -382,9 +343,8 @@ Incomplete implementation - validates structure but `_verifyPairing()` is stubbe
 
 ### Critical (Must Fix)
 
-1. **Remove or deprecate `HelixVerifier.sol`** - The stubbed pairing check is dangerous if accidentally used in production
-2. **Add ReentrancyGuard to `SlashingEvidence`** - ETH transfers are vulnerable to reentrancy
-3. **Fix XOR aggregation in `AggregationVerifier`** - Current implementation is cryptographically unsound
+1. **Add ReentrancyGuard to `SlashingEvidence`** - ETH transfers are vulnerable to reentrancy
+2. **Fix XOR aggregation in `AggregationVerifier`** - Current implementation is cryptographically unsound
 
 ### High Priority (Should Fix)
 
@@ -513,7 +473,6 @@ Based on code analysis (not test file inspection):
 | True batch verification | Implement RLC batching | Medium |
 | Proper commitment aggregation | Replace XOR with EC addition | Low |
 | Gas optimization | Profile and optimize hot paths | Medium |
-| Remove `HelixVerifier` confusion | Deprecate or delete | Low |
 | Adversarial demonstration | Ensure slashing flow complete | Low |
 
 **Key Demo Risk:** If gas per proof exceeds 250K, the 90-second demo window may be too tight. Current implementation should be profiled.
@@ -523,21 +482,20 @@ Based on code analysis (not test file inspection):
 ### Health Score: B
 
 The verification contracts are functional and demonstrate solid understanding of ZK verification, but have notable issues that prevent an A grade:
-- One stubbed implementation (`HelixVerifier`)
 - Cryptographically unsound aggregation (XOR)
 - Missing reentrancy protection
 - Incomplete batch optimization
 
 ### Overall Assessment
 
-The verification directory provides a comprehensive on-chain verification infrastructure for HELIX. The `Halo2Verifier` is production-quality with gas-optimized assembly, and `SlashingEvidence` implements a sophisticated gradual slashing mechanism. However, several contracts have incomplete implementations (`HelixVerifier`'s stubbed pairing, `AggregationVerifier`'s XOR aggregation) that should be addressed before production. The error tracking and Merkle verification components are well-designed and demo-ready. Priority should be given to removing dangerous stubs and adding reentrancy protection.
+The verification directory provides a comprehensive on-chain verification infrastructure for HELIX. The `Halo2Verifier` is production-quality with gas-optimized assembly, and `SlashingEvidence` implements a sophisticated gradual slashing mechanism. `PoseidonHasher` provides cross-language hash consistency verified against the Rust circuit implementation. `AggregationVerifier`'s XOR aggregation should be addressed before production. The error tracking and Merkle verification components are well-designed and demo-ready. Priority should be given to fixing aggregation and adding reentrancy protection.
 
 ### Key Metrics
 
 | Metric | Value |
 |--------|-------|
-| Lines of Code | ~3,600 |
-| Number of Contracts | 7 |
+| Lines of Code | ~2,900 |
+| Number of Contracts | 6 |
 | Test Coverage | Unknown (needs verification) |
 | Documentation Quality | Good (NatSpec present) |
 | Code Quality | B+ (minor issues) |

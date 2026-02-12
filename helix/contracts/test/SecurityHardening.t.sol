@@ -1807,3 +1807,168 @@ contract RewardsDoubleClaimExtendedTest is Test {
         rewards.claimRoundRewards(modelIds, roundIds);
     }
 }
+
+// ============================================================================
+// Rewards awardBonus Tests
+// ============================================================================
+
+/// @title RewardsAwardBonusTest
+/// @notice Verifies that awardBonus transfers tokens directly and maintains
+///         consistent accounting (totalEarned == totalClaimed for bonuses).
+contract RewardsAwardBonusTest is Test {
+    HelixToken public token;
+    Rewards public rewards;
+
+    address public deployer;
+    address public funder;
+    address public recipient;
+    address public coordinator;
+
+    uint256 constant FUND_AMOUNT = 100_000 ether;
+    uint256 constant REWARDS_PER_ROUND = 1000 ether;
+    uint256 constant DURATION = 365 days;
+    uint256 constant BONUS_AMOUNT = 500 ether;
+
+    function setUp() public {
+        deployer = address(this);
+        funder = makeAddr("funder");
+        recipient = makeAddr("recipient");
+        coordinator = makeAddr("coordinator");
+
+        token = new HelixToken(makeAddr("treasury"));
+        rewards = new Rewards(address(token));
+        rewards.setCoordinator(coordinator);
+
+        // Fund the reward pool
+        token.mint(funder, FUND_AMOUNT);
+        vm.startPrank(funder);
+        token.approve(address(rewards), FUND_AMOUNT);
+        rewards.fundRewardPool(FUND_AMOUNT, REWARDS_PER_ROUND, DURATION);
+        vm.stopPrank();
+    }
+
+    /// @notice awardBonus transfers tokens directly to recipient
+    function test_AwardBonus_TransfersTokens() public {
+        uint256 balBefore = token.balanceOf(recipient);
+        assertEq(balBefore, 0, "Recipient should start with zero balance");
+
+        rewards.awardBonus(recipient, BONUS_AMOUNT, "early adopter");
+
+        uint256 balAfter = token.balanceOf(recipient);
+        assertEq(balAfter, BONUS_AMOUNT, "Recipient should receive bonus tokens");
+    }
+
+    /// @notice awardBonus keeps totalEarned == totalClaimed (no pending rewards)
+    function test_AwardBonus_EarnedEqualsClaimed() public {
+        rewards.awardBonus(recipient, BONUS_AMOUNT, "early adopter");
+
+        (uint256 totalEarned, uint256 totalClaimed, , uint256 pendingAmount) =
+            rewards.getParticipantStats(recipient);
+
+        assertEq(totalEarned, BONUS_AMOUNT, "totalEarned should equal bonus");
+        assertEq(totalClaimed, BONUS_AMOUNT, "totalClaimed should equal bonus");
+        assertEq(pendingAmount, 0, "No pending rewards after bonus");
+    }
+
+    /// @notice getClaimableRewards returns 0 after bonus (nothing left to claim)
+    function test_AwardBonus_ClaimableIsZero() public {
+        rewards.awardBonus(recipient, BONUS_AMOUNT, "early adopter");
+
+        uint256 claimable = rewards.getClaimableRewards(recipient);
+        assertEq(claimable, 0, "Claimable should be zero after direct bonus");
+    }
+
+    /// @notice awardBonus reduces remaining pool correctly
+    function test_AwardBonus_ReducesPool() public {
+        (uint256 totalBefore, uint256 distributedBefore, uint256 remainingBefore, , ) =
+            rewards.getRewardPoolInfo();
+
+        rewards.awardBonus(recipient, BONUS_AMOUNT, "early adopter");
+
+        (uint256 totalAfter, uint256 distributedAfter, uint256 remainingAfter, , ) =
+            rewards.getRewardPoolInfo();
+
+        assertEq(totalAfter, totalBefore, "Total should not change");
+        assertEq(distributedAfter, distributedBefore + BONUS_AMOUNT, "Distributed should increase");
+        assertEq(remainingAfter, remainingBefore - BONUS_AMOUNT, "Remaining should decrease");
+    }
+
+    /// @notice awardBonus emits BonusAwarded event
+    function test_AwardBonus_EmitsEvent() public {
+        vm.expectEmit(true, false, false, true);
+        emit Rewards.BonusAwarded(recipient, BONUS_AMOUNT, "early adopter");
+
+        rewards.awardBonus(recipient, BONUS_AMOUNT, "early adopter");
+    }
+
+    /// @notice awardBonus reverts for non-owner
+    function test_AwardBonus_RevertsForNonOwner() public {
+        vm.prank(funder);
+        vm.expectRevert("Only owner");
+        rewards.awardBonus(recipient, BONUS_AMOUNT, "should fail");
+    }
+
+    /// @notice awardBonus reverts for zero recipient
+    function test_AwardBonus_RevertsForZeroAddress() public {
+        vm.expectRevert("Invalid recipient");
+        rewards.awardBonus(address(0), BONUS_AMOUNT, "should fail");
+    }
+
+    /// @notice awardBonus reverts when pool is insufficient
+    function test_AwardBonus_RevertsWhenPoolInsufficient() public {
+        uint256 tooMuch = FUND_AMOUNT + 1;
+        vm.expectRevert("Insufficient reward pool");
+        rewards.awardBonus(recipient, tooMuch, "should fail");
+    }
+
+    /// @notice Multiple bonuses accumulate correctly
+    function test_AwardBonus_MultipleAccumulate() public {
+        rewards.awardBonus(recipient, BONUS_AMOUNT, "bonus 1");
+        rewards.awardBonus(recipient, BONUS_AMOUNT, "bonus 2");
+
+        uint256 bal = token.balanceOf(recipient);
+        assertEq(bal, BONUS_AMOUNT * 2, "Should receive both bonuses");
+
+        (uint256 totalEarned, uint256 totalClaimed, , uint256 pendingAmount) =
+            rewards.getParticipantStats(recipient);
+        assertEq(totalEarned, BONUS_AMOUNT * 2, "totalEarned should be 2x bonus");
+        assertEq(totalClaimed, BONUS_AMOUNT * 2, "totalClaimed should be 2x bonus");
+        assertEq(pendingAmount, 0, "No pending rewards");
+    }
+
+    /// @notice Bonus + round rewards don't interfere with each other
+    function test_AwardBonus_PlusRoundRewards() public {
+        // First give a bonus
+        rewards.awardBonus(recipient, BONUS_AMOUNT, "bonus");
+
+        // Then register for a round and allocate rewards
+        vm.startPrank(coordinator);
+        rewards.registerParticipant(0, 1, recipient);
+        rewards.allocateRoundRewards(0, 1);
+        vm.stopPrank();
+
+        // After bonus + allocation, earned > claimed (pending from round)
+        (uint256 totalEarned, uint256 totalClaimed, , uint256 pendingAmount) =
+            rewards.getParticipantStats(recipient);
+        assertEq(totalClaimed, BONUS_AMOUNT, "Only bonus is claimed so far");
+        assertGt(totalEarned, totalClaimed, "Round rewards are pending");
+        assertEq(pendingAmount, totalEarned - totalClaimed, "Pending = round reward");
+
+        // Claim round rewards
+        uint256[] memory modelIds = new uint256[](1);
+        uint256[] memory roundIds = new uint256[](1);
+        modelIds[0] = 0;
+        roundIds[0] = 1;
+
+        vm.prank(recipient);
+        rewards.claimRoundRewards(modelIds, roundIds);
+
+        // Now everything should be claimed
+        (totalEarned, totalClaimed, , pendingAmount) = rewards.getParticipantStats(recipient);
+        assertEq(totalEarned, totalClaimed, "Everything claimed");
+        assertEq(pendingAmount, 0, "No pending");
+
+        // Balance should be bonus + round reward
+        assertEq(token.balanceOf(recipient), totalEarned, "Balance matches total earned");
+    }
+}

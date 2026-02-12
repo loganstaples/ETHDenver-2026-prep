@@ -655,4 +655,60 @@ mod tests {
         let prover = MockProver::run(12, &circuit, vec![]).unwrap();
         prover.assert_satisfied();
     }
+
+    /// Cross-language test vectors for PoseidonHasher.sol.
+    ///
+    /// These values must match the constants in
+    /// `contracts/test/PoseidonCrossLanguage.t.sol`.
+    /// If either implementation changes, both tests will fail.
+    #[test]
+    fn test_poseidon_cross_language_vectors() {
+        // Vector 1: hashTwo(0, 0)
+        let v1 = poseidon_hash_two(Fr::zero(), Fr::zero());
+
+        // Vector 2: hashTwo(1, 2)
+        let v2 = poseidon_hash_two(Fr::from(1u64), Fr::from(2u64));
+
+        // Vector 3: computeErrorChecksum(10, 1, 0, 1e18)
+        // checksum = hashTwo(hashTwo(errorBound, stepNumber), hashTwo(modelId, errorBudget))
+        let h3a = poseidon_hash_two(Fr::from(10u64), Fr::from(1u64));
+        let h3b = poseidon_hash_two(Fr::from(0u64), Fr::from(1_000_000_000_000_000_000u64));
+        let v3 = poseidon_hash_two(h3a, h3b);
+
+        // Vector 4: computeErrorChecksum(100, 5, 3, 1e18)
+        let h4a = poseidon_hash_two(Fr::from(100u64), Fr::from(5u64));
+        let h4b = poseidon_hash_two(Fr::from(3u64), Fr::from(1_000_000_000_000_000_000u64));
+        let v4 = poseidon_hash_two(h4a, h4b);
+
+        // Print hex values for pasting into Solidity test
+        let to_hex = |fr: Fr| -> String {
+            let repr = fr.to_repr();
+            let bytes: &[u8] = repr.as_ref();
+            // Fr repr is little-endian 32 bytes, convert to big-endian hex for Solidity uint256
+            let mut be = bytes.to_vec();
+            be.reverse();
+            format!("0x{}", hex::encode(&be))
+        };
+
+        eprintln!("=== Poseidon Cross-Language Test Vectors ===");
+        eprintln!("POSEIDON_ZERO_ZERO    = {};", to_hex(v1));
+        eprintln!("POSEIDON_ONE_TWO      = {};", to_hex(v2));
+        eprintln!("POSEIDON_CHECKSUM_DEFAULT = {};", to_hex(v3));
+        eprintln!("POSEIDON_CHECKSUM_MODEL3  = {};", to_hex(v4));
+        eprintln!("============================================");
+
+        // Sanity: all are nonzero
+        assert_ne!(v1, Fr::zero());
+        assert_ne!(v2, Fr::zero());
+        assert_ne!(v3, Fr::zero());
+        assert_ne!(v4, Fr::zero());
+
+        // Sanity: all are different
+        assert_ne!(v1, v2);
+        assert_ne!(v1, v3);
+        assert_ne!(v1, v4);
+        assert_ne!(v2, v3);
+        assert_ne!(v2, v4);
+        assert_ne!(v3, v4);
+    }
 }

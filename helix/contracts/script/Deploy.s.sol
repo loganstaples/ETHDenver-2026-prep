@@ -32,10 +32,12 @@ contract DeployScript is Script {
     // ============ V2 Deployment (Legacy) ============
 
     /// @notice Deploy V2 with default SRS (G2 generator, s=1)
-    /// @dev WARNING: Trivial SRS (s=1) allows proof forgery. Use only for testing.
+    /// @dev Trivial SRS (s=1) allows proof forgery. Requires ALLOW_TRIVIAL_SRS=true env var.
+    ///      For production, use runWithVK() with real SRS parameters.
     function run() public returns (address, address) {
-        console.log("WARNING: Deploying with trivial SRS (s=1). Anyone can forge proofs.");
-        console.log("         For production, use runWithVK() with real SRS parameters.");
+        bool allowTrivial = vm.envOr("ALLOW_TRIVIAL_SRS", false);
+        require(allowTrivial, "Trivial SRS deployment blocked. Set ALLOW_TRIVIAL_SRS=true or use runWithVK()");
+        console.log("NOTICE: Deploying with trivial SRS (s=1). Proofs are forgeable.");
         return deployWithVK(Halo2VKDefaults.g2Generator());
     }
 
@@ -103,10 +105,12 @@ contract DeployScript is Script {
     // ============ V3 Full Stack Deployment ============
 
     /// @notice Deploy V3 full stack with default SRS (G2 generator, s=1)
-    /// @dev WARNING: Trivial SRS (s=1) allows proof forgery. Use only for testing.
+    /// @dev Trivial SRS (s=1) allows proof forgery. Requires ALLOW_TRIVIAL_SRS=true env var.
+    ///      For production, use deployV3WithVK() with real SRS parameters.
     function deployV3() public {
-        console.log("WARNING: Deploying V3 with trivial SRS (s=1). Anyone can forge proofs.");
-        console.log("         For production, use deployV3WithVK() with real SRS parameters.");
+        bool allowTrivial = vm.envOr("ALLOW_TRIVIAL_SRS", false);
+        require(allowTrivial, "Trivial SRS deployment blocked. Set ALLOW_TRIVIAL_SRS=true or use deployV3WithVK()");
+        console.log("NOTICE: Deploying V3 with trivial SRS (s=1). Proofs are forgeable.");
         _deployV3Stack(Halo2VKDefaults.g2Generator());
     }
 

@@ -6,6 +6,7 @@ import "../src/core/HelixCoordinatorV2.sol";
 import "../src/core/DataCommitment.sol";
 import "../src/core/TrainingRound.sol";
 import "../src/verification/Halo2Verifier.sol";
+import "../src/verification/PoseidonHasher.sol";
 import "../src/verification/DataVerifier.sol";
 import "../src/verification/SlashingEvidence.sol";
 import "../src/verification/AggregationVerifier.sol";
@@ -364,7 +365,7 @@ contract LocalIntegrationTest is Script {
         // 5. Create and submit proof
         console.log("\n[5/6] Submitting Real Proof...");
         bytes memory proof = _createValidProof();
-        uint256[] memory publicInputs = _createPublicInputs();
+        uint256[] memory publicInputs = _createPublicInputs(modelId);
 
         console.log("  Proof length:", proof.length, "bytes");
         console.log("  Public inputs:", publicInputs.length);
@@ -440,6 +441,8 @@ contract LocalIntegrationTest is Script {
             proofs[i] = _createValidProof();
             inputsArray[i] = _createPublicInputs();
             inputsArray[i][6] = i + 1; // Different step numbers
+            // Recompute checksum for the updated step number
+            inputsArray[i][7] = PoseidonHasher.computeErrorChecksum(10, i + 1, 1, 1e18);
         }
         gasBefore = gasleft();
         bool batchResult = verifier.batchVerify(proofs, inputsArray);
@@ -485,7 +488,7 @@ contract LocalIntegrationTest is Script {
         // Submit corrupted proof
         console.log("\nSubmitting adversarial proof (corrupted bytes)...");
         bytes memory corruptedProof = _createInvalidProof();
-        uint256[] memory inputs = _createPublicInputs();
+        uint256[] memory inputs = _createPublicInputs(modelId);
 
         coordinator.submitProof(modelId, 1, corruptedProof, inputs);
 
@@ -555,7 +558,8 @@ contract LocalIntegrationTest is Script {
     }
 
     /// @notice Creates public inputs matching Rust circuit format
-    function _createPublicInputs() internal pure returns (uint256[] memory inputs) {
+    /// @param modelId The registered model ID (needed for Poseidon checksum)
+    function _createPublicInputs(uint256 modelId) internal pure returns (uint256[] memory inputs) {
         inputs = new uint256[](8);
         inputs[0] = 0x3039;  // oldHashLo
         inputs[1] = 0x3042;  // oldHashHi
@@ -564,6 +568,12 @@ contract LocalIntegrationTest is Script {
         inputs[4] = 1000;    // loss
         inputs[5] = 10;      // errorBound
         inputs[6] = 1;       // stepNumber
-        inputs[7] = 0;       // errorChecksum (not needed for deployment)
+        // Compute real Poseidon checksum matching coordinator's _computeErrorChecksum
+        inputs[7] = PoseidonHasher.computeErrorChecksum(10, 1, modelId, 1e18);
+    }
+
+    /// @notice Creates public inputs for standalone verifier tests (no coordinator)
+    function _createPublicInputs() internal pure returns (uint256[] memory inputs) {
+        return _createPublicInputs(1);
     }
 }
