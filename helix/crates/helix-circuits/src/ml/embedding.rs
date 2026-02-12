@@ -17,8 +17,13 @@
 //! # Commitment-Based Verification
 //!
 //! For distributed training with MPC, embeddings are secret-shared. We use
-//! Merkle tree commitments to verify that lookups are consistent with the
-//! committed embedding matrix without revealing the actual embeddings.
+//! Merkle tree commitments with in-circuit Poseidon hashing to verify that
+//! lookups are consistent with the committed embedding matrix without
+//! revealing the actual embeddings.
+//!
+//! Each Merkle step computes `parent = Poseidon(left, right)` in-circuit,
+//! chaining from the leaf hash up to the root. The final root is constrained
+//! to match the expected commitment (~764 rows per Merkle level).
 //!
 //! # Error Bounds
 //!
@@ -36,8 +41,11 @@ use halo2_proofs::{
 };
 use halo2curves::bn256::Fr;
 use halo2curves::ff::{Field, PrimeField};
-use sha2::{Digest, Sha256};
 use std::marker::PhantomData;
+
+use crate::gadgets::poseidon::{
+    poseidon_hash_many, poseidon_hash_two, synthesize_poseidon_hash, PoseidonCircuitConfig,
+};
 
 /// Maximum vocabulary size for embedding tables.
 pub const MAX_VOCAB_SIZE: usize = 65536;
@@ -62,8 +70,8 @@ pub struct EmbeddingConfig<F: PrimeField> {
     pub s_eq: Selector,
     /// Selector for commitment verification.
     pub s_commit: Selector,
-    /// Selector for hash computation.
-    pub s_hash: Selector,
+    /// Configuration for in-circuit Poseidon hashing (Merkle path verification).
+    pub poseidon: PoseidonCircuitConfig,
     /// Phantom data.
     _marker: PhantomData<F>,
 }
@@ -100,7 +108,6 @@ impl<F: PrimeField> EmbeddingChip<F> {
         let s_range = meta.complex_selector();
         let s_eq = meta.selector();
         let s_commit = meta.selector();
-        let s_hash = meta.selector();
 
         // Vocabulary range check lookup
         meta.lookup("embedding_lookup", |meta| {
@@ -126,22 +133,44 @@ impl<F: PrimeField> EmbeddingChip<F> {
             vec![s * (computed_hash - expected_hash)]
         });
 
-        // NOTE: Merkle path verification is done NATIVELY (out-of-circuit) via SHA-256.
-        // The s_hash selector is retained for circuit layout compatibility but the
-        // in-circuit gate only constrains parent == expected (witness self-equality).
-        // For true in-circuit Merkle verification, replace with Poseidon hash gadget
-        // (~764 rows per Merkle step). See SECURITY.md "Known Limitations" #1.
-        meta.create_gate("embed_hash_native_only", |meta| {
-            let s = meta.query_selector(s_hash);
-            let _left = meta.query_advice(advice[0], Rotation::cur());
-            let _right = meta.query_advice(advice[1], Rotation::cur());
-            let parent = meta.query_advice(advice[2], Rotation::cur());
-            let expected = meta.query_advice(advice[3], Rotation::cur());
-            // WARNING: This gate only checks parent == expected (self-equality).
-            // The actual hash(left, right) == parent check is NOT done in-circuit.
-            // Merkle path integrity relies on native SHA-256 verification.
-            vec![s * (parent - expected)]
+        // Poseidon gates for in-circuit Merkle path verification.
+        // Each Merkle step computes Poseidon(left, right) = parent in-circuit.
+        let s_mul = meta.selector();
+        let s_add = meta.selector();
+        let s_rc_add = meta.selector();
+
+        meta.create_gate("mul", |meta| {
+            let s = meta.query_selector(s_mul);
+            let a = meta.query_advice(advice[0], Rotation::cur());
+            let b = meta.query_advice(advice[1], Rotation::cur());
+            let c = meta.query_advice(advice[2], Rotation::cur());
+            vec![s * (a * b - c)]
         });
+
+        meta.create_gate("add", |meta| {
+            let s = meta.query_selector(s_add);
+            let a = meta.query_advice(advice[0], Rotation::cur());
+            let b = meta.query_advice(advice[1], Rotation::cur());
+            let c = meta.query_advice(advice[2], Rotation::cur());
+            vec![s * (a + b - c)]
+        });
+
+        meta.create_gate("rc_add", |meta| {
+            let s = meta.query_selector(s_rc_add);
+            let a = meta.query_advice(advice[0], Rotation::cur());
+            let rc = meta.query_fixed(fixed, Rotation::cur());
+            let c = meta.query_advice(advice[2], Rotation::cur());
+            vec![s * (a + rc - c)]
+        });
+
+        let poseidon = PoseidonCircuitConfig {
+            advice: [advice[0], advice[1], advice[2]],
+            fixed,
+            s_mul,
+            s_add,
+            s_rc_add,
+            s_eq,
+        };
 
         EmbeddingConfig {
             advice,
@@ -151,7 +180,7 @@ impl<F: PrimeField> EmbeddingChip<F> {
             s_range,
             s_eq,
             s_commit,
-            s_hash,
+            poseidon,
             _marker: PhantomData,
         }
     }
@@ -177,12 +206,20 @@ impl<F: PrimeField> EmbeddingChip<F> {
             },
         )
     }
+}
 
-    /// Verifies embedding lookup.
+/// Fr-specific methods for in-circuit Poseidon-based Merkle verification.
+impl EmbeddingChip<Fr> {
+    /// Verifies embedding lookup with in-circuit Merkle path verification.
+    ///
+    /// When `use_commitment` is true, each embedding's Merkle path is verified
+    /// in-circuit using Poseidon hashing. The computed root must match the
+    /// expected root commitment — a malicious prover cannot supply arbitrary
+    /// Merkle paths.
     pub fn verify_embedding_lookup(
         &self,
-        mut layouter: impl Layouter<F>,
-        witness: &EmbeddingWitness<F>,
+        mut layouter: impl Layouter<Fr>,
+        witness: &EmbeddingWitness<Fr>,
     ) -> Result<(), ErrorFront> {
         let seq_len = witness.token_ids.len();
         let embed_dim = witness.embeddings.get(0).map(|e| e.len()).unwrap_or(0);
@@ -206,13 +243,14 @@ impl<F: PrimeField> EmbeddingChip<F> {
                 },
             )?;
 
-            // If using commitment, verify Merkle path
+            // If using commitment, verify Merkle path with in-circuit Poseidon
             if witness.use_commitment {
                 self.verify_merkle_path(
-                    layouter.namespace(|| format!("merkle_path_{}", i)),
-                    &witness.embedding_hashes[i],
+                    &mut layouter,
+                    witness.embedding_hashes[i],
                     witness.root_commitment,
                     &witness.merkle_paths[i],
+                    i,
                 )?;
             }
 
@@ -246,25 +284,21 @@ impl<F: PrimeField> EmbeddingChip<F> {
         Ok(())
     }
 
-    /// Verifies a Merkle path for embedding commitment.
+    /// Verifies a Merkle path using in-circuit Poseidon hashing.
     ///
-    /// **WARNING: Native-only verification.** The `s_hash` gate checks
-    /// `parent == expected` (self-equality), NOT `hash(left, right) == parent`.
-    /// A malicious prover can supply arbitrary Merkle paths that will pass
-    /// the in-circuit check. Real Merkle integrity is enforced by native
-    /// SHA-256 verification outside the circuit. See SECURITY.md limitation #1.
-    ///
-    /// For production use with untrusted provers, replace with in-circuit
-    /// Poseidon hashing via `gadgets::poseidon::poseidon_hash_two()`.
+    /// For each level of the Merkle tree, computes `parent = Poseidon(left, right)`
+    /// in-circuit using the full Poseidon permutation (~764 rows per hash).
+    /// The final computed root is constrained to equal the expected root commitment.
     fn verify_merkle_path(
         &self,
-        mut layouter: impl Layouter<F>,
-        leaf_hash: &F,
-        root: F,
-        path: &[(F, bool)], // (sibling_hash, is_left)
+        layouter: &mut impl Layouter<Fr>,
+        leaf_hash: Fr,
+        root: Fr,
+        path: &[(Fr, bool)], // (sibling_hash, is_left)
+        token_idx: usize,
     ) -> Result<(), ErrorFront> {
         if path.is_empty() {
-            // Just verify leaf equals root
+            // Single-node tree: just verify leaf equals root
             layouter.assign_region(
                 || "single_node_tree",
                 |mut region| {
@@ -273,7 +307,7 @@ impl<F: PrimeField> EmbeddingChip<F> {
                         || "leaf",
                         self.config.advice[0],
                         0,
-                        || Value::known(*leaf_hash),
+                        || Value::known(leaf_hash),
                     )?;
                     region.assign_advice(
                         || "root",
@@ -287,39 +321,50 @@ impl<F: PrimeField> EmbeddingChip<F> {
             return Ok(());
         }
 
-        let mut current = *leaf_hash;
+        let mut current = leaf_hash;
 
-        for (i, (sibling, is_left)) in path.iter().enumerate() {
+        for (level, (sibling, is_left)) in path.iter().enumerate() {
             let (left, right) = if *is_left {
                 (*sibling, current)
             } else {
                 (current, *sibling)
             };
 
-            // Compute parent (in actual implementation, this would verify hash)
-            // For now, we use the witness-provided parent value
-            let parent = if i + 1 < path.len() {
-                path[i + 1].0 // Next level's "current" value from witness
-            } else {
-                root
-            };
-
-            layouter.assign_region(
-                || format!("merkle_step_{}", i),
-                |mut region| {
-                    self.config.s_hash.enable(&mut region, 0)?;
-                    region.assign_advice(|| "left", self.config.advice[0], 0, || Value::known(left))?;
-                    region.assign_advice(|| "right", self.config.advice[1], 0, || Value::known(right))?;
-                    region.assign_advice(|| "parent", self.config.advice[2], 0, || Value::known(parent))?;
-                    region.assign_advice(|| "expected", self.config.advice[3], 0, || Value::known(parent))?;
-                    Ok(())
-                },
+            // Compute parent = Poseidon(left, right) in-circuit.
+            // synthesize_poseidon_hash lays out the full permutation with all
+            // intermediate values constrained, and verifies the output matches
+            // the native hash. ~764 rows per call.
+            let parent = synthesize_poseidon_hash(
+                &self.config.poseidon,
+                layouter,
+                left,
+                right,
+                &format!("merkle_t{}_l{}", token_idx, level),
             )?;
 
             current = parent;
         }
 
-        Ok(())
+        // Verify computed root matches expected root commitment
+        layouter.assign_region(
+            || format!("merkle_root_check_t{}", token_idx),
+            |mut region| {
+                self.config.s_eq.enable(&mut region, 0)?;
+                region.assign_advice(
+                    || "computed_root",
+                    self.config.advice[0],
+                    0,
+                    || Value::known(current),
+                )?;
+                region.assign_advice(
+                    || "expected_root",
+                    self.config.advice[1],
+                    0,
+                    || Value::known(root),
+                )?;
+                Ok(())
+            },
+        )
     }
 }
 
@@ -365,7 +410,11 @@ impl<F: PrimeField> Default for EmbeddingWitness<F> {
     }
 }
 
-/// Embedding table with commitment support.
+/// Embedding table with Poseidon commitment support.
+///
+/// Uses Poseidon hashing (matching in-circuit constraints) for both leaf
+/// hashing and Merkle tree construction. This ensures native hashes match
+/// the in-circuit verification.
 #[derive(Clone, Debug)]
 pub struct EmbeddingTable {
     /// Embedding matrix [vocab_size, embed_dim].
@@ -386,13 +435,13 @@ impl EmbeddingTable {
         let vocab_size = embeddings.len();
         let embed_dim = embeddings.get(0).map(|e| e.len()).unwrap_or(0);
 
-        // Compute leaf hashes
+        // Compute leaf hashes using Poseidon
         let leaf_hashes: Vec<Fr> = embeddings
             .iter()
             .map(|embed| Self::hash_embedding(embed))
             .collect();
 
-        // Build Merkle tree
+        // Build Merkle tree using Poseidon
         let (merkle_tree, root) = Self::build_merkle_tree(&leaf_hashes);
 
         Self {
@@ -425,19 +474,14 @@ impl EmbeddingTable {
         Self::new(embeddings)
     }
 
-    /// Hashes an embedding vector.
+    /// Hashes an embedding vector using Poseidon sponge construction.
+    ///
+    /// This matches the in-circuit hash computation (same Poseidon parameters).
     fn hash_embedding(embedding: &[Fr]) -> Fr {
-        let mut hasher = Sha256::new();
-        for val in embedding {
-            hasher.update(val.to_repr().as_ref());
-        }
-        let hash: [u8; 32] = hasher.finalize().into();
-        // Convert first 8 bytes to Fr
-        let val = u64::from_le_bytes(hash[0..8].try_into().unwrap());
-        Fr::from(val)
+        poseidon_hash_many(embedding)
     }
 
-    /// Builds a Merkle tree from leaf hashes.
+    /// Builds a Merkle tree from leaf hashes using Poseidon.
     fn build_merkle_tree(leaves: &[Fr]) -> (Vec<Vec<Fr>>, Fr) {
         if leaves.is_empty() {
             return (vec![], Fr::ZERO);
@@ -470,14 +514,11 @@ impl EmbeddingTable {
         (tree, root)
     }
 
-    /// Hashes two field elements together.
+    /// Hashes two field elements using Poseidon.
+    ///
+    /// This is the same hash function used in-circuit for Merkle path verification.
     fn hash_pair(left: Fr, right: Fr) -> Fr {
-        let mut hasher = Sha256::new();
-        hasher.update(left.to_repr().as_ref());
-        hasher.update(right.to_repr().as_ref());
-        let hash: [u8; 32] = hasher.finalize().into();
-        let val = u64::from_le_bytes(hash[0..8].try_into().unwrap());
-        Fr::from(val)
+        poseidon_hash_two(left, right)
     }
 
     /// Looks up an embedding by token ID.
@@ -589,29 +630,30 @@ impl<F: PrimeField> EmbeddingCircuit<F> {
     }
 }
 
-impl<F: PrimeField> Circuit<F> for EmbeddingCircuit<F> {
-    type Config = EmbeddingConfig<F>;
+/// Circuit implementation specialized for BN254 Fr (required for Poseidon hashing).
+impl Circuit<Fr> for EmbeddingCircuit<Fr> {
+    type Config = EmbeddingConfig<Fr>;
     type FloorPlanner = SimpleFloorPlanner;
 
     fn without_witnesses(&self) -> Self {
         Self::default()
     }
 
-    fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
-        EmbeddingChip::<F>::configure(meta)
+    fn configure(meta: &mut ConstraintSystem<Fr>) -> Self::Config {
+        EmbeddingChip::<Fr>::configure(meta)
     }
 
     fn synthesize(
         &self,
         config: Self::Config,
-        mut layouter: impl Layouter<F>,
+        mut layouter: impl Layouter<Fr>,
     ) -> Result<(), ErrorFront> {
         let chip = EmbeddingChip::new(config.clone());
 
         // Load vocabulary table
         chip.load_vocab_table(&mut layouter, self.witness.vocab_size.max(1))?;
 
-        // Verify embeddings
+        // Verify embeddings with in-circuit Merkle verification
         chip.verify_embedding_lookup(layouter.namespace(|| "embedding_lookup"), &self.witness)?;
 
         Ok(())
@@ -728,6 +770,55 @@ mod tests {
         assert!(witness.merkle_paths.iter().all(|p| !p.is_empty()));
     }
 
+    /// Verifies that in-circuit Merkle path verification works with Poseidon.
+    ///
+    /// Each Merkle step synthesizes a full Poseidon permutation (~764 rows).
+    /// For a tree of 4 leaves (depth 2) with 2 token lookups, we need
+    /// 2 tokens × 2 levels × 764 rows ≈ 3,056 rows for Poseidon alone.
+    #[test]
+    fn test_embedding_circuit_with_commitment() {
+        let table = EmbeddingTable::random(4, 2);
+        let token_ids = vec![0, 1];
+        let base_error = Fr::from(1);
+
+        let witness = compute_embedding_witness(&token_ids, &table, true, base_error);
+        assert!(witness.use_commitment);
+        assert!(!witness.merkle_paths[0].is_empty());
+
+        let circuit = EmbeddingCircuit::<Fr>::new(witness);
+
+        // k=13 gives 8192 rows, enough for Poseidon-based Merkle verification
+        let prover = MockProver::run(13, &circuit, vec![vec![]]).unwrap();
+        prover.assert_satisfied();
+    }
+
+    /// Proves that a tampered Merkle path is REJECTED by in-circuit verification.
+    ///
+    /// This is the key security property: unlike the old trivial self-equality
+    /// check (parent == expected), the Poseidon-based verification catches
+    /// malicious provers who supply wrong sibling hashes.
+    #[test]
+    fn test_malicious_merkle_path_rejected() {
+        let table = EmbeddingTable::random(4, 2);
+        let token_ids = vec![0];
+        let base_error = Fr::from(1);
+
+        let mut witness = compute_embedding_witness(&token_ids, &table, true, base_error);
+
+        // Tamper with the sibling hash in the Merkle path
+        if let Some(path) = witness.merkle_paths.get_mut(0) {
+            if let Some(entry) = path.get_mut(0) {
+                entry.0 = Fr::from(9999u64); // Wrong sibling
+            }
+        }
+
+        let circuit = EmbeddingCircuit::<Fr>::new(witness);
+        let prover = MockProver::run(13, &circuit, vec![vec![]]).unwrap();
+
+        // Must FAIL: tampered sibling → wrong Poseidon hash → root mismatch
+        assert!(prover.verify().is_err(), "Tampered Merkle path must be rejected");
+    }
+
     #[test]
     fn test_batch_embedding() {
         let table = EmbeddingTable::random(100, 16);
@@ -746,5 +837,33 @@ mod tests {
         let hash1 = EmbeddingTable::hash_embedding(&embedding);
         let hash2 = EmbeddingTable::hash_embedding(&embedding);
         assert_eq!(hash1, hash2);
+    }
+
+    /// Verifies the native Merkle tree is consistent with in-circuit verification.
+    ///
+    /// Computes leaf hash → root using native Poseidon, then verifies the
+    /// same computation succeeds in-circuit.
+    #[test]
+    fn test_merkle_native_circuit_consistency() {
+        let table = EmbeddingTable::random(8, 4);
+
+        // Verify native Merkle proof for each leaf
+        for token_id in 0..8 {
+            let embed = table.lookup(token_id).unwrap();
+            let leaf_hash = EmbeddingTable::hash_embedding(embed);
+            let path = table.get_merkle_proof(token_id);
+
+            // Walk the path natively to verify it reaches the root
+            let mut current = leaf_hash;
+            for (sibling, is_left) in &path {
+                let (left, right) = if *is_left {
+                    (*sibling, current)
+                } else {
+                    (current, *sibling)
+                };
+                current = poseidon_hash_two(left, right);
+            }
+            assert_eq!(current, table.root, "Native Merkle path for token {} doesn't reach root", token_id);
+        }
     }
 }

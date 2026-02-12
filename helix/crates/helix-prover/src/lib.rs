@@ -333,9 +333,11 @@ mod pipeline_integration_tests {
             error_bound: 0.01,
         };
 
-        // Prove via parallel prover
+        // Prove via parallel prover (short timeout to prevent hangs if worker panics)
         let prover = ParallelProver::with_config(ParallelConfig {
             num_threads: 1,
+            proof_timeout_secs: 60,
+            max_retries_per_proof: 1,
             ..Default::default()
         });
         prover.submit(chunk.clone(), 100);
@@ -399,9 +401,11 @@ mod pipeline_integration_tests {
     /// Test compression modes with real proof data.
     #[test]
     fn test_pipeline_all_compression_modes() {
-        // Generate a real proof to compress
+        // Generate a real proof to compress (short timeout to prevent hangs)
         let prover = ParallelProver::with_config(ParallelConfig {
             num_threads: 1,
+            proof_timeout_secs: 60,
+            max_retries_per_proof: 1,
             ..Default::default()
         });
         let chunk = ComputationChunk {

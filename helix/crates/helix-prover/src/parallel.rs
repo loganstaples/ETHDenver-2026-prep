@@ -463,10 +463,18 @@ impl ParallelProver {
         let scheduler = Arc::new(WorkStealingScheduler::new(config.clone()));
 
         // Pre-initialize the shared pipeline once (expensive keygen).
-        let mut pipeline = ProverPipeline::<IVCStepCircuit>::new(5);
-        if let Err(e) = pipeline.setup(&IVCStepCircuit::default()) {
-            tracing::error!("Failed to setup shared IVC pipeline: {e}");
-        }
+        // If setup fails, store None so workers get a clean error instead of
+        // panicking on expect() when trying to use a broken pipeline.
+        let shared_pipeline = {
+            let mut pipeline = ProverPipeline::<IVCStepCircuit>::new(5);
+            match pipeline.setup(&IVCStepCircuit::default()) {
+                Ok(()) => Arc::new(RwLock::new(Some(pipeline))),
+                Err(e) => {
+                    tracing::error!("Failed to setup shared IVC pipeline: {e}");
+                    Arc::new(RwLock::new(None))
+                }
+            }
+        };
 
         Self {
             config,
@@ -478,7 +486,7 @@ impl ParallelProver {
             workers: Mutex::new(Vec::new()),
             stats: Arc::new(ParallelProverStats::new()),
             work_available: Arc::new((Mutex::new(false), Condvar::new())),
-            shared_pipeline: Arc::new(RwLock::new(Some(pipeline))),
+            shared_pipeline,
         }
     }
 
@@ -630,17 +638,11 @@ impl ParallelProver {
     }
 
     /// Waits for a specific proof to complete.
+    ///
+    /// Uses the configured `proof_timeout_secs` as a timeout to prevent infinite hangs
+    /// if a worker thread panics or dies silently.
     pub fn wait_for(&self, chunk_id: ChunkId) -> Option<ChunkProof> {
-        loop {
-            match self.get_status(chunk_id) {
-                Some(ProofStatus::Complete) => return self.get_proof(chunk_id),
-                Some(ProofStatus::Failed(_)) => return None,
-                None => return None,
-                _ => {
-                    thread::sleep(Duration::from_millis(10));
-                }
-            }
-        }
+        self.wait_for_timeout(chunk_id, Duration::from_secs(self.config.proof_timeout_secs))
     }
 
     /// Waits for a specific proof with timeout.
@@ -942,7 +944,22 @@ impl ParallelProver {
                     std::thread::sleep(Duration::from_millis(50 * (1 << attempt.min(6))));
                 }
 
-                let proof_result = Self::generate_proof(&task.chunk, &shared_pipeline);
+                let proof_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    Self::generate_proof(&task.chunk, &shared_pipeline)
+                }));
+                let proof_result = match proof_result {
+                    Ok(r) => r,
+                    Err(panic_info) => {
+                        let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                            s.to_string()
+                        } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "worker panic (unknown payload)".to_string()
+                        };
+                        Err(format!("Worker panicked: {msg}"))
+                    }
+                };
                 let elapsed_us = start_time.elapsed().as_micros() as u64;
                 let elapsed_ms = elapsed_us / 1000;
 
@@ -1317,6 +1334,16 @@ mod tests {
     use super::*;
     use crate::chunking::ComputationType;
 
+    /// Test config with shorter timeouts to prevent hangs if proofs fail.
+    fn test_config(num_threads: usize) -> ParallelConfig {
+        ParallelConfig {
+            num_threads,
+            proof_timeout_secs: 60,
+            max_retries_per_proof: 1,
+            ..Default::default()
+        }
+    }
+
     fn make_test_chunk(id: u64) -> ComputationChunk {
         ComputationChunk {
             id: ChunkId(id),
@@ -1331,7 +1358,7 @@ mod tests {
 
     #[test]
     fn test_parallel_prover_submit() {
-        let prover = ParallelProver::new();
+        let prover = ParallelProver::with_config(test_config(2));
         let chunk = make_test_chunk(1);
 
         prover.submit(chunk.clone(), 100);
@@ -1341,10 +1368,7 @@ mod tests {
 
     #[test]
     fn test_parallel_prover_prove() {
-        let prover = ParallelProver::with_config(ParallelConfig {
-            num_threads: 2,
-            ..Default::default()
-        });
+        let prover = ParallelProver::with_config(test_config(2));
 
         for i in 0..4 {
             prover.submit(make_test_chunk(i), 100);
@@ -1413,9 +1437,8 @@ mod tests {
     #[test]
     fn test_parallel_prover_with_dependencies() {
         let prover = ParallelProver::with_config(ParallelConfig {
-            num_threads: 2,
             task_affinity: true,
-            ..Default::default()
+            ..test_config(2)
         });
 
         // Create chunks with parent relationships.
@@ -1442,10 +1465,7 @@ mod tests {
 
         let result = prove_batch_with_dependencies(
             chunks,
-            ParallelConfig {
-                num_threads: 2,
-                ..Default::default()
-            },
+            test_config(2),
         ).expect("batch should succeed");
 
         assert_eq!(result.proofs.len(), 4);
@@ -1459,10 +1479,7 @@ mod tests {
     fn test_proof_bytes_are_valid_halo2() {
         // Verify that the generated proofs are actual Halo2 KZG proofs
         // that pass verification with the correct public inputs.
-        let prover = ParallelProver::with_config(ParallelConfig {
-            num_threads: 1,
-            ..Default::default()
-        });
+        let prover = ParallelProver::with_config(test_config(1));
 
         let chunk = make_test_chunk(42);
         prover.submit(chunk.clone(), 100);
@@ -1500,10 +1517,7 @@ mod tests {
     #[test]
     fn test_shared_pipeline_consistency() {
         // All proofs from different workers should be verifiable with the same VK
-        let prover = ParallelProver::with_config(ParallelConfig {
-            num_threads: 3,
-            ..Default::default()
-        });
+        let prover = ParallelProver::with_config(test_config(3));
 
         for i in 0..6 {
             prover.submit(make_test_chunk(i), 100);
@@ -1544,14 +1558,12 @@ mod tests {
     #[test]
     fn test_work_stealing_actually_steals() {
         // Force all tasks to one worker, then verify stealing happens
-        let config = ParallelConfig {
-            num_threads: 2,
+        let prover = ParallelProver::with_config(ParallelConfig {
             work_stealing: true,
             steal_threshold: 2,
             steal_batch_size: 2,
-            ..Default::default()
-        };
-        let prover = ParallelProver::with_config(config);
+            ..test_config(2)
+        });
 
         // Submit 8 tasks all with affinity to worker 0
         for i in 0..8 {
@@ -1573,10 +1585,7 @@ mod tests {
 
     #[test]
     fn test_wait_for_timeout_expires() {
-        let prover = ParallelProver::with_config(ParallelConfig {
-            num_threads: 1,
-            ..Default::default()
-        });
+        let prover = ParallelProver::with_config(test_config(1));
 
         let chunk = make_test_chunk(1);
         prover.submit(chunk.clone(), 100);
@@ -1588,10 +1597,7 @@ mod tests {
 
     #[test]
     fn test_progress_tracking() {
-        let prover = ParallelProver::with_config(ParallelConfig {
-            num_threads: 2,
-            ..Default::default()
-        });
+        let prover = ParallelProver::with_config(test_config(2));
 
         for i in 0..4 {
             prover.submit(make_test_chunk(i), 100);
@@ -1613,10 +1619,7 @@ mod tests {
     #[test]
     fn test_prove_batch_function() {
         let chunks: Vec<_> = (0..3).map(|i| make_test_chunk(i)).collect();
-        let result = prove_batch(chunks, ParallelConfig {
-            num_threads: 2,
-            ..Default::default()
-        }).expect("batch should succeed");
+        let result = prove_batch(chunks, test_config(2)).expect("batch should succeed");
 
         assert_eq!(result.proofs.len(), 3);
         assert!(result.failures.is_empty());

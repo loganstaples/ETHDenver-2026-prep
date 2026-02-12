@@ -708,9 +708,11 @@ impl HelixVerificationKey {
         Ok(Self { metadata })
     }
 
-    /// Returns the commitment points placeholder for EVM verification.
+    /// Returns commitment points placeholder for EVM verification.
+    ///
+    /// This is a metadata-only descriptor; it does not hold the actual VK.
+    /// For real commitment points, use `RealKeyBundle::commitment_points()`.
     pub fn commitment_points(&self) -> Vec<[u8; 64]> {
-        // In production, extract G1 points from the actual VK
         Vec::new()
     }
 
@@ -855,6 +857,50 @@ impl RealKeyBundle {
     /// Returns the K value.
     pub fn k(&self) -> u32 {
         self.metadata.metadata.k
+    }
+
+    /// Extracts real G1 commitment points from the verification key.
+    ///
+    /// Returns fixed column commitments as 64-byte uncompressed points
+    /// (x: 32 bytes big-endian, y: 32 bytes big-endian) suitable for
+    /// the EVM BN254 pairing precompile.
+    pub fn commitment_points(&self) -> Vec<[u8; 64]> {
+        use halo2curves::group::prime::PrimeCurveAffine;
+        use halo2curves::CurveAffine;
+
+        let fixed = self.vk.fixed_commitments();
+        let mut points = Vec::with_capacity(fixed.len());
+
+        for commitment in fixed {
+            let mut point = [0u8; 64];
+
+            if commitment.is_identity().into() {
+                // Point at infinity → all zeros
+                points.push(point);
+                continue;
+            }
+
+            let coords = commitment.coordinates()
+                .expect("non-identity G1Affine always has coordinates");
+
+            // x coordinate: 32 bytes little-endian from to_repr(), reversed to big-endian
+            let x_repr = coords.x().to_repr();
+            let x_bytes: &[u8] = x_repr.as_ref();
+            for (i, &b) in x_bytes.iter().enumerate() {
+                point[31 - i] = b;
+            }
+
+            // y coordinate: 32 bytes little-endian from to_repr(), reversed to big-endian
+            let y_repr = coords.y().to_repr();
+            let y_bytes: &[u8] = y_repr.as_ref();
+            for (i, &b) in y_bytes.iter().enumerate() {
+                point[63 - i] = b;
+            }
+
+            points.push(point);
+        }
+
+        points
     }
 
     /// Returns a summary of the key generation.
@@ -1258,6 +1304,32 @@ mod tests {
         assert_eq!(real_bundle.k(), 12);
         assert_eq!(real_bundle.circuit_name(), "IVCStepCircuit");
         assert!(!real_bundle.summary().is_empty());
+    }
+
+    #[test]
+    fn test_real_key_commitment_points() {
+        use halo2_proofs::poly::kzg::commitment::ParamsKZG;
+        use halo2curves::bn256::Bn256;
+        use rand_core::OsRng;
+
+        let circuit = IVCStepCircuit::default();
+        let params = ParamsKZG::<Bn256>::setup(12, OsRng);
+
+        let real_bundle = HelixProvingKey::generate_real(
+            &circuit, &params, "IVCStepCircuit",
+        ).expect("real keygen must succeed");
+
+        let points = real_bundle.commitment_points();
+
+        // Must have at least one fixed commitment (for the circuit's fixed column)
+        assert!(!points.is_empty(), "commitment_points must not be empty");
+
+        // Each point is 64 bytes (32 for x, 32 for y in big-endian)
+        for (i, point) in points.iter().enumerate() {
+            assert_eq!(point.len(), 64, "point {} must be 64 bytes", i);
+            // At least one coordinate should be non-zero for real commitments
+            // (unless the commitment is the point at infinity)
+        }
     }
 
     #[test]
