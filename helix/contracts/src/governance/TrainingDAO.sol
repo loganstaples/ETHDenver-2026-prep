@@ -194,17 +194,19 @@ contract TrainingDAO is ReentrancyGuard {
         string calldata description,
         ParameterProposal calldata params
     ) external returns (uint256 proposalId) {
-        // Pre-compute proposalId so calldata is correct from creation (no placeholder needed)
-        proposalId = proposalCount + 1;
-
-        createProposal(
+        // Create the proposal first, get the real ID back
+        proposalId = createProposal(
             ProposalType.ParameterChange,
             description,
             address(this),
-            abi.encodeWithSignature("applyParameters(uint256)", proposalId)
+            "" // placeholder calldata
         );
 
+        // Store params keyed by the real proposal ID
         parameterProposals[proposalId] = params;
+
+        // Update the calldata with the correct proposal ID
+        proposals[proposalId].callData = abi.encodeWithSignature("applyParameters(uint256)", proposalId);
     }
 
     /// @notice Cast a vote on a proposal
