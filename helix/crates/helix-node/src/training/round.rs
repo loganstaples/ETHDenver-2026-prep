@@ -149,6 +149,11 @@ pub struct GradientSubmission {
     pub gradient_data: Vec<u8>,
     /// ZK proof of valid computation.
     pub proof: Vec<u8>,
+    /// Public inputs accompanying the proof (8 × 32-byte big-endian field elements).
+    /// Layout: [old_hash_lo, old_hash_hi, new_hash_lo, new_hash_hi, loss, error_bound, step_number, error_checksum].
+    /// Required for proof aggregation via RLCAggregationProver.
+    #[serde(default)]
+    pub public_inputs: Vec<[u8; 32]>,
     /// Claimed error bound.
     pub error_bound: f64,
     /// Timestamp of submission.
@@ -632,6 +637,7 @@ mod tests {
             gradient_hash: [1u8; 32],
             gradient_data: vec![1, 2, 3],
             proof: vec![4, 5, 6],
+            public_inputs: vec![],
             error_bound: 0.01,
             timestamp: 1000,
         }).unwrap();
@@ -641,6 +647,7 @@ mod tests {
             gradient_hash: [2u8; 32],
             gradient_data: vec![7, 8, 9],
             proof: vec![10, 11, 12],
+            public_inputs: vec![],
             error_bound: 0.02,
             timestamp: 1001,
         }).unwrap();
@@ -688,6 +695,7 @@ mod tests {
             gradient_hash: [1u8; 32],
             gradient_data: vec![],
             proof: vec![],
+            public_inputs: vec![],
             error_bound: 0.01,
             timestamp: 0,
         }).unwrap();

@@ -38,9 +38,9 @@ abigen!(
 
 /// Public inputs for MLTrainingStepV2Circuit (8 elements).
 ///
-/// The first 7 are the on-chain public inputs consumed by `HelixCoordinatorV2`.
-/// The 8th (`error_checksum`) is required for native Halo2 KZG verification
-/// and is `SHA256(total_error || step_number || model_id || error_budget)`.
+/// All 8 public inputs are required by `HelixCoordinatorV2` and `V3`
+/// (`EXPECTED_PUBLIC_INPUTS = 8`). The 8th (`error_checksum`) is the
+/// Poseidon hash of the error state, verified both in-circuit and on-chain.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TrainingProofInputs {
     /// Old state hash (lower 128 bits).
@@ -64,21 +64,9 @@ pub struct TrainingProofInputs {
 }
 
 impl TrainingProofInputs {
-    /// Converts to the 7-element format expected by the on-chain contract.
+    /// Converts to the 8-element format required by the on-chain contract
+    /// (`EXPECTED_PUBLIC_INPUTS = 8` in HelixCoordinatorV2/V3).
     pub fn to_vec(&self) -> Vec<U256> {
-        vec![
-            self.old_hash_lo,
-            self.old_hash_hi,
-            self.new_hash_lo,
-            self.new_hash_hi,
-            self.loss,
-            self.error_bound,
-            self.step_number,
-        ]
-    }
-
-    /// Converts to the full 8-element format needed for native Halo2 verification.
-    pub fn to_vec_full(&self) -> Vec<U256> {
         vec![
             self.old_hash_lo,
             self.old_hash_hi,
@@ -440,15 +428,11 @@ mod tests {
             step_number: U256::from(1),
             error_checksum: U256::from(42),
         };
-        // On-chain format has 7 elements (no error_checksum)
+        // On-chain format has 8 elements (matching EXPECTED_PUBLIC_INPUTS = 8)
         let vec = inputs.to_vec();
-        assert_eq!(vec.len(), 7);
+        assert_eq!(vec.len(), 8);
         assert_eq!(vec[0], U256::from(1));
         assert_eq!(vec[6], U256::from(1));
-
-        // Full format for native Halo2 verification has 8 elements
-        let vec_full = inputs.to_vec_full();
-        assert_eq!(vec_full.len(), 8);
-        assert_eq!(vec_full[7], U256::from(42));
+        assert_eq!(vec[7], U256::from(42));
     }
 }

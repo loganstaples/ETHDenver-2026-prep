@@ -269,6 +269,7 @@ fn test_slashed_workers_excluded() {
             gradients: vec![1.0, 2.0],
             commitment: [0u8; 32],
             valid: true,
+
         },
         GradientSubmission {
             party: parties[1].clone(),
@@ -276,6 +277,7 @@ fn test_slashed_workers_excluded() {
             gradients: vec![100.0, 200.0], // Would corrupt average
             commitment: [0u8; 32],
             valid: true, // Marked valid but should be excluded due to slashing
+
         },
         GradientSubmission {
             party: parties[2].clone(),
@@ -283,6 +285,7 @@ fn test_slashed_workers_excluded() {
             gradients: vec![1.0, 2.0],
             commitment: [0u8; 32],
             valid: true,
+
         },
     ];
 

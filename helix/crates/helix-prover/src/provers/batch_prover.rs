@@ -35,6 +35,15 @@ pub enum BatchProveError {
         /// Total steps attempted.
         total: usize,
     },
+
+    /// Proof aggregation failed (both RLC and KZG paths).
+    #[error("Proof aggregation failed for {num_proofs} proofs: {reason}")]
+    AggregationFailed {
+        /// Why aggregation failed.
+        reason: String,
+        /// Number of proofs we tried to aggregate.
+        num_proofs: usize,
+    },
 }
 
 /// Configuration for batch proving.
@@ -470,7 +479,13 @@ impl BatchProver {
 
         // Aggregate if enabled.
         let aggregated = if self.config.aggregate_proofs {
-            Some(self.aggregate_proofs(&step_proofs, first_step, last_step))
+            match self.aggregate_proofs(&step_proofs, first_step, last_step) {
+                Ok(agg) => Some(agg),
+                Err(e) => {
+                    tracing::error!("Proof aggregation failed: {e}");
+                    None
+                }
+            }
         } else {
             None
         };
@@ -665,7 +680,7 @@ impl BatchProver {
         proofs: &[StepProof],
         first_step: u64,
         last_step: u64,
-    ) -> AggregatedBatchProof {
+    ) -> Result<AggregatedBatchProof, BatchProveError> {
         // Build SHA-256 Merkle root of all public inputs (backward compat).
         let mut hasher = Sha256::new();
         let mut total_error = 0.0f64;
@@ -688,6 +703,8 @@ impl BatchProver {
         // contract interface. This is what gets submitted on-chain.
         // ====================================================================
         let training_results = Self::step_proofs_to_training_results(proofs);
+        let mut rlc_error: Option<String> = None;
+
         let rlc_result = if proofs.len() <= helix_circuits::MAX_AGGREGATION_BATCH
             && proofs.iter().all(|p| p.public_inputs.len() >= 8)
         {
@@ -707,19 +724,26 @@ impl BatchProver {
                         Some(agg)
                     }
                     Err(e) => {
+                        rlc_error = Some(e.clone());
                         tracing::warn!("RLC aggregation failed, falling back to KZG: {e}");
                         None
                     }
                 }
             } else {
+                rlc_error = Some("PI chain broken: step[i].new_hash != step[i+1].old_hash".to_string());
                 tracing::warn!("PI chain broken, skipping RLC aggregation");
                 None
             }
         } else {
-            tracing::info!(
-                num_proofs = proofs.len(),
-                "Skipping RLC aggregation (proofs have < 8 PIs or batch too large)"
-            );
+            if proofs.len() > helix_circuits::MAX_AGGREGATION_BATCH {
+                rlc_error = Some(format!(
+                    "Batch size {} exceeds MAX_AGGREGATION_BATCH ({})",
+                    proofs.len(),
+                    helix_circuits::MAX_AGGREGATION_BATCH,
+                ));
+            } else {
+                rlc_error = Some("Some proofs have < 8 public inputs".to_string());
+            }
             None
         };
 
@@ -756,26 +780,19 @@ impl BatchProver {
             None
         };
 
-        // Use RLC proof > KZG proof > individual proofs.
+        // Use RLC proof > KZG proof. If both fail, return error.
         let (aggregated_proof_bytes, individual_proofs) = if let Some(ref rlc) = rlc_result {
             (rlc.proof.clone(), None)
         } else if let Some(ref kzg) = kzg_result {
             (kzg.proof.clone(), None)
         } else {
-            tracing::warn!(
-                num_proofs = proofs.len(),
-                "All aggregation unavailable, preserving {} individual proofs",
-                proofs.len(),
-            );
-            let individual: Vec<Vec<u8>> = proofs
-                .iter()
-                .map(|p| p.proof.clone())
-                .collect();
-            let representative = individual.first().cloned().unwrap_or_default();
-            (representative, Some(individual))
+            return Err(BatchProveError::AggregationFailed {
+                reason: rlc_error.unwrap_or_else(|| "Unknown aggregation failure".to_string()),
+                num_proofs: proofs.len(),
+            });
         };
 
-        AggregatedBatchProof {
+        Ok(AggregatedBatchProof {
             proof: aggregated_proof_bytes,
             merkle_root,
             num_steps: proofs.len(),
@@ -786,7 +803,7 @@ impl BatchProver {
             kzg_proof: kzg_result,
             individual_proofs,
             rlc_proof: rlc_result,
-        }
+        })
     }
 
     /// Attempts RLC aggregation using SHPLONKAggregationCircuit.
@@ -807,15 +824,15 @@ impl BatchProver {
     /// Converts StepProofs to TrainingProofResultV2 for RLC aggregation.
     fn step_proofs_to_training_results(proofs: &[StepProof]) -> Vec<TrainingProofResultV2> {
         use helix_circuits::halo2curves::bn256::Fr;
-        use helix_circuits::halo2curves::ff::PrimeField;
         use helix_circuits::halo2_proofs::arithmetic::Field;
+        use helix_circuits::verifier::evm_bytes_to_fr;
 
         proofs.iter().map(|step| {
+            // StepProof.public_inputs stores [u8; 32] in big-endian EVM format
+            // (matching fr_to_evm_bytes / to_evm_public_inputs convention).
+            // Use evm_bytes_to_fr for proper big-endian → Fr conversion.
             let pis: Vec<Fr> = step.public_inputs.iter().map(|bytes| {
-                let mut repr = [0u8; 32];
-                repr.copy_from_slice(bytes);
-                repr[31] &= 0x1F;
-                Fr::from_repr_vartime(repr.into()).unwrap_or(Fr::ZERO)
+                evm_bytes_to_fr(bytes).unwrap_or(Fr::ZERO)
             }).collect();
 
             let old_hash = if pis.len() >= 2 { (pis[0], pis[1]) } else { (Fr::ZERO, Fr::ZERO) };

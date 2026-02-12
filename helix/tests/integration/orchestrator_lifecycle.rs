@@ -67,6 +67,7 @@ fn make_gradient_submission(
         gradient_hash,
         gradient_data: serialized,
         proof: vec![0u8; 64], // placeholder proof
+        public_inputs: vec![],
         error_bound: 0.01,
         timestamp: step,
     }
@@ -650,6 +651,7 @@ fn proof_to_submission(
         gradient_hash,
         gradient_data: proof_result.proof.clone(),
         proof: proof_result.proof.clone(),
+        public_inputs: vec![],
         error_bound: 0.01,
         timestamp: step,
     }

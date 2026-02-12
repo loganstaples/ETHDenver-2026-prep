@@ -1026,6 +1026,7 @@ impl TrainingCoordinator {
         gradient: ModelGradient,
         error_bound: f64,
         proof: Vec<u8>,
+        public_inputs: Vec<[u8; 32]>,
     ) -> Result<(), CoordinatorError> {
         let round = self.rounds.current_mut()
             .ok_or(CoordinatorError::NoActiveRound)?;
@@ -1042,6 +1043,7 @@ impl TrainingCoordinator {
             gradient_hash,
             gradient_data: vec![], // Serialized separately
             proof,
+            public_inputs,
             error_bound,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1076,6 +1078,7 @@ impl TrainingCoordinator {
         error_bound: f64,
         gradient_hash: [u8; 32],
         proof: Vec<u8>,
+        public_inputs: Vec<[u8; 32]>,
     ) -> Result<(), CoordinatorError> {
         let round = self.rounds.current_mut()
             .ok_or(CoordinatorError::NoActiveRound)?;
@@ -1205,6 +1208,7 @@ impl TrainingCoordinator {
             gradient_hash,
             gradient_data: vec![],
             proof,
+            public_inputs,
             error_bound,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1248,6 +1252,7 @@ impl TrainingCoordinator {
         error_bound: f64,
         gradient_hash: [u8; 32],
         proof: Vec<u8>,
+        public_inputs: Vec<[u8; 32]>,
     ) -> Result<(), CoordinatorError> {
         let round = self.rounds.current_mut()
             .ok_or(CoordinatorError::NoActiveRound)?;
@@ -1340,6 +1345,7 @@ impl TrainingCoordinator {
             gradient_hash,
             gradient_data: vec![],
             proof,
+            public_inputs,
             error_bound,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1512,28 +1518,92 @@ impl TrainingCoordinator {
             });
         }
 
-        // Aggregate participant proofs into a single proof for on-chain submission.
-        // The individual proofs were collected during the submission phase.
+        // Aggregate participant proofs into a single ZK proof for on-chain submission.
+        // Collects individual proofs + public inputs from submissions, reconstructs
+        // TrainingProofResultV2 values, and aggregates via RLCAggregationProver
+        // (SHPLONKAggregationCircuit) into a single KZG proof with 8 PIs.
         let round_for_proofs = self.rounds.current()
             .ok_or(CoordinatorError::NoActiveRound)?;
-        let participant_proofs: Vec<Vec<u8>> = round_for_proofs.submissions.values()
-            .map(|s| s.proof.clone())
-            .filter(|p| !p.is_empty())
+
+        let submissions_with_proofs: Vec<_> = round_for_proofs.submissions.values()
+            .filter(|s| !s.proof.is_empty() && s.public_inputs.len() == 8)
             .collect();
-        let (agg_proof_bytes, agg_proof_pis) = if participant_proofs.is_empty() {
+
+        let (agg_proof_bytes, agg_proof_pis) = if submissions_with_proofs.is_empty() {
+            if !round_for_proofs.submissions.is_empty() {
+                log::warn!(
+                    "No submissions have valid proofs with 8 public inputs \
+                     ({} submissions total, {} with non-empty proofs). \
+                     Proof aggregation skipped.",
+                    round_for_proofs.submissions.len(),
+                    round_for_proofs.submissions.values().filter(|s| !s.proof.is_empty()).count(),
+                );
+            }
             (vec![], vec![])
         } else {
-            // NOTE: Real proof aggregation via RLCAggregationProver requires
-            // TrainingProofResultV2 with Fr-typed public inputs. When individual
-            // proofs are available with proper PI format, aggregate them.
-            // For now, concatenate proof bytes for the node layer — the actual
-            // ZK aggregation is handled by the prover crate when submitting
-            // the batch to the chain.
+            // Reconstruct TrainingProofResultV2 from submission bytes + PIs.
+            use halo2curves::bn256::Fr;
+            use halo2curves::ff::{PrimeField, Field};
+
+            let training_results: Vec<helix_prover::TrainingProofResultV2> = submissions_with_proofs
+                .iter()
+                .enumerate()
+                .map(|(i, sub)| {
+                    // Convert 32-byte big-endian EVM PIs to Fr field elements.
+                    let pis: Vec<Fr> = sub.public_inputs.iter().map(|bytes| {
+                        let mut repr = [0u8; 32];
+                        // EVM format is big-endian; Fr::from_repr expects little-endian.
+                        for (j, b) in bytes.iter().enumerate() {
+                            repr[31 - j] = *b;
+                        }
+                        // Mask top bits to fit within BN254 field modulus.
+                        repr[31] &= 0x1F;
+                        Fr::from_repr_vartime(repr.into()).unwrap_or(Fr::ZERO)
+                    }).collect();
+
+                    let old_hash = (pis[0], pis[1]);
+                    let new_hash = (pis[2], pis[3]);
+                    let loss = pis[4];
+                    let total_error = pis[5];
+
+                    helix_prover::TrainingProofResultV2 {
+                        proof: sub.proof.clone(),
+                        public_inputs: pis,
+                        loss,
+                        total_error,
+                        step_number: i as u64,
+                        old_state_hash: old_hash,
+                        new_state_hash: new_hash,
+                        verified: true,
+                        generation_time: std::time::Duration::from_millis(0),
+                        verification_time: None,
+                        attempts: 1,
+                        from_cache: false,
+                        witness_hash: None,
+                    }
+                })
+                .collect();
+
             log::info!(
-                "Collected {} participant proofs for aggregation",
-                participant_proofs.len(),
+                "Aggregating {} participant proofs via RLCAggregationProver",
+                training_results.len(),
             );
-            (vec![], vec![])
+
+            match helix_prover::BatchProver::aggregate_training_proofs(&training_results) {
+                Ok(agg) => {
+                    log::info!(
+                        "Proof aggregation succeeded: {} steps, proof size {} bytes",
+                        agg.num_steps,
+                        agg.proof.len(),
+                    );
+                    let evm_pis = agg.to_evm_public_inputs();
+                    (agg.proof, evm_pis)
+                }
+                Err(e) => {
+                    log::error!("Proof aggregation failed: {e}");
+                    (vec![], vec![])
+                }
+            }
         };
 
         let result = AggregationResult {
@@ -2030,7 +2100,7 @@ mod tests {
         let gradient_hash = gradient.commitment();
         let proof = create_valid_proof(gradient_hash, 0);
 
-        coordinator.submit_gradient(gradient, 0.01, proof).unwrap();
+        coordinator.submit_gradient(gradient, 0.01, proof, vec![]).unwrap();
         assert_eq!(coordinator.state(), CoordinatorState::WaitingForAggregation);
     }
 
@@ -2281,7 +2351,7 @@ mod tests {
         let gradient_hash = gradient.commitment();
         let proof = create_valid_proof(gradient_hash, round_id.0);
 
-        coordinator.submit_gradient(gradient, 0.01, proof).unwrap();
+        coordinator.submit_gradient(gradient, 0.01, proof, vec![]).unwrap();
 
         // Aggregate
         let result = coordinator.aggregate().unwrap();
@@ -2322,6 +2392,7 @@ mod tests {
             0.01,
             gradient_hash,
             proof,
+            vec![],
         );
 
         // Check propagation queue
@@ -2373,6 +2444,7 @@ mod tests {
             0.01,
             gradient_hash,
             invalid_proof,
+            vec![],
         );
 
         assert!(result.is_err());
@@ -2418,6 +2490,7 @@ mod tests {
             0.01,
             gradient_hash,
             proof,
+            vec![],
         );
 
         // Should be rejected as outlier due to max_gradient_norm

@@ -244,6 +244,7 @@ fn test_partition_training_progress() {
             gradients: true_gradients.clone(),
             commitment: [0u8; 32],
             valid: true,
+
         })
         .collect();
 
@@ -288,6 +289,7 @@ fn test_partition_training_progress() {
             gradients: true_gradients.clone(),
             commitment: [0u8; 32],
             valid: true,
+
         })
         .collect();
 
@@ -327,6 +329,7 @@ fn test_partition_byzantine_tolerance() {
             gradients: true_gradients.clone(),
             commitment: [0u8; 32],
             valid: true,
+
         })
         .collect();
 
@@ -345,6 +348,7 @@ fn test_partition_byzantine_tolerance() {
             gradients: true_gradients.clone(),
             commitment: [0u8; 32],
             valid: true,
+
         })
         .collect();
 
@@ -368,6 +372,7 @@ fn test_partition_byzantine_tolerance() {
             gradients: true_gradients.clone(),
             commitment: [0u8; 32],
             valid: true,
+
         })
         .collect();
 
