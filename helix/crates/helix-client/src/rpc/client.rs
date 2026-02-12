@@ -1179,6 +1179,8 @@ pub struct MockRpcClient {
     workers: Arc<RwLock<Vec<WorkerInfo>>>,
     /// Training progress history
     progress_history: Arc<RwLock<Vec<TrainingProgress>>>,
+    /// Auto-incrementing model ID counter
+    next_model_id: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl MockRpcClient {
@@ -1211,6 +1213,7 @@ impl MockRpcClient {
             })),
             workers: Arc::new(RwLock::new(Vec::new())),
             progress_history: Arc::new(RwLock::new(Vec::new())),
+            next_model_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         }
     }
 
@@ -1367,6 +1370,20 @@ impl Default for MockRpcClient {
     }
 }
 
+impl Clone for MockRpcClient {
+    fn clone(&self) -> Self {
+        Self {
+            training_status: self.training_status.clone(),
+            proof_status: self.proof_status.clone(),
+            workers: self.workers.clone(),
+            progress_history: self.progress_history.clone(),
+            next_model_id: Arc::new(std::sync::atomic::AtomicU64::new(
+                self.next_model_id.load(std::sync::atomic::Ordering::Relaxed),
+            )),
+        }
+    }
+}
+
 // ============================================================================
 // Unified RPC Client (Real + Mock)
 // ============================================================================
@@ -1381,9 +1398,10 @@ pub struct UnifiedRpcClient {
     use_mock: bool,
     /// Connection status
     connected: bool,
-    /// On-chain client for contract interactions (chain feature)
+    /// On-chain client for contract interactions (chain feature).
+    /// Wrapped in Arc for Clone support.
     #[cfg(feature = "chain")]
-    chain_client: Option<super::chain::ChainClient>,
+    chain_client: Option<Arc<super::chain::ChainClient>>,
 }
 
 impl UnifiedRpcClient {
@@ -1447,13 +1465,13 @@ impl UnifiedRpcClient {
     /// Attach an on-chain client for contract interactions.
     #[cfg(feature = "chain")]
     pub fn set_chain_client(&mut self, client: super::chain::ChainClient) {
-        self.chain_client = Some(client);
+        self.chain_client = Some(Arc::new(client));
     }
 
     /// Get a reference to the on-chain client, if attached.
     #[cfg(feature = "chain")]
     pub fn chain_client(&self) -> Option<&super::chain::ChainClient> {
-        self.chain_client.as_ref()
+        self.chain_client.as_deref()
     }
 
     /// Check if using mock mode
@@ -1696,6 +1714,136 @@ impl UnifiedRpcClient {
     /// Get the mock client for direct access (when in mock mode)
     pub fn mock(&self) -> &MockRpcClient {
         &self.mock_client
+    }
+
+    // ==================== SDK Forwarding Methods ====================
+
+    /// List all registered models.
+    pub async fn list_models(&self) -> Result<Vec<ModelInfo>, RpcError> {
+        if self.use_mock {
+            Ok(vec![ModelInfo {
+                id: 0,
+                name: "helix-demo-model".to_string(),
+                ipfs_hash: "QmXoYP...mock".to_string(),
+                architecture: "MLP".to_string(),
+                parameter_count: 4096,
+                current_commitment: format!("0x{}", "ab".repeat(32)),
+                owner: format!("0x{}", "42".repeat(20)),
+                min_stake: 0.1,
+                training_active: false,
+                current_round: 0,
+                accumulated_error: 0.0,
+                created_at: chrono::Utc::now().timestamp(),
+            }])
+        } else if let Some(ref client) = self.real_client {
+            client.list_models().await
+        } else {
+            Err(RpcError::NodeUnavailable("No client available".into()))
+        }
+    }
+
+    /// Register a new model.
+    pub async fn register_model(
+        &self,
+        name: &str,
+        ipfs_hash: &str,
+        min_stake: f64,
+    ) -> Result<u64, RpcError> {
+        if self.use_mock {
+            Ok(self
+                .mock_client
+                .next_model_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+        } else if let Some(ref client) = self.real_client {
+            client.register_model(name, ipfs_hash, min_stake).await
+        } else {
+            Err(RpcError::NodeUnavailable("No client available".into()))
+        }
+    }
+
+    /// Stake tokens for a model.
+    pub async fn stake(&self, model_id: u64, amount_eth: f64) -> Result<String, RpcError> {
+        if self.use_mock {
+            Ok(format!("0xmock_stake_tx_{}", model_id))
+        } else if let Some(ref client) = self.real_client {
+            client.stake(model_id, amount_eth).await
+        } else {
+            Err(RpcError::NodeUnavailable("No client available".into()))
+        }
+    }
+
+    /// Unstake tokens for a model.
+    pub async fn unstake(&self, model_id: u64) -> Result<String, RpcError> {
+        if self.use_mock {
+            Ok(format!("0xmock_unstake_tx_{}", model_id))
+        } else if let Some(ref client) = self.real_client {
+            client.unstake(model_id).await
+        } else {
+            Err(RpcError::NodeUnavailable("No client available".into()))
+        }
+    }
+
+    /// Claim rewards for a model.
+    pub async fn claim_rewards(&self, model_id: u64) -> Result<String, RpcError> {
+        if self.use_mock {
+            Ok(format!("0xmock_rewards_tx_{}", model_id))
+        } else if let Some(ref client) = self.real_client {
+            client.claim_rewards(model_id).await
+        } else {
+            Err(RpcError::NodeUnavailable("No client available".into()))
+        }
+    }
+
+    /// Health check.
+    pub async fn health_check(&self) -> Result<HealthStatus, RpcError> {
+        if self.use_mock {
+            Ok(HealthStatus {
+                healthy: true,
+                components: HashMap::new(),
+                last_check: chrono::Utc::now().timestamp(),
+                uptime_secs: 3600,
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            })
+        } else if let Some(ref client) = self.real_client {
+            client.health_check().await
+        } else {
+            Err(RpcError::NodeUnavailable("No client available".into()))
+        }
+    }
+
+    /// Start training for a specific model with full parameters.
+    pub async fn start_training_for(
+        &self,
+        model_id: u64,
+        rounds: u64,
+        round_duration_secs: u64,
+    ) -> Result<(), RpcError> {
+        if self.use_mock {
+            // Update the model_id on the mock status
+            {
+                let mut status = self.mock_client.training_status.write().await;
+                status.model_id = model_id;
+            }
+            self.mock_client.start_training(rounds).await;
+            Ok(())
+        } else if let Some(ref client) = self.real_client {
+            client.start_training(model_id, rounds, round_duration_secs).await
+        } else {
+            Err(RpcError::NodeUnavailable("No client available".into()))
+        }
+    }
+}
+
+impl Clone for UnifiedRpcClient {
+    fn clone(&self) -> Self {
+        Self {
+            real_client: self.real_client.clone(),
+            mock_client: self.mock_client.clone(),
+            use_mock: self.use_mock,
+            connected: self.connected,
+            #[cfg(feature = "chain")]
+            chain_client: self.chain_client.clone(),
+        }
     }
 }
 

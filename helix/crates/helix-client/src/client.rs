@@ -11,7 +11,12 @@ use anyhow::Result;
 
 use crate::config::{ConfigProfile, HelixConfig, RpcConfig};
 use crate::dashboard::DashboardState;
-use crate::rpc::client::{HelixRpcConfig, UnifiedRpcClient};
+use crate::error::HelixError;
+use crate::model::{ModelHandle, SdkModelConfig, TrainingParams};
+use crate::rpc::client::{
+    HealthStatus, HelixRpcConfig, ModelInfo, NetworkStatus, UnifiedRpcClient,
+};
+use crate::session::TrainingSession;
 
 /// High-level SDK facade for the HELIX protocol.
 ///
@@ -162,6 +167,115 @@ impl HelixClient {
         }
 
         result
+    }
+
+    // ==================== High-Level SDK API ====================
+
+    /// Create a mock client and connect in one call (convenience for tests/demos).
+    pub async fn connect_mock() -> Result<Self, HelixError> {
+        let config = HelixConfig::from_profile(ConfigProfile::Local);
+        let rpc = UnifiedRpcClient::new_mock();
+        Ok(Self {
+            config,
+            rpc,
+            dashboard_state: None,
+        })
+    }
+
+    /// Create a client and connect to a specific URL in one call.
+    pub async fn connect_to(url: &str) -> Result<Self, HelixError> {
+        let rpc_cfg = HelixRpcConfig::with_endpoint(url);
+        let rpc = UnifiedRpcClient::connect(rpc_cfg)
+            .await
+            .map_err(|e| HelixError::Connection(e.to_string()))?;
+        let config = HelixConfig::from_profile(ConfigProfile::Local);
+        Ok(Self {
+            config,
+            rpc,
+            dashboard_state: None,
+        })
+    }
+
+    /// Register a model using the SDK config type.
+    pub async fn register_model(
+        &self,
+        config: SdkModelConfig,
+    ) -> Result<ModelHandle, HelixError> {
+        config.validate()?;
+
+        let ipfs_hash = format!("Qm{:0>44}", hex::encode(&config.name));
+        let model_id = self
+            .rpc
+            .register_model(&config.name, &ipfs_hash, config.min_stake)
+            .await?;
+
+        Ok(ModelHandle {
+            model_id,
+            name: config.name,
+            commitment: format!("0x{}", "00".repeat(32)),
+            architecture: config.architecture,
+        })
+    }
+
+    /// Get model information by ID.
+    pub async fn get_model(&self, model_id: u64) -> Result<ModelInfo, HelixError> {
+        Ok(self.rpc.get_model(model_id).await?)
+    }
+
+    /// List all registered models.
+    pub async fn list_models(&self) -> Result<Vec<ModelInfo>, HelixError> {
+        Ok(self.rpc.list_models().await?)
+    }
+
+    /// Start a training session and return a streaming `TrainingSession`.
+    pub async fn start_training(
+        &self,
+        model_id: u64,
+        params: TrainingParams,
+    ) -> Result<TrainingSession, HelixError> {
+        self.rpc
+            .start_training_for(model_id, params.rounds, params.round_duration_secs)
+            .await?;
+
+        Ok(TrainingSession::new(
+            self.rpc.clone(),
+            model_id,
+            params,
+        ))
+    }
+
+    /// Stake tokens for a model. Returns the mock/real transaction hash.
+    pub async fn stake(
+        &self,
+        model_id: u64,
+        amount_eth: f64,
+    ) -> Result<String, HelixError> {
+        Ok(self.rpc.stake(model_id, amount_eth).await?)
+    }
+
+    /// Unstake tokens for a model.
+    pub async fn unstake(&self, model_id: u64) -> Result<String, HelixError> {
+        Ok(self.rpc.unstake(model_id).await?)
+    }
+
+    /// Claim accumulated rewards.
+    pub async fn claim_rewards(&self, model_id: u64) -> Result<String, HelixError> {
+        Ok(self.rpc.claim_rewards(model_id).await?)
+    }
+
+    /// Get network status information.
+    pub async fn node_status(&self) -> Result<NetworkStatus, HelixError> {
+        Ok(self.rpc.get_network_status().await?)
+    }
+
+    /// Health check.
+    pub async fn health(&self) -> Result<HealthStatus, HelixError> {
+        Ok(self.rpc.health_check().await?)
+    }
+
+    /// Clone the underlying RPC client (for use by TrainingSession etc.).
+    pub(crate) fn clone_rpc(&self) -> UnifiedRpcClient {
+        self.rpc.clone()
     }
 }
 
