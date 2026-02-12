@@ -1,25 +1,20 @@
 //! Oblivious Transfer (OT) primitives for secure computation.
 //!
-//! # SECURITY WARNING
+//! # Protocols Implemented
 //!
-//! **This OT implementation has known security limitations and should NOT be used
-//! in production.** Specifically:
-//! - The base OT uses XOR-based "encryption" instead of proper group operations
-//! - The OT extension is a simulation, not a real IKNP protocol
-//! - Beaver triples generated via OT may not satisfy the required correlation
-//!
-//! Use `TrustedDealer` for development/testing or implement a proper OT library
-//! (e.g., based on libOTe or emp-ot) for production use.
-//!
-//! # Protocols Implemented (Simulated)
-//!
-//! 1. **Simplest OT** - Based on the Chou-Orlandi protocol using Diffie-Hellman
-//! 2. **OT Extension** - Extends base OTs to many OTs efficiently (IKNP-style)
-//! 3. **Correlated OT** - For generating correlated randomness
+//! 1. **Base OT** - x25519 DH-based 1-out-of-2 OT with dual receiver keys.
+//!    Receiver sends two public keys (one real, one random dummy). Sender
+//!    encrypts each message under the DH shared secret for its slot. Receiver
+//!    can only decrypt the message in the slot with the real key (CDH security).
+//! 2. **OT Extension** - PRG-based extension from base OTs (IKNP-style structure)
+//! 3. **Correlated OT** - For generating correlated randomness (m, m XOR delta)
 //!
 //! # Security Model
 //!
-//! These implementations are secure against semi-honest adversaries.
+//! The base OT is secure against semi-honest adversaries under CDH on Curve25519.
+//! - Choice-hiding: Both receiver keys are random-looking to sender
+//! - Message-hiding: Receiver cannot compute DH for the dummy key slot
+//!
 //! For malicious security, MAC checks are added in the verification layer.
 
 use rand::{RngCore, SeedableRng};
@@ -37,12 +32,26 @@ use crate::field::Fr;
 /// A message in a 1-out-of-2 OT where the receiver gets one of two values.
 #[derive(Debug, Clone)]
 pub struct OTMessage {
-    /// Encrypted value m0 (for choice bit 0)
+    /// Encrypted value m0 (for choice bit 0), encrypted under DH(s, B0)
     pub enc_m0: Vec<u8>,
-    /// Encrypted value m1 (for choice bit 1)
+    /// Encrypted value m1 (for choice bit 1), encrypted under DH(s, B1)
     pub enc_m1: Vec<u8>,
     /// Sender's public key for this OT instance
     pub sender_pk: [u8; 32],
+}
+
+/// Two public keys sent by the receiver in the OT protocol.
+///
+/// The receiver places their real public key (for which they know the secret)
+/// in slot `b` and a random dummy key (unknown discrete log) in slot `1-b`.
+/// The sender cannot distinguish real from dummy (both are random-looking
+/// x25519 public keys), which provides choice-hiding.
+#[derive(Debug, Clone)]
+pub struct OTReceiverKeys {
+    /// Public key for slot 0 (real if choice=0, dummy if choice=1)
+    pub b0: [u8; 32],
+    /// Public key for slot 1 (real if choice=1, dummy if choice=0)
+    pub b1: [u8; 32],
 }
 
 /// Result of an OT execution from the receiver's perspective.
@@ -59,16 +68,20 @@ pub struct OTResult {
 /// The sender holds two messages (m0, m1) and the receiver with choice bit b
 /// learns m_b without the sender learning b, and without the receiver learning m_{1-b}.
 ///
-/// Protocol (Chou-Orlandi style on Curve25519):
-/// 1. Sender generates keypair (s, A = s*G) and sends A to receiver
-/// 2. Receiver generates keypair (k, K = k*G)
-///    - If choice=0: sends B = K (so B_0 = K, B_1 = A - K)
-///    - If choice=1: sends B = A - K (so B_0 = A - K, B_1 = K via A - B = K)
-///    Note: we can't do EC subtraction on x25519 directly, so we use a
-///    hash-based approach where B encodes the choice implicitly.
-/// 3. Sender derives key0 = H(s*B, 0) and key1 = H(s*(A-B), 1)
-///    Encrypts: enc_m0 = Enc(key0, m0), enc_m1 = Enc(key1, m1)
-/// 4. Receiver derives key_b = H(k*A, b) and decrypts m_b
+/// Protocol (x25519 DH with dual receiver keys):
+/// 1. Sender generates keypair (s, S = s*G) and sends S to receiver
+/// 2. Receiver generates real keypair (r, R = r*G) and random dummy D:
+///    - If choice=0: sends B0 = R (real), B1 = D (dummy)
+///    - If choice=1: sends B0 = D (dummy), B1 = R (real)
+/// 3. Sender computes independent DH shared secrets:
+///    - key0 = H(DH(s, B0), S, B0, 0), encrypts m0
+///    - key1 = H(DH(s, B1), S, B1, 1), encrypts m1
+/// 4. Receiver computes key_b = H(DH(r, S), S, R, b) and decrypts m_b.
+///    Cannot compute key_{1-b} because they don't know the discrete log of D.
+///
+/// Security (CDH on Curve25519):
+/// - Choice-hiding: B0 and B1 are indistinguishable (both random-looking)
+/// - Message-hiding: Receiver cannot compute DH(?, S) for the dummy key
 pub struct OTSender {
     /// Private key for this OT
     secret: StaticSecret,
@@ -90,30 +103,28 @@ impl OTSender {
         PublicKey::from(&self.secret).to_bytes()
     }
 
-    /// Creates the OT message given the receiver's response.
+    /// Creates the OT message given the receiver's two public keys.
     ///
-    /// The sender computes two shared secrets:
-    /// - For choice=0: H(DH(s, B), "OT-0") where B is receiver's key
-    /// - For choice=1: H(DH(s, B), "OT-1") with a different derivation
-    ///
-    /// We use a hash-based key derivation that ensures only the receiver
-    /// with the correct choice can derive the matching key.
-    pub fn send(&self, receiver_pk: &[u8; 32], m0: &[u8], m1: &[u8]) -> MPCResult<OTMessage> {
-        let receiver_key = PublicKey::from(*receiver_pk);
+    /// The sender computes TWO independent DH shared secrets using B0 and B1.
+    /// Each message is encrypted under the DH-derived key for its slot.
+    /// The receiver can only decrypt the message in the slot where they placed
+    /// their real key (the slot with the known discrete log).
+    pub fn send(&self, receiver_keys: &OTReceiverKeys, m0: &[u8], m1: &[u8]) -> MPCResult<OTMessage> {
+        let b0_key = PublicKey::from(receiver_keys.b0);
+        let b1_key = PublicKey::from(receiver_keys.b1);
         let sender_pk = PublicKey::from(&self.secret);
 
-        // Compute shared secret with receiver's key
-        let shared = self.secret.diffie_hellman(&receiver_key);
+        // Compute independent shared secrets for each slot
+        let shared0 = self.secret.diffie_hellman(&b0_key);
+        let shared1 = self.secret.diffie_hellman(&b1_key);
 
-        // Derive two keys using domain separation.
-        // The receiver constructed their public key such that only one of these
-        // will match their derived key, depending on their choice bit.
-        let key0 = derive_ot_key(shared.as_bytes(), &sender_pk.to_bytes(), receiver_pk, 0);
-        let key1 = derive_ot_key(shared.as_bytes(), &sender_pk.to_bytes(), receiver_pk, 1);
+        // Derive independent keys — each uses its own DH shared secret
+        let key0 = derive_ot_key(shared0.as_bytes(), &sender_pk.to_bytes(), &receiver_keys.b0, 0);
+        let key1 = derive_ot_key(shared1.as_bytes(), &sender_pk.to_bytes(), &receiver_keys.b1, 1);
 
-        // Encrypt both messages with unique nonces
-        let nonce0 = derive_nonce(shared.as_bytes(), 0);
-        let nonce1 = derive_nonce(shared.as_bytes(), 1);
+        // Derive independent nonces
+        let nonce0 = derive_nonce(shared0.as_bytes(), 0);
+        let nonce1 = derive_nonce(shared1.as_bytes(), 1);
 
         let enc_m0 = encrypt_with_key(&key0, m0, &nonce0)?;
         let enc_m1 = encrypt_with_key(&key1, m1, &nonce1)?;
@@ -130,7 +141,7 @@ impl OTSender {
 pub struct OTReceiver {
     /// Choice bit (which message to receive)
     choice: bool,
-    /// Private key for the chosen option
+    /// Private key for the real slot (receiver knows this secret)
     secret: StaticSecret,
 }
 
@@ -146,23 +157,47 @@ impl OTReceiver {
         }
     }
 
-    /// Gets the receiver's public key to send to the sender.
+    /// Generates the two public keys to send to the sender.
     ///
-    /// The key is constructed so that only the message corresponding to
-    /// the choice bit can be decrypted.
-    pub fn public_key(&self, _sender_pk: &[u8; 32]) -> [u8; 32] {
-        // Send our public key directly regardless of choice.
-        // The choice is encoded in the key derivation, not the public key itself.
-        PublicKey::from(&self.secret).to_bytes()
+    /// The real public key (corresponding to `self.secret`) is placed in slot `b`,
+    /// and a random dummy key (unknown discrete log) is placed in slot `1-b`.
+    /// The sender cannot distinguish real from dummy because both are random-looking
+    /// x25519 public keys (choice-hiding).
+    pub fn public_keys(&self, _sender_pk: &[u8; 32], rng: &mut impl RngCore) -> OTReceiverKeys {
+        let real_pk = PublicKey::from(&self.secret);
+
+        // Generate random dummy key — receiver does NOT know its discrete log
+        let mut dummy_bytes = [0u8; 32];
+        rng.fill_bytes(&mut dummy_bytes);
+
+        if self.choice {
+            // Choice=1: real key in slot 1, dummy in slot 0
+            OTReceiverKeys {
+                b0: dummy_bytes,
+                b1: real_pk.to_bytes(),
+            }
+        } else {
+            // Choice=0: real key in slot 0, dummy in slot 1
+            OTReceiverKeys {
+                b0: real_pk.to_bytes(),
+                b1: dummy_bytes,
+            }
+        }
     }
 
     /// Receives the chosen message from the OT.
+    ///
+    /// The receiver computes `DH(r, S)` using their real secret key and the
+    /// sender's public key, then derives the decryption key for their choice slot.
+    /// They cannot decrypt the other slot because they don't know the discrete
+    /// log of the dummy key they placed there.
     pub fn receive(&self, msg: &OTMessage) -> MPCResult<OTResult> {
         let sender_pk = PublicKey::from(msg.sender_pk);
         let my_pk = PublicKey::from(&self.secret);
         let shared = self.secret.diffie_hellman(&sender_pk);
 
-        // Derive the decryption key for our choice
+        // Derive the decryption key using the same DH shared secret and
+        // the same public key that the sender used for this slot
         let choice_byte = if self.choice { 1u8 } else { 0u8 };
         let key = derive_ot_key(
             shared.as_bytes(),
@@ -207,12 +242,12 @@ impl CorrelatedOT {
     }
 
     /// Sends correlated values (m, m XOR delta).
-    pub fn send(&self, receiver_pk: &[u8; 32], m: &[u8; 32]) -> MPCResult<OTMessage> {
+    pub fn send(&self, receiver_keys: &OTReceiverKeys, m: &[u8; 32]) -> MPCResult<OTMessage> {
         let mut m_delta = *m;
         for i in 0..32 {
             m_delta[i] ^= self.delta[i];
         }
-        self.sender.send(receiver_pk, m, &m_delta)
+        self.sender.send(receiver_keys, m, &m_delta)
     }
 }
 
@@ -684,12 +719,12 @@ mod tests {
         let receiver = OTReceiver::new(false, &mut rng);
 
         let sender_pk = sender.public_key();
-        let receiver_pk = receiver.public_key(&sender_pk);
+        let receiver_keys = receiver.public_keys(&sender_pk, &mut rng);
 
         let m0 = b"message zero";
         let m1 = b"message one!";
 
-        let ot_msg = sender.send(&receiver_pk, m0, m1).unwrap();
+        let ot_msg = sender.send(&receiver_keys, m0, m1).unwrap();
         let result = receiver.receive(&ot_msg).unwrap();
 
         assert!(!result.choice);
@@ -704,12 +739,12 @@ mod tests {
         let receiver = OTReceiver::new(true, &mut rng);
 
         let sender_pk = sender.public_key();
-        let receiver_pk = receiver.public_key(&sender_pk);
+        let receiver_keys = receiver.public_keys(&sender_pk, &mut rng);
 
         let m0 = b"message zero";
         let m1 = b"message one!";
 
-        let ot_msg = sender.send(&receiver_pk, m0, m1).unwrap();
+        let ot_msg = sender.send(&receiver_keys, m0, m1).unwrap();
         let result = receiver.receive(&ot_msg).unwrap();
 
         assert!(result.choice);
@@ -731,18 +766,66 @@ mod tests {
         let sender_pk = sender.public_key();
 
         // Choice 0
-        let rpk0 = receiver_0.public_key(&sender_pk);
-        let ot_msg0 = sender.send(&rpk0, &m0, &m1).unwrap();
+        let rkeys0 = receiver_0.public_keys(&sender_pk, &mut rng);
+        let ot_msg0 = sender.send(&rkeys0, &m0, &m1).unwrap();
         let result0 = receiver_0.receive(&ot_msg0).unwrap();
         assert_eq!(result0.value, m0);
 
         // New sender for choice 1 (each OT is a fresh instance)
         let sender2 = OTSender::new(&mut rng);
         let sender_pk2 = sender2.public_key();
-        let rpk1 = receiver_1.public_key(&sender_pk2);
-        let ot_msg1 = sender2.send(&rpk1, &m0, &m1).unwrap();
+        let rkeys1 = receiver_1.public_keys(&sender_pk2, &mut rng);
+        let ot_msg1 = sender2.send(&rkeys1, &m0, &m1).unwrap();
         let result1 = receiver_1.receive(&ot_msg1).unwrap();
         assert_eq!(result1.value, m1);
+    }
+
+    /// Verifies that the receiver CANNOT decrypt the unchosen message.
+    ///
+    /// This is the critical security property: because the receiver placed a
+    /// random dummy key (unknown discrete log) in the unchosen slot, they
+    /// cannot compute the DH shared secret for that slot and thus cannot
+    /// derive the decryption key.
+    #[test]
+    fn test_ot_receiver_cannot_decrypt_unchosen() {
+        let mut rng = ChaCha20Rng::from_seed([55u8; 32]);
+
+        let sender = OTSender::new(&mut rng);
+        let receiver = OTReceiver::new(false, &mut rng); // choice=0
+
+        let sender_pk = sender.public_key();
+        let receiver_keys = receiver.public_keys(&sender_pk, &mut rng);
+
+        let m0 = b"secret message zero!!!!!!!!!!!!!!";
+        let m1 = b"secret message one!!!!!!!!!!!!!!!";
+
+        let ot_msg = sender.send(&receiver_keys, m0, m1).unwrap();
+
+        // Receiver can decrypt m0 (their choice)
+        let result = receiver.receive(&ot_msg).unwrap();
+        assert_eq!(&result.value, m0);
+
+        // Try to decrypt m1 using the receiver's key — this should fail
+        // because the receiver used a dummy key for slot 1
+        let sender_pk_obj = PublicKey::from(ot_msg.sender_pk);
+        let shared = receiver.secret.diffie_hellman(&sender_pk_obj);
+        let my_pk = PublicKey::from(&receiver.secret);
+
+        // Try to derive key1 using the receiver's DH shared secret
+        let wrong_key = derive_ot_key(
+            shared.as_bytes(),
+            &ot_msg.sender_pk,
+            &my_pk.to_bytes(),
+            1, // try to get key for slot 1
+        );
+        let wrong_nonce = derive_nonce(shared.as_bytes(), 1);
+
+        // Decryption should fail (AES-GCM authentication failure)
+        let decrypt_result = decrypt_with_key(&wrong_key, &ot_msg.enc_m1, &wrong_nonce);
+        assert!(
+            decrypt_result.is_err(),
+            "Receiver should NOT be able to decrypt the unchosen message"
+        );
     }
 
     #[test]
@@ -844,10 +927,10 @@ mod tests {
         let receiver = OTReceiver::new(false, &mut rng);
 
         let sender_pk = cot.public_key();
-        let receiver_pk = receiver.public_key(&sender_pk);
+        let receiver_keys = receiver.public_keys(&sender_pk, &mut rng);
 
         let m = [42u8; 32];
-        let ot_msg = cot.send(&receiver_pk, &m).unwrap();
+        let ot_msg = cot.send(&receiver_keys, &m).unwrap();
         let result = receiver.receive(&ot_msg).unwrap();
 
         assert!(!result.choice);

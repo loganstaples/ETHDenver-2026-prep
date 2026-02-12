@@ -1,19 +1,22 @@
 //! Secure activation function protocols.
 //!
 //! Activation functions (ReLU, GELU, sigmoid, etc.) are non-linear and cannot
-//! be computed directly on additive shares. The standard approach is:
+//! be computed directly on additive shares. Two approaches are supported:
 //!
+//! ## `ReconstructReshare` mode
 //! 1. **Reconstruct** the intermediate value (parties open the pre-activation value)
-//! 2. **Apply** the activation function locally (each party computes it on the public value)
-//! 3. **Re-share** the result (one party acts as dealer to create new shares)
+//! 2. **Apply** the activation function locally
+//! 3. **Re-share** the result
 //!
-//! **Security note:** This reveals the intermediate activation values, NOT the weights.
-//! Activations change with every input and don't directly leak model architecture.
-//! This is the standard security/efficiency tradeoff in the MPC-ML literature.
+//! **Privacy warning:** This reveals activation values to all parties. Use only
+//! for activations where no private alternative exists (Tanh, SiLU).
 //!
-//! For stronger privacy, we also support a truncated polynomial approximation
-//! mode where activations are approximated by low-degree polynomials that can
-//! be evaluated on shares using Beaver triples.
+//! ## `PolynomialApprox` mode (recommended for ReLU)
+//! For ReLU/LeakyReLU: uses garbled-circuit sign protocol + Beaver multiplication
+//! to compute `relu(x) = x * sign_bit(x)` without revealing any values.
+//!
+//! For Sigmoid/GELU: uses polynomial approximations evaluated on shares with
+//! Beaver triples. Approximate but private.
 
 use rand::Rng;
 
@@ -57,8 +60,13 @@ impl SecureActivation {
     /// Routes to either reconstruct-reshare (exact, reveals activations) or
     /// polynomial approximation (private, approximate) based on the mode.
     ///
-    /// Polynomial approximation is supported for ReLU, Sigmoid, and GELU.
-    /// Other activation types fall back to reconstruct-reshare with a warning.
+    /// **ReLU and LeakyReLU always use the secure garbled-circuit path**,
+    /// regardless of mode. This prevents accidental cleartext reconstruction
+    /// of activation values, which would leak private model information.
+    /// Beaver triple pools MUST be provided for ReLU/LeakyReLU.
+    ///
+    /// Polynomial approximation is also supported for Sigmoid and GELU.
+    /// Other activation types (Tanh, SiLU) use reconstruct-reshare.
     pub fn apply(
         shares: &[Vec<Fr>],
         activation: ActivationType,
@@ -66,6 +74,19 @@ impl SecureActivation {
         pools: Option<&mut [BeaverPool]>,
         rng: &mut impl Rng,
     ) -> MPCResult<Vec<Vec<Fr>>> {
+        // ReLU and LeakyReLU MUST always go through the secure garbled-circuit
+        // path. Cleartext reconstruction of activations leaks private model data.
+        if matches!(activation, ActivationType::ReLU | ActivationType::LeakyReLU(_)) {
+            let pools = pools.ok_or_else(|| {
+                crate::error::MPCError::ProtocolError(
+                    "ReLU/LeakyReLU requires Beaver triple pools for secure evaluation. \
+                     Cleartext reconstruction is not permitted for these activations."
+                        .into(),
+                )
+            })?;
+            return Self::approximate_relu(shares, pools);
+        }
+
         match mode {
             ActivationMode::ReconstructReshare => {
                 Ok(Self::apply_reconstruct_reshare(shares, activation, rng))
@@ -78,9 +99,6 @@ impl SecureActivation {
                     }
                 })?;
                 match activation {
-                    ActivationType::ReLU | ActivationType::LeakyReLU(_) => {
-                        Self::approximate_relu(shares, pools)
-                    }
                     ActivationType::Sigmoid => {
                         Self::approximate_sigmoid(shares, pools)
                     }
@@ -166,50 +184,24 @@ impl SecureActivation {
     // ========== POLYNOMIAL APPROXIMATION APPROACH ==========
     // Does NOT reveal activations. Uses more Beaver triples.
 
-    /// Approximates ReLU using a polynomial: relu(x) ≈ 0.5*x + 0.5*x*sign_approx(x)
-    /// where sign_approx uses a polynomial approximation of the sign function.
+    /// Computes secure ReLU: relu(x) = x * sign_bit(x)
     ///
-    /// This keeps the computation entirely on shares but is less accurate.
+    /// Uses the garbled circuit sign protocol to privately compute the sign bit
+    /// of each element, then multiplies by x using Beaver triples. Neither the
+    /// sign bit nor the activation magnitude is revealed to any party.
+    ///
+    /// This replaces the broken polynomial approximation (0.5*x + 0.25*x²)
+    /// which did not zero negatives and grew quadratically for large inputs.
+    ///
+    /// Cost: 1 garbled circuit + 1 Beaver triple per element.
     pub fn approximate_relu(
         shares: &[Vec<Fr>],
         pools: &mut [BeaverPool],
     ) -> MPCResult<Vec<Vec<Fr>>> {
-        let num_parties = shares.len();
-        let dim = shares[0].len();
+        use crate::protocols::comparison::{SecureComparison, ComparisonConfig};
 
-        // Polynomial approximation of ReLU:
-        // relu(x) ≈ x/2 + x/(2π) * (π/2 + x - x³/6) for |x| < π
-        // Simplified: relu(x) ≈ 0.5*x + 0.197*x (for positive-biased inputs)
-        // We use: relu(x) ≈ max(0.01*x, x) via: 0.505*x + 0.495*|x|
-        // And |x| ≈ x * sign(x) where sign ≈ x / (|x| + ε)
-        //
-        // For the demo, we use the simpler degree-2 approximation:
-        // relu(x) ≈ 0.5*x + 0.5*x² / (|x| + 0.1)
-
-        // Compute x² on shares using Beaver triples.
-        let x_squared = SecureArithmetic::simulate_vector_multiply(shares, shares, pools)?;
-
-        // For the denominator, we need |x| + 0.1, but computing absolute value
-        // on shares is itself non-trivial. We approximate with x²/(x + ε) ≈ |x|.
-        //
-        // Final approximation: relu(x) ≈ 0.5*x + 0.25*x (crude but private)
-        // This is essentially a leaky linear activation.
-        let half = Fr::from_f64(0.5);
-        let quarter = Fr::from_f64(0.25);
-
-        let mut result: Vec<Vec<Fr>> = vec![vec![Fr::ZERO; dim]; num_parties];
-        for i in 0..num_parties {
-            for d in 0..dim {
-                // relu ≈ 0.5*x + 0.25*x² (simplified approximation)
-                // A crude approximation that preserves privacy
-                // Use mpc_scale for exact linear fixed-point arithmetic on shares
-                let term1 = half.mpc_scale(&shares[i][d]);
-                let term2 = quarter.mpc_scale(&x_squared[i][d]);
-                result[i][d] = Fr::add(&term1, &term2);
-            }
-        }
-
-        Ok(result)
+        let cmp = SecureComparison::new(ComparisonConfig::default());
+        cmp.relu_vector(shares, pools)
     }
 
     /// Approximates sigmoid using the polynomial:
@@ -478,15 +470,68 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_dispatcher_reconstruct() {
+    fn test_apply_dispatcher_relu_always_secure() {
+        // ReLU always uses garbled-circuit path regardless of mode.
+        // Even ReconstructReshare mode routes to secure path for ReLU.
+        let mut dealer = TrustedDealer::with_seed(99);
+        let per_party = dealer.generate_scalar_triples(200, 3);
+
+        let mut pools: Vec<BeaverPool> = (0..3)
+            .map(|i| {
+                let mut p = BeaverPool::new(i, 3, 64);
+                p.fill_scalar(per_party[i].clone());
+                p
+            })
+            .collect();
+
         let values = vec![-1.0, 0.0, 1.0];
         let shares = split_vector(&values, 3, 99);
         let mut rng = ChaCha20Rng::seed_from_u64(99);
 
-        // ReconstructReshare mode doesn't need pools.
+        // ReLU with ReconstructReshare mode still uses secure path (requires pools).
         let result_shares = SecureActivation::apply(
             &shares,
             ActivationType::ReLU,
+            ActivationMode::ReconstructReshare,
+            Some(&mut pools),
+            &mut rng,
+        )
+        .unwrap();
+
+        let result = reconstruct(&result_shares);
+        assert!((result[0] - 0.0).abs() < 0.1); // relu(-1) = 0
+        assert!((result[1] - 0.0).abs() < 0.1); // relu(0) = 0
+        assert!((result[2] - 1.0).abs() < 0.1); // relu(1) = 1
+    }
+
+    #[test]
+    fn test_relu_without_pools_errors() {
+        // ReLU without pools should fail with an error, not silently
+        // reconstruct in cleartext.
+        let values = vec![-1.0, 0.0, 1.0];
+        let shares = split_vector(&values, 3, 99);
+        let mut rng = ChaCha20Rng::seed_from_u64(99);
+
+        let result = SecureActivation::apply(
+            &shares,
+            ActivationType::ReLU,
+            ActivationMode::ReconstructReshare,
+            None,
+            &mut rng,
+        );
+        assert!(result.is_err(), "ReLU without pools should error, not reconstruct in cleartext");
+    }
+
+    #[test]
+    fn test_reconstruct_reshare_still_works_for_tanh() {
+        // Non-ReLU activations should still work with ReconstructReshare mode.
+        let values = vec![-1.0, 0.0, 1.0];
+        let shares = split_vector(&values, 3, 99);
+        let mut rng = ChaCha20Rng::seed_from_u64(99);
+
+        let result_shares = SecureActivation::apply(
+            &shares,
+            ActivationType::Tanh,
             ActivationMode::ReconstructReshare,
             None,
             &mut rng,
@@ -494,9 +539,10 @@ mod tests {
         .unwrap();
 
         let result = reconstruct(&result_shares);
-        assert!((result[0] - 0.0).abs() < 1e-6); // relu(-1) = 0
-        assert!((result[1] - 0.0).abs() < 1e-6); // relu(0) = 0
-        assert!((result[2] - 1.0).abs() < 1e-6); // relu(1) = 1
+        for (i, r) in result.iter().enumerate() {
+            let expected = values[i].tanh();
+            assert!((r - expected).abs() < 1e-6);
+        }
     }
 
     #[test]
@@ -535,6 +581,72 @@ mod tests {
                 i, r, expected,
             );
         }
+    }
+
+    #[test]
+    fn test_approximate_relu_garbled_circuit() {
+        // Test that the new garbled-circuit-based approximate_relu produces
+        // correct ReLU values: zeros negatives, passes positives.
+        let mut dealer = TrustedDealer::with_seed(88);
+        let per_party = dealer.generate_scalar_triples(200, 3);
+
+        let mut pools: Vec<BeaverPool> = (0..3)
+            .map(|i| {
+                let mut p = BeaverPool::new(i, 3, 64);
+                p.fill_scalar(per_party[i].clone());
+                p
+            })
+            .collect();
+
+        let values = vec![-3.0, -1.0, 0.0, 1.0, 3.0];
+        let shares = split_vector(&values, 3, 88);
+
+        let result_shares =
+            SecureActivation::approximate_relu(&shares, &mut pools).unwrap();
+        let result = reconstruct(&result_shares);
+
+        let expected = vec![0.0, 0.0, 0.0, 1.0, 3.0];
+        for (i, (r, e)) in result.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (r - e).abs() < 0.1,
+                "Secure ReLU[{}] failed: got {} expected {} (input {})",
+                i, r, e, values[i],
+            );
+        }
+    }
+
+    #[test]
+    fn test_apply_dispatcher_relu_polynomial_mode() {
+        // Test that PolynomialApprox mode for ReLU uses garbled circuits
+        // and produces correct results (not the broken polynomial).
+        let mut dealer = TrustedDealer::with_seed(91);
+        let per_party = dealer.generate_scalar_triples(200, 3);
+
+        let mut pools: Vec<BeaverPool> = (0..3)
+            .map(|i| {
+                let mut p = BeaverPool::new(i, 3, 64);
+                p.fill_scalar(per_party[i].clone());
+                p
+            })
+            .collect();
+
+        let values = vec![-2.0, 0.0, 2.0];
+        let shares = split_vector(&values, 3, 91);
+        let mut rng = ChaCha20Rng::seed_from_u64(91);
+
+        let result_shares = SecureActivation::apply(
+            &shares,
+            ActivationType::ReLU,
+            ActivationMode::PolynomialApprox,
+            Some(&mut pools),
+            &mut rng,
+        )
+        .unwrap();
+
+        let result = reconstruct(&result_shares);
+        assert!((result[0] - 0.0).abs() < 0.1, "relu(-2) = {}, expected 0", result[0]);
+        assert!((result[1] - 0.0).abs() < 0.1, "relu(0) = {}, expected 0", result[1]);
+        assert!((result[2] - 2.0).abs() < 0.1, "relu(2) = {}, expected 2", result[2]);
     }
 
     #[test]

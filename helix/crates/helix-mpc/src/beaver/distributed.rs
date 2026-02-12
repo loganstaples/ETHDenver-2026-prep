@@ -166,9 +166,16 @@ impl DistributedTripleGen {
         Ok(BeaverTriple::new(local_a, local_b, c_i))
     }
 
-    /// Generates a scalar triple using the full distributed protocol.
+    /// **WARNING: SINGLE-PROCESS SIMULATION — NOT DISTRIBUTED**
     ///
-    /// Runs the pairwise cross-term protocol locally for all parties:
+    /// Runs the pairwise cross-term protocol locally for all parties in a single
+    /// process. The protocol math is correct, but all parties' secret values are
+    /// accessible in the same memory space, providing NO real security.
+    ///
+    /// For production, each party must run independently and exchange messages
+    /// over authenticated encrypted channels (see `helix-mpc::transport`).
+    ///
+    /// Protocol:
     /// 1. Each party i generates random a_i, b_i, starts with c_i = a_i * b_i
     /// 2. For each ordered pair (i, j), party i picks random r_ij:
     ///    - party i adds r_ij to c_i
@@ -176,6 +183,13 @@ impl DistributedTripleGen {
     ///
     /// Correctness: sum(c) = sum(a_i*b_i) + sum_{i!=j}(a_i*b_j) = (sum a)(sum b)
     pub fn simulate_distributed_generation(num_parties: usize, seed: u64) -> Vec<BeaverTriple> {
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "WARNING: simulate_distributed_generation runs ALL {} parties in a single process. \
+             This provides no real MPC security. For production, use networked parties \
+             with authenticated transport.",
+            num_parties,
+        );
         let parties: Vec<PartyId> = (0..num_parties).map(PartyId::from_index).collect();
 
         // Phase 1: Each party generates randomness.

@@ -30,7 +30,7 @@ pub mod triple;
 
 pub use dealer::TrustedDealer;
 pub use distributed::DistributedTripleGen;
-pub use ot::{OTTripleGenerator, OTSender, OTReceiver, OTExtension, CorrelatedOT};
+pub use ot::{OTTripleGenerator, OTSender, OTReceiver, OTReceiverKeys, OTExtension, CorrelatedOT};
 pub use pool::BeaverPool;
 pub use triple::{BeaverTriple, MatrixBeaverTriple, VectorBeaverTriple};
 pub use pipeline::{

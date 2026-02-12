@@ -196,7 +196,9 @@ impl MPCSession {
             )));
         }
 
-        let mut dealer = TrustedDealer::with_seed(0xBE11C);
+        // Use cryptographic randomness for Beaver triples (not a fixed seed).
+        // Fixed seeds make all triples predictable, breaking MPC security.
+        let mut dealer = TrustedDealer::new();
 
         for pool in &mut self.pools {
             pool.fill_for_training_step(&mut dealer, hidden_dim, num_layers);
@@ -314,9 +316,8 @@ impl MPCSession {
         hidden_dim: usize,
         num_layers: usize,
     ) -> MPCResult<()> {
-        let mut dealer = TrustedDealer::with_seed(
-            (0xBE11C_u64).wrapping_add(self.current_step),
-        );
+        // Use cryptographic randomness — fixed seeds make triples predictable.
+        let mut dealer = TrustedDealer::new();
 
         for pool in &mut self.pools {
             pool.fill_for_training_step(&mut dealer, hidden_dim, num_layers);

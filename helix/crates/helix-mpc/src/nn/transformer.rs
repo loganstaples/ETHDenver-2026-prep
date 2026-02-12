@@ -17,7 +17,7 @@ use crate::error::MPCResult;
 use crate::field::Fr;
 use crate::nn::attention::{SecureAttention, SecureAttentionConfig};
 use crate::nn::linear::SecureLinear;
-use crate::protocols::activation::{ActivationType, SecureActivation};
+use crate::protocols::activation::{ActivationMode, ActivationType, SecureActivation};
 use crate::protocols::normalization::SecureNormalization;
 
 /// Configuration for a secure transformer block.
@@ -231,12 +231,30 @@ impl SecureTransformerBlock {
             pools,
         )?;
 
-        // Activation (reconstruct-compute-reshare).
-        let activated = SecureActivation::apply_reconstruct_reshare(
-            &up_out,
-            config.activation,
-            rng,
-        );
+        // Activation: use secure comparison-based ReLU (no cleartext reconstruction)
+        // for ReLU/LeakyReLU. Other activations fall back to reconstruct-reshare.
+        let activated = match config.activation {
+            ActivationType::ReLU | ActivationType::LeakyReLU(_) => {
+                SecureActivation::apply(
+                    &up_out,
+                    config.activation,
+                    ActivationMode::PolynomialApprox,
+                    Some(pools),
+                    rng,
+                )?
+            }
+            _ => {
+                // Sigmoid, Tanh, GELU, SiLU: use reconstruct-reshare.
+                // These non-linearities don't have efficient comparison-based
+                // implementations. The polynomial approximations for sigmoid
+                // and GELU are available as alternatives.
+                SecureActivation::apply_reconstruct_reshare(
+                    &up_out,
+                    config.activation,
+                    rng,
+                )
+            }
+        };
 
         // Down projection: [seq_len x d_ff] @ [d_ff x d_model]
         let down_out = SecureLinear::forward_shared(

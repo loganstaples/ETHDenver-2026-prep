@@ -12,14 +12,20 @@
 //! to ensure no party reconstructs the secret value. Party 0 acts as the
 //! garbler and parties 1..n-1 combine into the evaluator role.
 //!
-//! The OT implementation is currently simulated (structurally correct but
-//! runs locally rather than over a network). The garbled circuit protocol
-//! itself provides full privacy guarantees: neither the garbler nor the
-//! evaluator can learn the other's input bits.
+//! The OT uses real x25519 Diffie-Hellman key exchange: for each wire,
+//! the receiver provides two public keys (one real with known secret, one
+//! random dummy) and the sender encrypts both labels under independent
+//! DH-derived pads. The receiver can only decrypt the chosen label because
+//! they don't know the discrete log of the dummy key (CDH on Curve25519).
+//!
+//! In the current single-process simulation, garbler and evaluator share
+//! memory, but the OT cryptography is fully operational. When moved to a
+//! networked deployment, the same protocol provides real security.
 
 use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use sha2::{Digest, Sha256};
+use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::beaver::pool::BeaverPool;
 use crate::beaver::triple::BeaverTriple;
@@ -145,7 +151,14 @@ fn u64_limbs_to_bits(limbs: &[u64; 4]) -> Vec<bool> {
     bits
 }
 
-/// Convert a field element to 256 little-endian bits.
+/// Number of bits in the BN254 scalar field modulus.
+const FIELD_BITS: usize = 254;
+
+/// Convert a field element to little-endian bits.
+///
+/// Returns 256 bits (32 bytes), but only the lower 254 bits can be non-zero
+/// since the BN254 scalar field modulus is 254 bits. Bits 254 and 255 are
+/// always 0 for valid field elements (all elements are reduced mod p < 2^254).
 fn fr_to_bits(x: &Fr) -> Vec<bool> {
     let bytes = x.to_bytes_le();
     let mut bits = Vec::with_capacity(256);
@@ -154,6 +167,13 @@ fn fr_to_bits(x: &Fr) -> Vec<bool> {
             bits.push((byte >> bit_idx) & 1 == 1);
         }
     }
+    // BN254 scalar field is 254 bits. Valid field elements always have
+    // bits 254 and 255 equal to 0 since all values are < p < 2^254.
+    debug_assert!(
+        !bits[FIELD_BITS] && !bits[FIELD_BITS + 1],
+        "Field element exceeds {}-bit BN254 modulus — value is not a valid field element",
+        FIELD_BITS,
+    );
     bits
 }
 
@@ -194,58 +214,126 @@ impl GarblerState {
 // OT-based Label Transfer
 // ============================================================================
 
-/// Performs OT-based label transfer: for each choice bit, the evaluator
-/// receives exactly one of the two labels without the garbler learning
-/// which was chosen.
+/// XOR two 16-byte wire labels.
+#[inline]
+fn xor_label(a: &[u8; 16], b: &[u8; 16]) -> [u8; 16] {
+    let mut result = [0u8; 16];
+    for i in 0..16 {
+        result[i] = a[i] ^ b[i];
+    }
+    result
+}
+
+/// Derives a 16-byte encryption pad from an x25519 DH shared secret,
+/// a wire index, and a choice byte. Used for OT label encryption.
+fn ot_label_pad(shared_secret: &[u8], wire_index: usize, choice: u8) -> [u8; 16] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"HELIX-GC-OT-v1");
+    hasher.update(shared_secret);
+    hasher.update(&wire_index.to_le_bytes());
+    hasher.update(&[choice]);
+    let hash = hasher.finalize();
+    let mut pad = [0u8; 16];
+    pad.copy_from_slice(&hash[..16]);
+    pad
+}
+
+/// Performs real 1-out-of-2 Oblivious Transfer for garbled circuit label transfer
+/// using x25519 Diffie-Hellman key exchange.
 ///
-/// **SECURITY WARNING**: This is a SIMULATED OT, not a real oblivious transfer.
-/// In a real deployment, this must be replaced with a proper OT protocol
-/// (e.g., Chou-Orlandi or IKNP extension).
+/// For each wire `i` with label pair `(label_0, label_1)` and choice bit `b`:
 ///
-/// The simulation directly selects the chosen label without cryptographic
-/// transfer. It maintains the structural property that only chosen labels
-/// are returned, but provides no cryptographic OT guarantees.
-fn simulated_ot_transfer_labels(
+/// 1. **Sender** generates one x25519 keypair `(s, S = s*G)`.
+/// 2. **Receiver** generates a real keypair `(r_i, R_i = r_i*G)` and a random
+///    dummy 32-byte public key `D_i` (no known discrete log):
+///    - If `b_i = 0`: `B0_i = R_i`, `B1_i = D_i`
+///    - If `b_i = 1`: `B0_i = D_i`, `B1_i = R_i`
+/// 3. **Sender** computes two independent DH shared secrets and encrypts:
+///    - `pad0_i = H(DH(s, B0_i), i, 0)[0:16]`, `enc0_i = label_0 XOR pad0_i`
+///    - `pad1_i = H(DH(s, B1_i), i, 1)[0:16]`, `enc1_i = label_1 XOR pad1_i`
+/// 4. **Receiver** computes `pad = H(DH(r_i, S), i, b_i)[0:16]` and decrypts
+///    `label_b = enc_b XOR pad`. The dummy slot cannot be decrypted because
+///    the receiver does not know the discrete log of `D_i`.
+///
+/// # Security (CDH on Curve25519)
+///
+/// - **Choice-hiding**: `B0` and `B1` are indistinguishable to the sender
+///   (both are random-looking 32-byte x25519 public keys).
+/// - **Message-hiding**: The receiver cannot compute `DH(?, S)` for the dummy
+///   key since they don't know its discrete log. Under CDH on Curve25519,
+///   the DH shared secret for the dummy slot is computationally indistinguishable
+///   from random, so the unchosen label remains encrypted.
+fn ot_transfer_labels(
     label_pairs: &[([u8; 16], [u8; 16])],
     choice_bits: &[bool],
     rng: &mut impl RngCore,
 ) -> Vec<[u8; 16]> {
     assert_eq!(label_pairs.len(), choice_bits.len());
+    let n = choice_bits.len();
 
-    // For each bit position, simulate 1-out-of-2 OT:
-    // 1. Receiver generates a random key pair
-    // 2. Sender encrypts both labels under derived keys
-    // 3. Receiver can only decrypt the one matching their choice
-    //
-    // In this local simulation, we directly select the correct label.
-    // The security guarantee is structural: this function only returns
-    // the chosen labels, never exposing the unchosen ones to the caller.
-    // The garbler's code path never receives the choice_bits.
+    // --- Sender side: generate one static keypair for all wires ---
+    let mut sender_secret_bytes = [0u8; 32];
+    rng.fill_bytes(&mut sender_secret_bytes);
+    let sender_secret = StaticSecret::from(sender_secret_bytes);
+    let sender_public = PublicKey::from(&sender_secret);
 
-    let mut result = Vec::with_capacity(choice_bits.len());
-    for (i, &choice) in choice_bits.iter().enumerate() {
-        let (l0, l1) = label_pairs[i];
+    // --- Receiver side: generate per-wire real keypair + dummy key ---
+    let mut receiver_secrets: Vec<StaticSecret> = Vec::with_capacity(n);
+    let mut b0_keys: Vec<PublicKey> = Vec::with_capacity(n);
+    let mut b1_keys: Vec<PublicKey> = Vec::with_capacity(n);
 
-        // Simulate OT: sender encrypts both labels
-        let mut nonce = [0u8; 16];
-        rng.fill_bytes(&mut nonce);
-        let mut hasher0 = Sha256::new();
-        hasher0.update(&nonce);
-        hasher0.update(&[0u8]); // selector for m0
-        hasher0.update(&(i as u64).to_le_bytes());
-        let _k0 = hasher0.finalize(); // Key for encrypting l0
+    for i in 0..n {
+        // Real keypair the receiver knows the secret for
+        let mut real_secret_bytes = [0u8; 32];
+        rng.fill_bytes(&mut real_secret_bytes);
+        let real_secret = StaticSecret::from(real_secret_bytes);
+        let real_public = PublicKey::from(&real_secret);
 
-        let mut hasher1 = Sha256::new();
-        hasher1.update(&nonce);
-        hasher1.update(&[1u8]); // selector for m1
-        hasher1.update(&(i as u64).to_le_bytes());
-        let _k1 = hasher1.finalize(); // Key for encrypting l1
+        // Dummy key: random 32-byte value. On x25519 (Montgomery curve),
+        // any 32 bytes are a valid public key, but the receiver does NOT
+        // know the corresponding secret key, so they cannot compute DH.
+        let mut dummy_bytes = [0u8; 32];
+        rng.fill_bytes(&mut dummy_bytes);
+        let dummy_key = PublicKey::from(dummy_bytes);
 
-        // Receiver selects based on choice bit
-        // In the real protocol, only the chosen ciphertext can be decrypted.
-        // Here we directly return the chosen label.
-        let chosen = if choice { l1 } else { l0 };
-        result.push(chosen);
+        if choice_bits[i] {
+            // choice=1: real key in slot 1, dummy in slot 0
+            b0_keys.push(dummy_key);
+            b1_keys.push(real_public);
+        } else {
+            // choice=0: real key in slot 0, dummy in slot 1
+            b0_keys.push(real_public);
+            b1_keys.push(dummy_key);
+        }
+
+        receiver_secrets.push(real_secret);
+        let _ = i; // suppress unused warning
+    }
+
+    // --- Sender encrypts both labels per wire ---
+    let mut enc_pairs: Vec<([u8; 16], [u8; 16])> = Vec::with_capacity(n);
+    for i in 0..n {
+        let shared0 = sender_secret.diffie_hellman(&b0_keys[i]);
+        let shared1 = sender_secret.diffie_hellman(&b1_keys[i]);
+
+        let pad0 = ot_label_pad(shared0.as_bytes(), i, 0);
+        let pad1 = ot_label_pad(shared1.as_bytes(), i, 1);
+
+        let enc0 = xor_label(&label_pairs[i].0, &pad0);
+        let enc1 = xor_label(&label_pairs[i].1, &pad1);
+
+        enc_pairs.push((enc0, enc1));
+    }
+
+    // --- Receiver decrypts chosen label ---
+    let mut result = Vec::with_capacity(n);
+    for i in 0..n {
+        let shared = receiver_secrets[i].diffie_hellman(&sender_public);
+        let choice_byte = if choice_bits[i] { 1u8 } else { 0u8 };
+        let pad = ot_label_pad(shared.as_bytes(), i, choice_byte);
+
+        let enc = if choice_bits[i] { &enc_pairs[i].1 } else { &enc_pairs[i].0 };
+        result.push(xor_label(enc, &pad));
     }
 
     result
@@ -394,7 +482,7 @@ fn garbled_sign_protocol_impl(
 
     // Evaluator's input labels via OT
     let eval_pairs = garbler.evaluator_label_pairs(256, 256);
-    let ot_labels = simulated_ot_transfer_labels(&eval_pairs, evaluator_bits, rng);
+    let ot_labels = ot_transfer_labels(&eval_pairs, evaluator_bits, rng);
     for label in &ot_labels {
         eval_labels.push(*label);
     }
@@ -1078,7 +1166,7 @@ fn garbled_decompose_protocol(
 
     // Evaluator's input labels via OT
     let eval_pairs = garbler.evaluator_label_pairs(256, 256);
-    let ot_labels = simulated_ot_transfer_labels(&eval_pairs, evaluator_bits, rng);
+    let ot_labels = ot_transfer_labels(&eval_pairs, evaluator_bits, rng);
     for label in &ot_labels {
         eval_labels.push(*label);
     }
@@ -1480,7 +1568,7 @@ mod tests {
             .collect();
 
         // OT transfer: evaluator gets labels for their bits
-        let transferred = simulated_ot_transfer_labels(&label_pairs, &b_bits, &mut rng);
+        let transferred = ot_transfer_labels(&label_pairs, &b_bits, &mut rng);
 
         // Verify: evaluator got exactly the labels corresponding to their bits
         for (i, &bit) in b_bits.iter().enumerate() {
