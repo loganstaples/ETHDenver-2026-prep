@@ -593,10 +593,14 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
 
         modelRegistry.updateModel(modelId, bytes32(newCommitment), roundId, "", stepErrorBound, best.proofHash);
 
-        // Register all round participants for rewards
+        // Register all round participants for rewards (with loss + timing metadata)
         address[] storage participants = roundParticipantList[modelId][roundId];
         for (uint256 i = 0; i < participants.length; i++) {
-            rewardsContract.registerParticipant(modelId, roundId, participants[i]);
+            RoundParticipant storage rp = roundParticipants[modelId][roundId][participants[i]];
+            rewardsContract.registerParticipantWithData(
+                modelId, roundId, participants[i],
+                rp.loss, rp.submittedAt, ext.startedAt, round.deadline
+            );
         }
         try rewardsContract.allocateRoundRewards(modelId, roundId) {} catch {}
 

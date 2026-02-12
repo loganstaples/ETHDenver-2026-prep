@@ -27,6 +27,7 @@ contract ModelRegistry {
         uint256 timestamp;
         uint256 errorBound;
         bytes32 proofHash;
+        uint256 parentVersion;  // index of parent checkpoint (0 for initial)
     }
     
     /// @notice Model counter
@@ -43,6 +44,9 @@ contract ModelRegistry {
     
     /// @notice Mapping of owner to their model IDs
     mapping(address => uint256[]) public ownerModels;
+
+    /// @notice Reverse lookup: commitment => version index in checkpoints array (per model)
+    mapping(uint256 => mapping(bytes32 => uint256)) public commitmentToVersion;
     
     /// @notice Owner for admin functions
     address public owner;
@@ -68,6 +72,7 @@ contract ModelRegistry {
         uint256 indexed checkpointIndex,
         bytes32 commitment
     );
+    event ModelVersionCreated(uint256 indexed modelId, uint256 version, uint256 parentVersion, bytes32 commitment);
     event ModelDeactivated(uint256 indexed modelId);
     event ModelReactivated(uint256 indexed modelId);
     event OwnershipTransferred(uint256 indexed modelId, address indexed oldOwner, address indexed newOwner);
@@ -128,11 +133,14 @@ contract ModelRegistry {
             ipfsHash: ipfsHash,
             timestamp: block.timestamp,
             errorBound: 0,
-            proofHash: bytes32(0)
+            proofHash: bytes32(0),
+            parentVersion: 0
         }));
-        
+        commitmentToVersion[modelId][initialCommitment] = 0;
+
         emit ModelRegistered(modelId, msg.sender, name, initialCommitment);
         emit CheckpointCreated(modelId, 0, initialCommitment);
+        emit ModelVersionCreated(modelId, 0, 0, initialCommitment);
     }
     
     /// @notice Update model state after a training round
@@ -170,17 +178,26 @@ contract ModelRegistry {
         } else {
             checkpointIpfs = model.ipfsHash;
         }
+
+        // Capture parent index before push
+        uint256 parentIdx = checkpoints[modelId].length - 1;
+
         checkpoints[modelId].push(Checkpoint({
             roundId: roundId,
             commitment: newCommitment,
             ipfsHash: checkpointIpfs,
             timestamp: block.timestamp,
             errorBound: errorBound,
-            proofHash: proofHash
+            proofHash: proofHash,
+            parentVersion: parentIdx
         }));
-        
+
+        uint256 newIdx = checkpoints[modelId].length - 1;
+        commitmentToVersion[modelId][newCommitment] = newIdx;
+
         emit ModelUpdated(modelId, newCommitment, roundId, model.version);
-        emit CheckpointCreated(modelId, checkpoints[modelId].length - 1, newCommitment);
+        emit CheckpointCreated(modelId, newIdx, newCommitment);
+        emit ModelVersionCreated(modelId, newIdx, parentIdx, newCommitment);
     }
     
     /// @notice Deactivate a model
@@ -319,6 +336,46 @@ contract ModelRegistry {
         }
     }
     
+    /// @notice Get version chain from a starting version going backward
+    /// @param modelId Model ID
+    /// @param fromVersion Starting version index
+    /// @param count Maximum number of versions to return
+    /// @return chain Array of checkpoints in reverse order (newest first)
+    function getVersionChain(
+        uint256 modelId,
+        uint256 fromVersion,
+        uint256 count
+    ) external view returns (Checkpoint[] memory chain) {
+        Checkpoint[] storage all = checkpoints[modelId];
+        require(fromVersion < all.length, "Invalid version");
+
+        // First pass: count how many we'll actually return
+        uint256 actual = 0;
+        uint256 ver = fromVersion;
+        while (actual < count) {
+            actual++;
+            if (ver == 0) break;
+            ver = all[ver].parentVersion;
+        }
+
+        // Second pass: populate the array
+        chain = new Checkpoint[](actual);
+        ver = fromVersion;
+        for (uint256 i = 0; i < actual; i++) {
+            chain[i] = all[ver];
+            if (ver == 0) break;
+            ver = all[ver].parentVersion;
+        }
+    }
+
+    /// @notice Get the version index for a given commitment
+    /// @param modelId Model ID
+    /// @param commitment The commitment hash to look up
+    /// @return The version index in the checkpoints array
+    function getVersionForCommitment(uint256 modelId, bytes32 commitment) external view returns (uint256) {
+        return commitmentToVersion[modelId][commitment];
+    }
+
     /// @notice Set coordinator address
     function setCoordinator(address _coordinator) external onlyOwner {
         require(_coordinator != address(0), "Invalid address");

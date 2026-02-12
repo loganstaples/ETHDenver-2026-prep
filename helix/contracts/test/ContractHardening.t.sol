@@ -678,3 +678,388 @@ contract TrainingJobTest is Test {
         vm.stopPrank();
     }
 }
+
+/// @title ModelVersionTest
+/// @notice Tests for model version history: parentVersion, commitmentToVersion, getVersionChain, ModelVersionCreated event
+contract ModelVersionTest is Test {
+    ModelRegistry public registry;
+
+    bytes32 constant COMMIT_0 = keccak256("initial");
+    bytes32 constant COMMIT_1 = keccak256("update1");
+    bytes32 constant COMMIT_2 = keccak256("update2");
+    bytes32 constant COMMIT_3 = keccak256("update3");
+    bytes32 constant COMMIT_4 = keccak256("update4");
+    bytes32 constant COMMIT_5 = keccak256("update5");
+
+    function setUp() public {
+        registry = new ModelRegistry();
+        // Allow this test contract to call updateModel as coordinator
+        registry.setCoordinator(address(this));
+    }
+
+    /// @notice Register a model and return its ID
+    function _registerModel(bytes32 commitment) internal returns (uint256) {
+        return registry.registerModel("TestModel", "desc", "ipfs://hash", commitment);
+    }
+
+    /// @notice Update model with a new commitment
+    function _updateModel(uint256 modelId, bytes32 commitment, uint256 roundId) internal {
+        registry.updateModel(
+            modelId,
+            commitment,
+            roundId,
+            "",          // ipfsHash (empty = use model default)
+            100,         // errorBound
+            keccak256(abi.encodePacked(commitment, roundId)) // proofHash
+        );
+    }
+
+    // ============ Test 1: Initial checkpoint has parentVersion == 0 ============
+
+    function test_InitialCheckpoint_HasParentZero() public {
+        uint256 modelId = _registerModel(COMMIT_0);
+
+        ModelRegistry.Checkpoint memory cp = registry.getCheckpoint(modelId, 0);
+        assertEq(cp.parentVersion, 0, "Initial checkpoint parentVersion should be 0");
+        assertEq(cp.commitment, COMMIT_0, "Initial checkpoint commitment mismatch");
+        assertEq(cp.roundId, 0, "Initial checkpoint roundId should be 0");
+    }
+
+    // ============ Test 2: Update creates linked version ============
+
+    function test_UpdateCreatesLinkedVersion() public {
+        uint256 modelId = _registerModel(COMMIT_0);
+
+        _updateModel(modelId, COMMIT_1, 1);
+
+        // checkpoint[0] is the initial, checkpoint[1] is the update
+        ModelRegistry.Checkpoint memory cp0 = registry.getCheckpoint(modelId, 0);
+        ModelRegistry.Checkpoint memory cp1 = registry.getCheckpoint(modelId, 1);
+
+        assertEq(cp0.parentVersion, 0, "Initial parentVersion should be 0");
+        assertEq(cp1.parentVersion, 0, "Second checkpoint should point to index 0 as parent");
+        assertEq(cp1.commitment, COMMIT_1, "Second checkpoint commitment mismatch");
+
+        assertEq(registry.getCheckpointCount(modelId), 2, "Should have 2 checkpoints");
+    }
+
+    // ============ Test 3: getVersionChain returns correct chain ============
+
+    function test_GetVersionChain() public {
+        uint256 modelId = _registerModel(COMMIT_0);
+        _updateModel(modelId, COMMIT_1, 1);
+        _updateModel(modelId, COMMIT_2, 2);
+
+        // 3 checkpoints: 0 (initial), 1 (update1), 2 (update2)
+        // Chain from version 2 should be: [cp2, cp1, cp0]
+        ModelRegistry.Checkpoint[] memory chain = registry.getVersionChain(modelId, 2, 10);
+
+        assertEq(chain.length, 3, "Chain should have 3 entries");
+        assertEq(chain[0].commitment, COMMIT_2, "Chain[0] should be latest (version 2)");
+        assertEq(chain[1].commitment, COMMIT_1, "Chain[1] should be version 1");
+        assertEq(chain[2].commitment, COMMIT_0, "Chain[2] should be initial (version 0)");
+    }
+
+    // ============ Test 4: commitmentToVersion reverse lookup ============
+
+    function test_CommitmentToVersion_ReverseLookup() public {
+        uint256 modelId = _registerModel(COMMIT_0);
+        _updateModel(modelId, COMMIT_1, 1);
+
+        assertEq(registry.getVersionForCommitment(modelId, COMMIT_0), 0, "COMMIT_0 should map to version 0");
+        assertEq(registry.getVersionForCommitment(modelId, COMMIT_1), 1, "COMMIT_1 should map to version 1");
+
+        // Also check via the public mapping
+        assertEq(registry.commitmentToVersion(modelId, COMMIT_0), 0);
+        assertEq(registry.commitmentToVersion(modelId, COMMIT_1), 1);
+    }
+
+    // ============ Test 5: getVersionChain with limited count ============
+
+    function test_GetVersionChain_LimitedCount() public {
+        uint256 modelId = _registerModel(COMMIT_0);
+        _updateModel(modelId, COMMIT_1, 1);
+        _updateModel(modelId, COMMIT_2, 2);
+        _updateModel(modelId, COMMIT_3, 3);
+        _updateModel(modelId, COMMIT_4, 4);
+        _updateModel(modelId, COMMIT_5, 5);
+
+        // 6 checkpoints total (0-5). Request chain from version 5, limit 2
+        ModelRegistry.Checkpoint[] memory chain = registry.getVersionChain(modelId, 5, 2);
+
+        assertEq(chain.length, 2, "Chain should be limited to 2 entries");
+        assertEq(chain[0].commitment, COMMIT_5, "Chain[0] should be version 5");
+        assertEq(chain[1].commitment, COMMIT_4, "Chain[1] should be version 4");
+    }
+}
+
+/// @title ComputeRewardsTest
+/// @notice Tests for the compute-first 70/20/10 reward model
+contract ComputeRewardsTest is Test {
+    HelixCoordinatorV3 public coordinator;
+    HelixToken public token;
+    Staking public staking;
+    Rewards public rewards;
+    ModelRegistry public registry;
+    MockVerifierForRoundTest public mockVerifier;
+
+    address public modelOwner;
+    address public treasuryAddr;
+    address public worker1;
+    address public worker2;
+    address public worker3;
+
+    uint256 constant STAKE_AMOUNT = 200e18;
+    uint256 constant MIN_STAKE = 100e18;
+    uint256 constant ROUND_DURATION = 2 hours;
+    uint256 constant REWARDS_PER_ROUND = 100e18;
+
+    uint256 constant OLD_HASH_LO = 12345;
+    uint256 constant OLD_HASH_HI = 67890;
+
+    function setUp() public {
+        modelOwner = address(this);
+        treasuryAddr = makeAddr("treasury");
+        worker1 = makeAddr("worker1");
+        worker2 = makeAddr("worker2");
+        worker3 = makeAddr("worker3");
+
+        // Deploy token
+        token = new HelixToken(treasuryAddr);
+
+        // Deploy mock verifier
+        mockVerifier = new MockVerifierForRoundTest();
+
+        // Deploy staking
+        staking = new Staking(address(token), MIN_STAKE, 7 days, 5000);
+
+        // Deploy rewards
+        rewards = new Rewards(address(token));
+
+        // Deploy registry
+        registry = new ModelRegistry();
+
+        // Deploy coordinator
+        coordinator = new HelixCoordinatorV3(
+            address(mockVerifier),
+            address(staking),
+            address(rewards),
+            address(registry),
+            treasuryAddr
+        );
+
+        // Wire contracts
+        staking.setOperator(address(coordinator));
+        rewards.setCoordinator(address(coordinator));
+        rewards.setStakingContract(address(staking));
+        registry.setCoordinator(address(coordinator));
+
+        // Fund and stake all workers
+        _fundAndStake(worker1);
+        _fundAndStake(worker2);
+        _fundAndStake(worker3);
+
+        // Fund reward pool
+        token.mint(address(this), 100000e18);
+        token.approve(address(rewards), type(uint256).max);
+        rewards.fundRewardPool(100000e18, REWARDS_PER_ROUND, 365 days);
+    }
+
+    function _fundAndStake(address worker) internal {
+        token.mint(worker, 1000e18);
+        vm.startPrank(worker);
+        token.approve(address(staking), type(uint256).max);
+        staking.stake(STAKE_AMOUNT);
+        vm.stopPrank();
+    }
+
+    function _correctCommitment() internal pure returns (uint256) {
+        return uint256(keccak256(abi.encodePacked(OLD_HASH_LO, OLD_HASH_HI)));
+    }
+
+    function _computeChecksum(
+        uint256 errorBound, uint256 stepNumber, uint256 modelId, uint256 errorBudget
+    ) internal pure returns (uint256) {
+        return ProofFixtureHardcoded.computeErrorChecksum(errorBound, stepNumber, modelId, errorBudget);
+    }
+
+    function _buildPublicInputs(
+        uint256 newHashLo, uint256 newHashHi,
+        uint256 loss, uint256 errorBound,
+        uint256 step, uint256 modelId
+    ) internal view returns (uint256[] memory) {
+        uint256[] memory inputs = new uint256[](8);
+        inputs[0] = OLD_HASH_LO;
+        inputs[1] = OLD_HASH_HI;
+        inputs[2] = newHashLo;
+        inputs[3] = newHashHi;
+        inputs[4] = loss;
+        inputs[5] = errorBound;
+        inputs[6] = step;
+        inputs[7] = _computeChecksum(errorBound, step, modelId, coordinator.maxErrorBound());
+        return inputs;
+    }
+
+    function _createUniqueProof(uint256 nonce) internal pure returns (bytes memory) {
+        bytes memory base = ProofFixtureHardcoded.createValidProof();
+        return abi.encodePacked(base, nonce);
+    }
+
+    // ============ Test 1: Equal rewards for equal proofs ============
+
+    function test_ComputeReward_EqualForEqualProofs() public {
+        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", _correctCommitment());
+        coordinator.startRoundWithThreshold(modelId, ROUND_DURATION, 2);
+
+        uint256 sameLoss = 100;
+
+        // Worker1 submits
+        uint256[] memory inputs1 = _buildPublicInputs(11111, 22222, sameLoss, 10, 1, modelId);
+        vm.prank(worker1);
+        coordinator.submitProof(modelId, 1, _createUniqueProof(9001), inputs1);
+
+        // Worker2 submits with same loss
+        uint256[] memory inputs2 = _buildPublicInputs(33333, 44444, sameLoss, 10, 1, modelId);
+        vm.prank(worker2);
+        coordinator.submitProof(modelId, 1, _createUniqueProof(9002), inputs2);
+
+        // Warp past dispute period and finalize
+        vm.warp(block.timestamp + ROUND_DURATION + coordinator.DISPUTE_PERIOD() + 1);
+        coordinator.finalizeRound(modelId, 1);
+
+        // Both workers should get equal rewards (same loss = no quality bonus difference)
+        uint256 reward1 = rewards.pendingRewards(modelId, 1, worker1);
+        uint256 reward2 = rewards.pendingRewards(modelId, 1, worker2);
+
+        assertGt(reward1, 0, "Worker1 reward should be > 0");
+        assertEq(reward1, reward2, "Equal loss should produce equal rewards");
+    }
+
+    // ============ Test 2: Quality bonus — lower loss gets more ============
+
+    function test_QualityBonus_LowerLossGetsMore() public {
+        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", _correctCommitment());
+        coordinator.startRoundWithThreshold(modelId, ROUND_DURATION, 3);
+
+        // Worker1 submits with loss=50 (best)
+        uint256[] memory inputs1 = _buildPublicInputs(11111, 22222, 50, 10, 1, modelId);
+        vm.prank(worker1);
+        coordinator.submitProof(modelId, 1, _createUniqueProof(9010), inputs1);
+
+        // Worker2 submits with loss=100 (median)
+        uint256[] memory inputs2 = _buildPublicInputs(33333, 44444, 100, 10, 1, modelId);
+        vm.prank(worker2);
+        coordinator.submitProof(modelId, 1, _createUniqueProof(9011), inputs2);
+
+        // Worker3 submits with loss=200 (worst)
+        uint256[] memory inputs3 = _buildPublicInputs(55555, 66666, 200, 10, 1, modelId);
+        vm.prank(worker3);
+        coordinator.submitProof(modelId, 1, _createUniqueProof(9012), inputs3);
+
+        // Warp past dispute period and finalize
+        vm.warp(block.timestamp + ROUND_DURATION + coordinator.DISPUTE_PERIOD() + 1);
+        coordinator.finalizeRound(modelId, 1);
+
+        uint256 reward1 = rewards.pendingRewards(modelId, 1, worker1);
+        uint256 reward2 = rewards.pendingRewards(modelId, 1, worker2);
+        uint256 reward3 = rewards.pendingRewards(modelId, 1, worker3);
+
+        // Worker1 (loss=50) should get quality bonus (below median of 100)
+        // Worker2 (loss=100 = median) should not get quality bonus
+        // Worker3 (loss=200 > median) should not get quality bonus
+        assertGt(reward1, reward3, "Lower loss worker should get more than higher loss worker");
+        assertGt(reward1, reward2, "Best worker should get more than median worker");
+        // Worker2 and Worker3 should have no quality bonus, only compute + timeliness
+        // They submitted at the same block, so timeliness should be equal
+        assertEq(reward2, reward3, "Median and above-median should get equal reward (no quality bonus)");
+    }
+
+    // ============ Test 3: Full timeliness bonus for early submission ============
+
+    function test_TimelinessBonus_EarlySubmissionFull() public {
+        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", _correctCommitment());
+        coordinator.startRoundWithThreshold(modelId, ROUND_DURATION, 2);
+
+        uint256 sameLoss = 100;
+
+        // Worker1 submits immediately (at start of round, 0% progress)
+        uint256[] memory inputs1 = _buildPublicInputs(11111, 22222, sameLoss, 10, 1, modelId);
+        vm.prank(worker1);
+        coordinator.submitProof(modelId, 1, _createUniqueProof(9020), inputs1);
+
+        // Worker2 submits right at the deadline (100% progress)
+        vm.warp(block.timestamp + ROUND_DURATION);
+        uint256[] memory inputs2 = _buildPublicInputs(33333, 44444, sameLoss, 10, 1, modelId);
+        vm.prank(worker2);
+        coordinator.submitProof(modelId, 1, _createUniqueProof(9021), inputs2);
+
+        // Warp past dispute period and finalize
+        vm.warp(block.timestamp + coordinator.DISPUTE_PERIOD() + 1);
+        coordinator.finalizeRound(modelId, 1);
+
+        uint256 reward1 = rewards.pendingRewards(modelId, 1, worker1);
+        uint256 reward2 = rewards.pendingRewards(modelId, 1, worker2);
+
+        // Worker1 (early submission, progress=0%) gets full timeliness bonus
+        // Worker2 (at deadline, progress=100%) gets 0 timeliness bonus
+        assertGt(reward1, reward2, "Early submitter should get more than deadline submitter");
+    }
+
+    // ============ Test 4: Decayed timeliness bonus for late submission ============
+
+    function test_TimelinessBonus_LateSubmissionDecayed() public {
+        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", _correctCommitment());
+        coordinator.startRoundWithThreshold(modelId, ROUND_DURATION, 2);
+
+        uint256 sameLoss = 100;
+
+        // Worker1 submits at 50% of round duration (within 75% threshold = full bonus)
+        vm.warp(block.timestamp + ROUND_DURATION / 2);
+        uint256[] memory inputs1 = _buildPublicInputs(11111, 22222, sameLoss, 10, 1, modelId);
+        vm.prank(worker1);
+        coordinator.submitProof(modelId, 1, _createUniqueProof(9030), inputs1);
+
+        // Worker2 submits at 90% of round duration (beyond 75% = decayed)
+        vm.warp(block.timestamp + (ROUND_DURATION * 4 / 10)); // 50% + 40% = 90% total
+        uint256[] memory inputs2 = _buildPublicInputs(33333, 44444, sameLoss, 10, 1, modelId);
+        vm.prank(worker2);
+        coordinator.submitProof(modelId, 1, _createUniqueProof(9031), inputs2);
+
+        // Warp past dispute period and finalize
+        vm.warp(block.timestamp + ROUND_DURATION + coordinator.DISPUTE_PERIOD() + 1);
+        coordinator.finalizeRound(modelId, 1);
+
+        uint256 reward1 = rewards.pendingRewards(modelId, 1, worker1);
+        uint256 reward2 = rewards.pendingRewards(modelId, 1, worker2);
+
+        // Worker1 (50% progress, within 75% threshold) gets full timeliness bonus
+        // Worker2 (90% progress, beyond 75%) gets partial/decayed timeliness bonus
+        assertGt(reward1, reward2, "Worker at 50% should get more timeliness bonus than worker at 90%");
+        assertGt(reward2, 0, "Worker at 90% should still get some reward");
+    }
+
+    // ============ Test 5: Pool split configurable by owner ============
+
+    function test_PoolSplit_ConfigurableByOwner() public {
+        // Default split should be 70/20/10
+        assertEq(rewards.computePoolBps(), 7000);
+        assertEq(rewards.qualityPoolBps(), 2000);
+        assertEq(rewards.timelinessPoolBps(), 1000);
+
+        // Owner sets 80/10/10
+        rewards.setPoolSplit(8000, 1000, 1000);
+
+        assertEq(rewards.computePoolBps(), 8000, "Compute pool should be 80%");
+        assertEq(rewards.qualityPoolBps(), 1000, "Quality pool should be 10%");
+        assertEq(rewards.timelinessPoolBps(), 1000, "Timeliness pool should be 10%");
+
+        // Revert if split doesn't sum to 10000
+        vm.expectRevert("Must sum to 100%");
+        rewards.setPoolSplit(5000, 3000, 1000);
+
+        // Non-owner cannot set
+        vm.prank(worker1);
+        vm.expectRevert("Only owner");
+        rewards.setPoolSplit(8000, 1000, 1000);
+    }
+}

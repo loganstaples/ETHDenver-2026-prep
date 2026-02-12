@@ -58,7 +58,25 @@ contract Rewards is ReentrancyGuard {
 
     /// @notice Participants in each round
     mapping(uint256 => mapping(uint256 => address[])) public roundParticipants;
-    
+
+    /// @notice Participant loss per round
+    mapping(uint256 => mapping(uint256 => mapping(address => uint256))) public participantLoss;
+
+    /// @notice Participant submission time
+    mapping(uint256 => mapping(uint256 => mapping(address => uint40))) public participantSubmitTime;
+
+    /// @notice Round timing info
+    struct RoundTiming {
+        uint40 startTime;
+        uint40 deadline;
+    }
+    mapping(uint256 => mapping(uint256 => RoundTiming)) public roundTiming;
+
+    /// @notice Pool split configuration (basis points, must sum to 10000)
+    uint16 public computePoolBps = 7000;  // 70%
+    uint16 public qualityPoolBps = 2000;  // 20%
+    uint16 public timelinessPoolBps = 1000; // 10%
+
     /// @notice Events
     event RewardPoolFunded(uint256 amount, uint256 rewardsPerRound, uint256 endTime);
     event RewardsAllocated(uint256 indexed modelId, uint256 indexed roundId, uint256 totalAmount, uint256 participantCount);
@@ -131,8 +149,32 @@ contract Rewards is ReentrancyGuard {
         
         emit ParticipantRegistered(modelId, roundId, participant);
     }
-    
-    /// @notice Allocate rewards for a completed round
+
+    /// @notice Register participant with loss and timing data for compute-first rewards
+    function registerParticipantWithData(
+        uint256 modelId,
+        uint256 roundId,
+        address participant,
+        uint256 loss,
+        uint40 submittedAt,
+        uint40 roundStartTime,
+        uint40 roundDeadline
+    ) external onlyCoordinator {
+        roundParticipants[modelId][roundId].push(participant);
+        claimInfo[participant].roundsParticipated++;
+
+        participantLoss[modelId][roundId][participant] = loss;
+        participantSubmitTime[modelId][roundId][participant] = submittedAt;
+
+        // Only set timing once per round
+        if (roundTiming[modelId][roundId].startTime == 0) {
+            roundTiming[modelId][roundId] = RoundTiming(roundStartTime, roundDeadline);
+        }
+
+        emit ParticipantRegistered(modelId, roundId, participant);
+    }
+
+    /// @notice Allocate rewards for a completed round using 70/20/10 compute-first model
     /// @param modelId The model ID
     /// @param roundId The round ID
     function allocateRoundRewards(
@@ -144,46 +186,115 @@ contract Rewards is ReentrancyGuard {
             rewardPool.totalRewards - rewardPool.distributedRewards >= rewardPool.rewardsPerRound,
             "Insufficient reward pool"
         );
-        
+
         address[] storage participants = roundParticipants[modelId][roundId];
-        uint256 participantCount = participants.length;
-        
-        require(participantCount > 0, "No participants");
-        
+        uint256 count = participants.length;
+        require(count > 0, "No participants");
+
         roundRewardsAllocated[modelId][roundId] = true;
-        
-        // Calculate individual rewards based on stake weight
+
+        uint256 totalRoundReward = rewardPool.rewardsPerRound;
+        uint256 computePool = (totalRoundReward * computePoolBps) / 10000;
+        uint256 qualityPool = (totalRoundReward * qualityPoolBps) / 10000;
+        uint256 timelinessPool = totalRoundReward - computePool - qualityPool;
+
+        // Compute pool: equal per proof
+        uint256 perProofReward = computePool / count;
+
+        // Quality pool: bonus for below-median loss
+        uint256 medianLoss = _computeMedianLoss(modelId, roundId, participants);
+
+        // First pass: compute quality improvements
+        uint256[] memory improvements = new uint256[](count);
+        uint256 qualityDenominator = 0;
+        for (uint256 i = 0; i < count; i++) {
+            uint256 loss = participantLoss[modelId][roundId][participants[i]];
+            if (medianLoss > 0 && loss < medianLoss) {
+                improvements[i] = medianLoss - loss;
+                qualityDenominator += improvements[i];
+            }
+        }
+
+        // Second pass: distribute all pools
+        RoundTiming storage timing = roundTiming[modelId][roundId];
         uint256 totalDistributed = 0;
-        
-        for (uint i = 0; i < participantCount; i++) {
+        for (uint256 i = 0; i < count; i++) {
             address participant = participants[i];
-            uint256 reward = _calculateParticipantReward(participant, participantCount);
-            
+            uint256 reward = perProofReward;
+
+            // Quality bonus
+            if (qualityDenominator > 0 && improvements[i] > 0) {
+                reward += (qualityPool * improvements[i]) / qualityDenominator;
+            }
+
+            // Timeliness bonus
+            reward += _computeTimelinessBonus(modelId, roundId, participant, timelinessPool / count, timing);
+
             pendingRewards[modelId][roundId][participant] = reward;
             claimInfo[participant].totalEarned += reward;
             totalDistributed += reward;
         }
-        
+
         rewardPool.distributedRewards += totalDistributed;
-        
-        emit RewardsAllocated(modelId, roundId, totalDistributed, participantCount);
+
+        emit RewardsAllocated(modelId, roundId, totalDistributed, count);
     }
-    
-    /// @notice Calculate reward for a participant based on stake weight
-    function _calculateParticipantReward(
-        address participant,
-        uint256 totalParticipants
+
+    /// @notice Compute the median loss for a set of participants
+    function _computeMedianLoss(
+        uint256 modelId, uint256 roundId, address[] storage participants
     ) internal view returns (uint256) {
-        uint256 baseReward = rewardPool.rewardsPerRound / totalParticipants;
-        
-        // If staking contract is set, weight by stake
-        if (stakingContract != address(0)) {
-            // Get stake weight (would call staking contract)
-            // For now, use equal distribution with potential bonus
-            return baseReward;
+        uint256 count = participants.length;
+        if (count == 0) return 0;
+        if (count == 1) return participantLoss[modelId][roundId][participants[0]];
+
+        // Sort losses (insertion sort, O(n^2) fine for small n < 100)
+        uint256[] memory losses = new uint256[](count);
+        for (uint256 i = 0; i < count; i++) {
+            losses[i] = participantLoss[modelId][roundId][participants[i]];
         }
-        
-        return baseReward;
+        for (uint256 i = 1; i < count; i++) {
+            uint256 key = losses[i];
+            uint256 j = i;
+            while (j > 0 && losses[j - 1] > key) {
+                losses[j] = losses[j - 1];
+                j--;
+            }
+            losses[j] = key;
+        }
+        return losses[count / 2];
+    }
+
+    /// @notice Compute timeliness bonus with linear decay after 75% of round duration
+    function _computeTimelinessBonus(
+        uint256 modelId, uint256 roundId, address participant,
+        uint256 maxBonus, RoundTiming storage timing
+    ) internal view returns (uint256) {
+        uint40 submitTime = participantSubmitTime[modelId][roundId][participant];
+        if (submitTime == 0 || timing.startTime == 0) return maxBonus;
+
+        uint256 duration = uint256(timing.deadline) - uint256(timing.startTime);
+        if (duration == 0) return maxBonus;
+
+        uint256 elapsed = uint256(submitTime) - uint256(timing.startTime);
+        uint256 progress = (elapsed * 10000) / duration;
+
+        if (progress <= 7500) return maxBonus;
+        if (progress >= 10000) return 0;
+
+        uint256 decay = progress - 7500;
+        return maxBonus * (2500 - decay) / 2500;
+    }
+
+    /// @notice Set the pool split configuration (owner only)
+    /// @param _compute Compute pool basis points
+    /// @param _quality Quality pool basis points
+    /// @param _timeliness Timeliness pool basis points
+    function setPoolSplit(uint16 _compute, uint16 _quality, uint16 _timeliness) external onlyOwner {
+        require(_compute + _quality + _timeliness == 10000, "Must sum to 100%");
+        computePoolBps = _compute;
+        qualityPoolBps = _quality;
+        timelinessPoolBps = _timeliness;
     }
     
     /// @notice Claim rewards for specific rounds (single claim path to prevent double-claims)
