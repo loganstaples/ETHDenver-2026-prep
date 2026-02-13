@@ -7,6 +7,7 @@
 //! - **Streaming batches**: Process large training runs without memory exhaustion
 //! - **Checkpoint/resume**: Save progress for long-running training sessions
 //! - **Proof aggregation**: Combine batch proofs into a single succinct proof
+//! - **IVC integration**: Fold multiple steps into a single contract-compatible proof
 //! - **Memory-efficient processing**: Configurable memory limits and spill-to-disk
 
 use std::collections::HashMap;
@@ -23,7 +24,10 @@ use sha2::{Digest, Sha256};
 use crate::parallel::{ChunkProof, ParallelConfig, ParallelProver, ProofStatus};
 use crate::chunking::{ChunkId, ComputationChunk, ComputationType};
 use crate::aggregation::{KZGAggregatedProof, KZGBatchAggregator, RLCAggregationProver, AggregatedTrainingProof};
+use crate::ivc::{IVCProver, IVCConfig, IVCStep, DeciderProof};
 use crate::provers::training_prover_v2::TrainingProofResultV2;
+use helix_circuits::halo2curves::bn256::Fr;
+use helix_circuits::halo2_proofs::arithmetic::Field;
 use thiserror::Error;
 
 /// Errors from batch proving operations.
@@ -65,6 +69,17 @@ pub struct BatchConfig {
     pub streaming_mode: bool,
     /// Maximum memory usage (bytes) before spilling.
     pub max_memory_bytes: usize,
+    /// Enable IVC mode: fold all steps via IVC and produce a single decider proof.
+    /// When enabled, individual step proofs are still generated (for parallel proving)
+    /// but the final output is a single contract-compatible decider proof.
+    #[serde(default)]
+    pub ivc_mode: bool,
+    /// Model ID for IVC decider checksum (required when ivc_mode is true).
+    #[serde(default)]
+    pub model_id: u64,
+    /// Error budget for IVC decider checksum (required when ivc_mode is true).
+    #[serde(default)]
+    pub error_budget: u64,
 }
 
 impl Default for BatchConfig {
@@ -80,6 +95,9 @@ impl Default for BatchConfig {
             aggregation_batch_size: 10,
             streaming_mode: false,
             max_memory_bytes: 1024 * 1024 * 1024, // 1GB
+            ivc_mode: false,
+            model_id: 0,
+            error_budget: 10000,
         }
     }
 }
@@ -884,6 +902,139 @@ impl BatchProver {
         Self::try_rlc_aggregation(proofs)
     }
 
+    /// Proves a batch of training steps using IVC folding.
+    ///
+    /// Instead of generating independent proofs for each step, this method:
+    /// 1. Generates individual step proofs in parallel (via ParallelProver)
+    /// 2. Folds all steps into a single IVC accumulator
+    /// 3. Produces a single decider proof compatible with HelixCoordinatorV2
+    ///
+    /// The resulting `IVCBatchResult` contains both the individual step proofs
+    /// (for transparency) and the single decider proof (for on-chain submission).
+    pub fn prove_batch_ivc(
+        &self,
+        steps: Vec<TrainingStep>,
+    ) -> Result<IVCBatchResult, BatchProveError> {
+        let start_time = Instant::now();
+        let total_steps = steps.len();
+
+        if steps.is_empty() {
+            return Ok(IVCBatchResult {
+                batch_id: self.batch_id.clone(),
+                decider_proof: None,
+                step_proofs: Vec::new(),
+                total_steps: 0,
+                total_time_ms: 0,
+            });
+        }
+
+        // Update status
+        {
+            if let Ok(mut status) = self.status.write() {
+                *status = BatchStatus::InProgress {
+                    completed: 0,
+                    total: total_steps,
+                };
+            }
+        }
+
+        // Step 1: Generate individual proofs in parallel
+        let chunks: Vec<ComputationChunk> = steps.iter().map(|s| s.to_chunk()).collect();
+        self.parallel_prover.submit_batch_with_dependencies(chunks);
+        self.parallel_prover.start();
+        let chunk_proofs = self.wait_with_progress(total_steps);
+        self.parallel_prover.stop();
+
+        let step_proofs: Vec<StepProof> = chunk_proofs.into_iter().map(StepProof::from).collect();
+
+        if step_proofs.is_empty() && total_steps > 0 {
+            if let Ok(mut status) = self.status.write() {
+                *status = BatchStatus::Failed(format!("All {} steps produced 0 proofs", total_steps));
+            }
+            return Err(BatchProveError::AllStepsFailed { total: total_steps });
+        }
+
+        // Step 2: Fold steps into IVC accumulator
+        let initial_commitment = steps[0].input_commitment;
+        let ivc_config = IVCConfig {
+            steps_per_fold: total_steps + 1, // Don't auto-fold, we fold manually at the end
+            store_intermediates: false,
+            ..Default::default()
+        };
+        let mut ivc_prover = IVCProver::with_config(initial_commitment, ivc_config);
+
+        for step in &steps {
+            let computation_hash = {
+                let mut hasher = Sha256::new();
+                hasher.update(step.step_index.to_le_bytes());
+                hasher.update(step.input_commitment);
+                hasher.update(step.output_commitment);
+                let hash: [u8; 32] = hasher.finalize().into();
+                hash
+            };
+
+            let ivc_step = IVCStep {
+                step: step.step_index,
+                input_state: step.input_commitment,
+                output_state: step.output_commitment,
+                computation_hash,
+                step_error: step.error_bound,
+                proof: vec![], // IVCProver generates its own A1 proofs internally
+            };
+
+            if let Err(e) = ivc_prover.add_step(ivc_step) {
+                tracing::error!(step = step.step_index, error = %e, "IVC step failed");
+                return Err(BatchProveError::AggregationFailed {
+                    reason: format!("IVC fold failed at step {}: {}", step.step_index, e),
+                    num_proofs: total_steps,
+                });
+            }
+        }
+
+        // Step 3: Generate decider proof
+        let total_loss: f64 = steps.iter().map(|s| s.loss).sum::<f64>() / steps.len() as f64;
+        let loss_fr = Fr::from((total_loss * 1e9) as u64);
+        let model_id_fr = Fr::from(self.config.model_id);
+        let error_budget_fr = Fr::from(self.config.error_budget);
+
+        let decider_proof = match ivc_prover.prove_decider(loss_fr, model_id_fr, error_budget_fr) {
+            Ok(proof) => {
+                tracing::info!(
+                    num_steps = proof.num_steps,
+                    proof_size = proof.proof.len(),
+                    "IVC decider proof generated for batch"
+                );
+                Some(proof)
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "IVC decider proof generation failed");
+                return Err(BatchProveError::AggregationFailed {
+                    reason: format!("IVC decider proof failed: {}", e),
+                    num_proofs: total_steps,
+                });
+            }
+        };
+
+        // Update stats
+        let total_bytes: usize = step_proofs.iter().map(|p| p.proof_size).sum();
+        self.stats.proofs_generated.fetch_add(step_proofs.len() as u64, Ordering::Relaxed);
+        self.stats.total_bytes.fetch_add(total_bytes as u64, Ordering::Relaxed);
+
+        let total_time_ms = start_time.elapsed().as_millis() as u64;
+
+        if let Ok(mut status) = self.status.write() {
+            *status = BatchStatus::Complete;
+        }
+
+        Ok(IVCBatchResult {
+            batch_id: self.batch_id.clone(),
+            decider_proof,
+            step_proofs,
+            total_steps,
+            total_time_ms,
+        })
+    }
+
     /// Computes the RLC commitment from step proofs using Poseidon hashing.
     fn compute_rlc_commitment(proofs: &[StepProof]) -> [u8; 32] {
         use helix_circuits::gadgets::poseidon::poseidon_hash_two;
@@ -955,6 +1106,25 @@ impl StreamingBatchResult {
     }
 }
 
+/// Result of IVC-based batch proving.
+///
+/// Contains both the individual step proofs (for transparency/audit) and the
+/// single decider proof that can be submitted directly to `HelixCoordinatorV2`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IVCBatchResult {
+    /// Batch identifier.
+    pub batch_id: String,
+    /// Single contract-compatible decider proof covering all steps.
+    /// Contains 8 public inputs matching `HelixCoordinatorV2.submitProof()`.
+    pub decider_proof: Option<DeciderProof>,
+    /// Individual step proofs (retained for audit/transparency).
+    pub step_proofs: Vec<StepProof>,
+    /// Total steps processed.
+    pub total_steps: usize,
+    /// Total time in milliseconds.
+    pub total_time_ms: u64,
+}
+
 /// Builder for constructing batch proving jobs.
 pub struct BatchProverBuilder {
     config: BatchConfig,
@@ -1008,6 +1178,14 @@ impl BatchProverBuilder {
     /// Sets max memory bytes.
     pub fn max_memory_bytes(mut self, bytes: usize) -> Self {
         self.config.max_memory_bytes = bytes;
+        self
+    }
+
+    /// Enables IVC mode for folding steps into a single decider proof.
+    pub fn ivc_mode(mut self, model_id: u64, error_budget: u64) -> Self {
+        self.config.ivc_mode = true;
+        self.config.model_id = model_id;
+        self.config.error_budget = error_budget;
         self
     }
 
@@ -1390,5 +1568,52 @@ mod tests {
             let verified = aggregator.verify(kzg).expect("verification should complete");
             assert!(verified, "KZG aggregated proof should verify");
         }
+    }
+
+    #[test]
+    fn test_ivc_batch_proving() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Create chained steps where each output_state feeds the next input_state
+        fn make_chained_step(index: u64, input: [u8; 32]) -> TrainingStep {
+            let mut output = input;
+            output[0] = output[0].wrapping_add(1);
+            TrainingStep {
+                step_index: index,
+                input_commitment: input,
+                output_commitment: output,
+                loss: 0.5 + index as f64 * 0.01,
+                gradient_norm: 1.0,
+                error_bound: 0.001,
+                aux_data: None,
+            }
+        }
+
+        let mut steps = Vec::new();
+        let mut current = [0u8; 32];
+        for i in 1..=5u64 {
+            let step = make_chained_step(i, current);
+            current = step.output_commitment;
+            steps.push(step);
+        }
+
+        let prover = BatchProverBuilder::new()
+            .threads(2)
+            .ivc_mode(1, 10000)
+            .build();
+
+        let result = prover.prove_batch_ivc(steps)
+            .expect("IVC batch proving should succeed");
+
+        assert_eq!(result.total_steps, 5);
+        assert!(result.decider_proof.is_some(), "Decider proof must be present");
+
+        let decider = result.decider_proof.unwrap();
+        assert_eq!(decider.num_steps, 5, "Decider must report 5 steps");
+        assert_eq!(decider.public_inputs.len(), 8, "Must have 8 contract-compatible PIs");
+        assert!(!decider.proof.is_empty(), "Proof bytes must be non-empty");
+
+        // Verify step proofs were also generated (parallel proving)
+        assert!(!result.step_proofs.is_empty(), "Individual step proofs should exist");
     }
 }

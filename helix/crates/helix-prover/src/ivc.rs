@@ -1624,6 +1624,96 @@ mod tests {
             "PI[7] must match contract-compatible Poseidon checksum");
     }
 
+    /// E2E integration test: 5 training steps folded via IVC into a single
+    /// decider proof, verified with contract-compatible 8-PI format.
+    ///
+    /// This demonstrates the full IVC integration flow:
+    /// 1. Create 5 chained training steps
+    /// 2. Feed them into IVCProver (generating real A1 proofs per step)
+    /// 3. Fold all steps (generates real folding circuit proof)
+    /// 4. Produce single decider proof (contract-compatible)
+    /// 5. Verify the decider proof succeeds
+    /// 6. Validate the 8 public inputs match contract expectations
+    #[test]
+    fn test_e2e_5_steps_ivc_to_decider_contract_compatible() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let initial = [0u8; 32];
+        let config = IVCConfig {
+            steps_per_fold: 10, // Don't auto-fold; we'll fold at decider time
+            store_intermediates: true,
+            ..Default::default()
+        };
+        let mut prover = IVCProver::with_config(initial, config);
+
+        // Step 1: Generate 5 chained training steps
+        let mut current = initial;
+        for i in 1..=5u64 {
+            let step = make_step(i, current);
+            current = step.output_state;
+            prover.add_step(step).expect(&format!("step {} should succeed", i));
+        }
+
+        assert_eq!(prover.state().step, 5);
+        assert_eq!(prover.accumulator().num_steps, 5);
+        assert!(prover.state().accumulated_error > 0.0);
+
+        // Step 2: Generate decider proof (folds + proves in one call)
+        let loss = Fr::from(42u64);
+        let model_id = Fr::from(1u64);
+        let error_budget = Fr::from(10000u64);
+
+        let decider = prover.prove_decider(loss, model_id, error_budget)
+            .expect("5-step IVC decider proof should succeed");
+
+        // Step 3: Validate structure
+        assert_eq!(decider.num_steps, 5, "Decider must report 5 steps");
+        assert_eq!(decider.public_inputs.len(), 8, "Must have exactly 8 public inputs");
+        assert!(!decider.proof.is_empty(), "Proof must be non-empty");
+
+        // Step 4: Validate PI contents match contract format
+        let pi_fr: Vec<Fr> = decider.public_inputs.iter()
+            .map(|b| Fr::from_repr_vartime((*b).into()).unwrap_or(Fr::ZERO))
+            .collect();
+
+        // PI[0-1]: old_state_hash (lo, hi) — should be split of initial state
+        // PI[2-3]: new_state_hash (lo, hi) — should be split of final state
+        // PI[4]: loss
+        assert_eq!(pi_fr[4], loss, "PI[4] must be the training loss");
+        // PI[5]: error_bound (accumulated)
+        assert_ne!(pi_fr[5], Fr::ZERO, "PI[5] error_bound must be non-zero after 5 steps");
+        // PI[6]: step_number
+        assert_eq!(pi_fr[6], Fr::from(5u64), "PI[6] must be step_number=5");
+        // PI[7]: error_checksum (Poseidon)
+        let error_bound = prover.accumulator().error_bound;
+        let step_number = Fr::from(5u64);
+        let h1 = poseidon_hash_two(error_bound, step_number);
+        let h2 = poseidon_hash_two(model_id, error_budget);
+        let expected_checksum = poseidon_hash_two(h1, h2);
+        assert_eq!(pi_fr[7], expected_checksum, "PI[7] must match Poseidon checksum");
+
+        // Step 5: Verify the decider proof cryptographically
+        let verified = prover.verify_decider_proof(&decider)
+            .expect("verification should complete");
+        assert!(verified, "5-step IVC decider proof must verify");
+
+        // Step 6: Validate initial/final state are captured correctly
+        assert_eq!(decider.initial_state, fr_to_bytes(prover.initial_state_fr),
+            "Initial state must match prover's initial commitment");
+        let final_state_fr = prover.accumulator().state_commitment;
+        assert_eq!(decider.final_state, fr_to_bytes(final_state_fr),
+            "Final state must match accumulator's state commitment");
+        assert_ne!(decider.final_state, initial,
+            "Final state must differ from initial after 5 steps");
+
+        // Step 7: Verify proof is the right size for PSE SHPLONK format
+        // Real KZG proofs with PSE Keccak256 transcript are ~1856 bytes
+        assert!(
+            decider.proof.len() > 100,
+            "Proof ({} bytes) should be a real KZG proof, not a stub",
+            decider.proof.len()
+        );
+    }
+
     /// Test that corrupted decider proof is rejected.
     #[test]
     fn test_decider_proof_rejects_corruption() {
