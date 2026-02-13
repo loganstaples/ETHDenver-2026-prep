@@ -447,6 +447,11 @@ impl NetworkRunner {
         &self.partition_detector
     }
 
+    /// Returns the connection pool for building MPC bridges.
+    pub fn connection_pool(&self) -> &Arc<ConnectionPool> {
+        &self.pool
+    }
+
     /// Returns whether training is paused due to network partition.
     pub fn is_training_paused(&self) -> bool {
         self.training_paused.load(std::sync::atomic::Ordering::SeqCst)

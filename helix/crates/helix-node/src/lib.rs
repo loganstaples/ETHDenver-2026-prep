@@ -2,6 +2,7 @@ pub mod api;
 pub mod config;
 pub mod data;
 pub mod identity;
+pub mod mpc_bridge;
 pub mod network;
 pub mod on_chain_pipeline;
 pub mod roles;

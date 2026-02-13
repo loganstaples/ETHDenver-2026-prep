@@ -188,6 +188,8 @@ pub enum MessageTypeId {
     Sync = 0x0400,
     /// Heartbeat messages.
     Heartbeat = 0x0500,
+    /// MPC protocol messages (Beaver triples, secret shares, garbled circuits).
+    Mpc = 0x0600,
 }
 
 impl From<u16> for MessageTypeId {
@@ -198,6 +200,7 @@ impl From<u16> for MessageTypeId {
             0x0300 => Self::Gradient,
             0x0400 => Self::Sync,
             0x0500 => Self::Heartbeat,
+            0x0600 => Self::Mpc,
             _ => Self::Discovery, // Default
         }
     }
@@ -386,7 +389,7 @@ impl WireCodec {
             MessagePayload::Sync(_) => MessageTypeId::Sync as u16,
             MessagePayload::Heartbeat(_) => MessageTypeId::Heartbeat as u16,
             MessagePayload::Consensus(_) => MessageTypeId::Training as u16,
-            MessagePayload::MpcData(_) => MessageTypeId::Training as u16,
+            MessagePayload::MpcData(_) => MessageTypeId::Mpc as u16,
             MessagePayload::Registration(_) => MessageTypeId::Discovery as u16,
             MessagePayload::RoundManagement(_) => MessageTypeId::Training as u16,
         }

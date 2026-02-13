@@ -446,6 +446,45 @@ mod transport_session_impl {
     }
 }
 
+mod node_transport_session_impl {
+    use super::*;
+    use crate::session::node_transport::NodeTransport;
+
+    impl MPCSession {
+        /// Creates a session with a pre-wired `NodeTransport`.
+        ///
+        /// Unlike `connect_with_transport()` which creates its own TCP connections,
+        /// this method accepts a `NodeTransport` that's already wired to the node's
+        /// P2P connections via `NodeMpcBridge`. This allows MPC sessions to
+        /// communicate over the node's existing peer connections.
+        ///
+        /// # Arguments
+        ///
+        /// * `config` - MPC configuration (num_parties, thresholds, etc.)
+        /// * `session_id` - Unique session identifier
+        /// * `party_id` - Our party ID in this session
+        /// * `transport` - Pre-wired NodeTransport from `NodeMpcBridge::create_session()`
+        /// * `agreed_seed` - Random seed agreed upon by all parties (e.g., from handshake)
+        pub fn connect_with_node_transport(
+            config: MPCConfig,
+            session_id: impl Into<String>,
+            party_id: PartyId,
+            transport: NodeTransport,
+            agreed_seed: [u8; 32],
+        ) -> MPCResult<TransportSession<NodeTransport>> {
+            config.validate().map_err(MPCError::InvalidConfig)?;
+
+            Ok(TransportSession {
+                config,
+                session_id: session_id.into(),
+                party_id,
+                transport,
+                agreed_seed,
+            })
+        }
+    }
+}
+
 impl std::fmt::Display for SessionStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(

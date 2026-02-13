@@ -62,7 +62,9 @@ pub use transport::{HandshakeMessage, LocalTransport, MPCTransport};
 pub use transport::TcpTransport;
 pub use checkpoint::{SessionCheckpoint, SessionPersistence};
 pub use health::{HealthConfig, HealthEvent, HealthStatus, PartyHealthMonitor};
-pub use node_transport::{MPCMessageRouter, NodeTransport, PeerMapping, TaggedMessage};
+pub use node_transport::{
+    MPCMessageRouter, NodeConnectionBridge, NodeTransport, PeerMapping, TaggedMessage,
+};
 pub use registry::{
     PartyCapabilities, PartyRegistry, PartyStatus, RegisteredParty, RegistryConfig,
     SelectionCriteria,

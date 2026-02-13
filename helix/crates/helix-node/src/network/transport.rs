@@ -164,6 +164,8 @@ pub struct TcpTransport {
     connections: Arc<RwLock<HashMap<PeerId, Vec<Arc<PeerConnection>>>>>,
     /// Inbound message channel.
     inbound_tx: mpsc::Sender<(PeerId, NetworkMessage)>,
+    /// Actual bound address (updated after start_listener when port 0 is used).
+    actual_addr: Arc<RwLock<Option<SocketAddr>>>,
     /// Inbound message receiver.
     inbound_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<(PeerId, NetworkMessage)>>>,
     /// Running state.
@@ -191,6 +193,7 @@ impl TcpTransport {
             config,
             connections: Arc::new(RwLock::new(HashMap::new())),
             inbound_tx,
+            actual_addr: Arc::new(RwLock::new(None)),
             inbound_rx: Arc::new(tokio::sync::Mutex::new(inbound_rx)),
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tls_connector,
@@ -215,6 +218,7 @@ impl TcpTransport {
             config,
             connections: Arc::new(RwLock::new(HashMap::new())),
             inbound_tx,
+            actual_addr: Arc::new(RwLock::new(None)),
             inbound_rx: Arc::new(tokio::sync::Mutex::new(inbound_rx)),
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tls_connector: Some(connector),
@@ -550,6 +554,8 @@ impl TcpTransport {
     /// Starts the listener.
     async fn start_listener(&self) -> Result<(), TransportError> {
         let listener = TcpListener::bind(self.config.listen_addr).await?;
+        // Save the actual bound address (important when port 0 is used)
+        *self.actual_addr.write() = Some(listener.local_addr()?);
         let running = self.running.clone();
         let inbound_tx = self.inbound_tx.clone();
         let tls_acceptor = self.tls_acceptor.clone();
@@ -657,7 +663,9 @@ impl Transport for TcpTransport {
     }
 
     fn local_addr(&self) -> SocketAddr {
-        self.config.listen_addr
+        self.actual_addr
+            .read()
+            .unwrap_or(self.config.listen_addr)
     }
 }
 
