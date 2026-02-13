@@ -40,6 +40,7 @@ pub mod round_manager;
 pub mod dataset_sync;
 pub mod multi_round;
 pub mod job_manager;
+pub mod distribution;
 
 // Re-export key types
 pub use round::{
@@ -185,6 +186,16 @@ pub use job_manager::{
     TrainingJobManager, TrainingJobConfig, JobPhase, JobEvent, JobError, JobSnapshot,
     RoundResult as JobRoundResult, WorkerMessage, WorkerJobState,
     network_event_to_worker_message,
+};
+
+pub use distribution::{
+    ModelPackage, ModelArchitecture, LayerDescription, TrainingHyperparameters,
+    DataAssignment, DataSourceType, DataFormat,
+    ModelPackageChunk, ChunkMetadata, ChunkReceiver,
+    ModelPackageBuilder, DataShardPlanner, DistributionTracker,
+    verify_model_package, verify_weight_integrity, verify_checkpoint_integrity,
+    compute_data_hash, split_into_chunks, reassemble_chunks,
+    MAX_CHUNK_SIZE, CHUNKED_TRANSFER_THRESHOLD,
 };
 
 /// Convenience type alias for training results.

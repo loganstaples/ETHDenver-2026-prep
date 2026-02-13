@@ -3882,6 +3882,7 @@ dependencies = [
  "log",
  "lru",
  "mdns-sd",
+ "miniz_oxide",
  "parking_lot",
  "prost",
  "rand 0.8.5",

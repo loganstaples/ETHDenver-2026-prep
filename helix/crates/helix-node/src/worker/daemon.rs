@@ -26,6 +26,10 @@ use crate::network::messages::{
 use crate::network::runner::NetworkRunner;
 use crate::trainer::{MlpModel, Trainer};
 use crate::training::consensus::compute_hiding_gradient_commitment;
+use crate::training::distribution::{
+    self, ChunkReceiver, DataAssignment, ModelPackage, ModelPackageChunk,
+    verify_model_package,
+};
 use crate::worker::evaluator::{EvaluatorConfig, RejectReason, RoundEvaluator};
 use crate::worker::tracker::{EarningsSummary, ParticipationTracker};
 
@@ -249,6 +253,10 @@ pub struct WorkerDaemon {
     events: Arc<RwLock<Vec<WorkerDaemonEvent>>>,
     /// Maximum events to keep.
     max_events: usize,
+    /// Chunk receiver for in-progress chunked model transfers.
+    chunk_receiver: Arc<RwLock<Option<ChunkReceiver>>>,
+    /// Current data assignment for the active round.
+    data_assignment: Arc<RwLock<Option<DataAssignment>>>,
 }
 
 impl WorkerDaemon {
@@ -280,6 +288,8 @@ impl WorkerDaemon {
             trainer: Arc::new(RwLock::new(None)),
             events: Arc::new(RwLock::new(Vec::new())),
             max_events: 200,
+            chunk_receiver: Arc::new(RwLock::new(None)),
+            data_assignment: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -424,6 +434,20 @@ impl WorkerDaemon {
             RoundManagementMessage::WorkerReady { .. } => {}
             // ProofSubmission is sent by workers, not handled by workers
             RoundManagementMessage::ProofSubmission { .. } => {}
+            // Model package delivery — handled in handle_model_package_delivery
+            RoundManagementMessage::ModelPackageDelivery { package_data } => {
+                self.handle_model_package_delivery(package_data, network).await;
+            }
+            // Chunked model package delivery
+            RoundManagementMessage::ModelPackageChunkDelivery { chunk_data } => {
+                self.handle_model_package_chunk(chunk_data, network).await;
+            }
+            // Data assignment delivery
+            RoundManagementMessage::DataAssignmentDelivery { assignment_data } => {
+                self.handle_data_assignment(assignment_data);
+            }
+            // DistributionAcknowledged is sent by workers, not handled by workers
+            RoundManagementMessage::DistributionAcknowledged { .. } => {}
         }
     }
 
@@ -780,6 +804,10 @@ impl WorkerDaemon {
             steps: steps_per_worker,
         });
 
+        // Load training data from the data assignment if available,
+        // otherwise fall back to synthetic data generation.
+        let assigned_data = self.load_training_data(d_in, d_out, steps_per_worker);
+
         let mut total_loss = 0.0;
         let mut total_error_bound = 0.0;
         let mut last_proof_bytes: Vec<u8> = Vec::new();
@@ -787,10 +815,13 @@ impl WorkerDaemon {
         let mut last_model_hash = [0u8; 32];
 
         for step in 0..steps_per_worker {
-            // Generate training data deterministically from round+step
-            let (x, target) = generate_training_data(
-                d_in, d_out, model_seed + step as u64,
-            );
+            // Use assigned data if available, otherwise generate synthetic data
+            let (x, target) = if let Some(ref batches) = assigned_data {
+                let batch_idx = step as usize % batches.len();
+                batches[batch_idx].clone()
+            } else {
+                generate_training_data(d_in, d_out, model_seed + step as u64)
+            };
 
             let step_result = {
                 let mut trainer = self.trainer.write();
@@ -923,6 +954,492 @@ impl WorkerDaemon {
         );
     }
 
+    // ========================================================================
+    // Data Loading from Assignments
+    // ========================================================================
+
+    /// Loads training data from the current data assignment.
+    ///
+    /// Returns a vector of (input, target) batches if a data assignment is present
+    /// and the data can be loaded. Returns `None` to fall back to synthetic data.
+    fn load_training_data(
+        &self,
+        d_in: usize,
+        d_out: usize,
+        steps: u32,
+    ) -> Option<Vec<(Vec<f64>, Vec<f64>)>> {
+        let assignment = self.data_assignment.read();
+        let assignment = assignment.as_ref()?;
+
+        match &assignment.source {
+            distribution::DataSourceType::Inline { data, format } => {
+                match format {
+                    distribution::DataFormat::Csv => {
+                        self.load_csv_data(data, d_in, d_out, steps, assignment)
+                    }
+                    distribution::DataFormat::RawF32 => {
+                        self.load_raw_f32_data(data, d_in, d_out, steps)
+                    }
+                    distribution::DataFormat::BinaryTensor => {
+                        // Binary tensor uses helix-core's format
+                        warn!("BinaryTensor format not yet supported for inline data, using synthetic data");
+                        None
+                    }
+                }
+            }
+            distribution::DataSourceType::S3 { uri, .. } => {
+                info!("S3 data source ({}) — loading at runtime via helix-core", uri);
+                // S3 loading is async and requires the s3-fetch feature in helix-core.
+                // For the training loop, the worker would pre-fetch this before training starts.
+                // For now, log and fall back to synthetic data.
+                warn!("S3 data loading not yet wired into synchronous training loop, using synthetic data");
+                None
+            }
+            distribution::DataSourceType::Ipfs { cid, .. } => {
+                info!("IPFS data source ({}) — loading at runtime via helix-core", cid);
+                warn!("IPFS data loading not yet wired into synchronous training loop, using synthetic data");
+                None
+            }
+            distribution::DataSourceType::Http { url } => {
+                info!("HTTP data source ({}) — loading at runtime", url);
+                warn!("HTTP data loading not yet wired into synchronous training loop, using synthetic data");
+                None
+            }
+        }
+    }
+
+    /// Parses inline CSV data into training batches.
+    fn load_csv_data(
+        &self,
+        data: &[u8],
+        d_in: usize,
+        d_out: usize,
+        steps: u32,
+        assignment: &DataAssignment,
+    ) -> Option<Vec<(Vec<f64>, Vec<f64>)>> {
+        let text = match std::str::from_utf8(data) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("CSV data is not valid UTF-8: {}", e);
+                return None;
+            }
+        };
+
+        let mut batches = Vec::new();
+        let mut batch_x = Vec::new();
+        let mut batch_target = Vec::new();
+        let batch_size = assignment.batch_size.max(1) as usize;
+
+        for line in text.lines().skip(1) {
+            // skip header row
+            let values: Vec<f64> = line
+                .split(',')
+                .filter_map(|v| v.trim().parse::<f64>().ok())
+                .collect();
+
+            if values.is_empty() {
+                continue;
+            }
+
+            // Extract features and labels using column indices
+            let features: Vec<f64> = if assignment.feature_columns.is_empty() {
+                // Default: all columns except the last `d_out` are features
+                let end = values.len().saturating_sub(d_out);
+                values[..end].to_vec()
+            } else {
+                assignment.feature_columns.iter()
+                    .filter_map(|&i| values.get(i).copied())
+                    .collect()
+            };
+
+            let labels: Vec<f64> = if assignment.label_columns.is_empty() {
+                // Default: last `d_out` columns are labels
+                let start = values.len().saturating_sub(d_out);
+                values[start..].to_vec()
+            } else {
+                assignment.label_columns.iter()
+                    .filter_map(|&i| values.get(i).copied())
+                    .collect()
+            };
+
+            // Pad/truncate to expected dimensions
+            let mut x = features;
+            x.resize(d_in, 0.0);
+            let mut t = labels;
+            t.resize(d_out, 0.0);
+
+            batch_x.extend_from_slice(&x);
+            batch_target.extend_from_slice(&t);
+
+            if batch_x.len() >= d_in * batch_size {
+                // Average the batch into a single training sample
+                // (the Trainer expects single-sample (x, target) pairs)
+                let avg_x: Vec<f64> = (0..d_in)
+                    .map(|i| {
+                        (0..batch_size)
+                            .map(|b| batch_x[b * d_in + i])
+                            .sum::<f64>() / batch_size as f64
+                    })
+                    .collect();
+                let avg_t: Vec<f64> = (0..d_out)
+                    .map(|i| {
+                        (0..batch_size)
+                            .map(|b| batch_target[b * d_out + i])
+                            .sum::<f64>() / batch_size as f64
+                    })
+                    .collect();
+
+                batches.push((avg_x, avg_t));
+                batch_x.clear();
+                batch_target.clear();
+            }
+        }
+
+        // Flush remaining partial batch
+        if !batch_x.is_empty() {
+            let num_samples = batch_x.len() / d_in;
+            if num_samples > 0 {
+                let avg_x: Vec<f64> = (0..d_in)
+                    .map(|i| {
+                        (0..num_samples)
+                            .map(|b| batch_x[b * d_in + i])
+                            .sum::<f64>() / num_samples as f64
+                    })
+                    .collect();
+                let avg_t: Vec<f64> = (0..d_out)
+                    .map(|i| {
+                        (0..num_samples)
+                            .map(|b| batch_target[b * d_out + i])
+                            .sum::<f64>() / num_samples as f64
+                    })
+                    .collect();
+                batches.push((avg_x, avg_t));
+            }
+        }
+
+        if batches.is_empty() {
+            warn!("CSV data produced no training batches, falling back to synthetic data");
+            return None;
+        }
+
+        info!(
+            "Loaded {} training batches from CSV data ({} bytes, batch_size={})",
+            batches.len(), data.len(), batch_size,
+        );
+
+        Some(batches)
+    }
+
+    /// Parses raw float32 data into training batches.
+    fn load_raw_f32_data(
+        &self,
+        data: &[u8],
+        d_in: usize,
+        d_out: usize,
+        _steps: u32,
+    ) -> Option<Vec<(Vec<f64>, Vec<f64>)>> {
+        let sample_size = (d_in + d_out) * 4; // 4 bytes per f32
+        if data.len() < sample_size {
+            warn!("RawF32 data too small ({} bytes, need at least {})", data.len(), sample_size);
+            return None;
+        }
+
+        let num_samples = data.len() / sample_size;
+        let mut batches = Vec::with_capacity(num_samples);
+
+        for i in 0..num_samples {
+            let offset = i * sample_size;
+            let mut x = Vec::with_capacity(d_in);
+            let mut t = Vec::with_capacity(d_out);
+
+            for j in 0..d_in {
+                let pos = offset + j * 4;
+                if pos + 4 <= data.len() {
+                    let bytes: [u8; 4] = [data[pos], data[pos + 1], data[pos + 2], data[pos + 3]];
+                    x.push(f32::from_le_bytes(bytes) as f64);
+                }
+            }
+
+            for j in 0..d_out {
+                let pos = offset + (d_in + j) * 4;
+                if pos + 4 <= data.len() {
+                    let bytes: [u8; 4] = [data[pos], data[pos + 1], data[pos + 2], data[pos + 3]];
+                    t.push(f32::from_le_bytes(bytes) as f64);
+                }
+            }
+
+            if x.len() == d_in && t.len() == d_out {
+                batches.push((x, t));
+            }
+        }
+
+        if batches.is_empty() {
+            warn!("RawF32 data produced no training samples");
+            return None;
+        }
+
+        info!(
+            "Loaded {} training samples from RawF32 data ({} bytes)",
+            batches.len(), data.len(),
+        );
+
+        Some(batches)
+    }
+
+    // ========================================================================
+    // Model Package & Data Assignment Handlers
+    // ========================================================================
+
+    /// Handles receipt of a complete model package from the aggregator.
+    async fn handle_model_package_delivery(
+        &self,
+        package_data: &[u8],
+        network: &Arc<NetworkRunner>,
+    ) {
+        let package: ModelPackage = match bincode::deserialize(package_data) {
+            Ok(p) => p,
+            Err(e) => {
+                error!("Failed to deserialize model package: {}", e);
+                return;
+            }
+        };
+
+        let round_id = package.round_id;
+
+        // Verify the package matches our active round
+        {
+            let active = self.active_round.read();
+            match active.as_ref() {
+                Some(r) if r.round_id == round_id => {}
+                _ => {
+                    warn!(
+                        "Received model package for unknown round {} (active={:?})",
+                        round_id,
+                        active.as_ref().map(|r| r.round_id),
+                    );
+                    return;
+                }
+            }
+        }
+
+        // Verify model integrity and load it
+        match verify_model_package(&package) {
+            Ok(model) => {
+                // Also verify against the on-chain commitment hash
+                let active = self.active_round.read();
+                if let Some(ref round) = *active {
+                    let model_commitment = model.commitment();
+                    if model_commitment != round.current_model_hash {
+                        // For resume rounds, the hash may differ — only warn
+                        if !package.is_resume {
+                            warn!(
+                                "Model commitment mismatch for round {}: \
+                                 on-chain={}, received={}",
+                                round_id,
+                                hex::encode(&round.current_model_hash[..8]),
+                                hex::encode(&model_commitment[..8]),
+                            );
+                        }
+                    }
+                }
+                drop(active);
+
+                // Set up the trainer with the received model
+                {
+                    let mut trainer = self.trainer.write();
+                    *trainer = Some(Trainer::with_model(
+                        model,
+                        package.hyperparameters.learning_rate,
+                    ));
+                }
+
+                // Update round phase
+                {
+                    let mut active = self.active_round.write();
+                    if let Some(ref mut r) = *active {
+                        r.phase = RoundPhase::WeightsReceived;
+                    }
+                }
+
+                info!(
+                    "Model package loaded for round {} ({} bytes, compressed={}, resume={}, step={})",
+                    round_id,
+                    package_data.len(),
+                    package.compressed,
+                    package.is_resume,
+                    package.starting_step,
+                );
+
+                self.emit(WorkerDaemonEvent::WeightsReceived {
+                    round_id,
+                    bytes: package_data.len(),
+                });
+
+                // Send acknowledgement
+                let loaded_hash = {
+                    let trainer = self.trainer.read();
+                    trainer.as_ref().map(|t| t.model().commitment())
+                };
+                network.broadcast(MessagePayload::RoundManagement(
+                    RoundManagementMessage::DistributionAcknowledged {
+                        round_id,
+                        success: true,
+                        error: None,
+                        loaded_weight_hash: loaded_hash,
+                    },
+                )).await;
+            }
+            Err(e) => {
+                error!(
+                    "Model package verification failed for round {}: {}",
+                    round_id, e,
+                );
+
+                // Send failure acknowledgement
+                network.broadcast(MessagePayload::RoundManagement(
+                    RoundManagementMessage::DistributionAcknowledged {
+                        round_id,
+                        success: false,
+                        error: Some(e.clone()),
+                        loaded_weight_hash: None,
+                    },
+                )).await;
+
+                self.fail_round(round_id, &format!("model verification failed: {}", e));
+            }
+        }
+    }
+
+    /// Handles receipt of a model package chunk for chunked transfer.
+    async fn handle_model_package_chunk(
+        &self,
+        chunk_data: &[u8],
+        network: &Arc<NetworkRunner>,
+    ) {
+        let chunk: ModelPackageChunk = match bincode::deserialize(chunk_data) {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Failed to deserialize model package chunk: {}", e);
+                return;
+            }
+        };
+
+        let round_id = chunk.round_id;
+        let model_id = chunk.model_id;
+        let chunk_index = chunk.chunk_index;
+        let total_chunks = chunk.total_chunks;
+
+        // Initialize receiver if this is the first chunk
+        {
+            let mut receiver = self.chunk_receiver.write();
+            if receiver.is_none() || chunk_index == 0 {
+                *receiver = Some(ChunkReceiver::new(round_id, model_id, total_chunks));
+            }
+        }
+
+        // Add chunk to receiver
+        let is_complete = {
+            let mut receiver = self.chunk_receiver.write();
+            match receiver.as_mut() {
+                Some(recv) => match recv.add_chunk(chunk) {
+                    Ok(complete) => {
+                        info!(
+                            "Chunk {}/{} received for round {} ({:.0}%)",
+                            chunk_index + 1,
+                            total_chunks,
+                            round_id,
+                            recv.progress() * 100.0,
+                        );
+                        complete
+                    }
+                    Err(e) => {
+                        error!("Chunk {} failed integrity check: {}", chunk_index, e);
+                        return;
+                    }
+                },
+                None => {
+                    error!("No chunk receiver available");
+                    return;
+                }
+            }
+        };
+
+        // If all chunks received, assemble and process
+        if is_complete {
+            let receiver = self.chunk_receiver.write().take();
+            if let Some(recv) = receiver {
+                let elapsed = recv.elapsed();
+                let bytes = recv.bytes_received();
+                info!(
+                    "All {} chunks received for round {} ({} bytes in {:.1}s)",
+                    total_chunks, round_id, bytes, elapsed.as_secs_f64(),
+                );
+
+                match recv.assemble() {
+                    Ok(package) => {
+                        let package_bytes = match bincode::serialize(&package) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                error!("Failed to re-serialize assembled package: {}", e);
+                                return;
+                            }
+                        };
+                        self.handle_model_package_delivery(&package_bytes, network).await;
+                    }
+                    Err(e) => {
+                        error!("Failed to assemble model package chunks: {}", e);
+                        self.fail_round(round_id, &format!("chunk assembly failed: {}", e));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Handles receipt of a data assignment from the aggregator.
+    fn handle_data_assignment(&self, assignment_data: &[u8]) {
+        let assignment: DataAssignment = match bincode::deserialize(assignment_data) {
+            Ok(a) => a,
+            Err(e) => {
+                error!("Failed to deserialize data assignment: {}", e);
+                return;
+            }
+        };
+
+        let round_id = assignment.round_id;
+
+        // Verify the assignment matches our active round
+        {
+            let active = self.active_round.read();
+            match active.as_ref() {
+                Some(r) if r.round_id == round_id => {}
+                _ => {
+                    warn!(
+                        "Received data assignment for unknown round {} (active={:?})",
+                        round_id,
+                        active.as_ref().map(|r| r.round_id),
+                    );
+                    return;
+                }
+            }
+        }
+
+        info!(
+            "Data assignment received for round {}: worker {}/{}, {} samples, source={:?}",
+            round_id,
+            assignment.worker_index + 1,
+            assignment.total_workers,
+            assignment.num_samples,
+            match &assignment.source {
+                distribution::DataSourceType::S3 { uri, .. } => format!("S3({})", uri),
+                distribution::DataSourceType::Ipfs { cid, .. } => format!("IPFS({})", cid),
+                distribution::DataSourceType::Inline { data, .. } => format!("Inline({} bytes)", data.len()),
+                distribution::DataSourceType::Http { url } => format!("HTTP({})", url),
+            },
+        );
+
+        *self.data_assignment.write() = Some(assignment);
+    }
+
     fn handle_worker_registered(
         &self,
         accepted: bool,
@@ -980,8 +1497,10 @@ impl WorkerDaemon {
                 proof_hash,
             );
 
-            // Clear trainer
+            // Clear trainer and distribution state
             *self.trainer.write() = None;
+            *self.chunk_receiver.write() = None;
+            *self.data_assignment.write() = None;
 
             info!(
                 "Round {} completed: {} steps, {} proofs",
@@ -1026,6 +1545,8 @@ impl WorkerDaemon {
             active.take();
             self.tracker.write().record_failure(round_id);
             *self.trainer.write() = None;
+            *self.chunk_receiver.write() = None;
+            *self.data_assignment.write() = None;
 
             drop(active);
 
@@ -1457,5 +1978,335 @@ mod tests {
         assert_eq!(earnings.rounds_participated, 5);
         assert_eq!(earnings.rounds_succeeded, 2);
         assert_eq!(earnings.rounds_failed, 3);
+    }
+
+    // ========================================================================
+    // Data Loading Tests
+    // ========================================================================
+
+    #[test]
+    fn test_load_training_data_no_assignment() {
+        let daemon = WorkerDaemon::new(
+            PeerId::from_string("worker-1"),
+            test_config(),
+            test_capabilities(),
+        );
+
+        // No data assignment set → returns None (falls back to synthetic)
+        let result = daemon.load_training_data(4, 2, 10);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_load_training_data_csv_inline() {
+        let daemon = WorkerDaemon::new(
+            PeerId::from_string("worker-1"),
+            test_config(),
+            test_capabilities(),
+        );
+
+        // Set up a CSV data assignment
+        let csv = "\
+feat1,feat2,feat3,feat4,label1,label2
+0.1,0.2,0.3,0.4,0.5,0.6
+0.7,0.8,0.9,1.0,1.1,1.2
+0.2,0.3,0.4,0.5,0.6,0.7
+0.8,0.9,1.0,1.1,1.2,1.3";
+
+        let assignment = distribution::DataAssignment {
+            round_id: 1,
+            worker_index: 0,
+            total_workers: 1,
+            source: distribution::DataSourceType::Inline {
+                data: csv.as_bytes().to_vec(),
+                format: distribution::DataFormat::Csv,
+            },
+            byte_offset: 0,
+            byte_length: csv.len() as u64,
+            num_samples: 4,
+            shard_hash: None,
+            shuffle_seed: 42,
+            batch_size: 2,
+            format: distribution::DataFormat::Csv,
+            feature_columns: vec![0, 1, 2, 3],
+            label_columns: vec![4, 5],
+        };
+
+        *daemon.data_assignment.write() = Some(assignment);
+
+        let result = daemon.load_training_data(4, 2, 10);
+        assert!(result.is_some());
+        let batches = result.unwrap();
+        // 4 rows with batch_size=2 → 2 batches
+        assert_eq!(batches.len(), 2);
+
+        // Each batch should have d_in=4 inputs and d_out=2 outputs
+        for (x, t) in &batches {
+            assert_eq!(x.len(), 4);
+            assert_eq!(t.len(), 2);
+            // Values should be non-zero (came from CSV)
+            assert!(x.iter().any(|v| *v != 0.0));
+            assert!(t.iter().any(|v| *v != 0.0));
+        }
+    }
+
+    #[test]
+    fn test_load_training_data_csv_default_columns() {
+        let daemon = WorkerDaemon::new(
+            PeerId::from_string("worker-1"),
+            test_config(),
+            test_capabilities(),
+        );
+
+        // CSV with no explicit column mapping — defaults to last d_out as labels
+        let csv = "\
+a,b,c,d
+0.1,0.2,0.3,0.4
+0.5,0.6,0.7,0.8";
+
+        let assignment = distribution::DataAssignment {
+            round_id: 1,
+            worker_index: 0,
+            total_workers: 1,
+            source: distribution::DataSourceType::Inline {
+                data: csv.as_bytes().to_vec(),
+                format: distribution::DataFormat::Csv,
+            },
+            byte_offset: 0,
+            byte_length: csv.len() as u64,
+            num_samples: 2,
+            shard_hash: None,
+            shuffle_seed: 42,
+            batch_size: 1,
+            format: distribution::DataFormat::Csv,
+            feature_columns: vec![],  // empty → auto-detect
+            label_columns: vec![],    // empty → auto-detect
+        };
+
+        *daemon.data_assignment.write() = Some(assignment);
+
+        // d_in=2, d_out=2 → first 2 columns are features, last 2 are labels
+        let result = daemon.load_training_data(2, 2, 10);
+        assert!(result.is_some());
+        let batches = result.unwrap();
+        assert_eq!(batches.len(), 2); // batch_size=1, 2 rows
+
+        // First batch: features=[0.1, 0.2], labels=[0.3, 0.4]
+        assert!((batches[0].0[0] - 0.1).abs() < 0.001);
+        assert!((batches[0].0[1] - 0.2).abs() < 0.001);
+        assert!((batches[0].1[0] - 0.3).abs() < 0.001);
+        assert!((batches[0].1[1] - 0.4).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_load_training_data_raw_f32() {
+        let daemon = WorkerDaemon::new(
+            PeerId::from_string("worker-1"),
+            test_config(),
+            test_capabilities(),
+        );
+
+        // Create raw f32 data: 2 samples of (d_in=3, d_out=1)
+        // Each sample is 4 * (3 + 1) = 16 bytes
+        let mut data = Vec::new();
+        // Sample 1: x=[0.1, 0.2, 0.3], t=[0.5]
+        for v in &[0.1f32, 0.2, 0.3, 0.5] {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        // Sample 2: x=[0.4, 0.5, 0.6], t=[0.8]
+        for v in &[0.4f32, 0.5, 0.6, 0.8] {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+
+        let assignment = distribution::DataAssignment {
+            round_id: 1,
+            worker_index: 0,
+            total_workers: 1,
+            source: distribution::DataSourceType::Inline {
+                data: data.clone(),
+                format: distribution::DataFormat::RawF32,
+            },
+            byte_offset: 0,
+            byte_length: data.len() as u64,
+            num_samples: 2,
+            shard_hash: None,
+            shuffle_seed: 42,
+            batch_size: 1,
+            format: distribution::DataFormat::RawF32,
+            feature_columns: vec![],
+            label_columns: vec![],
+        };
+
+        *daemon.data_assignment.write() = Some(assignment);
+
+        let result = daemon.load_training_data(3, 1, 10);
+        assert!(result.is_some());
+        let batches = result.unwrap();
+        assert_eq!(batches.len(), 2);
+
+        // Verify values (f32→f64 conversion)
+        assert!((batches[0].0[0] - 0.1).abs() < 0.001);
+        assert!((batches[0].0[1] - 0.2).abs() < 0.001);
+        assert!((batches[0].0[2] - 0.3).abs() < 0.001);
+        assert!((batches[0].1[0] - 0.5).abs() < 0.001);
+
+        assert!((batches[1].0[0] - 0.4).abs() < 0.001);
+        assert!((batches[1].1[0] - 0.8).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_load_training_data_empty_csv() {
+        let daemon = WorkerDaemon::new(
+            PeerId::from_string("worker-1"),
+            test_config(),
+            test_capabilities(),
+        );
+
+        // CSV with only header, no data rows
+        let csv = "feat1,feat2,label\n";
+
+        let assignment = distribution::DataAssignment {
+            round_id: 1,
+            worker_index: 0,
+            total_workers: 1,
+            source: distribution::DataSourceType::Inline {
+                data: csv.as_bytes().to_vec(),
+                format: distribution::DataFormat::Csv,
+            },
+            byte_offset: 0,
+            byte_length: csv.len() as u64,
+            num_samples: 0,
+            shard_hash: None,
+            shuffle_seed: 42,
+            batch_size: 1,
+            format: distribution::DataFormat::Csv,
+            feature_columns: vec![],
+            label_columns: vec![],
+        };
+
+        *daemon.data_assignment.write() = Some(assignment);
+
+        // Empty CSV should return None (falls back to synthetic)
+        let result = daemon.load_training_data(2, 1, 10);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_data_assignment_cleared_on_round_complete() {
+        let daemon = WorkerDaemon::new(
+            PeerId::from_string("worker-1"),
+            test_config(),
+            test_capabilities(),
+        );
+
+        // Simulate having an active round with data assignment
+        {
+            let mut active = daemon.active_round.write();
+            *active = Some(ActiveRoundState {
+                round_id: 1,
+                model_id: 100,
+                model_dims: test_dims(),
+                steps_per_worker: 10,
+                learning_rate: 0.01,
+                error_budget: 0.1,
+                deadline: u64::MAX,
+                phase: RoundPhase::ProofSubmitted,
+                aggregator_id: PeerId::from_string("agg-1"),
+                dataset_ref: String::new(),
+                current_model_hash: [0u8; 32],
+                steps_completed: 10,
+                proofs_submitted: 1,
+                joined_at: 0,
+            });
+        }
+
+        // Set a data assignment
+        *daemon.data_assignment.write() = Some(distribution::DataAssignment {
+            round_id: 1,
+            worker_index: 0,
+            total_workers: 1,
+            source: distribution::DataSourceType::Inline {
+                data: vec![1, 2, 3],
+                format: distribution::DataFormat::Csv,
+            },
+            byte_offset: 0,
+            byte_length: 3,
+            num_samples: 1,
+            shard_hash: None,
+            shuffle_seed: 42,
+            batch_size: 1,
+            format: distribution::DataFormat::Csv,
+            feature_columns: vec![],
+            label_columns: vec![],
+        });
+
+        assert!(daemon.data_assignment.read().is_some());
+
+        // Complete the round
+        daemon.handle_round_completed(1, 0.01);
+
+        // Data assignment should be cleared
+        assert!(daemon.data_assignment.read().is_none());
+        assert!(daemon.chunk_receiver.read().is_none());
+        assert!(daemon.active_round.read().is_none());
+    }
+
+    #[test]
+    fn test_data_assignment_cleared_on_fail() {
+        let daemon = WorkerDaemon::new(
+            PeerId::from_string("worker-1"),
+            test_config(),
+            test_capabilities(),
+        );
+
+        // Simulate active round
+        {
+            let mut active = daemon.active_round.write();
+            *active = Some(ActiveRoundState {
+                round_id: 2,
+                model_id: 100,
+                model_dims: test_dims(),
+                steps_per_worker: 10,
+                learning_rate: 0.01,
+                error_budget: 0.1,
+                deadline: u64::MAX,
+                phase: RoundPhase::Training,
+                aggregator_id: PeerId::from_string("agg-1"),
+                dataset_ref: String::new(),
+                current_model_hash: [0u8; 32],
+                steps_completed: 5,
+                proofs_submitted: 0,
+                joined_at: 0,
+            });
+        }
+
+        *daemon.data_assignment.write() = Some(distribution::DataAssignment {
+            round_id: 2,
+            worker_index: 0,
+            total_workers: 1,
+            source: distribution::DataSourceType::Inline {
+                data: vec![1],
+                format: distribution::DataFormat::Csv,
+            },
+            byte_offset: 0,
+            byte_length: 1,
+            num_samples: 1,
+            shard_hash: None,
+            shuffle_seed: 42,
+            batch_size: 1,
+            format: distribution::DataFormat::Csv,
+            feature_columns: vec![],
+            label_columns: vec![],
+        });
+
+        assert!(daemon.data_assignment.read().is_some());
+
+        // Fail the round
+        daemon.fail_round(2, "test failure");
+
+        // Everything should be cleared
+        assert!(daemon.data_assignment.read().is_none());
+        assert!(daemon.chunk_receiver.read().is_none());
+        assert!(daemon.active_round.read().is_none());
     }
 }

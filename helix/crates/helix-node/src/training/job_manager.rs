@@ -35,6 +35,11 @@ use crate::network::runner::NetworkRunner;
 use crate::on_chain_pipeline::OnChainPipeline;
 use crate::roles::aggregator::{AggregatedResult, AggregatorNode, CollectedGradient};
 use crate::trainer::{average_models, MlpModel};
+use crate::training::distribution::{
+    self, DataAssignment, DataFormat, DataShardPlanner, DataSourceType,
+    DistributionTracker, ModelPackage, ModelPackageBuilder,
+    CHUNKED_TRANSFER_THRESHOLD, MAX_CHUNK_SIZE,
+};
 use crate::training::orchestrator::{OrchestratorEvent, TrainingOrchestrator};
 
 // ============================================================================
@@ -118,6 +123,19 @@ pub struct TrainingJobConfig {
     pub total_rounds: u64,
     /// Minimum stake required for worker participation (in wei).
     pub min_stake_amount: u64,
+    /// Data source for training data distribution.
+    /// When set, the aggregator assigns data shards to workers.
+    pub data_source: Option<DataSourceType>,
+    /// Total size of the dataset in bytes (for shard planning).
+    pub dataset_total_bytes: u64,
+    /// Total number of samples in the dataset.
+    pub dataset_total_samples: u64,
+    /// Batch size for training.
+    pub batch_size: u32,
+    /// Feature column indices for CSV data.
+    pub feature_columns: Vec<usize>,
+    /// Label column indices for CSV data.
+    pub label_columns: Vec<usize>,
 }
 
 impl Default for TrainingJobConfig {
@@ -146,6 +164,12 @@ impl Default for TrainingJobConfig {
             submit_on_chain: false,
             total_rounds: 1,
             min_stake_amount: 0,
+            data_source: None,
+            dataset_total_bytes: 0,
+            dataset_total_samples: 0,
+            batch_size: 32,
+            feature_columns: Vec::new(),
+            label_columns: Vec::new(),
         }
     }
 }
@@ -181,6 +205,12 @@ impl TrainingJobConfig {
             submit_on_chain,
             total_rounds: 1,
             min_stake_amount: 0,
+            data_source: None,
+            dataset_total_bytes: 0,
+            dataset_total_samples: 0,
+            batch_size: 32,
+            feature_columns: Vec::new(),
+            label_columns: Vec::new(),
         }
     }
 }
@@ -910,38 +940,182 @@ impl TrainingJobManager {
         let num_workers = worker_ids.len();
 
         info!(
-            "Round {}: distributing model weights to {} workers (checkpoint={} bytes)",
+            "Round {}: distributing model to {} workers via ModelPackage (checkpoint={} bytes)",
             self.round_id,
             num_workers,
             self.current_checkpoint_bytes.len(),
         );
 
-        // Send model weights to each worker
-        for peer_id in &worker_ids {
-            let payload = MessagePayload::Training(TrainingMessage::ModelWeights {
-                round_id: self.round_id,
-                checkpoint_data: self.current_checkpoint_bytes.clone(),
-                weight_hash: self.current_model_hash,
-            });
+        // Build ModelPackage from the current model
+        let package = ModelPackageBuilder::build(
+            &self.current_model,
+            self.round_id,
+            self.config.model_id.unwrap_or(0),
+            self.config.learning_rate,
+            self.config.batch_size,
+            self.config.steps_per_worker,
+            self.config.error_budget,
+            42, // model seed
+            self.config.model_dims.num_layers,
+            self.config.model_dims.activation_type,
+        ).map_err(|e| {
+            let err = JobError::NetworkError(format!("failed to build model package: {}", e));
+            self.fail(err.clone());
+            err
+        })?;
 
-            match self.network.send_direct(peer_id, payload).await {
+        let package_bytes = bincode::serialize(&package).map_err(|e| {
+            let err = JobError::NetworkError(format!("failed to serialize model package: {}", e));
+            self.fail(err.clone());
+            err
+        })?;
+
+        let use_chunked = package_bytes.len() > CHUNKED_TRANSFER_THRESHOLD;
+
+        // Prepare chunks if needed
+        let chunks = if use_chunked {
+            info!(
+                "Round {}: model package is {} bytes (>{} threshold), using chunked transfer",
+                self.round_id, package_bytes.len(), CHUNKED_TRANSFER_THRESHOLD,
+            );
+            Some(distribution::split_into_chunks(&package, MAX_CHUNK_SIZE).map_err(|e| {
+                let err = JobError::NetworkError(format!("failed to split into chunks: {}", e));
+                self.fail(err.clone());
+                err
+            })?)
+        } else {
+            None
+        };
+
+        // Create distribution tracker
+        let mut tracker = DistributionTracker::new(self.round_id, &worker_ids);
+
+        // Send model package (or chunks) to each worker
+        for peer_id in &worker_ids {
+            let send_result = if let Some(ref chunks) = chunks {
+                // Chunked transfer
+                let total_chunks = chunks.len() as u32;
+                let mut all_ok = true;
+                for (i, chunk) in chunks.iter().enumerate() {
+                    let chunk_bytes = match bincode::serialize(chunk) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            warn!("Failed to serialize chunk {} for {}: {}", i, peer_id, e);
+                            all_ok = false;
+                            break;
+                        }
+                    };
+                    let payload = MessagePayload::RoundManagement(
+                        RoundManagementMessage::ModelPackageChunkDelivery {
+                            chunk_data: chunk_bytes,
+                        },
+                    );
+                    match self.network.send_direct(peer_id, payload).await {
+                        Ok(()) => {
+                            tracker.update_chunk_progress(peer_id, (i + 1) as u32, total_chunks);
+                        }
+                        Err(e) => {
+                            warn!("Failed to send chunk {}/{} to {}: {}", i + 1, total_chunks, peer_id, e);
+                            tracker.mark_failed(peer_id, format!("chunk {} send failed: {}", i, e));
+                            all_ok = false;
+                            break;
+                        }
+                    }
+                }
+                if all_ok { Ok(()) } else { Err("chunk transfer failed".to_string()) }
+            } else {
+                // Single-shot transfer
+                let payload = MessagePayload::RoundManagement(
+                    RoundManagementMessage::ModelPackageDelivery {
+                        package_data: package_bytes.clone(),
+                    },
+                );
+                self.network.send_direct(peer_id, payload).await
+                    .map_err(|e| e.to_string())
+            };
+
+            match send_result {
                 Ok(()) => {
+                    if !use_chunked {
+                        tracker.mark_package_sent(peer_id);
+                    }
                     if let Some(worker) = self.workers.get_mut(peer_id) {
                         worker.weights_sent_at = Some(Instant::now());
                     }
-                    debug!("Sent model weights to worker {}", peer_id);
+                    debug!("Sent model package to worker {}", peer_id);
                 }
                 Err(e) => {
                     warn!(
-                        "Failed to send model weights to worker {}: {}. Removing from round.",
+                        "Failed to send model package to worker {}: {}. Removing from round.",
                         peer_id, e
                     );
+                    tracker.mark_failed(peer_id, e.clone());
                     let _ = self.event_tx.send(JobEvent::WorkerDropped {
                         round_id: self.round_id,
                         peer_id: peer_id.clone(),
-                        reason: format!("weight distribution failed: {}", e),
+                        reason: format!("model distribution failed: {}", e),
                     });
                 }
+            }
+        }
+
+        // Plan and send data assignments if a data source is configured
+        if let Some(ref data_source) = self.config.data_source {
+            let successful_workers: Vec<PeerId> = self.workers.iter()
+                .filter(|(_, w)| w.weights_sent_at.is_some())
+                .map(|(id, _)| id.clone())
+                .collect();
+
+            let assignments = DataShardPlanner::plan_shards(
+                data_source,
+                self.config.dataset_total_bytes,
+                self.config.dataset_total_samples,
+                successful_workers.len() as u32,
+                self.round_id,
+                self.round_id * 31337, // deterministic shuffle seed
+                self.config.batch_size,
+                DataFormat::Csv,
+                self.config.feature_columns.clone(),
+                self.config.label_columns.clone(),
+            );
+
+            for (i, peer_id) in successful_workers.iter().enumerate() {
+                if let Some(assignment) = assignments.get(i) {
+                    let assignment_bytes = match bincode::serialize(assignment) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            warn!("Failed to serialize data assignment for {}: {}", peer_id, e);
+                            continue;
+                        }
+                    };
+                    let payload = MessagePayload::RoundManagement(
+                        RoundManagementMessage::DataAssignmentDelivery {
+                            assignment_data: assignment_bytes,
+                        },
+                    );
+                    match self.network.send_direct(peer_id, payload).await {
+                        Ok(()) => {
+                            tracker.mark_data_assignment_sent(peer_id);
+                            debug!("Sent data assignment to worker {} (shard {}/{})", peer_id, i + 1, assignments.len());
+                        }
+                        Err(e) => {
+                            warn!("Failed to send data assignment to worker {}: {}", peer_id, e);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Also send legacy ModelWeights for backward compatibility with older workers
+        for peer_id in &worker_ids {
+            if self.workers.get(peer_id).map_or(false, |w| w.weights_sent_at.is_some()) {
+                let payload = MessagePayload::Training(TrainingMessage::ModelWeights {
+                    round_id: self.round_id,
+                    checkpoint_data: self.current_checkpoint_bytes.clone(),
+                    weight_hash: self.current_model_hash,
+                });
+                // Best-effort — don't fail the round if this fails
+                let _ = self.network.send_direct(peer_id, payload).await;
             }
         }
 
@@ -976,9 +1150,11 @@ impl TrainingJobManager {
         ).await;
 
         info!(
-            "Round {}: model distributed to {} workers, training signaled",
+            "Round {}: model distributed to {} workers ({} bytes, chunked={}), training signaled",
             self.round_id,
             self.workers.len(),
+            package_bytes.len(),
+            use_chunked,
         );
 
         Ok(())
@@ -1188,6 +1364,33 @@ impl TrainingJobManager {
                             peer_id, round_id
                         );
                         // Don't add them — they missed weight distribution
+                    }
+                }
+            }
+            // Handle distribution acknowledgements during training phase
+            WorkerMessage::DistributionAck {
+                peer_id, round_id, success, error, loaded_weight_hash,
+            } => {
+                if round_id == self.round_id {
+                    if success {
+                        debug!(
+                            "Distribution ack from {} for round {} (hash={})",
+                            peer_id, round_id,
+                            loaded_weight_hash.map(|h| hex::encode(&h[..4])).unwrap_or_default(),
+                        );
+                    } else {
+                        warn!(
+                            "Distribution NACK from {} for round {}: {}",
+                            peer_id, round_id,
+                            error.unwrap_or_else(|| "unknown".to_string()),
+                        );
+                        // Remove failed worker
+                        self.workers.remove(&peer_id);
+                        let _ = self.event_tx.send(JobEvent::WorkerDropped {
+                            round_id: self.round_id,
+                            peer_id,
+                            reason: "model distribution verification failed".to_string(),
+                        });
                     }
                 }
             }
@@ -1627,6 +1830,14 @@ pub enum WorkerMessage {
         peer_id: PeerId,
         message: RegistrationMessage,
     },
+    /// Worker acknowledges model distribution.
+    DistributionAck {
+        peer_id: PeerId,
+        round_id: u64,
+        success: bool,
+        error: Option<String>,
+        loaded_weight_hash: Option<[u8; 32]>,
+    },
 }
 
 /// Converts network events into worker messages for the job manager.
@@ -1666,6 +1877,20 @@ pub fn network_event_to_worker_message(
                     steps_completed: *steps_completed,
                     new_model_hash: *new_model_hash,
                     checkpoint_data: checkpoint_data.clone(),
+                })
+            }
+            RoundManagementMessage::DistributionAcknowledged {
+                round_id,
+                success,
+                error,
+                loaded_weight_hash,
+            } => {
+                Some(WorkerMessage::DistributionAck {
+                    peer_id: from,
+                    round_id: *round_id,
+                    success: *success,
+                    error: error.clone(),
+                    loaded_weight_hash: *loaded_weight_hash,
                 })
             }
             _ => None,
@@ -2311,6 +2536,113 @@ mod tests {
         manager.remove_non_submitting_workers();
         assert_eq!(manager.workers.len(), 2);
         assert!(!manager.workers.contains_key(&w3));
+    }
+
+    #[test]
+    fn test_network_event_to_worker_message_distribution_ack() {
+        let peer_id = PeerId::random();
+        let payload = MessagePayload::RoundManagement(
+            RoundManagementMessage::DistributionAcknowledged {
+                round_id: 3,
+                success: true,
+                error: None,
+                loaded_weight_hash: Some([0xAB; 32]),
+            },
+        );
+
+        let msg = network_event_to_worker_message(peer_id.clone(), &payload);
+        assert!(msg.is_some());
+        match msg.unwrap() {
+            WorkerMessage::DistributionAck {
+                peer_id: id, round_id, success, error, loaded_weight_hash,
+            } => {
+                assert_eq!(id, peer_id);
+                assert_eq!(round_id, 3);
+                assert!(success);
+                assert!(error.is_none());
+                assert_eq!(loaded_weight_hash, Some([0xAB; 32]));
+            }
+            _ => panic!("expected DistributionAck"),
+        }
+    }
+
+    #[test]
+    fn test_network_event_to_worker_message_distribution_nack() {
+        let peer_id = PeerId::random();
+        let payload = MessagePayload::RoundManagement(
+            RoundManagementMessage::DistributionAcknowledged {
+                round_id: 5,
+                success: false,
+                error: Some("hash mismatch".to_string()),
+                loaded_weight_hash: None,
+            },
+        );
+
+        let msg = network_event_to_worker_message(peer_id.clone(), &payload);
+        assert!(msg.is_some());
+        match msg.unwrap() {
+            WorkerMessage::DistributionAck {
+                round_id, success, error, ..
+            } => {
+                assert_eq!(round_id, 5);
+                assert!(!success);
+                assert_eq!(error, Some("hash mismatch".to_string()));
+            }
+            _ => panic!("expected DistributionAck"),
+        }
+    }
+
+    #[test]
+    fn test_job_config_data_source_fields() {
+        let config = TrainingJobConfig {
+            data_source: Some(DataSourceType::S3 {
+                uri: "s3://bucket/data.csv".to_string(),
+                region: "us-east-1".to_string(),
+            }),
+            dataset_total_bytes: 100_000,
+            dataset_total_samples: 1000,
+            batch_size: 64,
+            feature_columns: vec![0, 1, 2],
+            label_columns: vec![3],
+            ..Default::default()
+        };
+
+        assert!(config.data_source.is_some());
+        assert_eq!(config.dataset_total_bytes, 100_000);
+        assert_eq!(config.dataset_total_samples, 1000);
+        assert_eq!(config.batch_size, 64);
+        assert_eq!(config.feature_columns, vec![0, 1, 2]);
+        assert_eq!(config.label_columns, vec![3]);
+    }
+
+    #[test]
+    fn test_network_event_model_package_delivery_ignored() {
+        // ModelPackageDelivery is sent by aggregator to workers,
+        // not forwarded to the job manager
+        let peer_id = PeerId::random();
+        let payload = MessagePayload::RoundManagement(
+            RoundManagementMessage::ModelPackageDelivery {
+                package_data: vec![1, 2, 3],
+            },
+        );
+
+        let msg = network_event_to_worker_message(peer_id, &payload);
+        assert!(msg.is_none(), "ModelPackageDelivery should not produce a WorkerMessage");
+    }
+
+    #[test]
+    fn test_network_event_data_assignment_ignored() {
+        // DataAssignmentDelivery is sent by aggregator to workers,
+        // not forwarded to the job manager
+        let peer_id = PeerId::random();
+        let payload = MessagePayload::RoundManagement(
+            RoundManagementMessage::DataAssignmentDelivery {
+                assignment_data: vec![1, 2, 3],
+            },
+        );
+
+        let msg = network_event_to_worker_message(peer_id, &payload);
+        assert!(msg.is_none(), "DataAssignmentDelivery should not produce a WorkerMessage");
     }
 
     // Helper to create a test network runner (minimal, for unit tests)

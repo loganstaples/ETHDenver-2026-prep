@@ -918,6 +918,43 @@ pub enum RoundManagementMessage {
         /// Failure reason.
         reason: String,
     },
+    /// Aggregator distributes a complete model package to a worker.
+    ///
+    /// Contains the model architecture, compressed weights, hyperparameters,
+    /// and integrity hash. Replaces the older `TrainingMessage::ModelWeights`
+    /// for the distribution phase of the training lifecycle.
+    ModelPackageDelivery {
+        /// Serialized `ModelPackage` (bincode-encoded).
+        package_data: Vec<u8>,
+    },
+    /// Aggregator distributes a chunk of a large model package.
+    ///
+    /// Used when the model is too large for a single message transfer.
+    /// Workers reassemble chunks and verify integrity before training.
+    ModelPackageChunkDelivery {
+        /// Serialized `ModelPackageChunk` (bincode-encoded).
+        chunk_data: Vec<u8>,
+    },
+    /// Aggregator assigns a data shard to a worker.
+    ///
+    /// Tells the worker which portion of the training dataset to load,
+    /// the data source (S3, IPFS, inline, HTTP), and preprocessing config.
+    DataAssignmentDelivery {
+        /// Serialized `DataAssignment` (bincode-encoded).
+        assignment_data: Vec<u8>,
+    },
+    /// Worker acknowledges receipt of model package and data assignment.
+    DistributionAcknowledged {
+        /// Round ID.
+        round_id: u64,
+        /// Whether the worker successfully loaded the model and data.
+        success: bool,
+        /// Error message if loading failed.
+        error: Option<String>,
+        /// SHA-256 hash of the model weights as loaded by the worker.
+        /// Used by the aggregator to verify all workers have identical models.
+        loaded_weight_hash: Option<[u8; 32]>,
+    },
 }
 
 /// Model architecture dimensions.
