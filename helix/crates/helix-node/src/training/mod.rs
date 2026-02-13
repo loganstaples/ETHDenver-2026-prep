@@ -34,6 +34,7 @@ pub mod synchronization;
 pub mod fault_tolerance;
 pub mod distributed_coordinator;
 pub mod consensus;
+pub mod persistence;
 
 // Re-export key types
 pub use round::{
@@ -136,6 +137,10 @@ pub use consensus::{
     ConsensusResult, ConsensusEvent, ConsensusRound, ConsensusProtocol,
     compute_aggregated_commitment, compute_binding, verify_bft_threshold,
     compute_hiding_gradient_commitment, verify_hiding_gradient_commitment,
+};
+
+pub use persistence::{
+    AggregatorSnapshot, WorkerSnapshot, StatePersistence, PersistenceError,
 };
 
 pub use session_manager::{

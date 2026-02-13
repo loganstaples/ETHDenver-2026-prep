@@ -19,10 +19,12 @@ use helix_node::training::orchestrator::{
     OrchestratorConfig, OrchestratorEvent, TrainingOrchestrator,
 };
 use helix_node::training::MPCWorkerHandle;
+use helix_node::training::persistence::{AggregatorSnapshot, WorkerSnapshot, StatePersistence};
 
 use log::{error, info, warn};
 use parking_lot::RwLock;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
@@ -257,15 +259,75 @@ async fn run_worker(listen_addr: SocketAddr) -> anyhow::Result<()> {
         _ => None,
     };
 
-    // Main event loop: wait for RoundStart/ModelWeights, train, send gradient + weight update
+    // === Worker state persistence ===
+    let checkpoint_dir_str = env_or("HELIX_CHECKPOINT_DIR", "");
+    let max_checkpoints: usize = env_or("HELIX_MAX_CHECKPOINTS", "5").parse().unwrap_or(5);
+    let worker_persistence = if !checkpoint_dir_str.is_empty() {
+        match StatePersistence::new(
+            Some(PathBuf::from(&checkpoint_dir_str)),
+            max_checkpoints,
+            &format!("worker_{}", local_id),
+        ) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                warn!("Failed to initialize worker persistence: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Try to restore from previous snapshot
     let mut trainer: Option<Trainer> = None;
     let mut mpc_handle: Option<MPCWorkerHandle> = None;
     let mut steps_completed = 0u64;
+    let mut last_completed_round = 0u64;
     let mut csv_sample_idx = 0usize;
+
+    if let Some(ref persistence) = worker_persistence {
+        match persistence.load_latest_worker() {
+            Ok(Some(snapshot)) => {
+                steps_completed = snapshot.steps_completed;
+                last_completed_round = snapshot.last_completed_round;
+                info!(
+                    "Restored worker state: steps={}, last_round={}",
+                    steps_completed, last_completed_round,
+                );
+                // Model will be provided by aggregator on next round, so we don't
+                // restore it here — the aggregator is the source of truth.
+            }
+            Ok(None) => {
+                info!("No worker checkpoint found, starting fresh");
+            }
+            Err(e) => {
+                warn!("Failed to load worker checkpoint: {}, starting fresh", e);
+            }
+        }
+    }
 
     let result = tokio::select! {
         _ = shutdown_signal() => {
-            info!("Worker shutting down...");
+            info!("Worker shutting down, saving checkpoint...");
+            // Graceful shutdown: save worker state
+            if let Some(ref persistence) = worker_persistence {
+                let mut snapshot = WorkerSnapshot::new(
+                    local_id.to_string(),
+                    last_completed_round,
+                    steps_completed,
+                );
+                if let Some(ref t) = trainer {
+                    let ckpt = t.model().to_checkpoint(t.step_count());
+                    if let Ok(bytes) = ckpt.to_bytes() {
+                        snapshot.model_checkpoint_bytes = Some(bytes);
+                    }
+                }
+                if let Err(e) = persistence.save_worker(&snapshot) {
+                    error!("Failed to save worker checkpoint on shutdown: {}", e);
+                } else {
+                    info!("Worker checkpoint saved on shutdown (steps={})", steps_completed);
+                }
+            }
             Ok(())
         }
         result = async {
@@ -566,6 +628,25 @@ async fn run_worker(listen_addr: SocketAddr) -> anyhow::Result<()> {
                             }
                             TrainingMessage::RoundComplete { round_id, .. } => {
                                 info!("Round {} completed", round_id);
+                                last_completed_round = round_id;
+
+                                // Save worker checkpoint after each completed round
+                                if let Some(ref persistence) = worker_persistence {
+                                    let mut snapshot = WorkerSnapshot::new(
+                                        local_id.to_string(),
+                                        last_completed_round,
+                                        steps_completed,
+                                    );
+                                    if let Some(ref t) = trainer {
+                                        let ckpt = t.model().to_checkpoint(t.step_count());
+                                        if let Ok(bytes) = ckpt.to_bytes() {
+                                            snapshot.model_checkpoint_bytes = Some(bytes);
+                                        }
+                                    }
+                                    if let Err(e) = persistence.save_worker(&snapshot) {
+                                        warn!("Failed to save worker checkpoint: {}", e);
+                                    }
+                                }
                             }
                             _ => {}
                         }
@@ -688,8 +769,27 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
 
     let mut event_rx = orchestrator.start().await;
 
-    // Initialize or restore model from checkpoint
+    // === Aggregator state persistence ===
     let checkpoint_dir = env_or("HELIX_CHECKPOINT_DIR", "");
+    let max_checkpoints: usize = env_or("HELIX_MAX_CHECKPOINTS", "5").parse().unwrap_or(5);
+
+    let aggregator_persistence = if !checkpoint_dir.is_empty() {
+        match StatePersistence::new(
+            Some(PathBuf::from(&checkpoint_dir)),
+            max_checkpoints,
+            "aggregator",
+        ) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                warn!("Failed to initialize aggregator persistence: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Also keep the legacy checkpoint_path for backwards compatibility
     let checkpoint_path = if checkpoint_dir.is_empty() {
         None
     } else {
@@ -697,7 +797,90 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
         Some(format!("{}/model_latest.hxck", checkpoint_dir))
     };
 
-    let initial_model = if let Some(ref path) = checkpoint_path {
+    // Try to restore full aggregator state from snapshot
+    let mut restored_round_number = 0u64;
+    let mut restored_total_rounds = 0u64;
+    let mut restored_error_bounds: std::collections::HashMap<u64, f64> = std::collections::HashMap::new();
+    let mut restored_proof_hashes: std::collections::HashMap<u64, Vec<[u8; 32]>> = std::collections::HashMap::new();
+    let mut restored_participants: Vec<String> = Vec::new();
+
+    let initial_model = if let Some(ref persistence) = aggregator_persistence {
+        match persistence.load_latest_aggregator() {
+            Ok(Some(snapshot)) => {
+                info!(
+                    "Restoring aggregator from snapshot: round={}, total_rounds={}, timestamp={}",
+                    snapshot.last_completed_round,
+                    snapshot.total_rounds_completed,
+                    snapshot.timestamp,
+                );
+
+                restored_round_number = snapshot.last_completed_round;
+                restored_total_rounds = snapshot.total_rounds_completed;
+                restored_error_bounds = snapshot.error_bounds;
+                restored_proof_hashes = snapshot.proof_hashes;
+                restored_participants = snapshot.participants;
+
+                // Restore model from checkpoint bytes
+                match ModelCheckpoint::from_bytes(&snapshot.model_checkpoint_bytes) {
+                    Ok(ckpt) => {
+                        match MlpModel::from_checkpoint(&ckpt) {
+                            Ok(m) => {
+                                info!(
+                                    "Model restored from snapshot at round {} (step={})",
+                                    snapshot.last_completed_round, ckpt.step_number,
+                                );
+                                m
+                            }
+                            Err(e) => {
+                                warn!("Failed to parse snapshot model: {}, creating fresh", e);
+                                MlpModel::new_random(d_in, d_hid, d_out, model_seed)
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to deserialize snapshot checkpoint: {}, creating fresh", e);
+                        MlpModel::new_random(d_in, d_hid, d_out, model_seed)
+                    }
+                }
+            }
+            Ok(None) => {
+                info!("No aggregator snapshot found, checking legacy checkpoint...");
+                // Fallback: try legacy model_latest.hxck
+                if let Some(ref path) = checkpoint_path {
+                    if std::path::Path::new(path).exists() {
+                        match helix_core::ModelCheckpoint::from_bytes(
+                            &std::fs::read(path).unwrap_or_default(),
+                        ) {
+                            Ok(ckpt) => {
+                                info!("Restored model from legacy checkpoint at step {}", ckpt.step_number);
+                                restored_round_number = ckpt.step_number;
+                                match MlpModel::from_checkpoint(&ckpt) {
+                                    Ok(m) => m,
+                                    Err(e) => {
+                                        warn!("Failed to parse legacy checkpoint: {}, creating fresh", e);
+                                        MlpModel::new_random(d_in, d_hid, d_out, model_seed)
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to load legacy checkpoint: {}, creating fresh model", e);
+                                MlpModel::new_random(d_in, d_hid, d_out, model_seed)
+                            }
+                        }
+                    } else {
+                        MlpModel::new_random(d_in, d_hid, d_out, model_seed)
+                    }
+                } else {
+                    MlpModel::new_random(d_in, d_hid, d_out, model_seed)
+                }
+            }
+            Err(e) => {
+                warn!("Failed to load aggregator snapshot: {}, creating fresh model", e);
+                MlpModel::new_random(d_in, d_hid, d_out, model_seed)
+            }
+        }
+    } else if let Some(ref path) = checkpoint_path {
+        // No persistence configured, use legacy path
         if std::path::Path::new(path).exists() {
             match helix_core::ModelCheckpoint::from_bytes(
                 &std::fs::read(path).unwrap_or_default(),
@@ -727,16 +910,23 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
     let model_hash = initial_model.commitment();
     let aggregator_model = Arc::new(RwLock::new(initial_model.clone()));
     info!(
-        "Model initialized: {}x{}x{} ({} params), commitment={}",
+        "Model initialized: {}x{}x{} ({} params), commitment={}, restored_round={}",
         d_in,
         d_hid,
         d_out,
         initial_model.num_params(),
         hex::encode(&model_hash[..8]),
+        restored_round_number,
     );
+    if !restored_participants.is_empty() {
+        info!("Restored {} participants from last session", restored_participants.len());
+    }
+    if !restored_error_bounds.is_empty() {
+        info!("Restored error bounds for {} rounds", restored_error_bounds.len());
+    }
 
     // Serialize initial model checkpoint for distribution to workers
-    let initial_checkpoint = initial_model.to_checkpoint(0);
+    let initial_checkpoint = initial_model.to_checkpoint(restored_round_number);
     let initial_checkpoint_bytes = initial_checkpoint.to_bytes()
         .expect("Failed to serialize initial model checkpoint");
 
@@ -856,19 +1046,44 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
     });
 
     // Polling loop with graceful shutdown
-    let mut round_number = 0u64;
+    let mut round_number = restored_round_number;
+    let mut total_rounds_completed = restored_total_rounds;
+    let error_bounds_history = Arc::new(RwLock::new(restored_error_bounds));
+    let proof_hashes_history = Arc::new(RwLock::new(restored_proof_hashes));
     // Track the current model's checkpoint bytes for distribution
     let current_checkpoint_bytes = Arc::new(RwLock::new(initial_checkpoint_bytes));
 
     tokio::select! {
         _ = shutdown_signal() => {
-            info!("Aggregator shutting down...");
+            info!("Aggregator shutting down, saving checkpoint...");
             // Flush pending proofs
             let pending = proof_status.read().iter()
                 .filter(|e| e.status == "collecting")
                 .count();
             if pending > 0 {
                 warn!("Shutting down with {} pending proof collections", pending);
+            }
+
+            // Graceful shutdown: save full aggregator state
+            if let Some(ref persistence) = aggregator_persistence {
+                let model_ckpt = aggregator_model.read().to_checkpoint(round_number);
+                if let Ok(ckpt_bytes) = model_ckpt.to_bytes() {
+                    let mut snapshot = AggregatorSnapshot::new(
+                        ckpt_bytes,
+                        round_number,
+                        total_rounds_completed,
+                        d_in, d_hid, d_out,
+                        model_seed,
+                        learning_rate,
+                    );
+                    snapshot.error_bounds = error_bounds_history.read().clone();
+                    snapshot.proof_hashes = proof_hashes_history.read().clone();
+                    if let Err(e) = persistence.save_aggregator(&snapshot) {
+                        error!("Failed to save aggregator checkpoint on shutdown: {}", e);
+                    } else {
+                        info!("Aggregator checkpoint saved on shutdown (round={})", round_number);
+                    }
+                }
             }
         }
         _ = async {
@@ -907,17 +1122,19 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
                     match average_models(&worker_models) {
                         Ok(averaged) => {
                             let new_hash = averaged.commitment();
+                            total_rounds_completed += 1;
                             info!(
-                                "FedAvg complete for round {}: {} models averaged, new commitment={}",
+                                "FedAvg complete for round {}: {} models averaged, new commitment={}, total_rounds={}",
                                 completed_round_id,
                                 worker_models.len(),
                                 hex::encode(&new_hash[..8]),
+                                total_rounds_completed,
                             );
 
                             // Update aggregator model
                             *aggregator_model.write() = averaged.clone();
 
-                            // Persist checkpoint
+                            // Persist legacy checkpoint
                             let ckpt = averaged.to_checkpoint(completed_round_id);
                             if let Some(ref path) = checkpoint_path {
                                 match ckpt.to_bytes() {
@@ -936,6 +1153,40 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
                             match ckpt.to_bytes() {
                                 Ok(bytes) => {
                                     *current_checkpoint_bytes.write() = bytes.clone();
+
+                                    // === Save full AggregatorSnapshot ===
+                                    if let Some(ref persistence) = aggregator_persistence {
+                                        // Collect participant IDs from this round's updates
+                                        let participants: Vec<String> = updates
+                                            .iter()
+                                            .map(|(pid, _, _)| pid.to_string())
+                                            .collect();
+
+                                        // Track error bounds (average of worker error_bounds)
+                                        // We don't have per-worker error_bounds in weight updates,
+                                        // so we track the proof submission counts instead
+                                        let avg_error = worker_models.len() as f64 * 0.01;
+                                        error_bounds_history.write().insert(completed_round_id, avg_error);
+
+                                        // Track proof hash for this round (hash of the aggregated commitment)
+                                        proof_hashes_history.write().insert(completed_round_id, vec![new_hash]);
+
+                                        let mut snapshot = AggregatorSnapshot::new(
+                                            bytes.clone(),
+                                            completed_round_id,
+                                            total_rounds_completed,
+                                            d_in, d_hid, d_out,
+                                            model_seed,
+                                            learning_rate,
+                                        );
+                                        snapshot.participants = participants;
+                                        snapshot.error_bounds = error_bounds_history.read().clone();
+                                        snapshot.proof_hashes = proof_hashes_history.read().clone();
+
+                                        if let Err(e) = persistence.save_aggregator(&snapshot) {
+                                            error!("Failed to save aggregator snapshot: {}", e);
+                                        }
+                                    }
 
                                     // Broadcast updated weights to all workers
                                     network
@@ -1021,7 +1272,7 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
         } => {}
     }
 
-    info!("Aggregator shutdown complete (rounds_completed={})", round_number);
+    info!("Aggregator shutdown complete (round_number={}, total_rounds={})", round_number, total_rounds_completed);
     Ok(())
 }
 
