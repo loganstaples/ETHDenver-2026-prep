@@ -9,6 +9,44 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+/// Per-worker state stored in the aggregator snapshot for recovery.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerRegistryEntry {
+    /// Worker's peer ID string.
+    pub peer_id: String,
+    /// Worker health status string (Healthy, Degraded, Failed, etc.).
+    pub health_status: String,
+    /// Number of rounds this worker has participated in.
+    pub rounds_participated: u64,
+    /// Number of proofs submitted by this worker.
+    pub proofs_submitted: u64,
+    /// Last heartbeat timestamp (epoch seconds).
+    pub last_heartbeat_ts: u64,
+    /// Whether the worker is currently excluded.
+    pub excluded: bool,
+    /// Number of failures since joining.
+    pub failure_count: u32,
+}
+
+/// Active round state stored in the aggregator snapshot for recovery.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveRoundState {
+    /// Round ID.
+    pub round_id: u64,
+    /// Round phase (e.g., "Collecting", "Aggregating").
+    pub phase: String,
+    /// Workers assigned to this round.
+    pub assigned_workers: Vec<String>,
+    /// Workers that have submitted proofs.
+    pub submitted_workers: Vec<String>,
+    /// Collected proof hashes for this round.
+    pub collected_proof_hashes: Vec<[u8; 32]>,
+    /// Round start timestamp (epoch seconds).
+    pub started_at: u64,
+    /// Error bounds collected so far in this round: worker_id -> error_bound.
+    pub worker_error_bounds: HashMap<String, f64>,
+}
+
 /// Aggregator state snapshot — everything needed to resume after a crash.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AggregatorSnapshot {
@@ -47,6 +85,15 @@ pub struct AggregatorSnapshot {
     /// Current model weight commitment (SHA-256).
     #[serde(default)]
     pub current_weight_commitment: Option<[u8; 32]>,
+    /// Active round state (if a round was in progress when snapshot was taken).
+    #[serde(default)]
+    pub active_round: Option<ActiveRoundState>,
+    /// Worker registry — per-worker health and participation state.
+    #[serde(default)]
+    pub worker_registry: Vec<WorkerRegistryEntry>,
+    /// MPC session state (session ID if active).
+    #[serde(default)]
+    pub mpc_session_id: Option<String>,
 }
 
 /// Compact record of a completed round for persistence.
@@ -106,6 +153,9 @@ impl AggregatorSnapshot {
             current_weight_uri: None,
             completed_round_results: Vec::new(),
             current_weight_commitment: None,
+            active_round: None,
+            worker_registry: Vec::new(),
+            mpc_session_id: None,
         }
     }
 
@@ -146,6 +196,18 @@ pub struct WorkerSnapshot {
     /// URI of the weights this worker was trained on.
     #[serde(default)]
     pub weights_uri: Option<String>,
+    /// Accumulated error from training.
+    #[serde(default)]
+    pub accumulated_error: f64,
+    /// Current round ID this worker is participating in (if any).
+    #[serde(default)]
+    pub current_round_id: Option<u64>,
+    /// MPC party index (if MPC is enabled).
+    #[serde(default)]
+    pub mpc_party_index: Option<usize>,
+    /// MPC session ID (if in an active MPC session).
+    #[serde(default)]
+    pub mpc_session_id: Option<String>,
 }
 
 impl WorkerSnapshot {
@@ -163,6 +225,10 @@ impl WorkerSnapshot {
             optimizer_state: None,
             last_verified_commitment: None,
             weights_uri: None,
+            accumulated_error: 0.0,
+            current_round_id: None,
+            mpc_party_index: None,
+            mpc_session_id: None,
         }
     }
 

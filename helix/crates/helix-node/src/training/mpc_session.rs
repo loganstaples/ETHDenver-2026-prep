@@ -457,6 +457,16 @@ impl MpcSessionOrchestrator {
         self.active_session.as_ref()
     }
 
+    /// Returns whether there is an active MPC session.
+    pub fn has_active_session(&self) -> bool {
+        self.active_session.is_some()
+    }
+
+    /// Returns the current session ID, if any.
+    pub fn current_session_id(&self) -> Option<String> {
+        self.active_session.as_ref().map(|s| s.session_id.clone())
+    }
+
     /// Returns the party mapping.
     pub fn mapping(&self) -> &PartyMapping {
         &self.mapping

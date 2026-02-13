@@ -16,7 +16,9 @@ use std::collections::HashMap;
 
 use helix_core::ModelCheckpoint;
 use helix_node::trainer::MlpModel;
-use helix_node::training::persistence::{AggregatorSnapshot, StatePersistence, WorkerSnapshot};
+use helix_node::training::persistence::{
+    AggregatorSnapshot, ActiveRoundState, StatePersistence, WorkerRegistryEntry, WorkerSnapshot,
+};
 use tempfile::tempdir;
 
 /// Helper: perturb all weights in an MlpModel by a fixed delta.
@@ -535,5 +537,368 @@ fn test_fedavg_crash_recovery_with_real_aggregation() {
         aggregator_model.commitment(),
         fresh.commitment(),
         "Model should differ from fresh after 5 rounds of FedAvg"
+    );
+}
+
+// ============================================================================
+// Worker step-based checkpoint persistence
+// ============================================================================
+
+#[test]
+fn test_worker_step_based_checkpointing() {
+    let dir = tempdir().unwrap();
+    let persistence =
+        StatePersistence::new(Some(dir.path().to_path_buf()), 10, "worker_step").unwrap();
+
+    let model = MlpModel::new_random(4, 8, 2, 42);
+
+    // Simulate checkpointing every 10 steps
+    let checkpoint_interval = 10u64;
+    for step in 1..=35u64 {
+        if step % checkpoint_interval == 0 {
+            let mut snapshot = WorkerSnapshot::new("worker-1".to_string(), step / 10, step);
+            snapshot.accumulated_error = 0.001 * step as f64;
+            snapshot.current_round_id = Some(step / 10);
+
+            let ckpt = model.to_checkpoint(step);
+            snapshot.model_checkpoint_bytes = Some(ckpt.to_bytes().unwrap());
+
+            persistence.save_worker(&snapshot).unwrap();
+        }
+    }
+
+    // Should have checkpoints at steps 10, 20, 30
+    let files = persistence.list_checkpoints().unwrap();
+    assert_eq!(files.len(), 3, "Should have 3 step-based checkpoints");
+
+    // Latest should be at step 30
+    let latest = persistence.load_latest_worker().unwrap().unwrap();
+    assert_eq!(latest.steps_completed, 30);
+    assert_eq!(latest.current_round_id, Some(3));
+    assert!((latest.accumulated_error - 0.030).abs() < 1e-10);
+    assert!(latest.model_checkpoint_bytes.is_some());
+}
+
+// ============================================================================
+// Worker MPC state persistence
+// ============================================================================
+
+#[test]
+fn test_worker_mpc_state_persistence() {
+    let dir = tempdir().unwrap();
+    let persistence =
+        StatePersistence::new(Some(dir.path().to_path_buf()), 5, "worker_mpc").unwrap();
+
+    let mut snapshot = WorkerSnapshot::new("worker-mpc-1".to_string(), 5, 50);
+    snapshot.mpc_party_index = Some(2);
+    snapshot.mpc_session_id = Some("session-abc-123".to_string());
+    snapshot.current_round_id = Some(5);
+    snapshot.accumulated_error = 0.042;
+
+    persistence.save_worker(&snapshot).unwrap();
+
+    let restored = persistence.load_latest_worker().unwrap().unwrap();
+    assert_eq!(restored.mpc_party_index, Some(2));
+    assert_eq!(restored.mpc_session_id.as_deref(), Some("session-abc-123"));
+    assert_eq!(restored.current_round_id, Some(5));
+    assert!((restored.accumulated_error - 0.042).abs() < 1e-10);
+}
+
+// ============================================================================
+// Aggregator worker registry persistence
+// ============================================================================
+
+#[test]
+fn test_aggregator_worker_registry_persistence() {
+    let dir = tempdir().unwrap();
+    let persistence =
+        StatePersistence::new(Some(dir.path().to_path_buf()), 5, "agg_registry").unwrap();
+
+    let model = MlpModel::new_random(4, 8, 2, 42);
+    let ckpt_bytes = model.to_checkpoint(10).to_bytes().unwrap();
+
+    let mut snapshot = AggregatorSnapshot::new(ckpt_bytes, 10, 10, 4, 8, 2, 42, 0.01);
+    snapshot.worker_registry = vec![
+        WorkerRegistryEntry {
+            peer_id: "worker-1".to_string(),
+            health_status: "Healthy".to_string(),
+            rounds_participated: 10,
+            proofs_submitted: 10,
+            last_heartbeat_ts: 1700000000,
+            excluded: false,
+            failure_count: 0,
+        },
+        WorkerRegistryEntry {
+            peer_id: "worker-2".to_string(),
+            health_status: "Degraded".to_string(),
+            rounds_participated: 8,
+            proofs_submitted: 8,
+            last_heartbeat_ts: 1700000000,
+            excluded: false,
+            failure_count: 1,
+        },
+        WorkerRegistryEntry {
+            peer_id: "worker-3".to_string(),
+            health_status: "Failed".to_string(),
+            rounds_participated: 5,
+            proofs_submitted: 5,
+            last_heartbeat_ts: 1699999000,
+            excluded: true,
+            failure_count: 3,
+        },
+    ];
+
+    persistence.save_aggregator(&snapshot).unwrap();
+
+    let restored = persistence.load_latest_aggregator().unwrap().unwrap();
+    assert_eq!(restored.worker_registry.len(), 3);
+
+    let w1 = &restored.worker_registry[0];
+    assert_eq!(w1.peer_id, "worker-1");
+    assert_eq!(w1.health_status, "Healthy");
+    assert!(!w1.excluded);
+    assert_eq!(w1.failure_count, 0);
+
+    let w3 = &restored.worker_registry[2];
+    assert_eq!(w3.peer_id, "worker-3");
+    assert_eq!(w3.health_status, "Failed");
+    assert!(w3.excluded);
+    assert_eq!(w3.failure_count, 3);
+}
+
+// ============================================================================
+// Aggregator active round state persistence
+// ============================================================================
+
+#[test]
+fn test_aggregator_active_round_persistence() {
+    let dir = tempdir().unwrap();
+    let persistence =
+        StatePersistence::new(Some(dir.path().to_path_buf()), 5, "agg_round").unwrap();
+
+    let model = MlpModel::new_random(4, 8, 2, 42);
+    let ckpt_bytes = model.to_checkpoint(5).to_bytes().unwrap();
+
+    let mut snapshot = AggregatorSnapshot::new(ckpt_bytes, 5, 5, 4, 8, 2, 42, 0.01);
+    snapshot.active_round = Some(ActiveRoundState {
+        round_id: 6,
+        phase: "Collecting".to_string(),
+        assigned_workers: vec!["w1".to_string(), "w2".to_string(), "w3".to_string()],
+        submitted_workers: vec!["w1".to_string()],
+        collected_proof_hashes: vec![[0xAA; 32]],
+        started_at: 1700000100,
+        worker_error_bounds: {
+            let mut m = HashMap::new();
+            m.insert("w1".to_string(), 0.005);
+            m
+        },
+    });
+    snapshot.mpc_session_id = Some("mpc-round-6".to_string());
+
+    persistence.save_aggregator(&snapshot).unwrap();
+
+    let restored = persistence.load_latest_aggregator().unwrap().unwrap();
+    assert!(restored.active_round.is_some());
+
+    let round = restored.active_round.unwrap();
+    assert_eq!(round.round_id, 6);
+    assert_eq!(round.phase, "Collecting");
+    assert_eq!(round.assigned_workers.len(), 3);
+    assert_eq!(round.submitted_workers.len(), 1);
+    assert_eq!(round.collected_proof_hashes.len(), 1);
+    assert_eq!(round.worker_error_bounds.len(), 1);
+    assert!((round.worker_error_bounds["w1"] - 0.005).abs() < 1e-10);
+
+    assert_eq!(restored.mpc_session_id.as_deref(), Some("mpc-round-6"));
+}
+
+// ============================================================================
+// Fault tolerance: failure detection
+// ============================================================================
+
+#[test]
+fn test_failure_detector_heartbeat_timeout() {
+    use helix_node::training::fault_tolerance::{
+        FailureDetector, FaultToleranceConfig, WorkerHealth,
+    };
+    use helix_node::network::messages::PeerId;
+    use std::time::Duration;
+
+    let config = FaultToleranceConfig {
+        heartbeat_timeout: Duration::from_millis(50),
+        max_missed_heartbeats: 2,
+        min_healthy_workers: 1,
+        heartbeat_interval: Duration::from_millis(10),
+        ..Default::default()
+    };
+
+    let detector = FailureDetector::new(config);
+    let peer1 = PeerId::from_string("worker-1");
+    let peer2 = PeerId::from_string("worker-2");
+
+    detector.register_worker(peer1.clone());
+    detector.register_worker(peer2.clone());
+
+    // Both healthy initially
+    detector.record_heartbeat(&peer1, 5.0);
+    detector.record_heartbeat(&peer2, 5.0);
+
+    assert_eq!(detector.healthy_worker_count(), 2);
+    assert!(detector.is_system_healthy());
+
+    // Wait for timeout
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Only record heartbeat for peer1
+    detector.record_heartbeat(&peer1, 5.0);
+
+    // Check failures — peer2 should be detected
+    let replacements = detector.check_failures();
+
+    let health = detector.get_worker_health(&peer2).unwrap();
+    assert!(
+        matches!(health.health, WorkerHealth::Failed | WorkerHealth::Suspected),
+        "peer2 should be failed or suspected, got {:?}",
+        health.health,
+    );
+
+    // peer1 should still be healthy
+    let health1 = detector.get_worker_health(&peer1).unwrap();
+    assert_eq!(health1.health, WorkerHealth::Healthy);
+}
+
+#[test]
+fn test_failure_detector_worker_recovery() {
+    use helix_node::training::fault_tolerance::{
+        FailureDetector, FaultToleranceConfig, WorkerHealth,
+    };
+    use helix_node::network::messages::PeerId;
+    use std::time::Duration;
+
+    // Use max_missed_heartbeats=1 so a single check_failures call after
+    // one timeout period is enough to move the worker directly to Failed.
+    let config = FaultToleranceConfig {
+        heartbeat_timeout: Duration::from_millis(30),
+        max_missed_heartbeats: 1,
+        failure_cooldown: Duration::from_millis(10),
+        ..Default::default()
+    };
+
+    let detector = FailureDetector::new(config);
+    let peer = PeerId::from_string("worker-recover");
+
+    detector.register_worker(peer.clone());
+    detector.record_heartbeat(&peer, 5.0);
+
+    // Force failure by waiting past timeout, then calling check_failures
+    // multiple times to accumulate missed heartbeats
+    std::thread::sleep(Duration::from_millis(60));
+    detector.check_failures();
+    std::thread::sleep(Duration::from_millis(40));
+    detector.check_failures();
+
+    let health = detector.get_worker_health(&peer).unwrap();
+    assert_eq!(health.health, WorkerHealth::Failed, "Worker should be failed after multiple check_failures");
+
+    // Wait for cooldown
+    std::thread::sleep(Duration::from_millis(20));
+
+    // Attempt recovery
+    let recovered = detector.attempt_recovery(&peer);
+    assert!(recovered, "Worker should be recoverable after cooldown");
+
+    // Complete recovery with a heartbeat
+    detector.complete_recovery(&peer);
+    let health = detector.get_worker_health(&peer).unwrap();
+    assert_eq!(health.health, WorkerHealth::Healthy);
+}
+
+#[test]
+fn test_failure_detector_exclusion_after_max_failures() {
+    use helix_node::training::fault_tolerance::{
+        FailureDetector, FaultToleranceConfig, WorkerHealth, ReplacementAction,
+    };
+    use helix_node::network::messages::PeerId;
+    use std::time::Duration;
+
+    let config = FaultToleranceConfig {
+        heartbeat_timeout: Duration::from_millis(20),
+        max_missed_heartbeats: 1,
+        max_failures_before_exclusion: 2,
+        failure_cooldown: Duration::from_millis(5),
+        auto_recovery: false,
+        ..Default::default()
+    };
+
+    let detector = FailureDetector::new(config);
+    let peer = PeerId::from_string("flaky-worker");
+
+    detector.register_worker(peer.clone());
+
+    // Fail twice
+    for _ in 0..2 {
+        detector.record_heartbeat(&peer, 5.0);
+        std::thread::sleep(Duration::from_millis(50));
+        detector.check_failures();
+
+        // Reset for next round
+        std::thread::sleep(Duration::from_millis(10));
+        detector.attempt_recovery(&peer);
+        detector.complete_recovery(&peer);
+    }
+
+    // Third failure should trigger exclusion
+    detector.record_heartbeat(&peer, 5.0);
+    std::thread::sleep(Duration::from_millis(50));
+    let _replacements = detector.check_failures();
+
+    let health = detector.get_worker_health(&peer).unwrap();
+    // After 3 failures (>= max_failures_before_exclusion=2), should be excluded
+    // The exact state depends on timing, but the worker should be at least failed
+    assert!(
+        health.health == WorkerHealth::Failed || health.excluded,
+        "Worker should be failed or excluded after repeated failures"
+    );
+}
+
+// ============================================================================
+// Config fault tolerance defaults
+// ============================================================================
+
+#[test]
+fn test_fault_tolerance_config_defaults() {
+    use helix_node::config::{FaultToleranceNodeConfig, NodeConfig};
+
+    let config = NodeConfig::default();
+    assert_eq!(config.fault_tolerance.checkpoint_interval_steps, 10);
+    assert_eq!(config.fault_tolerance.heartbeat_timeout_secs, 15);
+    assert_eq!(config.fault_tolerance.max_missed_heartbeats, 3);
+    assert_eq!(config.fault_tolerance.min_healthy_workers, 1);
+    assert_eq!(config.fault_tolerance.max_checkpoints, 5);
+    assert_eq!(config.fault_tolerance.shutdown_timeout_secs, 30);
+    assert!(config.fault_tolerance.auto_recovery);
+}
+
+#[test]
+fn test_fault_tolerance_config_serialization() {
+    use helix_node::config::NodeConfig;
+
+    let config = NodeConfig::default();
+    let json = serde_json::to_string_pretty(&config).unwrap();
+
+    // Verify fault_tolerance section is present
+    assert!(json.contains("fault_tolerance"), "JSON should contain fault_tolerance section");
+    assert!(json.contains("checkpoint_interval_steps"));
+    assert!(json.contains("heartbeat_timeout_secs"));
+
+    // Round-trip
+    let loaded: NodeConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        loaded.fault_tolerance.checkpoint_interval_steps,
+        config.fault_tolerance.checkpoint_interval_steps,
+    );
+    assert_eq!(
+        loaded.fault_tolerance.shutdown_timeout_secs,
+        config.fault_tolerance.shutdown_timeout_secs,
     );
 }

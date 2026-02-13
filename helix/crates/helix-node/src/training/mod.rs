@@ -151,7 +151,7 @@ pub use consensus::{
 
 pub use persistence::{
     AggregatorSnapshot, WorkerSnapshot, StatePersistence, PersistenceError,
-    RoundResultEntry,
+    RoundResultEntry, WorkerRegistryEntry, ActiveRoundState,
 };
 
 pub use multi_round::{

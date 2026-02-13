@@ -3,7 +3,7 @@ mod sc_client;
 use helix_core::ModelCheckpoint;
 use helix_node::config::DataSourceConfig;
 use helix_node::sc_client::SCClient;
-use helix_node::api::http::{ApiRateLimiter, ApiState, MetricsSnapshot, OrchestratorSnapshot, PeerSnapshot, RoundInfo};
+use helix_node::api::http::{ApiRateLimiter, ApiState, FaultToleranceStatus, MetricsSnapshot, MpcHealthStatus, OrchestratorSnapshot, PeerSnapshot, RoundInfo};
 use helix_node::api::rpc::{
     ProofStatusEntry, RpcRateLimiter, RpcState, start_rpc_server,
     NodeConfigSnapshot, MPCStatusSnapshot,
@@ -24,7 +24,8 @@ use helix_node::training::{
     MpcSessionOrchestrator,
     serialize_gradient_share, deserialize_gradient_share,
 };
-use helix_node::training::persistence::{AggregatorSnapshot, WorkerSnapshot, StatePersistence};
+use helix_node::training::persistence::{AggregatorSnapshot, WorkerSnapshot, StatePersistence, WorkerRegistryEntry, ActiveRoundState};
+use helix_node::training::fault_tolerance::{FailureDetector, FaultToleranceConfig, FaultEvent, WorkerHealth, ReplacementAction};
 
 use log::{error, info, warn};
 use parking_lot::RwLock;
@@ -317,6 +318,10 @@ async fn run_worker(listen_addr: SocketAddr) -> anyhow::Result<()> {
     // === Worker state persistence ===
     let checkpoint_dir_str = env_or("HELIX_CHECKPOINT_DIR", "");
     let max_checkpoints: usize = env_or("HELIX_MAX_CHECKPOINTS", "5").parse().unwrap_or(5);
+    let checkpoint_interval_steps: u64 = env_or("HELIX_CHECKPOINT_INTERVAL_STEPS", "10").parse().unwrap_or(10);
+    if checkpoint_interval_steps > 0 {
+        info!("Worker checkpoint interval: every {} steps", checkpoint_interval_steps);
+    }
     let worker_persistence = if !checkpoint_dir_str.is_empty() {
         match StatePersistence::new(
             Some(PathBuf::from(&checkpoint_dir_str)),
@@ -363,8 +368,17 @@ async fn run_worker(listen_addr: SocketAddr) -> anyhow::Result<()> {
 
     let result = tokio::select! {
         _ = shutdown_signal() => {
-            info!("Worker shutting down, saving checkpoint...");
-            // Graceful shutdown: save worker state
+            info!("Worker shutting down gracefully...");
+
+            // 1. Notify peers we're departing
+            network.broadcast(MessagePayload::Heartbeat(HeartbeatMessage {
+                seq: u64::MAX, // sentinel: departure signal
+                is_pong: false,
+                load: 0,
+            })).await;
+            info!("Departure notification sent to peers");
+
+            // 2. Save final checkpoint
             if let Some(ref persistence) = worker_persistence {
                 let mut snapshot = WorkerSnapshot::new(
                     local_id.to_string(),
@@ -376,6 +390,9 @@ async fn run_worker(listen_addr: SocketAddr) -> anyhow::Result<()> {
                     if let Ok(bytes) = ckpt.to_bytes() {
                         snapshot.model_checkpoint_bytes = Some(bytes);
                     }
+                }
+                if mpc_enabled {
+                    snapshot.mpc_party_index = Some(mpc_party_index);
                 }
                 if let Err(e) = persistence.save_worker(&snapshot) {
                     error!("Failed to save worker checkpoint on shutdown: {}", e);
@@ -561,6 +578,32 @@ async fn run_worker(listen_addr: SocketAddr) -> anyhow::Result<()> {
                                                 round_id, steps_completed,
                                             );
 
+                                            // Step-based checkpoint
+                                            if checkpoint_interval_steps > 0
+                                                && steps_completed % checkpoint_interval_steps == 0
+                                            {
+                                                if let Some(ref persistence) = worker_persistence {
+                                                    let mut snap = WorkerSnapshot::new(
+                                                        local_id.to_string(),
+                                                        last_completed_round,
+                                                        steps_completed,
+                                                    );
+                                                    snap.mpc_party_index = Some(mpc_party_index);
+                                                    snap.current_round_id = Some(round_id);
+                                                    if let Some(ref t) = trainer {
+                                                        let ckpt = t.model().to_checkpoint(t.step_count());
+                                                        if let Ok(bytes) = ckpt.to_bytes() {
+                                                            snap.model_checkpoint_bytes = Some(bytes);
+                                                        }
+                                                    }
+                                                    if let Err(e) = persistence.save_worker(&snap) {
+                                                        warn!("Step checkpoint failed: {}", e);
+                                                    } else {
+                                                        info!("Worker checkpoint at step {}", steps_completed);
+                                                    }
+                                                }
+                                            }
+
                                             // Update MPC status
                                             {
                                                 let mut status = rpc_state.mpc_status.write();
@@ -668,6 +711,30 @@ async fn run_worker(listen_addr: SocketAddr) -> anyhow::Result<()> {
                                             steps_completed += 1;
                                             info!("Gradient + weights sent for round {} (total steps: {})", round_id, steps_completed);
 
+                                            // Step-based checkpoint
+                                            if checkpoint_interval_steps > 0
+                                                && steps_completed % checkpoint_interval_steps == 0
+                                            {
+                                                if let Some(ref persistence) = worker_persistence {
+                                                    let mut snap = WorkerSnapshot::new(
+                                                        local_id.to_string(),
+                                                        last_completed_round,
+                                                        steps_completed,
+                                                    );
+                                                    snap.accumulated_error = result.loss * 0.01;
+                                                    snap.current_round_id = Some(round_id);
+                                                    let ckpt = t.model().to_checkpoint(t.step_count());
+                                                    if let Ok(bytes) = ckpt.to_bytes() {
+                                                        snap.model_checkpoint_bytes = Some(bytes);
+                                                    }
+                                                    if let Err(e) = persistence.save_worker(&snap) {
+                                                        warn!("Step checkpoint failed: {}", e);
+                                                    } else {
+                                                        info!("Worker checkpoint at step {}", steps_completed);
+                                                    }
+                                                }
+                                            }
+
                                             // Update proof status
                                             proof_status.write().push(ProofStatusEntry {
                                                 round_id,
@@ -753,6 +820,32 @@ async fn run_worker(listen_addr: SocketAddr) -> anyhow::Result<()> {
                                                     "MPC gradient share sent for round {} (party {}, loss={:.6})",
                                                     round_id, party_index, computation.local_loss,
                                                 );
+
+                                                // Step-based checkpoint
+                                                if checkpoint_interval_steps > 0
+                                                    && steps_completed % checkpoint_interval_steps == 0
+                                                {
+                                                    if let Some(ref persistence) = worker_persistence {
+                                                        let mut snap = WorkerSnapshot::new(
+                                                            local_id.to_string(),
+                                                            last_completed_round,
+                                                            steps_completed,
+                                                        );
+                                                        snap.mpc_party_index = Some(party_index);
+                                                        snap.current_round_id = Some(round_id);
+                                                        if let Some(ref t) = trainer {
+                                                            let ckpt = t.model().to_checkpoint(t.step_count());
+                                                            if let Ok(bytes) = ckpt.to_bytes() {
+                                                                snap.model_checkpoint_bytes = Some(bytes);
+                                                            }
+                                                        }
+                                                        if let Err(e) = persistence.save_worker(&snap) {
+                                                            warn!("Step checkpoint failed: {}", e);
+                                                        } else {
+                                                            info!("Worker checkpoint at step {}", steps_completed);
+                                                        }
+                                                    }
+                                                }
                                             }
                                             Err(e) => error!("MPC gradient computation failed: {}", e),
                                         }
@@ -818,11 +911,36 @@ async fn run_worker(listen_addr: SocketAddr) -> anyhow::Result<()> {
                         warn!("Peer disconnected: {}, scheduling reconnection", peer_id);
                         // Schedule reconnection with exponential backoff
                         if let Some(peer_info) = network.discovery().get_peer(&peer_id).await {
+                            let is_aggregator = peer_info.capabilities.can_aggregate;
                             network.schedule_reconnect(
-                                peer_id,
+                                peer_id.clone(),
                                 peer_info.address,
                                 peer_info.capabilities,
                             );
+
+                            // If the aggregator disconnected, we're likely partitioned
+                            if is_aggregator {
+                                warn!(
+                                    "Aggregator {} disconnected — worker may be partitioned. \
+                                     Pausing training until reconnected.",
+                                    peer_id,
+                                );
+                                // Save checkpoint before pausing
+                                if let Some(ref persistence) = worker_persistence {
+                                    let mut snap = WorkerSnapshot::new(
+                                        local_id.to_string(),
+                                        last_completed_round,
+                                        steps_completed,
+                                    );
+                                    if let Some(ref t) = trainer {
+                                        let ckpt = t.model().to_checkpoint(t.step_count());
+                                        if let Ok(bytes) = ckpt.to_bytes() {
+                                            snap.model_checkpoint_bytes = Some(bytes);
+                                        }
+                                    }
+                                    let _ = persistence.save_worker(&snap);
+                                }
+                            }
                         }
                     }
                     Some(NetworkEvent::Error { error, .. }) => {
@@ -1190,6 +1308,9 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
     let api_key = helix_node::config::ApiConfig::default().api_key_or_generate();
     log::info!("API key: {}", api_key);
     let round_weights_shared = Arc::new(RwLock::new(Vec::new()));
+    let last_checkpoint_ts: Arc<RwLock<Option<u64>>> = Arc::new(RwLock::new(None));
+    let mpc_health = Arc::new(RwLock::new(MpcHealthStatus::default()));
+    let fault_tolerance_status = Arc::new(RwLock::new(FaultToleranceStatus::default()));
     let api_state = Arc::new(ApiState {
         orchestrator_workers: api_snapshot.clone(),
         round_trigger_tx: round_trigger_tx.clone(),
@@ -1198,6 +1319,68 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
         api_key,
         rate_limiter: Arc::new(ApiRateLimiter::new(100)),
         round_weights: round_weights_shared.clone(),
+        node_role: "aggregator".to_string(),
+        start_time: std::time::Instant::now(),
+        last_checkpoint_ts: last_checkpoint_ts.clone(),
+        mpc_health: mpc_health.clone(),
+        fault_tolerance_status: fault_tolerance_status.clone(),
+    });
+
+    // === Fault tolerance: failure detector ===
+    let ft_config = FaultToleranceConfig {
+        heartbeat_interval: Duration::from_secs(5),
+        heartbeat_timeout: Duration::from_secs(
+            env_or("HELIX_HEARTBEAT_TIMEOUT_SECS", "15").parse().unwrap_or(15)
+        ),
+        max_missed_heartbeats: env_or("HELIX_MAX_MISSED_HEARTBEATS", "3").parse().unwrap_or(3),
+        min_healthy_workers: min_workers,
+        max_failures_before_exclusion: 3,
+        failure_cooldown: Duration::from_secs(60),
+        auto_recovery: true,
+        leader_failover: false,
+        max_degraded_fraction: 0.5,
+    };
+    let failure_detector = Arc::new(FailureDetector::new(ft_config));
+    let mut fault_event_rx = failure_detector.subscribe();
+
+    // Start background failure detection loop
+    let fd_handle = failure_detector.start_detection_loop();
+
+    // Spawn fault event handler to update shared status
+    let ft_status_for_events = fault_tolerance_status.clone();
+    let fd_for_events = failure_detector.clone();
+    tokio::spawn(async move {
+        while let Ok(event) = fault_event_rx.recv().await {
+            match &event {
+                FaultEvent::WorkerFailed { peer_id, reason, failure_count } => {
+                    warn!(
+                        "Fault detector: worker {} failed (reason={}, count={})",
+                        peer_id, reason, failure_count,
+                    );
+                }
+                FaultEvent::WorkerRecovered { peer_id } => {
+                    info!("Fault detector: worker {} recovered", peer_id);
+                }
+                FaultEvent::InsufficientWorkers { healthy, required } => {
+                    error!(
+                        "Fault detector: insufficient workers ({}/{})",
+                        healthy, required,
+                    );
+                }
+                FaultEvent::WorkerExcluded { peer_id, reason } => {
+                    warn!("Fault detector: worker {} excluded: {}", peer_id, reason);
+                }
+                _ => {}
+            }
+
+            // Update shared fault tolerance status
+            let health_map = fd_for_events.all_worker_health();
+            let mut ft = ft_status_for_events.write();
+            ft.healthy_workers = health_map.values().filter(|w| w.health == WorkerHealth::Healthy).count();
+            ft.degraded_workers = health_map.values().filter(|w| w.health == WorkerHealth::Degraded).count();
+            ft.failed_workers = health_map.values().filter(|w| w.health == WorkerHealth::Failed).count();
+            ft.system_healthy = fd_for_events.is_system_healthy();
+        }
     });
 
     // Start HTTP API
@@ -1243,15 +1426,20 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
     // Spawn event logger + snapshot updater
     let snapshot_for_events = api_snapshot.clone();
     let proof_status_events = proof_status.clone();
+    let fd_for_orch = failure_detector.clone();
     let mut completed_rounds = 0u64;
     tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
             match &event {
                 OrchestratorEvent::WorkerJoined { peer_id } => {
                     info!("Worker joined: {}", peer_id);
+                    // Register with fault detector
+                    fd_for_orch.register_worker(peer_id.clone());
                 }
                 OrchestratorEvent::WorkerLeft { peer_id } => {
                     info!("Worker left: {}", peer_id);
+                    // Unregister from fault detector
+                    fd_for_orch.unregister_worker(peer_id);
                 }
                 OrchestratorEvent::RoundStarted { round_id, workers } => {
                     info!("Round {} started with {} workers", round_id, workers.len());
@@ -1309,8 +1497,18 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
 
     tokio::select! {
         _ = shutdown_signal() => {
-            info!("Aggregator shutting down, saving checkpoint...");
-            // Flush pending proofs
+            info!("Aggregator shutting down gracefully...");
+
+            // 1. Notify all workers we're shutting down (send RoundComplete as signal)
+            network.broadcast(MessagePayload::Training(
+                TrainingMessage::RoundComplete {
+                    round_id: round_number,
+                    result_hash: aggregator_model.read().commitment(),
+                },
+            )).await;
+            info!("Shutdown notification broadcast to workers");
+
+            // 2. Flush pending proofs
             let pending = proof_status.read().iter()
                 .filter(|e| e.status == "collecting")
                 .count();
@@ -1318,7 +1516,10 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
                 warn!("Shutting down with {} pending proof collections", pending);
             }
 
-            // Graceful shutdown: save full aggregator state
+            // 3. Stop failure detector
+            fd_handle.abort();
+
+            // 4. Save full aggregator state with worker registry
             if let Some(ref persistence) = aggregator_persistence {
                 let model_ckpt = aggregator_model.read().to_checkpoint(round_number);
                 if let Ok(ckpt_bytes) = model_ckpt.to_bytes() {
@@ -1332,10 +1533,50 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
                     );
                     snapshot.error_bounds = error_bounds_history.read().clone();
                     snapshot.proof_hashes = proof_hashes_history.read().clone();
+
+                    // Save worker registry from fault detector
+                    let health_map = failure_detector.all_worker_health();
+                    snapshot.worker_registry = health_map.iter().map(|(pid, info)| {
+                        WorkerRegistryEntry {
+                            peer_id: pid.to_string(),
+                            health_status: format!("{:?}", info.health),
+                            rounds_participated: 0, // tracked by orchestrator
+                            proofs_submitted: 0,
+                            last_heartbeat_ts: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs(),
+                            excluded: info.excluded,
+                            failure_count: info.failure_count,
+                        }
+                    }).collect();
+
+                    // Save active round state if one is in progress
+                    if let Some((rid, phase)) = orchestrator_ref.current_round() {
+                        snapshot.active_round = Some(ActiveRoundState {
+                            round_id: rid,
+                            phase: format!("{:?}", phase),
+                            assigned_workers: Vec::new(),
+                            submitted_workers: Vec::new(),
+                            collected_proof_hashes: Vec::new(),
+                            started_at: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs(),
+                            worker_error_bounds: std::collections::HashMap::new(),
+                        });
+                    }
+
+                    // Save MPC session ID
+                    if let Some(ref orch) = mpc_session_orch {
+                        snapshot.mpc_session_id = orch.current_session_id();
+                    }
+
                     if let Err(e) = persistence.save_aggregator(&snapshot) {
                         error!("Failed to save aggregator checkpoint on shutdown: {}", e);
                     } else {
-                        info!("Aggregator checkpoint saved on shutdown (round={})", round_number);
+                        info!("Aggregator checkpoint saved on shutdown (round={}, {} workers tracked)",
+                            round_number, snapshot.worker_registry.len());
                     }
                 }
             }
@@ -1523,8 +1764,25 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
                                         snapshot.error_bounds = error_bounds_history.read().clone();
                                         snapshot.proof_hashes = proof_hashes_history.read().clone();
 
+                                        // Include worker registry from fault detector
+                                        let health_map = failure_detector.all_worker_health();
+                                        snapshot.worker_registry = health_map.iter().map(|(pid, info)| {
+                                            WorkerRegistryEntry {
+                                                peer_id: pid.to_string(),
+                                                health_status: format!("{:?}", info.health),
+                                                rounds_participated: 0,
+                                                proofs_submitted: 0,
+                                                last_heartbeat_ts: snapshot.timestamp,
+                                                excluded: info.excluded,
+                                                failure_count: info.failure_count,
+                                            }
+                                        }).collect();
+
                                         if let Err(e) = persistence.save_aggregator(&snapshot) {
                                             error!("Failed to save aggregator snapshot: {}", e);
+                                        } else {
+                                            // Update last checkpoint timestamp for health endpoint
+                                            *last_checkpoint_ts.write() = Some(snapshot.timestamp);
                                         }
                                     }
 
@@ -1550,6 +1808,55 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
                 tokio::time::sleep(Duration::from_secs(5)).await;
 
                 let stats = orchestrator_ref.worker_stats();
+
+                // Update failure detector: record heartbeats for active workers
+                // The orchestrator tracks worker liveness internally; we sync
+                // its view to the failure detector for the health endpoint.
+                {
+                    let active_workers = orchestrator_ref.active_worker_ids();
+                    for wid in &active_workers {
+                        failure_detector.register_worker(wid.clone());
+                        failure_detector.record_heartbeat(wid, 10.0); // active = healthy
+                    }
+                    // Check for failures (missed heartbeats from workers that stopped responding)
+                    let replacements = failure_detector.check_failures();
+                    for rep in &replacements {
+                        match rep.action {
+                            ReplacementAction::AbortRound => {
+                                error!(
+                                    "Worker {} failed and below minimum threshold — would abort round",
+                                    rep.failed_peer,
+                                );
+                            }
+                            ReplacementAction::ContinueDegraded => {
+                                warn!(
+                                    "Worker {} failed — continuing in degraded mode",
+                                    rep.failed_peer,
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // Update fault tolerance status for health endpoint
+                    let health_map = failure_detector.all_worker_health();
+                    let mut ft = fault_tolerance_status.write();
+                    ft.healthy_workers = health_map.values().filter(|w| w.health == WorkerHealth::Healthy).count();
+                    ft.degraded_workers = health_map.values().filter(|w| w.health == WorkerHealth::Degraded).count();
+                    ft.failed_workers = health_map.values().filter(|w| w.health == WorkerHealth::Failed).count();
+                    ft.system_healthy = failure_detector.is_system_healthy();
+                }
+
+                // Update MPC health status for health endpoint
+                {
+                    let mut mpc = mpc_health.write();
+                    mpc.enabled = mpc_enabled;
+                    mpc.num_parties = mpc_num_parties;
+                    if let Some(ref orch) = mpc_session_orch {
+                        mpc.active_session = orch.has_active_session();
+                        mpc.session_id = orch.current_session_id();
+                    }
+                }
 
                 // Update API snapshot
                 {

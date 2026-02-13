@@ -120,6 +120,16 @@ pub struct ApiState {
     pub rate_limiter: Arc<ApiRateLimiter>,
     /// Completed round weights for result distribution (shared with RPC layer).
     pub round_weights: Arc<RwLock<Vec<RoundWeightEntry>>>,
+    /// Node role for health endpoint.
+    pub node_role: String,
+    /// Start time for uptime calculation.
+    pub start_time: Instant,
+    /// Last checkpoint timestamp (epoch seconds).
+    pub last_checkpoint_ts: Arc<RwLock<Option<u64>>>,
+    /// MPC health status (updated by main loop).
+    pub mpc_health: Arc<RwLock<MpcHealthStatus>>,
+    /// Fault tolerance status (updated by main loop).
+    pub fault_tolerance_status: Arc<RwLock<FaultToleranceStatus>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -191,12 +201,46 @@ impl Default for MetricsSnapshot {
     }
 }
 
+/// Rich health response with training progress, MPC status, memory, etc.
 #[derive(Serialize, Deserialize)]
-struct HealthResponse {
-    status: String,
-    role: String,
-    workers: usize,
-    current_round: Option<u64>,
+pub struct HealthResponse {
+    pub status: String,
+    pub role: String,
+    pub workers: usize,
+    pub current_round: Option<u64>,
+    /// Training progress: total completed rounds.
+    pub completed_rounds: u64,
+    /// Number of connected peers.
+    pub connected_peers: usize,
+    /// Uptime in seconds since the API state was created.
+    pub uptime_secs: u64,
+    /// MPC session status.
+    pub mpc: MpcHealthStatus,
+    /// Last checkpoint timestamp (epoch seconds), if any.
+    pub last_checkpoint_ts: Option<u64>,
+    /// Resident memory usage in bytes (macOS/Linux).
+    pub memory_bytes: u64,
+    /// Node fault tolerance status.
+    pub fault_tolerance: FaultToleranceStatus,
+}
+
+/// MPC health sub-status.
+#[derive(Serialize, Deserialize, Default)]
+pub struct MpcHealthStatus {
+    pub enabled: bool,
+    pub active_session: bool,
+    pub session_id: Option<String>,
+    pub num_parties: usize,
+    pub party_index: Option<usize>,
+}
+
+/// Fault tolerance sub-status.
+#[derive(Serialize, Deserialize, Default)]
+pub struct FaultToleranceStatus {
+    pub healthy_workers: usize,
+    pub degraded_workers: usize,
+    pub failed_workers: usize,
+    pub system_healthy: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -322,12 +366,100 @@ pub async fn start_api_server(
 
 async fn health_handler(State(state): State<Arc<ApiState>>) -> Json<HealthResponse> {
     let snapshot = state.orchestrator_workers.read();
+    let peers = state.peers.read();
+    let ft = state.fault_tolerance_status.read();
+
+    // Determine overall status from fault tolerance
+    let status = if ft.system_healthy {
+        "healthy".to_string()
+    } else if ft.failed_workers > 0 {
+        "degraded".to_string()
+    } else {
+        "healthy".to_string()
+    };
+
     Json(HealthResponse {
-        status: "healthy".to_string(),
-        role: "aggregator".to_string(),
+        status,
+        role: state.node_role.clone(),
         workers: snapshot.worker_count,
         current_round: snapshot.current_round.as_ref().map(|r| r.round_id),
+        completed_rounds: snapshot.completed_rounds,
+        connected_peers: peers.peers.len(),
+        uptime_secs: state.start_time.elapsed().as_secs(),
+        mpc: {
+            let mpc = state.mpc_health.read();
+            MpcHealthStatus {
+                enabled: mpc.enabled,
+                active_session: mpc.active_session,
+                session_id: mpc.session_id.clone(),
+                num_parties: mpc.num_parties,
+                party_index: mpc.party_index,
+            }
+        },
+        last_checkpoint_ts: *state.last_checkpoint_ts.read(),
+        memory_bytes: get_resident_memory(),
+        fault_tolerance: FaultToleranceStatus {
+            healthy_workers: ft.healthy_workers,
+            degraded_workers: ft.degraded_workers,
+            failed_workers: ft.failed_workers,
+            system_healthy: ft.system_healthy,
+        },
     })
+}
+
+/// Returns the resident memory size of this process in bytes.
+fn get_resident_memory() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        // macOS: use mach task_info
+        extern "C" {
+            fn mach_task_self() -> u32;
+        }
+        #[repr(C)]
+        struct MachTaskBasicInfo {
+            virtual_size: u64,
+            resident_size: u64,
+            resident_size_max: u64,
+            user_time: [u32; 2],
+            system_time: [u32; 2],
+            policy: i32,
+            suspend_count: i32,
+        }
+        const MACH_TASK_BASIC_INFO: u32 = 20;
+        extern "C" {
+            fn task_info(
+                target_task: u32,
+                flavor: u32,
+                task_info_out: *mut MachTaskBasicInfo,
+                task_info_out_cnt: *mut u32,
+            ) -> i32;
+        }
+        unsafe {
+            let mut info: MachTaskBasicInfo = std::mem::zeroed();
+            let mut count = (std::mem::size_of::<MachTaskBasicInfo>() / std::mem::size_of::<u32>()) as u32;
+            let ret = task_info(mach_task_self(), MACH_TASK_BASIC_INFO, &mut info, &mut count);
+            if ret == 0 {
+                return info.resident_size;
+            }
+        }
+        0
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Linux: read /proc/self/statm
+        if let Ok(statm) = std::fs::read_to_string("/proc/self/statm") {
+            if let Some(rss_pages) = statm.split_whitespace().nth(1) {
+                if let Ok(pages) = rss_pages.parse::<u64>() {
+                    return pages * 4096; // page size
+                }
+            }
+        }
+        0
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        0
+    }
 }
 
 async fn round_start_handler(State(state): State<Arc<ApiState>>) -> Json<RoundStartResponse> {
@@ -453,6 +585,22 @@ mod tests {
             api_key: api_key.to_string(),
             rate_limiter: Arc::new(ApiRateLimiter::new(100)),
             round_weights: Arc::new(RwLock::new(Vec::new())),
+            node_role: "aggregator".to_string(),
+            start_time: Instant::now(),
+            last_checkpoint_ts: Arc::new(RwLock::new(Some(1700000000))),
+            mpc_health: Arc::new(RwLock::new(MpcHealthStatus {
+                enabled: true,
+                active_session: true,
+                session_id: Some("test-session".to_string()),
+                num_parties: 3,
+                party_index: Some(0),
+            })),
+            fault_tolerance_status: Arc::new(RwLock::new(FaultToleranceStatus {
+                healthy_workers: 4,
+                degraded_workers: 1,
+                failed_workers: 0,
+                system_healthy: true,
+            })),
         })
     }
 
@@ -494,6 +642,14 @@ mod tests {
         assert_eq!(health.role, "aggregator");
         assert_eq!(health.workers, 5);
         assert_eq!(health.current_round, Some(42));
+        assert_eq!(health.completed_rounds, 10);
+        assert_eq!(health.connected_peers, 1);
+        assert!(health.uptime_secs < 5); // just created
+        assert!(health.mpc.enabled);
+        assert_eq!(health.mpc.num_parties, 3);
+        assert!(health.last_checkpoint_ts.is_some());
+        assert!(health.fault_tolerance.system_healthy);
+        assert_eq!(health.fault_tolerance.healthy_workers, 4);
     }
 
     #[tokio::test]

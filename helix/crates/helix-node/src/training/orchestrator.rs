@@ -705,6 +705,15 @@ impl TrainingOrchestrator {
             .map(|r| (r.id, r.phase))
     }
 
+    /// Returns the peer IDs of all active (non-excluded) workers.
+    pub fn active_worker_ids(&self) -> Vec<PeerId> {
+        self.workers.read()
+            .iter()
+            .filter(|(_, w)| w.status != WorkerStatus::Excluded)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
     /// Returns worker stats.
     pub fn worker_stats(&self) -> WorkerStats {
         let workers = self.workers.read();

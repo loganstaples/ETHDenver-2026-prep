@@ -223,6 +223,73 @@ impl MpcConfig {
     }
 }
 
+/// Fault tolerance configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FaultToleranceNodeConfig {
+    /// How often to checkpoint worker state (in training steps).
+    /// 0 = only checkpoint on round completion.
+    #[serde(default = "default_checkpoint_interval_steps")]
+    pub checkpoint_interval_steps: u64,
+
+    /// Heartbeat timeout before marking a worker as suspected (seconds).
+    #[serde(default = "default_heartbeat_timeout_secs")]
+    pub heartbeat_timeout_secs: u64,
+
+    /// Maximum missed heartbeats before marking worker as failed.
+    #[serde(default = "default_max_missed_heartbeats")]
+    pub max_missed_heartbeats: u32,
+
+    /// Minimum healthy workers required to continue a round.
+    #[serde(default = "default_min_healthy_workers")]
+    pub min_healthy_workers: usize,
+
+    /// Maximum failures before a worker is excluded from future rounds.
+    #[serde(default = "default_max_failures_before_exclusion")]
+    pub max_failures_before_exclusion: u32,
+
+    /// Cooldown period after failure before a worker can rejoin (seconds).
+    #[serde(default = "default_failure_cooldown_secs")]
+    pub failure_cooldown_secs: u64,
+
+    /// Enable automatic worker recovery.
+    #[serde(default = "default_auto_recovery")]
+    pub auto_recovery: bool,
+
+    /// Maximum number of checkpoints to keep on disk.
+    #[serde(default = "default_max_checkpoints")]
+    pub max_checkpoints: usize,
+
+    /// Graceful shutdown timeout (seconds). After this, force exit.
+    #[serde(default = "default_shutdown_timeout_secs")]
+    pub shutdown_timeout_secs: u64,
+}
+
+fn default_checkpoint_interval_steps() -> u64 { 10 }
+fn default_heartbeat_timeout_secs() -> u64 { 15 }
+fn default_max_missed_heartbeats() -> u32 { 3 }
+fn default_min_healthy_workers() -> usize { 1 }
+fn default_max_failures_before_exclusion() -> u32 { 3 }
+fn default_failure_cooldown_secs() -> u64 { 60 }
+fn default_auto_recovery() -> bool { true }
+fn default_max_checkpoints() -> usize { 5 }
+fn default_shutdown_timeout_secs() -> u64 { 30 }
+
+impl Default for FaultToleranceNodeConfig {
+    fn default() -> Self {
+        Self {
+            checkpoint_interval_steps: default_checkpoint_interval_steps(),
+            heartbeat_timeout_secs: default_heartbeat_timeout_secs(),
+            max_missed_heartbeats: default_max_missed_heartbeats(),
+            min_healthy_workers: default_min_healthy_workers(),
+            max_failures_before_exclusion: default_max_failures_before_exclusion(),
+            failure_cooldown_secs: default_failure_cooldown_secs(),
+            auto_recovery: default_auto_recovery(),
+            max_checkpoints: default_max_checkpoints(),
+            shutdown_timeout_secs: default_shutdown_timeout_secs(),
+        }
+    }
+}
+
 /// Full node configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
@@ -284,6 +351,10 @@ pub struct NodeConfig {
     /// Directory to persist model checkpoints (aggregator only).
     #[serde(default = "default_checkpoint_dir")]
     pub checkpoint_dir: PathBuf,
+
+    /// Fault tolerance and crash recovery configuration.
+    #[serde(default)]
+    pub fault_tolerance: FaultToleranceNodeConfig,
 }
 
 /// On-chain pipeline configuration for aggregator nodes.
@@ -407,6 +478,7 @@ impl Default for NodeConfig {
             chain: None,
             data_source: DataSourceConfig::default(),
             checkpoint_dir: default_checkpoint_dir(),
+            fault_tolerance: FaultToleranceNodeConfig::default(),
         }
     }
 }
