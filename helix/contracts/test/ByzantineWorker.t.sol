@@ -151,9 +151,9 @@ contract ByzantineWorkerTest is Test {
         vm.prank(honestWorkers[0]);
         coordinator.submitProof(modelId, 1, proof, inputs);
 
-        // Byzantine worker tries to submit same round
+        // Byzantine worker tries to submit same proof (replay protection)
         vm.prank(byzantineWorkers[0]);
-        vm.expectRevert(HelixCoordinatorV2.RoundAlreadyCompleted.selector);
+        vm.expectRevert(HelixCoordinatorV2.ProofAlreadyUsed.selector);
         coordinator.submitProof(modelId, 1, proof, inputs);
 
         // Honest worker should have completed the round
@@ -188,8 +188,18 @@ contract ByzantineWorkerTest is Test {
         coordinator.startRound(modelId, ROUND_DURATION);
 
         // Second Byzantine submits invalid in round 2 with unique proof
+        // Note: commitment chaining means old commitment is now hash(1111, 2222)
+        // Step must be sequential: lastStepNumber is now 1, so step must be 2
         mockVerifier.setShouldPass(false);
-        uint256[] memory inputs2 = _createValidPublicInputs(1111, 2222, 3333, 4444, modelId);
+        uint256[] memory inputs2 = new uint256[](8);
+        inputs2[0] = 1111;
+        inputs2[1] = 2222;
+        inputs2[2] = 3333;
+        inputs2[3] = 4444;
+        inputs2[4] = 100;
+        inputs2[5] = 10;
+        inputs2[6] = 2;  // step 2 (sequential)
+        inputs2[7] = ProofFixtureHardcoded.computeErrorChecksum(inputs2[5], inputs2[6], modelId, 1e18);
         bytes memory proof1 = new bytes(320);
         proof1[0] = 0x02;
 
@@ -356,9 +366,9 @@ contract ByzantineWorkerTest is Test {
         vm.prank(sybilCluster[0]);
         coordinator.submitProof(modelId, 1, proof, inputs);
 
-        // Other Sybils can't submit to same round
+        // Other Sybils can't submit same proof (replay protection)
         vm.prank(sybilCluster[1]);
-        vm.expectRevert(HelixCoordinatorV2.RoundAlreadyCompleted.selector);
+        vm.expectRevert(HelixCoordinatorV2.ProofAlreadyUsed.selector);
         coordinator.submitProof(modelId, 1, proof, inputs);
     }
 
@@ -641,6 +651,10 @@ contract ByzantineWorkerTest is Test {
 
         vm.prank(byzantineWorkers[0]);
         coordinator.submitProof(modelId, 1, proof, inputs);
+
+        // Finalize the round so challengeProof can work
+        vm.prank(modelOwner);
+        coordinator.finalizeRound(modelId, 1);
 
         // Later discovered to be fraudulent
         mockVerifier.setShouldPass(false);

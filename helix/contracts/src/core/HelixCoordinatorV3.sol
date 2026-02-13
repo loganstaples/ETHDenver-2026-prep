@@ -197,6 +197,23 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
     /// @notice Active job per model: modelId => jobId (0 = no job)
     mapping(uint256 => uint256) public activeModelJob;
 
+    // ============ Commitment Chaining & Step Sequencing State ============
+
+    /// @notice Per-model step counter: last finalized step number
+    mapping(uint256 => uint256) public lastStepNumber;
+
+    /// @notice Per-round maximum cumulative error budget (0 = no limit)
+    mapping(uint256 => mapping(uint256 => uint256)) public roundMaxErrorBudget;
+
+    /// @notice Per-round accumulated error from accepted proofs
+    mapping(uint256 => mapping(uint256 => uint256)) public roundAccumulatedError;
+
+    /// @notice Whether training has been halted for a round (error budget exceeded)
+    mapping(uint256 => mapping(uint256 => bool)) public roundHalted;
+
+    /// @notice Step number expected for proofs in this round
+    mapping(uint256 => mapping(uint256 => uint256)) public roundExpectedStep;
+
     // ============ Events ============
 
     event ModelRegistered(
@@ -261,6 +278,42 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
     event TrainingJobFunded(uint256 indexed modelId, uint256 indexed roundId, uint256 feeAmount);
     event TrainingJobRefunded(uint256 indexed modelId, uint256 indexed roundId, uint256 refundAmount);
     event TrainingJobCancelled(uint256 indexed jobId, uint256 refundAmount);
+
+    /// @notice Emitted when a proof is accepted with full details
+    event ProofAccepted(
+        uint256 indexed modelId,
+        uint256 indexed roundId,
+        address indexed prover,
+        uint256 stepNumber,
+        uint256 newCommitment,
+        uint256 loss,
+        uint256 errorBound
+    );
+
+    /// @notice Emitted when model commitment is updated
+    event CommitmentUpdated(
+        uint256 indexed modelId,
+        uint256 indexed roundId,
+        uint256 oldCommitment,
+        uint256 newCommitment,
+        uint256 stepNumber
+    );
+
+    /// @notice Emitted when error budget reaches 80% threshold
+    event ErrorBudgetWarning(
+        uint256 indexed modelId,
+        uint256 indexed roundId,
+        uint256 accumulated,
+        uint256 budget
+    );
+
+    /// @notice Emitted when training is halted due to error budget exhaustion
+    event TrainingHalted(
+        uint256 indexed modelId,
+        uint256 indexed roundId,
+        uint256 accumulatedError,
+        uint256 maxBudget
+    );
 
     // ============ Modifiers ============
 
@@ -387,6 +440,30 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
     }
 
     function _startRound(uint256 modelId, uint256 duration, uint32 minParticipants) internal {
+        _startRoundInternal(modelId, duration, minParticipants, 0);
+    }
+
+    /// @notice Starts a new training round with an error budget
+    function startRoundWithBudget(
+        uint256 modelId,
+        uint256 duration,
+        uint256 maxErrorBudget
+    ) external whenNotPaused nonReentrant modelExists(modelId) {
+        _startRoundInternal(modelId, duration, DEFAULT_MIN_PARTICIPANTS, maxErrorBudget);
+    }
+
+    /// @notice Starts a new training round with threshold and error budget
+    function startRoundWithThresholdAndBudget(
+        uint256 modelId,
+        uint256 duration,
+        uint32 minParticipants,
+        uint256 maxErrorBudget
+    ) external whenNotPaused nonReentrant modelExists(modelId) {
+        require(minParticipants > 0, "Min participants must be > 0");
+        _startRoundInternal(modelId, duration, minParticipants, maxErrorBudget);
+    }
+
+    function _startRoundInternal(uint256 modelId, uint256 duration, uint32 minParticipants, uint256 maxErrorBudget) internal {
         Model storage model = models[modelId];
         require(msg.sender == model.owner, "Only model owner");
         require(model.active, "Model not active");
@@ -412,6 +489,14 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
             bestLoss: type(uint256).max,
             bestNewCommitment: 0
         });
+
+        // Set expected step number for proofs in this round
+        roundExpectedStep[modelId][roundId] = lastStepNumber[modelId] + 1;
+
+        // Set error budget if specified
+        if (maxErrorBudget > 0) {
+            roundMaxErrorBudget[modelId][roundId] = maxErrorBudget;
+        }
 
         emit RoundStarted(modelId, roundId, deadline, model.currentCommitment);
     }
@@ -458,14 +543,8 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
         // Check staker has sufficient tokens via Staking.sol
         require(stakingContract.canParticipate(prover), "Insufficient stake or not active");
 
-        Model storage model = models[modelId];
-        Round storage round = rounds[modelId][roundId];
-        RoundExt storage ext = roundsExt[modelId][roundId];
-
-        // Validate round
-        require(roundId == model.currentRound, "Invalid round");
-        require(!round.isCompleted, "Round completed");
-        require(block.timestamp <= round.deadline, "Round expired");
+        // Validate round state
+        _validateRound(modelId, roundId);
 
         // Validate public inputs count
         require(publicInputs.length == EXPECTED_PUBLIC_INPUTS, "Invalid public inputs count");
@@ -475,53 +554,101 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
         require(!usedProofHashes[proofHash], "Proof already used");
         usedProofHashes[proofHash] = true;
 
-        // Reconstruct and validate old commitment
-        uint256 oldCommitmentFromProof = _hashPair(publicInputs[0], publicInputs[1]);
-        require(oldCommitmentFromProof == round.modelCommitment, "Old commitment mismatch");
-
-        // Validate error bound
-        uint256 stepErrorBound = publicInputs[5];
-        require(stepErrorBound <= maxErrorBound, "Error bound exceeds maximum");
-
-        // Validate error checksum
-        uint256 errorChecksum = publicInputs[7];
-        uint256 expectedChecksum = _computeErrorChecksum(
-            stepErrorBound,
-            publicInputs[6],
-            modelId,
-            maxErrorBound
-        );
-        require(errorChecksum == expectedChecksum, "Error checksum mismatch");
+        // Validate commitment, step, error bound, checksum
+        _validateProofInputs(modelId, roundId, publicInputs);
 
         // Verify the proof
         bool valid = verifier.verifyProof(proof, publicInputs);
 
         if (!valid) {
-            // Slash via Staking.sol - invalid proofs are Major severity (50% slash)
-            stakingContract.slashWithSeverity(
-                prover,
-                Staking.SeverityLevel.Major,
-                Staking.ViolationType.InvalidProof,
-                address(0),
-                "Invalid ZK proof submitted"
-            );
-
-            emit InvalidProofDetected(modelId, roundId, prover, proofHash);
-
-            // Record slashing
-            slashingRecords.push(SlashingRecord({
-                prover: prover,
-                modelId: uint64(modelId),
-                roundId: uint32(roundId),
-                amount: 0, // Actual amount determined by Staking.sol severity
-                reason: "Invalid proof",
-                timestamp: uint40(block.timestamp)
-            }));
+            _handleInvalidProof(prover, modelId, roundId, proofHash);
             return;
         }
 
-        // Record participant data
+        // Proof accepted - record and update state
+        _acceptProof(prover, modelId, roundId, publicInputs, proofHash);
+    }
+
+    /// @notice Validates round state for proof submission
+    function _validateRound(uint256 modelId, uint256 roundId) internal view {
+        Model storage model = models[modelId];
+        Round storage round = rounds[modelId][roundId];
+
+        require(roundId == model.currentRound, "Invalid round");
+        require(!round.isCompleted, "Round completed");
+        require(block.timestamp <= round.deadline, "Round expired");
+        require(!roundHalted[modelId][roundId], "Training halted for round");
+    }
+
+    /// @notice Validates proof public inputs (commitment chaining, step, error bound, checksum)
+    function _validateProofInputs(
+        uint256 modelId,
+        uint256 roundId,
+        uint256[] memory publicInputs
+    ) internal view {
+        // Commitment chaining
+        uint256 oldCommitmentFromProof = _hashPair(publicInputs[0], publicInputs[1]);
+        require(oldCommitmentFromProof == models[modelId].currentCommitment, "Old commitment mismatch");
+
+        // Step number sequencing
+        uint256 proofStep = publicInputs[6];
+        uint256 expectedStep = roundExpectedStep[modelId][roundId];
+        if (expectedStep == 0) {
+            expectedStep = lastStepNumber[modelId] + 1;
+        }
+        require(proofStep == expectedStep, "Step number mismatch");
+
+        // Error bound
+        uint256 stepErrorBound = publicInputs[5];
+        require(stepErrorBound <= maxErrorBound, "Error bound exceeds maximum");
+
+        // Error checksum
+        uint256 expectedChecksum = _computeErrorChecksum(
+            stepErrorBound, proofStep, modelId, maxErrorBound
+        );
+        require(publicInputs[7] == expectedChecksum, "Error checksum mismatch");
+    }
+
+    /// @notice Handles invalid proof: slash prover and record
+    function _handleInvalidProof(
+        address prover,
+        uint256 modelId,
+        uint256 roundId,
+        bytes32 proofHash
+    ) internal {
+        stakingContract.slashWithSeverity(
+            prover,
+            Staking.SeverityLevel.Major,
+            Staking.ViolationType.InvalidProof,
+            address(0),
+            "Invalid ZK proof submitted"
+        );
+
+        emit InvalidProofDetected(modelId, roundId, prover, proofHash);
+
+        slashingRecords.push(SlashingRecord({
+            prover: prover,
+            modelId: uint64(modelId),
+            roundId: uint32(roundId),
+            amount: 0,
+            reason: "Invalid proof",
+            timestamp: uint40(block.timestamp)
+        }));
+    }
+
+    /// @notice Records accepted proof and updates state
+    function _acceptProof(
+        address prover,
+        uint256 modelId,
+        uint256 roundId,
+        uint256[] memory publicInputs,
+        bytes32 proofHash
+    ) internal {
+        RoundExt storage ext = roundsExt[modelId][roundId];
         uint256 loss = publicInputs[4];
+        uint256 stepErrorBound = publicInputs[5];
+
+        // Record participant data
         roundParticipants[modelId][roundId][prover] = RoundParticipant({
             newCommitmentLo: publicInputs[2],
             newCommitmentHi: publicInputs[3],
@@ -533,15 +660,32 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
         roundParticipantList[modelId][roundId].push(prover);
         ext.validProofs++;
 
+        // Track per-round accumulated error
+        roundAccumulatedError[modelId][roundId] += stepErrorBound;
+
         // Track best (lowest) loss
+        uint256 newCommitment = _hashPair(publicInputs[2], publicInputs[3]);
         if (loss < ext.bestLoss) {
             ext.bestLoss = loss;
             ext.bestProver = prover;
-            ext.bestNewCommitment = _hashPair(publicInputs[2], publicInputs[3]);
+            ext.bestNewCommitment = newCommitment;
         }
 
-        uint256 newCommitment = _hashPair(publicInputs[2], publicInputs[3]);
+        // Emit rich events
+        emit ProofAccepted(modelId, roundId, prover, publicInputs[6], newCommitment, loss, stepErrorBound);
         emit ProofSubmitted(modelId, roundId, prover, newCommitment, stepErrorBound);
+
+        // Error budget enforcement (checked AFTER acceptance so halt flag persists)
+        uint256 maxBudget = roundMaxErrorBudget[modelId][roundId];
+        if (maxBudget > 0) {
+            uint256 accumulated = roundAccumulatedError[modelId][roundId];
+            if (accumulated > maxBudget) {
+                roundHalted[modelId][roundId] = true;
+                emit TrainingHalted(modelId, roundId, accumulated, maxBudget);
+            } else if (accumulated * 100 >= maxBudget * 80) {
+                emit ErrorBudgetWarning(modelId, roundId, accumulated, maxBudget);
+            }
+        }
 
         // For single-participant rounds (backward compat), auto-finalize
         if (ext.minParticipants <= 1) {
@@ -610,6 +754,7 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
         RoundExt storage ext = roundsExt[modelId][roundId];
 
         address bestProver = ext.bestProver;
+        uint256 oldCommitment = model.currentCommitment;
         uint256 newCommitment = ext.bestNewCommitment;
         RoundParticipant storage best = roundParticipants[modelId][roundId][bestProver];
 
@@ -618,6 +763,13 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
         round.isCompleted = true;
         round.prover = bestProver;
         ext.finalized = true;
+
+        // Advance step counter on finalization
+        uint256 expectedStep = roundExpectedStep[modelId][roundId];
+        if (expectedStep == 0) {
+            expectedStep = lastStepNumber[modelId] + 1;
+        }
+        lastStepNumber[modelId] = expectedStep;
 
         uint256 stepErrorBound = best.errorBound;
         uint256 newAccumulatedError = accumulatedErrorBound[modelId] + stepErrorBound;
@@ -638,7 +790,10 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
 
         _distributeRoundFees(modelId, roundId);
 
+        // Emit rich events
+        emit CommitmentUpdated(modelId, roundId, oldCommitment, newCommitment, expectedStep);
         emit RoundCompleted(modelId, roundId, newCommitment, newAccumulatedError);
+        emit RoundFinalized(modelId, roundId, bestProver, ext.bestLoss);
     }
 
     // ============ Training Jobs ============
@@ -770,6 +925,48 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
                 reason: "Fraudulent proof challenged",
                 timestamp: uint40(block.timestamp)
             }));
+        }
+    }
+
+    // ============ Sequential Batch Submission ============
+
+    /// @notice Submits multiple sequential proofs for the same model in one transaction
+    /// @dev Each proof advances the model commitment; all are for consecutive rounds
+    /// @param modelId The model ID
+    /// @param roundId The round ID
+    /// @param proofs Array of proof bytes
+    /// @param publicInputsArray Array of public inputs arrays (one per proof)
+    function submitSequentialBatch(
+        uint256 modelId,
+        uint256 roundId,
+        bytes[] calldata proofs,
+        uint256[][] calldata publicInputsArray
+    ) external whenNotPaused nonReentrant {
+        uint256 n = proofs.length;
+        require(n > 0, "Empty batch");
+        require(proofs.length == publicInputsArray.length, "Length mismatch");
+
+        for (uint256 i = 0; i < n; i++) {
+            _processProof(msg.sender, modelId, roundId, proofs[i], publicInputsArray[i]);
+        }
+        emit BatchProofSubmitted(msg.sender, n);
+    }
+
+    // ============ Error Budget Management ============
+
+    /// @notice Increases the error budget for a round (allows training to continue after halt)
+    /// @param modelId The model ID
+    /// @param roundId The round ID
+    /// @param additionalBudget Additional error budget to add
+    function increaseErrorBudget(uint256 modelId, uint256 roundId, uint256 additionalBudget) external {
+        require(
+            msg.sender == models[modelId].owner || msg.sender == owner,
+            "Not authorized"
+        );
+        roundMaxErrorBudget[modelId][roundId] += additionalBudget;
+        // If training was halted, un-halt it
+        if (roundHalted[modelId][roundId]) {
+            roundHalted[modelId][roundId] = false;
         }
     }
 
@@ -1039,5 +1236,25 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
 
     function getRoundDataRoot(uint256 modelId, uint256 roundId) external view returns (bytes32) {
         return roundDataRoot[modelId][roundId];
+    }
+
+    /// @notice Gets the current step number for a model
+    function getLastStepNumber(uint256 modelId) external view returns (uint256) {
+        return lastStepNumber[modelId];
+    }
+
+    /// @notice Gets round progress information
+    function getRoundProgress(uint256 modelId, uint256 roundId) external view returns (
+        uint256 expectedStep,
+        uint256 accumulatedError,
+        uint256 errorBudget,
+        bool halted
+    ) {
+        return (
+            roundExpectedStep[modelId][roundId],
+            roundAccumulatedError[modelId][roundId],
+            roundMaxErrorBudget[modelId][roundId],
+            roundHalted[modelId][roundId]
+        );
     }
 }

@@ -77,6 +77,9 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
     error ProofAlreadyUsed();
     // Batch submission error
     error EmptyBatch();
+    error StepNumberMismatch();
+    error ErrorBudgetExhausted();
+    error TrainingHaltedForRound();
 
     // ============ Structs (Optimized for Storage Packing) ============
 
@@ -264,6 +267,24 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
 
     /// @notice Proof replay protection: hash(proof || publicInputs) => used
     mapping(bytes32 => bool) public usedProofHashes;
+
+    /// @notice Per-model step counter: last accepted step number
+    mapping(uint256 => uint256) public lastStepNumber;
+
+    /// @notice Per-round maximum cumulative error budget (0 = no limit)
+    mapping(uint256 => mapping(uint256 => uint256)) public roundMaxErrorBudget;
+
+    /// @notice Per-round accumulated error from accepted proofs
+    mapping(uint256 => mapping(uint256 => uint256)) public roundAccumulatedError;
+
+    /// @notice Whether training has been halted for a round (error budget exceeded)
+    mapping(uint256 => mapping(uint256 => bool)) public roundHalted;
+
+    /// @notice Number of proofs accepted per round
+    mapping(uint256 => mapping(uint256 => uint256)) public roundProofCount;
+
+    /// @notice Last loss value per round (from most recent accepted proof)
+    mapping(uint256 => mapping(uint256 => uint256)) public roundLastLoss;
 
     // ============ Admin Timelock State ============
 
@@ -459,6 +480,52 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
     /// @notice Emitted when a timelocked admin change is executed
     event AdminChangeExecuted(bytes32 indexed changeKey);
 
+    /// @notice Emitted when a proof is accepted with full details
+    event ProofAccepted(
+        uint256 indexed modelId,
+        uint256 indexed roundId,
+        address indexed prover,
+        uint256 stepNumber,
+        uint256 newCommitment,
+        uint256 loss,
+        uint256 errorBound
+    );
+
+    /// @notice Emitted when model commitment is updated
+    event CommitmentUpdated(
+        uint256 indexed modelId,
+        uint256 indexed roundId,
+        uint256 oldCommitment,
+        uint256 newCommitment,
+        uint256 stepNumber
+    );
+
+    /// @notice Emitted when error budget reaches 80% threshold
+    event ErrorBudgetWarning(
+        uint256 indexed modelId,
+        uint256 indexed roundId,
+        uint256 accumulated,
+        uint256 budget
+    );
+
+    /// @notice Emitted when training is halted due to error budget exhaustion
+    event TrainingHalted(
+        uint256 indexed modelId,
+        uint256 indexed roundId,
+        uint256 accumulatedError,
+        uint256 maxBudget
+    );
+
+    /// @notice Emitted when a round is finalized
+    event RoundFinalized(
+        uint256 indexed modelId,
+        uint256 indexed roundId,
+        uint256 finalCommitment,
+        uint256 totalSteps,
+        uint256 finalLoss,
+        uint256 totalError
+    );
+
     // ============ Modifiers ============
 
     modifier onlyOwner() {
@@ -589,6 +656,37 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
         emit RoundStarted(modelId, roundId, deadline, model.currentCommitment);
     }
 
+    /// @notice Starts a new training round with an error budget
+    /// @param modelId The model ID
+    /// @param duration Round duration in seconds
+    /// @param maxErrorBudget Maximum cumulative error allowed (0 = no limit)
+    function startRoundWithBudget(
+        uint256 modelId,
+        uint256 duration,
+        uint256 maxErrorBudget
+    ) external whenNotPaused modelExists(modelId) {
+        Model storage model = models[modelId];
+        if (msg.sender != model.owner) revert NotModelOwner();
+        if (!model.active) revert ModelNotActive();
+
+        uint32 roundId = ++model.currentRound;
+        uint40 deadline = uint40(block.timestamp + duration);
+
+        rounds[modelId][roundId] = Round({
+            modelCommitment: model.currentCommitment,
+            newCommitment: 0,
+            deadline: deadline,
+            isCompleted: false,
+            prover: address(0)
+        });
+
+        if (maxErrorBudget > 0) {
+            roundMaxErrorBudget[modelId][roundId] = maxErrorBudget;
+        }
+
+        emit RoundStarted(modelId, roundId, deadline, model.currentCommitment);
+    }
+
     // ============ Staking ============
 
     /// @notice Stakes tokens to participate in a model's training
@@ -649,6 +747,28 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
         emit BatchProofSubmitted(msg.sender, n);
     }
 
+    /// @notice Submits multiple sequential proofs for the same model/round in one transaction
+    /// @dev Each proof's new_hash feeds into the next proof's expected old_hash via commitment chaining
+    /// @param modelId The model ID
+    /// @param roundId The round ID
+    /// @param proofs Array of proof bytes
+    /// @param publicInputsArray Array of public inputs arrays (one per proof)
+    function submitSequentialBatch(
+        uint256 modelId,
+        uint256 roundId,
+        bytes[] calldata proofs,
+        uint256[][] calldata publicInputsArray
+    ) external nonReentrant whenNotPaused {
+        uint256 n = proofs.length;
+        if (n == 0) revert EmptyBatch();
+        require(proofs.length == publicInputsArray.length, "Length mismatch");
+
+        for (uint256 i = 0; i < n; i++) {
+            _processProof(msg.sender, modelId, roundId, proofs[i], publicInputsArray[i]);
+        }
+        emit BatchProofSubmitted(msg.sender, n);
+    }
+
     /// @notice Internal proof processing logic
     function _processProof(
         address prover,
@@ -673,6 +793,9 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
         if (round.isCompleted) revert RoundAlreadyCompleted();
         if (block.timestamp > round.deadline) revert RoundExpired();
 
+        // Check if training is halted for this round
+        if (roundHalted[modelId][roundId]) revert TrainingHaltedForRound();
+
         // Validate public inputs count (8 inputs including error checksum)
         if (publicInputs.length != EXPECTED_PUBLIC_INPUTS) revert InvalidPublicInputsCount();
 
@@ -681,11 +804,17 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
         if (usedProofHashes[proofHash]) revert ProofAlreadyUsed();
         usedProofHashes[proofHash] = true;
 
-        // Reconstruct and validate old commitment
+        // Commitment chaining: validate old_hash matches current model commitment
+        // First proof in a round: model.currentCommitment == round.modelCommitment (set in startRound)
+        // Subsequent proofs: model.currentCommitment was updated by previous proof
         uint256 oldCommitmentFromProof = _hashPair(publicInputs[0], publicInputs[1]);
-        if (oldCommitmentFromProof != round.modelCommitment) revert OldCommitmentMismatch();
+        if (oldCommitmentFromProof != model.currentCommitment) revert OldCommitmentMismatch();
 
-        // Validate error bound
+        // Step number sequencing: must be exactly lastStepNumber + 1
+        uint256 proofStep = publicInputs[6];
+        if (proofStep != lastStepNumber[modelId] + 1) revert StepNumberMismatch();
+
+        // Validate per-step error bound
         uint256 stepErrorBound = publicInputs[5];
         if (stepErrorBound > maxErrorBound) revert ErrorBoundExceeded();
 
@@ -693,7 +822,7 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
         uint256 errorChecksum = publicInputs[7];
         uint256 expectedChecksum = _computeErrorChecksum(
             stepErrorBound,
-            publicInputs[6], // step_number
+            proofStep,
             modelId,
             maxErrorBound
         );
@@ -708,16 +837,25 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
             return;
         }
 
-        // Extract new commitment
+        // Proof accepted - update state
+        uint256 oldCommitment = model.currentCommitment;
         uint256 newCommitment = _hashPair(publicInputs[2], publicInputs[3]);
+        uint256 loss = publicInputs[4];
 
-        // Update state
+        // Update model commitment (chaining for next proof)
         model.currentCommitment = newCommitment;
         round.newCommitment = newCommitment;
-        round.isCompleted = true;
         round.prover = prover;
 
-        // Track accumulated error bound
+        // Update step counter
+        lastStepNumber[modelId] = proofStep;
+
+        // Update round tracking
+        roundProofCount[modelId][roundId]++;
+        roundLastLoss[modelId][roundId] = loss;
+
+        // Track accumulated error (both per-round and per-model)
+        roundAccumulatedError[modelId][roundId] += stepErrorBound;
         uint256 newAccumulatedError = accumulatedErrorBound[modelId] + stepErrorBound;
         accumulatedErrorBound[modelId] = newAccumulatedError;
 
@@ -729,8 +867,25 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
             modelRegistry.updateModel(modelId, bytes32(newCommitment), roundId, "", stepErrorBound, proofHash);
         }
 
+        // Emit rich events
+        emit ProofAccepted(modelId, roundId, prover, proofStep, newCommitment, loss, stepErrorBound);
+        emit CommitmentUpdated(modelId, roundId, oldCommitment, newCommitment, proofStep);
+
+        // Error budget enforcement (per-round cumulative)
+        // Checked AFTER proof acceptance so halt flag persists (reverts would undo state)
+        uint256 maxBudget = roundMaxErrorBudget[modelId][roundId];
+        if (maxBudget > 0) {
+            uint256 accumulated = roundAccumulatedError[modelId][roundId];
+            if (accumulated > maxBudget) {
+                roundHalted[modelId][roundId] = true;
+                emit TrainingHalted(modelId, roundId, accumulated, maxBudget);
+            } else if (accumulated * 100 >= maxBudget * 80) {
+                emit ErrorBudgetWarning(modelId, roundId, accumulated, maxBudget);
+            }
+        }
+
+        // Keep emitting existing event for backward compatibility
         emit ProofSubmitted(modelId, roundId, prover, newCommitment, stepErrorBound);
-        emit RoundCompleted(modelId, roundId, newCommitment, newAccumulatedError);
     }
 
     /// @notice Computes the expected error checksum for verification
@@ -843,6 +998,48 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
         }
     }
 
+    // ============ Round Finalization ============
+
+    /// @notice Finalizes a training round, marking it complete
+    /// @dev Can only be called when at least one proof has been submitted
+    /// @param modelId The model ID
+    /// @param roundId The round ID to finalize
+    function finalizeRound(uint256 modelId, uint256 roundId) external whenNotPaused {
+        if (models[modelId].owner == address(0)) revert ModelNotFound();
+        Round storage round = rounds[modelId][roundId];
+        if (round.isCompleted) revert RoundAlreadyCompleted();
+        require(roundProofCount[modelId][roundId] > 0, "No proofs submitted");
+
+        // Only model owner or contract owner can finalize
+        if (msg.sender != models[modelId].owner && msg.sender != owner) revert NotAuthorized();
+
+        round.isCompleted = true;
+
+        emit RoundFinalized(
+            modelId,
+            roundId,
+            round.newCommitment,
+            roundProofCount[modelId][roundId],
+            roundLastLoss[modelId][roundId],
+            roundAccumulatedError[modelId][roundId]
+        );
+
+        emit RoundCompleted(modelId, roundId, round.newCommitment, accumulatedErrorBound[modelId]);
+    }
+
+    /// @notice Increases the error budget for a round (allows training to continue after halt)
+    /// @param modelId The model ID
+    /// @param roundId The round ID
+    /// @param additionalBudget Additional error budget to add
+    function increaseErrorBudget(uint256 modelId, uint256 roundId, uint256 additionalBudget) external {
+        if (msg.sender != models[modelId].owner && msg.sender != owner) revert NotAuthorized();
+        roundMaxErrorBudget[modelId][roundId] += additionalBudget;
+        // If training was halted, un-halt it
+        if (roundHalted[modelId][roundId]) {
+            roundHalted[modelId][roundId] = false;
+        }
+    }
+
     // ============ View Functions ============
 
     /// @notice Gets the current state of a model
@@ -918,6 +1115,30 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
     /// @notice Gets the effective stake lock period in seconds
     function stakeLockPeriod() external view returns (uint256) {
         return uint256(stakeLockDays) * 1 days;
+    }
+
+    /// @notice Gets the current step number for a model
+    function getLastStepNumber(uint256 modelId) external view returns (uint256) {
+        return lastStepNumber[modelId];
+    }
+
+    /// @notice Gets round progress information
+    function getRoundProgress(uint256 modelId, uint256 roundId) external view returns (
+        uint256 proofCount,
+        uint256 currentStepNumber,
+        uint256 accumulatedError,
+        uint256 errorBudget,
+        bool halted,
+        uint256 lastLoss
+    ) {
+        return (
+            roundProofCount[modelId][roundId],
+            lastStepNumber[modelId],
+            roundAccumulatedError[modelId][roundId],
+            roundMaxErrorBudget[modelId][roundId],
+            roundHalted[modelId][roundId],
+            roundLastLoss[modelId][roundId]
+        );
     }
 
     // ============ Internal Helpers ============

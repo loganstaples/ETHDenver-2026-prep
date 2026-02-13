@@ -194,7 +194,7 @@ contract AdversarialTest is Test {
 
     // ============ Double Submission Attacks ============
 
-    /// @notice Test that same prover cannot submit twice to same round
+    /// @notice Test that same prover cannot submit twice to same round with same proof
     function test_DoubleSubmissionSameProver() public {
         (uint256 modelId, uint256 hashLo, uint256 hashHi) = _setupModelAndRound();
 
@@ -210,9 +210,9 @@ contract AdversarialTest is Test {
         vm.prank(honestProver);
         coordinator.submitProof(modelId, 1, proof, inputs);
 
-        // Second submission fails (round completed)
+        // Second submission fails (proof replay protection)
         vm.prank(honestProver);
-        vm.expectRevert(HelixCoordinatorV2.RoundAlreadyCompleted.selector);
+        vm.expectRevert(HelixCoordinatorV2.ProofAlreadyUsed.selector);
         coordinator.submitProof(modelId, 1, proof, inputs);
     }
 
@@ -235,7 +235,11 @@ contract AdversarialTest is Test {
         vm.prank(honestProver);
         coordinator.submitProof(modelId, 1, proof, inputs);
 
-        // Attacker tries to submit same round
+        // Finalize the round
+        vm.prank(modelOwner);
+        coordinator.finalizeRound(modelId, 1);
+
+        // Attacker tries to submit to completed round
         vm.prank(attacker1);
         vm.expectRevert(HelixCoordinatorV2.RoundAlreadyCompleted.selector);
         coordinator.submitProof(modelId, 1, proof, inputs);
@@ -306,9 +310,9 @@ contract AdversarialTest is Test {
         vm.prank(frontrunner);
         coordinator.submitProof(modelId, 1, proof, inputs);
 
-        // Honest prover's transaction now fails
+        // Honest prover's transaction now fails (proof replay protection)
         vm.prank(honestProver);
-        vm.expectRevert(HelixCoordinatorV2.RoundAlreadyCompleted.selector);
+        vm.expectRevert(HelixCoordinatorV2.ProofAlreadyUsed.selector);
         coordinator.submitProof(modelId, 1, proof, inputs);
 
         // Frontrunner got credit for the round
@@ -346,7 +350,16 @@ contract AdversarialTest is Test {
         coordinator.submitProof(modelId, 2, proof, inputs);
 
         // Even with correct old commitment and fresh proof, round 2 succeeds
-        uint256[] memory inputs2 = _createValidPublicInputs(newHashLo, newHashHi, 3333, 4444, modelId);
+        // Note: step must be sequential (lastStepNumber + 1 = 2)
+        uint256[] memory inputs2 = new uint256[](8);
+        inputs2[0] = newHashLo;
+        inputs2[1] = newHashHi;
+        inputs2[2] = 3333;
+        inputs2[3] = 4444;
+        inputs2[4] = 100;
+        inputs2[5] = 10;
+        inputs2[6] = 2;  // step 2 (sequential)
+        inputs2[7] = ProofFixtureHardcoded.computeErrorChecksum(inputs2[5], inputs2[6], modelId, 1e18);
         bytes memory proof2 = new bytes(320);
         proof2[0] = 0x01; // Unique proof bytes
         vm.prank(honestProver);
@@ -441,6 +454,10 @@ contract AdversarialTest is Test {
 
         vm.prank(attacker1);
         coordinator.submitProof(modelId, 1, proof, inputs);
+
+        // Finalize the round so challengeProof can work
+        vm.prank(modelOwner);
+        coordinator.finalizeRound(modelId, 1);
 
         // Later, someone discovers the proof was actually invalid
         // Change mock to return false for challenge verification
@@ -984,7 +1001,7 @@ contract AdversarialTest is Test {
         vm.prank(attacker1);
         coordinator.stake{value: LARGE_STAKE}(modelId);
 
-        // Test with zero values (except commitment)
+        // Test with zero values (except commitment and step number which must be 1)
         uint256[] memory inputs = new uint256[](8);
         inputs[0] = hashLo;
         inputs[1] = hashHi;
@@ -992,7 +1009,7 @@ contract AdversarialTest is Test {
         inputs[3] = 0;  // Zero new hash
         inputs[4] = 0;  // Zero loss
         inputs[5] = 0;  // Zero error bound
-        inputs[6] = 0;  // Zero step number
+        inputs[6] = 1;  // Step 1 (must be lastStepNumber + 1)
         inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(inputs[5], inputs[6], modelId, 1e18);
 
         bytes memory proof = new bytes(320);
@@ -1012,7 +1029,7 @@ contract AdversarialTest is Test {
         vm.prank(attacker1);
         coordinator.stake{value: LARGE_STAKE}(modelId);
 
-        // Test with max uint128 for hash values
+        // Test with max uint128 for hash values (step must be sequential: 1)
         uint256[] memory inputs = new uint256[](8);
         inputs[0] = hashLo;
         inputs[1] = hashHi;
@@ -1020,7 +1037,7 @@ contract AdversarialTest is Test {
         inputs[3] = type(uint128).max;  // Large new hash hi
         inputs[4] = type(uint128).max;  // Large loss
         inputs[5] = 10;  // Valid error bound
-        inputs[6] = type(uint64).max;  // Large step number
+        inputs[6] = 1;   // Step must be lastStepNumber + 1 = 1
         inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(inputs[5], inputs[6], modelId, 1e18);
 
         bytes memory proof = new bytes(320);
@@ -1062,7 +1079,7 @@ contract AdversarialTest is Test {
         (,, bool slashed0) = coordinator.getStake(attackers[0], modelId);
         assertTrue(slashed0);
 
-        // Second attacker submits valid with unique proof bytes (completes round)
+        // Second attacker submits valid with unique proof bytes
         mockVerifier.setShouldPass(true);
         bytes memory proof1 = new bytes(320);
         proof1[0] = 0x01; // Unique proof
@@ -1072,6 +1089,10 @@ contract AdversarialTest is Test {
         // Second attacker not slashed
         (,, bool slashed1) = coordinator.getStake(attackers[1], modelId);
         assertFalse(slashed1);
+
+        // Finalize the round
+        vm.prank(modelOwner);
+        coordinator.finalizeRound(modelId, 1);
 
         // Other attackers can't submit (round completed)
         for (uint256 i = 2; i < 5; i++) {

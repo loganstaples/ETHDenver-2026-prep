@@ -243,9 +243,9 @@ contract IntegrationTest is Test {
         (,, bool active) = coordinator.getModelState(modelId);
         assertTrue(active);
 
-        // Other provers cannot submit to completed round
+        // Other provers cannot submit same proof (replay protection)
         vm.prank(prover1);
-        vm.expectRevert(HelixCoordinatorV2.RoundAlreadyCompleted.selector);
+        vm.expectRevert(HelixCoordinatorV2.ProofAlreadyUsed.selector);
         coordinator.submitProof(modelId, 1, proof, inputs);
     }
 

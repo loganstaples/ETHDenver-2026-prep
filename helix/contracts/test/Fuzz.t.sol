@@ -437,8 +437,8 @@ contract FuzzTest is Test {
             vm.prank(modelOwner);
             coordinator.startRound(modelId, ROUND_DURATION);
 
-            // Since proofs fail, the model commitment stays the same
-            // So we always use the same old commitment
+            // Since proofs fail, the model commitment and lastStepNumber stay the same
+            // So we always use the same old commitment and step number must be 1
             uint256[] memory inputs = new uint256[](8);
             inputs[0] = hashLo;
             inputs[1] = hashHi;
@@ -446,10 +446,11 @@ contract FuzzTest is Test {
             inputs[3] = hashHi + 1;
             inputs[4] = 100;
             inputs[5] = 10;
-            inputs[6] = i + 1;
-            inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(10, i + 1, modelId, 1e18);
+            inputs[6] = 1;  // Step always 1 (invalid proofs don't update lastStepNumber)
+            inputs[7] = ProofFixtureHardcoded.computeErrorChecksum(10, 1, modelId, 1e18);
 
             bytes memory proof = new bytes(320);
+            proof[0] = bytes1(uint8(i)); // Unique proof per iteration
 
             uint256 treasuryBefore = treasury.balance;
 
