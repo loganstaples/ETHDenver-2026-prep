@@ -37,6 +37,7 @@ pub mod consensus;
 pub mod persistence;
 pub mod round_manager;
 pub mod dataset_sync;
+pub mod multi_round;
 
 // Re-export key types
 pub use round::{
@@ -143,6 +144,15 @@ pub use consensus::{
 
 pub use persistence::{
     AggregatorSnapshot, WorkerSnapshot, StatePersistence, PersistenceError,
+    RoundResultEntry,
+};
+
+pub use multi_round::{
+    MultiRoundConfig, MultiRoundController, MultiRoundError,
+    RoundResult, WeightStore, WeightStoreError, LocalWeightStore,
+    WorkerStateManager, RecoveredState, WorkerRecoveredState,
+    TrainingSummary as MultiRoundTrainingSummary,
+    compute_weight_commitment,
 };
 
 pub use session_manager::{

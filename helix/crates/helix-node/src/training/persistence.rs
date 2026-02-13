@@ -38,6 +38,38 @@ pub struct AggregatorSnapshot {
     pub timestamp: u64,
     /// Snapshot version for forward compatibility.
     pub version: u32,
+    /// URI where current model weights are stored (e.g. "file://..." or "ipfs://...").
+    #[serde(default)]
+    pub current_weight_uri: Option<String>,
+    /// Completed round results: (round_number, final_commitment, weights_uri, loss, error).
+    #[serde(default)]
+    pub completed_round_results: Vec<RoundResultEntry>,
+    /// Current model weight commitment (SHA-256).
+    #[serde(default)]
+    pub current_weight_commitment: Option<[u8; 32]>,
+}
+
+/// Compact record of a completed round for persistence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoundResultEntry {
+    /// Round number.
+    pub round_number: u64,
+    /// Model commitment after this round.
+    pub final_commitment: [u8; 32],
+    /// URI where weights are stored.
+    pub weights_uri: String,
+    /// Final loss value.
+    pub final_loss: f64,
+    /// Accumulated error bound.
+    pub total_error: f64,
+    /// Number of training steps.
+    pub steps_completed: u64,
+    /// Number of workers that contributed.
+    pub num_contributors: u32,
+    /// On-chain tx hash (if submitted).
+    pub tx_hash: Option<[u8; 32]>,
+    /// Completion timestamp.
+    pub completed_at: u64,
 }
 
 impl AggregatorSnapshot {
@@ -71,6 +103,9 @@ impl AggregatorSnapshot {
                 .unwrap_or_default()
                 .as_secs(),
             version: 1,
+            current_weight_uri: None,
+            completed_round_results: Vec::new(),
+            current_weight_commitment: None,
         }
     }
 
@@ -102,6 +137,15 @@ pub struct WorkerSnapshot {
     pub timestamp: u64,
     /// Snapshot version.
     pub version: u32,
+    /// Optimizer state bytes (Adam moments, etc.) for resume.
+    #[serde(default)]
+    pub optimizer_state: Option<Vec<u8>>,
+    /// Last verified on-chain commitment for this worker.
+    #[serde(default)]
+    pub last_verified_commitment: Option<[u8; 32]>,
+    /// URI of the weights this worker was trained on.
+    #[serde(default)]
+    pub weights_uri: Option<String>,
 }
 
 impl WorkerSnapshot {
@@ -116,6 +160,9 @@ impl WorkerSnapshot {
                 .unwrap_or_default()
                 .as_secs(),
             version: 1,
+            optimizer_state: None,
+            last_verified_commitment: None,
+            weights_uri: None,
         }
     }
 
