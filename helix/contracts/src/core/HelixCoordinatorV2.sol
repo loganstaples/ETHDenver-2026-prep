@@ -529,11 +529,16 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
 
     // ============ Model Management ============
 
-    /// @notice Registers a new model
+    /// @notice Registers a new model with architecture metadata
     function registerModel(
         string memory ipfsHash,
         uint256 initialCommitment,
-        uint256 minStake
+        uint256 minStake,
+        uint32 dIn,
+        uint32 dHidden,
+        uint32 dOut,
+        uint32 numLayers,
+        uint8 activationType
     ) external whenNotPaused returns (uint256 modelId) {
         modelId = nextModelId++;
 
@@ -554,7 +559,10 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
 
         // Optional ModelRegistry integration
         if (address(modelRegistry) != address(0)) {
-            modelRegistry.registerModel("", "", ipfsHash, bytes32(initialCommitment));
+            modelRegistry.registerModel(
+                "", "", ipfsHash, bytes32(initialCommitment),
+                ModelRegistry.ModelArchitecture(dIn, dHidden, dOut, numLayers, activationType)
+            );
         }
     }
 

@@ -139,7 +139,7 @@ contract AdversarialDemo is Script {
         vm.stopBroadcast();
         vm.startBroadcast(modelOwner);
 
-        modelId = coordinator.registerModel("QmTestModelIPFSHash", commitment, STANDARD_STAKE / 10);
+        modelId = coordinator.registerModel("QmTestModelIPFSHash", commitment, STANDARD_STAKE / 10, 4, 8, 2, 2, 0);
         console.log("Model registered with ID:", modelId);
         console.log("Initial commitment:", commitment);
 

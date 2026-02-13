@@ -3,8 +3,17 @@ pragma solidity ^0.8.24;
 
 /// @title ModelRegistry
 /// @notice Registry for ML models and their state commitments
-/// @dev Tracks model versions, checkpoints, and ownership
+/// @dev Tracks model versions, checkpoints, ownership, and architecture metadata
 contract ModelRegistry {
+    /// @notice Model architecture metadata
+    struct ModelArchitecture {
+        uint32 dIn;              // Input dimension
+        uint32 dHidden;          // Hidden dimension
+        uint32 dOut;             // Output dimension
+        uint32 numLayers;        // Number of layers
+        uint8 activationType;    // 0=ReLU, 1=Sigmoid, 2=Tanh, 3=GeLU, 4=LeakyReLU
+    }
+
     /// @notice Model information
     struct Model {
         string name;
@@ -47,6 +56,9 @@ contract ModelRegistry {
 
     /// @notice Reverse lookup: commitment => version index in checkpoints array (per model)
     mapping(uint256 => mapping(bytes32 => uint256)) public commitmentToVersion;
+
+    /// @notice Model architecture metadata per model ID
+    mapping(uint256 => ModelArchitecture) public modelArchitectures;
     
     /// @notice Owner for admin functions
     address public owner;
@@ -96,20 +108,26 @@ contract ModelRegistry {
         owner = msg.sender;
     }
     
-    /// @notice Register a new model
+    /// @notice Register a new model with architecture metadata
     /// @param name Model name
     /// @param description Model description
-    /// @param ipfsHash IPFS hash of model architecture
+    /// @param ipfsHash IPFS hash of model weights
     /// @param initialCommitment Initial state commitment
+    /// @param arch Model architecture (dimensions, layers, activation)
     /// @return modelId ID of the registered model
     function registerModel(
         string calldata name,
         string calldata description,
         string calldata ipfsHash,
-        bytes32 initialCommitment
+        bytes32 initialCommitment,
+        ModelArchitecture calldata arch
     ) external returns (uint256 modelId) {
+        require(arch.dIn > 0 && arch.dHidden > 0 && arch.dOut > 0, "Invalid dimensions");
+        require(arch.numLayers > 0, "Must have at least 1 layer");
+        require(arch.activationType <= 4, "Invalid activation type");
+
         modelId = nextModelId++;
-        
+
         models[modelId] = Model({
             name: name,
             description: description,
@@ -122,10 +140,12 @@ contract ModelRegistry {
             totalRounds: 0,
             isActive: true
         });
-        
+
+        modelArchitectures[modelId] = arch;
+
         commitmentToModel[initialCommitment] = modelId;
         ownerModels[msg.sender].push(modelId);
-        
+
         // Create initial checkpoint
         checkpoints[modelId].push(Checkpoint({
             roundId: 0,
@@ -261,6 +281,11 @@ contract ModelRegistry {
         );
     }
     
+    /// @notice Get model architecture metadata
+    function getModelArchitecture(uint256 modelId) external view returns (ModelArchitecture memory) {
+        return modelArchitectures[modelId];
+    }
+
     /// @notice Get checkpoint count for a model
     function getCheckpointCount(uint256 modelId) external view returns (uint256) {
         return checkpoints[modelId].length;

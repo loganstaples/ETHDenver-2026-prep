@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import "forge-std/Test.sol";
 import "../src/core/HelixCoordinatorV2.sol";
+import "../src/core/ModelRegistry.sol";
 import "../src/verification/Halo2Verifier.sol";
 import "./ProofFixtures.t.sol";
 
@@ -11,6 +12,7 @@ import "./ProofFixtures.t.sol";
 contract HelixCoordinatorV2Test is Test {
     HelixCoordinatorV2 public coordinator;
     Halo2Verifier public verifier;
+    ModelRegistry public registry;
 
     address public owner;
     address public treasury;
@@ -31,9 +33,12 @@ contract HelixCoordinatorV2Test is Test {
         prover1 = makeAddr("prover1");
         prover2 = makeAddr("prover2");
 
-        // Deploy verifier and coordinator
+        // Deploy verifier, registry, and coordinator
         verifier = new Halo2Verifier();
         coordinator = new HelixCoordinatorV2(address(verifier), treasury);
+        registry = new ModelRegistry();
+        registry.setCoordinator(address(coordinator));
+        coordinator.setModelRegistry(address(registry));
 
         // Fund provers
         vm.deal(prover1, 10 ether);
@@ -49,7 +54,7 @@ contract HelixCoordinatorV2Test is Test {
         vm.expectEmit(true, true, false, true);
         emit ModelRegistered(0, owner, initialCommitment, MIN_STAKE, ipfsHash);
 
-        uint256 modelId = coordinator.registerModel(ipfsHash, initialCommitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel(ipfsHash, initialCommitment, MIN_STAKE, 4, 8, 2, 2, 0);
 
         assertEq(modelId, 0);
 
@@ -60,9 +65,9 @@ contract HelixCoordinatorV2Test is Test {
     }
 
     function test_RegisterMultipleModels() public {
-        uint256 model1 = coordinator.registerModel("hash1", 100, MIN_STAKE);
-        uint256 model2 = coordinator.registerModel("hash2", 200, MIN_STAKE);
-        uint256 model3 = coordinator.registerModel("hash3", 300, MIN_STAKE);
+        uint256 model1 = coordinator.registerModel("hash1", 100, MIN_STAKE, 4, 8, 2, 2, 0);
+        uint256 model2 = coordinator.registerModel("hash2", 200, MIN_STAKE, 4, 8, 2, 2, 0);
+        uint256 model3 = coordinator.registerModel("hash3", 300, MIN_STAKE, 4, 8, 2, 2, 0);
 
         assertEq(model1, 0);
         assertEq(model2, 1);
@@ -72,7 +77,7 @@ contract HelixCoordinatorV2Test is Test {
     // ============ Staking Tests ============
 
     function test_Stake() public {
-        uint256 modelId = coordinator.registerModel("hash", 100, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("hash", 100, MIN_STAKE, 4, 8, 2, 2, 0);
 
         vm.prank(prover1);
         vm.expectEmit(true, true, false, true);
@@ -86,7 +91,7 @@ contract HelixCoordinatorV2Test is Test {
     }
 
     function test_StakeMultipleTimes() public {
-        uint256 modelId = coordinator.registerModel("hash", 100, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("hash", 100, MIN_STAKE, 4, 8, 2, 2, 0);
 
         vm.startPrank(prover1);
         coordinator.stake{value: 0.3 ether}(modelId);
@@ -98,7 +103,7 @@ contract HelixCoordinatorV2Test is Test {
     }
 
     function test_Unstake_AfterLockPeriod() public {
-        uint256 modelId = coordinator.registerModel("hash", 100, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("hash", 100, MIN_STAKE, 4, 8, 2, 2, 0);
 
         vm.prank(prover1);
         coordinator.stake{value: 0.5 ether}(modelId);
@@ -115,7 +120,7 @@ contract HelixCoordinatorV2Test is Test {
     }
 
     function test_Unstake_RevertIfStillLocked() public {
-        uint256 modelId = coordinator.registerModel("hash", 100, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("hash", 100, MIN_STAKE, 4, 8, 2, 2, 0);
 
         vm.prank(prover1);
         coordinator.stake{value: 0.5 ether}(modelId);
@@ -129,7 +134,7 @@ contract HelixCoordinatorV2Test is Test {
     // ============ Round Tests ============
 
     function test_StartRound() public {
-        uint256 modelId = coordinator.registerModel("hash", 100, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("hash", 100, MIN_STAKE, 4, 8, 2, 2, 0);
 
         vm.expectEmit(true, true, false, true);
         emit RoundStarted(modelId, 1, block.timestamp + ROUND_DURATION, 100);
@@ -140,7 +145,7 @@ contract HelixCoordinatorV2Test is Test {
     }
 
     function test_StartRound_OnlyOwner() public {
-        uint256 modelId = coordinator.registerModel("hash", 100, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("hash", 100, MIN_STAKE, 4, 8, 2, 2, 0);
 
         vm.prank(prover1);
         vm.expectRevert(HelixCoordinatorV2.NotModelOwner.selector);
@@ -155,7 +160,7 @@ contract HelixCoordinatorV2Test is Test {
         uint256 oldHashHi = 67890;
         uint256 correctCommitment = uint256(keccak256(abi.encodePacked(oldHashLo, oldHashHi)));
 
-        uint256 modelId = coordinator.registerModel("hash", correctCommitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("hash", correctCommitment, MIN_STAKE, 4, 8, 2, 2, 0);
         coordinator.startRound(modelId, ROUND_DURATION);
 
         // Prover stakes
@@ -192,7 +197,7 @@ contract HelixCoordinatorV2Test is Test {
     }
 
     function test_SubmitProof_InsufficientStake() public {
-        uint256 modelId = coordinator.registerModel("hash", 100, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("hash", 100, MIN_STAKE, 4, 8, 2, 2, 0);
         coordinator.startRound(modelId, ROUND_DURATION);
 
         // No stake
@@ -205,7 +210,7 @@ contract HelixCoordinatorV2Test is Test {
     }
 
     function test_SubmitProof_WrongRound() public {
-        uint256 modelId = coordinator.registerModel("hash", 100, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("hash", 100, MIN_STAKE, 4, 8, 2, 2, 0);
         coordinator.startRound(modelId, ROUND_DURATION);
 
         vm.prank(prover1);
@@ -220,7 +225,7 @@ contract HelixCoordinatorV2Test is Test {
     }
 
     function test_SubmitProof_ExpiredRound() public {
-        uint256 modelId = coordinator.registerModel("hash", 100, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("hash", 100, MIN_STAKE, 4, 8, 2, 2, 0);
         coordinator.startRound(modelId, ROUND_DURATION);
 
         vm.prank(prover1);
@@ -254,7 +259,7 @@ contract HelixCoordinatorV2Test is Test {
         uint256 oldHashHi = 222;
         uint256 correctCommitment = uint256(keccak256(abi.encodePacked(oldHashLo, oldHashHi)));
 
-        uint256 modelId = coordinator.registerModel("hash", correctCommitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("hash", correctCommitment, MIN_STAKE, 4, 8, 2, 2, 0);
         coordinator.startRound(modelId, ROUND_DURATION);
 
         vm.prank(prover1);
@@ -288,7 +293,7 @@ contract HelixCoordinatorV2Test is Test {
     // ============ Admin Tests ============
 
     function test_PauseModel() public {
-        uint256 modelId = coordinator.registerModel("hash", 100, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("hash", 100, MIN_STAKE, 4, 8, 2, 2, 0);
 
         coordinator.pauseModel(modelId);
         (,, bool active) = coordinator.getModelState(modelId);
@@ -315,7 +320,7 @@ contract HelixCoordinatorV2Test is Test {
         uint256 oldHashHi = 444;
         uint256 correctCommitment = uint256(keccak256(abi.encodePacked(oldHashLo, oldHashHi)));
 
-        uint256 modelId = coordinator.registerModel("hash", correctCommitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("hash", correctCommitment, MIN_STAKE, 4, 8, 2, 2, 0);
         coordinator.startRound(modelId, ROUND_DURATION);
 
         vm.prank(prover1);
@@ -347,5 +352,62 @@ contract HelixCoordinatorV2Test is Test {
         (bool success,) = address(coordinator).call{value: 1 ether}("");
         assertTrue(success);
         assertEq(address(coordinator).balance, 1 ether);
+    }
+
+    // ============ Architecture Validation Tests ============
+
+    function test_RegisterModel_ValidArchitecture() public {
+        vm.prank(owner);
+        uint256 modelId = coordinator.registerModel("QmArch", 99999, MIN_STAKE, 10, 20, 5, 3, 0);
+
+        // Verify architecture was stored in the registry
+        ModelRegistry.ModelArchitecture memory arch = registry.getModelArchitecture(modelId);
+        assertEq(arch.dIn, 10);
+        assertEq(arch.dHidden, 20);
+        assertEq(arch.dOut, 5);
+        assertEq(arch.numLayers, 3);
+        assertEq(arch.activationType, 0);
+    }
+
+    function test_RegisterModel_RejectsZeroDimensions() public {
+        vm.startPrank(owner);
+
+        // d_in = 0 should revert
+        vm.expectRevert("Invalid dimensions");
+        coordinator.registerModel("QmBad", 11111, MIN_STAKE, 0, 8, 2, 2, 0);
+
+        // d_hidden = 0 should revert
+        vm.expectRevert("Invalid dimensions");
+        coordinator.registerModel("QmBad", 22222, MIN_STAKE, 4, 0, 2, 2, 0);
+
+        // d_out = 0 should revert
+        vm.expectRevert("Invalid dimensions");
+        coordinator.registerModel("QmBad", 33333, MIN_STAKE, 4, 8, 0, 2, 0);
+
+        vm.stopPrank();
+    }
+
+    function test_RegisterModel_RejectsZeroLayers() public {
+        vm.prank(owner);
+        vm.expectRevert("Must have at least 1 layer");
+        coordinator.registerModel("QmBad", 44444, MIN_STAKE, 4, 8, 2, 0, 0);
+    }
+
+    function test_RegisterModel_RejectsInvalidActivation() public {
+        vm.prank(owner);
+        vm.expectRevert("Invalid activation type");
+        coordinator.registerModel("QmBad", 55555, MIN_STAKE, 4, 8, 2, 2, 5);
+    }
+
+    function test_RegisterModel_AllActivationTypes() public {
+        vm.startPrank(owner);
+        // All 5 activation types should be accepted (0=ReLU, 1=Sigmoid, 2=Tanh, 3=GeLU, 4=LeakyReLU)
+        for (uint8 act = 0; act <= 4; act++) {
+            uint256 commitment = uint256(keccak256(abi.encodePacked("act", act)));
+            uint256 modelId = coordinator.registerModel("QmAct", commitment, MIN_STAKE, 4, 8, 2, 2, act);
+            ModelRegistry.ModelArchitecture memory arch = registry.getModelArchitecture(modelId);
+            assertEq(arch.activationType, act);
+        }
+        vm.stopPrank();
     }
 }

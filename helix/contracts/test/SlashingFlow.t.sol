@@ -126,7 +126,7 @@ contract SlashingFlowTest is Test {
         uint256 commitment = uint256(keccak256(abi.encodePacked(hashLo, hashHi)));
 
         vm.prank(modelOwner);
-        modelId = coordinator.registerModel("QmTestModel", commitment, MIN_STAKE);
+        modelId = coordinator.registerModel("QmTestModel", commitment, MIN_STAKE, 4, 8, 2, 2, 0);
 
         vm.prank(modelOwner);
         coordinator.startRound(modelId, ROUND_DURATION);

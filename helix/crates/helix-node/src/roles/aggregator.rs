@@ -1228,6 +1228,8 @@ mod tests {
             d_hid: 8,
             d_out: 2,
             model_seed: 42,
+            num_layers: 2,
+            activation_type: 0,
         }
     }
 

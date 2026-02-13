@@ -69,7 +69,12 @@ interface IHelixCoordinatorV2 {
     function registerModel(
         string memory ipfsHash,
         uint256 initialCommitment,
-        uint256 minStake
+        uint256 minStake,
+        uint32 dIn,
+        uint32 dHidden,
+        uint32 dOut,
+        uint32 numLayers,
+        uint8 activationType
     ) external returns (uint256 modelId);
 
     function startRound(uint256 modelId, uint256 duration) external;

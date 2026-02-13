@@ -37,6 +37,25 @@ const CHECKPOINT_VERSION: u32 = 1;
 /// Flag: checkpoint includes error tracking state.
 const FLAG_HAS_ERROR_STATE: u32 = 1;
 
+/// Model architecture metadata describing the neural network structure.
+///
+/// This is stored as an in-memory field on `ModelCheckpoint` and also
+/// persisted via the JSON metadata HashMap for backward compatibility
+/// (no change to the binary checkpoint format).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelArchitectureMetadata {
+    /// Input dimension.
+    pub d_in: u32,
+    /// Hidden dimension.
+    pub d_hidden: u32,
+    /// Output dimension.
+    pub d_out: u32,
+    /// Number of layers.
+    pub num_layers: u32,
+    /// Activation function type (0=ReLU, 1=Sigmoid, 2=Tanh, 3=GeLU, 4=LeakyReLU).
+    pub activation_type: u8,
+}
+
 /// A complete model checkpoint that can be saved to disk and restored.
 ///
 /// Includes model weights, training metadata, and optionally the full
@@ -57,6 +76,9 @@ pub struct ModelCheckpoint {
     pub error_state: Option<CheckpointErrorState>,
     /// Arbitrary metadata (JSON-serializable).
     pub metadata: HashMap<String, String>,
+    /// Model architecture metadata (not part of binary format; persisted via `metadata` HashMap).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub architecture: Option<ModelArchitectureMetadata>,
 }
 
 /// A single layer in a checkpoint.
@@ -201,6 +223,7 @@ impl ModelCheckpoint {
             layers,
             error_state: None,
             metadata: HashMap::new(),
+            architecture: None,
         }
     }
 
@@ -214,6 +237,39 @@ impl ModelCheckpoint {
     pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.metadata.insert(key.into(), value.into());
         self
+    }
+
+    /// Sets the model architecture metadata.
+    ///
+    /// Stores the architecture both in the dedicated field and as a JSON
+    /// string in the `metadata` HashMap under the key `"architecture"`.
+    /// This ensures backward compatibility: older checkpoint readers that
+    /// do not know about the `architecture` field can still find it in
+    /// the JSON metadata section.
+    pub fn with_architecture(mut self, arch: ModelArchitectureMetadata) -> Self {
+        // Also store as JSON in the metadata HashMap for backward compatibility.
+        if let Ok(json) = serde_json::to_string(&arch) {
+            self.metadata.insert("architecture".to_string(), json);
+        }
+        self.architecture = Some(arch);
+        self
+    }
+
+    /// Returns the model architecture metadata, if available.
+    ///
+    /// First checks the dedicated `architecture` field. If that is `None`,
+    /// falls back to deserializing from the `"architecture"` key in the
+    /// `metadata` HashMap (for checkpoints created by older code that only
+    /// stored it there, or loaded from binary format which doesn't include
+    /// the dedicated field).
+    pub fn architecture(&self) -> Option<ModelArchitectureMetadata> {
+        if let Some(arch) = &self.architecture {
+            return Some(arch.clone());
+        }
+        // Fallback: try to deserialize from metadata HashMap.
+        self.metadata
+            .get("architecture")
+            .and_then(|json| serde_json::from_str(json).ok())
     }
 
     /// Computes the SHA-256 hash over all weight data.
@@ -427,6 +483,11 @@ impl ModelCheckpoint {
         let metadata: HashMap<String, String> = serde_json::from_slice(meta_bytes)
             .map_err(|e| HelixError::Serialization(SerializationError::JsonError(e.to_string())))?;
 
+        // Try to restore architecture from metadata JSON (backward compatible).
+        let architecture = metadata
+            .get("architecture")
+            .and_then(|json| serde_json::from_str(json).ok());
+
         Ok(Self {
             model_id,
             step_number,
@@ -435,6 +496,7 @@ impl ModelCheckpoint {
             layers,
             error_state,
             metadata,
+            architecture,
         })
     }
 

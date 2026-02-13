@@ -142,7 +142,8 @@ pub use csv_loader::{
 
 // Re-export model checkpoint types
 pub use checkpoint::{
-    CheckpointErrorState, CheckpointLayer, CheckpointTensor, ModelCheckpoint,
+    CheckpointErrorState, CheckpointLayer, CheckpointTensor, ModelArchitectureMetadata,
+    ModelCheckpoint,
 };
 
 // ============================================================================

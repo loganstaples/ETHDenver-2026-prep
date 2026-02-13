@@ -109,6 +109,8 @@ async fn test_full_p2p_training_round() {
         d_hid: D_HID,
         d_out: D_OUT,
         model_seed: 42,
+        num_layers: 2,
+        activation_type: 0,
     };
     let _round_msg = aggregator.start_round(model_hash, params).await;
 

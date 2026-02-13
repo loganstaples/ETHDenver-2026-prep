@@ -139,7 +139,7 @@ contract RealProofIntegrationTest is Test {
         uint256 hashHi = 0x3042;
         uint256 initialCommitment = uint256(keccak256(abi.encodePacked(hashLo, hashHi)));
 
-        uint256 modelId = coordinator.registerModel("QmTestModel", initialCommitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("QmTestModel", initialCommitment, MIN_STAKE, 4, 8, 2, 2, 0);
 
         vm.prank(prover1);
         coordinator.stake{value: PROVER_STAKE}(modelId);
@@ -249,7 +249,7 @@ contract RealProofIntegrationTest is Test {
     function testRealRustProofSlashingTrigger() public {
         // Setup model and stake
         uint256 initialCommitment = uint256(keccak256(abi.encodePacked(uint256(0x3039), uint256(0x3042))));
-        uint256 modelId = coordinator.registerModel("QmSlashTest", initialCommitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("QmSlashTest", initialCommitment, MIN_STAKE, 4, 8, 2, 2, 0);
 
         vm.prank(maliciousProver);
         coordinator.stake{value: PROVER_STAKE}(modelId);
@@ -285,7 +285,7 @@ contract RealProofIntegrationTest is Test {
     /// @notice Test slashing record is created
     function testRealRustProofSlashingRecord() public {
         uint256 initialCommitment = uint256(keccak256(abi.encodePacked(uint256(0x3039), uint256(0x3042))));
-        uint256 modelId = coordinator.registerModel("QmRecordTest", initialCommitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("QmRecordTest", initialCommitment, MIN_STAKE, 4, 8, 2, 2, 0);
 
         vm.prank(maliciousProver);
         coordinator.stake{value: PROVER_STAKE}(modelId);
@@ -440,7 +440,7 @@ contract RealProofIntegrationTest is Test {
         uint256 hashHi = 0x3042;
         uint256 initialCommitment = uint256(keccak256(abi.encodePacked(hashLo, hashHi)));
 
-        uint256 modelId = coordinator.registerModel("QmE2ETest", initialCommitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("QmE2ETest", initialCommitment, MIN_STAKE, 4, 8, 2, 2, 0);
 
         // 2. Stake as prover
         vm.startPrank(prover1);

@@ -418,6 +418,8 @@ async fn test_full_discovery_training_resilience_flow() {
             d_hid: 4,
             d_out: 1,
             model_seed: 42,
+            num_layers: 2,
+            activation_type: 0,
         },
     });
     agg_runner.broadcast(round_msg).await;
@@ -469,6 +471,8 @@ async fn test_full_discovery_training_resilience_flow() {
             d_hid: 4,
             d_out: 1,
             model_seed: 42,
+            num_layers: 2,
+            activation_type: 0,
         },
     });
     agg_runner.broadcast(round2_msg).await;

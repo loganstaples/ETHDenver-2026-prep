@@ -81,7 +81,7 @@ contract IntegrationTest is Test {
         uint256 initialCommitment = uint256(keccak256(abi.encodePacked(oldHashLo, oldHashHi)));
 
         vm.prank(modelOwner);
-        uint256 modelId = coordinator.registerModel("QmTestModel", initialCommitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("QmTestModel", initialCommitment, MIN_STAKE, 4, 8, 2, 2, 0);
 
         // Verify model registration
         (uint256 currentRound, uint256 commitment, bool active) = coordinator.getModelState(modelId);
@@ -150,7 +150,7 @@ contract IntegrationTest is Test {
         uint256 currentCommitment = uint256(keccak256(abi.encodePacked(hashLo, hashHi)));
 
         vm.prank(modelOwner);
-        uint256 modelId = coordinator.registerModel("QmMultiRound", currentCommitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("QmMultiRound", currentCommitment, MIN_STAKE, 4, 8, 2, 2, 0);
 
         // Prover stakes
         vm.prank(prover1);
@@ -205,7 +205,7 @@ contract IntegrationTest is Test {
         uint256 initialCommitment = uint256(keccak256(abi.encodePacked(hashLo, hashHi)));
 
         vm.prank(modelOwner);
-        uint256 modelId = coordinator.registerModel("QmCompetition", initialCommitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("QmCompetition", initialCommitment, MIN_STAKE, 4, 8, 2, 2, 0);
 
         // Multiple provers stake
         vm.prank(prover1);
@@ -256,8 +256,8 @@ contract IntegrationTest is Test {
         uint256 commit2 = uint256(keccak256(abi.encodePacked(uint256(3), uint256(4))));
 
         vm.startPrank(modelOwner);
-        uint256 model1 = coordinator.registerModel("Model1", commit1, MIN_STAKE);
-        uint256 model2 = coordinator.registerModel("Model2", commit2, 0.5 ether);
+        uint256 model1 = coordinator.registerModel("Model1", commit1, MIN_STAKE, 4, 8, 2, 2, 0);
+        uint256 model2 = coordinator.registerModel("Model2", commit2, 0.5 ether, 4, 8, 2, 2, 0);
         vm.stopPrank();
 
         // Prover stakes in both models
@@ -311,7 +311,7 @@ contract IntegrationTest is Test {
         uint256 commitment = uint256(keccak256(abi.encodePacked(uint256(1), uint256(2))));
 
         vm.prank(modelOwner);
-        uint256 modelId = coordinator.registerModel("Pausable", commitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("Pausable", commitment, MIN_STAKE, 4, 8, 2, 2, 0);
 
         // Prover stakes
         vm.prank(prover1);
@@ -351,7 +351,7 @@ contract IntegrationTest is Test {
         uint256 commitment = uint256(keccak256(abi.encodePacked(hashLo, hashHi)));
 
         vm.prank(modelOwner);
-        uint256 modelId = coordinator.registerModel("ErrorTest", commitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("ErrorTest", commitment, MIN_STAKE, 4, 8, 2, 2, 0);
 
         vm.prank(prover1);
         coordinator.stake{value: LARGE_STAKE}(modelId);
@@ -386,7 +386,7 @@ contract IntegrationTest is Test {
         uint256 commitment = uint256(keccak256(abi.encodePacked(hashLo, hashHi)));
 
         vm.prank(modelOwner);
-        uint256 modelId = coordinator.registerModel("ErrorTrack", commitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("ErrorTrack", commitment, MIN_STAKE, 4, 8, 2, 2, 0);
 
         vm.prank(prover1);
         coordinator.stake{value: LARGE_STAKE}(modelId);
@@ -446,7 +446,7 @@ contract IntegrationTest is Test {
         uint256 commitment = uint256(keccak256(abi.encodePacked(hashLo, hashHi)));
 
         vm.prank(modelOwner);
-        uint256 modelId = coordinator.registerModel("DeadlineTest", commitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("DeadlineTest", commitment, MIN_STAKE, 4, 8, 2, 2, 0);
 
         vm.prank(prover1);
         coordinator.stake{value: LARGE_STAKE}(modelId);
@@ -482,7 +482,7 @@ contract IntegrationTest is Test {
         uint256 commitment = uint256(keccak256(abi.encodePacked(uint256(1), uint256(2))));
 
         vm.prank(modelOwner);
-        uint256 modelId = coordinator.registerModel("UnstakeTest", commitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("UnstakeTest", commitment, MIN_STAKE, 4, 8, 2, 2, 0);
 
         vm.prank(prover1);
         coordinator.stake{value: LARGE_STAKE}(modelId);
@@ -515,7 +515,7 @@ contract IntegrationTest is Test {
         uint256 commitment = uint256(keccak256(abi.encodePacked(hashLo, hashHi)));
 
         vm.prank(modelOwner);
-        uint256 modelId = coordinator.registerModel("TreasuryTest", commitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("TreasuryTest", commitment, MIN_STAKE, 4, 8, 2, 2, 0);
 
         vm.prank(prover1);
         coordinator.stake{value: 2 ether}(modelId);
@@ -713,7 +713,7 @@ contract IntegrationTest is Test {
         uint256 commitment = uint256(keccak256(abi.encodePacked(hashLo, hashHi)));
 
         vm.prank(modelOwner);
-        uint256 modelId = coordinator.registerModel("VerifierSwap", commitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("VerifierSwap", commitment, MIN_STAKE, 4, 8, 2, 2, 0);
 
         vm.prank(prover1);
         coordinator.stake{value: LARGE_STAKE}(modelId);
@@ -755,7 +755,7 @@ contract IntegrationTest is Test {
         uint256 commitment = uint256(keccak256(abi.encodePacked(uint256(1), uint256(2))));
 
         vm.prank(modelOwner);
-        uint256 modelId = coordinator.registerModel("ZeroStake", commitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("ZeroStake", commitment, MIN_STAKE, 4, 8, 2, 2, 0);
 
         vm.prank(prover1);
         vm.expectRevert(HelixCoordinatorV2.ZeroStake.selector);
@@ -769,7 +769,7 @@ contract IntegrationTest is Test {
         uint256 expected = uint256(keccak256(abi.encodePacked(lo, hi)));
 
         vm.prank(modelOwner);
-        uint256 modelId = coordinator.registerModel("CommitTest", expected, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("CommitTest", expected, MIN_STAKE, 4, 8, 2, 2, 0);
 
         vm.prank(prover1);
         coordinator.stake{value: LARGE_STAKE}(modelId);

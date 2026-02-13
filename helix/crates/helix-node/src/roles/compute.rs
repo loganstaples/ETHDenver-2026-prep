@@ -263,6 +263,8 @@ impl ComputeNode {
                                 d_hid: 8,
                                 d_out: 2,
                                 model_seed: 42,
+                                num_layers: 2,
+                                activation_type: 0,
                             });
                         self.register_for_round(round_id, shard, params).await;
                     }
@@ -326,6 +328,8 @@ mod tests {
             d_hid: 8,
             d_out: 2,
             model_seed: 42,
+            num_layers: 2,
+            activation_type: 0,
         };
         
         node.register_for_round(1, 0, params).await;
@@ -353,6 +357,8 @@ mod tests {
             d_hid: 8,
             d_out: 2,
             model_seed: 42,
+            num_layers: 2,
+            activation_type: 0,
         };
         
         node.register_for_round(1, 0, params).await;

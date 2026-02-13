@@ -581,6 +581,10 @@ pub struct TrainingParams {
     pub d_out: usize,
     /// Random seed for deterministic model init.
     pub model_seed: u64,
+    /// Number of layers in the model.
+    pub num_layers: u32,
+    /// Activation function type (0=ReLU, 1=Sigmoid, 2=Tanh, 3=GeLU, 4=LeakyReLU).
+    pub activation_type: u8,
 }
 
 /// Gradient exchange messages.
@@ -868,6 +872,8 @@ pub struct ModelDims {
     pub num_layers: u32,
     /// Number of attention heads (0 for MLP-only).
     pub num_heads: u32,
+    /// Activation function type (0=ReLU, 1=Sigmoid, 2=Tanh, 3=GeLU, 4=LeakyReLU).
+    pub activation_type: u8,
 }
 
 /// Serializes a message to bytes using bincode.

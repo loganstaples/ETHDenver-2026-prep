@@ -262,7 +262,7 @@ contract V3CommitRoundDataAuthTest is Test {
     /// @notice Helper to register a model and start a round
     function _setupModel() internal returns (uint256 modelId) {
         vm.prank(modelOwner);
-        modelId = coordinator.registerModel("TestModel", "desc", "hash", 12345);
+        modelId = coordinator.registerModel("TestModel", "desc", "hash", 12345, 4, 8, 2, 2, 0);
 
         vm.prank(modelOwner);
         coordinator.startRound(modelId, 1 hours);

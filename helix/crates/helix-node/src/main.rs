@@ -824,6 +824,8 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
             d_hid,
             d_out,
             model_seed,
+            num_layers: 2,
+            activation_type: 0,
         },
         ..Default::default()
     };

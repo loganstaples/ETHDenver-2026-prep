@@ -278,6 +278,8 @@ fn default_params() -> helix_node::network::messages::TrainingParams {
         d_hid: 2,
         d_out: 1,
         model_seed: 42,
+        num_layers: 2,
+        activation_type: 0,
     }
 }
 

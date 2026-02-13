@@ -40,7 +40,7 @@ contract FuzzTest is Test {
 
         uint256 commitment = uint256(keccak256(abi.encodePacked(uint256(1), uint256(2))));
         vm.prank(modelOwner);
-        uint256 modelId = coordinator.registerModel("FuzzModel", commitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("FuzzModel", commitment, MIN_STAKE, 4, 8, 2, 2, 0);
 
         address prover = makeAddr("prover");
         vm.deal(prover, stakeAmount);
@@ -57,7 +57,7 @@ contract FuzzTest is Test {
     function testFuzz_MultipleStakesAccumulate(uint96[5] memory amounts) public {
         uint256 commitment = uint256(keccak256(abi.encodePacked(uint256(1), uint256(2))));
         vm.prank(modelOwner);
-        uint256 modelId = coordinator.registerModel("FuzzModel", commitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("FuzzModel", commitment, MIN_STAKE, 4, 8, 2, 2, 0);
 
         address prover = makeAddr("prover");
         vm.deal(prover, 1000 ether);
@@ -95,7 +95,8 @@ contract FuzzTest is Test {
             modelIds[i] = coordinator.registerModel(
                 string(abi.encodePacked("Model", i)),
                 commitment,
-                MIN_STAKE
+                MIN_STAKE,
+                4, 8, 2, 2, 0
             );
         }
         vm.stopPrank();
@@ -123,7 +124,7 @@ contract FuzzTest is Test {
 
         uint256 commitment = uint256(keccak256(abi.encodePacked(uint256(1), uint256(2))));
         vm.prank(modelOwner);
-        uint256 modelId = coordinator.registerModel("FuzzModel", commitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("FuzzModel", commitment, MIN_STAKE, 4, 8, 2, 2, 0);
 
         address prover = makeAddr("prover");
         vm.deal(prover, 10 ether);
@@ -150,7 +151,7 @@ contract FuzzTest is Test {
 
         uint256 commitment = uint256(keccak256(abi.encodePacked(uint256(1), uint256(2))));
         vm.prank(modelOwner);
-        uint256 modelId = coordinator.registerModel("FuzzModel", commitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("FuzzModel", commitment, MIN_STAKE, 4, 8, 2, 2, 0);
 
         address prover = makeAddr("prover");
         vm.deal(prover, 10 ether);
@@ -177,7 +178,7 @@ contract FuzzTest is Test {
         uint256 commitment = uint256(keccak256(abi.encodePacked(hashLo, hashHi)));
 
         vm.prank(modelOwner);
-        uint256 modelId = coordinator.registerModel("FuzzModel", commitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("FuzzModel", commitment, MIN_STAKE, 4, 8, 2, 2, 0);
 
         address prover = makeAddr("prover");
         vm.deal(prover, stakeAmount);
@@ -235,7 +236,7 @@ contract FuzzTest is Test {
         uint256 commitment = uint256(keccak256(abi.encodePacked(hashLo, hashHi)));
 
         vm.prank(modelOwner);
-        uint256 modelId = coordinator.registerModel("FuzzModel", commitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("FuzzModel", commitment, MIN_STAKE, 4, 8, 2, 2, 0);
 
         address prover = makeAddr("prover");
         uint256 stakeAmount = 1 ether;
@@ -278,7 +279,7 @@ contract FuzzTest is Test {
 
         uint256 commitment = uint256(keccak256(abi.encodePacked(uint256(1), uint256(2))));
         vm.prank(modelOwner);
-        uint256 modelId = coordinator.registerModel("FuzzModel", commitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("FuzzModel", commitment, MIN_STAKE, 4, 8, 2, 2, 0);
 
         vm.prank(modelOwner);
         coordinator.startRound(modelId, duration);
@@ -295,7 +296,7 @@ contract FuzzTest is Test {
         uint256 expectedCommitment = uint256(keccak256(abi.encodePacked(hashLo, hashHi)));
 
         vm.prank(modelOwner);
-        uint256 modelId = coordinator.registerModel("FuzzModel", expectedCommitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("FuzzModel", expectedCommitment, MIN_STAKE, 4, 8, 2, 2, 0);
 
         (, uint256 storedCommitment,) = coordinator.getModelState(modelId);
         assertEq(storedCommitment, expectedCommitment);
@@ -310,7 +311,7 @@ contract FuzzTest is Test {
         uint256 commitment = uint256(keccak256(abi.encodePacked(hashLo, hashHi)));
 
         vm.prank(modelOwner);
-        uint256 modelId = coordinator.registerModel("FuzzModel", commitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("FuzzModel", commitment, MIN_STAKE, 4, 8, 2, 2, 0);
 
         address prover = makeAddr("prover");
         vm.deal(prover, 10 ether);
@@ -354,7 +355,7 @@ contract FuzzTest is Test {
         minStake = uint96(bound(minStake, 0.001 ether, 10 ether));
 
         vm.prank(modelOwner);
-        uint256 modelId = coordinator.registerModel("FuzzModel", 12345, minStake);
+        uint256 modelId = coordinator.registerModel("FuzzModel", 12345, minStake, 4, 8, 2, 2, 0);
 
         address prover = makeAddr("prover");
         vm.deal(prover, 100 ether);
@@ -379,7 +380,7 @@ contract FuzzTest is Test {
 
         // Register with zero min stake should use default
         vm.prank(modelOwner);
-        uint256 modelId = coordinator.registerModel("FuzzModel", 12345, 0);
+        uint256 modelId = coordinator.registerModel("FuzzModel", 12345, 0, 4, 8, 2, 2, 0);
 
         // Model should have default min stake
         // We verify by checking if stake below default fails to meet requirements
@@ -398,7 +399,8 @@ contract FuzzTest is Test {
             uint256 modelId = coordinator.registerModel(
                 string(abi.encodePacked("Model", i)),
                 commitment,
-                MIN_STAKE
+                MIN_STAKE,
+                4, 8, 2, 2, 0
             );
             assertEq(modelId, i);
         }
@@ -417,7 +419,7 @@ contract FuzzTest is Test {
         uint256 commitment = uint256(keccak256(abi.encodePacked(hashLo, hashHi)));
 
         vm.prank(modelOwner);
-        uint256 modelId = coordinator.registerModel("FuzzModel", commitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("FuzzModel", commitment, MIN_STAKE, 4, 8, 2, 2, 0);
 
         mockVerifier.setShouldPass(false);
 
@@ -474,7 +476,7 @@ contract FuzzTest is Test {
         uint256 commitment = uint256(keccak256(abi.encodePacked(hashLo, hashHi)));
 
         vm.prank(modelOwner);
-        uint256 modelId = coordinator.registerModel("FuzzModel", commitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("FuzzModel", commitment, MIN_STAKE, 4, 8, 2, 2, 0);
 
         address prover = makeAddr("prover");
         vm.deal(prover, initialStake);

@@ -127,7 +127,7 @@ contract HelixCoordinatorV3Test is Test {
     // ============ Model Registration Tests ============
 
     function test_RegisterModel() public {
-        uint256 modelId = coordinator.registerModel("TestModel", "A test model", "QmHash123", 12345);
+        uint256 modelId = coordinator.registerModel("TestModel", "A test model", "QmHash123", 12345, 4, 8, 2, 2, 0);
         assertEq(modelId, 0);
 
         (uint256 round, uint256 commitment, bool active) = coordinator.getModelState(modelId);
@@ -137,7 +137,7 @@ contract HelixCoordinatorV3Test is Test {
     }
 
     function test_RegisterModel_CreatesCheckpoint() public {
-        coordinator.registerModel("TestModel", "A test model", "QmHash123", 12345);
+        coordinator.registerModel("TestModel", "A test model", "QmHash123", 12345, 4, 8, 2, 2, 0);
 
         // Verify ModelRegistry has the checkpoint
         uint256 checkpointCount = registry.getCheckpointCount(0);
@@ -145,8 +145,8 @@ contract HelixCoordinatorV3Test is Test {
     }
 
     function test_RegisterMultipleModels() public {
-        uint256 m1 = coordinator.registerModel("Model1", "desc1", "hash1", 100);
-        uint256 m2 = coordinator.registerModel("Model2", "desc2", "hash2", 200);
+        uint256 m1 = coordinator.registerModel("Model1", "desc1", "hash1", 100, 4, 8, 2, 2, 0);
+        uint256 m2 = coordinator.registerModel("Model2", "desc2", "hash2", 200, 4, 8, 2, 2, 0);
         assertEq(m1, 0);
         assertEq(m2, 1);
     }
@@ -154,7 +154,7 @@ contract HelixCoordinatorV3Test is Test {
     // ============ Round Tests ============
 
     function test_StartRound() public {
-        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", 100);
+        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", 100, 4, 8, 2, 2, 0);
         coordinator.startRound(modelId, ROUND_DURATION);
 
         (uint256 round,,) = coordinator.getModelState(modelId);
@@ -162,7 +162,7 @@ contract HelixCoordinatorV3Test is Test {
     }
 
     function test_StartRound_OnlyModelOwner() public {
-        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", 100);
+        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", 100, 4, 8, 2, 2, 0);
 
         vm.prank(prover1);
         vm.expectRevert("Only model owner");
@@ -177,7 +177,7 @@ contract HelixCoordinatorV3Test is Test {
         uint256 oldHashHi = 67890;
         uint256 correctCommitment = uint256(keccak256(abi.encodePacked(oldHashLo, oldHashHi)));
 
-        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", correctCommitment);
+        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", correctCommitment, 4, 8, 2, 2, 0);
         coordinator.startRound(modelId, ROUND_DURATION);
 
         // Build public inputs
@@ -210,7 +210,7 @@ contract HelixCoordinatorV3Test is Test {
         uint256 oldHashHi = 67890;
         uint256 correctCommitment = uint256(keccak256(abi.encodePacked(oldHashLo, oldHashHi)));
 
-        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", correctCommitment);
+        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", correctCommitment, 4, 8, 2, 2, 0);
         coordinator.startRound(modelId, ROUND_DURATION);
 
         uint256[] memory publicInputs = _buildPublicInputs(oldHashLo, oldHashHi, 99999, 88888, 100, 10, 1, modelId);
@@ -231,7 +231,7 @@ contract HelixCoordinatorV3Test is Test {
         uint256 oldHashHi = 67890;
         uint256 correctCommitment = uint256(keccak256(abi.encodePacked(oldHashLo, oldHashHi)));
 
-        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", correctCommitment);
+        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", correctCommitment, 4, 8, 2, 2, 0);
         coordinator.startRound(modelId, ROUND_DURATION);
 
         uint256[] memory publicInputs = _buildPublicInputs(oldHashLo, oldHashHi, 99999, 88888, 100, 10, 1, modelId);
@@ -266,7 +266,7 @@ contract HelixCoordinatorV3Test is Test {
         uint256 oldHashHi = 67890;
         uint256 correctCommitment = uint256(keccak256(abi.encodePacked(oldHashLo, oldHashHi)));
 
-        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", correctCommitment);
+        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", correctCommitment, 4, 8, 2, 2, 0);
         coordinator.startRound(modelId, ROUND_DURATION);
 
         uint256[] memory publicInputs = _buildPublicInputs(oldHashLo, oldHashHi, 99999, 88888, 100, 10, 1, modelId);
@@ -296,7 +296,7 @@ contract HelixCoordinatorV3Test is Test {
         uint256 oldHashHi = 67890;
         uint256 correctCommitment = uint256(keccak256(abi.encodePacked(oldHashLo, oldHashHi)));
 
-        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", correctCommitment);
+        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", correctCommitment, 4, 8, 2, 2, 0);
         coordinator.startRound(modelId, ROUND_DURATION);
 
         uint256[] memory publicInputs = _buildPublicInputs(oldHashLo, oldHashHi, 99999, 88888, 100, 10, 1, modelId);
@@ -321,7 +321,7 @@ contract HelixCoordinatorV3Test is Test {
         uint256 oldHashHi = 67890;
         uint256 correctCommitment = uint256(keccak256(abi.encodePacked(oldHashLo, oldHashHi)));
 
-        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", correctCommitment);
+        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", correctCommitment, 4, 8, 2, 2, 0);
         coordinator.startRound(modelId, ROUND_DURATION);
 
         uint256[] memory publicInputs = _buildPublicInputs(oldHashLo, oldHashHi, 99999, 88888, 100, 10, 1, modelId);
@@ -339,7 +339,7 @@ contract HelixCoordinatorV3Test is Test {
 
     function test_SubmitProof_RequiresTokenStake() public {
         address unstaked = makeAddr("unstaked");
-        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", 100);
+        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", 100, 4, 8, 2, 2, 0);
         coordinator.startRound(modelId, ROUND_DURATION);
 
         bytes memory proof = new bytes(320);
@@ -365,7 +365,7 @@ contract HelixCoordinatorV3Test is Test {
 
         // Cannot register model when paused
         vm.expectRevert("Contract is paused");
-        coordinator.registerModel("Model", "desc", "hash", 100);
+        coordinator.registerModel("Model", "desc", "hash", 100, 4, 8, 2, 2, 0);
     }
 
     function test_Unpause() public {
@@ -395,7 +395,7 @@ contract HelixCoordinatorV3Test is Test {
     }
 
     function test_PauseModel() public {
-        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", 100);
+        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", 100, 4, 8, 2, 2, 0);
         coordinator.pauseModel(modelId);
 
         (,, bool active) = coordinator.getModelState(modelId);
@@ -413,7 +413,7 @@ contract HelixCoordinatorV3Test is Test {
         uint256 oldHashHi = 67890;
         uint256 correctCommitment = uint256(keccak256(abi.encodePacked(oldHashLo, oldHashHi)));
 
-        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", correctCommitment);
+        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", correctCommitment, 4, 8, 2, 2, 0);
         coordinator.startRound(modelId, ROUND_DURATION);
 
         uint256[] memory publicInputs = _buildPublicInputs(oldHashLo, oldHashHi, 99999, 88888, 100, 10, 1, modelId);
@@ -430,7 +430,7 @@ contract HelixCoordinatorV3Test is Test {
         uint256 oldHashHi = 67890;
         uint256 correctCommitment = uint256(keccak256(abi.encodePacked(oldHashLo, oldHashHi)));
 
-        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", correctCommitment);
+        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", correctCommitment, 4, 8, 2, 2, 0);
         coordinator.startRound(modelId, ROUND_DURATION);
 
         // Set error bound higher than max
@@ -465,7 +465,7 @@ contract HelixCoordinatorV3Test is Test {
     // ============ Data Commitment Tests ============
 
     function test_SetModelDataCommitment() public {
-        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", 100);
+        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", 100, 4, 8, 2, 2, 0);
         bytes32 dataRoot = keccak256("training_data");
         coordinator.setModelDataCommitment(modelId, dataRoot);
         assertEq(coordinator.getModelDataCommitment(modelId), dataRoot);

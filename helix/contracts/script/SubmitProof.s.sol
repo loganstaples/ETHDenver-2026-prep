@@ -102,7 +102,8 @@ contract SubmitProofScript is Script {
         uint256 newModelId = HelixCoordinatorV2(_coordinator).registerModel(
             _ipfsHash,
             _initialCommitment,
-            _minStake
+            _minStake,
+            4, 8, 2, 2, 0
         );
 
         vm.stopBroadcast();

@@ -127,6 +127,8 @@ async fn test_multi_process_training_round_with_real_proofs() {
             d_hid,
             d_out,
             model_seed,
+            num_layers: 2,
+            activation_type: 0,
         },
         ..Default::default()
     };
@@ -551,6 +553,8 @@ async fn test_staggered_worker_startup() {
             d_hid: 2,
             d_out: 1,
             model_seed: 42,
+            num_layers: 2,
+            activation_type: 0,
         },
         ..Default::default()
     };
@@ -693,6 +697,8 @@ async fn test_aggregator_rejects_insufficient_workers() {
             d_hid: 2,
             d_out: 1,
             model_seed: 42,
+            num_layers: 2,
+            activation_type: 0,
         },
         ..Default::default()
     };
@@ -797,6 +803,8 @@ async fn test_tcp_connectivity_and_worker_registration() {
             d_hid: 2,
             d_out: 1,
             model_seed: 42,
+            num_layers: 2,
+            activation_type: 0,
         },
         ..Default::default()
     };

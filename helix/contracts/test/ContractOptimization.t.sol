@@ -208,7 +208,7 @@ contract BatchSubmissionTest is Test {
     /// @notice Helper to set up a model with a matching commitment
     function _setupModel(uint256 hashLo, uint256 hashHi) internal returns (uint256 modelId) {
         uint256 commitment = uint256(keccak256(abi.encodePacked(hashLo, hashHi)));
-        modelId = coordinator.registerModel("hash", commitment, 0.1 ether);
+        modelId = coordinator.registerModel("hash", commitment, 0.1 ether, 4, 8, 2, 2, 0);
         coordinator.startRound(modelId, ROUND_DURATION);
     }
 
@@ -388,7 +388,7 @@ contract ModelRegistryIntegrationTest is Test {
         coordinator.setModelRegistry(address(registry));
 
         uint256 initialCommitment = 12345;
-        coordinator.registerModel("ipfs://test", initialCommitment, 0.1 ether);
+        coordinator.registerModel("ipfs://test", initialCommitment, 0.1 ether, 4, 8, 2, 2, 0);
 
         // Registry should have 1 model with initial checkpoint
         assertEq(registry.getCheckpointCount(0), 1, "Should have 1 checkpoint");
@@ -402,7 +402,7 @@ contract ModelRegistryIntegrationTest is Test {
         uint256 hashHi = 9901;
         uint256 commitment = uint256(keccak256(abi.encodePacked(hashLo, hashHi)));
 
-        uint256 modelId = coordinator.registerModel("hash", commitment, 0.1 ether);
+        uint256 modelId = coordinator.registerModel("hash", commitment, 0.1 ether, 4, 8, 2, 2, 0);
         coordinator.startRound(modelId, ROUND_DURATION);
 
         vm.prank(prover);
@@ -434,7 +434,7 @@ contract ModelRegistryIntegrationTest is Test {
         uint256 hashHi = 8801;
         uint256 commitment = uint256(keccak256(abi.encodePacked(hashLo, hashHi)));
 
-        uint256 modelId = coordinator.registerModel("hash", commitment, 0.1 ether);
+        uint256 modelId = coordinator.registerModel("hash", commitment, 0.1 ether, 4, 8, 2, 2, 0);
         coordinator.startRound(modelId, ROUND_DURATION);
 
         vm.prank(prover);
@@ -528,7 +528,7 @@ contract V3BatchSubmissionTest is Test {
     /// @notice Helper to set up a model and round
     function _setupV3Model(uint256 hashLo, uint256 hashHi) internal returns (uint256 modelId) {
         uint256 commitment = uint256(keccak256(abi.encodePacked(hashLo, hashHi)));
-        modelId = coordinator.registerModel("Model", "desc", "hash", commitment);
+        modelId = coordinator.registerModel("Model", "desc", "hash", commitment, 4, 8, 2, 2, 0);
         coordinator.startRound(modelId, ROUND_DURATION);
     }
 

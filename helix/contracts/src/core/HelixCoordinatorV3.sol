@@ -328,16 +328,26 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
 
     // ============ Model Management ============
 
-    /// @notice Registers a new model and creates initial checkpoint in ModelRegistry
+    /// @notice Registers a new model with architecture metadata
     /// @param name Model name
     /// @param description Model description
     /// @param ipfsHash IPFS hash of initial model weights
     /// @param initialCommitment Hash commitment of initial weights
+    /// @param dIn Input dimension
+    /// @param dHidden Hidden dimension
+    /// @param dOut Output dimension
+    /// @param numLayers Number of layers
+    /// @param activationType Activation function (0=ReLU, 1=Sigmoid, 2=Tanh, 3=GeLU, 4=LeakyReLU)
     function registerModel(
         string memory name,
         string memory description,
         string memory ipfsHash,
-        uint256 initialCommitment
+        uint256 initialCommitment,
+        uint32 dIn,
+        uint32 dHidden,
+        uint32 dOut,
+        uint32 numLayers,
+        uint8 activationType
     ) external whenNotPaused nonReentrant returns (uint256 modelId) {
         modelId = nextModelId++;
 
@@ -349,8 +359,11 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
             active: true
         });
 
-        // Register in ModelRegistry for checkpoint history
-        modelRegistry.registerModel(name, description, ipfsHash, bytes32(initialCommitment));
+        // Register in ModelRegistry for checkpoint history with architecture
+        modelRegistry.registerModel(
+            name, description, ipfsHash, bytes32(initialCommitment),
+            ModelRegistry.ModelArchitecture(dIn, dHidden, dOut, numLayers, activationType)
+        );
 
         emit ModelRegistered(modelId, msg.sender, initialCommitment, ipfsHash);
     }

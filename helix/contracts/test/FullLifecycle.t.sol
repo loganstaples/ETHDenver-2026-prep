@@ -89,7 +89,7 @@ contract FullLifecycleTest is Test {
         uint256 oldHashHi = 67890;
         uint256 initialCommitment = uint256(keccak256(abi.encodePacked(oldHashLo, oldHashHi)));
 
-        uint256 modelId = coordinator.registerModel("TestModel", "Full lifecycle test", "QmTestHash", initialCommitment);
+        uint256 modelId = coordinator.registerModel("TestModel", "Full lifecycle test", "QmTestHash", initialCommitment, 4, 8, 2, 2, 0);
 
         // Verify model registered
         (uint256 round, uint256 commitment, bool active) = coordinator.getModelState(modelId);
@@ -232,7 +232,7 @@ contract FullLifecycleTest is Test {
         uint256 oldHashHi = 222;
         uint256 initialCommitment = uint256(keccak256(abi.encodePacked(oldHashLo, oldHashHi)));
 
-        uint256 modelId = coordinator.registerModel("MultiModel", "Multi-participant", "QmMulti", initialCommitment);
+        uint256 modelId = coordinator.registerModel("MultiModel", "Multi-participant", "QmMulti", initialCommitment, 4, 8, 2, 2, 0);
 
         // Start a multi-participant round (requires 3 workers)
         coordinator.startRoundWithThreshold(modelId, ROUND_DURATION, 3);
@@ -311,7 +311,7 @@ contract FullLifecycleTest is Test {
         uint256 oldHashHi = 444;
         uint256 initialCommitment = uint256(keccak256(abi.encodePacked(oldHashLo, oldHashHi)));
 
-        uint256 modelId = coordinator.registerModel("FeeModel", "Fee test", "QmFee", initialCommitment);
+        uint256 modelId = coordinator.registerModel("FeeModel", "Fee test", "QmFee", initialCommitment, 4, 8, 2, 2, 0);
 
         // Create training job: 3000 tokens / 3 rounds = 1000 tokens per round
         uint256 jobId = coordinator.createTrainingJob(modelId, 3, JOB_DEPOSIT);
@@ -357,7 +357,7 @@ contract FullLifecycleTest is Test {
 
     function test_RoundExpiry_RefundsNothingButExpires() public {
         uint256 initialCommitment = uint256(keccak256(abi.encodePacked(uint256(555), uint256(666))));
-        uint256 modelId = coordinator.registerModel("ExpiryModel", "Expiry test", "QmExpiry", initialCommitment);
+        uint256 modelId = coordinator.registerModel("ExpiryModel", "Expiry test", "QmExpiry", initialCommitment, 4, 8, 2, 2, 0);
 
         // Start round requiring 3 participants but don't submit any proofs
         coordinator.startRoundWithThreshold(modelId, ROUND_DURATION, 3);
@@ -380,7 +380,7 @@ contract FullLifecycleTest is Test {
         uint256 oldHashHi = 888;
         uint256 initialCommitment = uint256(keccak256(abi.encodePacked(oldHashLo, oldHashHi)));
 
-        uint256 modelId = coordinator.registerModel("SlashModel", "Slash test", "QmSlash", initialCommitment);
+        uint256 modelId = coordinator.registerModel("SlashModel", "Slash test", "QmSlash", initialCommitment, 4, 8, 2, 2, 0);
         coordinator.startRound(modelId, ROUND_DURATION);
 
         uint256[] memory publicInputs = _buildPublicInputs(
@@ -421,7 +421,7 @@ contract FullLifecycleTest is Test {
         uint256 oldHashHi = 2000;
         uint256 initialCommitment = uint256(keccak256(abi.encodePacked(oldHashLo, oldHashHi)));
 
-        uint256 modelId = coordinator.registerModel("StatsModel", "Stats test", "QmStats", initialCommitment);
+        uint256 modelId = coordinator.registerModel("StatsModel", "Stats test", "QmStats", initialCommitment, 4, 8, 2, 2, 0);
 
         uint256 currentOldLo = oldHashLo;
         uint256 currentOldHi = oldHashHi;
@@ -459,7 +459,7 @@ contract FullLifecycleTest is Test {
 
     function test_CancelTrainingJob_RefundsRemaining() public {
         uint256 initialCommitment = uint256(keccak256(abi.encodePacked(uint256(9000), uint256(9001))));
-        uint256 modelId = coordinator.registerModel("CancelModel", "Cancel test", "QmCancel", initialCommitment);
+        uint256 modelId = coordinator.registerModel("CancelModel", "Cancel test", "QmCancel", initialCommitment, 4, 8, 2, 2, 0);
 
         uint256 ownerBalBefore = token.balanceOf(modelOwner);
         coordinator.createTrainingJob(modelId, 10, 1000e18);

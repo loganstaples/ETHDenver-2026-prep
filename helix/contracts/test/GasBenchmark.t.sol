@@ -46,14 +46,14 @@ contract GasBenchmark is Test {
         // Register a model for testing
         // Initial commitment = keccak256(abi.encodePacked(1, 2)) to match _createValidPublicInputs
         uint256 initialCommitment = uint256(keccak256(abi.encodePacked(uint256(1), uint256(2))));
-        modelId = coordinator.registerModel("benchmark-model", initialCommitment, 0.1 ether);
+        modelId = coordinator.registerModel("benchmark-model", initialCommitment, 0.1 ether, 4, 8, 2, 2, 0);
     }
 
     // ============ Coordinator Operations ============
 
     function test_GasBenchmark_RegisterModel() public {
         uint256 gasBefore = gasleft();
-        coordinator.registerModel("new-model", 99999, 0.5 ether);
+        coordinator.registerModel("new-model", 99999, 0.5 ether, 4, 8, 2, 2, 0);
         uint256 gasUsed = gasBefore - gasleft();
 
         emit log_named_uint("RegisterModel gas", gasUsed);
@@ -338,7 +338,7 @@ contract GasBenchmark is Test {
         // 1. Register model with commitment matching our test inputs
         uint256 newCommitment = uint256(keccak256(abi.encodePacked(uint256(100), uint256(200))));
         gasBefore = gasleft();
-        uint256 newModelId = coordinator.registerModel("benchmark", newCommitment, 0.5 ether);
+        uint256 newModelId = coordinator.registerModel("benchmark", newCommitment, 0.5 ether, 4, 8, 2, 2, 0);
         gasUsed = gasBefore - gasleft();
         totalGas += gasUsed;
         emit log_named_uint("1. RegisterModel", gasUsed);

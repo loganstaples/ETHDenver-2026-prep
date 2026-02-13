@@ -180,7 +180,7 @@ contract DeployLocalScript is Script {
         uint256 hashHi = 67890;
         uint256 initialCommitment = uint256(keccak256(abi.encodePacked(hashLo, hashHi)));
 
-        uint256 modelId = coordinator.registerModel("QmDemoModel", initialCommitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("QmDemoModel", initialCommitment, MIN_STAKE, 4, 8, 2, 2, 0);
         console.log("  Model ID:", modelId);
         console.log("  Initial Commitment:", initialCommitment);
 
@@ -346,7 +346,7 @@ contract LocalIntegrationTest is Script {
         uint256 hashLo = 0x3039;  // 12345
         uint256 hashHi = 0x3042;  // 12354
         uint256 initialCommitment = uint256(keccak256(abi.encodePacked(hashLo, hashHi)));
-        uint256 modelId = coordinator.registerModel("QmIntegrationTestModel", initialCommitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("QmIntegrationTestModel", initialCommitment, MIN_STAKE, 4, 8, 2, 2, 0);
         console.log("  Model ID:", modelId);
         console.log("  Initial Commitment:", initialCommitment);
 
@@ -478,7 +478,7 @@ contract LocalIntegrationTest is Script {
 
         // Setup
         uint256 initialCommitment = uint256(keccak256(abi.encodePacked(uint256(0x3039), uint256(0x3042))));
-        uint256 modelId = coordinator.registerModel("QmAdversarialTest", initialCommitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("QmAdversarialTest", initialCommitment, MIN_STAKE, 4, 8, 2, 2, 0);
         coordinator.stake{value: PROVER_STAKE}(modelId);
         coordinator.startRound(modelId, ROUND_DURATION);
 

@@ -245,7 +245,7 @@ contract RealProofVerificationTest is Test {
         uint256 oldHashLo = 12345;
         uint256 oldHashHi = 67890;
         uint256 correctCommitment = uint256(keccak256(abi.encodePacked(oldHashLo, oldHashHi)));
-        uint256 modelId = v3.registerModel("Model", "desc", "hash", correctCommitment);
+        uint256 modelId = v3.registerModel("Model", "desc", "hash", correctCommitment, 4, 8, 2, 2, 0);
         v3.startRound(modelId, 1 hours);
 
         // Create a valid-format proof (on-curve points) but cryptographically invalid
@@ -287,7 +287,7 @@ contract RealProofVerificationTest is Test {
         uint256 oldHashLo = 12345;
         uint256 oldHashHi = 67890;
         uint256 correctCommitment = uint256(keccak256(abi.encodePacked(oldHashLo, oldHashHi)));
-        uint256 modelId = v3.registerModel("Model", "desc", "hash", correctCommitment);
+        uint256 modelId = v3.registerModel("Model", "desc", "hash", correctCommitment, 4, 8, 2, 2, 0);
         v3.startRound(modelId, 1 hours);
 
         // Off-curve proof
@@ -332,7 +332,7 @@ contract RealProofVerificationTest is Test {
         uint256 oldHashLo = 12345;
         uint256 oldHashHi = 67890;
         uint256 correctCommitment = uint256(keccak256(abi.encodePacked(oldHashLo, oldHashHi)));
-        uint256 modelId = v3.registerModel("Model", "desc", "hash", correctCommitment);
+        uint256 modelId = v3.registerModel("Model", "desc", "hash", correctCommitment, 4, 8, 2, 2, 0);
         v3.startRound(modelId, 1 hours);
 
         uint256[] memory publicInputs = new uint256[](8);

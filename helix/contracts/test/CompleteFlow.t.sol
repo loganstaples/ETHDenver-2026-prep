@@ -83,7 +83,7 @@ contract CompleteFlowTest is Test {
         uint256 initialCommitment = uint256(keccak256(abi.encodePacked(hashLo, hashHi)));
 
         vm.prank(modelOwner);
-        uint256 modelId = coordinator.registerModel("QmTestModel", initialCommitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("QmTestModel", initialCommitment, MIN_STAKE, 4, 8, 2, 2, 0);
 
         assertEq(modelId, 0);
         (uint256 currentRound, uint256 commitment, bool active) = coordinator.getModelState(modelId);
@@ -223,7 +223,7 @@ contract CompleteFlowTest is Test {
         uint256 commitment = uint256(keccak256(abi.encodePacked(hashLo, hashHi)));
 
         vm.prank(modelOwner);
-        uint256 modelId = coordinator.registerModel("Test", commitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("Test", commitment, MIN_STAKE, 4, 8, 2, 2, 0);
 
         // Commit batch data
         bytes32 batchRoot = keccak256("batch-1");
@@ -252,7 +252,7 @@ contract CompleteFlowTest is Test {
         uint256 commitment = uint256(keccak256(abi.encodePacked(uint256(1), uint256(2))));
         vm.prank(modelOwner);
         vm.expectRevert(HelixCoordinatorV2.ContractPaused.selector);
-        coordinator.registerModel("Test", commitment, MIN_STAKE);
+        coordinator.registerModel("Test", commitment, MIN_STAKE, 4, 8, 2, 2, 0);
 
         // Unpause
         coordinator.unpause();
@@ -260,7 +260,7 @@ contract CompleteFlowTest is Test {
 
         // Now can register
         vm.prank(modelOwner);
-        uint256 modelId = coordinator.registerModel("Test", commitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("Test", commitment, MIN_STAKE, 4, 8, 2, 2, 0);
         assertEq(modelId, 0);
     }
 
@@ -281,7 +281,7 @@ contract CompleteFlowTest is Test {
         uint256 commitment = uint256(keccak256(abi.encodePacked(hashLo, hashHi)));
 
         vm.prank(modelOwner);
-        uint256 modelId = coordinator.registerModel("Test", commitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("Test", commitment, MIN_STAKE, 4, 8, 2, 2, 0);
 
         vm.prank(modelOwner);
         coordinator.startRound(modelId, ROUND_DURATION);
@@ -400,7 +400,7 @@ contract CompleteFlowTest is Test {
         uint256 commitment = uint256(keccak256(abi.encodePacked(hashLo, hashHi)));
 
         vm.prank(modelOwner);
-        uint256 modelId = coordinator.registerModel("Test", commitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("Test", commitment, MIN_STAKE, 4, 8, 2, 2, 0);
 
         vm.prank(prover);
         coordinator.stake{value: PROVER_STAKE}(modelId);
@@ -459,7 +459,7 @@ contract CompleteFlowTest is Test {
         uint256 commitment = uint256(keccak256(abi.encodePacked(uint256(1), uint256(2))));
 
         vm.prank(modelOwner);
-        uint256 modelId = coordinator.registerModel("Test", commitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("Test", commitment, MIN_STAKE, 4, 8, 2, 2, 0);
 
         // No data commitment set
         assertFalse(coordinator.hasDataCommitment(modelId));
@@ -473,7 +473,7 @@ contract CompleteFlowTest is Test {
         uint256 commitment = uint256(keccak256(abi.encodePacked(uint256(1), uint256(2))));
 
         vm.prank(modelOwner);
-        uint256 modelId = coordinator.registerModel("Test", commitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("Test", commitment, MIN_STAKE, 4, 8, 2, 2, 0);
 
         // Pause
         coordinator.emergencyPause();

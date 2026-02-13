@@ -848,7 +848,7 @@ contract ReentrancyGuardTest is Test {
 
     /// @notice Test: reentrancy via unstake is blocked
     function test_Reentrancy_UnstakeBlocked() public {
-        uint256 modelId = coordinator.registerModel("hash", 100, 0.1 ether);
+        uint256 modelId = coordinator.registerModel("hash", 100, 0.1 ether, 4, 8, 2, 2, 0);
         attacker.setModelId(modelId);
 
         // Attacker stakes 1 ETH from its own balance
@@ -1085,7 +1085,7 @@ contract PaginationTest is Test {
             uint256 oldHashHi = 200 + i;
             uint256 commitment = uint256(keccak256(abi.encodePacked(oldHashLo, oldHashHi)));
 
-            uint256 modelId = coordinator.registerModel("hash", commitment, 0.1 ether);
+            uint256 modelId = coordinator.registerModel("hash", commitment, 0.1 ether, 4, 8, 2, 2, 0);
             coordinator.startRound(modelId, 1 hours);
 
             address p = makeAddr(string.concat("prover", vm.toString(i)));
@@ -1140,7 +1140,8 @@ contract PaginationTest is Test {
                 string.concat("Model ", vm.toString(i)),
                 "description",
                 "ipfsHash",
-                bytes32(i + 1)
+                bytes32(i + 1),
+                ModelRegistry.ModelArchitecture(4, 8, 2, 2, 0)
             );
         }
 
@@ -1166,7 +1167,7 @@ contract PaginationTest is Test {
     /// @notice Test: paginated checkpoints in ModelRegistry
     function test_ModelRegistry_CheckpointsPaginated() public {
         // Register model (creates 1 initial checkpoint)
-        uint256 modelId = registry.registerModel("Model", "desc", "ipfs", bytes32(uint256(1)));
+        uint256 modelId = registry.registerModel("Model", "desc", "ipfs", bytes32(uint256(1)), ModelRegistry.ModelArchitecture(4, 8, 2, 2, 0));
 
         // Set this contract as coordinator
         registry.setCoordinator(address(this));
@@ -1223,7 +1224,7 @@ contract CustomErrorsTest is Test {
     function test_CustomError_ContractPaused() public {
         coordinator.emergencyPause();
         vm.expectRevert(HelixCoordinatorV2.ContractPaused.selector);
-        coordinator.registerModel("hash", 100, 0.1 ether);
+        coordinator.registerModel("hash", 100, 0.1 ether, 4, 8, 2, 2, 0);
     }
 
     function test_CustomError_ModelNotFound() public {
@@ -1232,7 +1233,7 @@ contract CustomErrorsTest is Test {
     }
 
     function test_CustomError_ZeroStake() public {
-        uint256 modelId = coordinator.registerModel("hash", 100, 0.1 ether);
+        uint256 modelId = coordinator.registerModel("hash", 100, 0.1 ether, 4, 8, 2, 2, 0);
         vm.expectRevert(HelixCoordinatorV2.ZeroStake.selector);
         coordinator.stake{value: 0}(modelId);
     }
@@ -1333,7 +1334,7 @@ contract ProofReplayProtectionTest is Test {
         uint256 oldHashHi = 67890;
         uint256 correctCommitment = uint256(keccak256(abi.encodePacked(oldHashLo, oldHashHi)));
 
-        modelId = coordinator.registerModel("hash", correctCommitment, 0.1 ether);
+        modelId = coordinator.registerModel("hash", correctCommitment, 0.1 ether, 4, 8, 2, 2, 0);
         coordinator.startRound(modelId, ROUND_DURATION);
 
         proof = new bytes(320); // valid-length proof
@@ -1417,7 +1418,7 @@ contract ProofReplayProtectionTest is Test {
         uint256 oldHashHi = 666;
         uint256 correctCommitment = uint256(keccak256(abi.encodePacked(oldHashLo, oldHashHi)));
 
-        uint256 modelId = coordinator.registerModel("hash", correctCommitment, 0.1 ether);
+        uint256 modelId = coordinator.registerModel("hash", correctCommitment, 0.1 ether, 4, 8, 2, 2, 0);
         coordinator.startRound(modelId, ROUND_DURATION);
 
         // Use mock verifier that rejects proofs
@@ -1479,7 +1480,7 @@ contract CommitRoundDataAuthTest is Test {
     /// @notice Helper to register a model and start a round
     function _setupModel() internal returns (uint256 modelId) {
         vm.prank(modelOwner);
-        modelId = coordinator.registerModel("hash", 100, 0.1 ether);
+        modelId = coordinator.registerModel("hash", 100, 0.1 ether, 4, 8, 2, 2, 0);
 
         vm.prank(modelOwner);
         coordinator.startRound(modelId, 1 hours);

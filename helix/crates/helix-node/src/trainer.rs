@@ -10,9 +10,9 @@
 //!
 //! The model is a 2-layer MLP: `x → W1·x + b1 → ReLU → W2·h + b2 → output`.
 
-use helix_core::{CheckpointLayer, CheckpointTensor, ModelArchitecture, ModelCheckpoint};
+use helix_core::{CheckpointLayer, CheckpointTensor, ModelArchitecture, ModelArchitectureMetadata, ModelCheckpoint};
 use helix_prover::halo2curves::bn256::Fr;
-use helix_prover::provers::training_prover_v2::TrainingProofResultV2;
+use helix_prover::provers::training_prover_v2::{TrainingProofResultV2, V2ProverConfig};
 use helix_prover::{EvmProofBundle, MLTrainingProverV2, VkData};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -127,6 +127,24 @@ impl MlpModel {
         }
     }
 
+    /// Returns the `ModelArchitectureMetadata` for checkpoint serialization.
+    pub fn architecture_metadata(&self, num_layers: u32, activation_type: u8) -> ModelArchitectureMetadata {
+        ModelArchitectureMetadata {
+            d_in: self.d_in as u32,
+            d_hidden: self.d_hid as u32,
+            d_out: self.d_out as u32,
+            num_layers,
+            activation_type,
+        }
+    }
+
+    /// Serializes this model into a `ModelCheckpoint` with architecture metadata.
+    pub fn to_checkpoint_with_arch(&self, step_number: u64, num_layers: u32, activation_type: u8) -> ModelCheckpoint {
+        let checkpoint = self.to_checkpoint(step_number);
+        let arch = self.architecture_metadata(num_layers, activation_type);
+        checkpoint.with_architecture(arch)
+    }
+
     /// Serializes this model into a `ModelCheckpoint`.
     pub fn to_checkpoint(&self, step_number: u64) -> ModelCheckpoint {
         let fc1_weight = CheckpointTensor {
@@ -175,6 +193,7 @@ impl MlpModel {
             ],
             error_state: None,
             metadata,
+            architecture: None,
         }
     }
 
@@ -230,6 +249,32 @@ impl MlpModel {
             w2: fc2_weight.data.iter().map(|&v| v as f64).collect(),
             b2: fc2_bias.data.iter().map(|&v| v as f64).collect(),
         })
+    }
+
+    /// Validates that this model's dimensions match the expected architecture from a round broadcast.
+    ///
+    /// Returns an error if the model dimensions don't match the expected values.
+    /// This prevents workers from training with a mismatched model/architecture.
+    pub fn validate_against_dims(&self, expected_d_in: usize, expected_d_hid: usize, expected_d_out: usize) -> anyhow::Result<()> {
+        if self.d_in != expected_d_in {
+            anyhow::bail!(
+                "Architecture mismatch: model d_in={} but round expects d_in={}",
+                self.d_in, expected_d_in,
+            );
+        }
+        if self.d_hid != expected_d_hid {
+            anyhow::bail!(
+                "Architecture mismatch: model d_hid={} but round expects d_hid={}",
+                self.d_hid, expected_d_hid,
+            );
+        }
+        if self.d_out != expected_d_out {
+            anyhow::bail!(
+                "Architecture mismatch: model d_out={} but round expects d_out={}",
+                self.d_out, expected_d_out,
+            );
+        }
+        Ok(())
     }
 }
 
@@ -533,6 +578,12 @@ pub struct Trainer {
     error_budget: f64,
     /// Accumulated error across training steps.
     accumulated_error: f64,
+    /// Optional prover config (uses auto-scaling when set).
+    prover_config: Option<V2ProverConfig>,
+    /// Number of model layers (from round broadcast).
+    num_layers: u32,
+    /// Activation type (from round broadcast). 0=ReLU, 1=Sigmoid, 2=Tanh, 3=GeLU, 4=LeakyReLU.
+    activation_type: u8,
 }
 
 impl Trainer {
@@ -547,6 +598,9 @@ impl Trainer {
             step_count: 0,
             error_budget: 0.0,
             accumulated_error: 0.0,
+            prover_config: None,
+            num_layers: 2,
+            activation_type: 0,
         }
     }
 
@@ -560,7 +614,69 @@ impl Trainer {
             step_count: 0,
             error_budget: 0.0,
             accumulated_error: 0.0,
+            prover_config: None,
+            num_layers: 2,
+            activation_type: 0,
         }
+    }
+
+    /// Creates a trainer from round broadcast parameters with auto-scaled prover config.
+    ///
+    /// Uses `V2ProverConfig::auto()` to dynamically configure circuit size
+    /// based on the model dimensions received from the aggregator.
+    pub fn from_params(
+        d_in: usize,
+        d_hid: usize,
+        d_out: usize,
+        lr: f64,
+        seed: u64,
+        num_layers: u32,
+        activation_type: u8,
+    ) -> Self {
+        let model = MlpModel::new_random(d_in, d_hid, d_out, seed);
+        let config = V2ProverConfig::auto(d_in, d_hid, d_out, 128);
+        Self {
+            model,
+            lr,
+            prover: None,
+            vk_data: None,
+            step_count: 0,
+            error_budget: 0.0,
+            accumulated_error: 0.0,
+            prover_config: Some(config),
+            num_layers,
+            activation_type,
+        }
+    }
+
+    /// Creates a trainer from a checkpoint and round broadcast parameters.
+    ///
+    /// Validates that the checkpoint dimensions match the expected architecture
+    /// from the round broadcast, then auto-configures the prover circuit.
+    pub fn from_checkpoint_with_params(
+        checkpoint: &ModelCheckpoint,
+        lr: f64,
+        expected_d_in: usize,
+        expected_d_hid: usize,
+        expected_d_out: usize,
+        num_layers: u32,
+        activation_type: u8,
+    ) -> anyhow::Result<Self> {
+        let model = MlpModel::from_checkpoint(checkpoint)?;
+        model.validate_against_dims(expected_d_in, expected_d_hid, expected_d_out)?;
+        let config = V2ProverConfig::auto(model.d_in, model.d_hid, model.d_out, 128);
+        Ok(Self {
+            model,
+            lr,
+            prover: None,
+            vk_data: None,
+            step_count: 0,
+            error_budget: 0.0,
+            accumulated_error: 0.0,
+            prover_config: Some(config),
+            num_layers,
+            activation_type,
+        })
     }
 
     /// Sets the error budget for this trainer.
@@ -618,13 +734,25 @@ impl Trainer {
     }
 
     /// Ensures the prover is initialised.
+    ///
+    /// If a `V2ProverConfig` was set (via `from_params()`), uses `with_config()`
+    /// for auto-scaled circuit sizing. Otherwise falls back to default config.
     fn ensure_prover(&mut self) {
         if self.prover.is_none() {
-            self.prover = Some(MLTrainingProverV2::new(
-                self.model.d_in,
-                self.model.d_hid,
-                self.model.d_out,
-            ));
+            self.prover = Some(if let Some(config) = self.prover_config.take() {
+                MLTrainingProverV2::with_config(
+                    self.model.d_in,
+                    self.model.d_hid,
+                    self.model.d_out,
+                    config,
+                )
+            } else {
+                MLTrainingProverV2::new(
+                    self.model.d_in,
+                    self.model.d_hid,
+                    self.model.d_out,
+                )
+            });
         }
     }
 
@@ -1139,6 +1267,7 @@ mod tests {
             layers: vec![], // empty
             error_state: None,
             metadata: HashMap::new(),
+            architecture: None,
         };
         assert!(MlpModel::from_checkpoint(&ckpt).is_err());
     }
@@ -1177,5 +1306,115 @@ mod tests {
         let trainer = Trainer::new(2, 2, 1, 0.01, 42);
         // Default: no error budget limit
         assert_eq!(trainer.error_budget, 0.0);
+    }
+
+    #[test]
+    fn test_from_params_auto_scales_prover() {
+        // Simulates a worker receiving architecture from a round broadcast
+        // and correctly configuring its prover for those dimensions.
+        let trainer = Trainer::from_params(
+            4,   // d_in
+            8,   // d_hid
+            2,   // d_out
+            0.01,
+            42,
+            2,   // num_layers
+            0,   // activation_type = ReLU
+        );
+
+        // Verify dimensions are correctly set
+        assert_eq!(trainer.model().d_in, 4);
+        assert_eq!(trainer.model().d_hid, 8);
+        assert_eq!(trainer.model().d_out, 2);
+        assert_eq!(trainer.num_layers, 2);
+        assert_eq!(trainer.activation_type, 0);
+
+        // Prover config should be set (auto-scaled)
+        assert!(trainer.prover_config.is_some());
+    }
+
+    #[test]
+    fn test_validate_architecture_match() {
+        let model = MlpModel::new_random(4, 8, 2, 42);
+
+        // Should succeed with matching dimensions
+        assert!(model.validate_against_dims(4, 8, 2).is_ok());
+    }
+
+    #[test]
+    fn test_validate_architecture_mismatch_d_in() {
+        let model = MlpModel::new_random(4, 8, 2, 42);
+
+        // Should fail: d_in mismatch
+        let err = model.validate_against_dims(3, 8, 2).unwrap_err();
+        assert!(err.to_string().contains("d_in"));
+    }
+
+    #[test]
+    fn test_validate_architecture_mismatch_d_hid() {
+        let model = MlpModel::new_random(4, 8, 2, 42);
+
+        // Should fail: d_hid mismatch
+        let err = model.validate_against_dims(4, 16, 2).unwrap_err();
+        assert!(err.to_string().contains("d_hid"));
+    }
+
+    #[test]
+    fn test_validate_architecture_mismatch_d_out() {
+        let model = MlpModel::new_random(4, 8, 2, 42);
+
+        // Should fail: d_out mismatch
+        let err = model.validate_against_dims(4, 8, 5).unwrap_err();
+        assert!(err.to_string().contains("d_out"));
+    }
+
+    #[test]
+    fn test_from_checkpoint_with_params_validates() {
+        // Create a 4×8×2 model and checkpoint
+        let model = MlpModel::new_random(4, 8, 2, 42);
+        let checkpoint = model.to_checkpoint(0);
+
+        // Should succeed with matching dimensions
+        let trainer = Trainer::from_checkpoint_with_params(
+            &checkpoint, 0.01, 4, 8, 2, 2, 0,
+        );
+        assert!(trainer.is_ok());
+        let trainer = trainer.unwrap();
+        assert_eq!(trainer.num_layers, 2);
+        assert_eq!(trainer.activation_type, 0);
+        assert!(trainer.prover_config.is_some());
+
+        // Should fail with mismatched dimensions
+        let result = Trainer::from_checkpoint_with_params(
+            &checkpoint, 0.01, 10, 20, 5, 2, 0,
+        );
+        assert!(result.is_err());
+        let err_msg = result.err().unwrap().to_string();
+        assert!(err_msg.contains("Architecture mismatch"), "expected 'Architecture mismatch' in: {}", err_msg);
+    }
+
+    #[test]
+    fn test_checkpoint_includes_architecture_metadata() {
+        let model = MlpModel::new_random(4, 8, 2, 42);
+        let checkpoint = model.to_checkpoint_with_arch(0, 2, 0);
+
+        let arch = checkpoint.architecture().expect("architecture should be present");
+        assert_eq!(arch.d_in, 4);
+        assert_eq!(arch.d_hidden, 8);
+        assert_eq!(arch.d_out, 2);
+        assert_eq!(arch.num_layers, 2);
+        assert_eq!(arch.activation_type, 0);
+    }
+
+    #[test]
+    fn test_architecture_metadata_method() {
+        let model = MlpModel::new_random(4, 8, 2, 42);
+        let meta = model.architecture_metadata(3, 2);  // 3 layers, Tanh
+
+        assert_eq!(meta.d_in, 4);
+        assert_eq!(meta.d_hidden, 8);
+        assert_eq!(meta.d_out, 2);
+        assert_eq!(meta.num_layers, 3);
+        assert_eq!(meta.activation_type, 2);
     }
 }

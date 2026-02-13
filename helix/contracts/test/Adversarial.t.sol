@@ -81,7 +81,7 @@ contract AdversarialTest is Test {
         uint256 commitment = uint256(keccak256(abi.encodePacked(hashLo, hashHi)));
 
         vm.prank(modelOwner);
-        modelId = coordinator.registerModel("QmTestModel", commitment, MIN_STAKE);
+        modelId = coordinator.registerModel("QmTestModel", commitment, MIN_STAKE, 4, 8, 2, 2, 0);
 
         vm.prank(modelOwner);
         coordinator.startRound(modelId, ROUND_DURATION);
@@ -560,7 +560,7 @@ contract AdversarialTest is Test {
         uint256 commitment = uint256(keccak256(abi.encodePacked(uint256(1), uint256(2))));
 
         vm.prank(modelOwner);
-        uint256 modelId = coordinator.registerModel("Test", commitment, MIN_STAKE);
+        uint256 modelId = coordinator.registerModel("Test", commitment, MIN_STAKE, 4, 8, 2, 2, 0);
 
         vm.prank(attacker1);
         vm.expectRevert(HelixCoordinatorV2.NotAuthorized.selector);
@@ -934,7 +934,8 @@ contract AdversarialTest is Test {
             modelIds[i] = coordinator.registerModel(
                 string(abi.encodePacked("Model", i)),
                 commitment,
-                MIN_STAKE
+                MIN_STAKE,
+                4, 8, 2, 2, 0
             );
             vm.prank(modelOwner);
             coordinator.startRound(modelIds[i], ROUND_DURATION);
@@ -1229,7 +1230,7 @@ contract AdversarialTest is Test {
 
         vm.prank(modelOwner);
         vm.expectRevert(HelixCoordinatorV2.ContractPaused.selector);
-        coordinator.registerModel("Test", 12345, MIN_STAKE);
+        coordinator.registerModel("Test", 12345, MIN_STAKE, 4, 8, 2, 2, 0);
     }
 
     // ============ Model State Attack Tests ============

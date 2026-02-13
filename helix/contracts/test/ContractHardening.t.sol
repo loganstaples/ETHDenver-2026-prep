@@ -212,7 +212,7 @@ contract RoundLifecycleTest is Test {
     // ============ Test 1: startRoundWithThreshold stores minParticipants ============
 
     function test_StartRoundWithThreshold() public {
-        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", _correctCommitment());
+        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", _correctCommitment(), 4, 8, 2, 2, 0);
         coordinator.startRoundWithThreshold(modelId, ROUND_DURATION, 3);
 
         (uint32 minParticipants, uint32 validProofs, uint40 disputeDeadline,
@@ -230,7 +230,7 @@ contract RoundLifecycleTest is Test {
     // ============ Test 2: Multi-participant proof does NOT auto-finalize ============
 
     function test_MultiParticipant_ProofDoesNotFinalize() public {
-        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", _correctCommitment());
+        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", _correctCommitment(), 4, 8, 2, 2, 0);
         coordinator.startRoundWithThreshold(modelId, ROUND_DURATION, 3);
 
         // Submit 1 proof — should NOT finalize the round
@@ -258,7 +258,7 @@ contract RoundLifecycleTest is Test {
     // ============ Test 3: Finalize round after dispute period with best prover ============
 
     function test_FinalizeRound_AfterDisputePeriod() public {
-        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", _correctCommitment());
+        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", _correctCommitment(), 4, 8, 2, 2, 0);
         coordinator.startRoundWithThreshold(modelId, ROUND_DURATION, 2);
 
         // Prover1 submits with loss=200
@@ -306,7 +306,7 @@ contract RoundLifecycleTest is Test {
     // ============ Test 4: Finalize reverts before dispute end ============
 
     function test_FinalizeRound_RevertsBeforeDisputeEnd() public {
-        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", _correctCommitment());
+        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", _correctCommitment(), 4, 8, 2, 2, 0);
         coordinator.startRoundWithThreshold(modelId, ROUND_DURATION, 2);
 
         // Submit 2 proofs
@@ -333,7 +333,7 @@ contract RoundLifecycleTest is Test {
     // ============ Test 5: Expire round with insufficient participants ============
 
     function test_ExpireRound_InsufficientParticipants() public {
-        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", _correctCommitment());
+        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", _correctCommitment(), 4, 8, 2, 2, 0);
         coordinator.startRoundWithThreshold(modelId, ROUND_DURATION, 3);
 
         // Submit only 1 proof (need 3)
@@ -371,7 +371,7 @@ contract RoundLifecycleTest is Test {
     // ============ Test 6: Backward compat - single participant auto-finalizes ============
 
     function test_BackwardCompat_SingleParticipantAutoFinalizes() public {
-        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", _correctCommitment());
+        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", _correctCommitment(), 4, 8, 2, 2, 0);
 
         // Use the original startRound (defaults to minParticipants=1)
         coordinator.startRound(modelId, ROUND_DURATION);
@@ -518,7 +518,7 @@ contract TrainingJobTest is Test {
     /// @notice Register a model as modelOwner and return the modelId
     function _registerModel() internal returns (uint256 modelId) {
         vm.prank(modelOwner);
-        modelId = coordinator.registerModel("TestModel", "desc", "hash", _correctCommitment());
+        modelId = coordinator.registerModel("TestModel", "desc", "hash", _correctCommitment(), 4, 8, 2, 2, 0);
     }
 
     // ============ Test 1: Create training job ============
@@ -699,7 +699,7 @@ contract ModelVersionTest is Test {
 
     /// @notice Register a model and return its ID
     function _registerModel(bytes32 commitment) internal returns (uint256) {
-        return registry.registerModel("TestModel", "desc", "ipfs://hash", commitment);
+        return registry.registerModel("TestModel", "desc", "ipfs://hash", commitment, ModelRegistry.ModelArchitecture(4, 8, 2, 2, 0));
     }
 
     /// @notice Update model with a new commitment
@@ -908,7 +908,7 @@ contract ComputeRewardsTest is Test {
     // ============ Test 1: Equal rewards for equal proofs ============
 
     function test_ComputeReward_EqualForEqualProofs() public {
-        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", _correctCommitment());
+        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", _correctCommitment(), 4, 8, 2, 2, 0);
         coordinator.startRoundWithThreshold(modelId, ROUND_DURATION, 2);
 
         uint256 sameLoss = 100;
@@ -938,7 +938,7 @@ contract ComputeRewardsTest is Test {
     // ============ Test 2: Quality bonus — lower loss gets more ============
 
     function test_QualityBonus_LowerLossGetsMore() public {
-        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", _correctCommitment());
+        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", _correctCommitment(), 4, 8, 2, 2, 0);
         coordinator.startRoundWithThreshold(modelId, ROUND_DURATION, 3);
 
         // Worker1 submits with loss=50 (best)
@@ -977,7 +977,7 @@ contract ComputeRewardsTest is Test {
     // ============ Test 3: Full timeliness bonus for early submission ============
 
     function test_TimelinessBonus_EarlySubmissionFull() public {
-        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", _correctCommitment());
+        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", _correctCommitment(), 4, 8, 2, 2, 0);
         coordinator.startRoundWithThreshold(modelId, ROUND_DURATION, 2);
 
         uint256 sameLoss = 100;
@@ -1008,7 +1008,7 @@ contract ComputeRewardsTest is Test {
     // ============ Test 4: Decayed timeliness bonus for late submission ============
 
     function test_TimelinessBonus_LateSubmissionDecayed() public {
-        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", _correctCommitment());
+        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", _correctCommitment(), 4, 8, 2, 2, 0);
         coordinator.startRoundWithThreshold(modelId, ROUND_DURATION, 2);
 
         uint256 sameLoss = 100;
@@ -1182,7 +1182,7 @@ contract E2EContractHardeningTest is Test {
     function test_FullFlow_MultiRound_ComputeRewards() public {
         // --- Step 1: Register model ---
         vm.prank(modelOwner);
-        uint256 modelId = coordinator.registerModel("E2EModel", "Full E2E test", "ipfs://e2e", _correctCommitment());
+        uint256 modelId = coordinator.registerModel("E2EModel", "Full E2E test", "ipfs://e2e", _correctCommitment(), 4, 8, 2, 2, 0);
 
         // --- Step 2: Create training job (500e18 for 5 rounds = 100e18/round) ---
         vm.startPrank(modelOwner);
@@ -1297,7 +1297,7 @@ contract E2EContractHardeningTest is Test {
     function test_BatchFinalizeMultipleRounds() public {
         // --- Register model ---
         vm.prank(modelOwner);
-        uint256 modelId = coordinator.registerModel("BatchModel", "Batch test", "ipfs://batch", _correctCommitment());
+        uint256 modelId = coordinator.registerModel("BatchModel", "Batch test", "ipfs://batch", _correctCommitment(), 4, 8, 2, 2, 0);
 
         // Fund reward pool
         token.mint(address(this), 10000e18);
@@ -1368,7 +1368,7 @@ contract E2EContractHardeningTest is Test {
     function test_ExpireAndRefund() public {
         // --- Register model ---
         vm.prank(modelOwner);
-        uint256 modelId = coordinator.registerModel("ExpireModel", "Expire test", "ipfs://expire", _correctCommitment());
+        uint256 modelId = coordinator.registerModel("ExpireModel", "Expire test", "ipfs://expire", _correctCommitment(), 4, 8, 2, 2, 0);
 
         // --- Create training job ---
         vm.startPrank(modelOwner);
