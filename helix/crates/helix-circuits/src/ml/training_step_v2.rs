@@ -845,6 +845,65 @@ impl MLTrainingStepV2Circuit {
         k.max(10)
     }
 
+    /// Computes the maximum ReLU lookup range that fits in a circuit of size 2^k.
+    ///
+    /// Given model dimensions and a target k, this returns the largest `relu_range`
+    /// value the circuit can support. Larger k allows larger relu_range, which in
+    /// turn allows larger quantization scales (more precision).
+    ///
+    /// This is the inverse of `minimum_k()`: instead of "given relu_range, what k?",
+    /// it answers "given k, what relu_range?".
+    pub fn max_relu_range_for_k(
+        k: u32,
+        d_in: usize,
+        d_hid: usize,
+        d_out: usize,
+        use_freivalds: bool,
+        exp_range: usize,
+    ) -> usize {
+        let total_rows = 1usize << k;
+        // Apply 20% margin (same as minimum_k)
+        let usable = (total_rows as f64 / 1.2) as usize;
+
+        // Compute non-lookup constraint rows (same formula as minimum_k)
+        let fwd_l1 = if use_freivalds {
+            d_hid
+        } else {
+            d_hid * d_in + d_hid * (d_in.saturating_sub(1))
+        };
+        let bias_relu_l1 = d_hid * 2;
+        let fwd_l2 = if use_freivalds {
+            d_out
+        } else {
+            d_out * d_hid + d_out * (d_hid.saturating_sub(1))
+        };
+        let bias_l2 = d_out;
+        let loss_rows = d_out * 3 + d_out.saturating_sub(1) + 1;
+        let backward_dy = d_out * 2;
+        let backward_dw2 = d_out * d_hid * 2;
+        let backward_db2 = d_out;
+        let backward_dh = d_hid * d_out + d_hid * d_out.saturating_sub(1);
+        let backward_relu_mask = d_hid;
+        let backward_dw1 = d_hid * d_in * 2;
+        let backward_db1 = d_hid;
+        let total_weights = d_hid * d_in + d_hid + d_out * d_hid + d_out;
+        let weight_update_rows = total_weights * 2;
+        let poseidon_rows = 3 * POSEIDON_CIRCUIT_ROWS;
+        let pi_rows = NUM_PUBLIC_INPUTS;
+
+        let non_lookup_rows = pi_rows + fwd_l1 + bias_relu_l1 + fwd_l2 + bias_l2
+            + loss_rows + backward_dy + backward_dw2 + backward_db2
+            + backward_dh + backward_relu_mask + backward_dw1 + backward_db1
+            + weight_update_rows + poseidon_rows;
+
+        // Exp lookup rows are fixed
+        let exp_lookup_rows = 2 * exp_range;
+
+        // Remaining rows available for ReLU lookup: 2 * relu_range
+        let available = usable.saturating_sub(non_lookup_rows + exp_lookup_rows);
+        available / 2
+    }
+
     /// Returns the public inputs in EVM-compatible format.
     ///
     /// This is a convenience method that delegates to the witness.

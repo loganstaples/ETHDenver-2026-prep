@@ -13,7 +13,7 @@ crypto-sign = ["ed25519-dalek"]
 
 [dependencies]
 helix-core = { path = "../helix-core" }
-helix-avm = { path = "../helix-avm" }
+helix-avm = { path = "../helix-avm", features = ["circuit-bridge"] }
 helix-circuits = { path = "../helix-circuits" }
 halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2", rev = "198e9ae30d322cd0ad003b6955f91ec095b1490d" }
 halo2_backend = { git = "https://github.com/privacy-scaling-explorations/halo2", rev = "198e9ae30d322cd0ad003b6955f91ec095b1490d" }

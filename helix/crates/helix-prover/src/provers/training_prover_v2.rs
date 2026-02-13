@@ -210,6 +210,54 @@ impl V2ProverConfig {
         self.k = k;
         self
     }
+
+    /// Sets the ReLU range.
+    pub fn with_relu_range(mut self, relu_range: usize) -> Self {
+        self.relu_range = relu_range;
+        self
+    }
+
+    /// Auto-configures k and relu_range from the required ReLU lookup range.
+    ///
+    /// Uses `MLTrainingStepV2Circuit::minimum_k()` to compute the smallest k
+    /// that fits the given relu_range for this model shape, then expands
+    /// relu_range to use all available lookup rows in that k (free headroom).
+    pub fn auto(
+        d_in: usize,
+        d_hid: usize,
+        d_out: usize,
+        relu_range: usize,
+    ) -> Self {
+        use helix_circuits::ml::training_step_v2::MLTrainingStepV2Circuit;
+
+        let exp_range = 128usize;
+        let use_freivalds = true;
+
+        // First compute minimum k for the given relu_range
+        let dummy = MLTrainingStepV2Circuit {
+            witness: create_zero_witness(d_in, d_hid, d_out),
+            relu_range,
+            exp_range,
+            exp_scale: 64,
+            use_freivalds,
+        };
+        let min_k = dummy.minimum_k();
+
+        // Now expand relu_range to fill available space in that k
+        let max_range = MLTrainingStepV2Circuit::max_relu_range_for_k(
+            min_k, d_in, d_hid, d_out, use_freivalds, exp_range,
+        );
+        let final_relu_range = relu_range.max(max_range);
+
+        Self {
+            k: min_k,
+            relu_range: final_relu_range,
+            exp_range,
+            exp_scale: 64,
+            use_freivalds,
+            ..Default::default()
+        }
+    }
 }
 
 // ============================================================================
@@ -1832,5 +1880,247 @@ mod tests {
         let r1 = prover.prove(&witness).expect("prove should succeed");
         assert!(!r1.proof.is_empty());
         assert!(prover.verify_result(&r1));
+    }
+
+    #[test]
+    fn test_auto_config() {
+        // V2ProverConfig::auto should pick k and relu_range from model dims
+        let config = V2ProverConfig::auto(10, 10, 5, 512);
+        assert!(config.k >= 10, "k should be at least 10, got {}", config.k);
+        assert!(
+            config.relu_range >= 512,
+            "relu_range should be at least 512, got {}",
+            config.relu_range
+        );
+    }
+
+    #[test]
+    fn test_max_relu_range_for_k() {
+        use helix_circuits::ml::training_step_v2::MLTrainingStepV2Circuit;
+
+        // For a small model (2,2,1) with k=12, the max range should be substantial
+        let range = MLTrainingStepV2Circuit::max_relu_range_for_k(12, 2, 2, 1, true, 128);
+        assert!(range > 100, "max_relu_range for k=12 should be > 100, got {}", range);
+
+        // Larger k should allow larger range
+        let range14 = MLTrainingStepV2Circuit::max_relu_range_for_k(14, 10, 10, 5, true, 128);
+        let range16 = MLTrainingStepV2Circuit::max_relu_range_for_k(16, 10, 10, 5, true, 128);
+        assert!(range16 > range14, "k=16 should allow larger range than k=14");
+    }
+
+    /// Tests dynamic circuit scaling with a 10×10×5 Xavier-initialized model.
+    ///
+    /// This is the core test for the ReLU range fix: a model with real-sized
+    /// weights (not tiny 0.001 values) should produce valid proofs. The system
+    /// automatically picks the quantization scale and circuit size (k).
+    #[test]
+    fn test_xavier_10x10x5_auto_prove() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let (d_in, d_hid, d_out) = (10, 10, 5);
+
+        // Xavier/Glorot initialization: weights ~ N(0, sqrt(2/(fan_in+fan_out)))
+        let mut seed: u64 = 12345;
+        let mut rng = || -> f64 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let bits = (seed >> 11) as f64 / (1u64 << 53) as f64;
+            bits * 2.0 - 1.0 // Uniform [-1, 1]
+        };
+
+        let xavier_scale_1 = (2.0 / (d_in + d_hid) as f64).sqrt(); // ~0.316
+        let xavier_scale_2 = (2.0 / (d_hid + d_out) as f64).sqrt(); // ~0.365
+
+        let w1_data: Vec<f64> = (0..d_hid * d_in).map(|_| rng() * xavier_scale_1).collect();
+        let b1_data: Vec<f64> = (0..d_hid).map(|_| rng() * 0.01).collect();
+        let w2_data: Vec<f64> = (0..d_out * d_hid).map(|_| rng() * xavier_scale_2).collect();
+        let b2_data: Vec<f64> = (0..d_out).map(|_| rng() * 0.01).collect();
+
+        use helix_core::types::BoundedTensor;
+        use helix_core::types::Precision;
+        use helix_avm::nn::Linear;
+
+        let weights1 = BoundedTensor::from_exact(w1_data.clone(), vec![d_hid, d_in]);
+        let bias1 = BoundedTensor::from_exact(b1_data.clone(), vec![d_hid]);
+        let weights2 = BoundedTensor::from_exact(w2_data.clone(), vec![d_out, d_hid]);
+        let bias2 = BoundedTensor::from_exact(b2_data.clone(), vec![d_out]);
+
+        let l1 = Linear::new(weights1, Some(bias1), Precision::F32).unwrap();
+        let l2 = Linear::new(weights2, Some(bias2), Precision::F32).unwrap();
+
+        // Normalized inputs and targets
+        let input: Vec<f64> = (0..d_in).map(|i| (i as f64 - 5.0) / 5.0).collect();
+        let target: Vec<f64> = (0..d_out).map(|i| (i as f64) / 5.0).collect();
+        let learning_rate = 0.01;
+
+        // Auto-witness picks the best scale for max_k=16
+        let auto = helix_avm::circuit_bridge::build_training_witness_auto(
+            &l1, &l2, &input, &target, learning_rate, 1, 16,
+        ).expect("auto witness should succeed");
+
+        println!(
+            "Auto scale={}, relu_range={}, model={}×{}×{}",
+            auto.scale, auto.relu_range, d_in, d_hid, d_out
+        );
+
+        assert!(auto.scale >= 2, "scale should be at least 2, got {}", auto.scale);
+        assert!(auto.relu_range >= 256, "relu_range should be >= 256, got {}", auto.relu_range);
+
+        // Auto-configure prover from the computed relu_range
+        let config = V2ProverConfig::auto(d_in, d_hid, d_out, auto.relu_range);
+        println!("Prover config: k={}, relu_range={}", config.k, config.relu_range);
+
+        let prover = MLTrainingProverV2::with_config(d_in, d_hid, d_out, config);
+
+        // Prove step 1
+        let result = prover.prove(&auto.witness).expect("proof generation should succeed");
+        assert!(!result.proof.is_empty(), "proof should not be empty");
+        assert!(prover.verify_result(&result), "proof should verify");
+
+        println!(
+            "Step 1: proof={} bytes, loss={:?}, verified={}",
+            result.proof.len(),
+            result.loss,
+            result.verified
+        );
+    }
+
+    /// Multi-step training with Xavier-initialized 10×10×5 model.
+    ///
+    /// Trains for 5 steps, generates a proof for each, and verifies all.
+    /// This validates that the auto-scaling and dynamic circuit sizing work
+    /// across multiple training iterations where weights change.
+    #[test]
+    fn test_xavier_10x10x5_multistep() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let (d_in, d_hid, d_out) = (10, 10, 5);
+        let num_steps = 5;
+
+        // Xavier/Glorot initialization
+        let mut seed: u64 = 67890;
+        let mut rng = || -> f64 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let bits = (seed >> 11) as f64 / (1u64 << 53) as f64;
+            bits * 2.0 - 1.0
+        };
+
+        let xavier_1 = (2.0 / (d_in + d_hid) as f64).sqrt();
+        let xavier_2 = (2.0 / (d_hid + d_out) as f64).sqrt();
+
+        let mut w1: Vec<f64> = (0..d_hid * d_in).map(|_| rng() * xavier_1).collect();
+        let mut b1: Vec<f64> = (0..d_hid).map(|_| rng() * 0.01).collect();
+        let mut w2: Vec<f64> = (0..d_out * d_hid).map(|_| rng() * xavier_2).collect();
+        let mut b2: Vec<f64> = (0..d_out).map(|_| rng() * 0.01).collect();
+
+        let input: Vec<f64> = (0..d_in).map(|i| (i as f64 - 5.0) / 5.0).collect();
+        let target: Vec<f64> = (0..d_out).map(|i| (i as f64) / 5.0).collect();
+        let learning_rate = 0.01;
+
+        use helix_core::types::BoundedTensor;
+        use helix_core::types::Precision;
+        use helix_avm::nn::Linear;
+        use helix_avm::quantization::CircuitQuantizer;
+        use helix_circuits::ml::training_step_v2::MLTrainingStepV2Circuit;
+
+        // Pre-compute: find the max scale that works across all steps.
+        // Use 25% of the max relu_range as the target for auto_scale. This provides
+        // 4x headroom for weight growth during training — gradients can increase
+        // weight magnitudes, which in turn increases h_pre values.
+        let max_relu_range = MLTrainingStepV2Circuit::max_relu_range_for_k(
+            16, d_in, d_hid, d_out, true, 128,
+        );
+        let target_relu_range = max_relu_range / 4;
+        let scale = CircuitQuantizer::auto_scale(&w1, &b1, &input, d_in, target_relu_range);
+        println!(
+            "Chosen scale={} for target_relu_range={} (max={})",
+            scale, target_relu_range, max_relu_range
+        );
+
+        // Build first witness to get relu_range for prover setup
+        let l1 = Linear::new(
+            BoundedTensor::from_exact(w1.clone(), vec![d_hid, d_in]),
+            Some(BoundedTensor::from_exact(b1.clone(), vec![d_hid])),
+            Precision::F32,
+        ).unwrap();
+        let l2 = Linear::new(
+            BoundedTensor::from_exact(w2.clone(), vec![d_out, d_hid]),
+            Some(BoundedTensor::from_exact(b2.clone(), vec![d_out])),
+            Precision::F32,
+        ).unwrap();
+
+        let first_witness = helix_avm::circuit_bridge::build_training_witness_with_scale(
+            &l1, &l2, &input, &target, learning_rate, 1, scale,
+        ).expect("first witness should succeed");
+
+        // Set up prover with auto config
+        let config = V2ProverConfig::auto(d_in, d_hid, d_out, first_witness.relu_range);
+        println!(
+            "Prover: k={}, relu_range={}, model={}×{}×{}",
+            config.k, config.relu_range, d_in, d_hid, d_out
+        );
+        let prover = MLTrainingProverV2::with_config(d_in, d_hid, d_out, config);
+
+        // Multi-step proving loop
+        let mut proofs = Vec::new();
+        for step in 1..=num_steps {
+            let layer1 = Linear::new(
+                BoundedTensor::from_exact(w1.clone(), vec![d_hid, d_in]),
+                Some(BoundedTensor::from_exact(b1.clone(), vec![d_hid])),
+                Precision::F32,
+            ).unwrap();
+            let layer2 = Linear::new(
+                BoundedTensor::from_exact(w2.clone(), vec![d_out, d_hid]),
+                Some(BoundedTensor::from_exact(b2.clone(), vec![d_out])),
+                Precision::F32,
+            ).unwrap();
+
+            let output = helix_avm::circuit_bridge::build_training_witness_with_scale(
+                &layer1, &layer2, &input, &target, learning_rate, step as u64, scale,
+            ).expect(&format!("witness for step {} should succeed", step));
+
+            println!(
+                "Step {} witness: relu_range={}, prover_relu_range={}",
+                step, output.relu_range, max_relu_range
+            );
+            assert!(
+                output.relu_range <= max_relu_range,
+                "step {} relu_range {} exceeds prover max {}",
+                step, output.relu_range, max_relu_range
+            );
+
+            let result = prover.prove(&output.witness)
+                .expect(&format!("proof for step {} should succeed", step));
+
+            assert!(!result.proof.is_empty(), "step {} proof empty", step);
+            assert!(
+                prover.verify_result(&result),
+                "step {} proof failed verification", step
+            );
+
+            println!(
+                "Step {}: proof={} bytes, relu_range={}, verified={}",
+                step, result.proof.len(), output.relu_range, result.verified
+            );
+
+            proofs.push(result);
+
+            // Extract new weights from witness for next step
+            let q = CircuitQuantizer::with_scale(scale);
+            w1 = output.witness.w1_new.iter()
+                .map(|fr| q.dequantize_fr(*fr))
+                .collect();
+            b1 = output.witness.b1_new.iter()
+                .map(|fr| q.dequantize_fr(*fr))
+                .collect();
+            w2 = output.witness.w2_new.iter()
+                .map(|fr| q.dequantize_fr(*fr))
+                .collect();
+            b2 = output.witness.b2_new.iter()
+                .map(|fr| q.dequantize_fr(*fr))
+                .collect();
+        }
+
+        assert_eq!(proofs.len(), num_steps, "should have {} proofs", num_steps);
+        println!("All {} steps proved and verified successfully!", num_steps);
     }
 }

@@ -80,6 +80,67 @@ impl CircuitQuantizer {
     pub fn quantization_error(&self) -> f64 {
         0.5 / self.scale as f64
     }
+
+    /// Computes the ReLU lookup range needed for a given quantization scale.
+    ///
+    /// Only the forward-pass pre-activations go through the ReLU lookup table:
+    /// `h_pre[j] = sum_i(w1[j,i] * x[i]) + b1[j]` where all values are scaled
+    /// by `s`, so `h_pre` has magnitude `s^2 * d_in * max_w1 * max_x + s * max_b1`.
+    pub fn relu_range_for_scale(
+        scale: u64,
+        max_w1: f64,
+        max_b1: f64,
+        max_x: f64,
+        d_in: usize,
+    ) -> u64 {
+        let s = scale as f64;
+        let sw1 = (max_w1 * s).ceil() as u64;
+        let sb1 = (max_b1 * s).ceil() as u64;
+        let sx = (max_x * s).ceil() as u64;
+        // Use u128 to avoid overflow for moderate scales
+        let max_h_pre = (d_in as u128) * (sw1 as u128) * (sx as u128) + sb1 as u128;
+        (max_h_pre + 1).min(u64::MAX as u128) as u64
+    }
+
+    /// Finds the largest quantization scale where the ReLU lookup range fits
+    /// within `max_relu_range`.
+    ///
+    /// Uses binary search. The scale determines precision: scale=10 gives 1
+    /// decimal digit, scale=100 gives 2 digits, etc. Larger scales produce
+    /// larger lookup tables requiring bigger circuits (higher k).
+    ///
+    /// Returns a scale of at least 1.
+    pub fn auto_scale(
+        w1: &[f64],
+        b1: &[f64],
+        input: &[f64],
+        d_in: usize,
+        max_relu_range: usize,
+    ) -> u64 {
+        let max_w1 = w1.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+        let max_b1 = b1.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+        let max_x = input.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+
+        // Handle degenerate cases
+        if max_w1 == 0.0 && max_b1 == 0.0 {
+            return QUANTIZATION_SCALE; // Default: everything is zero
+        }
+
+        let mut lo: u64 = 1;
+        let mut hi: u64 = 1_000_000;
+
+        while lo < hi {
+            let mid = lo + (hi - lo + 1) / 2;
+            let relu = Self::relu_range_for_scale(mid, max_w1, max_b1, max_x, d_in);
+            if relu <= max_relu_range as u64 {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+
+        lo.max(1)
+    }
 }
 
 /// Trait for converting to/from circuit field elements.
@@ -224,6 +285,43 @@ mod tests {
     fn test_quantization_error() {
         let q = CircuitQuantizer::new();
         assert!((q.quantization_error() - 0.0005).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_relu_range_for_scale() {
+        // 10 inputs, weights ~0.3, inputs ~1.0, bias ~0.01
+        let range = CircuitQuantizer::relu_range_for_scale(10, 0.3, 0.01, 1.0, 10);
+        // 10 * ceil(0.3*10) * ceil(1.0*10) + ceil(0.01*10) + 1 = 10 * 3 * 10 + 1 + 1 = 302
+        assert_eq!(range, 302);
+    }
+
+    #[test]
+    fn test_auto_scale_small_weights() {
+        // Xavier-like: weights ~[-0.3, 0.3], inputs ~[-1, 1]
+        let w1: Vec<f64> = vec![0.3, -0.2, 0.1, 0.25, -0.15, 0.3, -0.1, 0.05, 0.2, -0.3];
+        let b1: Vec<f64> = vec![0.01, -0.01];
+        let input: Vec<f64> = vec![1.0, -0.5, 0.8, -0.3, 0.6];
+        let d_in = 5;
+
+        // With max_relu_range=5000 there should be plenty of room
+        let scale = CircuitQuantizer::auto_scale(&w1, &b1, &input, d_in, 5000);
+        assert!(scale >= 10, "scale should be at least 10, got {}", scale);
+        assert!(scale <= 5000, "scale should be reasonable, got {}", scale);
+
+        // Verify the chosen scale produces relu_range <= 5000
+        let relu_range = CircuitQuantizer::relu_range_for_scale(
+            scale, 0.3, 0.01, 1.0, d_in,
+        );
+        assert!(relu_range <= 5000, "relu_range {} exceeds max 5000", relu_range);
+    }
+
+    #[test]
+    fn test_auto_scale_zero_weights() {
+        let w1 = vec![0.0; 10];
+        let b1 = vec![0.0; 2];
+        let input = vec![1.0; 5];
+        let scale = CircuitQuantizer::auto_scale(&w1, &b1, &input, 5, 5000);
+        assert_eq!(scale, QUANTIZATION_SCALE, "zero weights should use default scale");
     }
 
     // Fr-dependent tests

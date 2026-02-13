@@ -562,6 +562,83 @@ pub fn build_training_witness(
     build_training_witness_with_scale(layer1, layer2, input, target, learning_rate, step_number, 1)
 }
 
+/// Output of [`build_training_witness_auto`].
+#[cfg(any(feature = "circuit-bridge", test))]
+pub struct AutoWitnessOutput {
+    /// The fully populated witness for the circuit.
+    pub witness: helix_circuits::MLTrainingStepV2Witness,
+    /// Minimum `relu_range` the circuit must use for the lookup table.
+    pub relu_range: usize,
+    /// The quantization scale that was automatically chosen.
+    pub scale: u64,
+}
+
+/// Automatically selects the best quantization scale for the given model and
+/// circuit size, then builds the witness.
+///
+/// This is the recommended entry point for production use: it picks the largest
+/// quantization scale (most precision) that keeps the ReLU lookup table within
+/// the available rows for `max_k`. If `max_k` is 0 or not specified, defaults
+/// to 18 (maximum practical size).
+///
+/// A 25% safety margin is applied: the scale is chosen so that the initial
+/// relu_range uses at most 25% of the available table space. This leaves 4x
+/// headroom for weight growth during multi-step training.
+///
+/// Returns the witness, the actual relu_range, and the chosen scale.
+#[cfg(any(feature = "circuit-bridge", test))]
+pub fn build_training_witness_auto(
+    layer1: &crate::nn::Linear,
+    layer2: &crate::nn::Linear,
+    input: &[f64],
+    target: &[f64],
+    learning_rate: f64,
+    step_number: u64,
+    max_k: u32,
+) -> Result<AutoWitnessOutput, String> {
+    use crate::quantization::CircuitQuantizer;
+    use helix_circuits::ml::training_step_v2::MLTrainingStepV2Circuit;
+
+    let cw = model_to_circuit_weights(layer1, layer2)?;
+    let max_k = if max_k == 0 { 18 } else { max_k };
+
+    // Compute max relu_range for the target k
+    let max_relu_range = MLTrainingStepV2Circuit::max_relu_range_for_k(
+        max_k, cw.d_in, cw.d_hid, cw.d_out, true, 128,
+    );
+
+    if max_relu_range < 256 {
+        return Err(format!(
+            "max_k={} is too small for model {}×{}×{}: max_relu_range={}",
+            max_k, cw.d_in, cw.d_hid, cw.d_out, max_relu_range,
+        ));
+    }
+
+    // Use 25% of max relu_range as target: leaves 4x headroom for weight
+    // growth during multi-step training (gradients can increase weights,
+    // which increases h_pre values beyond the initial estimate).
+    let target_relu_range = max_relu_range / 4;
+
+    // Auto-select scale
+    let scale = CircuitQuantizer::auto_scale(
+        &cw.w1, &cw.b1, input, cw.d_in, target_relu_range.max(256),
+    );
+
+    if scale < 1 {
+        return Err("auto_scale returned 0 — model weights may be too large".to_string());
+    }
+
+    let output = build_training_witness_with_scale(
+        layer1, layer2, input, target, learning_rate, step_number, scale,
+    )?;
+
+    Ok(AutoWitnessOutput {
+        witness: output.witness,
+        relu_range: output.relu_range,
+        scale,
+    })
+}
+
 /// Like [`build_training_witness`] but with a configurable quantization scale.
 #[cfg(any(feature = "circuit-bridge", test))]
 pub fn build_training_witness_with_scale(
@@ -626,19 +703,12 @@ pub fn build_training_witness_with_scale(
     let max_b1 = cw.b1.iter().map(|v| (v * scale as f64).round().abs() as u64).max().unwrap_or(0);
     let max_h_pre = cw.d_in as u64 * max_w1 * max_x + max_b1;
 
-    // Also account for y = W2 * h + b2 (though y doesn't go through ReLU)
-    // and backward pass gradients that flow through relu_mask
-    let max_w2 = cw.w2.iter().map(|v| (v * scale as f64).round().abs() as u64).max().unwrap_or(0);
-    let max_b2 = cw.b2.iter().map(|v| (v * scale as f64).round().abs() as u64).max().unwrap_or(0);
-    let max_y = cw.d_hid as u64 * max_w2 * max_h_pre + max_b2;
-
-    // Backward pass: dh_pre goes through relu_mask, but it's element-wise multiply
-    // with 0 or 1 so the magnitude is bounded by dh
-    let max_target = target.iter().map(|v| (v * scale as f64).round().abs() as u64).max().unwrap_or(0);
-    let max_dy = 2 * (max_y + max_target); // dy = 2 * (y - target)
-    let max_dh = cw.d_out as u64 * max_w2 * max_dy;
-
-    let relu_range = (max_h_pre.max(max_dh) + 1).max(256) as usize;
+    // Only h_pre values go through the ReLU lookup table (assign_relu is only
+    // called on h_pre[j] → h[j] in the forward pass). Backward-pass gradients
+    // (dh, dh_pre) use element-wise multiply with relu_mask (0 or 1), NOT the
+    // lookup table. The old code included max_dh which massively over-estimated
+    // the required range, making real-sized models impossible to prove.
+    let relu_range = (max_h_pre + 1).max(256) as usize;
 
     // 4. Use the circuit's own compute_witness_v2 for exact arithmetic.
     let base_error = Fr::from(1u64);
