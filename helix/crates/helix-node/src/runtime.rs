@@ -257,6 +257,7 @@ impl NodeRuntime {
             rpc_addr: format!("0.0.0.0:{}", self.config.rpc_port),
             rate_limiter: Arc::new(RwLock::new(RpcRateLimiter::default())),
             round_weights,
+            worker_daemon: None,
         })
     }
 
@@ -303,12 +304,31 @@ impl NodeRuntime {
         let proof_status = Arc::new(RwLock::new(Vec::<ProofStatusEntry>::new()));
         let round_weights = Arc::new(RwLock::new(Vec::new()));
 
-        let rpc_state = self.build_rpc_state(
+        // --- Worker Daemon ---
+        let worker_capabilities = NodeCapabilities {
+            can_train: true,
+            can_aggregate: false,
+            can_prove: true,
+            gpu_memory_mb: 0,
+            cpu_cores: std::thread::available_parallelism()
+                .map(|n| n.get() as u32)
+                .unwrap_or(4),
+            storage_gb: 10,
+        };
+        let worker_daemon = Arc::new(crate::worker::WorkerDaemon::new(
+            local_id.clone(),
+            self.config.worker_daemon.clone(),
+            worker_capabilities,
+        ));
+
+        let mut rpc_state = self.build_rpc_state(
             api_snapshot.clone(),
             round_trigger_tx.clone(),
             proof_status.clone(),
             round_weights.clone(),
         );
+        // Inject worker daemon into RPC state
+        Arc::get_mut(&mut rpc_state).unwrap().worker_daemon = Some(worker_daemon.clone());
 
         let rpc_state_clone = rpc_state.clone();
 
@@ -418,6 +438,7 @@ impl NodeRuntime {
                 mpc_party_index,
                 mpc_num_parties,
                 checkpoint_interval,
+                &worker_daemon,
             ) => result,
         };
 
@@ -447,6 +468,7 @@ impl NodeRuntime {
         mpc_party_index: usize,
         mpc_num_parties: usize,
         checkpoint_interval: u64,
+        worker_daemon: &Arc<crate::worker::WorkerDaemon>,
     ) -> anyhow::Result<()> {
         let t = &self.config.training;
 
@@ -484,13 +506,16 @@ impl NodeRuntime {
                                 ).await;
                             }
                         }
-                        TrainingMessage::ModelWeights { round_id, checkpoint_data, weight_hash: _ }
-                        | TrainingMessage::UpdatedWeights { round_id, checkpoint_data, weight_hash: _ } => {
+                        ref msg @ TrainingMessage::ModelWeights { round_id, ref checkpoint_data, weight_hash: _ }
+                        | ref msg @ TrainingMessage::UpdatedWeights { round_id, ref checkpoint_data, weight_hash: _ } => {
                             info!(
                                 "Received model weights for round {} ({} bytes)",
                                 round_id, checkpoint_data.len(),
                             );
-                            if let Ok(ckpt) = ModelCheckpoint::from_bytes(&checkpoint_data) {
+                            // Forward to worker daemon
+                            worker_daemon.handle_training_message(&from, msg, network).await;
+                            // Also update runtime's trainer (backward compat)
+                            if let Ok(ckpt) = ModelCheckpoint::from_bytes(checkpoint_data) {
                                 if let Ok(model) = MlpModel::from_checkpoint(&ckpt) {
                                     let lr = trainer.as_ref()
                                         .map(|tr| tr.learning_rate())
@@ -532,6 +557,12 @@ impl NodeRuntime {
                             peer_info.capabilities,
                         );
                     }
+                }
+                Some(NetworkEvent::RoundManagementMessage { from, message }) => {
+                    worker_daemon.handle_round_management(&from, &message, network).await;
+                }
+                Some(NetworkEvent::RegistrationMessage { from, message }) => {
+                    worker_daemon.handle_registration_message(&from, &message);
                 }
                 Some(NetworkEvent::Error { error, .. }) => {
                     warn!("Network error: {}", error);
@@ -1443,7 +1474,7 @@ pub async fn shutdown_signal() {
 // ============================================================================
 
 /// Generates synthetic training data for a given seed.
-fn generate_training_data(d_in: usize, d_out: usize, seed: u64) -> (Vec<f64>, Vec<f64>) {
+pub fn generate_training_data(d_in: usize, d_out: usize, seed: u64) -> (Vec<f64>, Vec<f64>) {
     use rand::SeedableRng;
     use rand::Rng;
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);

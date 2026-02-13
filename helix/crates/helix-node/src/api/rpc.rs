@@ -282,6 +282,8 @@ pub struct RpcState {
     pub rate_limiter: Arc<RwLock<RpcRateLimiter>>,
     /// Completed round weights for result distribution.
     pub round_weights: Arc<RwLock<Vec<RoundWeightEntry>>>,
+    /// Worker daemon state (for worker status, earnings, auto-join RPC).
+    pub worker_daemon: Option<Arc<crate::worker::WorkerDaemon>>,
 }
 
 /// Tracks proof status per round.
@@ -405,6 +407,10 @@ async fn rpc_handler(
         "helix_getModelWeights" => handle_get_model_weights(&state, &req.params, &id),
         "helix_getTrainingHistory" => handle_get_training_history(&state, &req.params, &id),
         "helix_getTrainingReport" => handle_get_training_report(&state, &req.params, &id),
+        // Worker daemon handlers
+        "helix_getWorkerStatus" => handle_get_worker_status(&state, &id),
+        "helix_getEarnings" => handle_get_earnings(&state, &id),
+        "helix_setAutoJoin" => handle_set_auto_join(&state, &req.params, &id),
         _ => JsonRpcResponse::method_not_found(id.clone(), &req.method),
     };
 
@@ -1422,6 +1428,98 @@ fn handle_get_training_report(
 }
 
 // ============================================================================
+// Worker Daemon RPC Handlers
+// ============================================================================
+
+fn handle_get_worker_status(state: &RpcState, id: &serde_json::Value) -> JsonRpcResponse {
+    match &state.worker_daemon {
+        Some(daemon) => {
+            let status = daemon.status();
+            let result = serde_json::json!({
+                "auto_join": status.auto_join,
+                "in_round": status.in_round,
+                "active_round": status.active_round.map(|r| serde_json::json!({
+                    "round_id": r.round_id,
+                    "model_id": r.model_id,
+                    "phase": r.phase,
+                    "steps_completed": r.steps_completed,
+                    "steps_required": r.steps_required,
+                    "elapsed_secs": r.elapsed_secs,
+                })),
+                "total_rounds": status.total_rounds,
+                "rounds_succeeded": status.rounds_succeeded,
+                "success_rate": status.success_rate,
+                "reputation_score": status.reputation_score,
+            });
+            JsonRpcResponse::success(id.clone(), result)
+        }
+        None => JsonRpcResponse::error(
+            id.clone(),
+            -32000,
+            "Worker daemon not available (node may not be a worker)".to_string(),
+        ),
+    }
+}
+
+fn handle_get_earnings(state: &RpcState, id: &serde_json::Value) -> JsonRpcResponse {
+    match &state.worker_daemon {
+        Some(daemon) => {
+            let earnings = daemon.earnings();
+            let result = serde_json::json!({
+                "total_earnings_wei": earnings.total_earnings_wei.to_string(),
+                "rounds_participated": earnings.rounds_participated,
+                "rounds_succeeded": earnings.rounds_succeeded,
+                "rounds_failed": earnings.rounds_failed,
+                "total_proofs_submitted": earnings.total_proofs_submitted,
+                "total_steps_completed": earnings.total_steps_completed,
+                "avg_earnings_per_round_wei": earnings.avg_earnings_per_round_wei.to_string(),
+                "success_rate": earnings.success_rate,
+                "reputation_score": earnings.reputation_score,
+            });
+            JsonRpcResponse::success(id.clone(), result)
+        }
+        None => JsonRpcResponse::error(
+            id.clone(),
+            -32000,
+            "Worker daemon not available (node may not be a worker)".to_string(),
+        ),
+    }
+}
+
+fn handle_set_auto_join(
+    state: &RpcState,
+    params: &serde_json::Value,
+    id: &serde_json::Value,
+) -> JsonRpcResponse {
+    let enabled = match params.get("enabled").and_then(|v| v.as_bool()) {
+        Some(b) => b,
+        None => {
+            return JsonRpcResponse::error(
+                id.clone(),
+                -32602,
+                "Missing or invalid 'enabled' parameter (expected boolean)".to_string(),
+            );
+        }
+    };
+
+    match &state.worker_daemon {
+        Some(daemon) => {
+            let previous = daemon.set_auto_join(enabled);
+            let result = serde_json::json!({
+                "auto_join": enabled,
+                "previous": previous,
+            });
+            JsonRpcResponse::success(id.clone(), result)
+        }
+        None => JsonRpcResponse::error(
+            id.clone(),
+            -32000,
+            "Worker daemon not available (node may not be a worker)".to_string(),
+        ),
+    }
+}
+
+// ============================================================================
 // Server Startup
 // ============================================================================
 
@@ -1463,6 +1561,7 @@ pub fn create_default_rpc_state(
         rpc_addr: rpc_addr.to_string(),
         rate_limiter: Arc::new(RwLock::new(RpcRateLimiter::default())),
         round_weights: Arc::new(RwLock::new(Vec::new())),
+        worker_daemon: None,
     })
 }
 
@@ -1519,6 +1618,7 @@ mod tests {
             rpc_addr: "127.0.0.1:9002".to_string(),
             rate_limiter: Arc::new(RwLock::new(RpcRateLimiter::default())),
             round_weights: Arc::new(RwLock::new(Vec::new())),
+            worker_daemon: None,
         })
     }
 

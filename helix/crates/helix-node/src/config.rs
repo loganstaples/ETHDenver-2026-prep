@@ -435,6 +435,10 @@ pub struct NodeConfig {
     /// Fault tolerance and crash recovery configuration.
     #[serde(default)]
     pub fault_tolerance: FaultToleranceNodeConfig,
+
+    /// Worker daemon (auto-discovery and participation) configuration.
+    #[serde(default)]
+    pub worker_daemon: crate::worker::daemon::WorkerDaemonConfig,
 }
 
 /// On-chain pipeline configuration for aggregator nodes.
@@ -567,6 +571,7 @@ impl Default for NodeConfig {
             training: TrainingModelConfig::default(),
             checkpoint_dir: default_checkpoint_dir(),
             fault_tolerance: FaultToleranceNodeConfig::default(),
+            worker_daemon: crate::worker::daemon::WorkerDaemonConfig::default(),
         }
     }
 }
