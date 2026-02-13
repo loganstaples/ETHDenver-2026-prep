@@ -444,7 +444,8 @@ pub fn generate_keys_for_circuit<C: helix_circuits::halo2_proofs::plonk::Circuit
 /// Generates real Halo2 proving/verification keys with a custom SRS seed.
 ///
 /// Use this when you need a different SRS than the default (e.g., for testing
-/// or for per-model SRS isolation).
+/// or for per-model SRS isolation). Automatically caches the SRS to disk
+/// for fast restarts via [`crate::pipeline::load_or_generate_srs`].
 pub fn generate_keys_for_circuit_with_seed<C: helix_circuits::halo2_proofs::plonk::Circuit<helix_circuits::halo2curves::bn256::Fr>>(
     circuit: &C,
     circuit_name: &str,
@@ -452,17 +453,12 @@ pub fn generate_keys_for_circuit_with_seed<C: helix_circuits::halo2_proofs::plon
     k: u32,
     srs_seed: [u8; 32],
 ) -> CircuitKeys {
-    use helix_circuits::halo2_proofs::poly::kzg::commitment::ParamsKZG;
     use helix_circuits::halo2_proofs::plonk::{keygen_pk, keygen_vk};
-    use helix_circuits::halo2curves::bn256::Bn256;
-    use rand::SeedableRng;
-    use rand::rngs::StdRng;
 
     let id = KeyId::new(circuit_name, version);
 
-    // Deterministic trusted setup (KZG) — same seed → same SRS
-    let rng = StdRng::from_seed(srs_seed);
-    let params = ParamsKZG::<Bn256>::setup(k, rng);
+    // Load SRS from cache or generate (deterministic — same seed → same SRS)
+    let (params, _cache_hit) = crate::pipeline::load_or_generate_srs(k, srs_seed, None);
 
     // Generate verification key then proving key
     let vk = keygen_vk(&params, circuit).expect("keygen_vk failed");

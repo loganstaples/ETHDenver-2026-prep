@@ -1085,6 +1085,11 @@ impl MLTrainingProverV2 {
     }
 }
 
+/// Creates a zero-initialized witness for setup (public variant for pipeline sizing).
+pub fn create_zero_witness_pub(d_in: usize, d_hid: usize, d_out: usize) -> MLTrainingStepV2Witness {
+    create_zero_witness(d_in, d_hid, d_out)
+}
+
 /// Creates a zero-initialized witness for setup.
 fn create_zero_witness(d_in: usize, d_hid: usize, d_out: usize) -> MLTrainingStepV2Witness {
     MLTrainingStepV2Witness {
@@ -1982,6 +1987,203 @@ mod tests {
             result.loss,
             result.verified
         );
+    }
+
+    // ========================================================================
+    // Circuit Scaling Tests (feature-gated for CI speed)
+    // ========================================================================
+
+    /// Helper: compute minimum_k and verify it's sane for given dimensions.
+    fn verify_minimum_k_for_dims(d_in: usize, d_hid: usize, d_out: usize) -> u32 {
+        use helix_circuits::ml::training_step_v2::MLTrainingStepV2Circuit;
+        let dummy = MLTrainingStepV2Circuit {
+            witness: create_zero_witness(d_in, d_hid, d_out),
+            relu_range: 256,
+            exp_range: 128,
+            exp_scale: 64,
+            use_freivalds: true,
+        };
+        let k = dummy.minimum_k();
+        assert!(k >= 10, "k should be at least 10, got {} for {}x{}x{}", k, d_in, d_hid, d_out);
+        assert!(k <= 26, "k should be at most 26, got {} for {}x{}x{}", k, d_in, d_hid, d_out);
+        k
+    }
+
+    #[test]
+    #[cfg(feature = "scaling-tests")]
+    fn test_scaling_16x16x8_minimum_k() {
+        let k = verify_minimum_k_for_dims(16, 16, 8);
+        println!("16x16x8: minimum_k = {}", k);
+        assert!(k >= 12, "16x16x8 should need at least k=12");
+    }
+
+    #[test]
+    #[cfg(feature = "scaling-tests")]
+    fn test_scaling_32x32x16_minimum_k() {
+        let k = verify_minimum_k_for_dims(32, 32, 16);
+        println!("32x32x16: minimum_k = {}", k);
+        assert!(k >= 13, "32x32x16 should need at least k=13");
+    }
+
+    #[test]
+    #[cfg(feature = "scaling-tests")]
+    fn test_scaling_64x64x32_minimum_k() {
+        let k = verify_minimum_k_for_dims(64, 64, 32);
+        println!("64x64x32: minimum_k = {}", k);
+        assert!(k >= 14, "64x64x32 should need at least k=14");
+    }
+
+    #[test]
+    #[cfg(feature = "scaling-tests")]
+    fn test_scaling_128x128x64_minimum_k() {
+        let k = verify_minimum_k_for_dims(128, 128, 64);
+        println!("128x128x64: minimum_k = {}", k);
+        assert!(k >= 15, "128x128x64 should need at least k=15");
+    }
+
+    #[test]
+    #[cfg(feature = "scaling-tests")]
+    fn test_scaling_16x16x8_mockprover() {
+        use helix_circuits::halo2_proofs::dev::MockProver;
+        use helix_circuits::ml::training_step_v2::MLTrainingStepV2Circuit;
+        use helix_circuits::halo2curves::bn256::Fr;
+
+        let (d_in, d_hid, d_out) = (16, 16, 8);
+        let k = verify_minimum_k_for_dims(d_in, d_hid, d_out);
+
+        let witness = MLTrainingProverV2::build_witness(
+            d_in, d_hid, d_out,
+            &vec![Fr::from(1); d_in],
+            &vec![Fr::from(1); d_out],
+            &vec![Fr::from(1); d_hid * d_in],
+            &vec![Fr::from(0); d_hid],
+            &vec![Fr::from(1); d_out * d_hid],
+            &vec![Fr::from(0); d_out],
+            Fr::from(1), 1, Fr::from(1),
+        );
+
+        let circuit = MLTrainingStepV2Circuit {
+            witness: witness.clone(),
+            relu_range: 256,
+            exp_range: 128,
+            exp_scale: 64,
+            use_freivalds: true,
+        };
+
+        let pi = witness.public_inputs();
+        let prover = MockProver::run(k, &circuit, vec![pi]).expect("MockProver::run failed");
+        prover.verify().expect("MockProver verification failed");
+        println!("16x16x8: MockProver passed at k={}", k);
+    }
+
+    #[test]
+    #[cfg(feature = "scaling-tests")]
+    fn test_scaling_16x16x8_real_proof() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (d_in, d_hid, d_out) = (16, 16, 8);
+
+        let config = V2ProverConfig::auto(d_in, d_hid, d_out, 256);
+        println!("16x16x8: auto config k={}, relu_range={}", config.k, config.relu_range);
+
+        let prover = MLTrainingProverV2::with_config(d_in, d_hid, d_out, config);
+        let witness = MLTrainingProverV2::build_witness(
+            d_in, d_hid, d_out,
+            &vec![Fr::from(1); d_in],
+            &vec![Fr::from(1); d_out],
+            &vec![Fr::from(1); d_hid * d_in],
+            &vec![Fr::from(0); d_hid],
+            &vec![Fr::from(1); d_out * d_hid],
+            &vec![Fr::from(0); d_out],
+            Fr::from(1), 1, Fr::from(1),
+        );
+
+        let start = std::time::Instant::now();
+        let result = prover.prove(&witness).expect("Real proof should succeed");
+        let elapsed = start.elapsed();
+
+        let peak_mem = crate::pipeline::current_resident_memory();
+        println!(
+            "16x16x8: proof={} bytes, time={:.1}s, peak_mem={}MB, verified={}",
+            result.proof.len(),
+            elapsed.as_secs_f64(),
+            peak_mem / (1024 * 1024),
+            result.verified,
+        );
+
+        assert!(!result.proof.is_empty());
+        assert!(prover.verify_result(&result));
+    }
+
+    #[test]
+    #[cfg(feature = "scaling-tests")]
+    fn test_scaling_32x32x16_mockprover() {
+        use helix_circuits::halo2_proofs::dev::MockProver;
+        use helix_circuits::ml::training_step_v2::MLTrainingStepV2Circuit;
+
+        let (d_in, d_hid, d_out) = (32, 32, 16);
+        let k = verify_minimum_k_for_dims(d_in, d_hid, d_out);
+
+        let witness = MLTrainingProverV2::build_witness(
+            d_in, d_hid, d_out,
+            &vec![Fr::from(1); d_in],
+            &vec![Fr::from(1); d_out],
+            &vec![Fr::from(1); d_hid * d_in],
+            &vec![Fr::from(0); d_hid],
+            &vec![Fr::from(1); d_out * d_hid],
+            &vec![Fr::from(0); d_out],
+            Fr::from(1), 1, Fr::from(1),
+        );
+
+        let circuit = MLTrainingStepV2Circuit {
+            witness: witness.clone(),
+            relu_range: 256,
+            exp_range: 128,
+            exp_scale: 64,
+            use_freivalds: true,
+        };
+
+        let pi = witness.public_inputs();
+        let prover = MockProver::run(k, &circuit, vec![pi]).expect("MockProver::run failed");
+        prover.verify().expect("MockProver verification failed");
+        println!("32x32x16: MockProver passed at k={}", k);
+    }
+
+    #[test]
+    #[cfg(feature = "scaling-tests")]
+    fn test_scaling_table_reference() {
+        let table = crate::pipeline::generate_scaling_table(&[
+            (2, 2, 1),
+            (8, 8, 4),
+            (16, 16, 8),
+            (32, 32, 16),
+            (64, 64, 32),
+            (128, 128, 64),
+        ]);
+
+        println!("\n=== Circuit Scaling Reference Table ===");
+        println!("{:<15} {:>4} {:>10} {:>12} {:>12} {:>10}",
+            "Model", "k", "Rows", "SRS (MB)", "Peak (MB)", "Disk (MB)");
+        println!("{:-<67}", "");
+        for entry in &table {
+            println!("{:<15} {:>4} {:>10} {:>12.1} {:>12.1} {:>10.1}",
+                format!("{}x{}x{}", entry.dims.0, entry.dims.1, entry.dims.2),
+                entry.k,
+                entry.rows,
+                entry.srs_memory_mb,
+                entry.peak_memory_mb,
+                entry.srs_disk_mb,
+            );
+        }
+        println!();
+
+        // Verify monotonicity
+        for i in 1..table.len() {
+            assert!(
+                table[i].k >= table[i-1].k,
+                "k should be monotonically non-decreasing: {} < {} at index {}",
+                table[i].k, table[i-1].k, i,
+            );
+        }
     }
 
     /// Multi-step training with Xavier-initialized 10×10×5 model.

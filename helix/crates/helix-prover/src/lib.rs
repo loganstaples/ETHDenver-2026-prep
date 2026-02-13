@@ -112,9 +112,11 @@ pub use parallel::{BatchError, BatchProofResult, ChunkProof, ParallelConfig, Par
 
 // Re-export pipeline types
 pub use pipeline::{
-    CancellationToken, ExtractedVkData, PipelineConfig, PipelineError, PipelineResult,
-    ProofPhase, ProofProgress, ProofResult, ProgressCallback, ProvingStats, ProverPipeline,
-    RetryConfig, no_progress_callback,
+    CancellationToken, ExtractedVkData, MemoryProfile, ModelRequirements, PipelineConfig,
+    PipelineError, PipelineResult, ProofPhase, ProofProgress, ProofResult, ProgressCallback,
+    ProvingStats, ProverPipeline, RetryConfig, ScalingEntry, compute_vk_hash,
+    current_resident_memory, default_srs_cache_dir, generate_scaling_table,
+    load_or_generate_srs, no_progress_callback,
 };
 
 // Re-export serialization types
@@ -137,7 +139,7 @@ pub use provers::training_prover_v2::{
     BatchProofResult as BatchProofResultV2, BatchTrainingProverV2, EvmProofBundle,
     MLTrainingProverV2, TrainingProofResultV2, TrainingProverError, TrainingProverResult,
     TrainingWeights, V2ProverConfig, WitnessValidationError, WitnessValidationResult,
-    validate_witness,
+    create_zero_witness_pub, validate_witness,
 };
 
 // Re-export cache types

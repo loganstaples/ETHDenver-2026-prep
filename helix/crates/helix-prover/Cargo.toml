@@ -10,6 +10,7 @@ parallel = ["rayon"]
 metal = ["metal-rs", "objc"]
 cuda = []  # CUDA backend - requires NVCC and CUDA Toolkit
 crypto-sign = ["ed25519-dalek"]
+scaling-tests = []
 
 [dependencies]
 helix-core = { path = "../helix-core" }
@@ -25,6 +26,7 @@ rand = "0.8"
 rand_core = "0.6"
 num_cpus = "1.16"
 sha2 = "0.10"
+hex = "0.4"
 num-bigint = "0.4"
 rayon = { version = "1.8", optional = true }
 blake3 = "1.5"
@@ -54,4 +56,3 @@ harness = false
 [[bench]]
 name = "gpu_acceleration"
 harness = false
-

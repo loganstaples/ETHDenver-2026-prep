@@ -3919,6 +3919,7 @@ dependencies = [
  "helix-avm",
  "helix-circuits",
  "helix-core",
+ "hex",
  "lz4_flex",
  "metal",
  "num-bigint",

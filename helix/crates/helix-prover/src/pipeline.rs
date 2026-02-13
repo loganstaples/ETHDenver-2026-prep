@@ -34,7 +34,9 @@ use rand::{rngs::StdRng, SeedableRng};
 use rand_core::{OsRng, RngCore};
 use sha2::Digest;
 use std::fmt;
+use std::io::{Read as IoRead, Write as IoWrite};
 use std::marker::PhantomData;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -456,6 +458,288 @@ impl PipelineConfig {
 }
 
 // ============================================================================
+// SRS Parameter Cache
+// ============================================================================
+
+/// Returns the default SRS cache directory.
+pub fn default_srs_cache_dir() -> PathBuf {
+    let base = std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp"))
+        .join(".cache");
+    base.join("helix").join("srs")
+}
+
+/// Loads cached SRS parameters from disk, or generates and caches them.
+///
+/// Uses `ParamsKZG::read()` / `ParamsKZG::write()` for efficient binary
+/// serialization of the SRS. The cache key is `srs_k{k}_{seed_hex}.bin`
+/// where `seed_hex` is the hex-encoded first 8 bytes of the SRS seed.
+///
+/// Returns `(params, cache_hit)` where `cache_hit` is true if loaded from disk.
+pub fn load_or_generate_srs(
+    k: u32,
+    srs_seed: [u8; 32],
+    cache_dir: Option<&Path>,
+) -> (ParamsKZG<Bn256>, bool) {
+    let cache_dir = cache_dir
+        .map(PathBuf::from)
+        .unwrap_or_else(default_srs_cache_dir);
+
+    let seed_prefix = hex::encode(&srs_seed[..8]);
+    let cache_file = cache_dir.join(format!("srs_k{}_{}.bin", k, seed_prefix));
+
+    // Try to load from cache
+    if cache_file.exists() {
+        if let Ok(file) = std::fs::File::open(&cache_file) {
+            let mut reader = std::io::BufReader::new(file);
+            if let Ok(params) = ParamsKZG::<Bn256>::read(&mut reader) {
+                if params.k() == k {
+                    tracing::info!(k, path = %cache_file.display(), "Loaded SRS from cache");
+                    return (params, true);
+                }
+                tracing::warn!(
+                    expected_k = k,
+                    found_k = params.k(),
+                    "Cached SRS k mismatch, regenerating"
+                );
+            } else {
+                tracing::warn!(path = %cache_file.display(), "Failed to read cached SRS, regenerating");
+            }
+        }
+    }
+
+    // Generate from scratch
+    let start = Instant::now();
+    let rng = StdRng::from_seed(srs_seed);
+    let params = ParamsKZG::<Bn256>::setup(k, rng);
+    let gen_time = start.elapsed();
+    tracing::info!(k, gen_time_ms = gen_time.as_millis() as u64, "Generated SRS from scratch");
+
+    // Cache to disk
+    if let Err(e) = std::fs::create_dir_all(&cache_dir) {
+        tracing::warn!(error = %e, "Failed to create SRS cache directory");
+    } else if let Ok(file) = std::fs::File::create(&cache_file) {
+        let mut writer = std::io::BufWriter::new(file);
+        if let Err(e) = params.write(&mut writer) {
+            tracing::warn!(error = %e, "Failed to write SRS to cache");
+            // Clean up partial file
+            let _ = std::fs::remove_file(&cache_file);
+        } else {
+            tracing::info!(
+                k,
+                path = %cache_file.display(),
+                size_mb = std::fs::metadata(&cache_file).map(|m| m.len() / (1024 * 1024)).unwrap_or(0),
+                "Cached SRS to disk"
+            );
+        }
+    }
+
+    (params, false)
+}
+
+/// Computes a SHA-256 hash of a verification key for consistency checks.
+///
+/// Serializes the VK and hashes the bytes. Two nodes with the same SRS and
+/// circuit must produce identical VK hashes.
+pub fn compute_vk_hash(vk: &VerifyingKey<G1Affine>) -> [u8; 32] {
+    use sha2::Sha256;
+    let mut hasher = Sha256::new();
+    // Serialize VK to bytes via its Debug representation as a stable proxy.
+    // The actual byte content includes all fixed commitments and selector data.
+    let mut vk_bytes = Vec::new();
+    vk.write(&mut vk_bytes, helix_circuits::halo2_proofs::SerdeFormat::RawBytes).unwrap_or_default();
+    hasher.update(&vk_bytes);
+    hasher.finalize().into()
+}
+
+// ============================================================================
+// Memory Profiling
+// ============================================================================
+
+/// Memory usage snapshot captured during proving.
+#[derive(Debug, Clone, Default)]
+pub struct MemoryProfile {
+    /// Resident memory before SRS generation (bytes).
+    pub pre_srs_memory: u64,
+    /// Resident memory after SRS generation (bytes).
+    pub post_srs_memory: u64,
+    /// Peak resident memory during proof generation (bytes).
+    pub peak_proving_memory: u64,
+    /// SRS size on disk (bytes).
+    pub srs_disk_size: u64,
+    /// Whether the SRS was loaded from cache.
+    pub srs_cache_hit: bool,
+}
+
+impl MemoryProfile {
+    /// Returns estimated SRS memory usage.
+    pub fn srs_memory_bytes(&self) -> u64 {
+        self.post_srs_memory.saturating_sub(self.pre_srs_memory)
+    }
+}
+
+/// Returns current resident memory size in bytes (macOS/Linux).
+pub fn current_resident_memory() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        // Use rusage which is simpler and more reliable than task_info
+        #[repr(C)]
+        struct Rusage {
+            ru_utime: [i64; 2],  // timeval
+            ru_stime: [i64; 2],  // timeval
+            ru_maxrss: i64,
+            _rest: [i64; 13],
+        }
+        extern "C" {
+            fn getrusage(who: i32, usage: *mut Rusage) -> i32;
+        }
+        const RUSAGE_SELF: i32 = 0;
+        unsafe {
+            let mut usage = std::mem::zeroed::<Rusage>();
+            if getrusage(RUSAGE_SELF, &mut usage) == 0 {
+                // On macOS, ru_maxrss is in bytes
+                return usage.ru_maxrss as u64;
+            }
+        }
+        0
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+            for line in status.lines() {
+                if line.starts_with("VmRSS:") {
+                    if let Some(kb_str) = line.split_whitespace().nth(1) {
+                        if let Ok(kb) = kb_str.parse::<u64>() {
+                            return kb * 1024;
+                        }
+                    }
+                }
+            }
+        }
+        0
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        0
+    }
+}
+
+// ============================================================================
+// Model Requirements
+// ============================================================================
+
+/// Hardware requirements for proving a model of given dimensions.
+#[derive(Debug, Clone)]
+pub struct ModelRequirements {
+    /// Model dimensions (d_in, d_hid, d_out).
+    pub dims: (usize, usize, usize),
+    /// Required k value (circuit size = 2^k rows).
+    pub k: u32,
+    /// Estimated SRS memory (bytes).
+    pub estimated_srs_memory: u64,
+    /// Estimated peak proving memory (bytes).
+    pub estimated_peak_memory: u64,
+    /// Estimated SRS disk size (bytes).
+    pub estimated_srs_disk_size: u64,
+    /// Whether this model fits the given constraints.
+    pub feasible: bool,
+    /// Reason if not feasible.
+    pub infeasible_reason: Option<String>,
+}
+
+impl ModelRequirements {
+    /// Estimates requirements for a model with the given dimensions.
+    ///
+    /// Uses heuristics based on k value:
+    /// - SRS memory: ~48 * 2^k bytes (G1 points)
+    /// - Peak proving memory: ~5x SRS memory
+    /// - SRS disk size: ~48 * 2^k bytes
+    pub fn estimate(d_in: usize, d_hid: usize, d_out: usize, max_memory_bytes: u64) -> Self {
+        use helix_circuits::ml::training_step_v2::MLTrainingStepV2Circuit;
+
+        let relu_range = 256usize;
+        let exp_range = 128usize;
+
+        let dummy_witness = crate::provers::training_prover_v2::create_zero_witness_pub(d_in, d_hid, d_out);
+        let dummy_circuit = MLTrainingStepV2Circuit {
+            witness: dummy_witness,
+            relu_range,
+            exp_range,
+            exp_scale: 64,
+            use_freivalds: true,
+        };
+        let k = dummy_circuit.minimum_k();
+
+        // Heuristic: each G1 point is ~48 bytes (compressed) in memory
+        let srs_points = 1u64 << k;
+        let estimated_srs_memory = srs_points * 96; // ~96 bytes per G1Affine in memory
+        let estimated_peak_memory = estimated_srs_memory * 5; // proving uses ~5x SRS
+        let estimated_srs_disk_size = srs_points * 64; // serialized format
+
+        let feasible = if max_memory_bytes > 0 {
+            estimated_peak_memory <= max_memory_bytes
+        } else {
+            true // No constraint
+        };
+
+        let infeasible_reason = if !feasible {
+            Some(format!(
+                "Model requires ~{}MB peak memory (k={}), but limit is {}MB. \
+                 Reduce model size or increase available memory.",
+                estimated_peak_memory / (1024 * 1024),
+                k,
+                max_memory_bytes / (1024 * 1024),
+            ))
+        } else {
+            None
+        };
+
+        Self {
+            dims: (d_in, d_hid, d_out),
+            k,
+            estimated_srs_memory,
+            estimated_peak_memory,
+            estimated_srs_disk_size,
+            feasible,
+            infeasible_reason,
+        }
+    }
+}
+
+/// Reference table entry for deployment planning.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ScalingEntry {
+    /// Model dimensions (d_in, d_hid, d_out).
+    pub dims: (usize, usize, usize),
+    /// Circuit size parameter.
+    pub k: u32,
+    /// Number of circuit rows (2^k).
+    pub rows: u64,
+    /// Estimated SRS memory in MB.
+    pub srs_memory_mb: f64,
+    /// Estimated peak proving memory in MB.
+    pub peak_memory_mb: f64,
+    /// Estimated SRS disk size in MB.
+    pub srs_disk_mb: f64,
+}
+
+/// Generates a scaling reference table for a list of model sizes.
+pub fn generate_scaling_table(model_sizes: &[(usize, usize, usize)]) -> Vec<ScalingEntry> {
+    model_sizes.iter().map(|&(d_in, d_hid, d_out)| {
+        let req = ModelRequirements::estimate(d_in, d_hid, d_out, 0);
+        ScalingEntry {
+            dims: (d_in, d_hid, d_out),
+            k: req.k,
+            rows: 1u64 << req.k,
+            srs_memory_mb: req.estimated_srs_memory as f64 / (1024.0 * 1024.0),
+            peak_memory_mb: req.estimated_peak_memory as f64 / (1024.0 * 1024.0),
+            srs_disk_mb: req.estimated_srs_disk_size as f64 / (1024.0 * 1024.0),
+        }
+    }).collect()
+}
+
+// ============================================================================
 // Extracted VK Data
 // ============================================================================
 
@@ -495,6 +779,8 @@ pub struct ProofResult {
     pub attempts: u32,
     /// Proof generation seed (for reproducibility).
     pub seed: Option<[u8; 32]>,
+    /// Peak memory during proof generation (bytes, 0 if unavailable).
+    pub peak_memory: u64,
 }
 
 // ============================================================================
@@ -513,6 +799,10 @@ pub struct ProverPipeline<C: Circuit<Fr>> {
     config: PipelineConfig,
     /// Proof counter for statistics.
     proof_count: AtomicU64,
+    /// Memory profile from SRS loading.
+    memory_profile: MemoryProfile,
+    /// VK hash for consistency checks.
+    vk_hash: Option<[u8; 32]>,
     /// Marker for circuit type.
     _marker: PhantomData<C>,
 }
@@ -527,21 +817,39 @@ impl<C: Circuit<Fr> + Clone> ProverPipeline<C> {
     ///
     /// Uses the deterministic HELIX SRS seed so all provers generate
     /// compatible parameters. Override with [`PipelineConfig::deterministic`]
-    /// to use a custom seed.
+    /// to use a custom seed. Automatically caches SRS to disk for fast
+    /// restarts.
     pub fn with_config(config: PipelineConfig) -> Self {
-        use rand::SeedableRng;
-        use rand::rngs::StdRng;
+        let pre_memory = current_resident_memory();
 
         let srs_seed = config.deterministic_seed
             .unwrap_or(crate::keys::HELIX_SRS_SEED);
-        let rng = StdRng::from_seed(srs_seed);
-        let params = ParamsKZG::<Bn256>::setup(config.k, rng);
+
+        let (params, cache_hit) = load_or_generate_srs(config.k, srs_seed, None);
+
+        let post_memory = current_resident_memory();
+
+        let srs_disk_size = {
+            let seed_prefix = hex::encode(&srs_seed[..8]);
+            let cache_file = default_srs_cache_dir()
+                .join(format!("srs_k{}_{}.bin", config.k, seed_prefix));
+            std::fs::metadata(&cache_file).map(|m| m.len()).unwrap_or(0)
+        };
+
         Self {
             params,
             pk: None,
             vk: None,
             config,
             proof_count: AtomicU64::new(0),
+            memory_profile: MemoryProfile {
+                pre_srs_memory: pre_memory,
+                post_srs_memory: post_memory,
+                peak_proving_memory: post_memory,
+                srs_disk_size,
+                srs_cache_hit: cache_hit,
+            },
+            vk_hash: None,
             _marker: PhantomData,
         }
     }
@@ -556,12 +864,15 @@ impl<C: Circuit<Fr> + Clone> ProverPipeline<C> {
         pk: ProvingKey<G1Affine>,
         vk: VerifyingKey<G1Affine>,
     ) -> Self {
+        let vk_hash = Some(compute_vk_hash(&vk));
         Self {
             params,
             pk: Some(pk),
             vk: Some(vk),
             config,
             proof_count: AtomicU64::new(0),
+            memory_profile: MemoryProfile::default(),
+            vk_hash,
             _marker: PhantomData,
         }
     }
@@ -588,6 +899,7 @@ impl<C: Circuit<Fr> + Clone> ProverPipeline<C> {
             PipelineError::keygen_with_cause("Failed to generate proving key", format!("{:?}", e))
         })?;
 
+        self.vk_hash = Some(compute_vk_hash(&vk));
         self.vk = Some(vk);
         self.pk = Some(pk);
 
@@ -698,6 +1010,7 @@ impl<C: Circuit<Fr> + Clone> ProverPipeline<C> {
                     // Determine seed used
                     let seed = self.config.deterministic_seed;
 
+                    let peak_mem = current_resident_memory();
                     self.proof_count.fetch_add(1, Ordering::Relaxed);
 
                     if self.config.enable_tracing {
@@ -706,6 +1019,7 @@ impl<C: Circuit<Fr> + Clone> ProverPipeline<C> {
                             generation_time_ms = gen_time.as_millis() as u64,
                             attempts = attempt + 1,
                             verified,
+                            peak_memory_mb = peak_mem / (1024 * 1024),
                             "Proof generated successfully"
                         );
                     }
@@ -717,6 +1031,7 @@ impl<C: Circuit<Fr> + Clone> ProverPipeline<C> {
                         verification_time: verify_time,
                         attempts: attempt + 1,
                         seed,
+                        peak_memory: peak_mem,
                     });
                 }
                 Err(e) => {
@@ -946,6 +1261,31 @@ impl<C: Circuit<Fr> + Clone> ProverPipeline<C> {
         self.proof_count.load(Ordering::Relaxed)
     }
 
+    /// Returns the memory profile from SRS loading and proving.
+    pub fn memory_profile(&self) -> &MemoryProfile {
+        &self.memory_profile
+    }
+
+    /// Returns the VK hash for consistency verification.
+    ///
+    /// Two pipelines with the same SRS seed, k, and circuit must produce
+    /// identical VK hashes. Use this to verify that a node's VK matches
+    /// the expected value from the aggregator or contract.
+    pub fn vk_hash(&self) -> Option<&[u8; 32]> {
+        self.vk_hash.as_ref()
+    }
+
+    /// Verifies that this pipeline's VK hash matches the expected hash.
+    ///
+    /// Returns `Ok(true)` if the hashes match, `Ok(false)` if they don't,
+    /// or `Err` if the pipeline hasn't been set up yet.
+    pub fn verify_vk_consistency(&self, expected_hash: &[u8; 32]) -> PipelineResult<bool> {
+        let hash = self.vk_hash.as_ref().ok_or_else(|| {
+            PipelineError::not_initialized("VK not generated - call setup() first")
+        })?;
+        Ok(hash == expected_hash)
+    }
+
     /// Proves multiple circuits in batch, returning individual proofs.
     pub fn prove_batch(
         &self,
@@ -1141,6 +1481,114 @@ fn g2_to_evm_decimal_tuple(point: &G2Affine) -> (String, String, String, String)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_srs_cache_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path();
+        let seed = crate::keys::HELIX_SRS_SEED;
+        let k = 5; // Small k for fast test
+
+        // First call: generate
+        let (params1, hit1) = load_or_generate_srs(k, seed, Some(cache_dir));
+        assert!(!hit1, "First call should not be a cache hit");
+        assert_eq!(params1.k(), k);
+
+        // Second call: should load from cache
+        let (params2, hit2) = load_or_generate_srs(k, seed, Some(cache_dir));
+        assert!(hit2, "Second call should be a cache hit");
+        assert_eq!(params2.k(), k);
+
+        // Verify the params produce the same s_g2 point (proving SRS equivalence)
+        let s1 = params1.s_g2();
+        let s2 = params2.s_g2();
+        assert_eq!(s1, s2, "Cached SRS must match generated SRS");
+    }
+
+    #[test]
+    fn test_srs_cache_different_seeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path();
+        let k = 5;
+
+        let seed1 = [1u8; 32];
+        let seed2 = [2u8; 32];
+
+        let (params1, _) = load_or_generate_srs(k, seed1, Some(cache_dir));
+        let (params2, _) = load_or_generate_srs(k, seed2, Some(cache_dir));
+
+        // Different seeds should produce different SRS
+        assert_ne!(params1.s_g2(), params2.s_g2(), "Different seeds must produce different SRS");
+    }
+
+    #[test]
+    fn test_vk_hash_consistency() {
+        use helix_circuits::halo2_proofs::plonk::{keygen_vk, Circuit};
+        use helix_circuits::halo2curves::bn256::Fr;
+
+        // Generate two VKs from the same SRS + circuit → must have same hash
+        let seed = crate::keys::HELIX_SRS_SEED;
+        let dir = tempfile::tempdir().unwrap();
+        let k = 5;
+
+        let (params, _) = load_or_generate_srs(k, seed, Some(dir.path()));
+
+        // Use the IVCStepCircuit as a simple test circuit
+        use crate::provers::ivc_circuit::IVCStepCircuit;
+        let circuit = IVCStepCircuit::default();
+
+        let vk1 = keygen_vk(&params, &circuit).unwrap();
+        let vk2 = keygen_vk(&params, &circuit).unwrap();
+
+        let hash1 = compute_vk_hash(&vk1);
+        let hash2 = compute_vk_hash(&vk2);
+
+        assert_eq!(hash1, hash2, "Same SRS + circuit must produce same VK hash");
+        assert_ne!(hash1, [0u8; 32], "VK hash should not be all zeros");
+    }
+
+    #[test]
+    fn test_memory_profiling() {
+        let mem = current_resident_memory();
+        // On macOS/Linux this should return a non-zero value
+        // On other platforms it returns 0 (which is fine)
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
+            assert!(mem > 0, "Resident memory should be positive on macOS/Linux");
+        }
+    }
+
+    #[test]
+    fn test_model_requirements_estimate() {
+        // Small model
+        let req = ModelRequirements::estimate(2, 2, 1, 0);
+        assert_eq!(req.dims, (2, 2, 1));
+        assert!(req.k >= 10, "k should be at least 10");
+        assert!(req.feasible, "Small model should be feasible");
+        assert!(req.estimated_srs_memory > 0);
+        assert!(req.estimated_peak_memory > req.estimated_srs_memory);
+
+        // Model with tight memory constraint
+        let req = ModelRequirements::estimate(2, 2, 1, 1024); // 1KB limit
+        assert!(!req.feasible, "Should be infeasible with 1KB limit");
+        assert!(req.infeasible_reason.is_some());
+    }
+
+    #[test]
+    fn test_scaling_table() {
+        let table = generate_scaling_table(&[
+            (2, 2, 1),
+            (16, 16, 8),
+            (32, 32, 16),
+        ]);
+        assert_eq!(table.len(), 3);
+
+        // k should increase with model size
+        assert!(table[1].k >= table[0].k, "Larger model should need >= k");
+        assert!(table[2].k >= table[1].k, "Larger model should need >= k");
+
+        // Memory should increase with k
+        assert!(table[1].srs_memory_mb >= table[0].srs_memory_mb);
+    }
 
     #[test]
     fn test_pipeline_error_display() {
