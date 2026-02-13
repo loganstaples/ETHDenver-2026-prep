@@ -17,6 +17,7 @@ use super::eclipse::{
     PeerNetworkInfo,
 };
 use super::gossip::{GossipConfig, GossipProtocol};
+use super::mdns_discovery::{MdnsConfig, MdnsDiscovery, MdnsEvent};
 use super::messages::{
     ConsensusMessage, DiscoveryMessage, GradientMessage, HeartbeatMessage, MessagePayload,
     NetworkMessage, NodeCapabilities, PeerId, PeerInfo, PeerKeyRegistry, SyncMessage,
@@ -76,6 +77,14 @@ pub struct NetworkRunnerConfig {
     pub cache_cleanup_interval_secs: u64,
     /// Maximum outbound messages per tick.
     pub max_outbound_per_tick: usize,
+    /// Enable mDNS discovery for local network.
+    pub mdns_enabled: bool,
+    /// Reconnection base interval (seconds) for exponential backoff.
+    pub reconnect_base_interval_secs: u64,
+    /// Maximum reconnection interval (seconds).
+    pub reconnect_max_interval_secs: u64,
+    /// Maximum reconnection attempts before giving up on a peer.
+    pub reconnect_max_attempts: u32,
 }
 
 impl Default for NetworkRunnerConfig {
@@ -92,6 +101,10 @@ impl Default for NetworkRunnerConfig {
             gossip_send_interval_ms: 100,
             cache_cleanup_interval_secs: 60,
             max_outbound_per_tick: 50,
+            mdns_enabled: false,
+            reconnect_base_interval_secs: 2,
+            reconnect_max_interval_secs: 60,
+            reconnect_max_attempts: 10,
         }
     }
 }
@@ -123,6 +136,19 @@ impl SignatureStats {
         *count += 1;
         *count > self.auto_blacklist_threshold
     }
+}
+
+/// State for a peer pending reconnection with exponential backoff.
+#[derive(Debug, Clone)]
+pub struct ReconnectState {
+    /// Peer address.
+    pub address: String,
+    /// Number of reconnection attempts so far.
+    pub attempts: u32,
+    /// Next retry time (unix seconds).
+    pub next_retry_secs: u64,
+    /// Capabilities of the peer (for re-registration).
+    pub capabilities: NodeCapabilities,
 }
 
 /// The network runner manages the complete network stack.
@@ -166,6 +192,10 @@ pub struct NetworkRunner {
     /// Whether training should be paused due to network issues
     /// (partition detection sets this to true when PauseTraining/Halt is recommended).
     training_paused: Arc<std::sync::atomic::AtomicBool>,
+    /// Peers that have disconnected and need reconnection (peer_id -> (addr, attempts, next_retry)).
+    reconnect_queue: Arc<parking_lot::Mutex<HashMap<PeerId, ReconnectState>>>,
+    /// Our ed25519 public key bytes (if crypto-sign is enabled).
+    pub_key_bytes: Option<Vec<u8>>,
 }
 
 impl NetworkRunner {
@@ -221,6 +251,8 @@ impl NetworkRunner {
             capabilities,
             listen_addr,
             training_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            reconnect_queue: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            pub_key_bytes: None,
         })
     }
 
@@ -280,6 +312,9 @@ impl NetworkRunner {
             ).await;
         });
 
+        // Start reconnection loop
+        self.start_reconnection_loop().await;
+
         Ok(())
     }
 
@@ -331,10 +366,11 @@ impl NetworkRunner {
         self.pool.register_peer(peer_info.id.clone(), addr);
         self.discovery.mark_connected(peer_info.clone()).await;
 
-        // Send join request
-        let join_msg = self.discovery.create_join_request(
+        // Send join request with our public key for authentication
+        let join_msg = self.discovery.create_join_request_with_key(
             self.capabilities.clone(),
             self.listen_addr.clone(),
+            self.pub_key_bytes.clone(),
         );
         self.pool.send(&peer_info.id, join_msg).await?;
 
@@ -415,6 +451,287 @@ impl NetworkRunner {
     /// Returns the peer key registry (for registering peer public keys).
     pub fn peer_keys(&self) -> &Arc<parking_lot::Mutex<PeerKeyRegistry>> {
         &self.peer_keys
+    }
+
+    /// Sets the ed25519 signing key for this node.
+    /// This enables authenticated connections: JoinRequests will include our public key,
+    /// and remote peers will register it for signature verification.
+    #[cfg(feature = "crypto-sign")]
+    pub fn set_signing_key(&mut self, key: ed25519_dalek::SigningKey) {
+        let vk = key.verifying_key();
+        self.pub_key_bytes = Some(vk.to_bytes().to_vec());
+        // Register our own key so self-messages are valid
+        self.peer_keys.lock().register(self.local_id.clone(), vk);
+    }
+
+    #[cfg(not(feature = "crypto-sign"))]
+    pub fn set_signing_key(&mut self, _key_bytes: &[u8]) {
+        // No-op without crypto-sign
+    }
+
+    /// Returns our public key bytes (for JoinRequest).
+    pub fn pub_key_bytes(&self) -> Option<&[u8]> {
+        self.pub_key_bytes.as_deref()
+    }
+
+    /// Connects to bootstrap peers listed in the discovery config.
+    /// For each bootstrap peer, sends a JoinRequest and receives a peer list back.
+    pub async fn bootstrap(&self) {
+        let bootstrap_nodes = self.config.discovery.bootstrap_nodes.clone();
+        if bootstrap_nodes.is_empty() {
+            log::debug!("No bootstrap nodes configured");
+            return;
+        }
+
+        log::info!("Bootstrapping from {} nodes: {:?}", bootstrap_nodes.len(), bootstrap_nodes);
+
+        for addr_str in &bootstrap_nodes {
+            let addr: SocketAddr = match addr_str.parse() {
+                Ok(a) => a,
+                Err(e) => {
+                    log::warn!("Invalid bootstrap address '{}': {}", addr_str, e);
+                    continue;
+                }
+            };
+
+            // Create a temporary PeerInfo for the bootstrap node
+            let boot_peer = PeerInfo {
+                id: PeerId::from_string(&format!("bootstrap-{}", addr_str)),
+                address: addr_str.clone(),
+                capabilities: NodeCapabilities::default(),
+                last_seen: 0,
+                reputation: 100,
+            };
+
+            match self.connect_peer(boot_peer).await {
+                Ok(()) => {
+                    log::info!("Connected to bootstrap node {}", addr_str);
+                    // Request peer list from bootstrap node
+                    let get_peers = self.discovery.create_get_peers_request();
+                    let boot_id = PeerId::from_string(&format!("bootstrap-{}", addr_str));
+                    if let Err(e) = self.pool.send(&boot_id, get_peers).await {
+                        log::warn!("Failed to request peers from bootstrap {}: {}", addr_str, e);
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Failed to connect to bootstrap node {}: {}", addr_str, e);
+                }
+            }
+        }
+
+        // Announce ourselves via gossip after bootstrap
+        let announce = self.discovery.create_announcement(
+            self.capabilities.clone(),
+            self.listen_addr.clone(),
+        );
+        let peers = self.get_connected_peer_ids().await;
+        self.gossip.broadcast(announce, &peers).await;
+    }
+
+    /// Starts mDNS discovery for local network peer finding.
+    /// Spawns a background task that auto-connects to discovered peers.
+    pub async fn start_mdns(&self) -> Result<(), super::mdns_discovery::MdnsError> {
+        if !self.config.mdns_enabled {
+            log::debug!("mDNS discovery disabled");
+            return Ok(());
+        }
+
+        let mdns_config = MdnsConfig {
+            port: self.config.transport.listen_addr.port(),
+            enabled: true,
+            ..MdnsConfig::default()
+        };
+
+        let mut mdns = MdnsDiscovery::new(
+            self.local_id.clone(),
+            mdns_config,
+            self.capabilities.clone(),
+        );
+
+        let mut event_rx = mdns.start()?;
+        log::info!("mDNS discovery started on port {}", self.config.transport.listen_addr.port());
+
+        // Spawn background task to handle mDNS events
+        let discovery = self.discovery.clone();
+        let pool = self.pool.clone();
+        let event_tx = self.event_tx.clone();
+        let running = self.running.clone();
+        let local_id = self.local_id.clone();
+        let capabilities = self.capabilities.clone();
+        let listen_addr = self.listen_addr.clone();
+        let pub_key = self.pub_key_bytes.clone();
+
+        tokio::spawn(async move {
+            while running.load(std::sync::atomic::Ordering::SeqCst) {
+                match tokio::time::timeout(Duration::from_secs(5), event_rx.recv()).await {
+                    Ok(Some(MdnsEvent::Discovered(peer_info))) => {
+                        if peer_info.id == local_id {
+                            continue; // Skip ourselves
+                        }
+                        log::info!(
+                            "mDNS discovered peer {} at {} (aggregate={}, train={})",
+                            peer_info.id, peer_info.address,
+                            peer_info.capabilities.can_aggregate,
+                            peer_info.capabilities.can_train,
+                        );
+
+                        // Register in discovery
+                        discovery.mark_connected(peer_info.clone()).await;
+
+                        // Register in pool and connect
+                        if let Ok(addr) = peer_info.address.parse::<SocketAddr>() {
+                            pool.register_peer(peer_info.id.clone(), addr);
+
+                            // Send join request
+                            let join_msg = discovery.create_join_request_with_key(
+                                capabilities.clone(),
+                                listen_addr.clone(),
+                                pub_key.clone(),
+                            );
+                            if let Err(e) = pool.send(&peer_info.id, join_msg).await {
+                                log::debug!("Failed to send join to mDNS peer {}: {}", peer_info.id, e);
+                            }
+                        }
+
+                        let _ = event_tx.send(NetworkEvent::PeerDiscovered(peer_info)).await;
+                    }
+                    Ok(Some(MdnsEvent::Lost(peer_id))) => {
+                        log::info!("mDNS peer lost: {}", peer_id);
+                        let _ = event_tx.send(NetworkEvent::PeerDisconnected(peer_id)).await;
+                    }
+                    Ok(Some(MdnsEvent::Updated(_))) => {} // Ignore updates
+                    Ok(None) => break, // Channel closed
+                    Err(_) => {} // Timeout, continue
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    /// Starts the reconnection background loop with exponential backoff.
+    pub async fn start_reconnection_loop(&self) {
+        let running = self.running.clone();
+        let reconnect_queue = self.reconnect_queue.clone();
+        let pool = self.pool.clone();
+        let discovery = self.discovery.clone();
+        let event_tx = self.event_tx.clone();
+        let capabilities = self.capabilities.clone();
+        let listen_addr = self.listen_addr.clone();
+        let pub_key = self.pub_key_bytes.clone();
+        let base_interval = self.config.reconnect_base_interval_secs;
+        let max_interval = self.config.reconnect_max_interval_secs;
+        let max_attempts = self.config.reconnect_max_attempts;
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+
+            while running.load(std::sync::atomic::Ordering::SeqCst) {
+                interval.tick().await;
+
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+
+                // Collect peers ready for retry
+                let ready_peers: Vec<(PeerId, ReconnectState)> = {
+                    let queue = reconnect_queue.lock();
+                    queue.iter()
+                        .filter(|(_, state)| now >= state.next_retry_secs)
+                        .map(|(id, state)| (id.clone(), state.clone()))
+                        .collect()
+                };
+
+                for (peer_id, state) in ready_peers {
+                    if state.attempts >= max_attempts {
+                        log::warn!(
+                            "Giving up reconnection to {} after {} attempts",
+                            peer_id, state.attempts,
+                        );
+                        reconnect_queue.lock().remove(&peer_id);
+                        let _ = event_tx.send(NetworkEvent::PeerDisconnected(peer_id)).await;
+                        continue;
+                    }
+
+                    let addr: SocketAddr = match state.address.parse() {
+                        Ok(a) => a,
+                        Err(_) => {
+                            reconnect_queue.lock().remove(&peer_id);
+                            continue;
+                        }
+                    };
+
+                    log::info!(
+                        "Reconnecting to {} (attempt {}/{})",
+                        peer_id, state.attempts + 1, max_attempts,
+                    );
+
+                    pool.register_peer(peer_id.clone(), addr);
+
+                    let join_msg = discovery.create_join_request_with_key(
+                        capabilities.clone(),
+                        listen_addr.clone(),
+                        pub_key.clone(),
+                    );
+
+                    match pool.send(&peer_id, join_msg).await {
+                        Ok(()) => {
+                            log::info!("Reconnected to {}", peer_id);
+                            // Re-register in discovery
+                            let peer_info = PeerInfo {
+                                id: peer_id.clone(),
+                                address: state.address.clone(),
+                                capabilities: state.capabilities.clone(),
+                                last_seen: now,
+                                reputation: 0,
+                            };
+                            discovery.mark_connected(peer_info.clone()).await;
+                            reconnect_queue.lock().remove(&peer_id);
+                            let _ = event_tx.send(NetworkEvent::PeerDiscovered(peer_info)).await;
+                        }
+                        Err(e) => {
+                            log::debug!("Reconnection to {} failed: {}", peer_id, e);
+                            // Exponential backoff
+                            let next_attempts = state.attempts + 1;
+                            let delay = (base_interval * 2u64.pow(next_attempts))
+                                .min(max_interval);
+                            reconnect_queue.lock().insert(peer_id, ReconnectState {
+                                address: state.address,
+                                attempts: next_attempts,
+                                next_retry_secs: now + delay,
+                                capabilities: state.capabilities,
+                            });
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// Schedules a peer for reconnection with exponential backoff.
+    pub fn schedule_reconnect(&self, peer_id: PeerId, address: String, capabilities: NodeCapabilities) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let mut queue = self.reconnect_queue.lock();
+        if queue.contains_key(&peer_id) {
+            return; // Already scheduled
+        }
+        queue.insert(peer_id.clone(), ReconnectState {
+            address,
+            attempts: 0,
+            next_retry_secs: now + self.config.reconnect_base_interval_secs,
+            capabilities,
+        });
+        log::info!("Scheduled reconnection for peer {}", peer_id);
+    }
+
+    /// Returns the reconnect queue for inspection.
+    pub fn reconnect_queue(&self) -> Arc<parking_lot::Mutex<HashMap<PeerId, ReconnectState>>> {
+        self.reconnect_queue.clone()
     }
 
     /// Returns the signature validation statistics.
@@ -511,11 +828,12 @@ impl NetworkRunner {
                         }
                     }
 
-                    // === Rate limiting (Task B3.4) ===
+                    // === Rate limiting with identity verification (Task B3.4) ===
                     let msg_type = Self::payload_to_message_type(&message.payload);
+                    let identity_verified = peer_keys.lock().has_key(&message.sender);
                     {
                         let mut limiter = rate_limiter.lock();
-                        let result = limiter.check_rate_limit(&message.sender, msg_type);
+                        let result = limiter.check_rate_limit_verified(&message.sender, msg_type, identity_verified);
                         match result {
                             RateLimitResult::Allowed => {}
                             RateLimitResult::Blacklisted => {
@@ -590,7 +908,27 @@ impl NetworkRunner {
 
                             // === Inbound peer registration (Task B3.6) ===
                             // Register inbound peers on JoinRequest so we can route responses
-                            if let DiscoveryMessage::JoinRequest { capabilities, listen_addr } = disc_msg {
+                            if let DiscoveryMessage::JoinRequest { capabilities, listen_addr, public_key } = disc_msg {
+                                // === Authenticated connection: register ed25519 key ===
+                                if let Some(ref key_bytes) = public_key {
+                                    let registered = peer_keys.lock().register_from_bytes(
+                                        message.sender.clone(),
+                                        key_bytes,
+                                    );
+                                    if registered {
+                                        log::info!(
+                                            "Registered ed25519 key for peer {} ({} bytes)",
+                                            message.sender, key_bytes.len(),
+                                        );
+                                    } else {
+                                        log::warn!(
+                                            "Invalid ed25519 key from peer {} — rejecting",
+                                            message.sender,
+                                        );
+                                        continue;
+                                    }
+                                }
+
                                 // === Eclipse diversity check for inbound peers (Task B3.5) ===
                                 if let Ok(addr) = listen_addr.parse::<SocketAddr>() {
                                     let peer_net_info = PeerNetworkInfo::new(
@@ -845,6 +1183,20 @@ impl NetworkRunnerBuilder {
     /// Sets gossip fanout.
     pub fn gossip_fanout(mut self, fanout: usize) -> Self {
         self.config.gossip.fanout = fanout;
+        self
+    }
+
+    /// Enables mDNS discovery.
+    pub fn enable_mdns(mut self, enabled: bool) -> Self {
+        self.config.mdns_enabled = enabled;
+        self
+    }
+
+    /// Sets reconnection parameters.
+    pub fn reconnect_config(mut self, base_secs: u64, max_secs: u64, max_attempts: u32) -> Self {
+        self.config.reconnect_base_interval_secs = base_secs;
+        self.config.reconnect_max_interval_secs = max_secs;
+        self.config.reconnect_max_attempts = max_attempts;
         self
     }
 

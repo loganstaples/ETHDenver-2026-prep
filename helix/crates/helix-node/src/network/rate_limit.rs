@@ -680,6 +680,69 @@ impl RateLimiter {
     pub fn blacklist(&self) -> &HashMap<String, BlacklistEntry> {
         &self.blacklist
     }
+
+    /// Checks rate limit using verified identity.
+    /// This should be called with the identity that was verified via ed25519 signature,
+    /// not the self-reported sender ID. If identity_verified is false, applies a
+    /// stricter rate limit (2x cost) to unverified peers.
+    pub fn check_rate_limit_verified(
+        &mut self,
+        peer_id: &PeerId,
+        msg_type: MessageType,
+        identity_verified: bool,
+    ) -> RateLimitResult {
+        if !identity_verified {
+            // Unverified peers get 2x cost multiplier
+            self.stats.total_requests += 1;
+
+            if self.is_blacklisted(&peer_id.0) {
+                self.stats.requests_denied += 1;
+                return RateLimitResult::Blacklisted;
+            }
+
+            let base_cost = self.message_costs.get(&msg_type).copied().unwrap_or(1.0);
+            let cost = base_cost * 2.0; // Penalty for unverified identity
+
+            if !self.global_limit.try_acquire(cost) {
+                self.stats.requests_denied += 1;
+                return RateLimitResult::GlobalLimitExceeded;
+            }
+
+            let (limit_exceeded, violations, should_blacklist) = {
+                let peer_limit = self.peer_limits.entry(peer_id.clone()).or_insert_with(|| {
+                    PeerRateLimit::new(
+                        peer_id.clone(),
+                        self.config.default_burst_size as f64 / 2.0, // Half burst for unverified
+                        self.config.default_requests_per_second / 2.0, // Half rate for unverified
+                    )
+                });
+
+                if !peer_limit.try_acquire_typed(msg_type, cost) {
+                    (true, peer_limit.violations(), peer_limit.violations() >= self.config.auto_blacklist_threshold)
+                } else {
+                    (false, 0, false)
+                }
+            };
+
+            if limit_exceeded {
+                self.stats.requests_denied += 1;
+                if should_blacklist {
+                    self.blacklist_peer(peer_id, BlacklistReason::RateLimitViolations { count: violations });
+                    return RateLimitResult::AutoBlacklisted;
+                }
+                let cooldown = Duration::from_secs_f64(
+                    self.config.cooldown_period.as_secs_f64() * 2.0_f64.powi(violations as i32 - 1),
+                ).min(self.config.max_cooldown);
+                return RateLimitResult::PeerLimitExceeded { cooldown, violations };
+            }
+
+            self.stats.requests_allowed += 1;
+            RateLimitResult::Allowed
+        } else {
+            // Verified identity gets normal rate limiting
+            self.check_rate_limit(peer_id, msg_type)
+        }
+    }
 }
 
 /// Result of a rate limit check.

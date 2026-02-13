@@ -241,6 +241,40 @@ impl PeerKeyRegistry {
     pub fn has_key(&self, _peer_id: &PeerId) -> bool {
         false
     }
+
+    /// Registers a peer's key from raw bytes (32-byte ed25519 public key).
+    /// Returns true if registration succeeded.
+    #[cfg(feature = "crypto-sign")]
+    pub fn register_from_bytes(&mut self, peer_id: PeerId, key_bytes: &[u8]) -> bool {
+        if key_bytes.len() != 32 {
+            return false;
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(key_bytes);
+        match ed25519_dalek::VerifyingKey::from_bytes(&arr) {
+            Ok(vk) => {
+                self.keys.insert(peer_id, vk);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    #[cfg(not(feature = "crypto-sign"))]
+    pub fn register_from_bytes(&mut self, _peer_id: PeerId, _key_bytes: &[u8]) -> bool {
+        true // Always succeed when crypto-sign is disabled
+    }
+
+    /// Returns the number of registered keys.
+    #[cfg(feature = "crypto-sign")]
+    pub fn key_count(&self) -> usize {
+        self.keys.len()
+    }
+
+    #[cfg(not(feature = "crypto-sign"))]
+    pub fn key_count(&self) -> usize {
+        0
+    }
 }
 
 /// Message deduplication and replay detection cache.
@@ -402,6 +436,10 @@ pub enum DiscoveryMessage {
         capabilities: NodeCapabilities,
         /// Listen address.
         listen_addr: String,
+        /// ed25519 public key bytes (32 bytes) for identity verification.
+        /// None when crypto-sign is disabled.
+        #[serde(default)]
+        public_key: Option<Vec<u8>>,
     },
     /// Response to join request.
     JoinResponse {
@@ -409,6 +447,9 @@ pub enum DiscoveryMessage {
         accepted: bool,
         /// List of known peers.
         peers: Vec<PeerInfo>,
+        /// Reason for rejection (if not accepted).
+        #[serde(default)]
+        reject_reason: Option<String>,
     },
     /// Announce peer presence.
     Announce {

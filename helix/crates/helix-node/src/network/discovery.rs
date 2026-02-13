@@ -193,11 +193,22 @@ impl PeerDiscovery {
 
     /// Creates a join request message.
     pub fn create_join_request(&self, capabilities: NodeCapabilities, listen_addr: String) -> NetworkMessage {
+        self.create_join_request_with_key(capabilities, listen_addr, None)
+    }
+
+    /// Creates a join request message with an optional ed25519 public key.
+    pub fn create_join_request_with_key(
+        &self,
+        capabilities: NodeCapabilities,
+        listen_addr: String,
+        public_key: Option<Vec<u8>>,
+    ) -> NetworkMessage {
         NetworkMessage::new(
             self.local_id.clone(),
             MessagePayload::Discovery(DiscoveryMessage::JoinRequest {
                 capabilities,
                 listen_addr,
+                public_key,
             }),
         )
     }
@@ -240,7 +251,7 @@ impl PeerDiscovery {
         self.update_last_seen(&sender).await;
 
         match msg {
-            DiscoveryMessage::JoinRequest { capabilities, listen_addr } => {
+            DiscoveryMessage::JoinRequest { capabilities, listen_addr, .. } => {
                 let peer_info = PeerInfo {
                     id: sender.clone(),
                     address: listen_addr,
@@ -251,9 +262,9 @@ impl PeerDiscovery {
                         .as_secs(),
                     reputation: 0,
                 };
-                
+
                 self.add_peer(peer_info).await;
-                
+
                 // Send response with known peers
                 let peers = self.get_all_peers().await;
                 Some(NetworkMessage::new(
@@ -261,10 +272,11 @@ impl PeerDiscovery {
                     MessagePayload::Discovery(DiscoveryMessage::JoinResponse {
                         accepted: true,
                         peers,
+                        reject_reason: None,
                     }),
                 ))
             }
-            DiscoveryMessage::JoinResponse { accepted, peers } => {
+            DiscoveryMessage::JoinResponse { accepted, peers, .. } => {
                 if accepted {
                     for peer in peers {
                         self.add_peer(peer).await;

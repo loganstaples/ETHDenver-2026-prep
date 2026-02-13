@@ -33,7 +33,7 @@ pub use messages::{
     MessagePayload, MessageRejectReason, MpcDataMessage, NetworkMessage, NodeCapabilities,
     PeerId, PeerInfo, PeerKeyRegistry, SyncMessage, TrainingMessage, TrainingParams,
 };
-pub use runner::{NetworkEvent, NetworkRunner, NetworkRunnerBuilder, NetworkRunnerConfig};
+pub use runner::{NetworkEvent, NetworkRunner, NetworkRunnerBuilder, NetworkRunnerConfig, ReconnectState};
 pub use sync::{Checkpoint, NetworkState, StateSync, SyncConfig, SyncStatus};
 pub use transport::{
     ConnectionPool, ConnectionState, PeerConnection, TcpTransport, Transport, TransportConfig,

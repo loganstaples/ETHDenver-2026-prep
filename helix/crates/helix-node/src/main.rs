@@ -83,10 +83,10 @@ async fn main() -> anyhow::Result<()> {
 // ============================================================================
 
 async fn run_worker(listen_addr: SocketAddr) -> anyhow::Result<()> {
-    let aggregator_addr: SocketAddr = env_or("HELIX_AGGREGATOR_ADDR", "127.0.0.1:9000")
-        .parse()
-        .expect("invalid HELIX_AGGREGATOR_ADDR");
+    let aggregator_addr_str = env_or("HELIX_AGGREGATOR_ADDR", "");
     let rpc_port: u16 = env_or("HELIX_RPC_PORT", "9002").parse().unwrap_or(9002);
+    let bootstrap_nodes_str = env_or("HELIX_BOOTSTRAP_NODES", "");
+    let mdns_enabled = env_or("HELIX_MDNS_ENABLED", "0") == "1";
 
     // MPC configuration
     let mpc_enabled = env_or("HELIX_MPC_ENABLED", "0") == "1";
@@ -100,13 +100,28 @@ async fn run_worker(listen_addr: SocketAddr) -> anyhow::Result<()> {
         );
     }
 
+    // Parse bootstrap nodes
+    let bootstrap_nodes: Vec<String> = bootstrap_nodes_str
+        .split(',')
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_string())
+        .collect();
+
     let local_id = PeerId::random();
-    info!("Worker {} starting, will connect to aggregator at {}", local_id, aggregator_addr);
+    info!(
+        "Worker {} starting (bootstrap={}, mdns={}, direct_agg={})",
+        local_id,
+        bootstrap_nodes.len(),
+        mdns_enabled,
+        !aggregator_addr_str.is_empty(),
+    );
 
     // Build network runner
-    let network = NetworkRunnerBuilder::new()
+    let mut network = NetworkRunnerBuilder::new()
         .local_id(local_id.clone())
         .listen_addr(listen_addr)
+        .bootstrap_nodes(bootstrap_nodes.clone())
+        .enable_mdns(mdns_enabled)
         .capabilities(NodeCapabilities {
             can_train: true,
             can_aggregate: false,
@@ -119,22 +134,50 @@ async fn run_worker(listen_addr: SocketAddr) -> anyhow::Result<()> {
         })
         .build()?;
 
+    // Set up ed25519 identity for authenticated connections
+    #[cfg(feature = "crypto-sign")]
+    {
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        network.set_signing_key(signing_key);
+        info!("Worker ed25519 identity configured");
+    }
+
     let network = Arc::new(network);
     network.start().await?;
 
-    // Connect to aggregator
-    let agg_peer = PeerInfo {
-        id: PeerId::from_string("aggregator"),
-        address: aggregator_addr.to_string(),
-        capabilities: NodeCapabilities {
-            can_aggregate: true,
-            ..Default::default()
-        },
-        last_seen: 0,
-        reputation: 100,
-    };
-    network.connect_peer(agg_peer).await?;
-    info!("Connected to aggregator at {}", aggregator_addr);
+    // Discovery: try direct aggregator, bootstrap, and mDNS
+    if !aggregator_addr_str.is_empty() {
+        // Direct aggregator connection (legacy mode)
+        let aggregator_addr: SocketAddr = aggregator_addr_str.parse()
+            .expect("invalid HELIX_AGGREGATOR_ADDR");
+        let agg_peer = PeerInfo {
+            id: PeerId::from_string("aggregator"),
+            address: aggregator_addr.to_string(),
+            capabilities: NodeCapabilities {
+                can_aggregate: true,
+                ..Default::default()
+            },
+            last_seen: 0,
+            reputation: 100,
+        };
+        match network.connect_peer(agg_peer).await {
+            Ok(()) => info!("Connected to aggregator at {}", aggregator_addr),
+            Err(e) => {
+                warn!("Failed to connect to aggregator at {}: {}. Will rely on discovery.", aggregator_addr, e);
+            }
+        }
+    }
+
+    // Bootstrap peer discovery
+    network.bootstrap().await;
+
+    // mDNS discovery for local network
+    if mdns_enabled {
+        match network.start_mdns().await {
+            Ok(()) => info!("mDNS discovery enabled"),
+            Err(e) => warn!("mDNS discovery failed to start: {}", e),
+        }
+    }
 
     // Set up shared state for RPC
     let (round_trigger_tx, _) = broadcast::channel::<()>(16);
@@ -655,7 +698,26 @@ async fn run_worker(listen_addr: SocketAddr) -> anyhow::Result<()> {
                         // Heartbeat pongs handled automatically
                     }
                     Some(NetworkEvent::PeerDiscovered(peer)) => {
-                        info!("Peer discovered: {} at {}", peer.id, peer.address);
+                        info!("Peer discovered: {} at {} (agg={}, train={})",
+                            peer.id, peer.address,
+                            peer.capabilities.can_aggregate,
+                            peer.capabilities.can_train,
+                        );
+                        // If we discover an aggregator via bootstrap/mDNS, connect to it
+                        if peer.capabilities.can_aggregate {
+                            info!("Discovered aggregator {} at {}", peer.id, peer.address);
+                        }
+                    }
+                    Some(NetworkEvent::PeerDisconnected(peer_id)) => {
+                        warn!("Peer disconnected: {}, scheduling reconnection", peer_id);
+                        // Schedule reconnection with exponential backoff
+                        if let Some(peer_info) = network.discovery().get_peer(&peer_id).await {
+                            network.schedule_reconnect(
+                                peer_id,
+                                peer_info.address,
+                                peer_info.capabilities,
+                            );
+                        }
                     }
                     Some(NetworkEvent::Error { error, .. }) => {
                         warn!("Network error: {}", error);
@@ -691,16 +753,27 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
     let http_port: u16 = env_or("HELIX_HTTP_PORT", "9001").parse().unwrap_or(9001);
     let rpc_port: u16 = env_or("HELIX_RPC_PORT", "9002").parse().unwrap_or(9002);
 
+    let bootstrap_nodes_str = env_or("HELIX_BOOTSTRAP_NODES", "");
+    let mdns_enabled = env_or("HELIX_MDNS_ENABLED", "0") == "1";
+    let bootstrap_nodes: Vec<String> = bootstrap_nodes_str
+        .split(',')
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_string())
+        .collect();
+
     let local_id = PeerId::from_string("aggregator");
     info!(
-        "Aggregator starting on {} (min_workers={}, model={}x{}x{})",
-        listen_addr, min_workers, d_in, d_hid, d_out
+        "Aggregator starting on {} (min_workers={}, model={}x{}x{}, bootstrap={}, mdns={})",
+        listen_addr, min_workers, d_in, d_hid, d_out,
+        bootstrap_nodes.len(), mdns_enabled,
     );
 
     // Build network runner
-    let network = NetworkRunnerBuilder::new()
+    let mut network = NetworkRunnerBuilder::new()
         .local_id(local_id.clone())
         .listen_addr(listen_addr)
+        .bootstrap_nodes(bootstrap_nodes.clone())
+        .enable_mdns(mdns_enabled)
         .capabilities(NodeCapabilities {
             can_train: false,
             can_aggregate: true,
@@ -713,9 +786,28 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
         })
         .build()?;
 
+    // Set up ed25519 identity for authenticated connections
+    #[cfg(feature = "crypto-sign")]
+    {
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        network.set_signing_key(signing_key);
+        info!("Aggregator ed25519 identity configured");
+    }
+
     let network = Arc::new(network);
     network.start().await?;
     info!("Aggregator listening on {}", listen_addr);
+
+    // Bootstrap peer discovery
+    network.bootstrap().await;
+
+    // mDNS discovery for local network
+    if mdns_enabled {
+        match network.start_mdns().await {
+            Ok(()) => info!("mDNS discovery enabled"),
+            Err(e) => warn!("mDNS discovery failed to start: {}", e),
+        }
+    }
 
     // Create orchestrator
     let orch_config = OrchestratorConfig {
