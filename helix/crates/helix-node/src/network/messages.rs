@@ -5,6 +5,8 @@
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 
+use crate::training::dataset_sync::DatasetSpec;
+
 /// Unique identifier for a peer.
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PeerId(pub String);
@@ -792,6 +794,11 @@ pub enum RoundManagementMessage {
         deadline: u64,
         /// SHA-256 hash of the current model weights.
         current_model_hash: [u8; 32],
+        /// Full dataset specification for deterministic training.
+        /// When present, workers use this for dataset loading, preprocessing, and batching.
+        /// When absent, workers fall back to the `dataset_ref` string.
+        #[serde(default)]
+        dataset_spec: Option<DatasetSpec>,
     },
     /// Worker acknowledges round configuration and signals readiness.
     WorkerReady {

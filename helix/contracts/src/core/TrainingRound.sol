@@ -29,6 +29,7 @@ contract TrainingRound {
         uint256 registeredCount;
         uint256 submittedCount;
         uint256 errorBound;
+        bytes32 datasetHash;          // SHA-256 of training dataset for auditability
     }
     
     /// @notice Participant information
@@ -104,13 +105,7 @@ contract TrainingRound {
         owner = msg.sender;
     }
     
-    /// @notice Create a new training round
-    /// @param modelId Model ID
-    /// @param startCommitment Current model state commitment
-    /// @param minParticipants Minimum participants required
-    /// @param maxParticipants Maximum participants allowed
-    /// @param duration Round duration in seconds
-    /// @return roundId ID of the created round
+    /// @notice Create a new training round (without dataset hash)
     function createRound(
         uint256 modelId,
         bytes32 startCommitment,
@@ -118,10 +113,41 @@ contract TrainingRound {
         uint256 maxParticipants,
         uint256 duration
     ) external onlyCoordinator returns (uint256 roundId) {
+        return _createRound(modelId, startCommitment, minParticipants, maxParticipants, duration, bytes32(0));
+    }
+
+    /// @notice Create a new training round with dataset hash
+    /// @param modelId Model ID
+    /// @param startCommitment Current model state commitment
+    /// @param minParticipants Minimum participants required
+    /// @param maxParticipants Maximum participants allowed
+    /// @param duration Round duration in seconds
+    /// @param datasetHash SHA-256 hash of the training dataset (for auditability)
+    /// @return roundId ID of the created round
+    function createRound(
+        uint256 modelId,
+        bytes32 startCommitment,
+        uint256 minParticipants,
+        uint256 maxParticipants,
+        uint256 duration,
+        bytes32 datasetHash
+    ) external onlyCoordinator returns (uint256 roundId) {
+        return _createRound(modelId, startCommitment, minParticipants, maxParticipants, duration, datasetHash);
+    }
+
+    /// @dev Internal implementation for createRound
+    function _createRound(
+        uint256 modelId,
+        bytes32 startCommitment,
+        uint256 minParticipants,
+        uint256 maxParticipants,
+        uint256 duration,
+        bytes32 datasetHash
+    ) internal returns (uint256 roundId) {
         roundId = ++roundCount[modelId];
-        
+
         uint256 deadline = block.timestamp + (duration > 0 ? duration : defaultRoundDuration);
-        
+
         rounds[modelId][roundId] = Round({
             modelId: modelId,
             roundId: roundId,
@@ -135,12 +161,13 @@ contract TrainingRound {
             maxParticipants: maxParticipants,
             registeredCount: 0,
             submittedCount: 0,
-            errorBound: 0
+            errorBound: 0,
+            datasetHash: datasetHash
         });
-        
+
         emit RoundCreated(modelId, roundId, startCommitment, deadline);
     }
-    
+
     /// @notice Register for a training round
     /// @param modelId Model ID
     /// @param roundId Round ID

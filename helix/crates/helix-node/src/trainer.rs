@@ -17,6 +17,8 @@ use helix_prover::{EvmProofBundle, MLTrainingProverV2, VkData};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
+use crate::training::dataset_sync::{DeterministicBatcher, Sample};
+
 // ──────────────────────────────────────────────────────────────
 // Model representation (f64 for native computation)
 // ──────────────────────────────────────────────────────────────
@@ -959,6 +961,71 @@ impl Trainer {
         Ok(())
     }
 
+    /// Trains using a `DeterministicBatcher`, producing one proved step per batch.
+    ///
+    /// Each batch from the batcher is averaged to produce a single (x, target) pair
+    /// for the MLP. This ensures all workers process identical data in identical order
+    /// when using the same dataset and shuffle seed.
+    pub fn train_from_batcher(
+        &mut self,
+        batcher: &mut DeterministicBatcher,
+    ) -> anyhow::Result<(Vec<ProvedStep>, TrainingMetrics)> {
+        let mut steps = Vec::new();
+        let mut losses = Vec::new();
+
+        while let Some(batch) = batcher.next_batch() {
+            // Average the batch samples into a single input/target
+            let (x, target) = average_batch(&batch, self.model.d_in, self.model.d_out);
+            let result = self.train_step(&x, &target)?;
+            losses.push(result.loss);
+            steps.push(result);
+        }
+
+        let loss_decreased = if losses.len() >= 2 {
+            losses.last().unwrap() < losses.first().unwrap()
+        } else {
+            false
+        };
+
+        let num_steps = steps.len();
+        let metrics = TrainingMetrics {
+            losses,
+            steps: num_steps as u64,
+            proofs_generated: num_steps as u64,
+            loss_decreased,
+        };
+
+        Ok((steps, metrics))
+    }
+
+    /// Trains using a `DeterministicBatcher` without proof generation (fast mode).
+    pub fn train_from_batcher_unproved(
+        &mut self,
+        batcher: &mut DeterministicBatcher,
+    ) -> TrainingMetrics {
+        let mut losses = Vec::new();
+
+        while let Some(batch) = batcher.next_batch() {
+            let (x, target) = average_batch(&batch, self.model.d_in, self.model.d_out);
+            let loss = self.train_step_unproved(&x, &target);
+            losses.push(loss);
+        }
+
+        let loss_decreased = if losses.len() >= 2 {
+            losses.last().unwrap() < losses.first().unwrap()
+        } else {
+            false
+        };
+
+        let num_steps = losses.len();
+        TrainingMetrics {
+            losses,
+            steps: num_steps as u64,
+            proofs_generated: 0,
+            loss_decreased,
+        }
+    }
+
     /// Legacy compatibility: `train_and_prove` matching the old mocked interface.
     pub fn train_and_prove(
         &mut self,
@@ -968,6 +1035,34 @@ impl Trainer {
         let result = self.train_step(x, target)?;
         Ok((result.proof_result.proof.clone(), result.commitment))
     }
+}
+
+/// Averages a batch of samples into a single (input, target) pair.
+///
+/// Each sample's features and labels are summed element-wise and divided by batch size.
+/// This reduces a batch to a single representative sample for the MLP.
+fn average_batch(batch: &[Sample], d_in: usize, d_out: usize) -> (Vec<f64>, Vec<f64>) {
+    let n = batch.len() as f64;
+    let mut avg_x = vec![0.0; d_in];
+    let mut avg_t = vec![0.0; d_out];
+
+    for (features, labels) in batch {
+        for (i, &f) in features.iter().enumerate().take(d_in) {
+            avg_x[i] += f;
+        }
+        for (i, &l) in labels.iter().enumerate().take(d_out) {
+            avg_t[i] += l;
+        }
+    }
+
+    for v in &mut avg_x {
+        *v /= n;
+    }
+    for v in &mut avg_t {
+        *v /= n;
+    }
+
+    (avg_x, avg_t)
 }
 
 #[cfg(test)]
@@ -1416,5 +1511,56 @@ mod tests {
         assert_eq!(meta.d_out, 2);
         assert_eq!(meta.num_layers, 3);
         assert_eq!(meta.activation_type, 2);
+    }
+
+    #[test]
+    fn test_average_batch() {
+        let batch: Vec<Sample> = vec![
+            (vec![1.0, 2.0], vec![10.0]),
+            (vec![3.0, 4.0], vec![20.0]),
+        ];
+        let (x, t) = average_batch(&batch, 2, 1);
+        assert!((x[0] - 2.0).abs() < 1e-10);
+        assert!((x[1] - 3.0).abs() < 1e-10);
+        assert!((t[0] - 15.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_train_from_batcher_unproved() {
+        let mut trainer = Trainer::new(2, 4, 1, 0.01, 42);
+        let samples: Vec<Sample> = simple_dataset();
+
+        let mut batcher = DeterministicBatcher::new(samples, 2, 42, 5);
+        let metrics = trainer.train_from_batcher_unproved(&mut batcher);
+        assert_eq!(metrics.steps, 5);
+        assert_eq!(metrics.proofs_generated, 0);
+        assert_eq!(metrics.losses.len(), 5);
+    }
+
+    #[test]
+    fn test_train_from_batcher_deterministic() {
+        // Two trainers with same model and same batcher config
+        // should produce identical loss sequences
+        let samples1: Vec<Sample> = simple_dataset();
+        let samples2: Vec<Sample> = simple_dataset();
+
+        let mut trainer1 = Trainer::new(2, 4, 1, 0.01, 42);
+        let mut trainer2 = Trainer::new(2, 4, 1, 0.01, 42);
+
+        let mut batcher1 = DeterministicBatcher::new(samples1, 2, 99, 4);
+        let mut batcher2 = DeterministicBatcher::new(samples2, 2, 99, 4);
+
+        let metrics1 = trainer1.train_from_batcher_unproved(&mut batcher1);
+        let metrics2 = trainer2.train_from_batcher_unproved(&mut batcher2);
+
+        assert_eq!(metrics1.losses.len(), metrics2.losses.len());
+        for (l1, l2) in metrics1.losses.iter().zip(metrics2.losses.iter()) {
+            assert!(
+                (l1 - l2).abs() < 1e-10,
+                "Losses should be identical: {} vs {}",
+                l1,
+                l2
+            );
+        }
     }
 }

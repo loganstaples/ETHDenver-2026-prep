@@ -21,6 +21,7 @@ use crate::network::messages::{
     ModelDims, NodeCapabilities, PeerId, RegistrationMessage, RoundManagementMessage,
 };
 use crate::sc_client::TrainingProofInputs;
+use crate::training::dataset_sync::DatasetSpec;
 
 // ============================================================================
 // Worker Registry
@@ -281,6 +282,9 @@ pub struct RoundConfiguration {
     pub deadline: u64,
     /// Current model weight hash.
     pub current_model_hash: [u8; 32],
+    /// Full dataset specification for deterministic training synchronization.
+    /// When present, all workers use this for identical data loading and batching.
+    pub dataset_spec: Option<DatasetSpec>,
 }
 
 impl RoundConfiguration {
@@ -297,6 +301,7 @@ impl RoundConfiguration {
             min_workers: self.min_workers,
             deadline: self.deadline,
             current_model_hash: self.current_model_hash,
+            dataset_spec: self.dataset_spec.clone(),
         }
     }
 }
@@ -1290,6 +1295,7 @@ mod tests {
                 .as_secs()
                 + 3600,
             current_model_hash: [0xAA; 32],
+            dataset_spec: None,
         }
     }
 
@@ -1900,6 +1906,7 @@ mod tests {
                 .as_secs()
                 + 7200,
             current_model_hash: [0x11; 32],
+            dataset_spec: None,
         };
 
         let round_config = mgr.start_round(config).unwrap();

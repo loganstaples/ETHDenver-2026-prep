@@ -36,6 +36,7 @@ pub mod distributed_coordinator;
 pub mod consensus;
 pub mod persistence;
 pub mod round_manager;
+pub mod dataset_sync;
 
 // Re-export key types
 pub use round::{
@@ -154,6 +155,12 @@ pub use round_manager::{
     WorkerProofSubmission, ProofTracker, RoundManagerState, RoundManagerEvent,
     AggregatedResult, RoundManagerConfig, RoundManager as AggregatorRoundManager,
     RoundManagerError, compute_model_commitment,
+};
+
+pub use dataset_sync::{
+    DatasetSpec, PreprocessingConfig, NormalizationMethod,
+    DatasetManager, DeterministicBatcher, StepAlignmentValidator,
+    Sample, DatasetError,
 };
 
 /// Convenience type alias for training results.

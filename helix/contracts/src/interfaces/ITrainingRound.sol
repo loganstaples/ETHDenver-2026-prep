@@ -13,13 +13,23 @@ interface ITrainingRound {
         Failed
     }
 
-    /// @notice Create a new training round
+    /// @notice Create a new training round (without dataset hash)
     function createRound(
         uint256 modelId,
         bytes32 startCommitment,
         uint256 minParticipants,
         uint256 maxParticipants,
         uint256 duration
+    ) external returns (uint256 roundId);
+
+    /// @notice Create a new training round with dataset hash
+    function createRound(
+        uint256 modelId,
+        bytes32 startCommitment,
+        uint256 minParticipants,
+        uint256 maxParticipants,
+        uint256 duration,
+        bytes32 datasetHash
     ) external returns (uint256 roundId);
 
     /// @notice Register for a round
