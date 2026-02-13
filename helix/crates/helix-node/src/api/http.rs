@@ -13,7 +13,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{HeaderMap, Method, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -23,6 +23,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
+use crate::api::rpc::RoundWeightEntry;
 use crate::round_commit::RoundCommitManager;
 use crate::training::orchestrator::{RoundPhase, TrainingOrchestrator};
 
@@ -117,6 +118,8 @@ pub struct ApiState {
     pub api_key: String,
     /// Per-IP rate limiter.
     pub rate_limiter: Arc<ApiRateLimiter>,
+    /// Completed round weights for result distribution (shared with RPC layer).
+    pub round_weights: Arc<RwLock<Vec<RoundWeightEntry>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -292,6 +295,7 @@ pub async fn start_api_server(
         .route("/round/status", get(round_status_handler))
         .route("/workers", get(workers_handler))
         .route("/peers", get(peers_handler))
+        .route("/models/{model_id}/rounds/{round_id}/weights", get(download_weights_handler))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
     // Combine and add rate limiting to everything
@@ -359,6 +363,46 @@ async fn metrics_handler(State(state): State<Arc<ApiState>>) -> Json<MetricsSnap
     Json(snapshot)
 }
 
+/// Downloads model weights for a completed round as raw bytes.
+///
+/// Returns the serialized weights with commitment and metadata headers.
+async fn download_weights_handler(
+    State(state): State<Arc<ApiState>>,
+    Path((model_id, round_id)): Path<(u64, u64)>,
+) -> Response {
+    let weights = state.round_weights.read();
+    let entry = weights.iter().find(|w| w.model_id == model_id && w.round_id == round_id);
+
+    match entry {
+        Some(e) => {
+            let commitment_hex = format!("0x{}", hex::encode(e.commitment));
+            (
+                StatusCode::OK,
+                [
+                    ("content-type", "application/octet-stream"),
+                    ("content-disposition", &format!("attachment; filename=\"model_{}_round_{}.weights\"", model_id, round_id)),
+                ],
+                [
+                    ("x-weight-commitment", commitment_hex.as_str()),
+                    ("x-round-id", &round_id.to_string()),
+                    ("x-model-id", &model_id.to_string()),
+                    ("x-loss", &e.loss.to_string()),
+                    ("x-error-bound", &e.error_bound.to_string()),
+                ],
+                e.weight_bytes.clone(),
+            ).into_response()
+        }
+        None => {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("Weights not found for model {} round {}", model_id, round_id),
+                }),
+            ).into_response()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,6 +452,7 @@ mod tests {
             })),
             api_key: api_key.to_string(),
             rate_limiter: Arc::new(ApiRateLimiter::new(100)),
+            round_weights: Arc::new(RwLock::new(Vec::new())),
         })
     }
 

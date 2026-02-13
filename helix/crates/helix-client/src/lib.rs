@@ -25,4 +25,7 @@ pub use orchestration::{
     DeploymentResult, OrchestratorConfig, ProcessHealthReport, TrainingOrchestrator, TrainingResult,
 };
 pub use orchestrator::{LiveTrainingOrchestrator, NetworkOrchestrator};
+pub use rpc::client::{
+    ModelWeightsResponse, RoundSummary, TrainingHistory, TrainingReport,
+};
 pub use session::{SessionResult, TrainingEvent, TrainingProgress, TrainingSession};

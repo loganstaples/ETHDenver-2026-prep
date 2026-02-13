@@ -199,6 +199,7 @@ async fn run_worker(listen_addr: SocketAddr) -> anyhow::Result<()> {
         model_id: Arc::new(RwLock::new(None)),
         rpc_addr: format!("0.0.0.0:{}", rpc_port),
         rate_limiter: Arc::new(RwLock::new(RpcRateLimiter::default())),
+        round_weights: Arc::new(RwLock::new(Vec::new())),
     });
 
     // Start JSON-RPC server
@@ -1032,6 +1033,7 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
     let api_metrics = Arc::new(RwLock::new(MetricsSnapshot::default()));
     let api_key = helix_node::config::ApiConfig::default().api_key_or_generate();
     log::info!("API key: {}", api_key);
+    let round_weights_shared = Arc::new(RwLock::new(Vec::new()));
     let api_state = Arc::new(ApiState {
         orchestrator_workers: api_snapshot.clone(),
         round_trigger_tx: round_trigger_tx.clone(),
@@ -1039,6 +1041,7 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
         metrics: api_metrics.clone(),
         api_key,
         rate_limiter: Arc::new(ApiRateLimiter::new(100)),
+        round_weights: round_weights_shared.clone(),
     });
 
     // Start HTTP API
@@ -1066,6 +1069,7 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
         model_id: Arc::new(RwLock::new(None)),
         rpc_addr: format!("0.0.0.0:{}", rpc_port),
         rate_limiter: Arc::new(RwLock::new(RpcRateLimiter::default())),
+        round_weights: round_weights_shared.clone(),
     });
     let rpc_addr: SocketAddr = format!("0.0.0.0:{}", rpc_port).parse().unwrap();
     let rpc_state_clone = rpc_state.clone();

@@ -1075,6 +1075,49 @@ impl HelixRpcClient {
         self.send_request("helix_claimRewards", Params { model_id }).await
     }
 
+    // ==================== Result Distribution ====================
+
+    /// Get model weights for a specific or latest round
+    pub async fn get_model_weights(
+        &self,
+        model_id: u64,
+        round_id: Option<u64>,
+    ) -> Result<ModelWeightsResponse, RpcError> {
+        #[derive(Serialize)]
+        struct Params {
+            model_id: u64,
+            round_id: Option<u64>,
+        }
+
+        self.send_request("helix_getModelWeights", Params { model_id, round_id }).await
+    }
+
+    /// Get full training history for a model
+    pub async fn get_training_history(
+        &self,
+        model_id: u64,
+    ) -> Result<TrainingHistory, RpcError> {
+        #[derive(Serialize)]
+        struct Params {
+            model_id: u64,
+        }
+
+        self.send_request("helix_getTrainingHistory", Params { model_id }).await
+    }
+
+    /// Get a full training report / certificate for a model
+    pub async fn get_training_report(
+        &self,
+        model_id: u64,
+    ) -> Result<TrainingReport, RpcError> {
+        #[derive(Serialize)]
+        struct Params {
+            model_id: u64,
+        }
+
+        self.send_request("helix_getTrainingReport", Params { model_id }).await
+    }
+
     // ==================== Subscription Helpers ====================
 
     /// Poll for training status updates
@@ -1142,6 +1185,86 @@ impl HelixRpcClient {
             timestamp: chrono::Utc::now().timestamp(),
         })
     }
+}
+
+/// Model weights response from the node
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelWeightsResponse {
+    /// Round ID these weights are from
+    pub round_id: u64,
+    /// Model ID
+    pub model_id: u64,
+    /// SHA-256 commitment hash of the weight bytes
+    pub commitment: String,
+    /// Raw weight bytes (base64-encoded in JSON transport)
+    pub weight_bytes: Vec<u8>,
+    /// Loss value at this round
+    pub loss: f64,
+    /// Error bound at this round
+    pub error_bound: f64,
+    /// Number of training steps completed
+    pub steps_completed: u64,
+    /// Number of contributing workers
+    pub num_contributors: u32,
+    /// Completion timestamp (unix seconds)
+    pub completed_at: u64,
+    /// On-chain transaction hash, if submitted
+    pub tx_hash: Option<String>,
+}
+
+/// Per-round summary for training history
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoundSummary {
+    /// Round ID
+    pub round_id: u64,
+    /// Loss value
+    pub loss: f64,
+    /// Accumulated error bound
+    pub error_bound: f64,
+    /// SHA-256 commitment hash
+    pub commitment: String,
+    /// Number of contributing workers
+    pub num_contributors: u32,
+    /// Number of training steps
+    pub steps_completed: u64,
+    /// Completion timestamp
+    pub completed_at: u64,
+    /// On-chain transaction hash
+    pub tx_hash: Option<String>,
+}
+
+/// Training history for a model
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrainingHistory {
+    /// Model ID
+    pub model_id: u64,
+    /// Per-round summaries
+    pub rounds: Vec<RoundSummary>,
+    /// Total rounds completed
+    pub total_rounds: u64,
+}
+
+/// Full training report / certificate
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrainingReport {
+    /// Model ID
+    pub model_id: u64,
+    /// Total rounds completed
+    pub total_rounds: u64,
+    /// Final loss value
+    pub final_loss: f64,
+    /// Final accumulated error bound
+    pub final_error_bound: f64,
+    /// Final weight commitment hash
+    pub final_commitment: String,
+    /// Loss curve (per-round loss values)
+    pub loss_curve: Vec<f64>,
+    /// Error curve (per-round error bound values)
+    pub error_curve: Vec<f64>,
+    /// Per-round details
+    pub per_round: Vec<RoundSummary>,
+    /// Report generation timestamp
+    pub generated_at: u64,
 }
 
 /// Complete status snapshot for demos
@@ -1817,6 +1940,102 @@ impl UnifiedRpcClient {
             })
         } else if let Some(ref client) = self.real_client {
             client.health_check().await
+        } else {
+            Err(RpcError::NodeUnavailable("No client available".into()))
+        }
+    }
+
+    // ==================== Result Distribution ====================
+
+    /// Get model weights for a specific or latest round.
+    pub async fn get_model_weights(
+        &self,
+        model_id: u64,
+        round_id: Option<u64>,
+    ) -> Result<ModelWeightsResponse, RpcError> {
+        if self.use_mock {
+            let rid = round_id.unwrap_or(1);
+            Ok(ModelWeightsResponse {
+                round_id: rid,
+                model_id,
+                commitment: format!("0x{}", "cd".repeat(32)),
+                weight_bytes: vec![0u8; 64],
+                loss: 0.15,
+                error_bound: 12.5,
+                steps_completed: rid * 10,
+                num_contributors: 3,
+                completed_at: chrono::Utc::now().timestamp() as u64,
+                tx_hash: Some(format!("0xmock_tx_{}", rid)),
+            })
+        } else if let Some(ref client) = self.real_client {
+            client.get_model_weights(model_id, round_id).await
+        } else {
+            Err(RpcError::NodeUnavailable("No client available".into()))
+        }
+    }
+
+    /// Get full training history for a model.
+    pub async fn get_training_history(
+        &self,
+        model_id: u64,
+    ) -> Result<TrainingHistory, RpcError> {
+        if self.use_mock {
+            let history = self.mock_client.get_progress_history().await;
+            let rounds: Vec<RoundSummary> = history.iter().map(|p| RoundSummary {
+                round_id: p.round,
+                loss: p.loss,
+                error_bound: p.error_bound,
+                commitment: format!("0x{}", "ab".repeat(32)),
+                num_contributors: 3,
+                steps_completed: p.round * 10,
+                completed_at: p.timestamp as u64,
+                tx_hash: None,
+            }).collect();
+            let total = rounds.len() as u64;
+            Ok(TrainingHistory {
+                model_id,
+                rounds,
+                total_rounds: total,
+            })
+        } else if let Some(ref client) = self.real_client {
+            client.get_training_history(model_id).await
+        } else {
+            Err(RpcError::NodeUnavailable("No client available".into()))
+        }
+    }
+
+    /// Get a full training report / certificate for a model.
+    pub async fn get_training_report(
+        &self,
+        model_id: u64,
+    ) -> Result<TrainingReport, RpcError> {
+        if self.use_mock {
+            let history = self.mock_client.get_progress_history().await;
+            let loss_curve: Vec<f64> = history.iter().map(|p| p.loss).collect();
+            let error_curve: Vec<f64> = history.iter().map(|p| p.error_bound).collect();
+            let per_round: Vec<RoundSummary> = history.iter().map(|p| RoundSummary {
+                round_id: p.round,
+                loss: p.loss,
+                error_bound: p.error_bound,
+                commitment: format!("0x{}", "ab".repeat(32)),
+                num_contributors: 3,
+                steps_completed: p.round * 10,
+                completed_at: p.timestamp as u64,
+                tx_hash: None,
+            }).collect();
+            Ok(TrainingReport {
+                model_id,
+                total_rounds: per_round.len() as u64,
+                final_loss: loss_curve.last().copied().unwrap_or(0.0),
+                final_error_bound: error_curve.last().copied().unwrap_or(0.0),
+                final_commitment: format!("0x{}", "ab".repeat(32)),
+                loss_curve,
+                error_curve,
+                per_round,
+                generated_at: chrono::Utc::now().timestamp() as u64,
+            })
+        } else if let Some(ref client) = self.real_client {
+            client.get_training_report(model_id).await
         } else {
             Err(RpcError::NodeUnavailable("No client available".into()))
         }

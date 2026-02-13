@@ -227,6 +227,31 @@ impl Default for RpcRateLimiter {
     }
 }
 
+/// Completed round weight metadata for result distribution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoundWeightEntry {
+    /// Round number.
+    pub round_id: u64,
+    /// Model ID.
+    pub model_id: u64,
+    /// SHA-256 commitment hash of the weight bytes.
+    pub commitment: [u8; 32],
+    /// Serialized weight bytes (the actual model weights).
+    pub weight_bytes: Vec<u8>,
+    /// Final loss value for this round.
+    pub loss: f64,
+    /// Accumulated error bound.
+    pub error_bound: f64,
+    /// Number of training steps completed in this round.
+    pub steps_completed: u64,
+    /// Number of workers that contributed.
+    pub num_contributors: u32,
+    /// Completion timestamp (unix seconds).
+    pub completed_at: u64,
+    /// On-chain transaction hash (hex), if submitted.
+    pub tx_hash: Option<String>,
+}
+
 /// Shared state for the RPC server.
 pub struct RpcState {
     /// Snapshot of orchestrator state (updated periodically by main loop).
@@ -255,6 +280,8 @@ pub struct RpcState {
     pub rpc_addr: String,
     /// Rate limiter for proof submissions.
     pub rate_limiter: Arc<RwLock<RpcRateLimiter>>,
+    /// Completed round weights for result distribution.
+    pub round_weights: Arc<RwLock<Vec<RoundWeightEntry>>>,
 }
 
 /// Tracks proof status per round.
@@ -374,6 +401,10 @@ async fn rpc_handler(
         "helix_getSelfWorker" => handle_get_self_worker(&state, &id),
         "helix_getStakingInfo" => handle_get_staking_info(&state, &id),
         "helix_claimRewards" => handle_claim_rewards(&state, &id),
+        // Result distribution handlers
+        "helix_getModelWeights" => handle_get_model_weights(&state, &req.params, &id),
+        "helix_getTrainingHistory" => handle_get_training_history(&state, &req.params, &id),
+        "helix_getTrainingReport" => handle_get_training_report(&state, &req.params, &id),
         _ => JsonRpcResponse::method_not_found(id.clone(), &req.method),
     };
 
@@ -1218,6 +1249,179 @@ fn handle_claim_rewards(_state: &RpcState, id: &serde_json::Value) -> JsonRpcRes
 }
 
 // ============================================================================
+// Result Distribution Handlers
+// ============================================================================
+
+fn handle_get_model_weights(
+    state: &RpcState,
+    params: &serde_json::Value,
+    id: &serde_json::Value,
+) -> JsonRpcResponse {
+    let model_id = params
+        .get("model_id")
+        .and_then(|v| v.as_u64())
+        .or_else(|| *state.model_id.read());
+    let round_id = params.get("round_id").and_then(|v| v.as_u64());
+
+    let weights = state.round_weights.read();
+
+    let entry = match round_id {
+        Some(rid) => weights.iter().find(|w| {
+            w.round_id == rid && model_id.map_or(true, |mid| w.model_id == mid)
+        }),
+        None => {
+            // Return the latest round's weights
+            weights.iter().filter(|w| model_id.map_or(true, |mid| w.model_id == mid)).last()
+        }
+    };
+
+    match entry {
+        Some(e) => {
+            let result = serde_json::json!({
+                "available": true,
+                "round_id": e.round_id,
+                "model_id": e.model_id,
+                "commitment": format!("0x{}", hex::encode(e.commitment)),
+                "size_bytes": e.weight_bytes.len(),
+                "loss": e.loss,
+                "error_bound": e.error_bound,
+                "steps_completed": e.steps_completed,
+                "num_contributors": e.num_contributors,
+                "completed_at": e.completed_at,
+                "tx_hash": e.tx_hash,
+                "weight_bytes": e.weight_bytes,
+            });
+            JsonRpcResponse::success(id.clone(), result)
+        }
+        None => {
+            let result = serde_json::json!({
+                "available": false,
+                "round_id": round_id.unwrap_or(0),
+                "model_id": model_id.unwrap_or(0),
+                "commitment": null,
+                "size_bytes": 0,
+                "loss": 0.0,
+                "error_bound": 0.0,
+                "steps_completed": 0,
+                "num_contributors": 0,
+                "completed_at": 0,
+                "tx_hash": null,
+                "weight_bytes": [],
+            });
+            JsonRpcResponse::success(id.clone(), result)
+        }
+    }
+}
+
+fn handle_get_training_history(
+    state: &RpcState,
+    params: &serde_json::Value,
+    id: &serde_json::Value,
+) -> JsonRpcResponse {
+    let model_id = params
+        .get("model_id")
+        .and_then(|v| v.as_u64())
+        .or_else(|| *state.model_id.read())
+        .unwrap_or(0);
+
+    let weights = state.round_weights.read();
+
+    let rounds: Vec<serde_json::Value> = weights
+        .iter()
+        .filter(|w| w.model_id == model_id)
+        .map(|w| {
+            serde_json::json!({
+                "round_id": w.round_id,
+                "commitment": format!("0x{}", hex::encode(w.commitment)),
+                "loss": w.loss,
+                "error_bound": w.error_bound,
+                "steps_completed": w.steps_completed,
+                "num_contributors": w.num_contributors,
+                "completed_at": w.completed_at,
+                "tx_hash": w.tx_hash,
+            })
+        })
+        .collect();
+
+    let total = rounds.len() as u64;
+    JsonRpcResponse::success(id.clone(), serde_json::json!({
+        "model_id": model_id,
+        "rounds": rounds,
+        "total_rounds": total,
+    }))
+}
+
+fn handle_get_training_report(
+    state: &RpcState,
+    params: &serde_json::Value,
+    id: &serde_json::Value,
+) -> JsonRpcResponse {
+    let model_id = params
+        .get("model_id")
+        .and_then(|v| v.as_u64())
+        .or_else(|| *state.model_id.read())
+        .unwrap_or(0);
+
+    let weights = state.round_weights.read();
+    let model_rounds: Vec<&RoundWeightEntry> = weights
+        .iter()
+        .filter(|w| w.model_id == model_id)
+        .collect();
+
+    if model_rounds.is_empty() {
+        return JsonRpcResponse::error(
+            id.clone(),
+            -32000,
+            format!("No training data for model {}", model_id),
+        );
+    }
+
+    let loss_values: Vec<f64> = model_rounds.iter().map(|r| r.loss).collect();
+    let error_values: Vec<f64> = model_rounds.iter().map(|r| r.error_bound).collect();
+
+    let final_loss = loss_values.last().copied().unwrap_or(0.0);
+    let final_error = error_values.last().copied().unwrap_or(0.0);
+    let final_commitment = model_rounds.last()
+        .map(|r| format!("0x{}", hex::encode(r.commitment)))
+        .unwrap_or_default();
+
+    let per_round: Vec<serde_json::Value> = model_rounds
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "round_id": r.round_id,
+                "loss": r.loss,
+                "error_bound": r.error_bound,
+                "steps_completed": r.steps_completed,
+                "num_contributors": r.num_contributors,
+                "commitment": format!("0x{}", hex::encode(r.commitment)),
+                "tx_hash": r.tx_hash,
+                "completed_at": r.completed_at,
+            })
+        })
+        .collect();
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let result = serde_json::json!({
+        "model_id": model_id,
+        "total_rounds": model_rounds.len(),
+        "final_loss": final_loss,
+        "final_error_bound": final_error,
+        "final_commitment": final_commitment,
+        "loss_curve": loss_values,
+        "error_curve": error_values,
+        "per_round": per_round,
+        "generated_at": now_secs,
+    });
+
+    JsonRpcResponse::success(id.clone(), result)
+}
+
+// ============================================================================
 // Server Startup
 // ============================================================================
 
@@ -1258,6 +1462,7 @@ pub fn create_default_rpc_state(
         model_id: Arc::new(RwLock::new(None)),
         rpc_addr: rpc_addr.to_string(),
         rate_limiter: Arc::new(RwLock::new(RpcRateLimiter::default())),
+        round_weights: Arc::new(RwLock::new(Vec::new())),
     })
 }
 
@@ -1313,6 +1518,7 @@ mod tests {
             model_id: Arc::new(RwLock::new(Some(1))),
             rpc_addr: "127.0.0.1:9002".to_string(),
             rate_limiter: Arc::new(RwLock::new(RpcRateLimiter::default())),
+            round_weights: Arc::new(RwLock::new(Vec::new())),
         })
     }
 
@@ -1801,6 +2007,125 @@ mod tests {
         let response = handle_unstake(&state, &params, &null_id());
         let v = response.result.unwrap();
         assert!(v.is_string());
+    }
+
+    // ---- Result distribution tests ----
+
+    fn state_with_weights() -> Arc<RpcState> {
+        let state = create_test_state();
+        {
+            let mut weights = state.round_weights.write();
+            weights.push(RoundWeightEntry {
+                round_id: 0,
+                model_id: 1,
+                commitment: [0xAA; 32],
+                weight_bytes: vec![1, 2, 3, 4, 5],
+                loss: 0.5,
+                error_bound: 0.02,
+                steps_completed: 100,
+                num_contributors: 3,
+                completed_at: 1700000000,
+                tx_hash: Some("0xabc".to_string()),
+            });
+            weights.push(RoundWeightEntry {
+                round_id: 1,
+                model_id: 1,
+                commitment: [0xBB; 32],
+                weight_bytes: vec![6, 7, 8, 9, 10],
+                loss: 0.3,
+                error_bound: 0.015,
+                steps_completed: 100,
+                num_contributors: 3,
+                completed_at: 1700001000,
+                tx_hash: Some("0xdef".to_string()),
+            });
+        }
+        state
+    }
+
+    #[test]
+    fn test_get_model_weights_latest() {
+        let state = state_with_weights();
+        let params = serde_json::json!({"model_id": 1});
+        let response = handle_get_model_weights(&state, &params, &null_id());
+        let v = response.result.unwrap();
+        assert_eq!(v["available"], true);
+        assert_eq!(v["round_id"], 1);
+        assert_eq!(v["size_bytes"], 5);
+        assert_eq!(v["loss"], 0.3);
+        assert_eq!(v["weight_bytes"], serde_json::json!([6, 7, 8, 9, 10]));
+    }
+
+    #[test]
+    fn test_get_model_weights_specific_round() {
+        let state = state_with_weights();
+        let params = serde_json::json!({"model_id": 1, "round_id": 0});
+        let response = handle_get_model_weights(&state, &params, &null_id());
+        let v = response.result.unwrap();
+        assert_eq!(v["available"], true);
+        assert_eq!(v["round_id"], 0);
+        assert_eq!(v["loss"], 0.5);
+    }
+
+    #[test]
+    fn test_get_model_weights_not_found() {
+        let state = create_test_state();
+        let params = serde_json::json!({"model_id": 1, "round_id": 99});
+        let response = handle_get_model_weights(&state, &params, &null_id());
+        let v = response.result.unwrap();
+        assert_eq!(v["available"], false);
+    }
+
+    #[test]
+    fn test_get_training_history() {
+        let state = state_with_weights();
+        let params = serde_json::json!({"model_id": 1});
+        let response = handle_get_training_history(&state, &params, &null_id());
+        let v = response.result.unwrap();
+        assert_eq!(v["model_id"], 1);
+        assert_eq!(v["total_rounds"], 2);
+        let arr = v["rounds"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["round_id"], 0);
+        assert_eq!(arr[0]["loss"], 0.5);
+        assert_eq!(arr[1]["round_id"], 1);
+        assert_eq!(arr[1]["loss"], 0.3);
+    }
+
+    #[test]
+    fn test_get_training_history_empty() {
+        let state = create_test_state();
+        let params = serde_json::json!({"model_id": 99});
+        let response = handle_get_training_history(&state, &params, &null_id());
+        let v = response.result.unwrap();
+        assert_eq!(v["total_rounds"], 0);
+        let arr = v["rounds"].as_array().unwrap();
+        assert_eq!(arr.len(), 0);
+    }
+
+    #[test]
+    fn test_get_training_report() {
+        let state = state_with_weights();
+        let params = serde_json::json!({"model_id": 1});
+        let response = handle_get_training_report(&state, &params, &null_id());
+        let v = response.result.unwrap();
+        assert_eq!(v["model_id"], 1);
+        assert_eq!(v["total_rounds"], 2);
+        assert_eq!(v["final_loss"], 0.3);
+        assert!(v["loss_curve"].is_array());
+        assert_eq!(v["loss_curve"].as_array().unwrap().len(), 2);
+        assert!(v["per_round"].is_array());
+        assert_eq!(v["per_round"].as_array().unwrap().len(), 2);
+        assert!(v["generated_at"].is_number());
+    }
+
+    #[test]
+    fn test_get_training_report_no_data() {
+        let state = create_test_state();
+        let params = serde_json::json!({"model_id": 99});
+        let response = handle_get_training_report(&state, &params, &null_id());
+        assert!(response.error.is_some());
+        assert_eq!(response.error.unwrap().code, -32000);
     }
 
     #[test]

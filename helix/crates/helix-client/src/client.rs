@@ -14,8 +14,8 @@ use crate::dashboard::DashboardState;
 use crate::error::HelixError;
 use crate::model::{ModelHandle, SdkModelConfig, TrainingParams};
 use crate::rpc::client::{
-    HealthStatus, HelixRpcConfig, ModelInfo, NetworkStatus, RoundInfo, TrainingResultData,
-    TrainingStatus, UnifiedRpcClient,
+    HealthStatus, HelixRpcConfig, ModelInfo, ModelWeightsResponse, NetworkStatus, RoundInfo,
+    TrainingHistory, TrainingReport, TrainingResultData, TrainingStatus, UnifiedRpcClient,
 };
 use crate::session::TrainingSession;
 
@@ -292,6 +292,67 @@ impl HelixClient {
     /// Get a specific round's information.
     pub async fn get_round(&self, model_id: u64, round_id: u64) -> Result<RoundInfo, HelixError> {
         Ok(self.rpc.get_round(model_id, round_id).await?)
+    }
+
+    // ==================== Result Distribution ====================
+
+    /// Get model weights for a specific round (or latest if `round_id` is None).
+    pub async fn get_model_weights(
+        &self,
+        model_id: u64,
+        round_id: Option<u64>,
+    ) -> Result<ModelWeightsResponse, HelixError> {
+        Ok(self.rpc.get_model_weights(model_id, round_id).await?)
+    }
+
+    /// Download model weights to a local file path.
+    ///
+    /// Fetches the weights from the node and writes them to disk. Returns the
+    /// commitment hash for optional verification.
+    pub async fn download_model(
+        &self,
+        model_id: u64,
+        round_id: Option<u64>,
+        path: impl Into<PathBuf>,
+    ) -> Result<String, HelixError> {
+        let weights = self.rpc.get_model_weights(model_id, round_id).await?;
+        let dest = path.into();
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| HelixError::Other(anyhow::anyhow!("Failed to create directory: {}", e)))?;
+        }
+        std::fs::write(&dest, &weights.weight_bytes)
+            .map_err(|e| HelixError::Other(anyhow::anyhow!("Failed to write model file: {}", e)))?;
+        Ok(weights.commitment)
+    }
+
+    /// Verify that local model weights match the on-chain commitment.
+    ///
+    /// Computes the SHA-256 hash of the weight bytes and compares it to the
+    /// commitment returned by the node.
+    pub fn verify_model(weight_bytes: &[u8], expected_commitment: &str) -> Result<bool, HelixError> {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(weight_bytes);
+        let hash = hasher.finalize();
+        let computed = format!("0x{}", hex::encode(hash));
+        Ok(computed == expected_commitment)
+    }
+
+    /// Get full training history for a model.
+    pub async fn get_training_history(
+        &self,
+        model_id: u64,
+    ) -> Result<TrainingHistory, HelixError> {
+        Ok(self.rpc.get_training_history(model_id).await?)
+    }
+
+    /// Get a full training report / certificate for a model.
+    pub async fn get_training_report(
+        &self,
+        model_id: u64,
+    ) -> Result<TrainingReport, HelixError> {
+        Ok(self.rpc.get_training_report(model_id).await?)
     }
 
     /// Clone the underlying RPC client (for use by TrainingSession etc.).

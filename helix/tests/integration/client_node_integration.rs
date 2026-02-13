@@ -464,3 +464,226 @@ async fn test_client_progress_during_training() {
     let progress = session.progress().await;
     assert_eq!(progress.current_round, 1, "should have polled round 1");
 }
+
+// ============================================================================
+// Result Distribution Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_client_get_model_weights() {
+    let (state, url) = boot_node().await;
+
+    // Seed some round weight data
+    {
+        let mut weights = state.round_weights.write();
+        weights.push(helix_node::api::rpc::RoundWeightEntry {
+            round_id: 1,
+            model_id: 1,
+            commitment: [0xab; 32],
+            weight_bytes: vec![1, 2, 3, 4, 5],
+            loss: 0.25,
+            error_bound: 10.0,
+            steps_completed: 10,
+            num_contributors: 3,
+            completed_at: 1000,
+            tx_hash: Some("0xdeadbeef".to_string()),
+        });
+    }
+
+    let client = HelixClient::connect_to(&url).await.unwrap();
+
+    // Get weights for model 1, latest round
+    let weights = client
+        .get_model_weights(1, None)
+        .await
+        .expect("get_model_weights failed");
+
+    assert_eq!(weights.round_id, 1);
+    assert_eq!(weights.model_id, 1);
+    assert_eq!(weights.weight_bytes, vec![1, 2, 3, 4, 5]);
+    assert!((weights.loss - 0.25).abs() < 1e-6);
+    assert_eq!(weights.num_contributors, 3);
+}
+
+#[tokio::test]
+async fn test_client_get_model_weights_specific_round() {
+    let (state, url) = boot_node().await;
+
+    // Seed two rounds of weight data
+    {
+        let mut weights = state.round_weights.write();
+        weights.push(helix_node::api::rpc::RoundWeightEntry {
+            round_id: 1,
+            model_id: 1,
+            commitment: [0xaa; 32],
+            weight_bytes: vec![10, 20, 30],
+            loss: 0.50,
+            error_bound: 5.0,
+            steps_completed: 5,
+            num_contributors: 2,
+            completed_at: 900,
+            tx_hash: None,
+        });
+        weights.push(helix_node::api::rpc::RoundWeightEntry {
+            round_id: 2,
+            model_id: 1,
+            commitment: [0xbb; 32],
+            weight_bytes: vec![40, 50, 60],
+            loss: 0.30,
+            error_bound: 8.0,
+            steps_completed: 10,
+            num_contributors: 3,
+            completed_at: 1000,
+            tx_hash: Some("0xcafe".to_string()),
+        });
+    }
+
+    let client = HelixClient::connect_to(&url).await.unwrap();
+
+    // Get weights for specific round 1
+    let weights = client
+        .get_model_weights(1, Some(1))
+        .await
+        .expect("get_model_weights round 1 failed");
+
+    assert_eq!(weights.round_id, 1);
+    assert_eq!(weights.weight_bytes, vec![10, 20, 30]);
+}
+
+#[tokio::test]
+async fn test_client_get_training_history() {
+    let (state, url) = boot_node().await;
+
+    // Seed weight data
+    {
+        let mut weights = state.round_weights.write();
+        for i in 1..=3 {
+            weights.push(helix_node::api::rpc::RoundWeightEntry {
+                round_id: i,
+                model_id: 1,
+                commitment: [i as u8; 32],
+                weight_bytes: vec![i as u8; 16],
+                loss: 1.0 - (i as f64 * 0.2),
+                error_bound: i as f64 * 5.0,
+                steps_completed: i * 10,
+                num_contributors: 3,
+                completed_at: 1000 + i,
+                tx_hash: None,
+            });
+        }
+    }
+
+    let client = HelixClient::connect_to(&url).await.unwrap();
+
+    let history = client
+        .get_training_history(1)
+        .await
+        .expect("get_training_history failed");
+
+    assert_eq!(history.model_id, 1);
+    assert_eq!(history.total_rounds, 3);
+    assert_eq!(history.rounds.len(), 3);
+    assert!((history.rounds[0].loss - 0.8).abs() < 1e-6);
+    assert!((history.rounds[2].loss - 0.4).abs() < 1e-6);
+}
+
+#[tokio::test]
+async fn test_client_get_training_report() {
+    let (state, url) = boot_node().await;
+
+    // Seed weight data
+    {
+        let mut weights = state.round_weights.write();
+        for i in 1..=4 {
+            weights.push(helix_node::api::rpc::RoundWeightEntry {
+                round_id: i,
+                model_id: 2,
+                commitment: [i as u8; 32],
+                weight_bytes: vec![i as u8; 32],
+                loss: 2.0 - (i as f64 * 0.3),
+                error_bound: i as f64 * 3.0,
+                steps_completed: i * 5,
+                num_contributors: 2,
+                completed_at: 2000 + i,
+                tx_hash: None,
+            });
+        }
+    }
+
+    let client = HelixClient::connect_to(&url).await.unwrap();
+
+    let report = client
+        .get_training_report(2)
+        .await
+        .expect("get_training_report failed");
+
+    assert_eq!(report.model_id, 2);
+    assert_eq!(report.total_rounds, 4);
+    assert_eq!(report.loss_curve.len(), 4);
+    assert_eq!(report.error_curve.len(), 4);
+    assert_eq!(report.per_round.len(), 4);
+    // Final loss = 2.0 - 4*0.3 = 0.8
+    assert!((report.final_loss - 0.8).abs() < 1e-6);
+}
+
+#[tokio::test]
+async fn test_client_download_model() {
+    let (state, url) = boot_node().await;
+
+    // Seed weight data with known content
+    let test_weights = vec![0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE];
+    {
+        let mut weights = state.round_weights.write();
+        weights.push(helix_node::api::rpc::RoundWeightEntry {
+            round_id: 1,
+            model_id: 1,
+            commitment: [0xff; 32],
+            weight_bytes: test_weights.clone(),
+            loss: 0.1,
+            error_bound: 1.0,
+            steps_completed: 100,
+            num_contributors: 5,
+            completed_at: 5000,
+            tx_hash: None,
+        });
+    }
+
+    let client = HelixClient::connect_to(&url).await.unwrap();
+
+    let tmpdir = tempfile::tempdir().expect("failed to create tmpdir");
+    let model_path = tmpdir.path().join("model.weights");
+
+    let commitment = client
+        .download_model(1, Some(1), &model_path)
+        .await
+        .expect("download_model failed");
+
+    // Verify the file was written
+    let written = std::fs::read(&model_path).expect("failed to read downloaded file");
+    assert_eq!(written, test_weights);
+
+    // Commitment should be non-empty
+    assert!(!commitment.is_empty());
+}
+
+#[tokio::test]
+async fn test_verify_model_integrity() {
+    use sha2::{Sha256, Digest};
+
+    let weight_bytes = vec![1, 2, 3, 4, 5, 6, 7, 8];
+    let mut hasher = Sha256::new();
+    hasher.update(&weight_bytes);
+    let hash = hasher.finalize();
+    let correct_commitment = format!("0x{}", hex::encode(hash));
+
+    // Correct commitment should pass
+    let result = HelixClient::verify_model(&weight_bytes, &correct_commitment)
+        .expect("verify_model failed");
+    assert!(result, "Should verify correctly with matching commitment");
+
+    // Wrong commitment should fail
+    let wrong = "0x0000000000000000000000000000000000000000000000000000000000000000";
+    let result = HelixClient::verify_model(&weight_bytes, wrong)
+        .expect("verify_model failed");
+    assert!(!result, "Should fail verification with wrong commitment");
+}
