@@ -246,6 +246,9 @@ pub struct TrainingOrchestrator {
     aggregation_strategy: Arc<RwLock<AggregationStrategy>>,
     /// BFT consensus protocol for 2-phase commit on gradient aggregation.
     consensus: Arc<RwLock<ConsensusProtocol>>,
+    /// Collected weight updates per round: round_id → [(peer_id, checkpoint_bytes, weight_hash)].
+    /// Populated by network processing when workers send GradientMessage::WeightUpdate.
+    weight_updates: Arc<RwLock<HashMap<u64, Vec<(PeerId, Vec<u8>, [u8; 32])>>>>,
 }
 
 impl TrainingOrchestrator {
@@ -290,6 +293,7 @@ impl TrainingOrchestrator {
             byzantine_filter,
             aggregation_strategy: Arc::new(RwLock::new(AggregationStrategy::FedAvg)),
             consensus,
+            weight_updates: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -312,6 +316,19 @@ impl TrainingOrchestrator {
     pub fn set_sc_client(&self, client: Arc<SCClient>, model_id: u64) {
         *self.sc_client.write() = Some(client);
         *self.model_id.write() = model_id;
+    }
+
+    /// Takes all collected weight updates for a given round, removing them.
+    ///
+    /// Returns a list of `(peer_id, checkpoint_bytes, weight_hash)` tuples.
+    /// After calling this, the collection for that round is empty.
+    pub fn take_weight_updates(&self, round_id: u64) -> Vec<(PeerId, Vec<u8>, [u8; 32])> {
+        self.weight_updates.write().remove(&round_id).unwrap_or_default()
+    }
+
+    /// Returns the number of weight updates collected for a round (without removing).
+    pub fn weight_update_count(&self, round_id: u64) -> usize {
+        self.weight_updates.read().get(&round_id).map_or(0, |v| v.len())
     }
 
     /// Starts the orchestrator.
@@ -1363,6 +1380,8 @@ impl TrainingOrchestrator {
         let (gradient_tx, mut gradient_rx) = mpsc::channel::<(PeerId, u64, [u8; 32], f64, Vec<u8>)>(100);
         let (heartbeat_tx, mut heartbeat_rx) = mpsc::channel::<(PeerId, HeartbeatMessage)>(100);
         let (consensus_tx, mut consensus_rx) = mpsc::channel::<(PeerId, crate::network::messages::ConsensusMessage)>(100);
+        let weight_updates_ref = self.weight_updates.clone();
+        let event_tx_for_weights = self.event_tx.clone();
 
         // Spawn event processing task
         tokio::spawn(async move {
@@ -1373,8 +1392,22 @@ impl TrainingOrchestrator {
                         match event {
                             NetworkEvent::GradientMessage { from, message } => {
                                 match message {
-                                    GradientMessage::ShareGradient { round_id, gradient_commitment, commitment_nonce, error_bound, proof } => {
+                                    GradientMessage::ShareGradient { round_id, gradient_commitment, commitment_nonce: _, error_bound, proof } => {
                                         let _ = gradient_tx.send((from, round_id, gradient_commitment, error_bound, proof)).await;
+                                    }
+                                    GradientMessage::WeightUpdate { round_id, checkpoint_data, weight_hash } => {
+                                        log::info!(
+                                            "Weight update received from {} for round {} ({} bytes)",
+                                            from, round_id, checkpoint_data.len(),
+                                        );
+                                        weight_updates_ref.write()
+                                            .entry(round_id)
+                                            .or_default()
+                                            .push((from.clone(), checkpoint_data, weight_hash));
+                                        let _ = event_tx_for_weights.send(OrchestratorEvent::GradientReceived {
+                                            round_id,
+                                            peer_id: from,
+                                        });
                                     }
                                     _ => {}
                                 }

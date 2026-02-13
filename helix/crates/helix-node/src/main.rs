@@ -1,5 +1,7 @@
 mod sc_client;
 
+use helix_core::ModelCheckpoint;
+use helix_node::config::DataSourceConfig;
 use helix_node::sc_client::SCClient;
 use helix_node::api::http::{ApiRateLimiter, ApiState, MetricsSnapshot, OrchestratorSnapshot, PeerSnapshot, RoundInfo};
 use helix_node::api::rpc::{
@@ -12,12 +14,11 @@ use helix_node::network::messages::{
 };
 use helix_node::network::runner::{NetworkEvent, NetworkRunnerBuilder};
 use helix_node::round_commit::{RoundCommitConfig, RoundCommitManager};
-use helix_node::trainer::Trainer;
+use helix_node::trainer::{average_models, MlpModel, Trainer};
 use helix_node::training::orchestrator::{
     OrchestratorConfig, OrchestratorEvent, TrainingOrchestrator,
 };
 use helix_node::training::MPCWorkerHandle;
-use helix_node::trainer::MlpModel;
 
 use log::{error, info, warn};
 use parking_lot::RwLock;
@@ -181,10 +182,86 @@ async fn run_worker(listen_addr: SocketAddr) -> anyhow::Result<()> {
         }
     });
 
-    // Main event loop: wait for RoundStart, train, send gradient
+    // Load worker data source configuration from env
+    let data_source_type = env_or("HELIX_DATA_SOURCE", "synthetic");
+    let data_source = match data_source_type.as_str() {
+        "csv" => {
+            let path = env_or("HELIX_CSV_PATH", "data.csv");
+            let input_cols: Vec<String> = env_or("HELIX_CSV_INPUT_COLS", "")
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.trim().to_string())
+                .collect();
+            let target_cols: Vec<String> = env_or("HELIX_CSV_TARGET_COLS", "")
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.trim().to_string())
+                .collect();
+            DataSourceConfig::CsvFile { path, input_cols, target_cols }
+        }
+        "ipfs" => {
+            let cid = env_or("HELIX_IPFS_CID", "");
+            let gateway = env_or("HELIX_IPFS_GATEWAY", "http://localhost:5001");
+            DataSourceConfig::Ipfs { cid, gateway }
+        }
+        _ => {
+            let seed: u64 = env_or("HELIX_DATA_SEED", "42").parse().unwrap_or(42);
+            DataSourceConfig::Synthetic { seed }
+        }
+    };
+    info!("Worker data source: {:?}", data_source);
+
+    // Pre-load CSV dataset if configured
+    let csv_dataset: Option<Vec<(Vec<f64>, Vec<f64>)>> = match &data_source {
+        DataSourceConfig::CsvFile { path, input_cols, target_cols } => {
+            info!("Loading CSV dataset from {}", path);
+            match std::fs::read_to_string(path) {
+                Ok(contents) => {
+                    let mut rows = Vec::new();
+                    let mut lines = contents.lines();
+                    let header: Vec<&str> = match lines.next() {
+                        Some(h) => h.split(',').map(|s| s.trim()).collect(),
+                        None => { warn!("CSV file is empty"); Vec::new() }
+                    };
+
+                    let in_idxs: Vec<usize> = input_cols.iter()
+                        .filter_map(|c| header.iter().position(|h| h == c))
+                        .collect();
+                    let tgt_idxs: Vec<usize> = target_cols.iter()
+                        .filter_map(|c| header.iter().position(|h| h == c))
+                        .collect();
+
+                    if in_idxs.is_empty() || tgt_idxs.is_empty() {
+                        warn!("CSV column matching failed: input_cols={:?}, target_cols={:?}, header={:?}", input_cols, target_cols, header);
+                    }
+
+                    for line in lines {
+                        let fields: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+                        let x: Vec<f64> = in_idxs.iter()
+                            .map(|&i| fields.get(i).and_then(|s| s.parse().ok()).unwrap_or(0.0))
+                            .collect();
+                        let t: Vec<f64> = tgt_idxs.iter()
+                            .map(|&i| fields.get(i).and_then(|s| s.parse().ok()).unwrap_or(0.0))
+                            .collect();
+                        rows.push((x, t));
+                    }
+                    info!("Loaded {} samples from CSV ({} inputs, {} targets)", rows.len(), in_idxs.len(), tgt_idxs.len());
+                    if rows.is_empty() { None } else { Some(rows) }
+                }
+                Err(e) => {
+                    warn!("Failed to read CSV file {}: {}", path, e);
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
+    // Main event loop: wait for RoundStart/ModelWeights, train, send gradient + weight update
     let mut trainer: Option<Trainer> = None;
     let mut mpc_handle: Option<MPCWorkerHandle> = None;
     let mut steps_completed = 0u64;
+    let mut csv_sample_idx = 0usize;
 
     let result = tokio::select! {
         _ = shutdown_signal() => {
@@ -196,6 +273,64 @@ async fn run_worker(listen_addr: SocketAddr) -> anyhow::Result<()> {
                 match network.next_event().await {
                     Some(NetworkEvent::TrainingMessage { from, message }) => {
                         match message {
+                            TrainingMessage::ModelWeights {
+                                round_id,
+                                checkpoint_data,
+                                weight_hash,
+                            } => {
+                                info!(
+                                    "Received ModelWeights for round {} from {} ({} bytes, hash={})",
+                                    round_id, from, checkpoint_data.len(),
+                                    hex::encode(&weight_hash[..8]),
+                                );
+                                match ModelCheckpoint::from_bytes(&checkpoint_data) {
+                                    Ok(ckpt) => {
+                                        match MlpModel::from_checkpoint(&ckpt) {
+                                            Ok(model) => {
+                                                let lr = trainer.as_ref()
+                                                    .map(|t| t.learning_rate())
+                                                    .unwrap_or(0.01);
+                                                trainer = Some(Trainer::with_model(model, lr));
+                                                info!(
+                                                    "Model loaded from aggregator for round {} (step={})",
+                                                    round_id, ckpt.step_number,
+                                                );
+                                            }
+                                            Err(e) => warn!("Failed to reconstruct model from checkpoint: {}", e),
+                                        }
+                                    }
+                                    Err(e) => warn!("Failed to deserialize model checkpoint: {}", e),
+                                }
+                            }
+                            TrainingMessage::UpdatedWeights {
+                                round_id,
+                                checkpoint_data,
+                                weight_hash,
+                            } => {
+                                info!(
+                                    "Received UpdatedWeights after round {} ({} bytes, hash={})",
+                                    round_id, checkpoint_data.len(),
+                                    hex::encode(&weight_hash[..8]),
+                                );
+                                match ModelCheckpoint::from_bytes(&checkpoint_data) {
+                                    Ok(ckpt) => {
+                                        match MlpModel::from_checkpoint(&ckpt) {
+                                            Ok(model) => {
+                                                let lr = trainer.as_ref()
+                                                    .map(|t| t.learning_rate())
+                                                    .unwrap_or(0.01);
+                                                trainer = Some(Trainer::with_model(model, lr));
+                                                info!(
+                                                    "Model updated from aggregator after round {} (step={})",
+                                                    round_id, ckpt.step_number,
+                                                );
+                                            }
+                                            Err(e) => warn!("Failed to reconstruct updated model: {}", e),
+                                        }
+                                    }
+                                    Err(e) => warn!("Failed to deserialize updated checkpoint: {}", e),
+                                }
+                            }
                             TrainingMessage::RoundStart {
                                 round_id,
                                 model_hash: _,
@@ -235,7 +370,6 @@ async fn run_worker(listen_addr: SocketAddr) -> anyhow::Result<()> {
                                     }
 
                                     // Initialize a Trainer in lockstep for ZK proof generation.
-                                    // The Trainer uses the same model state as the MPC handle.
                                     if trainer.is_none() {
                                         trainer = Some(Trainer::new(
                                             params.d_in,
@@ -267,7 +401,6 @@ async fn run_worker(listen_addr: SocketAddr) -> anyhow::Result<()> {
                                             );
 
                                             // Generate ZK proof using the Trainer (same model, same data).
-                                            // This proves the training step was computed correctly.
                                             let proof_bytes = if let Some(ref mut t) = trainer {
                                                 match t.train_step(&x, &target) {
                                                     Ok(proved_step) => {
@@ -332,7 +465,7 @@ async fn run_worker(listen_addr: SocketAddr) -> anyhow::Result<()> {
                                     }
                                 } else {
                                     // ── Regular (non-MPC) training path ────────────
-                                    // Initialize trainer if needed (same seed = same initial model)
+                                    // Initialize trainer with seed if we haven't received model weights
                                     if trainer.is_none() {
                                         trainer = Some(Trainer::new(
                                             params.d_in,
@@ -345,8 +478,17 @@ async fn run_worker(listen_addr: SocketAddr) -> anyhow::Result<()> {
 
                                     let t = trainer.as_mut().unwrap();
 
-                                    // Generate synthetic data from seed (deterministic)
-                                    let (x, target) = generate_training_data(params.d_in, params.d_out, params.model_seed + round_id);
+                                    // Load training data from configured source
+                                    let (x, target) = if let Some(ref dataset) = csv_dataset {
+                                        let sample = &dataset[csv_sample_idx % dataset.len()];
+                                        csv_sample_idx += 1;
+                                        (sample.0.clone(), sample.1.clone())
+                                    } else if let DataSourceConfig::Synthetic { seed } = &data_source {
+                                        generate_training_data(params.d_in, params.d_out, seed + round_id)
+                                    } else {
+                                        // Fallback to synthetic if non-CSV source not yet loaded
+                                        generate_training_data(params.d_in, params.d_out, params.model_seed + round_id)
+                                    };
 
                                     info!("Training step {} (round {})...", t.step_count() + 1, round_id);
                                     match t.train_step(&x, &target) {
@@ -381,8 +523,33 @@ async fn run_worker(listen_addr: SocketAddr) -> anyhow::Result<()> {
                                                 ))
                                                 .await;
 
+                                            // Send updated model weights back to aggregator
+                                            let updated_model = t.model();
+                                            let updated_ckpt = updated_model.to_checkpoint(t.step_count());
+                                            match updated_ckpt.to_bytes() {
+                                                Ok(ckpt_bytes) => {
+                                                    let weight_hash = updated_model.commitment();
+                                                    network
+                                                        .broadcast(MessagePayload::Gradient(
+                                                            GradientMessage::WeightUpdate {
+                                                                round_id,
+                                                                checkpoint_data: ckpt_bytes,
+                                                                weight_hash,
+                                                            },
+                                                        ))
+                                                        .await;
+                                                    info!(
+                                                        "Weight update sent for round {} (hash={})",
+                                                        round_id, hex::encode(&weight_hash[..8]),
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    warn!("Failed to serialize model checkpoint for weight update: {}", e);
+                                                }
+                                            }
+
                                             steps_completed += 1;
-                                            info!("Gradient sent for round {} (total steps: {})", round_id, steps_completed);
+                                            info!("Gradient + weights sent for round {} (total steps: {})", round_id, steps_completed);
 
                                             // Update proof status
                                             proof_status.write().push(ProofStatusEntry {
@@ -521,9 +688,44 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
 
     let mut event_rx = orchestrator.start().await;
 
-    // Compute initial model hash
-    let initial_model = helix_node::trainer::MlpModel::new_random(d_in, d_hid, d_out, model_seed);
+    // Initialize or restore model from checkpoint
+    let checkpoint_dir = env_or("HELIX_CHECKPOINT_DIR", "");
+    let checkpoint_path = if checkpoint_dir.is_empty() {
+        None
+    } else {
+        std::fs::create_dir_all(&checkpoint_dir).ok();
+        Some(format!("{}/model_latest.hxck", checkpoint_dir))
+    };
+
+    let initial_model = if let Some(ref path) = checkpoint_path {
+        if std::path::Path::new(path).exists() {
+            match helix_core::ModelCheckpoint::from_bytes(
+                &std::fs::read(path).unwrap_or_default(),
+            ) {
+                Ok(ckpt) => {
+                    info!("Restored model from checkpoint at step {}", ckpt.step_number);
+                    match MlpModel::from_checkpoint(&ckpt) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            warn!("Failed to parse checkpoint model: {}, creating fresh", e);
+                            MlpModel::new_random(d_in, d_hid, d_out, model_seed)
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to load checkpoint: {}, creating fresh model", e);
+                    MlpModel::new_random(d_in, d_hid, d_out, model_seed)
+                }
+            }
+        } else {
+            MlpModel::new_random(d_in, d_hid, d_out, model_seed)
+        }
+    } else {
+        MlpModel::new_random(d_in, d_hid, d_out, model_seed)
+    };
+
     let model_hash = initial_model.commitment();
+    let aggregator_model = Arc::new(RwLock::new(initial_model.clone()));
     info!(
         "Model initialized: {}x{}x{} ({} params), commitment={}",
         d_in,
@@ -532,6 +734,11 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
         initial_model.num_params(),
         hex::encode(&model_hash[..8]),
     );
+
+    // Serialize initial model checkpoint for distribution to workers
+    let initial_checkpoint = initial_model.to_checkpoint(0);
+    let initial_checkpoint_bytes = initial_checkpoint.to_bytes()
+        .expect("Failed to serialize initial model checkpoint");
 
     // Set up shared API state
     let (round_trigger_tx, mut round_trigger_rx) = broadcast::channel::<()>(16);
@@ -586,6 +793,9 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
 
     let orchestrator_ref = &orchestrator;
 
+    // Channel for the event handler to notify the polling loop of completed rounds
+    let (completed_round_tx, mut completed_round_rx) = tokio::sync::mpsc::channel::<u64>(16);
+
     // Spawn event logger + snapshot updater
     let snapshot_for_events = api_snapshot.clone();
     let proof_status_events = proof_status.clone();
@@ -619,15 +829,19 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
                     completed_rounds += 1;
                     snapshot_for_events.write().completed_rounds = completed_rounds;
                     // Update proof status
-                    let mut status = proof_status_events.write();
-                    if let Some(entry) = status.iter_mut().find(|e| e.round_id == *round_id) {
-                        entry.status = "completed".to_string();
-                    }
+                    {
+                        let mut status = proof_status_events.write();
+                        if let Some(entry) = status.iter_mut().find(|e| e.round_id == *round_id) {
+                            entry.status = "completed".to_string();
+                        }
+                    } // drop the write guard before await
                     info!(
                         "Round {} completed, result={}",
                         round_id,
                         hex::encode(&result_hash[..8])
                     );
+                    // Notify the polling loop to aggregate weight updates
+                    let _ = completed_round_tx.send(*round_id).await;
                 }
                 OrchestratorEvent::RoundFailed { round_id, reason } => {
                     error!("Round {} failed: {}", round_id, reason);
@@ -643,6 +857,8 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
 
     // Polling loop with graceful shutdown
     let mut round_number = 0u64;
+    // Track the current model's checkpoint bytes for distribution
+    let current_checkpoint_bytes = Arc::new(RwLock::new(initial_checkpoint_bytes));
 
     tokio::select! {
         _ = shutdown_signal() => {
@@ -657,6 +873,89 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
         }
         _ = async {
             loop {
+                // Check for completed rounds that need weight aggregation
+                while let Ok(completed_round_id) = completed_round_rx.try_recv() {
+                    let updates = orchestrator_ref.take_weight_updates(completed_round_id);
+                    if updates.is_empty() {
+                        info!("Round {} completed with no weight updates to aggregate", completed_round_id);
+                        continue;
+                    }
+
+                    info!(
+                        "Aggregating {} weight updates for round {}",
+                        updates.len(), completed_round_id,
+                    );
+
+                    // Deserialize all worker models
+                    let mut worker_models = Vec::new();
+                    for (peer_id, ckpt_bytes, _hash) in &updates {
+                        match ModelCheckpoint::from_bytes(ckpt_bytes) {
+                            Ok(ckpt) => match MlpModel::from_checkpoint(&ckpt) {
+                                Ok(model) => worker_models.push(model),
+                                Err(e) => warn!("Bad checkpoint from {}: {}", peer_id, e),
+                            },
+                            Err(e) => warn!("Bad checkpoint bytes from {}: {}", peer_id, e),
+                        }
+                    }
+
+                    if worker_models.is_empty() {
+                        warn!("No valid weight updates for round {}", completed_round_id);
+                        continue;
+                    }
+
+                    // FedAvg: average all worker models
+                    match average_models(&worker_models) {
+                        Ok(averaged) => {
+                            let new_hash = averaged.commitment();
+                            info!(
+                                "FedAvg complete for round {}: {} models averaged, new commitment={}",
+                                completed_round_id,
+                                worker_models.len(),
+                                hex::encode(&new_hash[..8]),
+                            );
+
+                            // Update aggregator model
+                            *aggregator_model.write() = averaged.clone();
+
+                            // Persist checkpoint
+                            let ckpt = averaged.to_checkpoint(completed_round_id);
+                            if let Some(ref path) = checkpoint_path {
+                                match ckpt.to_bytes() {
+                                    Ok(bytes) => {
+                                        if let Err(e) = std::fs::write(path, &bytes) {
+                                            error!("Failed to persist checkpoint: {}", e);
+                                        } else {
+                                            info!("Checkpoint persisted to {} ({} bytes)", path, bytes.len());
+                                        }
+                                    }
+                                    Err(e) => error!("Failed to serialize checkpoint: {}", e),
+                                }
+                            }
+
+                            // Serialize updated model for distribution
+                            match ckpt.to_bytes() {
+                                Ok(bytes) => {
+                                    *current_checkpoint_bytes.write() = bytes.clone();
+
+                                    // Broadcast updated weights to all workers
+                                    network
+                                        .broadcast(MessagePayload::Training(
+                                            TrainingMessage::UpdatedWeights {
+                                                round_id: completed_round_id,
+                                                checkpoint_data: bytes,
+                                                weight_hash: new_hash,
+                                            },
+                                        ))
+                                        .await;
+                                    info!("Updated weights broadcast for round {}", completed_round_id);
+                                }
+                                Err(e) => error!("Failed to serialize updated checkpoint: {}", e),
+                            }
+                        }
+                        Err(e) => error!("FedAvg failed for round {}: {}", completed_round_id, e),
+                    }
+                }
+
                 tokio::time::sleep(Duration::from_secs(5)).await;
 
                 let stats = orchestrator_ref.worker_stats();
@@ -690,9 +989,31 @@ async fn run_aggregator(listen_addr: SocketAddr) -> anyhow::Result<()> {
                         continue;
                     }
                     round_number += 1;
-                    info!("Starting round {} with {} available workers", round_number, stats.available);
-                    match orchestrator_ref.start_round(model_hash).await {
-                        Ok(id) => info!("Round {} started successfully (id={})", round_number, id),
+
+                    // Use current model's commitment hash
+                    let current_model_hash = aggregator_model.read().commitment();
+                    let ckpt_bytes = current_checkpoint_bytes.read().clone();
+
+                    info!(
+                        "Starting round {} with {} available workers (model={})",
+                        round_number, stats.available, hex::encode(&current_model_hash[..8]),
+                    );
+                    match orchestrator_ref.start_round(current_model_hash).await {
+                        Ok(id) => {
+                            info!("Round {} started successfully (id={})", round_number, id);
+
+                            // Distribute current model weights to all workers
+                            network
+                                .broadcast(MessagePayload::Training(
+                                    TrainingMessage::ModelWeights {
+                                        round_id: id,
+                                        checkpoint_data: ckpt_bytes,
+                                        weight_hash: current_model_hash,
+                                    },
+                                ))
+                                .await;
+                            info!("Model weights broadcast for round {} ({} bytes)", id, current_checkpoint_bytes.read().len());
+                        }
                         Err(e) => error!("Failed to start round: {}", e),
                     }
                 }

@@ -491,6 +491,30 @@ pub enum TrainingMessage {
         /// Assigned data shard.
         shard_id: Option<u32>,
     },
+    /// Aggregator distributes model weights to workers at round start.
+    ///
+    /// The `checkpoint_data` contains a serialized `ModelCheckpoint` (via `to_bytes()`).
+    /// Workers deserialize this to reconstruct the `MlpModel` for training.
+    ModelWeights {
+        /// Round ID this model is for.
+        round_id: u64,
+        /// Serialized ModelCheckpoint bytes.
+        checkpoint_data: Vec<u8>,
+        /// SHA-256 of the model weights (for integrity verification).
+        weight_hash: [u8; 32],
+    },
+    /// Aggregator distributes updated weights after aggregation.
+    ///
+    /// Sent after a round completes to give workers the new model state
+    /// for the next round of training.
+    UpdatedWeights {
+        /// Round ID this update is from (the completed round).
+        round_id: u64,
+        /// Serialized ModelCheckpoint bytes with aggregated weights.
+        checkpoint_data: Vec<u8>,
+        /// New weight hash after aggregation.
+        weight_hash: [u8; 32],
+    },
 }
 
 /// Training parameters.
@@ -551,6 +575,18 @@ pub enum GradientMessage {
         commitment: [u8; 32],
         /// Aggregation proof.
         proof: Vec<u8>,
+    },
+    /// Worker sends updated model weights after local training.
+    ///
+    /// The `checkpoint_data` contains a serialized `ModelCheckpoint` of the worker's
+    /// model state after training. The aggregator uses these to compute averaged weights.
+    WeightUpdate {
+        /// Round ID.
+        round_id: u64,
+        /// Serialized ModelCheckpoint bytes of the worker's updated model.
+        checkpoint_data: Vec<u8>,
+        /// SHA-256 of the updated weights.
+        weight_hash: [u8; 32],
     },
 }
 

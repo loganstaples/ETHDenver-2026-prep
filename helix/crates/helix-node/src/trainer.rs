@@ -233,6 +233,43 @@ impl MlpModel {
     }
 }
 
+/// Averages multiple MlpModel instances (FedAvg).
+///
+/// All models must have the same architecture (d_in, d_hid, d_out).
+/// Returns the element-wise average of all weight matrices and biases.
+pub fn average_models(models: &[MlpModel]) -> anyhow::Result<MlpModel> {
+    if models.is_empty() {
+        anyhow::bail!("Cannot average zero models");
+    }
+    let first = &models[0];
+    let n = models.len() as f64;
+
+    for m in &models[1..] {
+        if m.d_in != first.d_in || m.d_hid != first.d_hid || m.d_out != first.d_out {
+            anyhow::bail!(
+                "Model dimension mismatch: expected {}x{}x{}, got {}x{}x{}",
+                first.d_in, first.d_hid, first.d_out,
+                m.d_in, m.d_hid, m.d_out,
+            );
+        }
+    }
+
+    let avg = |vecs: Vec<&Vec<f64>>| -> Vec<f64> {
+        let len = vecs[0].len();
+        (0..len).map(|i| vecs.iter().map(|v| v[i]).sum::<f64>() / n).collect()
+    };
+
+    Ok(MlpModel {
+        d_in: first.d_in,
+        d_hid: first.d_hid,
+        d_out: first.d_out,
+        w1: avg(models.iter().map(|m| &m.w1).collect()),
+        b1: avg(models.iter().map(|m| &m.b1).collect()),
+        w2: avg(models.iter().map(|m| &m.w2).collect()),
+        b2: avg(models.iter().map(|m| &m.b2).collect()),
+    })
+}
+
 // ──────────────────────────────────────────────────────────────
 // Native forward / backward pass
 // ──────────────────────────────────────────────────────────────
@@ -732,6 +769,13 @@ impl Trainer {
             proofs_generated: 0,
             loss_decreased,
         }
+    }
+
+    /// Replaces the model with one reconstructed from a checkpoint.
+    pub fn load_from_checkpoint(&mut self, checkpoint: &ModelCheckpoint) -> anyhow::Result<()> {
+        let model = MlpModel::from_checkpoint(checkpoint)?;
+        self.model = model;
+        Ok(())
     }
 
     /// Legacy compatibility: `train_and_prove` matching the old mocked interface.

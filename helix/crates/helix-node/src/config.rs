@@ -97,6 +97,54 @@ impl ApiConfig {
     }
 }
 
+/// Worker training data source configuration.
+///
+/// Controls where workers load their training data from. Defaults to
+/// synthetic data generation for development/testing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DataSourceConfig {
+    /// Generate synthetic data from a seed (current default behavior).
+    Synthetic {
+        /// Base seed for data generation.
+        #[serde(default = "default_data_seed")]
+        seed: u64,
+    },
+    /// Load training data from a local CSV file.
+    CsvFile {
+        /// Path to the CSV file.
+        path: String,
+        /// Column names to use as input features.
+        input_cols: Vec<String>,
+        /// Column names to use as targets.
+        target_cols: Vec<String>,
+    },
+    /// Load training data from IPFS.
+    Ipfs {
+        /// Content identifier for the dataset.
+        cid: String,
+        /// IPFS gateway URL.
+        #[serde(default = "default_ipfs_gateway")]
+        gateway: String,
+    },
+}
+
+fn default_data_seed() -> u64 {
+    42
+}
+
+fn default_ipfs_gateway() -> String {
+    "http://localhost:5001".to_string()
+}
+
+impl Default for DataSourceConfig {
+    fn default() -> Self {
+        Self::Synthetic {
+            seed: default_data_seed(),
+        }
+    }
+}
+
 /// Full node configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
@@ -145,6 +193,14 @@ pub struct NodeConfig {
     /// When set, the aggregator will register models, stake, submit proofs on-chain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain: Option<ChainConfig>,
+
+    /// Training data source configuration for worker nodes.
+    #[serde(default)]
+    pub data_source: DataSourceConfig,
+
+    /// Directory to persist model checkpoints (aggregator only).
+    #[serde(default = "default_checkpoint_dir")]
+    pub checkpoint_dir: PathBuf,
 }
 
 /// On-chain pipeline configuration for aggregator nodes.
@@ -214,6 +270,10 @@ fn default_proof_queue_interval_secs() -> u64 {
     5
 }
 
+fn default_checkpoint_dir() -> PathBuf {
+    dirs_fallback().join("checkpoints")
+}
+
 fn default_listen_addr() -> String {
     "0.0.0.0:9000".to_string()
 }
@@ -261,6 +321,8 @@ impl Default for NodeConfig {
             rate_limit: RateLimitConfig::default(),
             api: ApiConfig::default(),
             chain: None,
+            data_source: DataSourceConfig::default(),
+            checkpoint_dir: default_checkpoint_dir(),
         }
     }
 }
