@@ -80,6 +80,7 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
     error StepNumberMismatch();
     error ErrorBudgetExhausted();
     error TrainingHaltedForRound();
+    error ModelErrorBudgetExceeded();
 
     // ============ Structs (Optimized for Storage Packing) ============
 
@@ -285,6 +286,9 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
 
     /// @notice Last loss value per round (from most recent accepted proof)
     mapping(uint256 => mapping(uint256 => uint256)) public roundLastLoss;
+
+    /// @notice Maximum accumulated error allowed per model (0 = no limit)
+    mapping(uint256 => uint256) public modelMaxAccumulatedError;
 
     // ============ Admin Timelock State ============
 
@@ -690,7 +694,7 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
     // ============ Staking ============
 
     /// @notice Stakes tokens to participate in a model's training
-    function stake(uint256 modelId) external payable modelExists(modelId) {
+    function stake(uint256 modelId) external payable whenNotPaused modelExists(modelId) {
         if (msg.value == 0) revert ZeroStake();
 
         Stake storage s = stakes[msg.sender][modelId];
@@ -859,6 +863,10 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
         uint256 newAccumulatedError = accumulatedErrorBound[modelId] + stepErrorBound;
         accumulatedErrorBound[modelId] = newAccumulatedError;
 
+        // Enforce model-level error budget
+        uint256 modelBudget = modelMaxAccumulatedError[modelId];
+        if (modelBudget > 0 && newAccumulatedError > modelBudget) revert ModelErrorBudgetExceeded();
+
         // Reset stake lock (reward for valid submission)
         stakes[prover][modelId].lockedUntil = uint40(block.timestamp);
 
@@ -985,7 +993,7 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
         uint256 roundId,
         bytes memory proof,
         uint256[] memory publicInputs
-    ) external nonReentrant {
+    ) external nonReentrant whenNotPaused {
         Round storage round = rounds[modelId][roundId];
         if (!round.isCompleted) revert RoundNotCompleted();
         if (round.prover == address(0)) revert NoProverToChallenge();
@@ -998,20 +1006,70 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
         }
     }
 
+    // ============ Optimized Batch Verification ============
+
+    /// @notice Verifies multiple proofs sharing the same model and round with reduced overhead
+    /// @dev Amortizes model/round lookup and validation across all proofs in the batch.
+    ///      Each proof still gets individually verified by the ZK verifier, but the
+    ///      shared state lookups (model, round, stake) are done once.
+    /// @param modelId The model ID
+    /// @param roundId The round ID
+    /// @param proofs Array of proof bytes
+    /// @param publicInputsArray Array of public inputs arrays (one per proof)
+    function verifyAndSubmitBatch(
+        uint256 modelId,
+        uint256 roundId,
+        bytes[] calldata proofs,
+        uint256[][] calldata publicInputsArray
+    ) external nonReentrant whenNotPaused {
+        uint256 n = proofs.length;
+        if (n == 0) revert EmptyBatch();
+        require(n == publicInputsArray.length, "Length mismatch");
+
+        // Pre-validate model and round once (saves ~5000 gas per extra proof)
+        if (models[modelId].owner == address(0)) revert ModelNotFound();
+        Stake storage s = stakes[msg.sender][modelId];
+        if (s.amount < models[modelId].minStake) revert InsufficientStake();
+        if (s.slashed) revert StakeSlashed();
+        if (roundId != models[modelId].currentRound) revert InvalidRound();
+        Round storage round = rounds[modelId][roundId];
+        if (round.isCompleted) revert RoundAlreadyCompleted();
+        if (block.timestamp > round.deadline) revert RoundExpired();
+        if (roundHalted[modelId][roundId]) revert TrainingHaltedForRound();
+
+        // Process each proof sequentially (commitment chaining requires order)
+        for (uint256 i = 0; i < n; i++) {
+            _processProof(msg.sender, modelId, roundId, proofs[i], publicInputsArray[i]);
+        }
+        emit BatchProofSubmitted(msg.sender, n);
+    }
+
     // ============ Round Finalization ============
 
     /// @notice Finalizes a training round, marking it complete
-    /// @dev Can only be called when at least one proof has been submitted
+    /// @dev Model/contract owner can finalize at any time if proofs exist.
+    ///      Anyone can finalize after the round deadline has passed (timeout enforcement).
+    ///      Rounds with zero proofs that have expired can be closed without distributing rewards.
     /// @param modelId The model ID
     /// @param roundId The round ID to finalize
     function finalizeRound(uint256 modelId, uint256 roundId) external whenNotPaused {
         if (models[modelId].owner == address(0)) revert ModelNotFound();
         Round storage round = rounds[modelId][roundId];
         if (round.isCompleted) revert RoundAlreadyCompleted();
-        require(roundProofCount[modelId][roundId] > 0, "No proofs submitted");
 
-        // Only model owner or contract owner can finalize
-        if (msg.sender != models[modelId].owner && msg.sender != owner) revert NotAuthorized();
+        bool isExpired = block.timestamp > round.deadline;
+        bool isAuthorized = msg.sender == models[modelId].owner || msg.sender == owner;
+
+        // Anyone can finalize after deadline; only owner/model owner before deadline
+        require(isExpired || isAuthorized, "Round not expired and not authorized");
+
+        // If no proofs submitted and expired, just close the round
+        if (roundProofCount[modelId][roundId] == 0) {
+            require(isExpired, "No proofs submitted and round not expired");
+            round.isCompleted = true;
+            emit RoundFinalized(modelId, roundId, 0, 0, 0, 0);
+            return;
+        }
 
         round.isCompleted = true;
 
@@ -1337,6 +1395,14 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
     function setMaxErrorBound(uint256 _maxErrorBound) external onlyOwner whenPaused {
         emit ConfigUpdated("maxErrorBound", maxErrorBound, _maxErrorBound);
         maxErrorBound = _maxErrorBound;
+    }
+
+    /// @notice Sets maximum accumulated error allowed for a model (0 = no limit)
+    /// @param modelId The model ID
+    /// @param maxError Maximum accumulated error (0 to disable)
+    function setModelMaxAccumulatedError(uint256 modelId, uint256 maxError) external {
+        if (msg.sender != models[modelId].owner && msg.sender != owner) revert NotAuthorized();
+        modelMaxAccumulatedError[modelId] = maxError;
     }
 
     /// @notice Resets accumulated error for a model

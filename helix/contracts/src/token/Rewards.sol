@@ -22,6 +22,9 @@ contract Rewards is ReentrancyGuard {
     
     /// @notice Owner for parameter updates
     address public owner;
+
+    /// @notice Whether the contract is paused
+    bool public paused;
     
     /// @notice Reward pool information
     struct RewardPool {
@@ -72,6 +75,12 @@ contract Rewards is ReentrancyGuard {
     }
     mapping(uint256 => mapping(uint256 => RoundTiming)) public roundTiming;
 
+    /// @notice Per-participant proof count per round (for weighted reward distribution)
+    mapping(uint256 => mapping(uint256 => mapping(address => uint256))) public participantProofCount;
+
+    /// @notice Total proof count per round
+    mapping(uint256 => mapping(uint256 => uint256)) public roundTotalProofCount;
+
     /// @notice Pool split configuration (basis points, must sum to 10000)
     uint16 public computePoolBps = 7000;  // 70%
     uint16 public qualityPoolBps = 2000;  // 20%
@@ -83,6 +92,7 @@ contract Rewards is ReentrancyGuard {
     event RewardsClaimed(address indexed claimer, uint256 amount);
     event ParticipantRegistered(uint256 indexed modelId, uint256 indexed roundId, address indexed participant);
     event BonusAwarded(address indexed recipient, uint256 amount, string reason);
+    event EmergencyPauseChanged(bool isPaused, address indexed changedBy);
     
     modifier onlyOwner() {
         require(msg.sender == owner, "Only owner");
@@ -91,6 +101,11 @@ contract Rewards is ReentrancyGuard {
     
     modifier onlyCoordinator() {
         require(msg.sender == coordinator, "Only coordinator");
+        _;
+    }
+
+    modifier whenNotPaused() {
+        require(!paused, "Contract is paused");
         _;
     }
     
@@ -120,7 +135,7 @@ contract Rewards is ReentrancyGuard {
         uint256 amount,
         uint256 rewardsPerRound,
         uint256 duration
-    ) external nonReentrant {
+    ) external nonReentrant whenNotPaused {
         require(amount > 0, "Amount must be positive");
         require(rewardsPerRound > 0, "Rewards per round must be positive");
         require(duration > 0, "Duration must be positive");
@@ -146,7 +161,11 @@ contract Rewards is ReentrancyGuard {
     ) external onlyCoordinator {
         roundParticipants[modelId][roundId].push(participant);
         claimInfo[participant].roundsParticipated++;
-        
+
+        // Track proof count for weighted reward distribution
+        participantProofCount[modelId][roundId][participant]++;
+        roundTotalProofCount[modelId][roundId]++;
+
         emit ParticipantRegistered(modelId, roundId, participant);
     }
 
@@ -165,6 +184,10 @@ contract Rewards is ReentrancyGuard {
 
         participantLoss[modelId][roundId][participant] = loss;
         participantSubmitTime[modelId][roundId][participant] = submittedAt;
+
+        // Track proof count for weighted reward distribution
+        participantProofCount[modelId][roundId][participant]++;
+        roundTotalProofCount[modelId][roundId]++;
 
         // Only set timing once per round
         if (roundTiming[modelId][roundId].startTime == 0) {
@@ -198,8 +221,9 @@ contract Rewards is ReentrancyGuard {
         uint256 qualityPool = (totalRoundReward * qualityPoolBps) / 10000;
         uint256 timelinessPool = totalRoundReward - computePool - qualityPool;
 
-        // Compute pool: equal per proof
-        uint256 perProofReward = computePool / count;
+        // Compute pool: proportional to proof count (workers who submit more proofs get more)
+        uint256 totalProofs = roundTotalProofCount[modelId][roundId];
+        if (totalProofs == 0) totalProofs = count; // fallback to equal distribution
 
         // Quality pool: bonus for below-median loss
         uint256 medianLoss = _computeMedianLoss(modelId, roundId, participants);
@@ -220,7 +244,10 @@ contract Rewards is ReentrancyGuard {
         uint256 totalDistributed = 0;
         for (uint256 i = 0; i < count; i++) {
             address participant = participants[i];
-            uint256 reward = perProofReward;
+            // Compute reward proportional to proof count
+            uint256 proofCount = participantProofCount[modelId][roundId][participant];
+            if (proofCount == 0) proofCount = 1; // safety fallback
+            uint256 reward = (computePool * proofCount) / totalProofs;
 
             // Quality bonus
             if (qualityDenominator > 0 && improvements[i] > 0) {
@@ -302,7 +329,7 @@ contract Rewards is ReentrancyGuard {
     function claimRoundRewards(
         uint256[] calldata modelIds,
         uint256[] calldata roundIds
-    ) external nonReentrant {
+    ) external nonReentrant whenNotPaused {
         require(modelIds.length == roundIds.length, "Length mismatch");
 
         uint256 totalClaim = 0;
@@ -400,6 +427,20 @@ contract Rewards is ReentrancyGuard {
         owner = newOwner;
     }
     
+    /// @notice Emergency pause - stops funding and claims
+    function emergencyPause() external onlyOwner {
+        require(!paused, "Already paused");
+        paused = true;
+        emit EmergencyPauseChanged(true, msg.sender);
+    }
+
+    /// @notice Unpause the contract
+    function unpause() external onlyOwner {
+        require(paused, "Not paused");
+        paused = false;
+        emit EmergencyPauseChanged(false, msg.sender);
+    }
+
     /// @notice Emergency withdraw (only excess tokens)
     function emergencyWithdraw(address to, uint256 amount) external onlyOwner {
         require(to != address(0), "Invalid address");

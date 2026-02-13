@@ -448,9 +448,9 @@ contract CommitmentChainingV2Test is Test {
         vm.prank(prover1);
         coordinator.submitProof(modelId, 1, _validProof(), inputs);
 
-        // Non-owner cannot finalize
+        // Non-owner cannot finalize before round expires
         vm.prank(prover2);
-        vm.expectRevert(HelixCoordinatorV2.NotAuthorized.selector);
+        vm.expectRevert("Round not expired and not authorized");
         coordinator.finalizeRound(modelId, 1);
     }
 
@@ -458,8 +458,8 @@ contract CommitmentChainingV2Test is Test {
         uint256 modelId = _registerAndStake(prover1);
         coordinator.startRound(modelId, ROUND_DURATION);
 
-        // Cannot finalize with no proofs
-        vm.expectRevert("No proofs submitted");
+        // Cannot finalize with no proofs when round hasn't expired
+        vm.expectRevert("No proofs submitted and round not expired");
         coordinator.finalizeRound(modelId, 1);
     }
 

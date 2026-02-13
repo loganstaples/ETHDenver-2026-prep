@@ -109,6 +109,9 @@ contract Staking is ReentrancyGuard {
     /// @notice Treasury for slashed funds and protocol fees
     address public treasury;
 
+    /// @notice Whether the contract is paused
+    bool public paused;
+
     /// @notice Challenger reward configuration
     ChallengerConfig public challengerConfig;
 
@@ -136,6 +139,7 @@ contract Staking is ReentrancyGuard {
     event SeverityEscalated(address indexed staker, SeverityLevel oldLevel, SeverityLevel newLevel);
     event TreasuryUpdated(address indexed oldTreasury, address indexed newTreasury);
     event ChallengerConfigUpdated(ChallengerConfig config);
+    event EmergencyPauseChanged(bool isPaused, address indexed changedBy);
     
     modifier onlyOwner() {
         require(msg.sender == owner, "Only owner");
@@ -144,6 +148,11 @@ contract Staking is ReentrancyGuard {
     
     modifier onlyOperator() {
         require(msg.sender == operator || msg.sender == owner, "Only operator");
+        _;
+    }
+
+    modifier whenNotPaused() {
+        require(!paused, "Contract is paused");
         _;
     }
     
@@ -191,7 +200,7 @@ contract Staking is ReentrancyGuard {
     
     /// @notice Stake tokens to participate in training
     /// @param amount Amount of HELIX tokens to stake
-    function stake(uint256 amount) external nonReentrant {
+    function stake(uint256 amount) external nonReentrant whenNotPaused {
         require(amount > 0, "Amount must be positive");
         require(!stakes[msg.sender].isUnbonding, "Cannot stake while unbonding");
         
@@ -221,7 +230,7 @@ contract Staking is ReentrancyGuard {
     }
     
     /// @notice Start the unbonding process to withdraw stake
-    function startUnbonding() external nonReentrant {
+    function startUnbonding() external nonReentrant whenNotPaused {
         StakeInfo storage stakeInfo = stakes[msg.sender];
         
         require(stakeInfo.amount > 0, "No stake to unbond");
@@ -607,5 +616,19 @@ contract Staking is ReentrancyGuard {
     /// @notice Reset warning record (emergency function)
     function resetWarningRecord(address staker) external onlyOwner {
         delete warningRecords[staker];
+    }
+
+    /// @notice Emergency pause - stops staking and unbonding
+    function emergencyPause() external onlyOwner {
+        require(!paused, "Already paused");
+        paused = true;
+        emit EmergencyPauseChanged(true, msg.sender);
+    }
+
+    /// @notice Unpause the contract
+    function unpause() external onlyOwner {
+        require(paused, "Not paused");
+        paused = false;
+        emit EmergencyPauseChanged(false, msg.sender);
     }
 }

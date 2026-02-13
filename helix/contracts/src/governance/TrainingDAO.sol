@@ -8,7 +8,9 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 /// @title TrainingDAO
 /// @notice Decentralized governance over training parameters and model updates
 /// @dev Uses ERC20Votes snapshot-based voting to prevent flash loan attacks.
-///      Voting power is based on getPastVotes() at the block when the proposal was created.
+///      Voting power is based on getPastVotes() at the block BEFORE the proposal was created,
+///      preventing same-block flash loan attacks where tokens are borrowed and delegated
+///      in the same block as proposal creation.
 contract TrainingDAO is ReentrancyGuard {
     /// @notice The HELIX token for voting (must implement IVotes / ERC20Votes)
     IERC20 public immutable helixToken;
@@ -24,6 +26,9 @@ contract TrainingDAO is ReentrancyGuard {
 
     /// @notice Owner (for emergency actions only)
     address public owner;
+
+    /// @notice Whether the contract is paused
+    bool public paused;
 
     /// @notice Proposal states
     enum ProposalState {
@@ -119,9 +124,15 @@ contract TrainingDAO is ReentrancyGuard {
     event ProposalCancelled(uint256 indexed proposalId);
     event ParametersUpdated(ParameterProposal newParameters);
     event GovConfigUpdated(GovConfig newConfig);
+    event EmergencyPauseChanged(bool isPaused, address indexed changedBy);
 
     modifier onlyOwner() {
         require(msg.sender == owner, "Only owner");
+        _;
+    }
+
+    modifier whenNotPaused() {
+        require(!paused, "Contract is paused");
         _;
     }
 
@@ -161,7 +172,7 @@ contract TrainingDAO is ReentrancyGuard {
         string memory description,
         address target,
         bytes memory callData
-    ) public returns (uint256 proposalId) {
+    ) public whenNotPaused returns (uint256 proposalId) {
         require(
             votesToken.getPastVotes(msg.sender, block.number - 1) >= govConfig.proposalThreshold,
             "Below proposal threshold"
@@ -179,14 +190,17 @@ contract TrainingDAO is ReentrancyGuard {
         proposal.startTime = block.timestamp + govConfig.votingDelay;
         proposal.endTime = proposal.startTime + govConfig.votingPeriod;
         proposal.quorumVotes = (helixToken.totalSupply() * govConfig.quorumPercentage) / 10000;
-        // Record snapshot block for flash-loan-resistant voting power lookups
-        proposal.snapshotBlock = block.number;
+        // Record snapshot block for flash-loan-resistant voting power lookups.
+        // Uses block.number - 1 so that tokens flash-borrowed in the same block as
+        // proposal creation cannot influence voting power at the snapshot.
+        proposal.snapshotBlock = block.number - 1;
 
         emit ProposalCreated(proposalId, msg.sender, proposalType, description);
     }
 
     /// @notice Create a parameter change proposal
-    /// @dev Uses internal call to _createProposal to avoid unnecessary external call overhead
+    /// @dev Validates parameter bounds before creating proposal to prevent governance attacks
+    ///      that could set dangerous parameters (e.g., zero batch size, extreme error bounds).
     /// @param description Description of changes
     /// @param params New training parameters
     /// @return proposalId ID of the created proposal
@@ -194,6 +208,13 @@ contract TrainingDAO is ReentrancyGuard {
         string calldata description,
         ParameterProposal calldata params
     ) external returns (uint256 proposalId) {
+        // Validate parameter bounds to prevent governance attacks with dangerous values
+        require(params.learningRate > 0, "Learning rate must be positive");
+        require(params.batchSize > 0, "Batch size must be positive");
+        require(params.maxErrorBound > 0, "Max error bound must be positive");
+        require(params.roundDuration >= 5 minutes, "Round duration too short");
+        require(params.roundDuration <= 30 days, "Round duration too long");
+
         // Create the proposal first, get the real ID back
         proposalId = createProposal(
             ProposalType.ParameterChange,
@@ -213,7 +234,7 @@ contract TrainingDAO is ReentrancyGuard {
     /// @dev Voting power is based on snapshot at proposal creation block (flash loan resistant)
     /// @param proposalId ID of the proposal
     /// @param support Whether to support the proposal
-    function castVote(uint256 proposalId, bool support) external {
+    function castVote(uint256 proposalId, bool support) external whenNotPaused {
         Proposal storage proposal = proposals[proposalId];
 
         require(getProposalState(proposalId) == ProposalState.Active, "Voting not active");
@@ -407,5 +428,19 @@ contract TrainingDAO is ReentrancyGuard {
     function transferOwnership(address newOwner) external onlyOwner {
         require(newOwner != address(0), "Invalid address");
         owner = newOwner;
+    }
+
+    /// @notice Emergency pause - stops proposal creation and voting
+    function emergencyPause() external onlyOwner {
+        require(!paused, "Already paused");
+        paused = true;
+        emit EmergencyPauseChanged(true, msg.sender);
+    }
+
+    /// @notice Unpause the contract
+    function unpause() external onlyOwner {
+        require(paused, "Not paused");
+        paused = false;
+        emit EmergencyPauseChanged(false, msg.sender);
     }
 }

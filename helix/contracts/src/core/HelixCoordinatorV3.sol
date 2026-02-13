@@ -214,6 +214,9 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
     /// @notice Step number expected for proofs in this round
     mapping(uint256 => mapping(uint256 => uint256)) public roundExpectedStep;
 
+    /// @notice Maximum accumulated error allowed per model (0 = no limit)
+    mapping(uint256 => uint256) public modelMaxAccumulatedError;
+
     // ============ Events ============
 
     event ModelRegistered(
@@ -693,9 +696,37 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
         }
     }
 
+    // ============ Optimized Batch Verification ============
+
+    /// @notice Verifies multiple proofs sharing the same model with reduced overhead
+    /// @dev Amortizes model/round lookup and staking validation once per batch.
+    ///      Sequential proofs maintain commitment chaining order.
+    function verifyAndSubmitBatch(
+        uint256 modelId,
+        uint256 roundId,
+        bytes[] calldata proofs,
+        uint256[][] calldata publicInputsArray
+    ) external whenNotPaused nonReentrant {
+        uint256 n = proofs.length;
+        require(n > 0, "Empty batch");
+        require(n == publicInputsArray.length, "Length mismatch");
+
+        // Pre-validate model, round, and staking once
+        require(models[modelId].owner != address(0), "Model does not exist");
+        require(stakingContract.canParticipate(msg.sender), "Insufficient stake or not active");
+        _validateRound(modelId, roundId);
+
+        for (uint256 i = 0; i < n; i++) {
+            _processProof(msg.sender, modelId, roundId, proofs[i], publicInputsArray[i]);
+        }
+        emit BatchProofSubmitted(msg.sender, n);
+    }
+
     // ============ Round Finalization ============
 
     /// @notice Finalize a multi-participant round after dispute period
+    /// @dev Anyone can call this after the dispute deadline has passed and threshold is met.
+    ///      This prevents rounds from staying open indefinitely.
     function finalizeRound(uint256 modelId, uint256 roundId) external whenNotPaused nonReentrant {
         RoundExt storage ext = roundsExt[modelId][roundId];
         Round storage round = rounds[modelId][roundId];
@@ -708,6 +739,30 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
 
         _finalizeRound(modelId, roundId);
         emit RoundFinalized(modelId, roundId, ext.bestProver, ext.bestLoss);
+    }
+
+    /// @notice Force-close an expired round that hasn't been finalized or expired
+    /// @dev Anyone can call this after deadline + dispute period.
+    ///      Handles cases where rounds are stuck (neither finalized nor expired).
+    function timeoutRound(uint256 modelId, uint256 roundId) external whenNotPaused nonReentrant {
+        Round storage round = rounds[modelId][roundId];
+        RoundExt storage ext = roundsExt[modelId][roundId];
+
+        require(!round.isCompleted, "Round already completed");
+        require(!ext.finalized, "Round already finalized");
+        require(block.timestamp > ext.disputeDeadline, "Dispute period not ended");
+
+        // If threshold met, finalize normally
+        if (ext.validProofs >= ext.minParticipants && ext.validProofs > 0) {
+            _finalizeRound(modelId, roundId);
+            emit RoundFinalized(modelId, roundId, ext.bestProver, ext.bestLoss);
+        } else {
+            // Threshold not met - expire the round
+            round.isCompleted = true;
+            ext.finalized = true;
+            _refundRoundFees(modelId, roundId);
+            emit RoundExpired(modelId, roundId, ext.validProofs, ext.minParticipants);
+        }
     }
 
     /// @notice Finalize multiple rounds in one transaction
@@ -774,6 +829,10 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
         uint256 stepErrorBound = best.errorBound;
         uint256 newAccumulatedError = accumulatedErrorBound[modelId] + stepErrorBound;
         accumulatedErrorBound[modelId] = newAccumulatedError;
+
+        // Enforce model-level error budget
+        uint256 modelBudget = modelMaxAccumulatedError[modelId];
+        require(modelBudget == 0 || newAccumulatedError <= modelBudget, "Model error budget exceeded");
 
         modelRegistry.updateModel(modelId, bytes32(newCommitment), roundId, "", stepErrorBound, best.proofHash);
 
@@ -1056,6 +1115,15 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
     function setModelRegistry(address _registry) external onlyOwner {
         require(_registry != address(0), "Invalid registry");
         modelRegistry = ModelRegistry(_registry);
+    }
+
+    /// @notice Sets maximum accumulated error allowed for a model (0 = no limit)
+    function setModelMaxAccumulatedError(uint256 modelId, uint256 maxError) external {
+        require(
+            msg.sender == models[modelId].owner || msg.sender == owner,
+            "Not authorized"
+        );
+        modelMaxAccumulatedError[modelId] = maxError;
     }
 
     function resetAccumulatedError(uint256 modelId) external {
