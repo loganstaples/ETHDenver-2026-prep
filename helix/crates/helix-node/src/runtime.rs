@@ -1057,10 +1057,63 @@ impl NodeRuntime {
             }
         });
 
-        // --- Main aggregator loop ---
+        // --- Main aggregator loop (TrainingJobManager-driven) ---
+        //
+        // When helix_startTraining fires on round_trigger_rx, the aggregator creates
+        // a TrainingJobManager and runs it to completion. The job manager handles:
+        //   1. Announcing the round via RoundManagementMessage::RoundConfigure
+        //   2. Collecting worker readiness (quorum)
+        //   3. Distributing model weights
+        //   4. Collecting proofs/gradients from workers
+        //   5. FedAvg aggregation with Byzantine filtering
+        //   6. On-chain proof submission (if chain config present)
+        //   7. Broadcasting results and updated weights
+        //
+        // Network events are forwarded to the job manager via a message channel.
+        // The orchestrator's legacy event handler is kept for API/dashboard updates.
+
+        use crate::training::job_manager::{
+            TrainingJobManager, TrainingJobConfig, WorkerMessage,
+            network_event_to_worker_message,
+        };
+
         let mut round_number = 0u64;
         let mut total_rounds_completed = 0u64;
         let mut shutdown_rx = self.shutdown_tx.subscribe();
+
+        // On-chain pipeline reference (if configured)
+        let on_chain_pipeline: Option<Arc<crate::on_chain_pipeline::OnChainPipeline>> =
+            if let Some(ref chain_config) = self.config.chain {
+                if let Some(ref pk) = self.config.private_key() {
+                    match crate::on_chain_pipeline::OnChainPipeline::new(
+                        &self.config.rpc_url, pk, chain_config.clone(),
+                    ).await {
+                        Ok(pipeline) => {
+                            let pipeline = Arc::new(pipeline);
+                            // Initialize: register model + stake
+                            match pipeline.initialize().await {
+                                Ok(model_id) => {
+                                    info!("On-chain pipeline initialized: model_id={}", model_id);
+                                    self.health.write().chain_pipeline = SubsystemStatus::Running;
+                                }
+                                Err(e) => {
+                                    warn!("On-chain initialization failed: {}. Continuing offline.", e);
+                                }
+                            }
+                            Some(pipeline)
+                        }
+                        Err(e) => {
+                            warn!("Failed to create on-chain pipeline: {}. Continuing offline.", e);
+                            None
+                        }
+                    }
+                } else {
+                    warn!("Chain config present but no private key set (HELIX_PRIVATE_KEY). Skipping on-chain.");
+                    None
+                }
+            } else {
+                None
+            };
 
         tokio::select! {
             _ = shutdown_rx.changed() => {
@@ -1099,14 +1152,12 @@ impl NodeRuntime {
             }
             _ = async {
                 loop {
-                    // Process completed rounds
+                    // Also handle legacy orchestrator completed rounds
                     while let Ok(completed_round_id) = completed_round_rx.try_recv() {
                         let updates = orchestrator.take_weight_updates(completed_round_id);
                         if updates.is_empty() {
                             continue;
                         }
-
-                        // FedAvg: aggregate worker models
                         let mut worker_models = Vec::new();
                         for (_peer_id, ckpt_bytes, _hash) in &updates {
                             if let Ok(ckpt) = ModelCheckpoint::from_bytes(ckpt_bytes) {
@@ -1115,55 +1166,171 @@ impl NodeRuntime {
                                 }
                             }
                         }
-
                         if !worker_models.is_empty() {
-                            match average_models(&worker_models) {
-                                Ok(aggregated) => {
-                                    let new_hash = aggregated.commitment();
-                                    *aggregator_model.write() = aggregated.clone();
-                                    total_rounds_completed += 1;
-
-                                    let ckpt = aggregated.to_checkpoint(completed_round_id);
-                                    if let Ok(bytes) = ckpt.to_bytes() {
-                                        *current_checkpoint_bytes.write() = bytes.clone();
-                                        network.broadcast(MessagePayload::Training(
-                                            TrainingMessage::UpdatedWeights {
-                                                round_id: completed_round_id,
-                                                checkpoint_data: bytes,
-                                                weight_hash: new_hash,
-                                            },
-                                        )).await;
-                                    }
+                            if let Ok(aggregated) = average_models(&worker_models) {
+                                let new_hash = aggregated.commitment();
+                                *aggregator_model.write() = aggregated.clone();
+                                total_rounds_completed += 1;
+                                let ckpt = aggregated.to_checkpoint(completed_round_id);
+                                if let Ok(bytes) = ckpt.to_bytes() {
+                                    *current_checkpoint_bytes.write() = bytes.clone();
+                                    network.broadcast(MessagePayload::Training(
+                                        TrainingMessage::UpdatedWeights {
+                                            round_id: completed_round_id,
+                                            checkpoint_data: bytes,
+                                            weight_hash: new_hash,
+                                        },
+                                    )).await;
                                 }
-                                Err(e) => error!("FedAvg aggregation failed: {}", e),
                             }
                         }
                     }
 
-                    // Wait for new round trigger or completed rounds
+                    // Wait for new round trigger
                     tokio::select! {
                         _ = round_trigger_rx.recv() => {
                             round_number += 1;
-                            let model_hash = aggregator_model.read().commitment();
+                            info!("=== Round {} triggered via RPC ===", round_number);
 
-                            // Send model weights to workers
-                            let ckpt_bytes = current_checkpoint_bytes.read().clone();
-                            network.broadcast(MessagePayload::Training(
-                                TrainingMessage::ModelWeights {
-                                    round_id: round_number,
-                                    checkpoint_data: ckpt_bytes,
-                                    weight_hash: model_hash,
-                                },
-                            )).await;
+                            // Build job config from node config
+                            let job_config = TrainingJobConfig::from_node_config(&self.config);
 
-                            // Start orchestrated round
-                            match orchestrator.start_round(model_hash).await {
-                                Ok(rid) => info!("Round {} started", rid),
-                                Err(e) => warn!("Failed to start round: {}", e),
+                            // Create a message channel for forwarding network events
+                            let (worker_msg_tx, worker_msg_rx) =
+                                tokio::sync::mpsc::channel::<WorkerMessage>(1000);
+
+                            // Create the job manager with current model state
+                            let current_model = aggregator_model.read().clone();
+                            let mut job_manager = TrainingJobManager::new(
+                                local_id.clone(),
+                                job_config,
+                                network.clone(),
+                                on_chain_pipeline.clone(),
+                                current_model,
+                            );
+
+                            // Subscribe to job events for API/dashboard updates
+                            let mut job_event_rx = job_manager.subscribe_events();
+                            let snapshot_for_job = api_snapshot.clone();
+                            let proof_status_for_job = proof_status.clone();
+                            tokio::spawn(async move {
+                                while let Ok(event) = job_event_rx.recv().await {
+                                    match &event {
+                                        crate::training::job_manager::JobEvent::ProofReceived {
+                                            round_id, proofs_received, ..
+                                        } => {
+                                            let mut status = proof_status_for_job.write();
+                                            if let Some(entry) = status.iter_mut().find(|e| e.round_id == *round_id) {
+                                                entry.proofs_collected = *proofs_received;
+                                            } else {
+                                                status.push(ProofStatusEntry {
+                                                    round_id: *round_id,
+                                                    status: "collecting".to_string(),
+                                                    proofs_collected: *proofs_received,
+                                                });
+                                            }
+                                        }
+                                        crate::training::job_manager::JobEvent::RoundComplete {
+                                            round_id, num_contributors, ..
+                                        } => {
+                                            snapshot_for_job.write().completed_rounds += 1;
+                                            let mut status = proof_status_for_job.write();
+                                            if let Some(entry) = status.iter_mut().find(|e| e.round_id == *round_id) {
+                                                entry.status = "completed".to_string();
+                                                entry.proofs_collected = *num_contributors;
+                                            }
+                                        }
+                                        crate::training::job_manager::JobEvent::RoundFailed {
+                                            round_id, reason, ..
+                                        } => {
+                                            let mut status = proof_status_for_job.write();
+                                            if let Some(entry) = status.iter_mut().find(|e| e.round_id == *round_id) {
+                                                entry.status = format!("failed: {}", reason);
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            });
+
+                            // Spawn a task to forward network events to the job manager
+                            let net_for_forward = network.clone();
+                            let worker_msg_tx_clone = worker_msg_tx.clone();
+                            let forward_handle = tokio::spawn(async move {
+                                let event_rx = net_for_forward.event_receiver();
+                                let mut rx = event_rx.lock().await;
+                                while let Some(event) = rx.recv().await {
+                                    let (from, payload) = match &event {
+                                        crate::network::runner::NetworkEvent::RoundManagementMessage { from, message } => {
+                                            (from.clone(), MessagePayload::RoundManagement(message.clone()))
+                                        }
+                                        crate::network::runner::NetworkEvent::TrainingMessage { from, message } => {
+                                            (from.clone(), MessagePayload::Training(message.clone()))
+                                        }
+                                        crate::network::runner::NetworkEvent::GradientMessage { from, message } => {
+                                            (from.clone(), MessagePayload::Gradient(message.clone()))
+                                        }
+                                        crate::network::runner::NetworkEvent::RegistrationMessage { from, message } => {
+                                            (from.clone(), MessagePayload::Registration(message.clone()))
+                                        }
+                                        _ => continue,
+                                    };
+
+                                    if let Some(worker_msg) = network_event_to_worker_message(from, &payload) {
+                                        if worker_msg_tx_clone.send(worker_msg).await.is_err() {
+                                            break; // Job manager dropped its receiver
+                                        }
+                                    }
+                                }
+                            });
+
+                            // Run the job manager
+                            match job_manager.run(worker_msg_rx).await {
+                                Ok(result) => {
+                                    // Update shared model state
+                                    *aggregator_model.write() = result.aggregated_model.clone();
+                                    total_rounds_completed += 1;
+                                    let ckpt = result.aggregated_model.to_checkpoint(round_number);
+                                    if let Ok(bytes) = ckpt.to_bytes() {
+                                        *current_checkpoint_bytes.write() = bytes;
+                                    }
+
+                                    info!(
+                                        "TrainingJobManager round {} complete: {} contributors, error={:.6}, tx={:?}",
+                                        round_number,
+                                        result.num_contributors,
+                                        result.total_error_bound,
+                                        result.tx_hash,
+                                    );
+
+                                    // Save checkpoint
+                                    if let Some(ref p) = persistence {
+                                        let model_ckpt = result.aggregated_model.to_checkpoint(round_number);
+                                        if let Ok(ckpt_bytes) = model_ckpt.to_bytes() {
+                                            let snapshot = AggregatorSnapshot::new(
+                                                ckpt_bytes,
+                                                round_number,
+                                                total_rounds_completed,
+                                                t.d_in, t.d_hid, t.d_out,
+                                                t.model_seed,
+                                                t.learning_rate,
+                                            );
+                                            if let Err(e) = p.save_aggregator(&snapshot) {
+                                                error!("Failed to save checkpoint: {}", e);
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("TrainingJobManager round {} failed: {}", round_number, e);
+                                }
                             }
+
+                            // Clean up the forwarding task
+                            forward_handle.abort();
                         }
                         Some(rid) = completed_round_rx.recv() => {
-                            // Already handled above in the try_recv loop, but also catch here
+                            // Handle legacy orchestrator completed rounds
                             let updates = orchestrator.take_weight_updates(rid);
                             if !updates.is_empty() {
                                 let mut worker_models = Vec::new();

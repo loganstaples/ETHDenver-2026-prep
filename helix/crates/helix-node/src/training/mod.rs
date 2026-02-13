@@ -39,6 +39,7 @@ pub mod persistence;
 pub mod round_manager;
 pub mod dataset_sync;
 pub mod multi_round;
+pub mod job_manager;
 
 // Re-export key types
 pub use round::{
@@ -178,6 +179,12 @@ pub use dataset_sync::{
     DatasetSpec, PreprocessingConfig, NormalizationMethod,
     DatasetManager, DeterministicBatcher, StepAlignmentValidator,
     Sample, DatasetError,
+};
+
+pub use job_manager::{
+    TrainingJobManager, TrainingJobConfig, JobPhase, JobEvent, JobError, JobSnapshot,
+    RoundResult as JobRoundResult, WorkerMessage, WorkerJobState,
+    network_event_to_worker_message,
 };
 
 /// Convenience type alias for training results.
