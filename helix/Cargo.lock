@@ -3898,6 +3898,7 @@ dependencies = [
  "tokio",
  "tokio-rustls 0.26.4",
  "tokio-test",
+ "toml 0.8.2",
  "tower 0.5.3",
  "tower-http 0.6.8",
  "uuid 1.20.0",

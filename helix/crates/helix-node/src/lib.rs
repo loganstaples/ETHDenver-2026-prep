@@ -5,6 +5,7 @@ pub mod identity;
 pub mod network;
 pub mod on_chain_pipeline;
 pub mod roles;
+pub mod runtime;
 pub mod storage;
 pub mod trainer;
 pub mod training;

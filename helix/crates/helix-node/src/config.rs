@@ -1,10 +1,10 @@
 //! Node Configuration.
 //!
 //! Provides configuration for HELIX nodes including network settings,
-//! storage paths, and role assignments. Supports loading from and saving
-//! to JSON config files.
+//! storage paths, and role assignments. Supports loading from JSON and
+//! TOML config files.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -290,12 +290,88 @@ impl Default for FaultToleranceNodeConfig {
     }
 }
 
+/// Model and training parameters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrainingModelConfig {
+    /// Model input dimension.
+    #[serde(default = "default_d_in")]
+    pub d_in: usize,
+
+    /// Model hidden dimension.
+    #[serde(default = "default_d_hid")]
+    pub d_hid: usize,
+
+    /// Model output dimension.
+    #[serde(default = "default_d_out")]
+    pub d_out: usize,
+
+    /// Learning rate.
+    #[serde(default = "default_learning_rate")]
+    pub learning_rate: f64,
+
+    /// Random seed for model initialization.
+    #[serde(default = "default_model_seed")]
+    pub model_seed: u64,
+
+    /// Minimum workers required to start a training round (aggregator only).
+    #[serde(default = "default_min_workers")]
+    pub min_workers: usize,
+
+    /// Round collection timeout in seconds.
+    #[serde(default = "default_collection_timeout_secs")]
+    pub collection_timeout_secs: u64,
+
+    /// Worker timeout in seconds (no heartbeat = dead).
+    #[serde(default = "default_worker_timeout_secs")]
+    pub worker_timeout_secs: u64,
+}
+
+fn default_d_in() -> usize { 4 }
+fn default_d_hid() -> usize { 8 }
+fn default_d_out() -> usize { 2 }
+fn default_learning_rate() -> f64 { 0.01 }
+fn default_model_seed() -> u64 { 42 }
+fn default_min_workers() -> usize { 1 }
+fn default_collection_timeout_secs() -> u64 { 120 }
+fn default_worker_timeout_secs() -> u64 { 60 }
+
+impl Default for TrainingModelConfig {
+    fn default() -> Self {
+        Self {
+            d_in: default_d_in(),
+            d_hid: default_d_hid(),
+            d_out: default_d_out(),
+            learning_rate: default_learning_rate(),
+            model_seed: default_model_seed(),
+            min_workers: default_min_workers(),
+            collection_timeout_secs: default_collection_timeout_secs(),
+            worker_timeout_secs: default_worker_timeout_secs(),
+        }
+    }
+}
+
 /// Full node configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
     /// Address to listen on for P2P connections.
     #[serde(default = "default_listen_addr")]
     pub listen_addr: String,
+
+    /// Port for the JSON-RPC server.
+    #[serde(default = "default_rpc_port")]
+    pub rpc_port: u16,
+
+    /// Port for the HTTP REST API (aggregator only).
+    #[serde(default = "default_http_port")]
+    pub http_port: u16,
+
+    /// Bootstrap peer addresses for initial network discovery.
+    #[serde(default)]
+    pub bootstrap_nodes: Vec<String>,
+
+    /// Enable mDNS for local network peer discovery.
+    #[serde(default)]
+    pub mdns_enabled: bool,
 
     /// Directory for persistent data (state, checkpoints, peers).
     #[serde(default = "default_data_dir")]
@@ -347,6 +423,10 @@ pub struct NodeConfig {
     /// Training data source configuration for worker nodes.
     #[serde(default)]
     pub data_source: DataSourceConfig,
+
+    /// Model and training parameters.
+    #[serde(default)]
+    pub training: TrainingModelConfig,
 
     /// Directory to persist model checkpoints (aggregator only).
     #[serde(default = "default_checkpoint_dir")]
@@ -424,6 +504,9 @@ fn default_proof_queue_interval_secs() -> u64 {
     5
 }
 
+fn default_rpc_port() -> u16 { 9002 }
+fn default_http_port() -> u16 { 9001 }
+
 fn default_checkpoint_dir() -> PathBuf {
     dirs_fallback().join("checkpoints")
 }
@@ -465,6 +548,10 @@ impl Default for NodeConfig {
     fn default() -> Self {
         Self {
             listen_addr: default_listen_addr(),
+            rpc_port: default_rpc_port(),
+            http_port: default_http_port(),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
             data_dir: default_data_dir(),
             role: NodeRole::default(),
             rpc_url: default_rpc_url(),
@@ -477,6 +564,7 @@ impl Default for NodeConfig {
             mpc: MpcConfig::default(),
             chain: None,
             data_source: DataSourceConfig::default(),
+            training: TrainingModelConfig::default(),
             checkpoint_dir: default_checkpoint_dir(),
             fault_tolerance: FaultToleranceNodeConfig::default(),
         }
@@ -492,13 +580,37 @@ impl NodeConfig {
         self.private_key.clone().or_else(|| std::env::var("HELIX_PRIVATE_KEY").ok())
     }
 
-    /// Loads configuration from a JSON file.
-    pub fn from_file(path: impl AsRef<std::path::Path>) -> Result<Self, ConfigError> {
-        let data = std::fs::read_to_string(path.as_ref())
-            .map_err(|e| ConfigError::Io(e.to_string()))?;
+    /// Loads configuration from a file, auto-detecting format by extension.
+    ///
+    /// Supported formats:
+    /// - `.toml` — TOML format
+    /// - `.json` — JSON format
+    /// - anything else — tries JSON, then TOML
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        let path = path.as_ref();
+        let data = std::fs::read_to_string(path)
+            .map_err(|e| ConfigError::Io(format!("{}: {}", path.display(), e)))?;
 
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+
+        let config: Self = match ext {
+            "toml" => Self::parse_toml(&data)?,
+            "json" => Self::parse_json(&data)?,
+            _ => {
+                // Try JSON first, then TOML
+                Self::parse_json(&data)
+                    .or_else(|_| Self::parse_toml(&data))?
+            }
+        };
+
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Parses configuration from a JSON string.
+    fn parse_json(data: &str) -> Result<Self, ConfigError> {
         // Warn if the config file contains a private_key field
-        if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&data) {
+        if let Ok(raw) = serde_json::from_str::<serde_json::Value>(data) {
             if raw.get("private_key").is_some() {
                 log::warn!(
                     "Config file contains 'private_key' field — this is ignored for security. \
@@ -507,14 +619,28 @@ impl NodeConfig {
             }
         }
 
-        let config: Self = serde_json::from_str(&data)
-            .map_err(|e| ConfigError::Parse(e.to_string()))?;
-        config.validate()?;
-        Ok(config)
+        serde_json::from_str(data)
+            .map_err(|e| ConfigError::Parse(format!("JSON: {}", e)))
+    }
+
+    /// Parses configuration from a TOML string.
+    fn parse_toml(data: &str) -> Result<Self, ConfigError> {
+        // Warn if the config file contains a private_key field
+        if let Ok(raw) = data.parse::<toml::Table>() {
+            if raw.get("private_key").is_some() {
+                log::warn!(
+                    "Config file contains 'private_key' field — this is ignored for security. \
+                     Use the HELIX_PRIVATE_KEY environment variable instead."
+                );
+            }
+        }
+
+        toml::from_str(data)
+            .map_err(|e| ConfigError::Parse(format!("TOML: {}", e)))
     }
 
     /// Saves configuration to a JSON file.
-    pub fn to_file(&self, path: impl AsRef<std::path::Path>) -> Result<(), ConfigError> {
+    pub fn to_file(&self, path: impl AsRef<Path>) -> Result<(), ConfigError> {
         let data = serde_json::to_string_pretty(self)
             .map_err(|e| ConfigError::Parse(e.to_string()))?;
         std::fs::write(path.as_ref(), data)
@@ -536,6 +662,10 @@ impl NodeConfig {
             )));
         }
 
+        if self.rpc_port == 0 {
+            return Err(ConfigError::Validation("rpc_port must be > 0".into()));
+        }
+
         if self.rpc_url.is_empty() {
             return Err(ConfigError::Validation("rpc_url cannot be empty".into()));
         }
@@ -544,7 +674,34 @@ impl NodeConfig {
             return Err(ConfigError::Validation("max_messages_per_sec must be > 0".into()));
         }
 
+        if self.training.d_in == 0 || self.training.d_hid == 0 || self.training.d_out == 0 {
+            return Err(ConfigError::Validation("model dimensions (d_in, d_hid, d_out) must be > 0".into()));
+        }
+
+        if self.training.learning_rate <= 0.0 || self.training.learning_rate > 10.0 {
+            return Err(ConfigError::Validation("learning_rate must be in (0.0, 10.0]".into()));
+        }
+
+        // Validate chain config if present
+        if let Some(ref chain) = self.chain {
+            if chain.coordinator_address.is_empty() {
+                return Err(ConfigError::Validation("chain.coordinator_address cannot be empty".into()));
+            }
+            if chain.d_in == 0 || chain.d_hid == 0 || chain.d_out == 0 {
+                return Err(ConfigError::Validation("chain model dimensions must be > 0".into()));
+            }
+        }
+
         Ok(())
+    }
+
+    /// Returns the role as the string expected by RPC state ("worker" or "aggregator").
+    pub fn role_str(&self) -> &'static str {
+        match self.role {
+            NodeRole::Compute => "worker",
+            NodeRole::Aggregator => "aggregator",
+            NodeRole::Verifier => "verifier",
+        }
     }
 }
 
@@ -661,5 +818,99 @@ mod tests {
         std::env::set_var("HELIX_PRIVATE_KEY", "deadbeef");
         assert_eq!(config.private_key(), Some("deadbeef".to_string()));
         std::env::remove_var("HELIX_PRIVATE_KEY");
+    }
+
+    #[test]
+    fn test_config_from_toml_string() {
+        let toml_str = r#"
+listen_addr = "127.0.0.1:9000"
+rpc_port = 9002
+http_port = 9001
+role = "aggregator"
+rpc_url = "http://localhost:8545"
+bootstrap_nodes = ["127.0.0.1:9010", "127.0.0.1:9011"]
+mdns_enabled = true
+
+[training]
+d_in = 10
+d_hid = 20
+d_out = 5
+learning_rate = 0.001
+model_seed = 123
+min_workers = 3
+
+[mpc]
+enabled = true
+num_parties = 4
+
+[fault_tolerance]
+checkpoint_interval_steps = 5
+max_checkpoints = 10
+"#;
+        let config: NodeConfig = toml::from_str(toml_str).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.listen_addr, "127.0.0.1:9000");
+        assert_eq!(config.rpc_port, 9002);
+        assert_eq!(config.role, NodeRole::Aggregator);
+        assert_eq!(config.bootstrap_nodes.len(), 2);
+        assert!(config.mdns_enabled);
+        assert_eq!(config.training.d_in, 10);
+        assert_eq!(config.training.d_hid, 20);
+        assert_eq!(config.training.d_out, 5);
+        assert_eq!(config.training.min_workers, 3);
+        assert_eq!(config.mpc.num_parties, 4);
+        assert_eq!(config.fault_tolerance.checkpoint_interval_steps, 5);
+    }
+
+    #[test]
+    fn test_config_from_toml_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        std::fs::write(&path, r#"
+listen_addr = "127.0.0.1:9000"
+role = "compute"
+rpc_url = "http://localhost:8545"
+
+[training]
+d_in = 4
+d_hid = 8
+d_out = 2
+"#).unwrap();
+
+        let config = NodeConfig::from_file(&path).unwrap();
+        assert_eq!(config.role, NodeRole::Compute);
+        assert_eq!(config.training.d_in, 4);
+    }
+
+    #[test]
+    fn test_config_role_str() {
+        let mut config = NodeConfig::default();
+        assert_eq!(config.role_str(), "worker");
+        config.role = NodeRole::Aggregator;
+        assert_eq!(config.role_str(), "aggregator");
+    }
+
+    #[test]
+    fn test_config_validation_zero_dimensions() {
+        let config = NodeConfig {
+            training: TrainingModelConfig {
+                d_in: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_training_defaults() {
+        let config = TrainingModelConfig::default();
+        assert_eq!(config.d_in, 4);
+        assert_eq!(config.d_hid, 8);
+        assert_eq!(config.d_out, 2);
+        assert_eq!(config.learning_rate, 0.01);
+        assert_eq!(config.model_seed, 42);
+        assert_eq!(config.min_workers, 1);
     }
 }

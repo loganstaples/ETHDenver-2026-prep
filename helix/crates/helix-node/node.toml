@@ -1,0 +1,130 @@
+# =============================================================================
+# HELIX Node Configuration (Example)
+# =============================================================================
+#
+# Copy this file and customize for your deployment:
+#   cp node.toml my-node.toml
+#   cargo run -p helix-node -- --config my-node.toml
+#
+# Environment variables (never stored in config):
+#   HELIX_PRIVATE_KEY      — Hex private key for on-chain transactions
+#   HELIX_MPC_STORAGE_KEY  — Password for encrypted MPC weight storage
+#   RUST_LOG               — Logging filter (e.g. "info", "helix_node=debug")
+
+# =============================================================================
+# Node Identity & Networking
+# =============================================================================
+
+# Role: "compute" (training worker), "aggregator", or "verifier"
+role = "compute"
+
+# P2P listen address (TCP)
+listen_addr = "0.0.0.0:9000"
+
+# JSON-RPC server port
+rpc_port = 9002
+
+# HTTP REST API port (aggregator monitoring)
+http_port = 9001
+
+# Bootstrap peers for initial discovery (empty = standalone or mDNS-only)
+bootstrap_nodes = []
+
+# Enable mDNS for local network peer discovery
+mdns_enabled = true
+
+# TLS for peer connections
+use_tls = true
+
+# Gossip protocol tuning
+gossip_send_interval_ms = 100
+max_outbound_per_tick = 50
+
+# =============================================================================
+# Model & Training Parameters
+# =============================================================================
+
+[training]
+d_in = 4                     # Input dimension
+d_hid = 8                    # Hidden dimension
+d_out = 2                    # Output dimension
+learning_rate = 0.01         # SGD learning rate
+model_seed = 42              # Deterministic model initialization
+min_workers = 1              # Minimum workers to start a round (aggregator)
+collection_timeout_secs = 120  # Max wait for gradient collection
+worker_timeout_secs = 60      # Worker heartbeat timeout
+
+# =============================================================================
+# MPC (Multi-Party Computation)
+# =============================================================================
+
+[mpc]
+enabled = true               # Privacy-preserving training (default: true)
+num_parties = 3              # Total MPC parties
+# party_index is auto-assigned by the aggregator
+reshare_interval = 50        # Re-share weights every N steps
+max_gradient_norm = 100.0    # Gradient clipping threshold
+verify_commitments = true    # Verify share commitments
+
+# =============================================================================
+# Training Data Source
+# =============================================================================
+
+[data_source]
+type = "synthetic"           # "synthetic", "csv_file", or "ipfs"
+seed = 42
+
+# CSV example:
+# [data_source]
+# type = "csv_file"
+# path = "/data/training.csv"
+# input_cols = ["x1", "x2", "x3", "x4"]
+# target_cols = ["y1", "y2"]
+
+# =============================================================================
+# Fault Tolerance & Crash Recovery
+# =============================================================================
+
+[fault_tolerance]
+checkpoint_interval_steps = 10   # Save state every N training steps
+heartbeat_timeout_secs = 15      # Heartbeat timeout before suspicion
+max_missed_heartbeats = 3        # Missed beats before marking failed
+max_failures_before_exclusion = 3  # Failures before permanent exclusion
+failure_cooldown_secs = 60       # Cooldown after failure
+auto_recovery = true             # Auto-recover failed workers
+max_checkpoints = 5              # Max checkpoints on disk
+shutdown_timeout_secs = 30       # Graceful shutdown deadline
+
+# =============================================================================
+# Rate Limiting
+# =============================================================================
+
+[rate_limit]
+max_messages_per_sec = 100
+max_bytes_per_sec = 10485760  # 10 MB/s
+
+# =============================================================================
+# HTTP API (Aggregator)
+# =============================================================================
+
+[api]
+# api_key = "your-secret-key"  # Auto-generated if not set
+rate_limit_per_sec = 100
+listen_addr = "0.0.0.0:8080"
+
+# =============================================================================
+# Ethereum RPC & On-Chain Pipeline (Optional)
+# =============================================================================
+
+rpc_url = "http://localhost:8545"
+
+# Uncomment to enable on-chain proof submission:
+# [chain]
+# coordinator_address = "0x..."
+# model_ipfs_hash = "QmDefault"
+# d_in = 4
+# d_hid = 8
+# d_out = 2
+# min_stake_wei = "1000000000000000000"    # 1 ETH
+# stake_amount_wei = "1000000000000000000"  # 1 ETH
+# round_duration_secs = 600

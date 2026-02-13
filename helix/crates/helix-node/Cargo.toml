@@ -66,6 +66,9 @@ tower-http = { version = "0.6", features = ["cors"] }
 # IPFS storage
 reqwest = { version = "0.12", features = ["json", "multipart"] }
 
+# Configuration
+toml = "0.8"
+
 [dev-dependencies]
 tempfile = "3.24.0"
 tokio-test = "0.4"

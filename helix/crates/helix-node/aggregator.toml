@@ -1,0 +1,34 @@
+# =============================================================================
+# HELIX Aggregator Node Configuration
+# =============================================================================
+#
+# Run with:
+#   cargo run -p helix-node -- --config aggregator.toml
+
+role = "aggregator"
+listen_addr = "0.0.0.0:9000"
+rpc_port = 9002
+http_port = 9001
+bootstrap_nodes = []
+mdns_enabled = true
+use_tls = true
+rpc_url = "http://localhost:8545"
+
+[training]
+d_in = 4
+d_hid = 8
+d_out = 2
+learning_rate = 0.01
+model_seed = 42
+min_workers = 2
+collection_timeout_secs = 120
+worker_timeout_secs = 60
+
+[mpc]
+enabled = true
+num_parties = 3
+
+[fault_tolerance]
+checkpoint_interval_steps = 10
+max_checkpoints = 5
+shutdown_timeout_secs = 30
