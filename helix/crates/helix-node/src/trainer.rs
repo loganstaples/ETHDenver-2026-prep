@@ -529,6 +529,10 @@ pub struct Trainer {
     vk_data: Option<VkData>,
     /// Step counter.
     step_count: u64,
+    /// Maximum allowed accumulated error budget (0.0 = no limit).
+    error_budget: f64,
+    /// Accumulated error across training steps.
+    accumulated_error: f64,
 }
 
 impl Trainer {
@@ -541,6 +545,8 @@ impl Trainer {
             prover: None,
             vk_data: None,
             step_count: 0,
+            error_budget: 0.0,
+            accumulated_error: 0.0,
         }
     }
 
@@ -552,7 +558,25 @@ impl Trainer {
             prover: None,
             vk_data: None,
             step_count: 0,
+            error_budget: 0.0,
+            accumulated_error: 0.0,
         }
+    }
+
+    /// Sets the error budget for this trainer.
+    ///
+    /// When set to a positive value, the trainer will halt with an error
+    /// if accumulated error across training steps exceeds this budget.
+    /// This prevents wasting computation on proofs that would fail
+    /// the circuit's error range check.
+    pub fn with_error_budget(mut self, budget: f64) -> Self {
+        self.error_budget = budget;
+        self
+    }
+
+    /// Returns the accumulated error across training steps.
+    pub fn accumulated_error(&self) -> f64 {
+        self.accumulated_error
     }
 
     /// Returns a reference to the current model.
@@ -612,9 +636,21 @@ impl Trainer {
     /// 4. SGD update
     /// 5. Quantise everything to Fr
     /// 6. Generate Halo2 proof via MLTrainingProverV2 (with EVM output)
+    ///
+    /// Returns an error if the accumulated error budget is exceeded.
     pub fn train_step(&mut self, x: &[f64], target: &[f64]) -> anyhow::Result<ProvedStep> {
         assert_eq!(x.len(), self.model.d_in, "input dimension mismatch");
         assert_eq!(target.len(), self.model.d_out, "target dimension mismatch");
+
+        // Check error budget before spending computation on proof generation
+        if self.error_budget > 0.0 && self.accumulated_error > self.error_budget {
+            anyhow::bail!(
+                "Error budget exceeded: accumulated {:.6} > budget {:.6} at step {}",
+                self.accumulated_error,
+                self.error_budget,
+                self.step_count,
+            );
+        }
 
         self.step_count += 1;
 
@@ -685,6 +721,23 @@ impl Trainer {
         });
 
         let commitment = self.model.commitment();
+
+        // Accumulate quantization error for this step.
+        // Each quantization introduces ~1/scale error per value.
+        // Total error for one step ≈ num_params / scale.
+        let step_error = self.model.num_params() as f64 / scale.max(1.0);
+        self.accumulated_error += step_error;
+
+        // Warn if approaching budget
+        if self.error_budget > 0.0 {
+            let pct = (self.accumulated_error / self.error_budget) * 100.0;
+            if pct > 80.0 {
+                eprintln!(
+                    "[helix-node] WARNING: Error budget {:.1}% consumed ({:.6} / {:.6}) at step {}",
+                    pct, self.accumulated_error, self.error_budget, self.step_count,
+                );
+            }
+        }
 
         Ok(ProvedStep {
             proof_result,
@@ -1099,5 +1152,30 @@ mod tests {
         assert_eq!(arch.d_out, 2);
         assert_eq!(arch.activation, "relu");
         assert_eq!(arch.num_layers, 1);
+    }
+
+    #[test]
+    fn test_error_budget_propagation() {
+        let model = MlpModel::new(
+            2, 2, 1,
+            vec![0.001, 0.002, 0.003, 0.001],
+            vec![0.0, 0.0],
+            vec![0.001, 0.001],
+            vec![0.0],
+        );
+
+        // Set a very tight error budget
+        let trainer = Trainer::with_model(model, 0.001)
+            .with_error_budget(0.0001);
+
+        assert_eq!(trainer.error_budget, 0.0001);
+        assert_eq!(trainer.accumulated_error(), 0.0);
+    }
+
+    #[test]
+    fn test_error_budget_default_unlimited() {
+        let trainer = Trainer::new(2, 2, 1, 0.01, 42);
+        // Default: no error budget limit
+        assert_eq!(trainer.error_budget, 0.0);
     }
 }

@@ -355,6 +355,33 @@ impl TrainingErrorConfig {
     }
 }
 
+/// Validates that the estimated error for a training step is within the given budget.
+///
+/// Call this before proof generation to avoid wasting computation on proofs
+/// that will fail the circuit's error range check.
+///
+/// Returns `Ok(estimated_error)` if within budget, or `Err` with a descriptive message.
+pub fn validate_error_budget(
+    d_in: usize,
+    d_hid: usize,
+    d_out: usize,
+    error_budget: f64,
+) -> Result<f64, String> {
+    let config = TrainingErrorConfig::default();
+    let bounds = config.estimate_mlp_bounds(d_in, d_hid, d_out);
+    let estimated = bounds.total_as_f64();
+
+    if error_budget > 0.0 && estimated > error_budget {
+        return Err(format!(
+            "Estimated error {:.6} exceeds budget {:.6} for model {}x{}x{}. \
+             Proof generation would fail the circuit's error range check.",
+            estimated, error_budget, d_in, d_hid, d_out,
+        ));
+    }
+
+    Ok(estimated)
+}
+
 /// Converts quantized weights to field element representation.
 ///
 /// Weights are stored as fixed-point integers for circuit compatibility.
@@ -1166,5 +1193,20 @@ mod tests {
             .expect("MockProver::run failed");
 
         prover.assert_satisfied();
+    }
+
+    #[test]
+    fn test_validate_error_budget() {
+        // Budget is generous enough
+        let result = validate_error_budget(2, 2, 1, 100.0);
+        assert!(result.is_ok());
+
+        // Budget is too tight
+        let result = validate_error_budget(100, 200, 50, 0.00001);
+        assert!(result.is_err());
+
+        // No budget (0.0 = unlimited)
+        let result = validate_error_budget(100, 200, 50, 0.0);
+        assert!(result.is_ok());
     }
 }

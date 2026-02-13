@@ -3,7 +3,7 @@
 //! Implements the aggregator node role which collects and aggregates
 //! gradients from compute nodes and coordinates training rounds.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::sync::RwLock;
@@ -89,6 +89,8 @@ pub struct AggregatorConfig {
     /// When set and gradient data is available, outliers are excluded
     /// before computing the aggregated commitment.
     pub byzantine_strategy: Option<AggregationStrategy>,
+    /// Minimum required stake amount for worker participation.
+    pub min_stake_amount: u64,
 }
 
 impl Default for AggregatorConfig {
@@ -101,6 +103,7 @@ impl Default for AggregatorConfig {
             max_error_bound: 0.1,
             commitment_aggregation: CommitmentAggregation::HashBased,
             byzantine_strategy: Some(AggregationStrategy::Krum { num_byzantine: 1 }),
+            min_stake_amount: 0,
         }
     }
 }
@@ -166,6 +169,13 @@ pub struct AggregatorNode {
     partition_detector: Option<Arc<PartitionDetector>>,
     /// Optional on-chain pipeline for proof aggregation and submission.
     on_chain_pipeline: Option<Arc<OnChainPipeline>>,
+    /// Allowlist of registered worker public keys that have verified stakes.
+    worker_allowlist: Arc<RwLock<HashSet<PeerId>>>,
+    /// Local LRU cache of recent proof hashes for replay protection.
+    /// Stores SHA-256 hashes of recently seen proofs.
+    seen_proof_hashes: Arc<RwLock<Vec<[u8; 32]>>>,
+    /// Maximum number of proof hashes to cache.
+    max_proof_cache_size: usize,
 }
 
 /// Aggregator statistics.
@@ -195,6 +205,9 @@ impl AggregatorNode {
             stats: Arc::new(RwLock::new(AggregatorStats::default())),
             partition_detector: None,
             on_chain_pipeline: None,
+            worker_allowlist: Arc::new(RwLock::new(HashSet::new())),
+            seen_proof_hashes: Arc::new(RwLock::new(Vec::new())),
+            max_proof_cache_size: 10_000,
         }
     }
 
@@ -208,6 +221,67 @@ impl AggregatorNode {
     pub fn with_on_chain_pipeline(mut self, pipeline: Arc<OnChainPipeline>) -> Self {
         self.on_chain_pipeline = Some(pipeline);
         self
+    }
+
+    /// Registers a worker as authorized to participate.
+    ///
+    /// In production, this should be called after verifying the worker's
+    /// on-chain stake via `verify_stake()`.
+    pub async fn register_worker(&self, peer_id: PeerId) {
+        let mut allowlist = self.worker_allowlist.write().await;
+        allowlist.insert(peer_id);
+    }
+
+    /// Removes a worker from the allowlist.
+    pub async fn deregister_worker(&self, peer_id: &PeerId) {
+        let mut allowlist = self.worker_allowlist.write().await;
+        allowlist.remove(peer_id);
+    }
+
+    /// Checks if a worker is in the allowlist.
+    pub async fn is_worker_authorized(&self, peer_id: &PeerId) -> bool {
+        let allowlist = self.worker_allowlist.read().await;
+        // If allowlist is empty, allow all workers (permissive mode)
+        allowlist.is_empty() || allowlist.contains(peer_id)
+    }
+
+    /// Verifies that a worker has sufficient stake on-chain.
+    ///
+    /// In a production deployment, this would query the Staking contract.
+    /// Currently returns the configured minimum stake requirement for
+    /// the caller to verify externally.
+    pub fn required_stake(&self) -> u64 {
+        self.config.min_stake_amount
+    }
+
+    /// Checks if a proof has already been seen (replay protection).
+    ///
+    /// Returns true if the proof is a duplicate (should be rejected).
+    /// Uses an LRU-style bounded cache of recent proof hashes.
+    pub async fn is_duplicate_proof(&self, proof: &[u8]) -> bool {
+        if proof.is_empty() {
+            return false;
+        }
+
+        let hash: [u8; 32] = {
+            let mut hasher = Sha256::new();
+            hasher.update(proof);
+            hasher.finalize().into()
+        };
+
+        let mut cache = self.seen_proof_hashes.write().await;
+
+        if cache.iter().any(|h| h == &hash) {
+            return true;
+        }
+
+        // Add to cache, evict oldest if at capacity
+        if cache.len() >= self.max_proof_cache_size {
+            cache.remove(0);
+        }
+        cache.push(hash);
+
+        false
     }
 
     /// Gets the node's capabilities.
@@ -394,6 +468,18 @@ impl AggregatorNode {
             return false;
         }
 
+        // Check worker allowlist authorization
+        if !self.is_worker_authorized(&from).await {
+            log::warn!("Rejected gradient from unauthorized worker: {}", from);
+            return false;
+        }
+
+        // Check for proof replay
+        if self.is_duplicate_proof(&proof).await {
+            log::warn!("Rejected duplicate proof from worker: {}", from);
+            return false;
+        }
+
         // Check if from registered participant
         let is_participant = self.participants.read().await.contains_key(&from);
         if !is_participant {
@@ -486,9 +572,36 @@ impl AggregatorNode {
             return None;
         }
 
+        // Validate gradients: reject NaN/Inf error bounds and gradient data
+        let mut validation_rejected: Vec<PeerId> = Vec::new();
+        for (peer, grad) in gradients.iter() {
+            if !grad.error_bound.is_finite() || grad.error_bound > self.config.max_error_bound {
+                log::warn!("Rejected gradient from {} (error_bound={:.6})", peer, grad.error_bound);
+                validation_rejected.push(peer.clone());
+                continue;
+            }
+            if let Some(ref gd) = grad.gradient_data {
+                let has_nan = gd.layers.iter().any(|layer| {
+                    layer.gradients.values().any(|wd| wd.data.iter().any(|v| !v.is_finite()))
+                });
+                if has_nan {
+                    log::warn!("Rejected gradient from {} with NaN/Inf values", peer);
+                    validation_rejected.push(peer.clone());
+                }
+            }
+        }
+
+        if !validation_rejected.is_empty() {
+            log::info!(
+                "Gradient validation filtered {}/{} submissions",
+                validation_rejected.len(),
+                gradients.len(),
+            );
+        }
+
         // Run Byzantine filtering if configured and gradient data is available
         let mut excluded_participants = Vec::new();
-        let excluded_peers: std::collections::HashSet<PeerId>;
+        let excluded_peers: HashSet<PeerId>;
 
         if let Some(ref strategy) = self.config.byzantine_strategy {
             let has_gradient_data = gradients.values().any(|g| g.gradient_data.is_some());
@@ -542,7 +655,10 @@ impl AggregatorNode {
             }
         }
 
-        excluded_peers = excluded_participants.iter().cloned().collect();
+        excluded_peers = excluded_participants.iter()
+            .chain(validation_rejected.iter())
+            .cloned()
+            .collect();
 
         // Collect and sort commitments for deterministic aggregation,
         // excluding any participants flagged by Byzantine filtering
@@ -1260,14 +1376,14 @@ mod tests {
         }
         node.start_collection().await;
 
-        // 4 honest gradients with small offsets
+        // 4 honest gradients with small offsets (unique proofs per worker)
         for (i, p) in peers[..4].iter().enumerate() {
             node.handle_gradient_share_with_data(
                 p.clone(),
                 1,
                 [i as u8 + 1; 32],
                 0.01,
-                vec![1],
+                vec![i as u8 + 1],
                 Some(make_simple_gradient(i as f32 * 0.1)),
                 None,
             ).await;
@@ -1278,7 +1394,7 @@ mod tests {
             1,
             [0xFF; 32],
             0.01,
-            vec![1],
+            vec![5],
             Some(make_simple_gradient(1000.0)),
             None,
         ).await;
@@ -1379,5 +1495,81 @@ mod tests {
             }
             other => panic!("Expected Recruiting state with healthy network, got {:?}", other),
         }
+    }
+
+    fn make_aggregator() -> AggregatorNode {
+        AggregatorNode::new(
+            PeerId::from_string("aggregator-1"),
+            AggregatorConfig::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_worker_allowlist_authorization() {
+        let agg = make_aggregator();
+        let worker = PeerId::from_string("worker-1");
+        let unknown = PeerId::from_string("unknown");
+
+        // Empty allowlist = permissive mode
+        assert!(agg.is_worker_authorized(&worker).await);
+
+        // Register worker
+        agg.register_worker(worker.clone()).await;
+        assert!(agg.is_worker_authorized(&worker).await);
+        assert!(!agg.is_worker_authorized(&unknown).await);
+
+        // Deregister
+        agg.deregister_worker(&worker).await;
+        // Back to empty = permissive
+        assert!(agg.is_worker_authorized(&unknown).await);
+    }
+
+    #[tokio::test]
+    async fn test_proof_replay_detection() {
+        let agg = make_aggregator();
+        let proof = vec![1, 2, 3, 4, 5];
+
+        // First submission: not duplicate
+        assert!(!agg.is_duplicate_proof(&proof).await);
+        // Second submission: duplicate
+        assert!(agg.is_duplicate_proof(&proof).await);
+        // Different proof: not duplicate
+        assert!(!agg.is_duplicate_proof(&[6, 7, 8]).await);
+        // Empty proof: never tracked
+        assert!(!agg.is_duplicate_proof(&[]).await);
+    }
+
+    #[tokio::test]
+    async fn test_reject_unregistered_worker() {
+        let agg = make_aggregator();
+        let authorized = PeerId::from_string("auth-worker");
+        let unauthorized = PeerId::from_string("bad-worker");
+
+        agg.register_worker(authorized.clone()).await;
+
+        // Start a round
+        agg.start_round([1; 32], default_params()).await;
+
+        // Register both as participants
+        agg.handle_participate_request(authorized.clone(), 1).await;
+        agg.handle_participate_request(unauthorized.clone(), 1).await;
+        agg.start_collection().await;
+
+        // Gradient from unauthorized should be rejected
+        let accepted = agg.handle_gradient_share(
+            unauthorized.clone(), 1, [0u8; 32], 0.01, vec![1, 2, 3],
+        ).await;
+        assert!(!accepted);
+
+        // Gradient from authorized should be accepted (returns false because
+        // we need all participants, but it should not be rejected due to auth)
+        let accepted = agg.handle_gradient_share(
+            authorized.clone(), 1, [0u8; 32], 0.01, vec![4, 5, 6],
+        ).await;
+        // With 2 expected and 1 received, this returns false (not all received)
+        // but the gradient IS stored, which we verify below
+        let gradients = agg.gradients.read().await;
+        assert!(gradients.contains_key(&authorized), "authorized worker gradient should be stored");
+        assert!(!gradients.contains_key(&unauthorized), "unauthorized worker gradient should not be stored");
     }
 }

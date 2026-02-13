@@ -422,7 +422,7 @@ async fn test_aggregator_round_completion_flow() {
             1,
             [(i as u8) + 1; 32],
             0.01,
-            vec![0xAB; 1856], // Correct KZG proof size
+            vec![(i as u8) + 1; 1856], // Unique proof bytes per worker
             None,
             Some(public_inputs),
         ).await;

@@ -35,6 +35,11 @@ pub enum TrainingError {
     },
     /// Backward pass failed.
     BackwardError(String),
+    /// Accumulated error exceeded the allowed budget.
+    ErrorBudgetExceeded {
+        accumulated_error: f64,
+        error_budget: f64,
+    },
 }
 
 impl std::fmt::Display for TrainingError {
@@ -45,6 +50,8 @@ impl std::fmt::Display for TrainingError {
             TrainingError::ExplodingGradients { grad_norm, threshold } =>
                 write!(f, "Exploding gradients: norm {} exceeds threshold {}", grad_norm, threshold),
             TrainingError::BackwardError(msg) => write!(f, "Backward error: {}", msg),
+            TrainingError::ErrorBudgetExceeded { accumulated_error, error_budget } =>
+                write!(f, "Error budget exceeded: accumulated {:.6} > budget {:.6}", accumulated_error, error_budget),
         }
     }
 }
@@ -74,6 +81,10 @@ pub struct TrainingConfig {
     pub max_divergent_steps: usize,
     /// Maximum gradient norm before halting (0.0 = no limit).
     pub max_grad_norm: f64,
+    /// Maximum allowed accumulated error before halting (0.0 = no limit, default: 0.0).
+    pub error_budget: f64,
+    /// Warning threshold as fraction of budget (default: 0.8 = warn at 80%).
+    pub error_budget_warn_threshold: f64,
 }
 
 impl Default for TrainingConfig {
@@ -89,6 +100,8 @@ impl Default for TrainingConfig {
             checkpoint_strategy: None,
             max_divergent_steps: 3,
             max_grad_norm: 1e6,
+            error_budget: 0.0,
+            error_budget_warn_threshold: 0.8,
         }
     }
 }
@@ -126,6 +139,12 @@ impl TrainingConfig {
     /// Sets gradient checkpointing strategy.
     pub fn with_checkpoint_strategy(mut self, strategy: CheckpointStrategy) -> Self {
         self.checkpoint_strategy = Some(strategy);
+        self
+    }
+
+    /// Sets the maximum allowed accumulated error budget.
+    pub fn with_error_budget(mut self, budget: f64) -> Self {
+        self.error_budget = budget;
         self
     }
 }
@@ -211,6 +230,11 @@ impl TrainingState {
     /// Returns the number of consecutive divergent (NaN/Inf) loss steps.
     pub fn consecutive_divergent_steps(&self) -> usize {
         self.consecutive_divergent_steps
+    }
+
+    /// Returns the accumulated error for the current epoch.
+    pub fn running_error(&self) -> f64 {
+        self.running_error
     }
 
     /// Finalizes epoch and returns metrics.
@@ -499,6 +523,27 @@ impl<O: Optimizer> Trainer<O> {
             });
         }
 
+        // Check error budget
+        if self.config.error_budget > 0.0 {
+            let accumulated = self.state.running_error();
+            if accumulated > self.config.error_budget {
+                return Err(TrainingError::ErrorBudgetExceeded {
+                    accumulated_error: accumulated,
+                    error_budget: self.config.error_budget,
+                });
+            }
+            // Warn at threshold
+            let threshold = self.config.error_budget * self.config.error_budget_warn_threshold;
+            if accumulated > threshold {
+                eprintln!(
+                    "[helix-avm] WARNING: Error budget {:.1}% consumed ({:.6} / {:.6})",
+                    (accumulated / self.config.error_budget) * 100.0,
+                    accumulated,
+                    self.config.error_budget,
+                );
+            }
+        }
+
         Ok(StepMetrics {
             loss: loss_value,
             loss_error,
@@ -672,5 +717,35 @@ mod tests {
         // Without checkpointing, should_checkpoint always returns false
         assert!(!trainer.should_checkpoint(0));
         assert!(!trainer.should_checkpoint(5));
+    }
+
+    #[test]
+    fn test_error_budget_exceeded() {
+        let mut state = TrainingState::new();
+
+        // Accumulate error over budget
+        for _ in 0..100 {
+            state.record_step(0.5, 1.0, 0.1); // 0.1 error per step
+        }
+
+        // total_error should be ~10.0
+        let metrics = state.finalize_epoch();
+        assert!(metrics.total_error > 9.9);
+    }
+
+    #[test]
+    fn test_error_budget_config() {
+        let config = TrainingConfig::new()
+            .with_error_budget(1.0);
+
+        assert_eq!(config.error_budget, 1.0);
+        assert_eq!(config.error_budget_warn_threshold, 0.8);
+    }
+
+    #[test]
+    fn test_running_error_accessor() {
+        let mut state = TrainingState::new();
+        state.record_step(0.5, 1.0, 0.05);
+        assert!((state.running_error() - 0.05).abs() < 1e-10);
     }
 }
