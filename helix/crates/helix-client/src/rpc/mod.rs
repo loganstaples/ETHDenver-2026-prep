@@ -14,10 +14,19 @@
 #[cfg(feature = "chain")]
 pub mod chain;
 
+#[cfg(feature = "chain")]
+pub mod chain_v3;
+
 pub mod client;
 
 #[cfg(feature = "chain")]
 pub use chain::{ChainClient, ChainCircuitBreaker, ChainCircuitState, ChainModelState, ChainRoundState, ChainStakeInfo, ForgeDeployResult, TrainingProofInputs};
+
+#[cfg(feature = "chain")]
+pub use chain_v3::{
+    ChainClientV3, ChainRoundExtState, ChainV3StakeInfo,
+    ChainRewardPoolInfo, ChainParticipantStats, ForgeDeployResultV3,
+};
 
 pub use client::{
     // Core client types
