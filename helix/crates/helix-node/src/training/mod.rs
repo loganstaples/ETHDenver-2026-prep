@@ -35,6 +35,7 @@ pub mod fault_tolerance;
 pub mod distributed_coordinator;
 pub mod consensus;
 pub mod persistence;
+pub mod round_manager;
 
 // Re-export key types
 pub use round::{
@@ -146,6 +147,13 @@ pub use persistence::{
 pub use session_manager::{
     TrainingSessionConfig, SessionState, SessionSummary, SessionEvent,
     RegisteredWorker, TrainingSessionManager, SessionError,
+};
+
+pub use round_manager::{
+    RegisteredWorker as RoundRegisteredWorker, WorkerRegistry, RoundConfiguration,
+    WorkerProofSubmission, ProofTracker, RoundManagerState, RoundManagerEvent,
+    AggregatedResult, RoundManagerConfig, RoundManager as AggregatorRoundManager,
+    RoundManagerError, compute_model_commitment,
 };
 
 /// Convenience type alias for training results.

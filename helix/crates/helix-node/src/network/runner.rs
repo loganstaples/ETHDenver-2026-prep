@@ -48,6 +48,10 @@ pub enum NetworkEvent {
     ConsensusMessage { from: PeerId, message: ConsensusMessage },
     /// MPC protocol data received (Beaver triples, secret shares, etc.)
     MpcDataMessage { from: PeerId, message: super::messages::MpcDataMessage },
+    /// Worker registration message received.
+    RegistrationMessage { from: PeerId, message: super::messages::RegistrationMessage },
+    /// Round management message received.
+    RoundManagementMessage { from: PeerId, message: super::messages::RoundManagementMessage },
     /// Network error.
     Error { peer: Option<PeerId>, error: String },
 }
@@ -765,6 +769,10 @@ impl NetworkRunner {
             MessagePayload::Consensus(_) => MessageType::Training,
             // MPC messages use the Training rate limit bucket.
             MessagePayload::MpcData(_) => MessageType::Training,
+            // Registration messages use the Discovery rate limit bucket.
+            MessagePayload::Registration(_) => MessageType::Discovery,
+            // Round management messages use the Training rate limit bucket.
+            MessagePayload::RoundManagement(_) => MessageType::Training,
         }
     }
 
@@ -1006,6 +1014,18 @@ impl NetworkRunner {
                             let _ = event_tx.send(NetworkEvent::MpcDataMessage {
                                 from: message.sender,
                                 message: mpc_msg,
+                            }).await;
+                        }
+                        MessagePayload::Registration(reg_msg) => {
+                            let _ = event_tx.send(NetworkEvent::RegistrationMessage {
+                                from: message.sender,
+                                message: reg_msg,
+                            }).await;
+                        }
+                        MessagePayload::RoundManagement(rm_msg) => {
+                            let _ = event_tx.send(NetworkEvent::RoundManagementMessage {
+                                from: message.sender,
+                                message: rm_msg,
                             }).await;
                         }
                     }

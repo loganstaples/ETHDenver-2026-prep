@@ -411,6 +411,10 @@ pub enum MessagePayload {
     Consensus(ConsensusMessage),
     /// MPC protocol messages (Beaver triples, secret sharing, etc.)
     MpcData(MpcDataMessage),
+    /// Worker registration messages.
+    Registration(RegistrationMessage),
+    /// Round management messages (configuration, proof submission, completion).
+    RoundManagement(RoundManagementMessage),
 }
 
 /// MPC data message carrying raw bytes for the MPC layer.
@@ -717,6 +721,153 @@ pub enum ConsensusMessage {
         /// Reason for abort.
         reason: String,
     },
+}
+
+/// Worker registration messages for explicit aggregator enrollment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RegistrationMessage {
+    /// Worker requests to register with the aggregator.
+    WorkerRegister {
+        /// Worker's capabilities.
+        capabilities: NodeCapabilities,
+        /// Worker's listen address for direct communication.
+        listen_addr: String,
+        /// Optional public key bytes for identity verification.
+        #[serde(default)]
+        public_key: Option<Vec<u8>>,
+        /// Maximum concurrent training steps this worker can handle.
+        max_concurrent_steps: u32,
+        /// Available memory in MB for model weights.
+        available_memory_mb: u64,
+    },
+    /// Worker requests to deregister from the aggregator.
+    WorkerDeregister {
+        /// Reason for leaving (graceful shutdown, error, etc.).
+        reason: String,
+    },
+    /// Aggregator confirms worker registration.
+    WorkerRegistered {
+        /// Whether registration was accepted.
+        accepted: bool,
+        /// Assigned worker ID within the aggregator's registry.
+        worker_slot: Option<u32>,
+        /// Rejection reason if not accepted.
+        reject_reason: Option<String>,
+        /// Current round ID if a round is in progress (so worker can catch up).
+        current_round_id: Option<u64>,
+    },
+    /// Aggregator acknowledges worker deregistration.
+    WorkerDeregistered {
+        /// Confirmation that deregistration was processed.
+        acknowledged: bool,
+    },
+}
+
+/// Round management messages for configuration, proof collection, and completion.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RoundManagementMessage {
+    /// Aggregator configures a new training round and sends to all registered workers.
+    RoundConfigure {
+        /// Unique round identifier.
+        round_id: u64,
+        /// On-chain model ID.
+        model_id: u64,
+        /// Model architecture dimensions.
+        model_dims: ModelDims,
+        /// Reference to the training dataset (IPFS hash, URL, etc.).
+        dataset_ref: String,
+        /// Number of training steps each worker should perform.
+        steps_per_worker: u32,
+        /// Learning rate for this round.
+        learning_rate: f64,
+        /// Maximum error budget for this round.
+        error_budget: f64,
+        /// Minimum number of workers required to proceed.
+        min_workers: u32,
+        /// Round deadline (Unix timestamp in seconds).
+        deadline: u64,
+        /// SHA-256 hash of the current model weights.
+        current_model_hash: [u8; 32],
+    },
+    /// Worker acknowledges round configuration and signals readiness.
+    WorkerReady {
+        /// Round ID being acknowledged.
+        round_id: u64,
+        /// Whether the worker is ready to proceed.
+        ready: bool,
+        /// Reason if not ready.
+        reason: Option<String>,
+    },
+    /// Aggregator signals workers to begin training.
+    BeginTraining {
+        /// Round ID.
+        round_id: u64,
+        /// Final list of participating worker peer IDs.
+        participants: Vec<String>,
+    },
+    /// Worker submits proof of completed training step(s).
+    ProofSubmission {
+        /// Round ID.
+        round_id: u64,
+        /// ZK proof bytes.
+        proof: Vec<u8>,
+        /// Public inputs for the proof (8 elements as U256 bytes).
+        public_inputs: Vec<[u8; 32]>,
+        /// Error bound achieved.
+        error_bound: f64,
+        /// Number of training steps completed.
+        steps_completed: u32,
+        /// SHA-256 hash of updated model weights after training.
+        new_model_hash: [u8; 32],
+        /// Serialized model checkpoint (for FedAvg aggregation).
+        checkpoint_data: Vec<u8>,
+    },
+    /// Aggregator acknowledges proof receipt.
+    ProofAcknowledged {
+        /// Round ID.
+        round_id: u64,
+        /// Whether the proof passed local validation.
+        valid: bool,
+        /// Rejection reason if invalid.
+        reason: Option<String>,
+    },
+    /// Aggregator broadcasts round completion with final commitment.
+    RoundCompleted {
+        /// Round ID.
+        round_id: u64,
+        /// Final aggregated model commitment hash.
+        final_commitment: [u8; 32],
+        /// On-chain transaction hash (if submitted).
+        tx_hash: Option<[u8; 32]>,
+        /// New model hash after aggregation.
+        new_model_hash: [u8; 32],
+        /// Total error bound for the round.
+        total_error_bound: f64,
+        /// Number of workers that contributed.
+        num_contributors: u32,
+    },
+    /// Aggregator signals round failure.
+    RoundFailed {
+        /// Round ID.
+        round_id: u64,
+        /// Failure reason.
+        reason: String,
+    },
+}
+
+/// Model architecture dimensions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelDims {
+    /// Input dimension.
+    pub d_in: usize,
+    /// Hidden dimension.
+    pub d_hid: usize,
+    /// Output dimension.
+    pub d_out: usize,
+    /// Number of layers.
+    pub num_layers: u32,
+    /// Number of attention heads (0 for MLP-only).
+    pub num_heads: u32,
 }
 
 /// Serializes a message to bytes using bincode.

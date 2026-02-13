@@ -387,6 +387,8 @@ impl WireCodec {
             MessagePayload::Heartbeat(_) => MessageTypeId::Heartbeat as u16,
             MessagePayload::Consensus(_) => MessageTypeId::Training as u16,
             MessagePayload::MpcData(_) => MessageTypeId::Training as u16,
+            MessagePayload::Registration(_) => MessageTypeId::Discovery as u16,
+            MessagePayload::RoundManagement(_) => MessageTypeId::Training as u16,
         }
     }
 }
