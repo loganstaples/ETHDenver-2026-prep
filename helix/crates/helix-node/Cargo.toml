@@ -53,6 +53,10 @@ chrono = "0.4"
 # LRU cache for replay detection
 lru = "0.12"
 
+# Encrypted weight storage (AES-256-GCM + Argon2id)
+aes-gcm = "0.10"
+argon2 = "0.5"
+
 # HTTP API
 axum = "0.7"
 subtle = "2.5"

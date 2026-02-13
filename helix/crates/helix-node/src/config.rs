@@ -145,6 +145,84 @@ impl Default for DataSourceConfig {
     }
 }
 
+/// MPC (Multi-Party Computation) configuration.
+///
+/// Controls whether MPC is used for privacy-preserving training.
+/// MPC is enabled by default — the non-MPC path is opt-out for testing/debugging only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MpcConfig {
+    /// Whether MPC is enabled. Defaults to true (privacy-first).
+    #[serde(default = "default_mpc_enabled")]
+    pub enabled: bool,
+
+    /// This worker's party index in the MPC protocol.
+    /// Auto-assigned by the aggregator if not set.
+    #[serde(default)]
+    pub party_index: Option<usize>,
+
+    /// Total number of parties in the MPC protocol.
+    #[serde(default = "default_mpc_num_parties")]
+    pub num_parties: usize,
+
+    /// How often to reshare weights (in steps) to prevent gradient accumulation attacks.
+    #[serde(default = "default_mpc_reshare_interval")]
+    pub reshare_interval: u64,
+
+    /// Maximum gradient norm for anomaly detection.
+    #[serde(default = "default_mpc_max_gradient_norm")]
+    pub max_gradient_norm: f64,
+
+    /// Whether to verify share commitments.
+    #[serde(default = "default_mpc_verify_commitments")]
+    pub verify_commitments: bool,
+
+    /// Password for encrypted weight storage (used with AES-256-GCM + Argon2id).
+    /// Read from HELIX_MPC_STORAGE_KEY env var. Never stored in config files.
+    #[serde(skip)]
+    pub storage_key: Option<String>,
+}
+
+fn default_mpc_enabled() -> bool {
+    true
+}
+
+fn default_mpc_num_parties() -> usize {
+    3
+}
+
+fn default_mpc_reshare_interval() -> u64 {
+    50
+}
+
+fn default_mpc_max_gradient_norm() -> f64 {
+    100.0
+}
+
+fn default_mpc_verify_commitments() -> bool {
+    true
+}
+
+impl Default for MpcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_mpc_enabled(),
+            party_index: None,
+            num_parties: default_mpc_num_parties(),
+            reshare_interval: default_mpc_reshare_interval(),
+            max_gradient_norm: default_mpc_max_gradient_norm(),
+            verify_commitments: default_mpc_verify_commitments(),
+            storage_key: None,
+        }
+    }
+}
+
+impl MpcConfig {
+    /// Returns the storage key from the HELIX_MPC_STORAGE_KEY environment variable.
+    pub fn storage_key(&self) -> Option<String> {
+        self.storage_key.clone().or_else(|| std::env::var("HELIX_MPC_STORAGE_KEY").ok())
+    }
+}
+
 /// Full node configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
@@ -188,6 +266,11 @@ pub struct NodeConfig {
     /// HTTP API configuration.
     #[serde(default)]
     pub api: ApiConfig,
+
+    /// MPC (Multi-Party Computation) configuration.
+    /// Enabled by default for privacy-preserving training.
+    #[serde(default)]
+    pub mpc: MpcConfig,
 
     /// On-chain pipeline configuration for aggregator nodes.
     /// When set, the aggregator will register models, stake, submit proofs on-chain.
@@ -320,6 +403,7 @@ impl Default for NodeConfig {
             max_outbound_per_tick: default_max_outbound(),
             rate_limit: RateLimitConfig::default(),
             api: ApiConfig::default(),
+            mpc: MpcConfig::default(),
             chain: None,
             data_source: DataSourceConfig::default(),
             checkpoint_dir: default_checkpoint_dir(),

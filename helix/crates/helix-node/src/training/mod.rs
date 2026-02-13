@@ -27,6 +27,7 @@ pub mod coordinator;
 pub mod session;
 pub mod session_manager;
 pub mod mpc;
+pub mod mpc_session;
 pub mod orchestrator;
 pub mod verification;
 pub mod state_machine;
@@ -89,6 +90,12 @@ pub use mpc::{
     model_to_flat, flat_to_model,
     mpc_proof_to_bytes, mpc_proof_public_inputs_hex,
     ConnectionPoolBridge,
+    SecureWeightDistributor, PrivateAggregator,
+    serialize_gradient_share, deserialize_gradient_share,
+};
+
+pub use mpc_session::{
+    PartyMapping, ActiveSession, MpcSessionOrchestrator, OrchestratorHealthEvent,
 };
 
 pub use orchestrator::{

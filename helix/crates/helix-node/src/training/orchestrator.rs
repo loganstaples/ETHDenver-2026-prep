@@ -1411,6 +1411,30 @@ impl TrainingOrchestrator {
                                             peer_id: from,
                                         });
                                     }
+                                    GradientMessage::MpcGradientShare {
+                                        round_id,
+                                        party_index,
+                                        gradient_share_data,
+                                        gradient_commitment,
+                                        error_bound,
+                                        proof,
+                                        session_id,
+                                    } => {
+                                        log::info!(
+                                            "MPC gradient share received from {} for round {} (party {}, session {})",
+                                            from, round_id, party_index, &session_id[..8.min(session_id.len())],
+                                        );
+                                        // Store as a weight update with the gradient share data
+                                        // The main loop's MPC aggregator will process these
+                                        weight_updates_ref.write()
+                                            .entry(round_id)
+                                            .or_default()
+                                            .push((from.clone(), gradient_share_data, gradient_commitment));
+                                        let _ = event_tx_for_weights.send(OrchestratorEvent::GradientReceived {
+                                            round_id,
+                                            peer_id: from,
+                                        });
+                                    }
                                     _ => {}
                                 }
                             }

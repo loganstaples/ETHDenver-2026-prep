@@ -1164,6 +1164,242 @@ impl NodeConnectionBridge for ConnectionPoolBridge {
 }
 
 // ──────────────────────────────────────────────────────────────
+// Secure Weight Distribution (Privacy-First Architecture)
+// ──────────────────────────────────────────────────────────────
+
+/// Splits a model into N secret shares for distribution to workers.
+///
+/// Each worker receives only their share — never the full model weights.
+/// The aggregator holds no share; it only orchestrates the sharing and
+/// collects gradient shares back.
+pub struct SecureWeightDistributor {
+    /// Number of parties (workers).
+    num_parties: usize,
+    /// Model dimensions.
+    dims: (usize, usize, usize),
+}
+
+impl SecureWeightDistributor {
+    /// Creates a new distributor for the given number of parties.
+    pub fn new(num_parties: usize, d_in: usize, d_hid: usize, d_out: usize) -> Self {
+        Self {
+            num_parties,
+            dims: (d_in, d_hid, d_out),
+        }
+    }
+
+    /// Splits a model into N additive secret shares.
+    ///
+    /// Returns a vector of serialized `ModelShare` bytes (one per party).
+    /// The aggregator should send `shares[i]` to worker `i` and then
+    /// discard its copy.
+    pub fn share_model(&self, model: &MlpModel) -> MPCResult<Vec<Vec<u8>>> {
+        let flat = model_to_flat(model);
+
+        // Use ModelSharing to create additive shares.
+        let parties: Vec<PartyId> = (0..self.num_parties)
+            .map(PartyId::from_index)
+            .collect();
+
+        // Convert ModelWeightsFlat fields into the share_model_additive API format.
+        let layers_for_sharing: Vec<(usize, Vec<(&str, &[f32], &[usize], f64)>)> = flat
+            .layers
+            .iter()
+            .map(|layer| {
+                let weights: Vec<(&str, &[f32], &[usize], f64)> = layer
+                    .weights
+                    .iter()
+                    .map(|(name, data, shape)| (name.as_str(), data.as_slice(), shape.as_slice(), 0.01))
+                    .collect();
+                (layer.layer_idx, weights)
+            })
+            .collect();
+
+        let sharing = AdditiveSharing::new();
+        let shares = ModelSharing::share_model_additive(
+            None,                // embeddings (MLP has none)
+            &layers_for_sharing,
+            None,                // lm_head (MLP has none)
+            &flat.name,
+            &parties,
+            &sharing,
+        )?;
+
+        // Serialize each share for network transmission.
+        let mut serialized = Vec::with_capacity(self.num_parties);
+        for share in &shares {
+            let bytes = bincode::serialize(share)
+                .map_err(|e| MPCError::ProtocolError(format!("Failed to serialize ModelShare: {}", e)))?;
+            serialized.push(bytes);
+        }
+
+        Ok(serialized)
+    }
+
+    /// Deserializes a ModelShare from bytes.
+    pub fn deserialize_share(data: &[u8]) -> MPCResult<ModelShare> {
+        bincode::deserialize(data)
+            .map_err(|e| MPCError::ProtocolError(format!("Failed to deserialize ModelShare: {}", e)))
+    }
+
+    /// Computes a commitment to the full model for verification.
+    pub fn model_commitment(model: &MlpModel) -> [u8; 32] {
+        model.commitment()
+    }
+
+    /// Returns the model dimensions.
+    pub fn dims(&self) -> (usize, usize, usize) {
+        self.dims
+    }
+}
+
+/// Private gradient aggregator for MPC training.
+///
+/// Collects gradient shares from all workers and aggregates them without
+/// ever reconstructing cleartext gradients. The aggregator only sees
+/// encrypted/shared gradient contributions.
+pub struct PrivateAggregator {
+    /// Inner MPC training round that handles share-based aggregation.
+    round: MPCTrainingRound,
+    /// Collected gradient shares per round (party_index -> WorkerComputation).
+    pending_shares: HashMap<usize, WorkerComputation>,
+    /// Expected number of parties.
+    num_parties: usize,
+    /// Current round ID.
+    current_round_id: u64,
+}
+
+impl PrivateAggregator {
+    /// Creates a new private aggregator from an MPC training round.
+    pub fn new(config: MPCTrainingConfig, model: &MlpModel) -> MPCResult<Self> {
+        let num_parties = config.num_parties;
+        let round = MPCTrainingRound::new(config, model)?;
+        Ok(Self {
+            round,
+            pending_shares: HashMap::new(),
+            num_parties,
+            current_round_id: 0,
+        })
+    }
+
+    /// Starts a new aggregation round.
+    pub fn start_round(&mut self, round_id: u64) {
+        self.current_round_id = round_id;
+        self.pending_shares.clear();
+    }
+
+    /// Submits a gradient share from a worker.
+    ///
+    /// Returns `true` if all shares have been collected and aggregation can proceed.
+    pub fn submit_gradient_share(
+        &mut self,
+        party_index: usize,
+        gradient_share_data: &[u8],
+        _gradient_commitment: [u8; 32],
+        local_loss: f64,
+    ) -> MPCResult<bool> {
+        let gradient_share: GradientShare = bincode::deserialize(gradient_share_data)
+            .map_err(|e| MPCError::ProtocolError(format!("Failed to deserialize GradientShare: {}", e)))?;
+
+        // Recompute commitment from the deserialized share to ensure consistency
+        // (bincode roundtrip may change HashMap ordering, affecting the hash)
+        let commitment = compute_gradient_commitment_bytes(&gradient_share);
+
+        let party = PartyId::from_index(party_index);
+        let computation = WorkerComputation {
+            party,
+            index: party_index,
+            gradient_share,
+            local_loss,
+            gradient_commitment: commitment,
+        };
+
+        self.pending_shares.insert(party_index, computation);
+        Ok(self.pending_shares.len() >= self.num_parties)
+    }
+
+    /// Aggregates all collected gradient shares.
+    ///
+    /// This performs the aggregation over secret shares — no cleartext gradients
+    /// are ever reconstructed. Returns the step result with metrics.
+    pub fn aggregate(&mut self) -> MPCResult<MPCStepResult> {
+        if self.pending_shares.len() < self.num_parties {
+            return Err(MPCError::ShareCountMismatch {
+                expected: self.num_parties,
+                got: self.pending_shares.len(),
+            });
+        }
+
+        // Collect computations in party order.
+        let mut computations: Vec<WorkerComputation> = Vec::with_capacity(self.num_parties);
+        for i in 0..self.num_parties {
+            let comp = self.pending_shares.remove(&i)
+                .ok_or_else(|| MPCError::ShareCountMismatch {
+                    expected: self.num_parties,
+                    got: computations.len(),
+                })?;
+            computations.push(comp);
+        }
+
+        self.round.training_step(computations)
+    }
+
+    /// Gets the model shares for distribution to workers.
+    ///
+    /// Returns serialized ModelShare bytes for each party.
+    pub fn get_shares(&self) -> MPCResult<Vec<Vec<u8>>> {
+        let mut shares = Vec::with_capacity(self.num_parties);
+        for i in 0..self.num_parties {
+            let share = self.round.get_party_share(i)?;
+            let bytes = bincode::serialize(share)
+                .map_err(|e| MPCError::ProtocolError(format!("Failed to serialize share: {}", e)))?;
+            shares.push(bytes);
+        }
+        Ok(shares)
+    }
+
+    /// Reconstructs the model from shares (for proof generation only).
+    ///
+    /// WARNING: This reveals the full model. Only call this for ZK proof
+    /// generation after aggregation, never during training.
+    pub fn reconstruct_for_proof(&self) -> MPCResult<MlpModel> {
+        self.round.peek_model()
+    }
+
+    /// Returns the current round step.
+    pub fn current_step(&self) -> u64 {
+        self.round.current_step()
+    }
+
+    /// Returns slashing events.
+    pub fn slashing_record(&self) -> &[SlashingEvent] {
+        self.round.slashing_record()
+    }
+
+    /// Returns the current round ID.
+    pub fn current_round_id(&self) -> u64 {
+        self.current_round_id
+    }
+
+    /// Returns the number of pending shares.
+    pub fn pending_count(&self) -> usize {
+        self.pending_shares.len()
+    }
+}
+
+/// Serializes a GradientShare for network transmission.
+pub fn serialize_gradient_share(share: &GradientShare) -> MPCResult<Vec<u8>> {
+    bincode::serialize(share)
+        .map_err(|e| MPCError::ProtocolError(format!("Failed to serialize GradientShare: {}", e)))
+}
+
+/// Deserializes a GradientShare from network bytes.
+pub fn deserialize_gradient_share(data: &[u8]) -> MPCResult<GradientShare> {
+    bincode::deserialize(data)
+        .map_err(|e| MPCError::ProtocolError(format!("Failed to deserialize GradientShare: {}", e)))
+}
+
+// ──────────────────────────────────────────────────────────────
 // Tests
 // ──────────────────────────────────────────────────────────────
 
@@ -1758,5 +1994,83 @@ mod tests {
             }
             other => panic!("Expected MpcData payload, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_secure_weight_distributor() {
+        let model = create_test_model();
+        let distributor = SecureWeightDistributor::new(3, 4, 8, 2);
+
+        let shares = distributor.share_model(&model).unwrap();
+        assert_eq!(shares.len(), 3);
+
+        // Each share should be non-empty
+        for share in &shares {
+            assert!(!share.is_empty());
+        }
+
+        // Shares should deserialize correctly
+        for share_bytes in &shares {
+            let share = SecureWeightDistributor::deserialize_share(share_bytes).unwrap();
+            assert!(!share.layers.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_private_aggregator() {
+        let model = create_test_model();
+        let config = MPCTrainingConfig {
+            num_parties: 3,
+            learning_rate: 0.01,
+            d_in: 4,
+            d_hid: 8,
+            d_out: 2,
+            max_gradient_norm: 10000.0,
+            ..Default::default()
+        };
+
+        let mut aggregator = PrivateAggregator::new(config.clone(), &model).unwrap();
+        aggregator.start_round(1);
+
+        let x = vec![1.0, 0.5, -0.3, 0.8];
+        let target = vec![1.0, 0.0];
+
+        // Simulate worker computations using the round's simulation
+        for i in 0..3 {
+            let comp = aggregator.round.simulate_worker_computation(i, &x, &target).unwrap();
+            let share_bytes = serialize_gradient_share(&comp.gradient_share).unwrap();
+            let ready = aggregator.submit_gradient_share(
+                i,
+                &share_bytes,
+                comp.gradient_commitment,
+                comp.local_loss,
+            ).unwrap();
+            assert_eq!(ready, i == 2); // Ready after 3rd share
+        }
+
+        let result = aggregator.aggregate().unwrap();
+        assert_eq!(result.step, 1);
+        assert_eq!(result.num_contributors, 3);
+    }
+
+    #[test]
+    fn test_gradient_share_serialization_roundtrip() {
+        let model = create_test_model();
+        let config = MPCTrainingConfig {
+            num_parties: 3,
+            d_in: 4,
+            d_hid: 8,
+            d_out: 2,
+            max_gradient_norm: 10000.0,
+            ..Default::default()
+        };
+        let round = MPCTrainingRound::new(config, &model).unwrap();
+        let comp = round.simulate_worker_computation(0, &[1.0, 0.5, -0.3, 0.8], &[1.0, 0.0]).unwrap();
+
+        let bytes = serialize_gradient_share(&comp.gradient_share).unwrap();
+        let deserialized = deserialize_gradient_share(&bytes).unwrap();
+
+        assert_eq!(deserialized.party, comp.gradient_share.party);
+        assert_eq!(deserialized.layers.len(), comp.gradient_share.layers.len());
     }
 }

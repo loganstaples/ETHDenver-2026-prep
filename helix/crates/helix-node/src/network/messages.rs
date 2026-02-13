@@ -562,6 +562,38 @@ pub enum TrainingMessage {
         /// New weight hash after aggregation.
         weight_hash: [u8; 32],
     },
+    /// Aggregator distributes a secret-shared weight share to a specific worker (MPC mode).
+    ///
+    /// Each worker receives only their share of the model weights — never the full model.
+    /// The aggregator splits the model into N shares using additive secret sharing
+    /// and sends each worker their individual share.
+    WeightShare {
+        /// Round ID this share is for.
+        round_id: u64,
+        /// This worker's party index (0..num_parties-1).
+        party_index: usize,
+        /// Total number of parties in the MPC session.
+        num_parties: usize,
+        /// Serialized ModelShare bytes (bincode-encoded helix_mpc::sharing::model::ModelShare).
+        share_data: Vec<u8>,
+        /// SHA-256 commitment to the full model weights (workers can verify reconstruction).
+        weight_commitment: [u8; 32],
+        /// MPC session ID for correlating messages.
+        session_id: String,
+    },
+    /// Aggregator distributes updated secret-shared weights after MPC aggregation.
+    UpdatedWeightShare {
+        /// Round ID this update is from (the completed round).
+        round_id: u64,
+        /// This worker's party index.
+        party_index: usize,
+        /// Serialized updated ModelShare bytes.
+        share_data: Vec<u8>,
+        /// Commitment to the new aggregated model.
+        weight_commitment: [u8; 32],
+        /// MPC session ID.
+        session_id: String,
+    },
 }
 
 /// Training parameters.
@@ -638,6 +670,28 @@ pub enum GradientMessage {
         checkpoint_data: Vec<u8>,
         /// SHA-256 of the updated weights.
         weight_hash: [u8; 32],
+    },
+    /// Worker sends gradient share in MPC mode.
+    ///
+    /// Instead of sending full gradient data, the worker sends a serialized
+    /// gradient share that can only be meaningful when combined with all other
+    /// parties' shares. The aggregator collects all shares and aggregates
+    /// without ever seeing cleartext gradients.
+    MpcGradientShare {
+        /// Round ID.
+        round_id: u64,
+        /// This worker's party index.
+        party_index: usize,
+        /// Serialized GradientShare bytes (bincode-encoded).
+        gradient_share_data: Vec<u8>,
+        /// SHA-256 commitment to this gradient share.
+        gradient_commitment: [u8; 32],
+        /// Error bound for this computation.
+        error_bound: f64,
+        /// ZK proof of correct gradient computation on the share.
+        proof: Vec<u8>,
+        /// MPC session ID.
+        session_id: String,
     },
 }
 

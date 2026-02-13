@@ -3857,7 +3857,9 @@ dependencies = [
 name = "helix-node"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
+ "argon2",
  "async-trait",
  "axum",
  "bincode",
