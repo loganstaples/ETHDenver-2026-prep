@@ -223,7 +223,9 @@ impl OnChainPipeline {
     ///
     /// Takes collected worker proofs (from AggregatorNode round completion),
     /// runs RLC aggregation to produce a single proof, and submits it
-    /// via `SCClient::submit_proof_raw()`.
+    /// via `SCClient::submit_aggregated_proof()` which calls the V3
+    /// `submitAggregatedProof()` contract method for single-verification
+    /// gas savings over per-proof `submitProof()` calls.
     ///
     /// Returns `None` if there are no proofs or aggregation fails.
     pub async fn submit_aggregated_round(
@@ -261,10 +263,16 @@ impl OnChainPipeline {
         // Convert Fr public inputs to U256 for on-chain submission
         let public_inputs_u256 = fr_vec_to_u256(&aggregated.public_inputs);
 
-        // Submit on-chain
+        // Submit via V3's submitAggregatedProof for single-verification gas savings
         let receipt = self
             .sc_client
-            .submit_proof_raw(model_id, round_id, aggregated.proof.clone(), public_inputs_u256)
+            .submit_aggregated_proof(
+                model_id,
+                round_id,
+                aggregated.proof.clone(),
+                public_inputs_u256,
+                aggregated.num_steps as u64,
+            )
             .await?;
 
         let tx_hash = format!("{:?}", receipt.transaction_hash);

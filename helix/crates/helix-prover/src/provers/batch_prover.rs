@@ -237,6 +237,9 @@ pub struct BatchResult {
     pub proofs: Vec<StepProof>,
     /// Aggregated proof (if enabled).
     pub aggregated_proof: Option<AggregatedBatchProof>,
+    /// On-chain-ready aggregated proof bundle (when RLC aggregation succeeds).
+    #[serde(skip)]
+    pub aggregated_bundle: Option<AggregatedProofBundle>,
     /// Total steps processed.
     pub total_steps: usize,
     /// Total proof generation time.
@@ -281,6 +284,89 @@ pub struct AggregatedBatchProof {
     /// This is the preferred aggregation format for on-chain submission.
     #[serde(skip)]
     pub rlc_proof: Option<AggregatedTrainingProof>,
+}
+
+/// On-chain-ready aggregated proof bundle.
+///
+/// Wraps an `AggregatedTrainingProof` with metadata needed for
+/// `HelixCoordinatorV3.submitAggregatedProof()`. Contains the single
+/// KZG proof, 8 public inputs as U256-sized byte arrays, and batch metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AggregatedProofBundle {
+    /// Single aggregated KZG proof bytes (~1856 bytes for PSE SHPLONK format).
+    pub proof: Vec<u8>,
+    /// 8 public inputs as 32-byte big-endian arrays (EVM format).
+    /// [oldHashLo, oldHashHi, newHashLo, newHashHi, totalLoss, totalError, stepInfo, rlcCommitment]
+    pub public_inputs: Vec<[u8; 32]>,
+    /// Number of individual training steps aggregated (1-32).
+    pub num_steps: usize,
+    /// Training round identifier.
+    pub round_id: u64,
+    /// Model identifier.
+    pub model_id: u64,
+    /// Participant addresses/IDs that contributed proofs.
+    pub participants: Vec<String>,
+    /// Total accumulated loss across all steps.
+    pub total_loss_bytes: [u8; 32],
+    /// Total accumulated error bound across all steps.
+    pub total_error_bytes: [u8; 32],
+    /// First step's old state hash (commitment chain start).
+    pub first_old_hash: ([u8; 32], [u8; 32]),
+    /// Last step's new state hash (commitment chain end).
+    pub last_new_hash: ([u8; 32], [u8; 32]),
+    /// Proof size in bytes.
+    pub proof_size: usize,
+    /// Time taken to aggregate (milliseconds).
+    pub aggregation_time_ms: u64,
+    /// Individual proof results (retained for off-chain auditing).
+    #[serde(skip)]
+    pub individual_results: Vec<TrainingProofResultV2>,
+}
+
+impl AggregatedProofBundle {
+    /// Creates an on-chain-ready bundle from an `AggregatedTrainingProof`.
+    ///
+    /// Converts Fr public inputs to 32-byte big-endian EVM format and
+    /// attaches batch metadata (round_id, model_id, participants).
+    pub fn from_aggregated(
+        agg: AggregatedTrainingProof,
+        round_id: u64,
+        model_id: u64,
+        participants: Vec<String>,
+    ) -> Self {
+        let evm_pis = agg.to_evm_public_inputs();
+
+        let fr_to_bytes = |fr: &Fr| -> [u8; 32] {
+            use helix_circuits::verifier::fr_to_evm_bytes;
+            fr_to_evm_bytes(fr)
+        };
+
+        Self {
+            proof_size: agg.proof.len(),
+            proof: agg.proof.clone(),
+            public_inputs: evm_pis,
+            num_steps: agg.num_steps,
+            round_id,
+            model_id,
+            participants,
+            total_loss_bytes: fr_to_bytes(&agg.total_loss),
+            total_error_bytes: fr_to_bytes(&agg.total_error),
+            first_old_hash: (fr_to_bytes(&agg.first_old_hash.0), fr_to_bytes(&agg.first_old_hash.1)),
+            last_new_hash: (fr_to_bytes(&agg.last_new_hash.0), fr_to_bytes(&agg.last_new_hash.1)),
+            aggregation_time_ms: agg.aggregation_time.as_millis() as u64,
+            individual_results: agg.individual_proofs,
+        }
+    }
+
+    /// Returns the proof bytes suitable for EVM calldata.
+    pub fn evm_proof(&self) -> &[u8] {
+        &self.proof
+    }
+
+    /// Returns public inputs as flat bytes (for ABI encoding).
+    pub fn evm_public_inputs_flat(&self) -> Vec<u8> {
+        self.public_inputs.iter().flat_map(|pi| pi.iter().copied()).collect()
+    }
 }
 
 /// Checkpoint for resumable batch proving.
@@ -442,6 +528,7 @@ impl BatchProver {
                 batch_id: self.batch_id.clone(),
                 proofs: Vec::new(),
                 aggregated_proof: None,
+                aggregated_bundle: None,
                 total_steps: 0,
                 total_time_ms: 0,
                 avg_time_per_proof_ms: 0.0,
@@ -508,6 +595,18 @@ impl BatchProver {
             None
         };
 
+        // Create on-chain bundle from RLC aggregation result.
+        let aggregated_bundle = aggregated.as_ref().and_then(|agg| {
+            agg.rlc_proof.as_ref().map(|rlc| {
+                AggregatedProofBundle::from_aggregated(
+                    rlc.clone(),
+                    0, // round_id set by caller
+                    0, // model_id set by caller
+                    Vec::new(), // participants set by caller
+                )
+            })
+        });
+
         // Check for total failure: if we expected proofs but got none, return error.
         if step_proofs.is_empty() && total_steps > 0 {
             if let Ok(mut status) = self.status.write() {
@@ -527,6 +626,7 @@ impl BatchProver {
             batch_id: self.batch_id.clone(),
             proofs: step_proofs,
             aggregated_proof: aggregated,
+            aggregated_bundle,
             total_steps,
             total_time_ms,
             avg_time_per_proof_ms: avg_time,
@@ -900,6 +1000,20 @@ impl BatchProver {
         proofs: &[TrainingProofResultV2],
     ) -> Result<AggregatedTrainingProof, String> {
         Self::try_rlc_aggregation(proofs)
+    }
+
+    /// Aggregates training proofs into an on-chain-ready `AggregatedProofBundle`.
+    ///
+    /// This is the primary API for producing a single proof bundle that can be
+    /// submitted to `HelixCoordinatorV3.submitAggregatedProof()`.
+    pub fn aggregate_to_bundle(
+        proofs: &[TrainingProofResultV2],
+        round_id: u64,
+        model_id: u64,
+        participants: Vec<String>,
+    ) -> Result<AggregatedProofBundle, String> {
+        let agg = Self::try_rlc_aggregation(proofs)?;
+        Ok(AggregatedProofBundle::from_aggregated(agg, round_id, model_id, participants))
     }
 
     /// Proves a batch of training steps using IVC folding.

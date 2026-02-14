@@ -331,6 +331,49 @@ impl SCClient {
         Ok(receipt)
     }
 
+    /// Submits an aggregated proof via `submitAggregatedProof()` on V3.
+    ///
+    /// This calls `HelixCoordinatorV3.submitAggregatedProof(modelId, roundId, proof, publicInputs, numSteps)`
+    /// which verifies the single aggregated proof against the aggregation verifier contract.
+    /// Uses raw calldata encoding since the abigen bindings are for V2 only.
+    pub async fn submit_aggregated_proof(
+        &self,
+        model_id: u64,
+        round_id: u64,
+        proof: Vec<u8>,
+        public_inputs: Vec<U256>,
+        num_steps: u64,
+    ) -> anyhow::Result<TransactionReceipt> {
+        // submitAggregatedProof(uint256,uint256,bytes,uint256[],uint256)
+        let selector =
+            ethers::utils::id("submitAggregatedProof(uint256,uint256,bytes,uint256[],uint256)");
+        let encoded = ethers::abi::encode(&[
+            ethers::abi::Token::Uint(U256::from(model_id)),
+            ethers::abi::Token::Uint(U256::from(round_id)),
+            ethers::abi::Token::Bytes(proof),
+            ethers::abi::Token::Array(
+                public_inputs
+                    .iter()
+                    .map(|pi| ethers::abi::Token::Uint(*pi))
+                    .collect(),
+            ),
+            ethers::abi::Token::Uint(U256::from(num_steps)),
+        ]);
+
+        let mut calldata = selector[..4].to_vec();
+        calldata.extend_from_slice(&encoded);
+
+        let tx = ethers::types::TransactionRequest::new()
+            .to(self.address)
+            .data(calldata);
+
+        let pending_tx = self.client.send_transaction(tx, None).await?;
+        let receipt = pending_tx
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Tx dropped"))?;
+        Ok(receipt)
+    }
+
     /// Challenges a previously submitted proof (for fraud detection).
     pub async fn challenge_proof(
         &self,

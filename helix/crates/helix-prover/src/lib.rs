@@ -124,8 +124,8 @@ pub use serialization::{ProofFormat, ProofSerializer, SerializedProof};
 
 // Re-export batch prover types
 pub use provers::batch_prover::{
-    AggregatedBatchProof, BatchProveError, BatchProver, BatchConfig, BatchResult, BatchStatus,
-    EpochProver, EpochProofResult, IVCBatchResult, StreamingBatchResult,
+    AggregatedBatchProof, AggregatedProofBundle, BatchProveError, BatchProver, BatchConfig,
+    BatchResult, BatchStatus, EpochProver, EpochProofResult, IVCBatchResult, StreamingBatchResult,
 };
 
 // Re-export step prover types

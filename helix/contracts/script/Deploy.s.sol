@@ -9,6 +9,7 @@ import "../src/core/ModelRegistry.sol";
 import "../src/token/HelixToken.sol";
 import "../src/token/Staking.sol";
 import "../src/token/Rewards.sol";
+import "../src/verification/RLCAggregationVerifier.sol";
 
 /// @title DeployScript
 /// @notice Deploys the HELIX verification infrastructure to Anvil/testnet
@@ -26,6 +27,7 @@ contract DeployScript is Script {
     address public stakingAddr;
     address public rewardsAddr;
     address public registryAddr;
+    address public aggregationVerifierAddr;
 
     // ============ V2 Deployment ============
 
@@ -121,6 +123,15 @@ contract DeployScript is Script {
         );
         coordinator = address(v3);
 
+        // 6b. Deploy RLCAggregationVerifier (uses same core as Halo2Verifier but with separate VK)
+        // NOTE: The aggregation VK must be deployed separately from the individual proof VK.
+        // For now, use the same VK as a placeholder — production deployments must generate
+        // the aggregation circuit's VK via `cargo test -p helix-prover test_generate_aggregation_vk`.
+        address coreAddr = address(halo2Verifier.core());
+        address vkAddr = halo2Verifier.vk();
+        RLCAggregationVerifier rlcAggVerifier = new RLCAggregationVerifier(coreAddr, vkAddr);
+        aggregationVerifierAddr = address(rlcAggVerifier);
+
         // 7. Wire contracts: set coordinator as operator/coordinator
         staking.setOperator(coordinator);
         rewards.setCoordinator(coordinator);
@@ -129,6 +140,9 @@ contract DeployScript is Script {
 
         // 8. Grant minter role to Rewards for token distribution
         token.addMinter(rewardsAddr);
+
+        // 9. Set aggregation verifier on V3
+        v3.setAggregationVerifier(aggregationVerifierAddr);
 
         vm.stopBroadcast();
 
@@ -173,6 +187,10 @@ contract DeployScript is Script {
         );
         coordinator = address(v3);
 
+        // 6b. Deploy mock aggregation verifier
+        MockVerifierForDeploy mockAggVerifier = new MockVerifierForDeploy();
+        aggregationVerifierAddr = address(mockAggVerifier);
+
         // 7. Wire contracts: set coordinator as operator/coordinator
         staking.setOperator(coordinator);
         rewards.setCoordinator(coordinator);
@@ -182,6 +200,9 @@ contract DeployScript is Script {
         // 8. Grant minter role to Rewards for token distribution
         token.addMinter(rewardsAddr);
 
+        // 9. Set aggregation verifier on V3
+        v3.setAggregationVerifier(aggregationVerifierAddr);
+
         vm.stopBroadcast();
 
         _logV3Deployment("Mock");
@@ -190,6 +211,7 @@ contract DeployScript is Script {
     function _logV3Deployment(string memory verifierType) internal view {
         console.log("=== HELIX V3 Full Stack Deployment ===");
         console.log("Verifier (%s):", verifierType, verifier);
+        console.log("AggregationVerifier:", aggregationVerifierAddr);
         console.log("HelixToken:", helixToken);
         console.log("Staking:", stakingAddr);
         console.log("Rewards:", rewardsAddr);

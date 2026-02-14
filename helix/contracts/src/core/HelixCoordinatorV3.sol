@@ -122,6 +122,9 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
     /// @notice Model checkpoint registry
     ModelRegistry public modelRegistry;
 
+    /// @notice Aggregation proof verifier (uses different VK than individual proofs)
+    IHelixVerifier public aggregationVerifier;
+
     // ============ State Variables ============
 
     /// @notice Contract owner
@@ -281,6 +284,14 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
     event TrainingJobFunded(uint256 indexed modelId, uint256 indexed roundId, uint256 feeAmount);
     event TrainingJobRefunded(uint256 indexed modelId, uint256 indexed roundId, uint256 refundAmount);
     event TrainingJobCancelled(uint256 indexed jobId, uint256 refundAmount);
+    event AggregatedProofSubmitted(
+        uint256 indexed modelId,
+        uint256 indexed roundId,
+        address indexed prover,
+        uint256 numSteps,
+        uint256 totalError,
+        uint256 totalLoss
+    );
 
     /// @notice Emitted when a proof is accepted with full details
     event ProofAccepted(
@@ -693,6 +704,155 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
         // For single-participant rounds (backward compat), auto-finalize
         if (ext.minParticipants <= 1) {
             _finalizeRound(modelId, roundId);
+        }
+    }
+
+    // ============ Aggregated Proof Submission ============
+
+    /// @notice Submits an aggregated proof covering multiple training steps in a single verification
+    /// @dev The aggregated proof is verified by aggregationVerifier (different VK from individual proofs).
+    ///      A single pairing check replaces N individual verifications, reducing gas from ~150K×N to ~200K total.
+    /// @param modelId The model ID
+    /// @param roundId The round ID
+    /// @param proof The aggregated proof bytes (~1856 bytes)
+    /// @param publicInputs 8 public inputs [oldHashLo, oldHashHi, newHashLo, newHashHi, totalLoss, totalError, stepNumber, rlcCommitment]
+    /// @param numSteps Number of steps aggregated in this proof (1-32)
+    function submitAggregatedProof(
+        uint256 modelId,
+        uint256 roundId,
+        bytes calldata proof,
+        uint256[] calldata publicInputs,
+        uint256 numSteps
+    ) external whenNotPaused nonReentrant {
+        require(models[modelId].owner != address(0), "Model does not exist");
+        require(stakingContract.canParticipate(msg.sender), "Insufficient stake or not active");
+        _validateRound(modelId, roundId);
+        require(publicInputs.length == EXPECTED_PUBLIC_INPUTS, "Invalid public inputs count");
+        require(numSteps > 0 && numSteps <= 32, "numSteps must be between 1 and 32");
+
+        // Proof replay protection (includes numSteps in hash to differentiate from individual proofs)
+        bytes32 proofHash = keccak256(abi.encodePacked(proof, publicInputs, numSteps));
+        require(!usedProofHashes[proofHash], "Proof already used");
+        usedProofHashes[proofHash] = true;
+
+        // Validate commitment chaining: aggregated proof's old_hash must match current model state
+        uint256 oldCommitmentFromProof = _hashPair(publicInputs[0], publicInputs[1]);
+        require(oldCommitmentFromProof == models[modelId].currentCommitment, "Old commitment mismatch");
+
+        // Validate step number sequencing
+        uint256 proofStep = publicInputs[6];
+        uint256 expectedStep = roundExpectedStep[modelId][roundId];
+        if (expectedStep == 0) {
+            expectedStep = lastStepNumber[modelId] + 1;
+        }
+        require(proofStep == expectedStep, "Step number mismatch");
+
+        // Error bound: aggregated error can be up to numSteps × per-step max
+        uint256 totalErrorBound = publicInputs[5];
+        require(totalErrorBound <= maxErrorBound * numSteps, "Error bound exceeds maximum");
+
+        // Verify via aggregation verifier (single pairing check for N steps)
+        require(address(aggregationVerifier) != address(0), "Aggregation verifier not set");
+        bool valid = aggregationVerifier.verifyProof(proof, publicInputs);
+
+        if (!valid) {
+            _handleInvalidProof(msg.sender, modelId, roundId, proofHash);
+            return;
+        }
+
+        // Proof accepted — update state for all aggregated steps
+        _acceptAggregatedProof(msg.sender, modelId, roundId, publicInputs, proofHash, numSteps);
+    }
+
+    /// @notice Records accepted aggregated proof and updates state for all steps
+    function _acceptAggregatedProof(
+        address prover,
+        uint256 modelId,
+        uint256 roundId,
+        uint256[] memory publicInputs,
+        bytes32 proofHash,
+        uint256 numSteps
+    ) internal {
+        RoundExt storage ext = roundsExt[modelId][roundId];
+        uint256 loss = publicInputs[4];
+        uint256 totalErrorBound = publicInputs[5];
+
+        // Record participant data
+        roundParticipants[modelId][roundId][prover] = RoundParticipant({
+            newCommitmentLo: publicInputs[2],
+            newCommitmentHi: publicInputs[3],
+            loss: loss,
+            errorBound: totalErrorBound,
+            submittedAt: uint40(block.timestamp),
+            proofHash: proofHash
+        });
+        roundParticipantList[modelId][roundId].push(prover);
+        ext.validProofs++;
+
+        // Track per-round accumulated error
+        roundAccumulatedError[modelId][roundId] += totalErrorBound;
+
+        // Track best (lowest) loss
+        uint256 newCommitment = _hashPair(publicInputs[2], publicInputs[3]);
+        if (loss < ext.bestLoss) {
+            ext.bestLoss = loss;
+            ext.bestProver = prover;
+            ext.bestNewCommitment = newCommitment;
+        }
+
+        emit AggregatedProofSubmitted(modelId, roundId, prover, numSteps, totalErrorBound, loss);
+        emit ProofSubmitted(modelId, roundId, prover, newCommitment, totalErrorBound);
+
+        // Error budget enforcement
+        uint256 maxBudget = roundMaxErrorBudget[modelId][roundId];
+        if (maxBudget > 0) {
+            uint256 accumulated = roundAccumulatedError[modelId][roundId];
+            if (accumulated > maxBudget) {
+                roundHalted[modelId][roundId] = true;
+                emit TrainingHalted(modelId, roundId, accumulated, maxBudget);
+            } else if (accumulated * 100 >= maxBudget * 80) {
+                emit ErrorBudgetWarning(modelId, roundId, accumulated, maxBudget);
+            }
+        }
+
+        // For single-participant rounds, auto-finalize with batch step advancement
+        if (ext.minParticipants <= 1) {
+            Model storage model = models[modelId];
+            uint256 oldCommitment = model.currentCommitment;
+            model.currentCommitment = newCommitment;
+
+            Round storage round = rounds[modelId][roundId];
+            round.newCommitment = newCommitment;
+            round.isCompleted = true;
+            round.prover = prover;
+            ext.finalized = true;
+
+            // Advance step counter by numSteps
+            uint256 expectedStep = roundExpectedStep[modelId][roundId];
+            if (expectedStep == 0) {
+                expectedStep = lastStepNumber[modelId] + 1;
+            }
+            lastStepNumber[modelId] = expectedStep + numSteps - 1;
+
+            uint256 newAccumulatedError = accumulatedErrorBound[modelId] + totalErrorBound;
+            accumulatedErrorBound[modelId] = newAccumulatedError;
+
+            uint256 modelBudget = modelMaxAccumulatedError[modelId];
+            require(modelBudget == 0 || newAccumulatedError <= modelBudget, "Model error budget exceeded");
+
+            modelRegistry.updateModel(modelId, bytes32(newCommitment), roundId, "", totalErrorBound, proofHash);
+
+            rewardsContract.registerParticipantWithData(
+                modelId, roundId, prover,
+                loss, uint40(block.timestamp), ext.startedAt, round.deadline
+            );
+            try rewardsContract.allocateRoundRewards(modelId, roundId) {} catch {}
+
+            _distributeRoundFees(modelId, roundId);
+
+            emit CommitmentUpdated(modelId, roundId, oldCommitment, newCommitment, expectedStep + numSteps - 1);
+            emit RoundCompleted(modelId, roundId, newCommitment, newAccumulatedError);
+            emit RoundFinalized(modelId, roundId, prover, loss);
         }
     }
 
@@ -1115,6 +1275,11 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
     function setModelRegistry(address _registry) external onlyOwner {
         require(_registry != address(0), "Invalid registry");
         modelRegistry = ModelRegistry(_registry);
+    }
+
+    function setAggregationVerifier(address _aggregationVerifier) external onlyOwner {
+        require(_aggregationVerifier != address(0), "Invalid aggregation verifier");
+        aggregationVerifier = IHelixVerifier(_aggregationVerifier);
     }
 
     /// @notice Sets maximum accumulated error allowed for a model (0 = no limit)
