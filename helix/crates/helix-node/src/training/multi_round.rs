@@ -242,7 +242,7 @@ impl WeightStore for LocalWeightStore {
         self.gc()?;
 
         let uri = format!("file://{}", path.display());
-        log::info!(
+        tracing::info!(
             "Stored weights for round {}: {} bytes, commitment={}",
             round,
             weight_bytes.len(),
@@ -505,7 +505,7 @@ impl MultiRoundController {
             worker_scores,
         };
 
-        log::info!(
+        tracing::info!(
             "Round {} complete: commitment {} -> {}, loss={:.6}, error={:.6}, steps={}, workers={}",
             round_number,
             hex::encode(&result.initial_commitment[..8]),
@@ -619,7 +619,7 @@ impl MultiRoundController {
         self.current_weights = Some(snapshot.model_checkpoint_bytes.clone());
         self.model_id = snapshot.on_chain_model_id;
 
-        log::info!(
+        tracing::info!(
             "Recovered from snapshot: round={}, commitment={}, {} bytes",
             self.current_round,
             hex::encode(&weight_commitment[..8]),
@@ -785,7 +785,7 @@ impl WorkerStateManager {
         self.current_weights = Some(bytes.clone());
         self.current_commitment = Some(expected_commitment);
 
-        log::info!(
+        tracing::info!(
             "Worker {} prepared for round {}: {} bytes, commitment={}",
             self.peer_id,
             self.last_completed_round + 1,

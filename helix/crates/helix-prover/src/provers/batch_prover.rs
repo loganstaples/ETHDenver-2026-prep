@@ -29,6 +29,7 @@ use crate::provers::training_prover_v2::TrainingProofResultV2;
 use helix_circuits::halo2curves::bn256::Fr;
 use helix_circuits::halo2_proofs::arithmetic::Field;
 use thiserror::Error;
+use tracing::{error, info, instrument, warn};
 
 /// Errors from batch proving operations.
 #[derive(Error, Debug)]
@@ -519,6 +520,7 @@ impl BatchProver {
     /// Proves a batch of training steps.
     ///
     /// Returns an error if the batch produces 0 proofs (all steps failed).
+    #[instrument(skip_all, fields(num_steps = steps.len(), batch_id = %self.batch_id))]
     pub fn prove_batch(&self, steps: Vec<TrainingStep>) -> Result<BatchResult, BatchProveError> {
         let start_time = Instant::now();
         let total_steps = steps.len();
@@ -587,7 +589,7 @@ impl BatchProver {
             match self.aggregate_proofs(&step_proofs, first_step, last_step) {
                 Ok(agg) => Some(agg),
                 Err(e) => {
-                    tracing::error!("Proof aggregation failed: {e}");
+                    error!(error = %e, "Proof aggregation failed");
                     None
                 }
             }
@@ -639,6 +641,7 @@ impl BatchProver {
     /// Proves a batch with streaming (memory-efficient for large batches).
     ///
     /// Returns an error if any sub-batch produces 0 proofs.
+    #[instrument(skip_all, fields(batch_id = %self.batch_id))]
     pub fn prove_batch_streaming<I>(&self, steps: I) -> Result<StreamingBatchResult, BatchProveError>
     where
         I: Iterator<Item = TrainingStep>,
@@ -766,7 +769,7 @@ impl BatchProver {
 
         let path = dir.join(format!("{}.json", checkpoint_id));
         if let Err(e) = checkpoint.save(&path) {
-            tracing::error!("Failed to save batch checkpoint to {}: {e}", path.display());
+            error!("Failed to save batch checkpoint to {}: {e}", path.display());
         } else {
             self.stats.checkpoints_created.fetch_add(1, Ordering::Relaxed);
         }
@@ -779,7 +782,7 @@ impl BatchProver {
         loop {
             // Check timeout to prevent infinite hang.
             if start.elapsed() > timeout {
-                tracing::error!(
+                error!(
                     elapsed_ms = start.elapsed().as_millis() as u64,
                     total,
                     "wait_with_progress timed out"
@@ -849,7 +852,7 @@ impl BatchProver {
             if chain_valid {
                 match Self::try_rlc_aggregation(&training_results) {
                     Ok(agg) => {
-                        tracing::info!(
+                        info!(
                             num_steps = agg.num_steps,
                             proof_size = agg.proof.len(),
                             "RLC aggregation succeeded (8-PI contract-compatible proof)"
@@ -858,13 +861,13 @@ impl BatchProver {
                     }
                     Err(e) => {
                         rlc_error = Some(e.clone());
-                        tracing::warn!("RLC aggregation failed, falling back to KZG: {e}");
+                        warn!("RLC aggregation failed, falling back to KZG: {e}");
                         None
                     }
                 }
             } else {
                 rlc_error = Some("PI chain broken: step[i].new_hash != step[i+1].old_hash".to_string());
-                tracing::warn!("PI chain broken, skipping RLC aggregation");
+                warn!("PI chain broken, skipping RLC aggregation");
                 None
             }
         } else {
@@ -894,7 +897,7 @@ impl BatchProver {
             if aggregator.is_ready() {
                 match aggregator.aggregate(&chunk_proofs) {
                     Ok(kzg_agg) => {
-                        tracing::info!(
+                        info!(
                             num_proofs = kzg_agg.num_proofs,
                             proof_size = kzg_agg.proof.len(),
                             "KZG batch aggregation succeeded (fallback)"
@@ -902,7 +905,7 @@ impl BatchProver {
                         Some(kzg_agg)
                     }
                     Err(e) => {
-                        tracing::warn!("KZG aggregation also failed: {e}");
+                        warn!("KZG aggregation also failed: {e}");
                         None
                     }
                 }
@@ -1025,6 +1028,7 @@ impl BatchProver {
     ///
     /// The resulting `IVCBatchResult` contains both the individual step proofs
     /// (for transparency) and the single decider proof (for on-chain submission).
+    #[instrument(skip_all, fields(num_steps = steps.len(), batch_id = %self.batch_id))]
     pub fn prove_batch_ivc(
         &self,
         steps: Vec<TrainingStep>,
@@ -1097,7 +1101,7 @@ impl BatchProver {
             };
 
             if let Err(e) = ivc_prover.add_step(ivc_step) {
-                tracing::error!(step = step.step_index, error = %e, "IVC step failed");
+                error!(step = step.step_index, error = %e, "IVC step failed");
                 return Err(BatchProveError::AggregationFailed {
                     reason: format!("IVC fold failed at step {}: {}", step.step_index, e),
                     num_proofs: total_steps,
@@ -1113,7 +1117,7 @@ impl BatchProver {
 
         let decider_proof = match ivc_prover.prove_decider(loss_fr, model_id_fr, error_budget_fr) {
             Ok(proof) => {
-                tracing::info!(
+                info!(
                     num_steps = proof.num_steps,
                     proof_size = proof.proof.len(),
                     "IVC decider proof generated for batch"
@@ -1121,7 +1125,7 @@ impl BatchProver {
                 Some(proof)
             }
             Err(e) => {
-                tracing::error!(error = %e, "IVC decider proof generation failed");
+                error!(error = %e, "IVC decider proof generation failed");
                 return Err(BatchProveError::AggregationFailed {
                     reason: format!("IVC decider proof failed: {}", e),
                     num_proofs: total_steps,
@@ -1336,6 +1340,7 @@ impl EpochProver {
     }
 
     /// Proves an entire epoch.
+    #[instrument(skip_all, fields(num_steps = steps.len(), epoch_size = self.steps_per_epoch))]
     pub fn prove_epoch(&self, steps: Vec<TrainingStep>) -> Result<EpochProofResult, BatchProveError> {
         let start = Instant::now();
 
@@ -1451,7 +1456,7 @@ impl BatchProvingPipeline {
                                 .fetch_add(result.total_steps as u64, std::sync::atomic::Ordering::Relaxed);
                         }
                         Err(e) => {
-                            tracing::error!("Pipeline batch proving failed: {e}");
+                            error!("Pipeline batch proving failed: {e}");
                         }
                     }
                 }

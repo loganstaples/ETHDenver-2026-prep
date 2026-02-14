@@ -962,7 +962,7 @@ impl DistributedTrainingCoordinator {
             Err(e) => {
                 // Log the error but don't fail the round for on-chain issues
                 // The training can continue locally even if on-chain submission fails
-                log::warn!("Failed to submit proof on-chain: {}", e);
+                tracing::warn!("Failed to submit proof on-chain: {}", e);
                 Err(DistributedCoordinatorError::CheckpointError(format!("On-chain submission failed: {}", e)))
             }
         }

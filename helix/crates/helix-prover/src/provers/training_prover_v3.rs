@@ -33,6 +33,7 @@ use helix_circuits::verifier::{
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use tracing::{debug, error, info, instrument, warn};
 
 // ============================================================================
 // Configuration
@@ -163,6 +164,7 @@ impl MLTrainingProverV3 {
     }
 
     /// Creates a V3 prover with custom configuration.
+    #[instrument(skip_all, fields(num_layers = arch.num_layers(), k = config.k))]
     pub fn with_config(arch: MLPArchitecture, config: V3ProverConfig) -> Self {
         let pipeline_config = PipelineConfig {
             k: config.k,
@@ -283,17 +285,20 @@ impl MLTrainingProverV3 {
     }
 
     /// Generates a proof for the given witness.
+    #[instrument(skip_all, fields(step = witness.step_number))]
     pub fn prove(&self, witness: &MLTrainingStepV3Witness) -> TrainingProverResult<TrainingProofResultV2> {
         self.prove_with_options(witness, no_progress_callback(), None)
     }
 
     /// Generates a proof with progress callbacks and cancellation support.
+    #[instrument(skip_all, fields(step = witness.step_number))]
     pub fn prove_with_options(
         &self,
         witness: &MLTrainingStepV3Witness,
         progress: ProgressCallback,
         cancel_token: Option<&CancellationToken>,
     ) -> TrainingProverResult<TrainingProofResultV2> {
+        info!("Proof generation started for V3 training step");
         let start = Instant::now();
 
         if let Some(token) = cancel_token {
@@ -364,13 +369,11 @@ impl MLTrainingProverV3 {
             .pipeline
             .prove_with_options(&circuit, &pi_refs, progress.clone(), cancel_token)
             .map_err(|e| {
-                if self.config.enable_tracing {
-                    tracing::error!(
-                        step = witness.step_number,
-                        error = %e,
-                        "V3 proof generation failed"
-                    );
-                }
+                error!(
+                    step = witness.step_number,
+                    error = %e,
+                    "V3 proof generation failed"
+                );
                 TrainingProverError::Pipeline(e)
             })?;
 
@@ -418,16 +421,14 @@ impl MLTrainingProverV3 {
 
         self.proof_count.fetch_add(1, Ordering::Relaxed);
 
-        if self.config.enable_tracing {
-            tracing::info!(
-                step = witness.step_number,
-                num_layers = self.arch.num_layers(),
-                proof_size = proof.len(),
-                generation_time_ms = gen_time.as_millis() as u64,
-                verified,
-                "V3 training proof generated"
-            );
-        }
+        info!(
+            step = witness.step_number,
+            num_layers = self.arch.num_layers(),
+            proof_size = proof.len(),
+            generation_time_ms = gen_time.as_millis() as u64,
+            verified,
+            "Proof generation complete"
+        );
 
         Ok(TrainingProofResultV2 {
             proof,
@@ -447,9 +448,20 @@ impl MLTrainingProverV3 {
     }
 
     /// Verifies a proof against the given public inputs.
+    #[instrument(skip_all, fields(proof_size = proof.len()))]
     pub fn verify(&self, proof: &[u8], public_inputs: &[Fr]) -> bool {
         let pi_refs: Vec<&[Fr]> = vec![public_inputs];
-        self.pipeline.verify(proof, &pi_refs).unwrap_or(false)
+        match self.pipeline.verify(proof, &pi_refs) {
+            Ok(true) => true,
+            Ok(false) => {
+                warn!("V3 proof verification failed");
+                false
+            }
+            Err(e) => {
+                error!(error = %e, "V3 proof verification error");
+                false
+            }
+        }
     }
 
     /// Verifies a `TrainingProofResultV2`.
@@ -461,6 +473,7 @@ impl MLTrainingProverV3 {
     }
 
     /// Exports verification key data for contract deployment.
+    #[instrument(skip_all)]
     pub fn export_vk_data(&self) -> Result<VkData, TrainingProverError> {
         let extracted = self
             .pipeline
@@ -477,6 +490,7 @@ impl MLTrainingProverV3 {
     }
 
     /// Generates a proof and exports everything needed for on-chain verification.
+    #[instrument(skip_all, fields(step = witness.step_number))]
     pub fn prove_and_export_evm(
         &self,
         witness: &MLTrainingStepV3Witness,

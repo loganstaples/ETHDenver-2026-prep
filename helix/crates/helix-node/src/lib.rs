@@ -1,13 +1,16 @@
 pub mod api;
+pub mod circuit_breaker;
 pub mod config;
 pub mod data;
 pub mod identity;
+pub mod metrics;
 pub mod mpc_bridge;
 pub mod network;
 pub mod on_chain_pipeline;
 pub mod roles;
 pub mod runtime;
 pub mod storage;
+pub mod subsystem;
 pub mod trainer;
 pub mod training;
 pub mod sc_client;

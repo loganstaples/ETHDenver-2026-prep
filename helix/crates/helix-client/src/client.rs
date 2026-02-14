@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
+use tracing::{debug, info, instrument, warn};
 
 use crate::config::{ConfigProfile, HelixConfig, RpcConfig};
 use crate::dashboard::DashboardState;
@@ -39,9 +40,11 @@ impl HelixClient {
     /// The RPC layer starts disconnected. Call [`connect`](Self::connect)
     /// to establish a real node connection. This will NOT silently fall back
     /// to mock mode — use [`new_mock`](Self::new_mock) explicitly for testing.
+    #[instrument(skip_all)]
     pub fn new(config: HelixConfig) -> Result<Self> {
         config.validate()?;
         let rpc = UnifiedRpcClient::new_disconnected();
+        debug!("HelixClient created (disconnected)");
         Ok(Self {
             config,
             rpc,
@@ -54,9 +57,11 @@ impl HelixClient {
     /// Use this for development and testing when you don't have a real node
     /// available. Unlike [`new`](Self::new) + [`connect`](Self::connect),
     /// this never attempts a real connection.
+    #[instrument(skip_all)]
     pub fn new_mock(config: HelixConfig) -> Result<Self> {
         config.validate()?;
         let rpc = UnifiedRpcClient::new_mock();
+        info!("HelixClient created in mock mode");
         Ok(Self {
             config,
             rpc,
@@ -65,6 +70,7 @@ impl HelixClient {
     }
 
     /// Load configuration from a TOML file and create the client.
+    #[instrument(skip_all)]
     pub fn from_config_file(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
         let config = HelixConfig::load(&path)?;
@@ -81,9 +87,12 @@ impl HelixClient {
     ///
     /// Returns an error if the connection fails. For testing/demo scenarios
     /// where no real node is available, use [`new_mock`](Self::new_mock).
+    #[instrument(skip_all)]
     pub async fn connect(&mut self) -> Result<()> {
+        info!(endpoint = %self.config.rpc.url, "Connecting to HELIX node");
         let rpc_cfg = rpc_config_from_helix(&self.config.rpc);
         self.rpc = UnifiedRpcClient::connect(rpc_cfg).await?;
+        info!("Connected to HELIX node");
         Ok(())
     }
 
@@ -120,9 +129,12 @@ impl HelixClient {
     /// Uses the RPC URL, chain ID, and coordinator address from this client's
     /// configuration to create and attach a `ChainClient`.
     #[cfg(feature = "chain")]
+    #[instrument(skip_all)]
     pub async fn connect_chain(&mut self, private_key: &str) -> Result<()> {
+        info!("Connecting on-chain client");
         let chain = self.config.chain_client(private_key).await?;
         self.rpc.set_chain_client(chain);
+        info!("On-chain client connected");
         Ok(())
     }
 
@@ -143,16 +155,18 @@ impl HelixClient {
     ///
     /// After training completes, the RPC client is upgraded to connect to
     /// the real node (if it was started).
+    #[instrument(skip_all)]
     pub async fn train(
         &mut self,
         orch_config: crate::orchestration::OrchestratorConfig,
     ) -> Result<crate::orchestration::TrainingResult> {
+        info!("Starting E2E training orchestration");
         let mut orchestrator = crate::orchestration::TrainingOrchestrator::new(orch_config)?;
         let result = orchestrator.train().await;
 
         // Always clean up processes, even on error
         if let Err(e) = orchestrator.shutdown().await {
-            tracing::warn!("Shutdown error: {}", e);
+            warn!("Shutdown error: {}", e);
         }
 
         // If deployment happened, update our config with new contract addresses
@@ -173,6 +187,7 @@ impl HelixClient {
     // ==================== High-Level SDK API ====================
 
     /// Create a mock client and connect in one call (convenience for tests/demos).
+    #[instrument(skip_all)]
     pub async fn connect_mock() -> Result<Self, HelixError> {
         let config = HelixConfig::from_profile(ConfigProfile::Local);
         let rpc = UnifiedRpcClient::new_mock();
@@ -184,6 +199,7 @@ impl HelixClient {
     }
 
     /// Create a client and connect to a specific URL in one call.
+    #[instrument(skip_all)]
     pub async fn connect_to(url: &str) -> Result<Self, HelixError> {
         let rpc_cfg = HelixRpcConfig::with_endpoint(url);
         let rpc = UnifiedRpcClient::connect(rpc_cfg)
@@ -198,6 +214,7 @@ impl HelixClient {
     }
 
     /// Register a model using the SDK config type.
+    #[instrument(skip_all)]
     pub async fn register_model(
         &self,
         config: SdkModelConfig,
@@ -219,21 +236,25 @@ impl HelixClient {
     }
 
     /// Get model information by ID.
+    #[instrument(skip_all)]
     pub async fn get_model(&self, model_id: u64) -> Result<ModelInfo, HelixError> {
         Ok(self.rpc.get_model(model_id).await?)
     }
 
     /// List all registered models.
+    #[instrument(skip_all)]
     pub async fn list_models(&self) -> Result<Vec<ModelInfo>, HelixError> {
         Ok(self.rpc.list_models().await?)
     }
 
     /// Start a training session and return a streaming `TrainingSession`.
+    #[instrument(skip_all)]
     pub async fn start_training(
         &self,
         model_id: u64,
         params: TrainingParams,
     ) -> Result<TrainingSession, HelixError> {
+        info!(model_id, rounds = params.rounds, "Training started");
         self.rpc
             .start_training_for(model_id, params.rounds, params.round_duration_secs)
             .await?;
@@ -246,6 +267,7 @@ impl HelixClient {
     }
 
     /// Stake tokens for a model. Returns the mock/real transaction hash.
+    #[instrument(skip_all)]
     pub async fn stake(
         &self,
         model_id: u64,
@@ -255,41 +277,49 @@ impl HelixClient {
     }
 
     /// Unstake tokens for a model.
+    #[instrument(skip_all)]
     pub async fn unstake(&self, model_id: u64) -> Result<String, HelixError> {
         Ok(self.rpc.unstake(model_id).await?)
     }
 
     /// Claim accumulated rewards.
+    #[instrument(skip_all)]
     pub async fn claim_rewards(&self, model_id: u64) -> Result<String, HelixError> {
         Ok(self.rpc.claim_rewards(model_id).await?)
     }
 
     /// Get network status information.
+    #[instrument(skip_all)]
     pub async fn node_status(&self) -> Result<NetworkStatus, HelixError> {
         Ok(self.rpc.get_network_status().await?)
     }
 
     /// Health check.
+    #[instrument(skip_all)]
     pub async fn health(&self) -> Result<HealthStatus, HelixError> {
         Ok(self.rpc.health_check().await?)
     }
 
     /// Get the current training status from the connected node.
+    #[instrument(skip_all)]
     pub async fn training_status(&self) -> Result<TrainingStatus, HelixError> {
         Ok(self.rpc.get_training_status().await?)
     }
 
     /// Get the training result for a completed round.
+    #[instrument(skip_all)]
     pub async fn get_training_result(&self, round_id: u64) -> Result<TrainingResultData, HelixError> {
         Ok(self.rpc.get_training_result(round_id).await?)
     }
 
     /// Get the current round information for a model.
+    #[instrument(skip_all)]
     pub async fn get_current_round(&self, model_id: u64) -> Result<RoundInfo, HelixError> {
         Ok(self.rpc.get_current_round(model_id).await?)
     }
 
     /// Get a specific round's information.
+    #[instrument(skip_all)]
     pub async fn get_round(&self, model_id: u64, round_id: u64) -> Result<RoundInfo, HelixError> {
         Ok(self.rpc.get_round(model_id, round_id).await?)
     }
@@ -297,6 +327,7 @@ impl HelixClient {
     // ==================== Result Distribution ====================
 
     /// Get model weights for a specific round (or latest if `round_id` is None).
+    #[instrument(skip_all)]
     pub async fn get_model_weights(
         &self,
         model_id: u64,
@@ -309,6 +340,7 @@ impl HelixClient {
     ///
     /// Fetches the weights from the node and writes them to disk. Returns the
     /// commitment hash for optional verification.
+    #[instrument(skip_all)]
     pub async fn download_model(
         &self,
         model_id: u64,
@@ -330,6 +362,7 @@ impl HelixClient {
     ///
     /// Fetches weights from the node, verifies the SHA-256 commitment matches,
     /// then writes to disk. Returns the full `ModelWeightsResponse` for metadata access.
+    #[instrument(skip_all)]
     pub async fn download_model_verified(
         &self,
         model_id: u64,
@@ -370,6 +403,7 @@ impl HelixClient {
     }
 
     /// Get full training history for a model.
+    #[instrument(skip_all)]
     pub async fn get_training_history(
         &self,
         model_id: u64,
@@ -378,6 +412,7 @@ impl HelixClient {
     }
 
     /// Get a full training report / certificate for a model.
+    #[instrument(skip_all)]
     pub async fn get_training_report(
         &self,
         model_id: u64,

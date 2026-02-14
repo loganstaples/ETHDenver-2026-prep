@@ -40,6 +40,7 @@ use helix_circuits::verifier::{
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use tracing::{debug, error, info, instrument, warn};
 
 // ============================================================================
 // Error Types
@@ -587,6 +588,7 @@ impl MLTrainingProverV2 {
     /// Uses [`generate_keys_for_circuit`] to produce real Halo2 KZG keys
     /// (params, proving key, verification key) and threads them through
     /// the pipeline for production-grade proof generation.
+    #[instrument(skip_all, fields(d_in, d_hid, d_out, k = config.k))]
     pub fn with_config(
         d_in: usize,
         d_hid: usize,
@@ -816,17 +818,20 @@ impl MLTrainingProverV2 {
     }
 
     /// Generates a Halo2 proof for the given witness.
+    #[instrument(skip_all, fields(step = witness.step_number))]
     pub fn prove(&self, witness: &MLTrainingStepV2Witness) -> TrainingProverResult<TrainingProofResultV2> {
         self.prove_with_options(witness, no_progress_callback(), None)
     }
 
     /// Generates a proof with progress callbacks and cancellation support.
+    #[instrument(skip_all, fields(step = witness.step_number))]
     pub fn prove_with_options(
         &self,
         witness: &MLTrainingStepV2Witness,
         progress: ProgressCallback,
         cancel_token: Option<&CancellationToken>,
     ) -> TrainingProverResult<TrainingProofResultV2> {
+        info!("Proof generation started for V2 training step");
         let start = Instant::now();
 
         // Check cancellation
@@ -869,12 +874,10 @@ impl MLTrainingProverV2 {
                 self.cache_hits.fetch_add(1, Ordering::Relaxed);
                 self.proof_count.fetch_add(1, Ordering::Relaxed);
 
-                if self.config.enable_tracing {
-                    tracing::info!(
-                        witness_hash = %witness_hash,
-                        "Cache hit for training proof"
-                    );
-                }
+                info!(
+                    witness_hash = %witness_hash,
+                    "Cache hit for training proof"
+                );
 
                 // Reconstruct public inputs from witness
                 let pi = witness.public_inputs();
@@ -933,7 +936,7 @@ impl MLTrainingProverV2 {
             .pipeline
             .prove_with_options(&circuit, &pi_refs, progress.clone(), cancel_token)
             .map_err(|e| {
-                tracing::error!(
+                error!(
                     witness_hash = %witness_hash,
                     step = witness.step_number,
                     error = %e,
@@ -980,12 +983,10 @@ impl MLTrainingProverV2 {
                 ));
             }
 
-            if self.config.enable_tracing {
-                tracing::debug!(
-                    evm_proof_size = proof.len(),
-                    "EVM proof format validated successfully"
-                );
-            }
+            debug!(
+                evm_proof_size = proof.len(),
+                "EVM proof format validated successfully"
+            );
 
             (true, Some(verify_start.elapsed()))
         } else {
@@ -1016,15 +1017,13 @@ impl MLTrainingProverV2 {
 
         self.proof_count.fetch_add(1, Ordering::Relaxed);
 
-        if self.config.enable_tracing {
-            tracing::info!(
-                step = witness.step_number,
-                proof_size = proof.len(),
-                generation_time_ms = gen_time.as_millis() as u64,
-                verified,
-                "Training proof generated"
-            );
-        }
+        info!(
+            step = witness.step_number,
+            proof_size = proof.len(),
+            generation_time_ms = gen_time.as_millis() as u64,
+            verified,
+            "Proof generation complete"
+        );
 
         Ok(TrainingProofResultV2 {
             proof,
@@ -1044,25 +1043,46 @@ impl MLTrainingProverV2 {
     }
 
     /// Verifies a proof against the given public inputs.
+    #[instrument(skip_all, fields(proof_size = proof.len()))]
     pub fn verify(&self, proof: &[u8], public_inputs: &[Fr]) -> bool {
         let pi_refs: Vec<&[Fr]> = vec![public_inputs];
-        self.pipeline.verify(proof, &pi_refs).unwrap_or(false)
+        match self.pipeline.verify(proof, &pi_refs) {
+            Ok(true) => true,
+            Ok(false) => {
+                warn!("Proof verification failed");
+                false
+            }
+            Err(e) => {
+                error!(error = %e, "Proof verification error");
+                false
+            }
+        }
     }
 
     /// Verifies a `TrainingProofResultV2`.
+    #[instrument(skip_all)]
     pub fn verify_result(&self, result: &TrainingProofResultV2) -> bool {
         if result.proof.is_empty() {
+            warn!("Attempted to verify empty proof");
             return false;
         }
         self.verify(&result.proof, &result.public_inputs)
     }
 
     /// Generates a Solidity verifier contract for this prover's circuit.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the pipeline VK has not been initialized (i.e., setup was not called).
+    #[instrument(skip_all, fields(contract_name))]
     pub fn generate_solidity_verifier(&self, contract_name: &str) -> String {
         let vk_data = self
             .pipeline
             .extract_vk_data(NUM_PUBLIC_INPUTS)
-            .expect("VK not initialized");
+            .unwrap_or_else(|| {
+                error!(contract_name, "VK not initialized — cannot generate Solidity verifier");
+                panic!("VK not initialized — call setup before generate_solidity_verifier");
+            });
 
         let evm_vk = VkData {
             g1: vk_data.g1,
@@ -1083,6 +1103,7 @@ impl MLTrainingProverV2 {
     /// Returns [`VkData`] containing the pairing-check points (G1 generator,
     /// s·G2 from SRS, -G2) that the on-chain `Halo2Verifier` contract needs.
     /// This must be called after key generation (which happens in [`new`]/[`with_config`]).
+    #[instrument(skip_all)]
     pub fn export_vk_data(&self) -> Result<VkData, TrainingProverError> {
         let extracted = self
             .pipeline
@@ -1107,6 +1128,7 @@ impl MLTrainingProverV2 {
     /// - `evm_public_inputs`: 8 x 32-byte big-endian public inputs
     /// - `vk_deployment_args`: VK data for Halo2Verifier constructor
     /// - The underlying `TrainingProofResultV2` for metadata
+    #[instrument(skip_all, fields(step = witness.step_number))]
     pub fn prove_and_export_evm(
         &self,
         witness: &MLTrainingStepV2Witness,
@@ -1359,7 +1381,7 @@ impl BatchTrainingProverV2 {
         cancel_token: Option<&CancellationToken>,
     ) -> TrainingProverResult<BatchProofResult> {
         if training_samples.is_empty() {
-            tracing::warn!("prove_batch_with_options: called with 0 training samples");
+            warn!("prove_batch_with_options: called with 0 training samples");
             return Ok(BatchProofResult {
                 proofs: Vec::new(),
                 final_weights: initial_weights,
@@ -1424,9 +1446,7 @@ impl BatchTrainingProverV2 {
                     proofs.push(result);
                 }
                 Err(e) => {
-                    if self.prover.config.enable_tracing {
-                        tracing::error!(step, error = %e, "Batch proving failed at step");
-                    }
+                    error!(step, error = %e, "Batch proving failed at step");
                     failed_steps.push((step, e.to_string()));
                 }
             }
@@ -1434,7 +1454,7 @@ impl BatchTrainingProverV2 {
 
         // Return error if all steps failed (no proofs produced).
         if proofs.is_empty() && !failed_steps.is_empty() {
-            tracing::error!(
+            error!(
                 total_steps = total_steps,
                 failed_count = failed_steps.len(),
                 "Batch proving produced 0 proofs: all {} steps failed",

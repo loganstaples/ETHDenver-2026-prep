@@ -12,6 +12,7 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, broadcast};
+use tracing::{debug, info, instrument};
 
 /// Network orchestrator for managing multi-node deployments
 pub struct NetworkOrchestrator {
@@ -140,8 +141,9 @@ impl NetworkOrchestrator {
     }
 
     /// Start the network
+    #[instrument(skip_all, fields(network = %self.name))]
     pub async fn start(&self) -> Result<()> {
-        tracing::info!("Starting network: {}", self.name);
+        info!("Starting network: {}", self.name);
 
         // Create data directory
         std::fs::create_dir_all(&self.config.data_dir)?;
@@ -162,7 +164,7 @@ impl NetworkOrchestrator {
             self.start_node(&node_id, NodeRole::Worker, port).await?;
         }
 
-        tracing::info!("Network {} started with {} nodes",
+        info!("Network {} started with {} nodes",
             self.name,
             self.config.aggregator_count + self.config.worker_count
         );
@@ -171,8 +173,9 @@ impl NetworkOrchestrator {
     }
 
     /// Start a single node
+    #[instrument(skip_all, fields(%node_id, ?role, port))]
     async fn start_node(&self, node_id: &str, role: NodeRole, port: u16) -> Result<()> {
-        tracing::debug!("Starting node: {} (role: {:?}, port: {})", node_id, role, port);
+        debug!("Starting node: {} (role: {:?}, port: {})", node_id, role, port);
 
         let process = match &self.live_config {
             Some(live) => self.spawn_real_node(node_id, role, port, live)?,
@@ -241,7 +244,7 @@ impl NetworkOrchestrator {
         cmd.stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        tracing::info!("Spawning {} ({}) on {}", node_id, role_str, listen_addr);
+        info!("Spawning {} ({}) on {}", node_id, role_str, listen_addr);
         let child = cmd.spawn().map_err(|e| {
             anyhow!("Failed to spawn {}: {}. Is helix-node built? Run: cargo build -p helix-node", node_id, e)
         })?;
@@ -250,8 +253,9 @@ impl NetworkOrchestrator {
     }
 
     /// Stop the network
+    #[instrument(skip_all, fields(network = %self.name))]
     pub async fn stop(&self) -> Result<()> {
-        tracing::info!("Stopping network: {}", self.name);
+        info!("Stopping network: {}", self.name);
 
         // Send shutdown signal
         let _ = self.shutdown_tx.send(());
@@ -259,7 +263,7 @@ impl NetworkOrchestrator {
         // Stop all nodes
         let mut nodes = self.nodes.write().await;
         for (id, handle) in nodes.iter_mut() {
-            tracing::debug!("Stopping node: {}", id);
+            debug!("Stopping node: {}", id);
             handle.status = NodeStatus::Stopped;
 
             if let Some(mut process) = handle.process.take() {
@@ -269,12 +273,13 @@ impl NetworkOrchestrator {
         }
 
         nodes.clear();
-        tracing::info!("Network {} stopped", self.name);
+        info!("Network {} stopped", self.name);
 
         Ok(())
     }
 
     /// Get network status
+    #[instrument(skip_all)]
     pub async fn status(&self) -> NetworkStatus {
         let nodes = self.nodes.read().await;
 
@@ -299,6 +304,7 @@ impl NetworkOrchestrator {
     }
 
     /// Scale the network to the specified number of workers
+    #[instrument(skip_all, fields(worker_count))]
     pub async fn scale(&self, worker_count: u32) -> Result<()> {
         let current = {
             let nodes = self.nodes.read().await;
@@ -341,6 +347,7 @@ impl NetworkOrchestrator {
     }
 
     /// Wait for network to be ready
+    #[instrument(skip_all)]
     pub async fn wait_ready(&self, timeout: Duration) -> Result<()> {
         let start = std::time::Instant::now();
 
@@ -428,6 +435,7 @@ impl DemoOrchestrator {
     }
 
     /// Run the demo
+    #[instrument(skip_all)]
     pub async fn run(&self, mut shutdown: broadcast::Receiver<()>) -> Result<()> {
         // Start network
         self.orchestrator.start().await?;
@@ -439,10 +447,10 @@ impl DemoOrchestrator {
         for round in 0..self.demo_config.round_count {
             tokio::select! {
                 _ = tokio::time::sleep(self.demo_config.round_duration) => {
-                    tracing::info!("Round {} completed", round + 1);
+                    info!("Round {} completed", round + 1);
                 }
                 _ = shutdown.recv() => {
-                    tracing::info!("Demo interrupted");
+                    info!("Demo interrupted");
                     break;
                 }
             }
@@ -491,16 +499,19 @@ impl LiveTrainingOrchestrator {
     }
 
     /// Start all nodes.
+    #[instrument(skip_all)]
     pub async fn start(&self) -> Result<()> {
         self.orchestrator.start().await
     }
 
     /// Stop all nodes.
+    #[instrument(skip_all)]
     pub async fn stop(&self) -> Result<()> {
         self.orchestrator.stop().await
     }
 
     /// Poll the aggregator's /health endpoint.
+    #[instrument(skip_all)]
     pub async fn poll_health(&self) -> Result<serde_json::Value> {
         let url = format!("{}/health", self.aggregator_url);
         let resp = self.http_client.get(&url).send().await?.json::<serde_json::Value>().await?;
@@ -508,6 +519,7 @@ impl LiveTrainingOrchestrator {
     }
 
     /// Poll the aggregator's /round/status endpoint.
+    #[instrument(skip_all)]
     pub async fn poll_round_status(&self) -> Result<serde_json::Value> {
         let url = format!("{}/round/status", self.aggregator_url);
         let resp = self.http_client.get(&url).send().await?.json::<serde_json::Value>().await?;
@@ -515,6 +527,7 @@ impl LiveTrainingOrchestrator {
     }
 
     /// Trigger a round start via POST /round/start.
+    #[instrument(skip_all)]
     pub async fn trigger_round(&self) -> Result<serde_json::Value> {
         let url = format!("{}/round/start", self.aggregator_url);
         let resp = self.http_client.post(&url).send().await?.json::<serde_json::Value>().await?;

@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, warn, instrument};
 
 use crate::beaver::triple::BeaverTriple;
 use crate::error::{MPCError, MPCResult};
@@ -1038,6 +1038,7 @@ impl<T: MPCTransport> MPCTrainer<T> {
     /// Parties reconstruct weights (by exchanging shares) into a
     /// `ReconstructedWitness`, then use `CircuitBridge` to generate the
     /// Halo2 KZG proof.
+    #[instrument(skip_all, level = "info", fields(party = self.party_index, step = step))]
     fn generate_proof(
         &mut self,
         old_w1: &[Fr],
@@ -1059,7 +1060,9 @@ impl<T: MPCTransport> MPCTrainer<T> {
                     .with_base_error(self.config.base_error),
             ));
         }
-        let bridge = self.circuit_bridge.as_ref().unwrap();
+        let bridge = self.circuit_bridge.as_ref().ok_or_else(|| {
+            MPCError::InvalidConfig("circuit bridge not initialized".into())
+        })?;
 
         // For proof generation, we need the full reconstructed weights.
         // In a real system, parties would exchange shares and one party
@@ -1234,6 +1237,7 @@ impl<T: MPCTransport> MPCTrainer<T> {
     ///
     /// This is called by the prover party (party 0) after reconstructing the
     /// full old and new weights from all parties' shares.
+    #[instrument(skip_all, level = "info", fields(party = self.party_index, step = step))]
     fn generate_proof_from_reconstructed(
         &mut self,
         old_w1: &[Fr],
@@ -1259,7 +1263,9 @@ impl<T: MPCTransport> MPCTrainer<T> {
                     .with_base_error(self.config.base_error),
             ));
         }
-        let bridge = self.circuit_bridge.as_ref().unwrap();
+        let bridge = self.circuit_bridge.as_ref().ok_or_else(|| {
+            MPCError::InvalidConfig("circuit bridge not initialized".into())
+        })?;
 
         let input_fr: Vec<Fr> = input.iter().map(|&v| Fr::from_f64(v)).collect();
         let target_fr: Vec<Fr> = target.iter().map(|&v| Fr::from_f64(v)).collect();
@@ -1304,6 +1310,7 @@ impl<T: MPCTransport> MPCTrainer<T> {
     /// Creates a `TensorShare` by concatenating all weight shares (w1, b1,
     /// w2, b2) into a single flat vector, then uses `ShareValidityProver`
     /// to prove that the shares are well-formed without revealing their values.
+    #[instrument(skip_all, level = "info", fields(party = self.party_index))]
     fn generate_share_validity_proof(&mut self) -> MPCResult<ShareValidityProof> {
         // Concatenate all weight shares into a single vector.
         let mut all_weights = Vec::with_capacity(
@@ -1341,7 +1348,13 @@ impl<T: MPCTransport> MPCTrainer<T> {
         );
 
         // Generate the proof.
-        self.share_prover.prove(&witness)
+        debug!(party = self.party_index, num_weights = total_len, "Generating share validity proof");
+        let proof = self.share_prover.prove(&witness).map_err(|e| {
+            warn!(error = %e, party = self.party_index, "Share validity proof generation failed");
+            e
+        })?;
+        info!(party = self.party_index, "Share validity proof generated");
+        Ok(proof)
     }
 
     /// Generates an aggregation proof for gradient aggregation.
@@ -1351,6 +1364,11 @@ impl<T: MPCTransport> MPCTrainer<T> {
     /// committed, then the aggregation is proven correct.
     ///
     /// Returns `Ok(None)` if there are no gradients to aggregate.
+    #[instrument(skip_all, level = "info", fields(
+        party = self.party_index,
+        num_gradients = gradients.len(),
+        round = round,
+    ))]
     fn generate_aggregation_proof(
         &mut self,
         gradients: &[(Vec<Fr>, Vec<Fr>, Vec<Fr>, Vec<Fr>)],
@@ -1392,7 +1410,12 @@ impl<T: MPCTransport> MPCTrainer<T> {
         witness.compute_aggregation();
 
         // Generate the proof.
-        let proof = self.agg_prover.prove(&witness)?;
+        debug!(round = round, num_parties = num_parties, gradient_dim = gradient_dim, "Generating aggregation proof");
+        let proof = self.agg_prover.prove(&witness).map_err(|e| {
+            warn!(error = %e, round = round, "Aggregation proof generation failed");
+            e
+        })?;
+        info!(round = round, "Aggregation proof generated");
         Ok(Some(proof))
     }
 
@@ -1403,23 +1426,29 @@ impl<T: MPCTransport> MPCTrainer<T> {
     /// - Aggregation proof (if present): verifies gradient aggregation was correct
     ///
     /// Returns `Ok(true)` if all present proofs verify, `Ok(false)` if any fail.
+    #[instrument(skip_all, level = "info", fields(step = result.step))]
     pub fn verify_step(result: &MPCTrainingStepResult) -> MPCResult<bool> {
         // Verify share validity proof if present.
         if let Some(ref sv_proof) = result.share_validity_proof {
             let sv_verifier = ShareValidityVerifier::new();
             if !sv_verifier.verify(sv_proof)? {
+                warn!(step = result.step, "Share validity proof verification failed");
                 return Ok(false);
             }
+            debug!(step = result.step, "Share validity proof verified");
         }
 
         // Verify aggregation proof if present.
         if let Some(ref agg_proof) = result.aggregation_proof {
             let agg_verifier = AggregationVerifier::new();
             if !agg_verifier.verify(agg_proof)? {
+                warn!(step = result.step, "Aggregation proof verification failed");
                 return Ok(false);
             }
+            debug!(step = result.step, "Aggregation proof verified");
         }
 
+        info!(step = result.step, "All step proofs verified successfully");
         Ok(true)
     }
 
@@ -1430,10 +1459,19 @@ impl<T: MPCTransport> MPCTrainer<T> {
     /// Runs multiple training steps.
     ///
     /// `data` is a list of (input, target) pairs.
+    #[instrument(skip_all, level = "info", fields(
+        party = self.party_index,
+        num_samples = data.len(),
+    ))]
     pub async fn train(
         &mut self,
         data: &[(Vec<f64>, Vec<f64>)],
     ) -> MPCResult<Vec<MPCTrainingStepResult>> {
+        info!(
+            party = self.party_index,
+            num_samples = data.len(),
+            "Starting MPC training loop"
+        );
         let mut results = Vec::with_capacity(data.len());
 
         for (input, target) in data {
@@ -1453,10 +1491,18 @@ impl<T: MPCTransport> MPCTrainer<T> {
                 ).await?;
             }
 
-            let result = self.training_step(input, target).await?;
+            let result = self.training_step(input, target).await.map_err(|e| {
+                warn!(error = %e, party = self.party_index, step = self.current_step, "MPC training step failed");
+                e
+            })?;
             results.push(result);
         }
 
+        info!(
+            party = self.party_index,
+            steps_completed = results.len(),
+            "MPC training loop complete"
+        );
         Ok(results)
     }
 

@@ -319,7 +319,7 @@ impl AggregatorNode {
                 if let Some(status) = detector.get_status() {
                     match status.recommended_action {
                         PartitionAction::Halt | PartitionAction::PauseTraining => {
-                            log::warn!(
+                            tracing::warn!(
                                 "Partition detected ({:?}), refusing to start round",
                                 status.recommended_action
                             );
@@ -342,7 +342,7 @@ impl AggregatorNode {
                             );
                         }
                         PartitionAction::ReconnectPeers | PartitionAction::AlertOperator => {
-                            log::warn!(
+                            tracing::warn!(
                                 "Partition detected ({:?}), proceeding optimistically",
                                 status.recommended_action
                             );
@@ -470,13 +470,13 @@ impl AggregatorNode {
 
         // Check worker allowlist authorization
         if !self.is_worker_authorized(&from).await {
-            log::warn!("Rejected gradient from unauthorized worker: {}", from);
+            tracing::warn!("Rejected gradient from unauthorized worker: {}", from);
             return false;
         }
 
         // Check for proof replay
         if self.is_duplicate_proof(&proof).await {
-            log::warn!("Rejected duplicate proof from worker: {}", from);
+            tracing::warn!("Rejected duplicate proof from worker: {}", from);
             return false;
         }
 
@@ -546,14 +546,14 @@ impl AggregatorNode {
             if detector.is_partitioned() {
                 if let Some(status) = detector.get_status() {
                     if status.recommended_action == PartitionAction::Halt {
-                        log::warn!(
+                        tracing::warn!(
                             "Partition detected with Halt action, refusing to aggregate round {}",
                             round_id
                         );
                         return None;
                     }
                     // For PauseTraining/ReconnectPeers, proceed with warning
-                    log::warn!(
+                    tracing::warn!(
                         "Partition detected ({:?}) during aggregation, proceeding optimistically",
                         status.recommended_action
                     );
@@ -576,7 +576,7 @@ impl AggregatorNode {
         let mut validation_rejected: Vec<PeerId> = Vec::new();
         for (peer, grad) in gradients.iter() {
             if !grad.error_bound.is_finite() || grad.error_bound > self.config.max_error_bound {
-                log::warn!("Rejected gradient from {} (error_bound={:.6})", peer, grad.error_bound);
+                tracing::warn!("Rejected gradient from {} (error_bound={:.6})", peer, grad.error_bound);
                 validation_rejected.push(peer.clone());
                 continue;
             }
@@ -585,14 +585,14 @@ impl AggregatorNode {
                     layer.gradients.values().any(|wd| wd.data.iter().any(|v| !v.is_finite()))
                 });
                 if has_nan {
-                    log::warn!("Rejected gradient from {} with NaN/Inf values", peer);
+                    tracing::warn!("Rejected gradient from {} with NaN/Inf values", peer);
                     validation_rejected.push(peer.clone());
                 }
             }
         }
 
         if !validation_rejected.is_empty() {
-            log::info!(
+            tracing::info!(
                 "Gradient validation filtered {}/{} submissions",
                 validation_rejected.len(),
                 gradients.len(),
@@ -637,7 +637,7 @@ impl AggregatorNode {
                             }
                         }
                         if !excluded_participants.is_empty() {
-                            log::info!(
+                            tracing::info!(
                                 "Byzantine filtering excluded {} participants: {:?}",
                                 excluded_participants.len(),
                                 excluded_participants
@@ -645,11 +645,11 @@ impl AggregatorNode {
                         }
                     }
                     Err(e) => {
-                        log::warn!("Byzantine filtering failed ({}), using all gradients", e);
+                        tracing::warn!("Byzantine filtering failed ({}), using all gradients", e);
                     }
                 }
             } else {
-                log::debug!(
+                tracing::debug!(
                     "Byzantine filtering configured but no gradient data available, skipping"
                 );
             }
@@ -701,7 +701,7 @@ impl AggregatorNode {
                             });
                         }
                         None => {
-                            log::warn!(
+                            tracing::warn!(
                                 "Failed to parse Pedersen commitment from {}, falling back to hash-based",
                                 grad.participant,
                             );
@@ -788,7 +788,7 @@ impl AggregatorNode {
                 tokio::spawn(async move {
                     match pipeline.submit_aggregated_round(round, worker_proofs).await {
                         Ok(Some(submission)) => {
-                            log::info!(
+                            tracing::info!(
                                 "On-chain submission for round {}: tx={}, gas={}, proofs={}",
                                 round,
                                 submission.tx_hash,
@@ -797,15 +797,15 @@ impl AggregatorNode {
                             );
                         }
                         Ok(None) => {
-                            log::warn!("On-chain submission returned None for round {}", round);
+                            tracing::warn!("On-chain submission returned None for round {}", round);
                         }
                         Err(e) => {
-                            log::error!("On-chain submission failed for round {}: {}", round, e);
+                            tracing::error!("On-chain submission failed for round {}: {}", round, e);
                         }
                     }
                 });
             } else {
-                log::debug!(
+                tracing::debug!(
                     "Round {}: no worker proofs with public inputs for RLC aggregation",
                     round_id,
                 );
@@ -975,7 +975,7 @@ impl AggregatorNode {
             .collect();
 
         if worker_proofs.is_empty() {
-            log::warn!("No worker proofs with public inputs for IVC aggregation");
+            tracing::warn!("No worker proofs with public inputs for IVC aggregation");
             return None;
         }
 
@@ -1068,7 +1068,7 @@ impl AggregatorNode {
                     total_error += grad.error_bound;
                 }
                 Err(e) => {
-                    log::error!("IVC step {} failed for round {}: {}", i + 1, round_id, e);
+                    tracing::error!("IVC step {} failed for round {}: {}", i + 1, round_id, e);
                     return None;
                 }
             }
@@ -1082,7 +1082,7 @@ impl AggregatorNode {
 
         match ivc_prover.prove_decider(loss_fr, model_id_fr, error_budget_fr) {
             Ok(decider) => {
-                log::info!(
+                tracing::info!(
                     "IVC aggregation for round {}: {} worker proofs → 1 decider proof ({} bytes, {} steps)",
                     round_id,
                     worker_proofs.len(),
@@ -1121,16 +1121,16 @@ impl AggregatorNode {
                     tokio::spawn(async move {
                         match pipeline.submit_aggregated_round(round_id, vec![decider_as_result]).await {
                             Ok(Some(submission)) => {
-                                log::info!(
+                                tracing::info!(
                                     "IVC decider proof submitted on-chain for round {}: tx={}, gas={}",
                                     round_id, submission.tx_hash, submission.gas_used,
                                 );
                             }
                             Ok(None) => {
-                                log::warn!("IVC on-chain submission returned None for round {}", round_id);
+                                tracing::warn!("IVC on-chain submission returned None for round {}", round_id);
                             }
                             Err(e) => {
-                                log::error!("IVC on-chain submission failed for round {}: {}", round_id, e);
+                                tracing::error!("IVC on-chain submission failed for round {}: {}", round_id, e);
                             }
                         }
                     });
@@ -1152,7 +1152,7 @@ impl AggregatorNode {
                 })
             }
             Err(e) => {
-                log::error!("IVC decider proof failed for round {}: {}", round_id, e);
+                tracing::error!("IVC decider proof failed for round {}: {}", round_id, e);
                 None
             }
         }

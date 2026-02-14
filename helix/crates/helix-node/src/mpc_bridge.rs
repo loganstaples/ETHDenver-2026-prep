@@ -143,7 +143,7 @@ impl NodeMpcBridge {
                         MessagePayload::MpcData(mpc_msg),
                     );
                     if let Err(e) = pool.send(&target_peer, network_msg).await {
-                        log::error!(
+                        tracing::error!(
                             "Failed to send MPC message to peer {}: {}",
                             target_peer, e
                         );
@@ -237,7 +237,7 @@ impl NodeMpcBridge {
         // Remove mapping
         self.session_mappings.lock().await.remove(session_id);
 
-        log::info!("MPC session '{}' removed from bridge", session_id);
+        tracing::info!("MPC session '{}' removed from bridge", session_id);
     }
 
     /// Returns the number of active sessions.

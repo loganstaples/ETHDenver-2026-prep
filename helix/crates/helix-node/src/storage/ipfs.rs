@@ -192,7 +192,7 @@ impl IpfsStorage {
         let cid = self.store(&payload).await?;
         self.pin(&cid).await?;
 
-        log::info!("Stored checkpoint for round {} on IPFS: {}", round, cid);
+        tracing::info!("Stored checkpoint for round {} on IPFS: {}", round, cid);
         Ok(cid)
     }
 
@@ -244,7 +244,7 @@ impl StorageBackend for IpfsStorage {
             })
         })?;
 
-        log::info!("Saved state '{}' to IPFS: {}", key, cid);
+        tracing::info!("Saved state '{}' to IPFS: {}", key, cid);
         Ok(())
     }
 

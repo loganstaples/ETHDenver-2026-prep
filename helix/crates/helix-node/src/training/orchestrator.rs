@@ -334,6 +334,7 @@ impl TrainingOrchestrator {
     }
 
     /// Starts the orchestrator.
+    #[tracing::instrument(skip_all)]
     pub async fn start(&self) -> mpsc::Receiver<OrchestratorEvent> {
         self.running.store(true, std::sync::atomic::Ordering::SeqCst);
 
@@ -363,6 +364,7 @@ impl TrainingOrchestrator {
     }
 
     /// Stops the orchestrator.
+    #[tracing::instrument(skip_all)]
     pub fn stop(&self) {
         self.running.store(false, std::sync::atomic::Ordering::SeqCst);
     }
@@ -398,7 +400,7 @@ impl TrainingOrchestrator {
                         return false;
                     }
                     if !rep_mgr.is_peer_eligible(id) {
-                        log::warn!(
+                        tracing::warn!(
                             "Worker {} excluded from round: reputation {:.1} below minimum threshold",
                             id, rep_mgr.score(id),
                         );
@@ -543,7 +545,7 @@ impl TrainingOrchestrator {
             }
 
             if validation.should_slash {
-                log::warn!("Worker {} should be slashed: {}", from, validation.reason);
+                tracing::warn!("Worker {} should be slashed: {}", from, validation.reason);
                 // Trigger on-chain slashing via challenge_proof
                 let sc_client = self.sc_client.read().clone();
                 let model_id = *self.model_id.read();
@@ -552,7 +554,7 @@ impl TrainingOrchestrator {
                 let reason = validation.reason.clone();
                 if let Some(client) = sc_client {
                     tokio::spawn(async move {
-                        log::info!(
+                        tracing::info!(
                             "Submitting challenge_proof for worker {} on model {} round {}",
                             from_clone, model_id, round_id,
                         );
@@ -563,13 +565,13 @@ impl TrainingOrchestrator {
                             vec![], // public inputs not available in rejection path
                         ).await {
                             Ok(receipt) => {
-                                log::info!(
+                                tracing::info!(
                                     "Slashing tx submitted for worker {}: tx={:?}",
                                     from_clone, receipt.transaction_hash,
                                 );
                             }
                             Err(e) => {
-                                log::error!(
+                                tracing::error!(
                                     "Failed to submit slashing tx for worker {}: {}",
                                     from_clone, e,
                                 );
@@ -797,7 +799,7 @@ impl TrainingOrchestrator {
 
             match result {
                 Ok(result_hash) => {
-                    log::info!(
+                    tracing::info!(
                         "Round {} aggregated via RoundCommitManager, tx={}",
                         round_id,
                         hex::encode(result_hash)
@@ -813,7 +815,7 @@ impl TrainingOrchestrator {
                     return;
                 }
                 Err(e) => {
-                    log::warn!(
+                    tracing::warn!(
                         "RoundCommitManager submission failed for round {}: {}, falling back to local aggregation",
                         round_id, e
                     );
@@ -849,7 +851,7 @@ impl TrainingOrchestrator {
                     peer_id: PeerId::from_string(peer_id_str.clone()),
                     reason: result.reason.clone().unwrap_or_else(|| "Byzantine filter".to_string()),
                 });
-                log::warn!(
+                tracing::warn!(
                     "Byzantine filter rejected gradient from {}: {:?}",
                     peer_id_str,
                     result.reason
@@ -863,7 +865,7 @@ impl TrainingOrchestrator {
             return;
         }
 
-        log::info!(
+        tracing::info!(
             "Byzantine filter: {}/{} gradients accepted for round {}",
             accepted_commitments.len(),
             gradients.len(),
@@ -882,7 +884,7 @@ impl TrainingOrchestrator {
             // Check BFT threshold: need n >= 3f+1
             let max_faulty = self.config.consensus.max_faulty;
             if !verify_bft_threshold(participants.len(), max_faulty) {
-                log::warn!(
+                tracing::warn!(
                     "Insufficient participants ({}) for BFT consensus (need >= 3f+1 = {}), \
                      falling back to leader-only aggregation",
                     participants.len(),
@@ -903,7 +905,7 @@ impl TrainingOrchestrator {
 
                 self.network.broadcast(MessagePayload::Consensus(propose_msg)).await;
 
-                log::info!(
+                tracing::info!(
                     "Consensus proposal broadcast for round {} (commitment={})",
                     round_id,
                     hex::encode(&combined[..8]),
@@ -1004,7 +1006,7 @@ impl TrainingOrchestrator {
                 .map_err(|e| format!("submit_to_chain: {}", e))?
         };
 
-        log::info!(
+        tracing::info!(
             "On-chain proof submitted: tx={:?}, block={}, gas={}",
             result.tx_hash,
             result.block_number,
@@ -1038,7 +1040,7 @@ impl TrainingOrchestrator {
             reason: reason.to_string(),
         });
 
-        log::error!("Round {} failed: {}", round_id, reason);
+        tracing::error!("Round {} failed: {}", round_id, reason);
 
         // Clear round
         *self.current_round.write() = None;
@@ -1148,7 +1150,7 @@ impl TrainingOrchestrator {
                             votes_for,
                             total_participants,
                         } => {
-                            log::info!(
+                            tracing::info!(
                                 "Consensus COMMITTED for round {}: {}/{} votes (commitment={})",
                                 commit_round_id,
                                 votes_for,
@@ -1182,7 +1184,7 @@ impl TrainingOrchestrator {
                             self.consensus.write().clear_active_round();
                         }
                         ConsensusMessage::Abort { round_id: abort_round_id, reason } => {
-                            log::warn!(
+                            tracing::warn!(
                                 "Consensus ABORTED for round {}: {}",
                                 abort_round_id, reason,
                             );
@@ -1225,7 +1227,7 @@ impl TrainingOrchestrator {
                     )
                 };
 
-                log::info!(
+                tracing::info!(
                     "Received consensus commit for round {} (commitment={})",
                     round_id,
                     hex::encode(&final_commitment[..8]),
@@ -1241,7 +1243,7 @@ impl TrainingOrchestrator {
                     consensus.handle_abort(round_id, reason.clone())
                 };
 
-                log::warn!(
+                tracing::warn!(
                     "Received consensus abort for round {}: {}",
                     round_id, reason,
                 );
@@ -1407,7 +1409,7 @@ impl TrainingOrchestrator {
                                         let _ = gradient_tx.send((from, round_id, gradient_commitment, error_bound, proof)).await;
                                     }
                                     GradientMessage::WeightUpdate { round_id, checkpoint_data, weight_hash } => {
-                                        log::info!(
+                                        tracing::info!(
                                             "Weight update received from {} for round {} ({} bytes)",
                                             from, round_id, checkpoint_data.len(),
                                         );
@@ -1429,7 +1431,7 @@ impl TrainingOrchestrator {
                                         proof,
                                         session_id,
                                     } => {
-                                        log::info!(
+                                        tracing::info!(
                                             "MPC gradient share received from {} for round {} (party {}, session {})",
                                             from, round_id, party_index, &session_id[..8.min(session_id.len())],
                                         );
@@ -1535,7 +1537,7 @@ impl TrainingOrchestrator {
                             let gradients_count = round.gradients.len();
                             let workers_count = round.workers.len();
                             if gradients_count >= workers_count {
-                                log::info!(
+                                tracing::info!(
                                     "All gradients collected for round {} ({}/{}), triggering aggregation",
                                     round_id, gradients_count, workers_count,
                                 );
@@ -1583,14 +1585,14 @@ impl TrainingOrchestrator {
                                 let proof_slash = proof.clone();
                                 if let Some(client) = sc_client {
                                     tokio::spawn(async move {
-                                        log::info!(
+                                        tracing::info!(
                                             "Submitting challenge_proof for worker {} (round {})",
                                             from_slash, round_id,
                                         );
                                         if let Err(e) = client.challenge_proof(
                                             model_id, round_id, proof_slash, vec![],
                                         ).await {
-                                            log::error!(
+                                            tracing::error!(
                                                 "Failed to submit slashing tx for {}: {}",
                                                 from_slash, e,
                                             );
@@ -1735,7 +1737,7 @@ impl TrainingOrchestrator {
                                     votes_for,
                                     total_participants,
                                 } => {
-                                    log::info!(
+                                    tracing::info!(
                                         "Consensus COMMITTED for round {}: {}/{} votes (commitment={})",
                                         commit_round_id, votes_for, total_participants,
                                         hex::encode(&final_commitment[..8]),
@@ -1799,7 +1801,7 @@ impl TrainingOrchestrator {
                                     consensus_proto.write().clear_active_round();
                                 }
                                 ConsensusMessage::Abort { round_id: abort_round_id, reason } => {
-                                    log::warn!(
+                                    tracing::warn!(
                                         "Consensus ABORTED for round {}: {}",
                                         abort_round_id, reason,
                                     );
@@ -1856,7 +1858,7 @@ impl TrainingOrchestrator {
                             );
                         }
 
-                        log::info!(
+                        tracing::info!(
                             "Received consensus commit for round {} (commitment={})",
                             round_id, hex::encode(&final_commitment[..8]),
                         );
@@ -1871,7 +1873,7 @@ impl TrainingOrchestrator {
                             let _events = consensus.handle_abort(round_id, reason.clone());
                         }
 
-                        log::warn!(
+                        tracing::warn!(
                             "Received consensus abort for round {}: {}",
                             round_id, reason,
                         );

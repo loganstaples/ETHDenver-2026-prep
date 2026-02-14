@@ -14,12 +14,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use log::{error, info, warn};
+use tracing::{error, info, warn, instrument};
 use parking_lot::RwLock;
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 
 use crate::api::http::{ApiRateLimiter, ApiState, FaultToleranceStatus, MpcHealthStatus};
+use crate::metrics::NodeMetrics;
 use crate::api::rpc::{
     MPCStatusSnapshot, NodeConfigSnapshot, ProofStatusEntry, RpcRateLimiter, RpcState,
     start_rpc_server,
@@ -135,6 +136,8 @@ pub struct NodeRuntime {
     config: NodeConfig,
     health: Arc<RwLock<RuntimeHealth>>,
     shutdown_tx: watch::Sender<bool>,
+    /// Node-wide atomic metrics shared across all subsystems.
+    node_metrics: Arc<NodeMetrics>,
 }
 
 impl NodeRuntime {
@@ -145,12 +148,18 @@ impl NodeRuntime {
             config,
             health: Arc::new(RwLock::new(RuntimeHealth::new())),
             shutdown_tx,
+            node_metrics: NodeMetrics::new(),
         }
     }
 
     /// Returns the current health status.
     pub fn health(&self) -> RuntimeHealth {
         self.health.read().clone()
+    }
+
+    /// Returns a reference to the node-wide metrics.
+    pub fn metrics(&self) -> &Arc<NodeMetrics> {
+        &self.node_metrics
     }
 
     /// Returns a reference to the configuration.
@@ -162,6 +171,7 @@ impl NodeRuntime {
     ///
     /// Boots all subsystems in dependency order, runs the main event loop,
     /// and performs graceful shutdown on SIGINT/SIGTERM.
+    #[instrument(skip_all)]
     pub async fn run(&self) -> anyhow::Result<()> {
         info!(
             "Starting HELIX node (role={}, addr={}, rpc_port={})",
@@ -181,6 +191,7 @@ impl NodeRuntime {
     }
 
     /// Triggers graceful shutdown.
+    #[instrument(skip_all)]
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
     }
@@ -258,6 +269,7 @@ impl NodeRuntime {
             rate_limiter: Arc::new(RwLock::new(RpcRateLimiter::default())),
             round_weights,
             worker_daemon: None,
+            node_metrics: self.node_metrics.clone(),
         })
     }
 
@@ -265,6 +277,7 @@ impl NodeRuntime {
     // Worker Role
     // ========================================================================
 
+    #[instrument(skip_all)]
     async fn run_worker(&self) -> anyhow::Result<()> {
         let local_id = PeerId::random();
         let _t = &self.config.training;
@@ -328,7 +341,11 @@ impl NodeRuntime {
             round_weights.clone(),
         );
         // Inject worker daemon into RPC state
-        Arc::get_mut(&mut rpc_state).unwrap().worker_daemon = Some(worker_daemon.clone());
+        if let Some(state) = Arc::get_mut(&mut rpc_state) {
+            state.worker_daemon = Some(worker_daemon.clone());
+        } else {
+            return Err(anyhow::anyhow!("Failed to get mutable reference to RPC state - already shared"));
+        }
 
         let rpc_state_clone = rpc_state.clone();
 
@@ -579,6 +596,7 @@ impl NodeRuntime {
 
     /// Handle a training round in MPC mode.
     #[allow(clippy::too_many_arguments)]
+    #[instrument(skip_all)]
     async fn worker_handle_mpc_round(
         &self,
         network: &Arc<NetworkRunner>,
@@ -606,7 +624,10 @@ impl NodeRuntime {
             ));
         }
 
-        let mpc = mpc_handle.as_mut().unwrap();
+        let Some(mpc) = mpc_handle.as_mut() else {
+            error!("MPC handle not initialized");
+            return;
+        };
         let (x, target) = generate_training_data(
             params.d_in, params.d_out, params.model_seed + round_id,
         );
@@ -673,6 +694,7 @@ impl NodeRuntime {
 
     /// Handle a training round in regular (non-MPC) mode.
     #[allow(clippy::too_many_arguments)]
+    #[instrument(skip_all)]
     async fn worker_handle_regular_round(
         &self,
         network: &Arc<NetworkRunner>,
@@ -687,7 +709,10 @@ impl NodeRuntime {
         round_id: u64,
         params: &TrainingParams,
     ) {
-        let tr = trainer.as_mut().unwrap();
+        let Some(tr) = trainer.as_mut() else {
+            error!("Trainer not initialized");
+            return;
+        };
         let (x, target) = generate_training_data(
             params.d_in, params.d_out, params.model_seed + round_id,
         );
@@ -783,6 +808,7 @@ impl NodeRuntime {
     // Aggregator Role
     // ========================================================================
 
+    #[instrument(skip_all)]
     async fn run_aggregator(&self) -> anyhow::Result<()> {
         let t = &self.config.training;
         let local_id = PeerId::from_string("aggregator");
@@ -982,6 +1008,7 @@ impl NodeRuntime {
             last_checkpoint_ts: Arc::new(RwLock::new(None)),
             mpc_health: Arc::new(RwLock::new(MpcHealthStatus::default())),
             fault_tolerance_status: fault_tolerance_status.clone(),
+            node_metrics: self.node_metrics.clone(),
         });
 
         let http_addr: SocketAddr = format!("0.0.0.0:{}", self.config.http_port).parse()?;

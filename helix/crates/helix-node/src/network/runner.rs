@@ -261,6 +261,7 @@ impl NetworkRunner {
     }
 
     /// Starts the network runner.
+    #[tracing::instrument(skip_all)]
     pub async fn start(&self) -> Result<(), TransportError> {
         // Start transport listener
         self.transport.start().await?;
@@ -329,6 +330,7 @@ impl NetworkRunner {
     }
 
     /// Broadcasts a message via gossip.
+    #[tracing::instrument(skip_all)]
     pub async fn broadcast(&self, payload: MessagePayload) {
         let message = NetworkMessage::new(self.local_id.clone(), payload);
         let peers = self.get_connected_peer_ids().await;
@@ -356,7 +358,7 @@ impl NetworkRunner {
             );
             let mut eclipse = self.eclipse_manager.lock();
             if let Err(e) = eclipse.try_add_peer(peer_net_info) {
-                log::warn!(
+                tracing::warn!(
                     "Eclipse diversity check rejected outbound peer {}: {}",
                     peer_info.id, e
                 );
@@ -488,17 +490,17 @@ impl NetworkRunner {
     pub async fn bootstrap(&self) {
         let bootstrap_nodes = self.config.discovery.bootstrap_nodes.clone();
         if bootstrap_nodes.is_empty() {
-            log::debug!("No bootstrap nodes configured");
+            tracing::debug!("No bootstrap nodes configured");
             return;
         }
 
-        log::info!("Bootstrapping from {} nodes: {:?}", bootstrap_nodes.len(), bootstrap_nodes);
+        tracing::info!("Bootstrapping from {} nodes: {:?}", bootstrap_nodes.len(), bootstrap_nodes);
 
         for addr_str in &bootstrap_nodes {
             let addr: SocketAddr = match addr_str.parse() {
                 Ok(a) => a,
                 Err(e) => {
-                    log::warn!("Invalid bootstrap address '{}': {}", addr_str, e);
+                    tracing::warn!("Invalid bootstrap address '{}': {}", addr_str, e);
                     continue;
                 }
             };
@@ -514,16 +516,16 @@ impl NetworkRunner {
 
             match self.connect_peer(boot_peer).await {
                 Ok(()) => {
-                    log::info!("Connected to bootstrap node {}", addr_str);
+                    tracing::info!("Connected to bootstrap node {}", addr_str);
                     // Request peer list from bootstrap node
                     let get_peers = self.discovery.create_get_peers_request();
                     let boot_id = PeerId::from_string(&format!("bootstrap-{}", addr_str));
                     if let Err(e) = self.pool.send(&boot_id, get_peers).await {
-                        log::warn!("Failed to request peers from bootstrap {}: {}", addr_str, e);
+                        tracing::warn!("Failed to request peers from bootstrap {}: {}", addr_str, e);
                     }
                 }
                 Err(e) => {
-                    log::warn!("Failed to connect to bootstrap node {}: {}", addr_str, e);
+                    tracing::warn!("Failed to connect to bootstrap node {}: {}", addr_str, e);
                 }
             }
         }
@@ -541,7 +543,7 @@ impl NetworkRunner {
     /// Spawns a background task that auto-connects to discovered peers.
     pub async fn start_mdns(&self) -> Result<(), super::mdns_discovery::MdnsError> {
         if !self.config.mdns_enabled {
-            log::debug!("mDNS discovery disabled");
+            tracing::debug!("mDNS discovery disabled");
             return Ok(());
         }
 
@@ -558,7 +560,7 @@ impl NetworkRunner {
         );
 
         let mut event_rx = mdns.start()?;
-        log::info!("mDNS discovery started on port {}", self.config.transport.listen_addr.port());
+        tracing::info!("mDNS discovery started on port {}", self.config.transport.listen_addr.port());
 
         // Spawn background task to handle mDNS events
         let discovery = self.discovery.clone();
@@ -577,7 +579,7 @@ impl NetworkRunner {
                         if peer_info.id == local_id {
                             continue; // Skip ourselves
                         }
-                        log::info!(
+                        tracing::info!(
                             "mDNS discovered peer {} at {} (aggregate={}, train={})",
                             peer_info.id, peer_info.address,
                             peer_info.capabilities.can_aggregate,
@@ -598,14 +600,14 @@ impl NetworkRunner {
                                 pub_key.clone(),
                             );
                             if let Err(e) = pool.send(&peer_info.id, join_msg).await {
-                                log::debug!("Failed to send join to mDNS peer {}: {}", peer_info.id, e);
+                                tracing::debug!("Failed to send join to mDNS peer {}: {}", peer_info.id, e);
                             }
                         }
 
                         let _ = event_tx.send(NetworkEvent::PeerDiscovered(peer_info)).await;
                     }
                     Ok(Some(MdnsEvent::Lost(peer_id))) => {
-                        log::info!("mDNS peer lost: {}", peer_id);
+                        tracing::info!("mDNS peer lost: {}", peer_id);
                         let _ = event_tx.send(NetworkEvent::PeerDisconnected(peer_id)).await;
                     }
                     Ok(Some(MdnsEvent::Updated(_))) => {} // Ignore updates
@@ -654,7 +656,7 @@ impl NetworkRunner {
 
                 for (peer_id, state) in ready_peers {
                     if state.attempts >= max_attempts {
-                        log::warn!(
+                        tracing::warn!(
                             "Giving up reconnection to {} after {} attempts",
                             peer_id, state.attempts,
                         );
@@ -671,7 +673,7 @@ impl NetworkRunner {
                         }
                     };
 
-                    log::info!(
+                    tracing::info!(
                         "Reconnecting to {} (attempt {}/{})",
                         peer_id, state.attempts + 1, max_attempts,
                     );
@@ -686,7 +688,7 @@ impl NetworkRunner {
 
                     match pool.send(&peer_id, join_msg).await {
                         Ok(()) => {
-                            log::info!("Reconnected to {}", peer_id);
+                            tracing::info!("Reconnected to {}", peer_id);
                             // Re-register in discovery
                             let peer_info = PeerInfo {
                                 id: peer_id.clone(),
@@ -700,7 +702,7 @@ impl NetworkRunner {
                             let _ = event_tx.send(NetworkEvent::PeerDiscovered(peer_info)).await;
                         }
                         Err(e) => {
-                            log::debug!("Reconnection to {} failed: {}", peer_id, e);
+                            tracing::debug!("Reconnection to {} failed: {}", peer_id, e);
                             // Exponential backoff
                             let next_attempts = state.attempts + 1;
                             let delay = (base_interval * 2u64.pow(next_attempts))
@@ -735,7 +737,7 @@ impl NetworkRunner {
             next_retry_secs: now + self.config.reconnect_base_interval_secs,
             capabilities,
         });
-        log::info!("Scheduled reconnection for peer {}", peer_id);
+        tracing::info!("Scheduled reconnection for peer {}", peer_id);
     }
 
     /// Returns the reconnect queue for inspection.
@@ -808,7 +810,7 @@ impl NetworkRunner {
                         if !keys.verify_message(&message) {
                             let mut stats = sig_stats.lock();
                             let should_blacklist = stats.record_invalid(&message.sender);
-                            log::warn!(
+                            tracing::warn!(
                                 "Invalid signature from peer {} (total invalid: {})",
                                 message.sender, stats.total_invalid,
                             );
@@ -820,7 +822,7 @@ impl NetworkRunner {
                             );
 
                             if should_blacklist {
-                                log::warn!(
+                                tracing::warn!(
                                     "Auto-blacklisting peer {} after {} invalid signatures",
                                     message.sender, stats.auto_blacklist_threshold,
                                 );
@@ -850,25 +852,25 @@ impl NetworkRunner {
                         match result {
                             RateLimitResult::Allowed => {}
                             RateLimitResult::Blacklisted => {
-                                log::debug!(
+                                tracing::debug!(
                                     "Dropping message from blacklisted peer {}",
                                     message.sender
                                 );
                                 continue;
                             }
                             RateLimitResult::GlobalLimitExceeded => {
-                                log::warn!("Global rate limit exceeded, dropping message from {}", message.sender);
+                                tracing::warn!("Global rate limit exceeded, dropping message from {}", message.sender);
                                 continue;
                             }
                             RateLimitResult::PeerLimitExceeded { violations, .. } => {
-                                log::debug!(
+                                tracing::debug!(
                                     "Rate limited peer {} (violations: {})",
                                     message.sender, violations
                                 );
                                 continue;
                             }
                             RateLimitResult::AutoBlacklisted => {
-                                log::warn!(
+                                tracing::warn!(
                                     "Auto-blacklisted peer {} due to repeated violations",
                                     message.sender
                                 );
@@ -879,7 +881,7 @@ impl NetworkRunner {
                                 continue;
                             }
                             RateLimitResult::ConnectionFlood => {
-                                log::warn!("Connection flood from {}", message.sender);
+                                tracing::warn!("Connection flood from {}", message.sender);
                                 continue;
                             }
                         }
@@ -929,12 +931,12 @@ impl NetworkRunner {
                                         key_bytes,
                                     );
                                     if registered {
-                                        log::info!(
+                                        tracing::info!(
                                             "Registered ed25519 key for peer {} ({} bytes)",
                                             message.sender, key_bytes.len(),
                                         );
                                     } else {
-                                        log::warn!(
+                                        tracing::warn!(
                                             "Invalid ed25519 key from peer {} — rejecting",
                                             message.sender,
                                         );
@@ -952,7 +954,7 @@ impl NetworkRunner {
                                     );
                                     let eclipse_result = eclipse_manager.lock().try_add_peer(peer_net_info);
                                     if let Err(e) = eclipse_result {
-                                        log::warn!(
+                                        tracing::warn!(
                                             "Eclipse diversity check rejected inbound peer {}: {}",
                                             message.sender, e
                                         );
@@ -1077,7 +1079,7 @@ impl NetworkRunner {
 
                 // Send message
                 if let Err(e) = pool.send(&peer_id, message).await {
-                    log::debug!("Failed to send gossip message to {:?}: {}", peer_id, e);
+                    tracing::debug!("Failed to send gossip message to {:?}: {}", peer_id, e);
                 }
             }
         }
@@ -1115,7 +1117,7 @@ impl NetworkRunner {
             match partition_detector.detect_partition().await {
                 Ok(status) => {
                     if status.is_partitioned {
-                        log::warn!(
+                        tracing::warn!(
                             "Network partition detected: {} connected, {} unreachable, action={:?}",
                             status.connected_peers,
                             status.unreachable_peers,
@@ -1125,7 +1127,7 @@ impl NetworkRunner {
                             PartitionAction::PauseTraining | PartitionAction::Halt => {
                                 // Actually pause training — orchestrator checks this flag
                                 training_paused.store(true, std::sync::atomic::Ordering::SeqCst);
-                                log::warn!(
+                                tracing::warn!(
                                     "Training PAUSED due to network partition (action={:?})",
                                     status.recommended_action,
                                 );
@@ -1144,12 +1146,12 @@ impl NetworkRunner {
                         // Network healthy — resume training if previously paused
                         if training_paused.load(std::sync::atomic::Ordering::SeqCst) {
                             training_paused.store(false, std::sync::atomic::Ordering::SeqCst);
-                            log::info!("Training RESUMED: network partition resolved");
+                            tracing::info!("Training RESUMED: network partition resolved");
                         }
                     }
                 }
                 Err(e) => {
-                    log::debug!("Partition detection skipped: {}", e);
+                    tracing::debug!("Partition detection skipped: {}", e);
                 }
             }
         }

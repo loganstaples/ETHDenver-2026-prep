@@ -58,7 +58,7 @@ fn generate_training_data(d_in: usize, d_out: usize, seed: u64) -> (Vec<f64>, Ve
 /// Halo2 KZG proofs, completing a full training round.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_multi_process_training_round_with_real_proofs() {
-    let _ = env_logger::builder().is_test(true).try_init();
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
     // Model config: small weights (0.001 range) to stay within ReLU lookup range.
     let d_in = 2;
@@ -72,7 +72,7 @@ async fn test_multi_process_training_round_with_real_proofs() {
     let worker_ports: Vec<u16> = (0..3).map(|_| get_available_port()).collect();
     let agg_addr: SocketAddr = format!("127.0.0.1:{}", agg_port).parse().unwrap();
 
-    log::info!(
+    tracing::info!(
         "Ports: aggregator={}, workers={:?}",
         agg_port, worker_ports
     );
@@ -95,7 +95,7 @@ async fn test_multi_process_training_round_with_real_proofs() {
 
     let agg_network = Arc::new(agg_network);
     agg_network.start().await.expect("Failed to start aggregator");
-    log::info!("Aggregator started on {}", agg_addr);
+    tracing::info!("Aggregator started on {}", agg_addr);
 
     // ── 3. Create orchestrator ─────────────────────────────────────
     let orch_config = OrchestratorConfig {
@@ -183,7 +183,7 @@ async fn test_multi_process_training_round_with_real_proofs() {
             .await
             .unwrap_or_else(|e| panic!("Worker-{} failed to connect to aggregator: {}", i, e));
 
-        log::info!("Worker-{} ({}) connected to aggregator", i, worker_id);
+        tracing::info!("Worker-{} ({}) connected to aggregator", i, worker_id);
 
         // Spawn worker heartbeat + event loop
         let wn = worker_network.clone();
@@ -225,7 +225,7 @@ async fn test_multi_process_training_round_with_real_proofs() {
                                 model_hash: _,
                                 params,
                             } => {
-                                log::info!(
+                                tracing::info!(
                                     "{}: Received RoundStart #{} ({}x{}x{})",
                                     wid,
                                     round_id,
@@ -256,7 +256,7 @@ async fn test_multi_process_training_round_with_real_proofs() {
                                     params.model_seed + round_id,
                                 );
 
-                                log::info!("{}: Training step (round {})...", wid, round_id);
+                                tracing::info!("{}: Training step (round {})...", wid, round_id);
                                 match trainer.train_step(&x, &target) {
                                     Ok(result) => {
                                         let proof_bytes = result
@@ -267,7 +267,7 @@ async fn test_multi_process_training_round_with_real_proofs() {
                                                 result.proof_result.proof.clone()
                                             });
 
-                                        log::info!(
+                                        tracing::info!(
                                             "{}: Proof generated: {} bytes, loss={:.6}, verified={}",
                                             wid,
                                             proof_bytes.len(),
@@ -300,14 +300,14 @@ async fn test_multi_process_training_round_with_real_proofs() {
                                         )
                                         .await
                                         {
-                                            log::error!(
+                                            tracing::error!(
                                                 "{}: Failed to send gradient directly: {}",
                                                 wid, e,
                                             );
                                         }
 
                                         steps_completed += 1;
-                                        log::info!(
+                                        tracing::info!(
                                             "{}: Gradient sent for round {} (steps: {})",
                                             wid,
                                             round_id,
@@ -315,7 +315,7 @@ async fn test_multi_process_training_round_with_real_proofs() {
                                         );
                                     }
                                     Err(e) => {
-                                        log::error!(
+                                        tracing::error!(
                                             "{}: Training step failed: {}",
                                             wid,
                                             e,
@@ -324,7 +324,7 @@ async fn test_multi_process_training_round_with_real_proofs() {
                                 }
                             }
                             TrainingMessage::RoundComplete { round_id, .. } => {
-                                log::info!("{}: Round {} completed", wid, round_id);
+                                tracing::info!("{}: Round {} completed", wid, round_id);
                                 // Worker can exit after round completes
                                 return steps_completed;
                             }
@@ -335,20 +335,20 @@ async fn test_multi_process_training_round_with_real_proofs() {
                         // Heartbeat pongs — ignore
                     }
                     Ok(Some(NetworkEvent::PeerDiscovered(peer))) => {
-                        log::info!("{}: Discovered peer {}", wid, peer.id);
+                        tracing::info!("{}: Discovered peer {}", wid, peer.id);
                     }
                     Ok(Some(NetworkEvent::Error { error, .. })) => {
-                        log::warn!("{}: Network error: {}", wid, error);
+                        tracing::warn!("{}: Network error: {}", wid, error);
                     }
                     Ok(Some(_)) => {
                         // Other events — ignore
                     }
                     Ok(None) => {
-                        log::warn!("{}: Event stream ended", wid);
+                        tracing::warn!("{}: Event stream ended", wid);
                         return steps_completed;
                     }
                     Err(_) => {
-                        log::warn!("{}: Timed out waiting for event", wid);
+                        tracing::warn!("{}: Timed out waiting for event", wid);
                         return steps_completed;
                     }
                 }
@@ -366,7 +366,7 @@ async fn test_multi_process_training_round_with_real_proofs() {
     let registration_start = std::time::Instant::now();
     loop {
         let stats = orchestrator.worker_stats();
-        log::info!(
+        tracing::info!(
             "Waiting for workers: total={}, available={}",
             stats.total, stats.available
         );
@@ -382,7 +382,7 @@ async fn test_multi_process_training_round_with_real_proofs() {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    log::info!("All 3 workers registered, starting training round...");
+    tracing::info!("All 3 workers registered, starting training round...");
 
     // ── 6. Start training round ────────────────────────────────────
     let initial_model = MlpModel::new(
@@ -401,7 +401,7 @@ async fn test_multi_process_training_round_with_real_proofs() {
         .await
         .expect("Failed to start training round");
 
-    log::info!("Round {} started, waiting for completion...", round_id);
+    tracing::info!("Round {} started, waiting for completion...", round_id);
 
     // ── 7. Wait for round to complete ──────────────────────────────
     let round_timeout = Duration::from_secs(180); // ZK proof gen takes time
@@ -411,7 +411,7 @@ async fn test_multi_process_training_round_with_real_proofs() {
             match event {
                 OrchestratorEvent::GradientReceived { round_id: rid, peer_id } => {
                     gradients_received += 1;
-                    log::info!(
+                    tracing::info!(
                         "Aggregator: Gradient {}/3 received from {} (round {})",
                         gradients_received, peer_id, rid,
                     );
@@ -420,7 +420,7 @@ async fn test_multi_process_training_round_with_real_proofs() {
                     round_id: rid,
                     result_hash,
                 } => {
-                    log::info!(
+                    tracing::info!(
                         "Round {} completed! result_hash={}",
                         rid,
                         hex::encode(&result_hash[..8]),
@@ -441,13 +441,13 @@ async fn test_multi_process_training_round_with_real_proofs() {
                     peer_id,
                     reason,
                 } => {
-                    log::warn!(
+                    tracing::warn!(
                         "Gradient rejected from {} in round {}: {}",
                         peer_id, rid, reason,
                     );
                 }
                 OrchestratorEvent::WorkerJoined { peer_id } => {
-                    log::info!("Aggregator: Worker joined: {}", peer_id);
+                    tracing::info!("Aggregator: Worker joined: {}", peer_id);
                 }
                 _ => {}
             }
@@ -462,7 +462,7 @@ async fn test_multi_process_training_round_with_real_proofs() {
             assert_eq!(rid, round_id, "Round ID should match");
             assert_ne!(result_hash, [0u8; 32], "Result hash should be non-zero");
             assert_eq!(gradients_count, 3, "Should have received 3 gradients");
-            log::info!(
+            tracing::info!(
                 "SUCCESS: Round {} completed with {} gradients, hash={}",
                 rid,
                 gradients_count,
@@ -493,7 +493,7 @@ async fn test_multi_process_training_round_with_real_proofs() {
                     "Worker-{} should have completed at least 1 step, got {}",
                     i, steps,
                 );
-                log::info!("Worker-{} completed {} steps", i, steps);
+                tracing::info!("Worker-{} completed {} steps", i, steps);
             }
             Ok(Err(e)) => {
                 // JoinError — task panicked
@@ -502,14 +502,14 @@ async fn test_multi_process_training_round_with_real_proofs() {
             Err(_) => {
                 // Worker didn't finish in time — that's OK, it may be waiting
                 // for more events. The important thing is the round completed.
-                log::info!("Worker-{} still running (round completed on aggregator side)", i);
+                tracing::info!("Worker-{} still running (round completed on aggregator side)", i);
             }
         }
     }
 
     // Clean up
     orchestrator.stop();
-    log::info!("Test complete: multi-process training round successful!");
+    tracing::info!("Test complete: multi-process training round successful!");
 }
 
 // ============================================================================
@@ -520,7 +520,7 @@ async fn test_multi_process_training_round_with_real_proofs() {
 /// even with a slightly delayed start (simulating process startup jitter).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_staggered_worker_startup() {
-    let _ = env_logger::builder().is_test(true).try_init();
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
     let agg_port = get_available_port();
     let agg_addr: SocketAddr = format!("127.0.0.1:{}", agg_port).parse().unwrap();
@@ -610,7 +610,7 @@ async fn test_staggered_worker_startup() {
                 }))
                 .await;
 
-            log::info!("Staggered worker-{} connected (delay={:?})", i, delay);
+            tracing::info!("Staggered worker-{} connected (delay={:?})", i, delay);
         });
     }
 
@@ -620,7 +620,7 @@ async fn test_staggered_worker_startup() {
     loop {
         let stats = orchestrator.worker_stats();
         if stats.available >= 2 {
-            log::info!(
+            tracing::info!(
                 "Staggered test: {}/{} workers registered",
                 stats.available,
                 3
@@ -653,7 +653,7 @@ async fn test_staggered_worker_startup() {
         result.err(),
     );
 
-    log::info!(
+    tracing::info!(
         "Staggered worker test passed: round {} started",
         result.unwrap()
     );
@@ -667,7 +667,7 @@ async fn test_staggered_worker_startup() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_aggregator_rejects_insufficient_workers() {
-    let _ = env_logger::builder().is_test(true).try_init();
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
     let agg_port = get_available_port();
     let agg_addr: SocketAddr = format!("127.0.0.1:{}", agg_port).parse().unwrap();
@@ -756,7 +756,7 @@ async fn test_aggregator_rejects_insufficient_workers() {
         "Should not start round with only 1 worker when min=3",
     );
 
-    log::info!(
+    tracing::info!(
         "Correctly rejected round start: {:?}",
         result.err().unwrap()
     );
@@ -772,7 +772,7 @@ async fn test_aggregator_rejects_insufficient_workers() {
 /// receives it and registers the worker. No ZK proofs involved.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_tcp_connectivity_and_worker_registration() {
-    let _ = env_logger::builder().is_test(true).try_init();
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
     let agg_port = get_available_port();
     let agg_addr: SocketAddr = format!("127.0.0.1:{}", agg_port).parse().unwrap();
@@ -863,7 +863,7 @@ async fn test_tcp_connectivity_and_worker_registration() {
     loop {
         let stats = orchestrator.worker_stats();
         if stats.total >= 3 {
-            log::info!("All 3 workers registered via TCP");
+            tracing::info!("All 3 workers registered via TCP");
             break;
         }
 
@@ -873,7 +873,7 @@ async fn test_tcp_connectivity_and_worker_registration() {
         {
             if let Some(OrchestratorEvent::WorkerJoined { peer_id }) = event {
                 worker_joined_count += 1;
-                log::info!(
+                tracing::info!(
                     "WorkerJoined event: {} ({}/3)",
                     peer_id, worker_joined_count
                 );
@@ -897,5 +897,5 @@ async fn test_tcp_connectivity_and_worker_registration() {
     );
 
     orchestrator.stop();
-    log::info!("TCP connectivity test passed!");
+    tracing::info!("TCP connectivity test passed!");
 }

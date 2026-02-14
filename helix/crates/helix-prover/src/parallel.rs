@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use super::chunking::{ChunkId, ComputationChunk};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tracing::{debug, error, info, instrument, warn};
 
 use crate::pipeline::ProverPipeline;
 use crate::provers::ivc_circuit::IVCStepCircuit;
@@ -213,7 +214,7 @@ impl WorkerDeque {
     /// Push a task to the local end (LIFO).
     fn push(&self, task: ProofTask) {
         let Ok(mut tasks) = self.tasks.lock() else {
-            tracing::error!("Worker {} deque lock poisoned on push", self.worker_id);
+            error!("Worker {} deque lock poisoned on push", self.worker_id);
             return;
         };
         tasks.push(task);
@@ -470,7 +471,7 @@ impl ParallelProver {
             match pipeline.setup(&IVCStepCircuit::default()) {
                 Ok(()) => Arc::new(RwLock::new(Some(pipeline))),
                 Err(e) => {
-                    tracing::error!("Failed to setup shared IVC pipeline: {e}");
+                    error!("Failed to setup shared IVC pipeline: {e}");
                     Arc::new(RwLock::new(None))
                 }
             }
@@ -491,6 +492,7 @@ impl ParallelProver {
     }
 
     /// Submits a chunk for proving.
+    #[instrument(skip_all, fields(chunk_id = chunk.id.0, priority))]
     pub fn submit(&self, chunk: ComputationChunk, priority: u32) {
         let task = ProofTask::new(chunk.clone(), priority);
 
@@ -519,6 +521,7 @@ impl ParallelProver {
     }
 
     /// Submits multiple chunks.
+    #[instrument(skip_all, fields(batch_size = chunks.len()))]
     pub fn submit_batch(&self, chunks: Vec<ComputationChunk>) {
         for (i, chunk) in chunks.into_iter().enumerate() {
             // Assign affinity based on chunk index for better locality.
@@ -554,6 +557,7 @@ impl ParallelProver {
     }
 
     /// Starts the worker threads.
+    #[instrument(skip_all, fields(num_threads = self.config.num_threads))]
     pub fn start(&self) {
         if self.running.swap(true, Ordering::SeqCst) {
             return; // Already running.
@@ -562,7 +566,7 @@ impl ParallelProver {
         self.shutdown.store(false, Ordering::SeqCst);
 
         let Ok(mut workers) = self.workers.lock() else {
-            tracing::error!("Workers lock poisoned, cannot start");
+            error!("Workers lock poisoned, cannot start");
             return;
         };
         workers.clear();
@@ -641,6 +645,7 @@ impl ParallelProver {
     ///
     /// Uses the configured `proof_timeout_secs` as a timeout to prevent infinite hangs
     /// if a worker thread panics or dies silently.
+    #[instrument(skip_all, fields(chunk_id = chunk_id.0))]
     pub fn wait_for(&self, chunk_id: ChunkId) -> Option<ChunkProof> {
         self.wait_for_timeout(chunk_id, Duration::from_secs(self.config.proof_timeout_secs))
     }
@@ -688,7 +693,7 @@ impl ParallelProver {
                 let proofs = self.get_all_proofs();
                 let (completed, failed, total) = self.completion_summary();
 
-                tracing::error!(
+                error!(
                     completed,
                     failed,
                     total,
@@ -712,7 +717,7 @@ impl ParallelProver {
             }
 
             let status = self.status.read().unwrap_or_else(|e| {
-                tracing::error!("Status lock poisoned: {e}");
+                error!("Status lock poisoned: {e}");
                 e.into_inner()
             });
             let all_done = status
@@ -726,7 +731,7 @@ impl ParallelProver {
                 let total = proofs.len() + failures.len();
 
                 if proofs.is_empty() && !failures.is_empty() {
-                    tracing::error!(
+                    error!(
                         num_failures = failures.len(),
                         "All proofs in batch failed"
                     );
@@ -742,7 +747,7 @@ impl ParallelProver {
                     if success_rate < self.config.min_success_rate {
                         let required_pct = self.config.min_success_rate * 100.0;
                         let actual_pct = success_rate * 100.0;
-                        tracing::error!(
+                        error!(
                             succeeded = proofs.len(),
                             failed = failures.len(),
                             success_rate = %format!("{actual_pct:.1}%"),
@@ -766,7 +771,7 @@ impl ParallelProver {
                 }
 
                 if !failures.is_empty() {
-                    tracing::warn!(
+                    warn!(
                         succeeded = proofs.len(),
                         failed = failures.len(),
                         "Batch completed with partial failures"
@@ -924,7 +929,7 @@ impl ParallelProver {
                         "Per-proof timeout ({}s) exceeded after {} attempts",
                         proof_timeout_secs, attempt
                     );
-                    tracing::error!(
+                    error!(
                         chunk_id = task.chunk.id.0,
                         timeout_secs = proof_timeout_secs,
                         attempts = attempt,
@@ -934,7 +939,7 @@ impl ParallelProver {
                 }
 
                 if attempt > 0 {
-                    tracing::info!(
+                    info!(
                         chunk_id = task.chunk.id.0,
                         attempt,
                         max_retries,
@@ -994,7 +999,7 @@ impl ParallelProver {
                         succeeded = true;
 
                         if attempt > 0 {
-                            tracing::info!(
+                            info!(
                                 chunk_id = task.chunk.id.0,
                                 attempt,
                                 elapsed_ms,
@@ -1004,7 +1009,7 @@ impl ParallelProver {
                         break;
                     }
                     Err(e) => {
-                        tracing::error!(
+                        error!(
                             chunk_id = task.chunk.id.0,
                             attempt,
                             max_retries,
@@ -1017,7 +1022,7 @@ impl ParallelProver {
             }
 
             if !succeeded {
-                tracing::error!(
+                error!(
                     chunk_id = task.chunk.id.0,
                     error = %last_error,
                     attempts = max_retries + 1,
@@ -1115,7 +1120,7 @@ pub fn prove_batch(chunks: Vec<ComputationChunk>, config: ParallelConfig) -> Res
     let failures = prover.collect_failures();
     prover.stop();
 
-    tracing::info!(
+    info!(
         succeeded = proofs.len(),
         failed = failures.len(),
         total_time_ms,

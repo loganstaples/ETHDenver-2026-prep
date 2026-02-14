@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use tracing::{debug, instrument};
 
 use crate::error::{MPCError, MPCResult};
 use crate::types::{MPCConfig, MPCPhase, PartyId};
@@ -185,12 +186,14 @@ impl PartyHealthMonitor {
     }
 
     /// Records a heartbeat from a party.
+    #[instrument(skip_all, level = "trace", fields(party = %party_id))]
     pub fn record_heartbeat(&mut self, party_id: &PartyId) {
         if let Some(health) = self.parties.get_mut(party_id) {
             health.last_seen = Instant::now();
             health.missed_heartbeats = 0;
 
             if health.status == HealthStatus::Degraded {
+                debug!(party = %party_id, "Party recovered from degraded status");
                 health.status = HealthStatus::Healthy;
             }
         }
@@ -204,6 +207,7 @@ impl PartyHealthMonitor {
     }
 
     /// Runs a health check sweep and returns status changes.
+    #[instrument(skip_all, level = "debug", fields(phase = ?self.current_phase, step = self.current_step))]
     pub fn check(&mut self) -> HealthCheckResult {
         let now = Instant::now();
         let mut events = Vec::new();

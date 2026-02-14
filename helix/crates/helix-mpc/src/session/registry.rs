@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info, warn, instrument};
 
 use crate::error::{MPCError, MPCResult};
 use crate::types::PartyId;
@@ -158,6 +159,7 @@ impl PartyRegistry {
     }
 
     /// Registers a new party or updates an existing one.
+    #[instrument(skip_all, level = "info", fields(party = %party_id, addr = %addr))]
     pub fn register(
         &self,
         party_id: PartyId,
@@ -189,6 +191,7 @@ impl PartyRegistry {
                 existing.node_peer_id = node_peer_id;
             }
         } else {
+            info!(party = %party_id, addr = %addr, "New party registered");
             parties.insert(
                 party_id.clone(),
                 RegisteredParty {
@@ -209,8 +212,15 @@ impl PartyRegistry {
     }
 
     /// Removes a party from the registry.
+    #[instrument(skip_all, level = "info", fields(party = %party_id))]
     pub fn deregister(&self, party_id: &PartyId) -> bool {
-        self.parties.write().remove(party_id).is_some()
+        let removed = self.parties.write().remove(party_id).is_some();
+        if removed {
+            info!(party = %party_id, "Party deregistered");
+        } else {
+            debug!(party = %party_id, "Deregister called for unknown party");
+        }
+        removed
     }
 
     /// Updates a party's heartbeat timestamp.
@@ -273,6 +283,7 @@ impl PartyRegistry {
     ///
     /// Returns a vector of `(PartyId, SocketAddr)` sorted by reputation
     /// (highest first). Returns an error if not enough eligible parties exist.
+    #[instrument(skip_all, level = "info", fields(requested = criteria.num_parties))]
     pub fn select_parties(
         &self,
         criteria: &SelectionCriteria,
@@ -291,6 +302,11 @@ impl PartyRegistry {
             .collect();
 
         if eligible.len() < criteria.num_parties {
+            warn!(
+                required = criteria.num_parties,
+                available = eligible.len(),
+                "Insufficient eligible parties for session"
+            );
             return Err(MPCError::InsufficientParties {
                 required: criteria.num_parties,
                 available: eligible.len(),
@@ -305,11 +321,17 @@ impl PartyRegistry {
                 .then_with(|| a.registered_at.cmp(&b.registered_at))
         });
 
-        Ok(eligible
+        let selected: Vec<(PartyId, SocketAddr)> = eligible
             .iter()
             .take(criteria.num_parties)
             .map(|p| (p.party_id.clone(), p.addr))
-            .collect())
+            .collect();
+        info!(
+            selected = selected.len(),
+            eligible = eligible.len(),
+            "Parties selected for MPC session"
+        );
+        Ok(selected)
     }
 
     /// Removes stale parties that haven't been seen within the TTL.

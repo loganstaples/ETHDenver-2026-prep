@@ -197,12 +197,12 @@ impl MpcSessionOrchestrator {
             PartyCapabilities::default(),
             Some(peer_id.0.clone()),
         ) {
-            log::warn!("Failed to register party in MPC registry: {}", e);
+            tracing::warn!("Failed to register party in MPC registry: {}", e);
             self.mapping.deregister(peer_id);
             return None;
         }
 
-        log::info!(
+        tracing::info!(
             "MPC party registered: peer={} -> party_index={}",
             peer_id, party_index,
         );
@@ -217,7 +217,7 @@ impl MpcSessionOrchestrator {
             self.registry.deregister(&party);
             self.mapping.deregister(peer_id);
 
-            log::info!(
+            tracing::info!(
                 "MPC party deregistered: peer={} (was party_index={})",
                 peer_id, party_index,
             );
@@ -268,7 +268,7 @@ impl MpcSessionOrchestrator {
         let selected_parties = match self.registry.select_parties(&criteria) {
             Ok(parties) => parties,
             Err(e) => {
-                log::warn!("Failed to select MPC parties: {}", e);
+                tracing::warn!("Failed to select MPC parties: {}", e);
                 return None;
             }
         };
@@ -280,7 +280,7 @@ impl MpcSessionOrchestrator {
         for (party_id, _addr) in &selected_parties {
             // Assign party to this session in the registry.
             if let Err(e) = self.registry.assign_to_session(party_id, &session_id) {
-                log::warn!("Failed to assign party {} to session: {}", party_id, e);
+                tracing::warn!("Failed to assign party {} to session: {}", party_id, e);
                 continue;
             }
 
@@ -332,7 +332,7 @@ impl MpcSessionOrchestrator {
             active: true,
         });
 
-        log::info!(
+        tracing::info!(
             "MPC session started: id={}, round={}, parties={}",
             session_id, round_id, result.len(),
         );
@@ -345,7 +345,7 @@ impl MpcSessionOrchestrator {
         if let Some(ref mut session) = self.active_session {
             session.active = false;
             let duration = session.started_at.elapsed();
-            log::info!(
+            tracing::info!(
                 "MPC session completed: id={}, round={}, duration={:.1}s",
                 session.session_id, session.round_id, duration.as_secs_f64(),
             );
@@ -364,7 +364,7 @@ impl MpcSessionOrchestrator {
     /// Fails the current MPC session with an error reason.
     pub fn fail_session(&mut self, reason: &str) {
         if let Some(ref session) = self.active_session {
-            log::error!(
+            tracing::error!(
                 "MPC session failed: id={}, round={}, reason={}",
                 session.session_id, session.round_id, reason,
             );
@@ -442,7 +442,7 @@ impl MpcSessionOrchestrator {
             if let Some(idx_str) = party_id.0.strip_prefix("party-") {
                 if let Ok(idx) = idx_str.parse::<usize>() {
                     if let Some(pid) = self.mapping.peer_id(idx) {
-                        log::info!("Stale MPC party cleaned up: peer={}, party_index={}", pid, idx);
+                        tracing::info!("Stale MPC party cleaned up: peer={}, party_index={}", pid, idx);
                     }
                 }
             }

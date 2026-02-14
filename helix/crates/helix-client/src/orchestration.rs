@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -124,6 +124,7 @@ impl OrchestratorConfig {
     /// Validate the configuration for production safety.
     ///
     /// Rejects known dev private keys when the RPC URL points to a non-local network.
+    #[instrument(skip_all)]
     pub fn validate(&self) -> Result<()> {
         let is_local = self.eth_rpc_url.contains("localhost")
             || self.eth_rpc_url.contains("127.0.0.1");
@@ -272,6 +273,7 @@ impl TrainingOrchestrator {
     /// 5. Wait for workers to connect
     /// 6. Run training rounds with proof submission
     /// 7. Clean up all processes
+    #[instrument(skip_all)]
     pub async fn train(&mut self) -> Result<TrainingResult> {
         let start = Instant::now();
         let mut tx_hashes = Vec::new();
@@ -422,6 +424,7 @@ impl TrainingOrchestrator {
     // =======================================================================
 
     /// Start a local Anvil instance.
+    #[instrument(skip_all)]
     pub async fn start_anvil(&mut self) -> Result<()> {
         info!("Starting Anvil on port {}...", self.config.anvil_port);
 
@@ -481,6 +484,7 @@ impl TrainingOrchestrator {
     ///
     /// Runs `deployV3WithMock()` for the demo (uses MockVerifier for speed).
     /// Parses the broadcast JSON to extract deployed contract addresses.
+    #[instrument(skip_all)]
     pub async fn deploy_contracts(&mut self) -> Result<()> {
         info!("Deploying contracts via forge script...");
 
@@ -700,6 +704,7 @@ impl TrainingOrchestrator {
     // =======================================================================
 
     /// Spawn aggregator + worker nodes as child processes with health tracking.
+    #[instrument(skip_all)]
     pub async fn start_network(&mut self) -> Result<()> {
         let (d_in, d_hid, d_out) = self.config.model_dims;
 
@@ -815,6 +820,7 @@ impl TrainingOrchestrator {
     ///
     /// Returns once all requested workers have connected, or on timeout returns
     /// a partial success if at least one worker is available.
+    #[instrument(skip_all)]
     pub async fn wait_for_workers(&mut self) -> Result<()> {
         info!("Waiting for {} workers to connect...", self.config.workers);
 
@@ -876,6 +882,7 @@ impl TrainingOrchestrator {
     // =======================================================================
 
     /// Trigger a training round via the aggregator's HTTP API.
+    #[instrument(skip_all)]
     pub async fn trigger_round(&self) -> Result<serde_json::Value> {
         let url = format!("http://127.0.0.1:{}/round/start", self.config.http_port);
         let resp = self
@@ -891,6 +898,7 @@ impl TrainingOrchestrator {
     }
 
     /// Poll the aggregator until the current round completes.
+    #[instrument(skip_all, fields(round))]
     pub async fn wait_for_round_completion(&self, round: u32) -> Result<serde_json::Value> {
         let deadline = Instant::now() + self.config.round_timeout;
 
@@ -923,6 +931,7 @@ impl TrainingOrchestrator {
     }
 
     /// Initialize the ZK prover and training state for real proof generation.
+    #[instrument(skip_all)]
     fn initialize_prover(&mut self) -> Result<()> {
         use helix_prover::{MLTrainingProverV2, V2ProverConfig};
         use crate::demo::real_training::TrainingState;
@@ -1113,6 +1122,7 @@ impl TrainingOrchestrator {
     /// - Pings the aggregator's `/health` endpoint when applicable
     /// - Automatically restarts crashed processes (up to `max_restarts`)
     /// - Captures stderr output from crashed processes for diagnostics
+    #[instrument(skip_all)]
     pub fn check_process_health(&mut self) -> Result<Vec<ProcessHealthReport>> {
         let mut reports = Vec::new();
         let mut to_restart: Vec<(String, String, u16, u32)> = Vec::new();
@@ -1212,6 +1222,7 @@ impl TrainingOrchestrator {
     }
 
     /// Check aggregator health via HTTP endpoint.
+    #[instrument(skip_all)]
     pub async fn check_aggregator_health(&self) -> Result<bool> {
         let url = format!("http://127.0.0.1:{}/health", self.config.http_port);
 
@@ -1236,6 +1247,7 @@ impl TrainingOrchestrator {
     // =======================================================================
 
     /// Shut down all managed processes (nodes + Anvil).
+    #[instrument(skip_all)]
     pub async fn shutdown(&mut self) -> Result<()> {
         info!("Shutting down orchestrator...");
 

@@ -1531,7 +1531,7 @@ impl TrainingCoordinator {
 
         let (agg_proof_bytes, agg_proof_pis) = if submissions_with_proofs.is_empty() {
             if !round_for_proofs.submissions.is_empty() {
-                log::warn!(
+                tracing::warn!(
                     "No submissions have valid proofs with 8 public inputs \
                      ({} submissions total, {} with non-empty proofs). \
                      Proof aggregation skipped.",
@@ -1584,14 +1584,14 @@ impl TrainingCoordinator {
                 })
                 .collect();
 
-            log::info!(
+            tracing::info!(
                 "Aggregating {} participant proofs via RLCAggregationProver",
                 training_results.len(),
             );
 
             match helix_prover::BatchProver::aggregate_training_proofs(&training_results) {
                 Ok(agg) => {
-                    log::info!(
+                    tracing::info!(
                         "Proof aggregation succeeded: {} steps, proof size {} bytes",
                         agg.num_steps,
                         agg.proof.len(),
@@ -1600,7 +1600,7 @@ impl TrainingCoordinator {
                     (agg.proof, evm_pis)
                 }
                 Err(e) => {
-                    log::error!("Proof aggregation failed: {e}");
+                    tracing::error!("Proof aggregation failed: {e}");
                     (vec![], vec![])
                 }
             }

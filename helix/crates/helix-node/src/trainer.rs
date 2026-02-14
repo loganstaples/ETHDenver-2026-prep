@@ -768,6 +768,7 @@ impl Trainer {
     /// 6. Generate Halo2 proof via MLTrainingProverV2 (with EVM output)
     ///
     /// Returns an error if the accumulated error budget is exceeded.
+    #[tracing::instrument(skip_all)]
     pub fn train_step(&mut self, x: &[f64], target: &[f64]) -> anyhow::Result<ProvedStep> {
         assert_eq!(x.len(), self.model.d_in, "input dimension mismatch");
         assert_eq!(target.len(), self.model.d_out, "target dimension mismatch");

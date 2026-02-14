@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use tracing::{info, instrument};
+
 use crate::beaver::dealer::TrustedDealer;
 use crate::beaver::pool::BeaverPool;
 use crate::error::{MPCError, MPCResult};
@@ -47,6 +49,7 @@ pub struct ParticipantInfo {
 
 impl MPCSession {
     /// Creates a new MPC session.
+    #[instrument(skip_all, level = "info")]
     pub fn new(config: MPCConfig, session_id: impl Into<String>) -> MPCResult<Self> {
         config.validate().map_err(MPCError::InvalidConfig)?;
 
@@ -58,6 +61,8 @@ impl MPCSession {
             .map(|i| BeaverPool::new(i, n, config.beaver_batch_size))
             .collect();
 
+        let session_id = session_id.into();
+        info!(session_id = %session_id, num_parties = n, "MPC session created");
         Ok(Self {
             config,
             phase: MPCPhase::Preprocessing,
@@ -65,7 +70,7 @@ impl MPCSession {
             pools,
             model_shares: vec![None; n],
             current_step: 0,
-            session_id: session_id.into(),
+            session_id,
             channel,
         })
     }
@@ -78,6 +83,7 @@ impl MPCSession {
     /// 3. Synchronize random seed contributions
     ///
     /// Returns a `ConnectedSession` containing the agreed parameters.
+    #[instrument(skip_all, level = "info")]
     pub async fn connect(
         config: MPCConfig,
         session_id: impl Into<String>,
@@ -146,6 +152,7 @@ impl MPCSession {
     }
 
     /// Registers a participant in the session.
+    #[instrument(skip_all, level = "info", fields(party = %party_id, index = index))]
     pub fn register_participant(
         &mut self,
         party_id: PartyId,
@@ -164,6 +171,7 @@ impl MPCSession {
             return Err(MPCError::DuplicateParty(party_id));
         }
 
+        info!(party = %party_id, index = index, role = ?role, stake = stake, "Participant registered");
         self.participants.insert(
             party_id.clone(),
             ParticipantInfo {
@@ -184,6 +192,7 @@ impl MPCSession {
     }
 
     /// Runs the preprocessing phase: generates Beaver triples.
+    #[instrument(skip_all, level = "info", fields(hidden_dim = hidden_dim, num_layers = num_layers))]
     pub fn preprocess(
         &mut self,
         hidden_dim: usize,
@@ -205,10 +214,12 @@ impl MPCSession {
         }
 
         self.phase = MPCPhase::InputSharing;
+        info!("Preprocessing complete, transitioning to InputSharing phase");
         Ok(())
     }
 
     /// Distributes model weight shares to participants.
+    #[instrument(skip_all, level = "info", fields(num_shares = shares.len()))]
     pub fn distribute_model_shares(
         &mut self,
         shares: Vec<ModelShare>,
@@ -232,6 +243,7 @@ impl MPCSession {
         }
 
         self.phase = MPCPhase::Computation;
+        info!("Model shares distributed, transitioning to Computation phase");
         Ok(())
     }
 
@@ -273,6 +285,7 @@ impl MPCSession {
     }
 
     /// Advances the training step counter and checks if re-sharing is needed.
+    #[instrument(skip_all, level = "debug", fields(step = self.current_step))]
     pub fn advance_step(&mut self) -> MPCResult<bool> {
         self.current_step += 1;
 

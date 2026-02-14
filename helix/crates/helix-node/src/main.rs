@@ -18,7 +18,8 @@ use std::time::Duration;
 
 use helix_node::config::NodeConfig;
 use helix_node::runtime::{shutdown_signal, NodeRuntime};
-use log::{error, info};
+use tracing::{error, info};
+use tracing_subscriber::{fmt, EnvFilter};
 
 fn print_usage() {
     eprintln!(
@@ -95,12 +96,15 @@ async fn main() {
         }
     };
 
-    // Initialize logging
+    // Initialize tracing
     let default_filter = if args.verbose { "debug" } else { "info" };
-    if std::env::var("RUST_LOG").is_err() {
-        std::env::set_var("RUST_LOG", default_filter);
-    }
-    env_logger::init();
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(default_filter));
+    fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .with_thread_ids(true)
+        .init();
 
     // Load and validate config
     info!("Loading configuration from {}", args.config_path);

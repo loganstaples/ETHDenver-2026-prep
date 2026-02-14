@@ -12,6 +12,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::RwLock;
+use tracing::{info, instrument, warn};
 
 /// RPC Error types
 #[derive(Debug, Error)]
@@ -714,10 +715,13 @@ impl HelixRpcClient {
     }
 
     /// Connect to the node and verify availability
+    #[instrument(skip_all)]
     pub async fn connect(&self) -> Result<(), RpcError> {
+        info!(endpoint = %self.config.endpoint, "Connecting to HELIX node RPC");
         let health = self.health_check().await?;
 
         if !health.healthy {
+            warn!("Node reports unhealthy");
             return Err(RpcError::NodeUnavailable("Node reports unhealthy".to_string()));
         }
 
@@ -729,6 +733,7 @@ impl HelixRpcClient {
             *self.capabilities.write().await = Some(caps);
         }
 
+        info!("RPC client connected successfully");
         Ok(())
     }
 
@@ -743,6 +748,7 @@ impl HelixRpcClient {
     }
 
     /// Send JSON-RPC request with exponential backoff and circuit breaker
+    #[instrument(skip_all, fields(%method))]
     async fn send_request<P: Serialize, R: for<'de> Deserialize<'de>>(
         &self,
         method: &str,
@@ -826,12 +832,15 @@ impl HelixRpcClient {
         // All retries exhausted — record failure in circuit breaker
         self.circuit_breaker.write().await.record_failure();
 
-        Err(last_error.unwrap_or_else(|| RpcError::ConnectionFailed("Unknown error".to_string())))
+        let err = last_error.unwrap_or_else(|| RpcError::ConnectionFailed("Unknown error".to_string()));
+        warn!(error = %err, "RPC call failed after all retries");
+        Err(err)
     }
 
     // ==================== Health & Status ====================
 
     /// Health check
+    #[instrument(skip_all)]
     pub async fn health_check(&self) -> Result<HealthStatus, RpcError> {
         self.send_request("helix_health", ()).await
     }
@@ -849,6 +858,7 @@ impl HelixRpcClient {
     // ==================== Training Operations ====================
 
     /// Get current training status
+    #[instrument(skip_all)]
     pub async fn get_training_status(&self) -> Result<TrainingStatus, RpcError> {
         self.send_request("helix_getTrainingStatus", ()).await
     }
@@ -864,6 +874,7 @@ impl HelixRpcClient {
     }
 
     /// Start training for a model
+    #[instrument(skip_all)]
     pub async fn start_training(
         &self,
         model_id: u64,
@@ -891,6 +902,7 @@ impl HelixRpcClient {
     }
 
     /// Stop training
+    #[instrument(skip_all)]
     pub async fn stop_training(&self, model_id: u64) -> Result<(), RpcError> {
         #[derive(Serialize)]
         struct Params {
@@ -936,6 +948,7 @@ impl HelixRpcClient {
     }
 
     /// Submit proof to blockchain
+    #[instrument(skip_all)]
     pub async fn submit_proof(&self, submission: &ProofSubmission) -> Result<String, RpcError> {
         self.send_request("helix_submitProof", submission).await
     }
@@ -963,6 +976,7 @@ impl HelixRpcClient {
     }
 
     /// Register a new model
+    #[instrument(skip_all)]
     pub async fn register_model(
         &self,
         name: &str,
@@ -1045,6 +1059,7 @@ impl HelixRpcClient {
     }
 
     /// Stake tokens for a model
+    #[instrument(skip_all)]
     pub async fn stake(&self, model_id: u64, amount_eth: f64) -> Result<String, RpcError> {
         #[derive(Serialize)]
         struct Params {
@@ -1056,6 +1071,7 @@ impl HelixRpcClient {
     }
 
     /// Unstake tokens
+    #[instrument(skip_all)]
     pub async fn unstake(&self, model_id: u64) -> Result<String, RpcError> {
         #[derive(Serialize)]
         struct Params {
@@ -1066,6 +1082,7 @@ impl HelixRpcClient {
     }
 
     /// Claim accumulated rewards
+    #[instrument(skip_all)]
     pub async fn claim_rewards(&self, model_id: u64) -> Result<String, RpcError> {
         #[derive(Serialize)]
         struct Params {
@@ -1547,11 +1564,12 @@ impl UnifiedRpcClient {
     ///
     /// In production code, always use this method so misconfigurations are
     /// caught immediately instead of silently running in mock mode.
+    #[instrument(skip_all)]
     pub async fn connect(config: HelixRpcConfig) -> Result<Self, RpcError> {
         let client = HelixRpcClient::new(config.clone())?;
         client.connect().await?;
 
-        tracing::info!("Connected to HELIX node at {}", config.endpoint);
+        info!("Connected to HELIX node at {}", config.endpoint);
         Ok(Self {
             real_client: Some(client),
             mock_client: MockRpcClient::new(),

@@ -422,7 +422,7 @@ impl TcpTransport {
             let msg_len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
 
             if msg_len > MAX_MESSAGE_SIZE {
-                log::error!("Message too large from {:?}: {}", peer_id, msg_len);
+                tracing::error!("Message too large from {:?}: {}", peer_id, msg_len);
                 break;
             }
 
@@ -447,7 +447,7 @@ impl TcpTransport {
                     }
                 }
                 Err(e) => {
-                    log::error!("Failed to deserialize message: {}", e);
+                    tracing::error!("Failed to deserialize message: {}", e);
                 }
             }
         }
@@ -474,7 +474,7 @@ impl TcpTransport {
             let msg_len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
 
             if msg_len > MAX_MESSAGE_SIZE {
-                log::error!("Message too large from {:?}: {}", peer_id, msg_len);
+                tracing::error!("Message too large from {:?}: {}", peer_id, msg_len);
                 return;
             }
 
@@ -499,7 +499,7 @@ impl TcpTransport {
                     }
                 }
                 Err(e) => {
-                    log::error!("Failed to deserialize message: {}", e);
+                    tracing::error!("Failed to deserialize message: {}", e);
                 }
             }
         }
@@ -522,7 +522,7 @@ impl TcpTransport {
                     }
                 }
                 Err(e) => {
-                    log::error!("Failed to serialize message: {}", e);
+                    tracing::error!("Failed to serialize message: {}", e);
                 }
             }
         }
@@ -545,7 +545,7 @@ impl TcpTransport {
                     }
                 }
                 Err(e) => {
-                    log::error!("Failed to serialize message: {}", e);
+                    tracing::error!("Failed to serialize message: {}", e);
                 }
             }
         }
@@ -581,7 +581,7 @@ impl TcpTransport {
                         });
                     }
                     Err(e) => {
-                        log::error!("Accept error: {}", e);
+                        tracing::error!("Accept error: {}", e);
                     }
                 }
             }
@@ -608,7 +608,7 @@ impl TcpTransport {
                     Self::read_loop_tls(read_half, placeholder_id, inbound_tx).await;
                 }
                 Err(e) => {
-                    log::error!("TLS accept error: {}", e);
+                    tracing::error!("TLS accept error: {}", e);
                 }
             }
         } else {
@@ -707,7 +707,7 @@ impl ConnectionPool {
             return true;
         }
         if self.max_pool_size > 0 && addrs.len() >= self.max_pool_size {
-            log::warn!(
+            tracing::warn!(
                 "Connection pool at capacity ({}/{}), rejecting peer {}",
                 addrs.len(),
                 self.max_pool_size,

@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::time::Instant;
 
-use log::{debug, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::network::messages::{ModelDims, PeerId};
 use crate::trainer::MlpModel;

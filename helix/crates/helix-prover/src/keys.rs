@@ -9,6 +9,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use tracing::{debug, error, info, instrument, warn};
 
 /// Identifier for a key set (circuit-specific).
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
@@ -111,6 +112,7 @@ impl InMemoryKeyStore {
     }
 
     /// Stores a key pair.
+    #[instrument(skip_all, fields(key_id = %id))]
     pub fn store(
         &mut self,
         id: KeyId,
@@ -119,9 +121,11 @@ impl InMemoryKeyStore {
         metadata: KeyMetadata,
     ) -> KeyResult<()> {
         if self.proving_keys.contains_key(&id) {
+            warn!(key_id = %id, "Key already exists in memory store");
             return Err(KeyError::AlreadyExists(id));
         }
 
+        debug!(key_id = %id, pk_size = pk.len(), vk_size = vk.len(), "Storing key pair in memory");
         self.proving_keys.insert(id.clone(), pk);
         self.verification_keys.insert(id.clone(), vk);
         self.metadata.insert(id, metadata);
@@ -130,19 +134,27 @@ impl InMemoryKeyStore {
     }
 
     /// Gets the proving key.
+    #[instrument(skip_all, fields(key_id = %id))]
     pub fn get_pk(&self, id: &KeyId) -> KeyResult<&[u8]> {
         self.proving_keys
             .get(id)
             .map(|v| v.as_slice())
-            .ok_or_else(|| KeyError::NotFound(id.clone()))
+            .ok_or_else(|| {
+                debug!(key_id = %id, "Proving key not found in memory store");
+                KeyError::NotFound(id.clone())
+            })
     }
 
     /// Gets the verification key.
+    #[instrument(skip_all, fields(key_id = %id))]
     pub fn get_vk(&self, id: &KeyId) -> KeyResult<&[u8]> {
         self.verification_keys
             .get(id)
             .map(|v| v.as_slice())
-            .ok_or_else(|| KeyError::NotFound(id.clone()))
+            .ok_or_else(|| {
+                debug!(key_id = %id, "Verification key not found in memory store");
+                KeyError::NotFound(id.clone())
+            })
     }
 
     /// Gets key metadata.
@@ -192,6 +204,7 @@ impl FileKeyStore {
     }
 
     /// Stores a key pair to disk.
+    #[instrument(skip_all, fields(key_id = %id, circuit_name, version, k))]
     pub fn store(
         &mut self,
         id: KeyId,
@@ -201,6 +214,7 @@ impl FileKeyStore {
         version: u32,
         k: u32,
     ) -> KeyResult<()> {
+        info!(key_id = %id, pk_size = pk.len(), vk_size = vk.len(), "Storing key pair to disk");
         let key_dir = self.base_dir.join(id.0.clone());
         fs::create_dir_all(&key_dir)?;
 
@@ -244,6 +258,7 @@ impl FileKeyStore {
     }
 
     /// Loads a proving key from disk.
+    #[instrument(skip_all, fields(key_id = %id))]
     pub fn load_pk(&mut self, id: &KeyId) -> KeyResult<Vec<u8>> {
         // Check cache first
         if let Ok(pk) = self.cache.get_pk(id) {
@@ -261,6 +276,7 @@ impl FileKeyStore {
     }
 
     /// Loads a verification key from disk.
+    #[instrument(skip_all, fields(key_id = %id))]
     pub fn load_vk(&mut self, id: &KeyId) -> KeyResult<Vec<u8>> {
         // Check cache first
         if let Ok(vk) = self.cache.get_vk(id) {
@@ -295,22 +311,30 @@ impl FileKeyStore {
     }
 
     /// Verifies key integrity.
+    #[instrument(skip_all, fields(key_id = %id))]
     pub fn verify(&self, id: &KeyId) -> KeyResult<bool> {
         let key_dir = self.index.get(id)
             .ok_or_else(|| KeyError::NotFound(id.clone()))?;
-        
+
         let pk_path = key_dir.join("proving_key.bin");
         let vk_path = key_dir.join("verification_key.bin");
-        
+
         let pk = fs::read(&pk_path)?;
         let vk = fs::read(&vk_path)?;
-        
+
         let metadata = self.load_metadata(id)?;
-        
+
         let pk_hash = Self::hash_bytes(&pk);
         let vk_hash = Self::hash_bytes(&vk);
-        
-        Ok(pk_hash == metadata.pk_hash && vk_hash == metadata.vk_hash)
+
+        let valid = pk_hash == metadata.pk_hash && vk_hash == metadata.vk_hash;
+        if !valid {
+            warn!(key_id = %id, "Key integrity verification failed: hash mismatch");
+        } else {
+            debug!(key_id = %id, "Key integrity verified");
+        }
+
+        Ok(valid)
     }
 
     /// Deletes a key pair.
@@ -432,12 +456,14 @@ pub const HELIX_SRS_SEED: [u8; 32] = *b"HELIX_DETERMINISTIC_SRS_SEED_v1!";
 ///
 /// Uses a deterministic SRS derived from [`HELIX_SRS_SEED`] so that all
 /// provers in the network generate compatible keys for the same circuit.
+#[instrument(skip_all, fields(circuit_name, version, k))]
 pub fn generate_keys_for_circuit<C: helix_circuits::halo2_proofs::plonk::Circuit<helix_circuits::halo2curves::bn256::Fr>>(
     circuit: &C,
     circuit_name: &str,
     version: u32,
     k: u32,
 ) -> CircuitKeys {
+    info!(circuit_name, version, k, "Generating keys for circuit");
     generate_keys_for_circuit_with_seed(circuit, circuit_name, version, k, HELIX_SRS_SEED)
 }
 
@@ -446,6 +472,12 @@ pub fn generate_keys_for_circuit<C: helix_circuits::halo2_proofs::plonk::Circuit
 /// Use this when you need a different SRS than the default (e.g., for testing
 /// or for per-model SRS isolation). Automatically caches the SRS to disk
 /// for fast restarts via [`crate::pipeline::load_or_generate_srs`].
+///
+/// # Panics
+///
+/// Panics if VK or PK generation fails. This indicates a circuit configuration
+/// error (e.g., k too small for the circuit constraints).
+#[instrument(skip_all, fields(circuit_name, version, k))]
 pub fn generate_keys_for_circuit_with_seed<C: helix_circuits::halo2_proofs::plonk::Circuit<helix_circuits::halo2curves::bn256::Fr>>(
     circuit: &C,
     circuit_name: &str,
@@ -458,12 +490,21 @@ pub fn generate_keys_for_circuit_with_seed<C: helix_circuits::halo2_proofs::plon
     let id = KeyId::new(circuit_name, version);
 
     // Load SRS from cache or generate (deterministic — same seed → same SRS)
+    debug!(k, "Loading or generating SRS");
     let (params, _cache_hit) = crate::pipeline::load_or_generate_srs(k, srs_seed, None);
 
     // Generate verification key then proving key
-    let vk = keygen_vk(&params, circuit).expect("keygen_vk failed");
-    let pk = keygen_pk(&params, vk.clone(), circuit).expect("keygen_pk failed");
+    info!(circuit_name, version, k, "Generating VK and PK");
+    let vk = keygen_vk(&params, circuit).unwrap_or_else(|e| {
+        error!(circuit_name, version, k, error = %e, "keygen_vk failed");
+        panic!("keygen_vk failed for circuit '{circuit_name}' v{version} k={k}: {e}");
+    });
+    let pk = keygen_pk(&params, vk.clone(), circuit).unwrap_or_else(|e| {
+        error!(circuit_name, version, k, error = %e, "keygen_pk failed");
+        panic!("keygen_pk failed for circuit '{circuit_name}' v{version} k={k}: {e}");
+    });
 
+    info!(circuit_name, version, k, "Key generation complete");
     CircuitKeys { id, params, pk, vk }
 }
 

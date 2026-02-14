@@ -161,7 +161,7 @@ impl ProofVerifier {
     /// development/testing with an explicit configuration override.
     pub fn new(config: VerificationConfig) -> Self {
         if matches!(config.policy, VerificationPolicy::StructuralOnly) {
-            log::warn!(
+            tracing::warn!(
                 "⚠ VerificationPolicy::StructuralOnly is active — proofs are NOT cryptographically \
                  verified! This provides ZERO security and must only be used for development/testing. \
                  Set policy to VerifyAll (the default) for production use."
@@ -178,7 +178,7 @@ impl ProofVerifier {
     /// Creates a proof verifier with a pre-initialized prover for the given model dimensions.
     pub fn with_model_dims(config: VerificationConfig, d_in: usize, d_hid: usize, d_out: usize) -> Self {
         if matches!(config.policy, VerificationPolicy::StructuralOnly) {
-            log::warn!(
+            tracing::warn!(
                 "⚠ VerificationPolicy::StructuralOnly is active — proofs are NOT cryptographically \
                  verified! This provides ZERO security and must only be used for development/testing. \
                  Set policy to VerifyAll (the default) for production use."

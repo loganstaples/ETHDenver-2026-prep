@@ -206,7 +206,7 @@ impl LocalStorage {
         let to_remove = entries.len() - self.max_checkpoints;
 
         for (round, path) in entries.iter().take(to_remove) {
-            log::info!("GC: removing old checkpoint round_{}", round);
+            tracing::info!("GC: removing old checkpoint round_{}", round);
             let _ = fs::remove_file(path);
             let _ = fs::remove_file(Self::checksum_path(path));
         }

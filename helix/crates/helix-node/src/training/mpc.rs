@@ -650,7 +650,7 @@ impl MPCWorkerHandle {
         x: &[f64],
         target: &[f64],
     ) -> MPCResult<WorkerComputation> {
-        log::warn!(
+        tracing::warn!(
             "MPC SIMULATION: party {} computing on FULL model (not secret shares). \
              This provides NO privacy guarantees.",
             self.party_index

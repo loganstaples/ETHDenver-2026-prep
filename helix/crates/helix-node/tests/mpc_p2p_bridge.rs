@@ -105,7 +105,7 @@ async fn run_event_pump(
                         if *shutdown.borrow() {
                             break;
                         }
-                        log::trace!("Transport recv error (may be normal): {}", e);
+                        tracing::trace!("Transport recv error (may be normal): {}", e);
                     }
                 }
             }

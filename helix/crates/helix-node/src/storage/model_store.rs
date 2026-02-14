@@ -303,7 +303,7 @@ impl LocalModelStore {
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 // No checksum file — cannot verify, but do not fail
-                log::warn!(
+                tracing::warn!(
                     "No checksum sidecar for {}; skipping integrity check",
                     data_path.display()
                 );
@@ -332,7 +332,7 @@ impl ModelStoreBackend for LocalModelStore {
         fs::write(&checksum_path, checksum.as_bytes())?;
 
         let location = path.to_string_lossy().to_string();
-        log::info!(
+        tracing::info!(
             "Stored model_{}/round_{} locally ({} bytes): {}",
             model_id,
             round_id,
@@ -524,10 +524,10 @@ impl ModelStoreBackend for IpfsModelStore {
         // Write to local cache for fast subsequent loads
         let cache_path = self.cache_path(&cid);
         if let Err(e) = fs::write(&cache_path, data) {
-            log::warn!("Failed to write IPFS cache for CID {}: {}", cid, e);
+            tracing::warn!("Failed to write IPFS cache for CID {}: {}", cid, e);
         }
 
-        log::info!(
+        tracing::info!(
             "Stored model_{}/round_{} on IPFS ({} bytes): {}",
             model_id,
             round_id,
@@ -542,7 +542,7 @@ impl ModelStoreBackend for IpfsModelStore {
         // Check local cache first
         let cache_path = self.cache_path(location);
         if cache_path.exists() {
-            log::debug!("IPFS cache hit for CID {}", location);
+            tracing::debug!("IPFS cache hit for CID {}", location);
             return fs::read(&cache_path).map_err(ModelStoreError::from);
         }
 
@@ -551,7 +551,7 @@ impl ModelStoreBackend for IpfsModelStore {
 
         // Populate cache
         if let Err(e) = fs::write(&cache_path, &data) {
-            log::warn!("Failed to populate IPFS cache for CID {}: {}", location, e);
+            tracing::warn!("Failed to populate IPFS cache for CID {}: {}", location, e);
         }
 
         Ok(data)
@@ -762,10 +762,10 @@ impl ModelStoreBackend for S3ModelStore {
         // Populate local cache
         let cache_path = self.cache_path(&key);
         if let Err(e) = fs::write(&cache_path, data) {
-            log::warn!("Failed to write S3 cache for {}: {}", key, e);
+            tracing::warn!("Failed to write S3 cache for {}: {}", key, e);
         }
 
-        log::info!(
+        tracing::info!(
             "Stored model_{}/round_{} on S3 ({} bytes): {}",
             model_id,
             round_id,
@@ -786,7 +786,7 @@ impl ModelStoreBackend for S3ModelStore {
 
         let cache_path = self.cache_path(&cache_key);
         if cache_path.exists() {
-            log::debug!("S3 cache hit for {}", location);
+            tracing::debug!("S3 cache hit for {}", location);
             return fs::read(&cache_path).map_err(ModelStoreError::from);
         }
 
@@ -795,7 +795,7 @@ impl ModelStoreBackend for S3ModelStore {
 
         // Populate cache
         if let Err(e) = fs::write(&cache_path, &data) {
-            log::warn!("Failed to populate S3 cache for {}: {}", location, e);
+            tracing::warn!("Failed to populate S3 cache for {}: {}", location, e);
         }
 
         Ok(data)
@@ -928,7 +928,7 @@ impl ModelStore {
             match IpfsModelStore::new("http://localhost:5001", cache_dir) {
                 Ok(ipfs) => backends.push(Box::new(ipfs)),
                 Err(e) => {
-                    log::warn!("IPFS backend unavailable: {}", e);
+                    tracing::warn!("IPFS backend unavailable: {}", e);
                 }
             }
         }
@@ -941,7 +941,7 @@ impl ModelStore {
             match S3ModelStore::new(bucket, region, cache_dir) {
                 Ok(s3) => backends.push(Box::new(s3)),
                 Err(e) => {
-                    log::warn!("S3 backend unavailable: {}", e);
+                    tracing::warn!("S3 backend unavailable: {}", e);
                 }
             }
         }

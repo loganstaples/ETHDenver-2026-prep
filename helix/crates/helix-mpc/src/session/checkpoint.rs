@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info, instrument};
 
 use crate::error::{MPCError, MPCResult};
 use crate::types::{MPCConfig, MPCPhase, PartyId, PartyRole};
@@ -187,6 +188,10 @@ impl SessionPersistence {
     }
 
     /// Saves a checkpoint to disk.
+    #[instrument(skip_all, level = "info", fields(
+        session_id = %checkpoint.session_id,
+        step = checkpoint.current_step,
+    ))]
     pub fn save(&self, checkpoint: &SessionCheckpoint) -> MPCResult<PathBuf> {
         let filename = format!(
             "{}_step{}.json",
@@ -214,19 +219,30 @@ impl SessionPersistence {
     }
 
     /// Loads the latest checkpoint for a session.
+    #[instrument(skip_all, level = "info", fields(session_id = session_id))]
     pub fn load_latest(&self, session_id: &str) -> MPCResult<Option<SessionCheckpoint>> {
         let latest_path = self.latest_path(session_id);
 
         let filename = match std::fs::read_to_string(&latest_path) {
             Ok(f) => f.trim().to_string(),
-            Err(_) => return Ok(None),
+            Err(_) => {
+                debug!(session_id = session_id, "No checkpoint found for session");
+                return Ok(None);
+            }
         };
 
         let path = self.base_dir.join(&filename);
-        self.load_from_path(&path).map(Some)
+        let checkpoint = self.load_from_path(&path)?;
+        info!(
+            session_id = session_id,
+            step = checkpoint.current_step,
+            "Checkpoint loaded"
+        );
+        Ok(Some(checkpoint))
     }
 
     /// Loads a checkpoint from a specific path.
+    #[instrument(skip_all, level = "debug", fields(path = %path.display()))]
     pub fn load_from_path(&self, path: &Path) -> MPCResult<SessionCheckpoint> {
         let data = std::fs::read(path).map_err(|e| {
             MPCError::SessionError(format!(

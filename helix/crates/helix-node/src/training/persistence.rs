@@ -298,7 +298,7 @@ impl StatePersistence {
         // Prune old checkpoints
         self.prune()?;
 
-        log::info!(
+        tracing::info!(
             "Aggregator snapshot saved: round={}, {} bytes -> {}",
             snapshot.last_completed_round,
             bytes.len(),
@@ -328,7 +328,7 @@ impl StatePersistence {
 
         self.prune()?;
 
-        log::info!(
+        tracing::info!(
             "Worker snapshot saved: step={}, {} bytes -> {}",
             snapshot.steps_completed,
             bytes.len(),
@@ -353,7 +353,7 @@ impl StatePersistence {
         }
 
         let snapshot = AggregatorSnapshot::from_bytes(&bytes)?;
-        log::info!(
+        tracing::info!(
             "Loaded aggregator snapshot: round={}, timestamp={}",
             snapshot.last_completed_round,
             snapshot.timestamp,
@@ -376,7 +376,7 @@ impl StatePersistence {
         }
 
         let snapshot = WorkerSnapshot::from_bytes(&bytes)?;
-        log::info!(
+        tracing::info!(
             "Loaded worker snapshot: step={}, peer={}",
             snapshot.steps_completed,
             snapshot.peer_id,
@@ -421,9 +421,9 @@ impl StatePersistence {
         while checkpoint_files.len() > self.max_checkpoints {
             let (path, _) = checkpoint_files.remove(0);
             if let Err(e) = std::fs::remove_file(&path) {
-                log::warn!("Failed to prune checkpoint {}: {}", path.display(), e);
+                tracing::warn!("Failed to prune checkpoint {}: {}", path.display(), e);
             } else {
-                log::debug!("Pruned old checkpoint: {}", path.display());
+                tracing::debug!("Pruned old checkpoint: {}", path.display());
             }
         }
 

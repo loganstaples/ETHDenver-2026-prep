@@ -137,10 +137,10 @@ impl OnChainPipeline {
 
         // Step 1: Register model if we don't have a model_id
         let model_id = if let Some(id) = state.model_id {
-            log::info!("Using pre-registered model_id={}", id);
+            tracing::info!("Using pre-registered model_id={}", id);
             id
         } else {
-            log::info!("Registering new model on-chain...");
+            tracing::info!("Registering new model on-chain...");
             let min_stake = U256::from_dec_str(&self.config.min_stake_wei)
                 .unwrap_or(U256::from(1_000_000_000_000_000_000u64));
 
@@ -149,7 +149,7 @@ impl OnChainPipeline {
                 .register_model(&self.config.model_ipfs_hash, U256::from(1), min_stake)
                 .await?;
 
-            log::info!(
+            tracing::info!(
                 "Model registered: model_id={}, tx={:?}",
                 model_id,
                 receipt.transaction_hash
@@ -163,14 +163,14 @@ impl OnChainPipeline {
             let stake_amount = U256::from_dec_str(&self.config.stake_amount_wei)
                 .unwrap_or(U256::from(1_000_000_000_000_000_000u64));
 
-            log::info!(
+            tracing::info!(
                 "Staking {} wei for model_id={}...",
                 stake_amount,
                 model_id
             );
             match self.sc_client.stake(model_id, stake_amount).await {
                 Ok(receipt) => {
-                    log::info!(
+                    tracing::info!(
                         "Staked successfully: tx={:?}",
                         receipt.transaction_hash
                     );
@@ -178,7 +178,7 @@ impl OnChainPipeline {
                 }
                 Err(e) => {
                     // Staking may fail if already staked — log but don't fail
-                    log::warn!("Stake transaction failed (may already be staked): {}", e);
+                    tracing::warn!("Stake transaction failed (may already be staked): {}", e);
                     state.staked = true; // Assume staked
                 }
             }
@@ -195,7 +195,7 @@ impl OnChainPipeline {
             .ok_or_else(|| anyhow::anyhow!("Model not registered — call initialize() first"))?;
         drop(state);
 
-        log::info!(
+        tracing::info!(
             "Starting on-chain round for model_id={}, duration={}s",
             model_id,
             self.config.round_duration_secs
@@ -210,7 +210,7 @@ impl OnChainPipeline {
         state.current_round += 1;
         let round = state.current_round;
 
-        log::info!(
+        tracing::info!(
             "Round {} started on-chain: tx={:?}",
             round,
             receipt.transaction_hash
@@ -234,7 +234,7 @@ impl OnChainPipeline {
         worker_proofs: Vec<TrainingProofResultV2>,
     ) -> anyhow::Result<Option<OnChainSubmission>> {
         if worker_proofs.is_empty() {
-            log::warn!("No worker proofs to aggregate for round {}", round_id);
+            tracing::warn!("No worker proofs to aggregate for round {}", round_id);
             return Ok(None);
         }
 
@@ -244,7 +244,7 @@ impl OnChainPipeline {
             .ok_or_else(|| anyhow::anyhow!("Model not registered"))?;
         drop(state);
 
-        log::info!(
+        tracing::info!(
             "Aggregating {} worker proofs for round {} via RLC...",
             worker_proofs.len(),
             round_id
@@ -254,7 +254,7 @@ impl OnChainPipeline {
         let aggregated = BatchProver::aggregate_training_proofs(&worker_proofs)
             .map_err(|e| anyhow::anyhow!("RLC aggregation failed: {}", e))?;
 
-        log::info!(
+        tracing::info!(
             "RLC aggregation succeeded: {} steps, proof size {} bytes",
             aggregated.num_steps,
             aggregated.proof.len()
@@ -285,7 +285,7 @@ impl OnChainPipeline {
         let mut state = self.state.write().await;
         state.proofs_submitted += 1;
 
-        log::info!(
+        tracing::info!(
             "Proof submitted on-chain: tx={}, block={}, gas={}",
             tx_hash,
             block_number,
@@ -318,7 +318,7 @@ impl OnChainPipeline {
             .ok_or_else(|| anyhow::anyhow!("Model not registered — call initialize() first"))?;
         drop(state);
 
-        log::info!(
+        tracing::info!(
             "Finalizing round {} for model_id={} on-chain...",
             round_id,
             model_id,
@@ -332,7 +332,7 @@ impl OnChainPipeline {
         let tx_hash = format!("{:?}", receipt.transaction_hash);
         let gas_used = receipt.gas_used.map(|g| g.as_u64()).unwrap_or(0);
 
-        log::info!(
+        tracing::info!(
             "Round {} finalized on-chain: tx={}, gas={}",
             round_id,
             tx_hash,
@@ -363,11 +363,11 @@ impl OnChainPipeline {
         // Step 2: Finalize if requested (multi-participant rounds)
         if finalize {
             match self.finalize_round(round_id).await {
-                Ok(tx) => log::info!("Round {} finalized: tx={}", round_id, tx),
+                Ok(tx) => tracing::info!("Round {} finalized: tx={}", round_id, tx),
                 Err(e) => {
                     // Finalization may fail if dispute period hasn't ended yet
                     // or if round was auto-finalized by submitProof
-                    log::warn!(
+                    tracing::warn!(
                         "Round {} finalization failed (may be auto-finalized or dispute pending): {}",
                         round_id, e
                     );
@@ -390,7 +390,7 @@ impl OnChainPipeline {
         let model_id = match state.model_id {
             Some(id) => id,
             None => {
-                log::debug!("Proof queue processor: model not registered yet, skipping");
+                tracing::debug!("Proof queue processor: model not registered yet, skipping");
                 return vec![];
             }
         };
@@ -411,7 +411,7 @@ impl OnChainPipeline {
             return vec![];
         }
 
-        log::info!(
+        tracing::info!(
             "Processing {} queued proofs from RPC submissions",
             unsubmitted.len()
         );
@@ -467,7 +467,7 @@ impl OnChainPipeline {
             {
                 Ok(receipt) => {
                     let tx_hash = format!("{:?}", receipt.transaction_hash);
-                    log::info!(
+                    tracing::info!(
                         "Queued proof submitted: model={}, round={}, tx={}",
                         submit_model_id,
                         queued.round_id,
@@ -489,7 +489,7 @@ impl OnChainPipeline {
                     results.push((idx, Ok(tx_hash)));
                 }
                 Err(e) => {
-                    log::error!(
+                    tracing::error!(
                         "Failed to submit queued proof (model={}, round={}): {}",
                         submit_model_id,
                         queued.round_id,
@@ -515,7 +515,7 @@ impl OnChainPipeline {
         let interval_secs = pipeline.config.proof_queue_interval_secs;
 
         tokio::spawn(async move {
-            log::info!(
+            tracing::info!(
                 "Proof queue processor started (interval={}s)",
                 interval_secs
             );
@@ -527,7 +527,7 @@ impl OnChainPipeline {
                 if !results.is_empty() {
                     let successes = results.iter().filter(|(_, r)| r.is_ok()).count();
                     let failures = results.iter().filter(|(_, r)| r.is_err()).count();
-                    log::info!(
+                    tracing::info!(
                         "Proof queue batch: {} submitted, {} failed",
                         successes,
                         failures

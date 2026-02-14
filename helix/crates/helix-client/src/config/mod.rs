@@ -15,6 +15,7 @@ use std::path::PathBuf;
 
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info, instrument};
 
 pub use training::TrainingJobConfig;
 
@@ -73,13 +74,17 @@ impl Default for HelixConfig {
 
 impl HelixConfig {
     /// Load configuration from a TOML file
+    #[instrument(skip_all, fields(path = %path.display()))]
     pub fn load(path: &PathBuf) -> Result<Self> {
+        info!("Loading configuration from {}", path.display());
         let content = std::fs::read_to_string(path)?;
         let config: Self = toml::from_str(&content)?;
+        debug!("Configuration loaded successfully");
         Ok(config)
     }
 
     /// Save configuration to a TOML file
+    #[instrument(skip_all, fields(path = %path.display()))]
     pub fn save(&self, path: &PathBuf) -> Result<()> {
         let content = toml::to_string_pretty(self)?;
         std::fs::write(path, content)?;
@@ -115,6 +120,7 @@ impl HelixConfig {
     }
 
     /// Validate the configuration
+    #[instrument(skip_all)]
     pub fn validate(&self) -> Result<()> {
         // Validate node name
         if self.node.name.is_empty() {

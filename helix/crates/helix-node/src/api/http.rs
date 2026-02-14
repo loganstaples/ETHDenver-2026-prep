@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::api::rpc::RoundWeightEntry;
+use crate::metrics::NodeMetrics;
 use crate::round_commit::RoundCommitManager;
 use crate::training::orchestrator::{RoundPhase, TrainingOrchestrator};
 
@@ -113,6 +114,8 @@ pub struct ApiState {
     pub peers: Arc<RwLock<PeerSnapshot>>,
     /// Snapshot of aggregate metrics (updated periodically).
     pub metrics: Arc<RwLock<MetricsSnapshot>>,
+    /// Node-wide atomic metrics (for Prometheus endpoint and RPC).
+    pub node_metrics: Arc<NodeMetrics>,
     /// Bearer token required for authenticated endpoints.
     /// Must match the `Authorization: Bearer <token>` header.
     pub api_key: String,
@@ -324,6 +327,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// `Authorization` header.
 ///
 /// All endpoints are subject to per-IP token-bucket rate limiting.
+#[tracing::instrument(skip_all)]
 pub async fn start_api_server(
     addr: SocketAddr,
     state: Arc<ApiState>,
@@ -350,7 +354,7 @@ pub async fn start_api_server(
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    log::info!("HTTP API listening on {}", addr);
+    tracing::info!("HTTP API listening on {}", addr);
 
     axum::serve(
         listener,
@@ -490,9 +494,17 @@ async fn peers_handler(State(state): State<Arc<ApiState>>) -> Json<PeerSnapshot>
     Json(snapshot)
 }
 
-async fn metrics_handler(State(state): State<Arc<ApiState>>) -> Json<MetricsSnapshot> {
-    let snapshot = state.metrics.read().clone();
-    Json(snapshot)
+async fn metrics_handler(State(state): State<Arc<ApiState>>) -> Response {
+    let body = state.node_metrics.to_prometheus();
+    (
+        StatusCode::OK,
+        [(
+            "content-type",
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response()
 }
 
 /// Downloads model weights for a completed round as raw bytes.
@@ -544,6 +556,12 @@ mod tests {
 
     fn test_state(api_key: &str) -> Arc<ApiState> {
         let (tx, _rx) = broadcast::channel(16);
+        let node_metrics = NodeMetrics::new();
+        // Pre-populate some metrics for testing
+        node_metrics.record_proof_generated(100);
+        node_metrics.record_proof_verified();
+        node_metrics.record_proof_verified();
+        node_metrics.record_training_step(0.42);
         Arc::new(ApiState {
             orchestrator_workers: Arc::new(RwLock::new(OrchestratorSnapshot {
                 worker_count: 5,
@@ -582,6 +600,7 @@ mod tests {
                 avg_round_time_ms: 5000.0,
                 uptime_secs: 3600,
             })),
+            node_metrics,
             api_key: api_key.to_string(),
             rate_limiter: Arc::new(ApiRateLimiter::new(100)),
             round_weights: Arc::new(RwLock::new(Vec::new())),
@@ -663,10 +682,19 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+
+        // Verify Prometheus content-type
+        let ct = response.headers().get("content-type").unwrap().to_str().unwrap();
+        assert!(ct.contains("text/plain"), "expected text/plain content-type, got {}", ct);
+
         let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-        let metrics: MetricsSnapshot = serde_json::from_slice(&body).unwrap();
-        assert_eq!(metrics.total_rounds, 100);
-        assert_eq!(metrics.proofs_valid, 190);
+        let body_str = std::str::from_utf8(&body).unwrap();
+
+        // Verify Prometheus format with pre-populated values from test_state
+        assert!(body_str.contains("helix_proofs_generated_total 1"));
+        assert!(body_str.contains("helix_proofs_verified_total 2"));
+        assert!(body_str.contains("# TYPE helix_proofs_generated_total counter"));
+        assert!(body_str.contains("# TYPE helix_uptime_seconds gauge"));
     }
 
     #[tokio::test]

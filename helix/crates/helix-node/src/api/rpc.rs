@@ -14,6 +14,7 @@
 //! - `helix_getConfig` — get node configuration
 //! - `helix_getAggregationResult` — get aggregation result for a round
 //! - `helix_getMPCStatus` — get MPC training status
+//! - `helix_getMetrics` — get node-wide metrics snapshot (JSON)
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -26,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::api::http::OrchestratorSnapshot;
+use crate::metrics::NodeMetrics;
 
 // ============================================================================
 // JSON-RPC Protocol Types
@@ -284,6 +286,8 @@ pub struct RpcState {
     pub round_weights: Arc<RwLock<Vec<RoundWeightEntry>>>,
     /// Worker daemon state (for worker status, earnings, auto-join RPC).
     pub worker_daemon: Option<Arc<crate::worker::WorkerDaemon>>,
+    /// Node-wide atomic metrics (for helix_getMetrics RPC).
+    pub node_metrics: Arc<NodeMetrics>,
 }
 
 /// Tracks proof status per round.
@@ -408,6 +412,8 @@ async fn rpc_handler(
         "helix_getTrainingHistory" => handle_get_training_history(&state, &req.params, &id),
         "helix_getTrainingReport" => handle_get_training_report(&state, &req.params, &id),
         "helix_downloadModel" => handle_download_model(&state, &req.params, &id),
+        // Metrics handler
+        "helix_getMetrics" => handle_get_metrics(&state, &id),
         // Worker daemon handlers
         "helix_getWorkerStatus" => handle_get_worker_status(&state, &id),
         "helix_getEarnings" => handle_get_earnings(&state, &id),
@@ -873,6 +879,14 @@ fn handle_get_mpc_status(state: &RpcState, id: &serde_json::Value) -> JsonRpcRes
     JsonRpcResponse::success(
         id.clone(),
         serde_json::to_value(result).unwrap_or_default(),
+    )
+}
+
+fn handle_get_metrics(state: &RpcState, id: &serde_json::Value) -> JsonRpcResponse {
+    let snapshot = state.node_metrics.snapshot();
+    JsonRpcResponse::success(
+        id.clone(),
+        serde_json::to_value(snapshot).unwrap_or_default(),
     )
 }
 
@@ -1609,6 +1623,7 @@ fn handle_set_auto_join(
 // ============================================================================
 
 /// Starts the JSON-RPC server on the given address.
+#[tracing::instrument(skip_all)]
 pub async fn start_rpc_server(
     addr: SocketAddr,
     state: Arc<RpcState>,
@@ -1618,7 +1633,7 @@ pub async fn start_rpc_server(
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    log::info!("JSON-RPC server listening on {}", addr);
+    tracing::info!("JSON-RPC server listening on {}", addr);
 
     axum::serve(listener, app).await?;
     Ok(())
@@ -1647,6 +1662,7 @@ pub fn create_default_rpc_state(
         rate_limiter: Arc::new(RwLock::new(RpcRateLimiter::default())),
         round_weights: Arc::new(RwLock::new(Vec::new())),
         worker_daemon: None,
+        node_metrics: NodeMetrics::new(),
     })
 }
 
@@ -1704,6 +1720,7 @@ mod tests {
             rate_limiter: Arc::new(RwLock::new(RpcRateLimiter::default())),
             round_weights: Arc::new(RwLock::new(Vec::new())),
             worker_daemon: None,
+            node_metrics: NodeMetrics::new(),
         })
     }
 

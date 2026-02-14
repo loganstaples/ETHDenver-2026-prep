@@ -8,7 +8,7 @@
 //! cryptographic guarantees that state commitments are correctly chained.
 
 use serde::{Deserialize, Serialize};
-use tracing;
+use tracing::{debug, error, info, instrument, warn};
 
 use crate::pipeline::ProverPipeline;
 
@@ -234,14 +234,14 @@ impl IVCProver {
         let step_k = config.circuit_k.max(12);
         let mut step_pipeline = ProverPipeline::new(step_k);
         if let Err(e) = step_pipeline.setup(&A1StepCircuit::default()) {
-            tracing::error!("IVC step pipeline setup failed: {e}");
+            error!("IVC step pipeline setup failed: {e}");
         }
 
         // Setup fold pipeline (k=13 for 4 Poseidon hashes in folding circuit).
         let fold_k = (step_k + 1).max(13);
         let mut fold_pipeline = ProverPipeline::new(fold_k);
         if let Err(e) = fold_pipeline.setup(&IVCFoldingCircuit::default()) {
-            tracing::error!("IVC fold pipeline setup failed: {e}");
+            error!("IVC fold pipeline setup failed: {e}");
         }
 
         // Convert bytes to Fr for A1 accumulator.
@@ -264,6 +264,7 @@ impl IVCProver {
     }
 
     /// Adds a step to the IVC chain with a real A1 step proof.
+    #[instrument(skip_all, fields(step_number = step.step))]
     pub fn add_step(&mut self, step: IVCStep) -> Result<(), String> {
         // Verify step connects to current state
         if step.input_state != self.state.state_commitment {
@@ -331,6 +332,7 @@ impl IVCProver {
     ///
     /// Uses the A1 `IVCFoldingCircuit` to generate a ZK proof that the
     /// accumulator was correctly folded.
+    #[instrument(skip_all, fields(pending_steps = self.pending_steps.len()))]
     pub fn fold(&mut self) -> Result<(), String> {
         if self.pending_steps.is_empty() {
             return Ok(());
@@ -389,7 +391,7 @@ impl IVCProver {
     fn verify_folded_proof(&self, proof: &[u8]) -> bool {
         let header = b"HELIX_IVC_FOLD_A1:";
         if proof.len() < header.len() + 8 {
-            tracing::warn!("verify_folded_proof: proof too short");
+            warn!("verify_folded_proof: proof too short");
             return false;
         }
         if !proof.starts_with(header) {
@@ -406,7 +408,7 @@ impl IVCProver {
         let step_proofs_start = offset;
         for _ in 0..num_steps {
             if offset + 4 > proof.len() {
-                tracing::warn!("verify_folded_proof: truncated step proof length");
+                warn!("verify_folded_proof: truncated step proof length");
                 return false;
             }
             let step_proof_len = u32::from_le_bytes(
@@ -414,7 +416,7 @@ impl IVCProver {
             ) as usize;
             offset += 4;
             if step_proof_len == 0 || offset + step_proof_len > proof.len() {
-                tracing::warn!("verify_folded_proof: invalid step proof at index");
+                warn!("verify_folded_proof: invalid step proof at index");
                 return false;
             }
             offset += step_proof_len;
@@ -431,7 +433,7 @@ impl IVCProver {
                 // half-accumulators were correctly folded, which transitively
                 // covers all step proofs.
                 if offset + 4 > proof.len() {
-                    tracing::warn!("verify_folded_proof: truncated fold proof length");
+                    warn!("verify_folded_proof: truncated fold proof length");
                     return false;
                 }
                 let fold_proof_len = u32::from_le_bytes(
@@ -439,7 +441,7 @@ impl IVCProver {
                 ) as usize;
                 offset += 4;
                 if offset + fold_proof_len > proof.len() {
-                    tracing::warn!("verify_folded_proof: truncated fold proof data");
+                    warn!("verify_folded_proof: truncated fold proof data");
                     return false;
                 }
                 let fold_proof_bytes = &proof[offset..offset + fold_proof_len];
@@ -449,7 +451,7 @@ impl IVCProver {
                 let num_fold_pi = 8;
                 let fold_pi_bytes = num_fold_pi * 32;
                 if offset + fold_pi_bytes > proof.len() {
-                    tracing::warn!("verify_folded_proof: truncated fold public inputs");
+                    warn!("verify_folded_proof: truncated fold public inputs");
                     return false;
                 }
                 let mut fold_pi = Vec::with_capacity(num_fold_pi);
@@ -464,18 +466,18 @@ impl IVCProver {
                 let pi_refs: Vec<&[Fr]> = vec![&fold_pi];
                 match self.fold_pipeline.verify(fold_proof_bytes, &pi_refs) {
                     Ok(true) => {
-                        tracing::info!(
+                        info!(
                             num_steps,
                             "O(1) folding proof verified — skipping individual step replay"
                         );
                         return true;
                     }
                     Ok(false) => {
-                        tracing::error!("verify_folded_proof: folding circuit proof INVALID");
+                        error!("verify_folded_proof: folding circuit proof INVALID");
                         return false;
                     }
                     Err(e) => {
-                        tracing::error!("verify_folded_proof: folding proof error: {e}");
+                        error!("verify_folded_proof: folding proof error: {e}");
                         return false;
                     }
                 }
@@ -485,7 +487,7 @@ impl IVCProver {
         // Fallback: no folding proof present, verify each step individually.
         // This requires history to be available.
         if self.history.len() < num_steps {
-            tracing::warn!(
+            warn!(
                 "verify_folded_proof: no folding proof and history has {} steps but proof claims {}",
                 self.history.len(),
                 num_steps,
@@ -535,11 +537,11 @@ impl IVCProver {
             match self.step_pipeline.verify(step_proof, &pi_refs) {
                 Ok(true) => {}
                 Ok(false) => {
-                    tracing::warn!("verify_folded_proof: step {} failed", step_data.step);
+                    warn!("verify_folded_proof: step {} failed", step_data.step);
                     return false;
                 }
                 Err(e) => {
-                    tracing::error!("verify_folded_proof: step {} error: {e}", step_data.step);
+                    error!("verify_folded_proof: step {} error: {e}", step_data.step);
                     return false;
                 }
             }
@@ -565,7 +567,7 @@ impl IVCProver {
     fn verify_legacy_folded_proof(&self, proof: &[u8]) -> bool {
         let header = b"HELIX_IVC_FOLD:";
         if !proof.starts_with(header) {
-            tracing::warn!("verify_folded_proof: invalid header");
+            warn!("verify_folded_proof: invalid header");
             return false;
         }
         // Legacy proofs are structurally verified (non-empty step proofs present)
@@ -607,6 +609,7 @@ impl IVCProver {
     }
 
     /// Generates a final proof for the entire chain.
+    #[instrument(skip_all, fields(total_steps = self.state.step))]
     pub fn finalize(&mut self) -> Result<Vec<u8>, String> {
         self.fold()?;
         Ok(self.generate_final_proof())
@@ -628,6 +631,7 @@ impl IVCProver {
     ///
     /// ## Returns
     /// A `DeciderProof` containing the proof bytes and public inputs.
+    #[instrument(skip_all, fields(total_steps = self.chain.accumulator.num_steps))]
     pub fn prove_decider(
         &mut self,
         loss: Fr,
@@ -694,7 +698,7 @@ impl IVCProver {
             .map(|f| fr_to_bytes(*f))
             .collect();
 
-        tracing::info!(
+        info!(
             num_steps = acc.num_steps,
             proof_size = proof_bytes.len(),
             "IVC decider proof generated successfully"
@@ -835,14 +839,14 @@ impl IVCProver {
                     for pi_val in &pi {
                         folded.extend_from_slice(pi_val.to_repr().as_ref());
                     }
-                    tracing::info!(
+                    info!(
                         fold_proof_size = fold_proof_bytes.len(),
                         num_steps = self.pending_steps.len(),
                         "Generated IVC folding circuit proof"
                     );
                 }
                 Err(e) => {
-                    tracing::error!("Folding proof generation failed (step proofs still valid): {e}");
+                    error!("Folding proof generation failed (step proofs still valid): {e}");
                     folded.push(0u8); // no folding proof, fall back to step-by-step verification
                 }
             }
@@ -1000,12 +1004,12 @@ pub fn verify_ivc_chain(
     let final_header = b"HELIX_IVC_FINAL:";
     // Minimum: header(16) + step_count(8) + commitment(32) + error(8) = 64
     if proof.len() < 64 {
-        tracing::warn!("verify_ivc_chain: proof too short ({} bytes, need >= 64)", proof.len());
+        warn!("verify_ivc_chain: proof too short ({} bytes, need >= 64)", proof.len());
         return false;
     }
 
     if !proof.starts_with(final_header) {
-        tracing::warn!("verify_ivc_chain: invalid HELIX_IVC_FINAL header");
+        warn!("verify_ivc_chain: invalid HELIX_IVC_FINAL header");
         return false;
     }
 
@@ -1018,25 +1022,25 @@ pub fn verify_ivc_chain(
     offset += 8;
 
     if step_count == 0 {
-        tracing::warn!("verify_ivc_chain: zero step count");
+        warn!("verify_ivc_chain: zero step count");
         return false;
     }
 
     // State commitment
     if offset + 32 > proof.len() {
-        tracing::warn!("verify_ivc_chain: truncated at commitment");
+        warn!("verify_ivc_chain: truncated at commitment");
         return false;
     }
     let stored_commitment: [u8; 32] = proof[offset..offset + 32].try_into().expect("invariant: fixed-size slice");
     offset += 32;
     if stored_commitment != final_commitment {
-        tracing::warn!("verify_ivc_chain: commitment mismatch");
+        warn!("verify_ivc_chain: commitment mismatch");
         return false;
     }
 
     // Accumulated error (8 bytes f64)
     if offset + 8 > proof.len() {
-        tracing::warn!("verify_ivc_chain: truncated at error");
+        warn!("verify_ivc_chain: truncated at error");
         return false;
     }
     let _accumulated_error = f64::from_le_bytes(
@@ -1046,7 +1050,7 @@ pub fn verify_ivc_chain(
 
     // Remaining bytes should be the embedded folded proof
     if offset >= proof.len() {
-        tracing::warn!("verify_ivc_chain: no embedded folded proof");
+        warn!("verify_ivc_chain: no embedded folded proof");
         return false;
     }
 
@@ -1058,7 +1062,7 @@ pub fn verify_ivc_chain(
         // A1 format: same structural check — verify step proofs are present and non-empty
         let mut a1_offset = a1_fold_header.len();
         if a1_offset + 8 > folded.len() {
-            tracing::warn!("verify_ivc_chain: A1 fold header truncated");
+            warn!("verify_ivc_chain: A1 fold header truncated");
             return false;
         }
         let a1_num_steps = u64::from_le_bytes(
@@ -1067,13 +1071,13 @@ pub fn verify_ivc_chain(
         a1_offset += 8;
 
         if a1_num_steps == 0 {
-            tracing::warn!("verify_ivc_chain: A1 fold has zero steps");
+            warn!("verify_ivc_chain: A1 fold has zero steps");
             return false;
         }
 
         for step_idx in 0..a1_num_steps {
             if a1_offset + 4 > folded.len() {
-                tracing::warn!("verify_ivc_chain: truncated at A1 step {step_idx}");
+                warn!("verify_ivc_chain: truncated at A1 step {step_idx}");
                 return false;
             }
             let sp_len = u32::from_le_bytes(
@@ -1081,7 +1085,7 @@ pub fn verify_ivc_chain(
             ) as usize;
             a1_offset += 4;
             if sp_len == 0 || a1_offset + sp_len > folded.len() {
-                tracing::warn!("verify_ivc_chain: invalid A1 step proof at {step_idx}");
+                warn!("verify_ivc_chain: invalid A1 step proof at {step_idx}");
                 return false;
             }
             a1_offset += sp_len;
@@ -1092,7 +1096,7 @@ pub fn verify_ivc_chain(
 
     let fold_header = b"HELIX_IVC_FOLD:";
     if folded.len() < fold_header.len() + 8 || !folded.starts_with(fold_header) {
-        tracing::warn!("verify_ivc_chain: invalid embedded fold header");
+        warn!("verify_ivc_chain: invalid embedded fold header");
         return false;
     }
 
@@ -1103,14 +1107,14 @@ pub fn verify_ivc_chain(
     fold_offset += 8;
 
     if num_steps == 0 {
-        tracing::warn!("verify_ivc_chain: folded proof has zero steps");
+        warn!("verify_ivc_chain: folded proof has zero steps");
         return false;
     }
 
     // Verify each step proof is present and non-empty
     for step_idx in 0..num_steps {
         if fold_offset + 4 > folded.len() {
-            tracing::warn!("verify_ivc_chain: truncated at fold step {step_idx} length");
+            warn!("verify_ivc_chain: truncated at fold step {step_idx} length");
             return false;
         }
         let step_proof_len = u32::from_le_bytes(
@@ -1119,11 +1123,11 @@ pub fn verify_ivc_chain(
         fold_offset += 4;
 
         if step_proof_len == 0 {
-            tracing::warn!("verify_ivc_chain: empty proof at fold step {step_idx}");
+            warn!("verify_ivc_chain: empty proof at fold step {step_idx}");
             return false;
         }
         if fold_offset + step_proof_len > folded.len() {
-            tracing::warn!("verify_ivc_chain: truncated at fold step {step_idx} data");
+            warn!("verify_ivc_chain: truncated at fold step {step_idx} data");
             return false;
         }
         fold_offset += step_proof_len;

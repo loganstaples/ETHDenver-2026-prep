@@ -41,6 +41,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use tracing::{debug, error, info, instrument, warn};
 
 // ============================================================================
 // Error Types
@@ -495,16 +496,16 @@ pub fn load_or_generate_srs(
             let mut reader = std::io::BufReader::new(file);
             if let Ok(params) = ParamsKZG::<Bn256>::read(&mut reader) {
                 if params.k() == k {
-                    tracing::info!(k, path = %cache_file.display(), "Loaded SRS from cache");
+                    info!(k, path = %cache_file.display(), "Loaded SRS from cache");
                     return (params, true);
                 }
-                tracing::warn!(
+                warn!(
                     expected_k = k,
                     found_k = params.k(),
                     "Cached SRS k mismatch, regenerating"
                 );
             } else {
-                tracing::warn!(path = %cache_file.display(), "Failed to read cached SRS, regenerating");
+                warn!(path = %cache_file.display(), "Failed to read cached SRS, regenerating");
             }
         }
     }
@@ -514,19 +515,19 @@ pub fn load_or_generate_srs(
     let rng = StdRng::from_seed(srs_seed);
     let params = ParamsKZG::<Bn256>::setup(k, rng);
     let gen_time = start.elapsed();
-    tracing::info!(k, gen_time_ms = gen_time.as_millis() as u64, "Generated SRS from scratch");
+    info!(k, gen_time_ms = gen_time.as_millis() as u64, "Generated SRS from scratch");
 
     // Cache to disk
     if let Err(e) = std::fs::create_dir_all(&cache_dir) {
-        tracing::warn!(error = %e, "Failed to create SRS cache directory");
+        warn!(error = %e, "Failed to create SRS cache directory");
     } else if let Ok(file) = std::fs::File::create(&cache_file) {
         let mut writer = std::io::BufWriter::new(file);
         if let Err(e) = params.write(&mut writer) {
-            tracing::warn!(error = %e, "Failed to write SRS to cache");
+            warn!(error = %e, "Failed to write SRS to cache");
             // Clean up partial file
             let _ = std::fs::remove_file(&cache_file);
         } else {
-            tracing::info!(
+            info!(
                 k,
                 path = %cache_file.display(),
                 size_mb = std::fs::metadata(&cache_file).map(|m| m.len() / (1024 * 1024)).unwrap_or(0),
@@ -883,34 +884,36 @@ impl<C: Circuit<Fr> + Clone> ProverPipeline<C> {
     }
 
     /// Sets up the pipeline with a circuit.
+    #[instrument(skip_all, fields(k = self.config.k))]
     pub fn setup(&mut self, circuit: &C) -> PipelineResult<()> {
-        if self.config.enable_tracing {
-            tracing::info!(k = self.config.k, "Setting up proving pipeline");
-        }
+        info!(k = self.config.k, "Setting up proving pipeline");
 
         let vk = keygen_vk(&self.params, circuit).map_err(|e| {
-            PipelineError::keygen_with_cause(
+            let err = PipelineError::keygen_with_cause(
                 "Failed to generate verification key",
                 format!("{:?}", e),
-            )
+            );
+            error!(error = %err, "Verification key generation failed");
+            err
         })?;
 
         let pk = keygen_pk(&self.params, vk.clone(), circuit).map_err(|e| {
-            PipelineError::keygen_with_cause("Failed to generate proving key", format!("{:?}", e))
+            let err = PipelineError::keygen_with_cause("Failed to generate proving key", format!("{:?}", e));
+            error!(error = %err, "Proving key generation failed");
+            err
         })?;
 
         self.vk_hash = Some(compute_vk_hash(&vk));
         self.vk = Some(vk);
         self.pk = Some(pk);
 
-        if self.config.enable_tracing {
-            tracing::info!("Pipeline setup complete");
-        }
+        info!("Pipeline setup complete");
 
         Ok(())
     }
 
     /// Generates a proof with full error handling and optional callbacks.
+    #[instrument(skip_all)]
     pub fn prove(
         &self,
         circuit: &C,
@@ -926,6 +929,7 @@ impl<C: Circuit<Fr> + Clone> ProverPipeline<C> {
     }
 
     /// Generates a proof with progress callbacks and cancellation support.
+    #[instrument(skip_all)]
     pub fn prove_with_options(
         &self,
         circuit: &C,
@@ -937,6 +941,7 @@ impl<C: Circuit<Fr> + Clone> ProverPipeline<C> {
             PipelineError::not_initialized("Proving key not generated - call setup() first")
         })?;
 
+        info!("Proof generation started");
         let start = Instant::now();
         let mut last_error: Option<PipelineError> = None;
 
@@ -1013,16 +1018,14 @@ impl<C: Circuit<Fr> + Clone> ProverPipeline<C> {
                     let peak_mem = current_resident_memory();
                     self.proof_count.fetch_add(1, Ordering::Relaxed);
 
-                    if self.config.enable_tracing {
-                        tracing::info!(
-                            proof_size = proof.len(),
-                            generation_time_ms = gen_time.as_millis() as u64,
-                            attempts = attempt + 1,
-                            verified,
-                            peak_memory_mb = peak_mem / (1024 * 1024),
-                            "Proof generated successfully"
-                        );
-                    }
+                    info!(
+                        proof_size = proof.len(),
+                        generation_time_ms = gen_time.as_millis() as u64,
+                        attempts = attempt + 1,
+                        verified,
+                        peak_memory_mb = peak_mem / (1024 * 1024),
+                        "Proof generation complete"
+                    );
 
                     return Ok(ProofResult {
                         proof,
@@ -1035,13 +1038,11 @@ impl<C: Circuit<Fr> + Clone> ProverPipeline<C> {
                     });
                 }
                 Err(e) => {
-                    if self.config.enable_tracing {
-                        tracing::warn!(
-                            attempt,
-                            error = %e,
-                            "Proof generation failed"
-                        );
-                    }
+                    warn!(
+                        attempt,
+                        error = %e,
+                        "Proof generation attempt failed"
+                    );
 
                     last_error = Some(e);
 
@@ -1066,6 +1067,7 @@ impl<C: Circuit<Fr> + Clone> ProverPipeline<C> {
     }
 
     /// Internal proof generation attempt.
+    #[instrument(skip_all, fields(attempt))]
     fn try_prove(
         &self,
         circuit: &C,
@@ -1163,6 +1165,7 @@ impl<C: Circuit<Fr> + Clone> ProverPipeline<C> {
     }
 
     /// Verifies a proof against public inputs.
+    #[instrument(skip_all, fields(proof_size = proof.len()))]
     pub fn verify(&self, proof: &[u8], public_inputs: &[&[Fr]]) -> PipelineResult<bool> {
         let vk = self.vk.as_ref().ok_or_else(|| {
             PipelineError::not_initialized("Verification key not generated - call setup() first")
@@ -1193,8 +1196,13 @@ impl<C: Circuit<Fr> + Clone> ProverPipeline<C> {
             SingleStrategy<Bn256>,
         >(&verifier_params, vk, &[instances], &mut transcript);
 
-        if self.config.enable_tracing && !result {
-            tracing::warn!("Proof verification failed");
+        if !result {
+            warn!("Proof verification failed");
+        } else {
+            debug!(
+                verification_time_ms = start.elapsed().as_millis() as u64,
+                "Proof verification succeeded"
+            );
         }
 
         Ok(result)
@@ -1287,6 +1295,7 @@ impl<C: Circuit<Fr> + Clone> ProverPipeline<C> {
     }
 
     /// Proves multiple circuits in batch, returning individual proofs.
+    #[instrument(skip_all, fields(batch_size = circuits.len()))]
     pub fn prove_batch(
         &self,
         circuits: &[C],
@@ -1311,6 +1320,7 @@ impl<C: Circuit<Fr> + Clone> ProverPipeline<C> {
     }
 
     /// Verifies multiple proofs in batch.
+    #[instrument(skip_all, fields(batch_size = proofs.len()))]
     pub fn verify_batch(
         &self,
         proofs: &[Vec<u8>],

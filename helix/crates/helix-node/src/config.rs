@@ -617,7 +617,7 @@ impl NodeConfig {
         // Warn if the config file contains a private_key field
         if let Ok(raw) = serde_json::from_str::<serde_json::Value>(data) {
             if raw.get("private_key").is_some() {
-                log::warn!(
+                tracing::warn!(
                     "Config file contains 'private_key' field — this is ignored for security. \
                      Use the HELIX_PRIVATE_KEY environment variable instead."
                 );
@@ -633,7 +633,7 @@ impl NodeConfig {
         // Warn if the config file contains a private_key field
         if let Ok(raw) = data.parse::<toml::Table>() {
             if raw.get("private_key").is_some() {
-                log::warn!(
+                tracing::warn!(
                     "Config file contains 'private_key' field — this is ignored for security. \
                      Use the HELIX_PRIVATE_KEY environment variable instead."
                 );
