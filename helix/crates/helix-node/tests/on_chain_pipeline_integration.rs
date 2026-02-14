@@ -96,6 +96,7 @@ fn test_chain_config_serialization_roundtrip() {
         d_hid: 8,
         d_out: 2,
         proof_queue_interval_secs: 10,
+        watcher: Default::default(),
     };
     let json = serde_json::to_string(&config).unwrap();
     let loaded: ChainConfig = serde_json::from_str(&json).unwrap();

@@ -87,6 +87,7 @@ pub struct RuntimeHealth {
     pub training_orchestrator: SubsystemStatus,
     pub failure_detector: SubsystemStatus,
     pub chain_pipeline: SubsystemStatus,
+    pub chain_watcher: SubsystemStatus,
     pub started_at: Instant,
 }
 
@@ -99,6 +100,7 @@ impl RuntimeHealth {
             training_orchestrator: SubsystemStatus::Pending,
             failure_detector: SubsystemStatus::Pending,
             chain_pipeline: SubsystemStatus::Pending,
+            chain_watcher: SubsystemStatus::Pending,
             started_at: Instant::now(),
         }
     }
@@ -121,6 +123,7 @@ impl RuntimeHealth {
                 "training_orchestrator": self.training_orchestrator.to_string(),
                 "failure_detector": self.failure_detector.to_string(),
                 "chain_pipeline": self.chain_pipeline.to_string(),
+                "chain_watcher": self.chain_watcher.to_string(),
             },
             "version": env!("CARGO_PKG_VERSION"),
         })
@@ -276,6 +279,87 @@ impl NodeRuntime {
     }
 
     // ========================================================================
+    // Chain Watcher Setup
+    // ========================================================================
+
+    /// Starts the on-chain event watcher if chain config is present and enabled.
+    ///
+    /// Returns the watcher handle, event reactor, and join handle. The reactor
+    /// tracks on-chain state (active models, pause status, slash events) and
+    /// can be queried by other subsystems.
+    async fn start_chain_watcher(
+        &self,
+        local_address: Option<ethers::types::Address>,
+    ) -> Option<(
+        Arc<crate::chain_watcher::NodeEventReactor>,
+        tokio::task::JoinHandle<()>,
+    )> {
+        let chain_config = self.config.chain.as_ref()?;
+
+        if !chain_config.watcher.enabled {
+            info!("Chain watcher disabled in config");
+            return None;
+        }
+
+        self.health.write().chain_watcher = SubsystemStatus::Starting;
+
+        let cursor_path = self.config.data_dir.join("chain_watcher_cursor.json");
+
+        match crate::chain_watcher::ChainWatcher::new(
+            &self.config.rpc_url,
+            &chain_config.coordinator_address,
+            chain_config.watcher.clone(),
+            cursor_path,
+        ).await {
+            Ok(watcher) => {
+                // Create the event reactor
+                let reactor = Arc::new(
+                    crate::chain_watcher::NodeEventReactor::new(local_address),
+                );
+
+                // Subscribe the reactor to events
+                let rx = watcher.subscribe();
+                let reactor_handle = crate::chain_watcher::spawn_event_handler(
+                    rx, reactor.clone(),
+                );
+
+                // Start the watcher polling loop
+                let watcher_handle = watcher.start();
+
+                // Combine both handles into one. Move `watcher` into the
+                // task so the shutdown channel stays alive until the task ends.
+                let combined_handle = tokio::spawn(async move {
+                    let _watcher = watcher; // keep alive for shutdown_tx
+                    tokio::select! {
+                        _ = watcher_handle => {
+                            info!("Chain watcher polling loop exited");
+                        }
+                        _ = reactor_handle => {
+                            info!("Chain watcher event reactor exited");
+                        }
+                    }
+                });
+
+                self.health.write().chain_watcher = SubsystemStatus::Running;
+                info!(
+                    contract = %chain_config.coordinator_address,
+                    poll_secs = chain_config.watcher.poll_interval_secs,
+                    confirmations = chain_config.watcher.confirmation_depth,
+                    "Chain watcher started"
+                );
+
+                Some((reactor, combined_handle))
+            }
+            Err(e) => {
+                self.health.write().chain_watcher =
+                    SubsystemStatus::Failed(e.to_string());
+                warn!("Failed to start chain watcher: {}. Continuing without event watching.", e);
+                None
+            }
+        }
+    }
+
+    // ========================================================================
     // Worker Role
     // ========================================================================
 
@@ -381,7 +465,10 @@ impl NodeRuntime {
             }
         });
 
-        // --- 4. State persistence ---
+        // --- 4. Chain Watcher ---
+        let _chain_watcher = self.start_chain_watcher(None).await;
+
+        // --- 5. State persistence ---
         let persistence = self.create_persistence(&format!("worker_{}", local_id));
 
         let mut trainer: Option<Trainer> = None;
@@ -1200,6 +1287,18 @@ impl NodeRuntime {
         let mut round_number = 0u64;
         let mut total_rounds_completed = 0u64;
         let mut shutdown_rx = self.shutdown_tx.subscribe();
+
+        // --- Chain Watcher ---
+        // Resolve the signer address for local slash detection
+        let signer_address = self.config.private_key().and_then(|pk| {
+            use ethers::signers::LocalWallet;
+            use std::str::FromStr;
+            LocalWallet::from_str(&pk).ok().map(|w| {
+                use ethers::signers::Signer;
+                w.address()
+            })
+        });
+        let _chain_watcher = self.start_chain_watcher(signer_address).await;
 
         // On-chain pipeline reference (if configured)
         let on_chain_pipeline: Option<Arc<crate::on_chain_pipeline::OnChainPipeline>> =

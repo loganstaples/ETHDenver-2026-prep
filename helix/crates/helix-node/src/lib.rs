@@ -1,5 +1,6 @@
 pub mod aggregator_proof_pipeline;
 pub mod api;
+pub mod chain_watcher;
 pub mod circuit_breaker;
 pub mod config;
 pub mod coordination;

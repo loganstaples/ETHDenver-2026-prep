@@ -449,6 +449,7 @@ pub struct NodeConfig {
 /// 3. Start training rounds on-chain
 /// 4. Submit aggregated proofs via the coordinator contract
 /// 5. Use VerifyAll verification with real Halo2 KZG checks
+/// 6. Watch for on-chain events (model registrations, proof acceptances, slashing)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChainConfig {
     /// Deployed HelixCoordinatorV2 contract address (hex, with 0x prefix).
@@ -486,6 +487,11 @@ pub struct ChainConfig {
     /// Interval in seconds for processing the proof queue.
     #[serde(default = "default_proof_queue_interval_secs")]
     pub proof_queue_interval_secs: u64,
+
+    /// On-chain event watcher configuration.
+    /// Controls polling interval, confirmation depth, and block scanning range.
+    #[serde(default)]
+    pub watcher: crate::chain_watcher::ChainWatcherConfig,
 }
 
 fn default_model_ipfs_hash() -> String {

@@ -2052,6 +2052,7 @@ mod tests {
             d_hid: 8,
             d_out: 2,
             proof_queue_interval_secs: 5,
+            watcher: Default::default(),
         });
 
         let job_config = TrainingJobConfig::from_node_config(&node_config);
