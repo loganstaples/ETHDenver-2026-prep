@@ -14,6 +14,9 @@ use serde::{Deserialize, Serialize};
 use helix_mpc::poseidon::{poseidon_hash_two, poseidon_commit_with_domain, domains};
 use helix_mpc::Fr as MpcFr;
 
+use crate::aggregator_proof_pipeline::{
+    AggregatorProofPipeline, ProofPipelineError, ProofSubmissionResult,
+};
 use crate::network::messages::{
     GradientMessage, MessagePayload, NetworkMessage, NodeCapabilities, PeerId, TrainingMessage,
     TrainingParams,
@@ -169,6 +172,8 @@ pub struct AggregatorNode {
     partition_detector: Option<Arc<PartitionDetector>>,
     /// Optional on-chain pipeline for proof aggregation and submission.
     on_chain_pipeline: Option<Arc<OnChainPipeline>>,
+    /// Optional proof pipeline for real ZK proof generation + on-chain submission.
+    proof_pipeline: Option<Arc<AggregatorProofPipeline>>,
     /// Allowlist of registered worker public keys that have verified stakes.
     worker_allowlist: Arc<RwLock<HashSet<PeerId>>>,
     /// Local LRU cache of recent proof hashes for replay protection.
@@ -205,6 +210,7 @@ impl AggregatorNode {
             stats: Arc::new(RwLock::new(AggregatorStats::default())),
             partition_detector: None,
             on_chain_pipeline: None,
+            proof_pipeline: None,
             worker_allowlist: Arc::new(RwLock::new(HashSet::new())),
             seen_proof_hashes: Arc::new(RwLock::new(Vec::new())),
             max_proof_cache_size: 10_000,
@@ -220,6 +226,12 @@ impl AggregatorNode {
     /// Sets the on-chain pipeline for proof aggregation and submission.
     pub fn with_on_chain_pipeline(mut self, pipeline: Arc<OnChainPipeline>) -> Self {
         self.on_chain_pipeline = Some(pipeline);
+        self
+    }
+
+    /// Sets the proof pipeline for real ZK proof generation + on-chain submission.
+    pub fn with_proof_pipeline(mut self, pipeline: Arc<AggregatorProofPipeline>) -> Self {
+        self.proof_pipeline = Some(pipeline);
         self
     }
 
@@ -947,6 +959,55 @@ impl AggregatorNode {
         };
 
         bincode::serialize(&agg_proof).unwrap_or_default()
+    }
+
+    /// Aggregates gradients then generates a real ZK proof and submits it on-chain.
+    ///
+    /// This is the primary proof pipeline entry point. After calling `aggregate()`,
+    /// call this method to:
+    /// 1. Generate a ZK proof of the aggregated training step via MLTrainingProverV2
+    /// 2. Submit the proof to HelixCoordinatorV2 (which verifies it on-chain)
+    /// 3. Track commitment chaining (new_hash → next round's old_hash)
+    ///
+    /// Requires a proof pipeline to be set via `with_proof_pipeline()`.
+    ///
+    /// `training_input` and `training_target` are the training data for this step.
+    /// If None, uses the pipeline's configured defaults.
+    pub async fn prove_and_submit_round(
+        &self,
+        round_id: u64,
+        training_input: Option<&[halo2curves::bn256::Fr]>,
+        training_target: Option<&[halo2curves::bn256::Fr]>,
+    ) -> Result<ProofSubmissionResult, ProofPipelineError> {
+        let pipeline = self.proof_pipeline.as_ref().ok_or_else(|| {
+            ProofPipelineError::NotInitialized(
+                "No proof pipeline configured — call with_proof_pipeline() first".to_string(),
+            )
+        })?;
+
+        pipeline
+            .prove_and_submit(round_id, training_input, training_target)
+            .await
+    }
+
+    /// Returns the proof pipeline's current commitment, if a pipeline is configured.
+    pub async fn proof_pipeline_commitment(
+        &self,
+    ) -> Option<(halo2curves::bn256::Fr, halo2curves::bn256::Fr)> {
+        if let Some(ref pipeline) = self.proof_pipeline {
+            Some(pipeline.current_commitment().await)
+        } else {
+            None
+        }
+    }
+
+    /// Returns the proof pipeline's current step number, if configured.
+    pub async fn proof_pipeline_step(&self) -> Option<u64> {
+        if let Some(ref pipeline) = self.proof_pipeline {
+            Some(pipeline.current_step().await)
+        } else {
+            None
+        }
     }
 
     /// Aggregates worker proofs using IVC folding into a single decider proof.

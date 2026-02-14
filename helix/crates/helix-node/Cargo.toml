@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 helix-core = { path = "../helix-core" }
 helix-avm = { path = "../helix-avm" }
+helix-circuits = { path = "../helix-circuits" }
 helix-prover = { path = "../helix-prover" }
 helix-mpc = { path = "../helix-mpc" }
 tokio = { version = "1", features = ["full", "macros", "sync", "net", "io-util", "time"] }

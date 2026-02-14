@@ -144,9 +144,16 @@ impl OnChainPipeline {
             let min_stake = U256::from_dec_str(&self.config.min_stake_wei)
                 .unwrap_or(U256::from(1_000_000_000_000_000_000u64));
 
+            let model_arch = (
+                self.config.d_in as u32,
+                self.config.d_hid as u32,
+                self.config.d_out as u32,
+                2u32, // num_layers
+                0u8,  // activation_type (ReLU)
+            );
             let (receipt, model_id) = self
                 .sc_client
-                .register_model(&self.config.model_ipfs_hash, U256::from(1), min_stake)
+                .register_model(&self.config.model_ipfs_hash, U256::from(1), min_stake, model_arch)
                 .await?;
 
             tracing::info!(

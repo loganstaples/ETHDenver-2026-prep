@@ -981,7 +981,9 @@ impl DistributedTrainingCoordinator {
         let commitment = ethers::types::U256::from_big_endian(&initial_commitment);
         let stake = ethers::types::U256::from(min_stake);
 
-        let (_, model_id) = client.register_model(ipfs_hash, commitment, stake).await
+        // Default model architecture: 2-layer MLP with ReLU
+        let model_arch = (2u32, 2u32, 1u32, 2u32, 0u8);
+        let (_, model_id) = client.register_model(ipfs_hash, commitment, stake, model_arch).await
             .map_err(|e| DistributedCoordinatorError::CheckpointError(format!("Failed to register model: {}", e)))?;
 
         self.model_id = Some(model_id);

@@ -24,7 +24,7 @@ abigen!(
         function stakes(address prover, uint256 modelId) external view returns (uint256 amount, uint256 lockedUntil, bool slashed)
         function getModelState(uint256 modelId) external view returns (uint256 currentRound, uint256 currentCommitment, bool active)
         function getStake(address prover, uint256 modelId) external view returns (uint256 amount, uint256 lockedUntil, bool slashed)
-        function registerModel(string ipfsHash, uint256 initialCommitment, uint256 minStake) external returns (uint256 modelId)
+        function registerModel(string ipfsHash, uint256 initialCommitment, uint256 minStake, uint32 dIn, uint32 dHidden, uint32 dOut, uint32 numLayers, uint8 activationType) external returns (uint256 modelId)
         function startRound(uint256 modelId, uint256 duration) external
         function stake(uint256 modelId) external payable
         function unstake(uint256 modelId) external
@@ -186,17 +186,27 @@ impl SCClient {
 
     // ============ Model Management ============
 
-    /// Registers a new model on-chain.
+    /// Registers a new model on-chain with architecture parameters.
+    ///
+    /// The `model_arch` tuple contains `(d_in, d_hid, d_out, num_layers, activation_type)`.
+    /// These are stored on-chain for verification and model registry integration.
     pub async fn register_model(
         &self,
         ipfs_hash: &str,
         initial_commitment: U256,
         min_stake: U256,
+        model_arch: (u32, u32, u32, u32, u8),
     ) -> anyhow::Result<(TransactionReceipt, u64)> {
+        let (d_in, d_hid, d_out, num_layers, activation_type) = model_arch;
         let call = self.coordinator.register_model(
             ipfs_hash.to_string(),
             initial_commitment,
             min_stake,
+            d_in,
+            d_hid,
+            d_out,
+            num_layers,
+            activation_type,
         );
         let pending_tx = call.send().await?;
         let receipt = pending_tx.await?.ok_or_else(|| anyhow::anyhow!("Tx dropped"))?;

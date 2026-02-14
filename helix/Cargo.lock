@@ -3872,6 +3872,7 @@ dependencies = [
  "futures",
  "halo2curves",
  "helix-avm",
+ "helix-circuits",
  "helix-core",
  "helix-mpc",
  "helix-prover",
