@@ -36,10 +36,13 @@ pub use loss::{
     softmax_cross_entropy_loss,
 };
 pub use optimizer::{
-    Adam, CosineAnnealingLR, ExponentialLR, LRScheduler, LinearWarmupCosineDecay, OneCycleLR,
-    Optimizer, PolynomialLR, SGD, StepLR, WarmupScheduler,
+    Adam, CosineAnnealingLR, CosineAnnealingWarmRestarts, ExponentialLR, LRScheduler,
+    LinearWarmupCosineDecay, OneCycleLR, Optimizer, PolynomialLR, SGD, StepLR, WarmupScheduler,
 };
-pub use training::{EpochMetrics, StepMetrics, Trainer, TrainingConfig, TrainingError, TrainingState, train_step};
+pub use training::{
+    EarlyStopping, EpochMetrics, StepMetrics, Trainer, TrainingConfig, TrainingError,
+    TrainingState, train_step,
+};
 
 /// Prelude for convenient imports.
 pub mod prelude {

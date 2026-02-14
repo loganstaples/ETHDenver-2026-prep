@@ -13,6 +13,11 @@ members = [
     "tests",
 ]
 
+# Optimize dependencies in test builds — halo2 crypto operations are 10-100x
+# slower at opt-level=0, causing test hangs from rayon thread pool contention.
+[profile.test]
+opt-level = 1
+
 [workspace.metadata.demo]
 # Shared SRS parameter: k=14 (2^14 = 16K rows) for demo-sized models
 srs_k = 14

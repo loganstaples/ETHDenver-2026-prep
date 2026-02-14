@@ -569,6 +569,86 @@ impl<O: Optimizer> Trainer<O> {
     }
 }
 
+/// Early stopping based on validation loss.
+///
+/// Monitors a metric (typically validation loss) and signals when training
+/// should stop if the metric hasn't improved for `patience` evaluations.
+#[derive(Debug, Clone)]
+pub struct EarlyStopping {
+    /// Number of evaluations with no improvement before stopping.
+    patience: usize,
+    /// Minimum change to qualify as an improvement.
+    min_delta: f64,
+    /// Best metric value seen so far.
+    best_value: f64,
+    /// Number of evaluations since last improvement.
+    counter: usize,
+    /// Whether to look for lower (true) or higher (false) values.
+    minimize: bool,
+    /// Best epoch number.
+    best_epoch: usize,
+}
+
+impl EarlyStopping {
+    /// Creates a new early stopping monitor.
+    ///
+    /// - `patience`: Number of evaluations with no improvement before stopping.
+    /// - `min_delta`: Minimum change to qualify as an improvement.
+    pub fn new(patience: usize, min_delta: f64) -> Self {
+        Self {
+            patience,
+            min_delta,
+            best_value: f64::INFINITY,
+            counter: 0,
+            minimize: true,
+            best_epoch: 0,
+        }
+    }
+
+    /// Sets whether to minimize (default) or maximize the metric.
+    pub fn maximize(mut self) -> Self {
+        self.minimize = false;
+        self.best_value = f64::NEG_INFINITY;
+        self
+    }
+
+    /// Checks if training should stop. Call this once per evaluation (e.g., end of epoch).
+    ///
+    /// Returns `true` if training should stop (no improvement for `patience` evaluations).
+    pub fn should_stop(&mut self, metric: f64, epoch: usize) -> bool {
+        let improved = if self.minimize {
+            metric < self.best_value - self.min_delta
+        } else {
+            metric > self.best_value + self.min_delta
+        };
+
+        if improved {
+            self.best_value = metric;
+            self.counter = 0;
+            self.best_epoch = epoch;
+            false
+        } else {
+            self.counter += 1;
+            self.counter >= self.patience
+        }
+    }
+
+    /// Returns the best metric value seen.
+    pub fn best_value(&self) -> f64 {
+        self.best_value
+    }
+
+    /// Returns the epoch of the best metric value.
+    pub fn best_epoch(&self) -> usize {
+        self.best_epoch
+    }
+
+    /// Returns the number of evaluations since last improvement.
+    pub fn evaluations_without_improvement(&self) -> usize {
+        self.counter
+    }
+}
+
 /// Simple training step function for one-off use.
 pub fn train_step(
     loss: &Variable,
@@ -740,6 +820,47 @@ mod tests {
 
         assert_eq!(config.error_budget, 1.0);
         assert_eq!(config.error_budget_warn_threshold, 0.8);
+    }
+
+    #[test]
+    fn test_early_stopping_triggers() {
+        let mut es = EarlyStopping::new(3, 0.001);
+
+        // Improving losses
+        assert!(!es.should_stop(1.0, 0));
+        assert!(!es.should_stop(0.8, 1));
+        assert!(!es.should_stop(0.6, 2));
+
+        // Stagnating losses
+        assert!(!es.should_stop(0.6, 3)); // counter = 1
+        assert!(!es.should_stop(0.601, 4)); // counter = 2 (within min_delta)
+        assert!(es.should_stop(0.7, 5)); // counter = 3 -> stop!
+
+        assert_eq!(es.best_epoch(), 2);
+        assert!((es.best_value() - 0.6).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_early_stopping_resets_on_improvement() {
+        let mut es = EarlyStopping::new(3, 0.0);
+
+        assert!(!es.should_stop(1.0, 0));
+        assert!(!es.should_stop(1.0, 1)); // no improvement, counter = 1
+        assert!(!es.should_stop(1.0, 2)); // counter = 2
+        assert!(!es.should_stop(0.5, 3)); // improvement! counter resets
+        assert_eq!(es.evaluations_without_improvement(), 0);
+        assert_eq!(es.best_epoch(), 3);
+    }
+
+    #[test]
+    fn test_early_stopping_maximize() {
+        let mut es = EarlyStopping::new(2, 0.0).maximize();
+
+        assert!(!es.should_stop(0.5, 0)); // best = 0.5
+        assert!(!es.should_stop(0.7, 1)); // improved
+        assert!(!es.should_stop(0.6, 2)); // counter = 1
+        assert!(es.should_stop(0.65, 3)); // counter = 2 -> stop
+        assert!((es.best_value() - 0.7).abs() < 1e-10);
     }
 
     #[test]

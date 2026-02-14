@@ -515,6 +515,7 @@ mod tests {
     /// Standalone prove-and-verify test: keygen uses same circuit as proving.
     #[test]
     fn test_v3_raw_prove_verify() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use helix_circuits::halo2_proofs::{
             plonk::{keygen_vk, keygen_pk, create_proof, verify_proof_multi},
             poly::kzg::{
@@ -589,6 +590,7 @@ mod tests {
     /// This mimics what MLTrainingProverV3 does.
     #[test]
     fn test_v3_separate_keygen_prove() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use helix_circuits::halo2_proofs::{
             plonk::{keygen_vk, keygen_pk, create_proof, verify_proof_multi},
             poly::kzg::{

@@ -1523,6 +1523,7 @@ mod tests {
 
     #[test]
     fn test_vk_hash_consistency() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use helix_circuits::halo2_proofs::plonk::{keygen_vk, Circuit};
         use helix_circuits::halo2curves::bn256::Fr;
 
@@ -1706,8 +1707,12 @@ mod tests {
 
     /// Generate a correct Halo2 SHPLONK Solidity verifier from our circuit VK.
     /// Writes the verifier to contracts/src/verification/Halo2Verifier.sol
+    /// Ignored by default: this is a code-generation tool, not a correctness test.
+    /// Run explicitly with: cargo test -p helix-prover test_generate_solidity_verifier -- --ignored
     #[test]
+    #[ignore]
     fn test_generate_solidity_verifier() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use helix_circuits::{
             MLTrainingStepV2Circuit, compute_witness_v2, compute_state_hash_v2,
         };

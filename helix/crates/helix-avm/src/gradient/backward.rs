@@ -648,6 +648,143 @@ pub fn backward(loss: &Variable) -> Result<HashMap<NodeIndex, BoundedTensor>, St
                     }
                 }
             }
+            Operation::LogSoftmax(input_idx) => {
+                // y_i = log(softmax(x_i)) = x_i - max(x) - log(sum(exp(x_j - max(x))))
+                // dL/dx_i = dL/dy_i - softmax(x_i) * sum_j(dL/dy_j)
+                let current_node = &tape.nodes[idx];
+                let input_node = &tape.nodes[*input_idx];
+                if let (Some(output_val), Some(input_val)) = (&current_node.cached_value, &input_node.cached_value) {
+                    let n = output_val.len();
+                    let grad_data = grad_output.data();
+
+                    // Compute softmax(x) = exp(log_softmax(x))
+                    let softmax_vals: Vec<f64> = output_val.data().iter()
+                        .map(|v| v.value().exp())
+                        .collect();
+
+                    let grad_sum: f64 = grad_data.iter().map(|g| g.value()).sum();
+
+                    let grad_input_data: Vec<BoundedValue<f64>> = (0..n).map(|i| {
+                        let grad_val = grad_data[i].value() - softmax_vals[i] * grad_sum;
+                        let error = grad_data[i].absolute_error()
+                            + softmax_vals[i] * grad_data.iter().map(|g| g.absolute_error()).sum::<f64>()
+                            + grad_sum.abs() * softmax_vals[i] * input_val.data()[i].absolute_error();
+                        BoundedValue::new(grad_val, helix_core::types::ErrorMargin::absolute(error))
+                    }).collect();
+
+                    let grad_input = BoundedTensor::new(grad_input_data, input_val.shape().clone());
+                    accumulate_grad(&mut grads, *input_idx, &grad_input);
+                }
+            }
+            Operation::CrossEntropyLoss { logits, targets } => {
+                // L = -sum(t_i * log(softmax(x_i)))
+                // dL/dx_i = softmax(x_i) - t_i  (the famous efficient gradient)
+                // This is a scalar loss, so grad_output is [1.0].
+                let logits_node = &tape.nodes[*logits];
+                let targets_node = &tape.nodes[*targets];
+
+                if let (Some(logits_val), Some(targets_val)) =
+                    (&logits_node.cached_value, &targets_node.cached_value)
+                {
+                    let n = logits_val.len();
+                    let logits_data = logits_val.data();
+                    let targets_data = targets_val.data();
+                    let grad_scalar = if !grad_output.is_empty() {
+                        grad_output.data()[0].value()
+                    } else {
+                        1.0
+                    };
+
+                    // Compute softmax(logits) via log-sum-exp
+                    let max_val = logits_data.iter()
+                        .map(|v| v.value())
+                        .fold(f64::NEG_INFINITY, f64::max);
+                    let exp_vals: Vec<f64> = logits_data.iter()
+                        .map(|v| (v.value() - max_val).exp())
+                        .collect();
+                    let exp_sum: f64 = exp_vals.iter().sum();
+                    let softmax_vals: Vec<f64> = exp_vals.iter()
+                        .map(|e| e / exp_sum)
+                        .collect();
+
+                    // dL/d_logits = grad_scalar * (softmax - targets)
+                    let grad_logits_data: Vec<BoundedValue<f64>> = (0..n).map(|i| {
+                        let t_i = if i < targets_data.len() { targets_data[i].value() } else { 0.0 };
+                        let grad_val = grad_scalar * (softmax_vals[i] - t_i);
+                        let error = grad_scalar.abs() * (
+                            softmax_vals[i] * (1.0 - softmax_vals[i]) * logits_data[i].absolute_error()
+                            + if i < targets_data.len() { targets_data[i].absolute_error() } else { 0.0 }
+                        );
+                        BoundedValue::new(grad_val, helix_core::types::ErrorMargin::absolute(error))
+                    }).collect();
+
+                    let grad_logits = BoundedTensor::new(grad_logits_data, logits_val.shape().clone());
+                    accumulate_grad(&mut grads, *logits, &grad_logits);
+
+                    // dL/d_targets = -log(softmax(logits)) * grad_scalar
+                    // Targets are typically fixed (one-hot), but we propagate for completeness.
+                    let log_sum = exp_sum.ln();
+                    let grad_targets_data: Vec<BoundedValue<f64>> = (0..targets_data.len()).map(|i| {
+                        let log_softmax_i = if i < n {
+                            logits_data[i].value() - max_val - log_sum
+                        } else {
+                            0.0
+                        };
+                        let grad_val = -grad_scalar * log_softmax_i;
+                        let error = grad_scalar.abs() * if i < n { logits_data[i].absolute_error() } else { 0.0 };
+                        BoundedValue::new(grad_val, helix_core::types::ErrorMargin::absolute(error))
+                    }).collect();
+
+                    let grad_targets = BoundedTensor::new(grad_targets_data, targets_val.shape().clone());
+                    accumulate_grad(&mut grads, *targets, &grad_targets);
+                }
+            }
+            Operation::BinaryCrossEntropyLoss { predictions, targets } => {
+                // L = -mean(t*log(p) + (1-t)*log(1-p))
+                // dL/dp = (-t/p + (1-t)/(1-p)) / n
+                // dL/dt = (-log(p) + log(1-p)) / n
+                let pred_node = &tape.nodes[*predictions];
+                let targets_node = &tape.nodes[*targets];
+
+                if let (Some(pred_val), Some(targets_val)) =
+                    (&pred_node.cached_value, &targets_node.cached_value)
+                {
+                    let n = pred_val.len();
+                    let pred_data = pred_val.data();
+                    let targets_data = targets_val.data();
+                    let eps = 1e-7;
+                    let grad_scalar = if !grad_output.is_empty() {
+                        grad_output.data()[0].value()
+                    } else {
+                        1.0
+                    };
+                    let scale = if n > 0 { grad_scalar / n as f64 } else { grad_scalar };
+
+                    // dL/dp
+                    let grad_pred_data: Vec<BoundedValue<f64>> = (0..n).map(|i| {
+                        let p = pred_data[i].value().clamp(eps, 1.0 - eps);
+                        let t = if i < targets_data.len() { targets_data[i].value() } else { 0.0 };
+                        let grad_val = scale * (-t / p + (1.0 - t) / (1.0 - p));
+                        let error = scale.abs() * (
+                            pred_data[i].absolute_error() / (p * (1.0 - p)).max(eps)
+                        );
+                        BoundedValue::new(grad_val, helix_core::types::ErrorMargin::absolute(error))
+                    }).collect();
+
+                    let grad_pred = BoundedTensor::new(grad_pred_data, pred_val.shape().clone());
+                    accumulate_grad(&mut grads, *predictions, &grad_pred);
+
+                    // dL/dt
+                    let grad_targets_data: Vec<BoundedValue<f64>> = (0..targets_data.len()).map(|i| {
+                        let p = if i < n { pred_data[i].value().clamp(eps, 1.0 - eps) } else { 0.5 };
+                        let grad_val = scale * (-p.ln() + (1.0 - p).ln());
+                        BoundedValue::new(grad_val, helix_core::types::ErrorMargin::absolute(0.0))
+                    }).collect();
+
+                    let grad_targets = BoundedTensor::new(grad_targets_data, targets_val.shape().clone());
+                    accumulate_grad(&mut grads, *targets, &grad_targets);
+                }
+            }
             Operation::GroupedConv2d { input, kernel, stride, padding, groups: _ } => {
                 // Grouped convolution backward: same structure as Conv2d backward.
                 // The conv2d_backward_input and conv2d_backward_weight functions handle

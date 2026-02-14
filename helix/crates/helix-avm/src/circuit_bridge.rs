@@ -793,6 +793,91 @@ pub fn build_training_witness_with_scale(
     })
 }
 
+/// Like [`build_training_witness_with_scale`] but supports specifying the loss function.
+///
+/// For `LossFunction::MSE`, delegates to the existing implementation.
+/// For `LossFunction::CrossEntropy`, uses `compute_witness_v2_cross_entropy` which
+/// computes softmax + cross-entropy loss and the efficient gradient (softmax - target).
+#[cfg(any(feature = "circuit-bridge", test))]
+pub fn build_training_witness_with_loss(
+    layer1: &crate::nn::Linear,
+    layer2: &crate::nn::Linear,
+    input: &[f64],
+    target: &[f64],
+    learning_rate: f64,
+    step_number: u64,
+    scale: u64,
+    loss_function: helix_circuits::ml::config::LossFunction,
+) -> Result<TrainingWitnessOutput, String> {
+    use helix_circuits::ml::config::LossFunction;
+
+    match loss_function {
+        LossFunction::MSE => {
+            build_training_witness_with_scale(layer1, layer2, input, target, learning_rate, step_number, scale)
+        }
+        LossFunction::CrossEntropy => {
+            use crate::quantization::circuit_quantizer::fr_ops::i64_to_fr;
+            use crate::quantization::CircuitQuantizer;
+            use helix_circuits::halo2curves::bn256::Fr;
+            use helix_circuits::halo2curves::ff::Field;
+            use helix_circuits::{compute_state_hash_v2, compute_witness_v2_cross_entropy};
+
+            let cw = model_to_circuit_weights(layer1, layer2)?;
+
+            if input.len() != cw.d_in {
+                return Err(format!("input length {} != d_in {}", input.len(), cw.d_in));
+            }
+            if target.len() != cw.d_out {
+                return Err(format!("target length {} != d_out {}", target.len(), cw.d_out));
+            }
+
+            validate_finite(input, "input")?;
+            validate_finite(target, "target")?;
+
+            if learning_rate <= 0.0 || !learning_rate.is_finite() {
+                return Err(format!("learning_rate must be finite and positive, got {learning_rate}"));
+            }
+
+            let q = CircuitQuantizer::with_scale(scale);
+            let x_fr: Vec<Fr> = q.quantize_slice_to_fr(input);
+            let target_fr: Vec<Fr> = q.quantize_slice_to_fr(target);
+            let w1_fr: Vec<Fr> = q.quantize_slice_to_fr(&cw.w1);
+            let b1_fr: Vec<Fr> = q.quantize_slice_to_fr(&cw.b1);
+            let w2_fr: Vec<Fr> = q.quantize_slice_to_fr(&cw.w2);
+            let b2_fr: Vec<Fr> = q.quantize_slice_to_fr(&cw.b2);
+            let lr_fr: Fr = i64_to_fr(q.quantize_to_i64(learning_rate));
+
+            let max_w1 = cw.w1.iter().map(|v| (v * scale as f64).round().abs() as u64).max().unwrap_or(0);
+            let max_x = input.iter().map(|v| (v * scale as f64).round().abs() as u64).max().unwrap_or(0);
+            let max_b1 = cw.b1.iter().map(|v| (v * scale as f64).round().abs() as u64).max().unwrap_or(0);
+            let max_h_pre = cw.d_in as u64 * max_w1 * max_x + max_b1;
+            let relu_range = (max_h_pre + 1).max(256) as usize;
+
+            let base_error = Fr::from(1u64);
+            let old_hash = compute_state_hash_v2(&w1_fr, &b1_fr, &w2_fr, &b2_fr);
+
+            let tmp = compute_witness_v2_cross_entropy(
+                cw.d_in, cw.d_hid, cw.d_out,
+                &x_fr, &target_fr, &w1_fr, &b1_fr, &w2_fr, &b2_fr,
+                lr_fr, old_hash, (Fr::ZERO, Fr::ZERO), step_number, base_error, scale as f64,
+            );
+
+            let new_hash = compute_state_hash_v2(&tmp.w1_new, &tmp.b1_new, &tmp.w2_new, &tmp.b2_new);
+
+            let mut witness = compute_witness_v2_cross_entropy(
+                cw.d_in, cw.d_hid, cw.d_out,
+                &x_fr, &target_fr, &w1_fr, &b1_fr, &w2_fr, &b2_fr,
+                lr_fr, old_hash, new_hash, step_number, base_error, scale as f64,
+            );
+
+            witness.finalize_error_checksum();
+            verify_witness_consistency(&witness, cw.d_in, cw.d_hid, cw.d_out)?;
+
+            Ok(TrainingWitnessOutput { witness, relu_range })
+        }
+    }
+}
+
 /// Verifies that a witness has internally consistent dimensions and non-trivial state hashes.
 ///
 /// This catches bugs where the witness was partially initialized or has mismatched vectors.

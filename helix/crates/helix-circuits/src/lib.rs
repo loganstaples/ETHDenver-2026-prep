@@ -24,7 +24,8 @@ pub use ivc::{
     DECIDER_MAX_VECTOR_SIZE,
 };
 pub use ml::training_step_v2::{
-    MLTrainingStepV2Circuit, MLTrainingStepV2Witness, compute_witness_v2, compute_state_hash_v2,
+    MLTrainingStepV2Circuit, MLTrainingStepV2Witness, compute_witness_v2,
+    compute_witness_v2_cross_entropy, compute_state_hash_v2,
     ErrorTracker, ToEvmProof, ToEvmPublicInputs,
 };
 pub use ml::training_step_v3::{

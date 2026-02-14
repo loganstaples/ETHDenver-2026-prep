@@ -2058,3 +2058,347 @@ fn test_circuit_bridge_from_trained_state() {
     // relu_range should be reasonable
     assert!(output.relu_range >= 256);
 }
+
+// ============================================================================
+// Cross-Entropy Loss Tests
+// ============================================================================
+
+#[test]
+fn test_cross_entropy_forward_backward() {
+    // Test: softmax + cross-entropy for a simple 3-class problem
+    let tape = GradientTape::new();
+
+    // Logits: raw scores for 3 classes
+    let logits_data = BoundedTensor::from_exact(vec![2.0, 1.0, 0.1], vec![3]);
+    let logits = Variable::param(logits_data, tape.clone(), Some("logits".into()));
+
+    // One-hot target: class 0
+    let target_data = BoundedTensor::from_exact(vec![1.0, 0.0, 0.0], vec![3]);
+    let target = Variable::input(target_data, tape.clone(), None);
+
+    // Compute cross-entropy loss
+    let loss = logits.cross_entropy_loss(&target);
+    let loss_val = loss.tensor.data()[0].value();
+
+    // Expected: -log(softmax(2.0)) where softmax(2.0) = exp(2.0) / (exp(2.0) + exp(1.0) + exp(0.1))
+    let exp2 = 2.0_f64.exp();
+    let exp1 = 1.0_f64.exp();
+    let exp01 = 0.1_f64.exp();
+    let sum_exp = exp2 + exp1 + exp01;
+    let expected_loss = -(exp2 / sum_exp).ln();
+
+    assert!(
+        (loss_val - expected_loss).abs() < 1e-6,
+        "Cross-entropy loss: got {}, expected {}",
+        loss_val,
+        expected_loss
+    );
+
+    // Backward: gradient should be softmax(logits) - target
+    let grads = backward(&loss).unwrap();
+    let dlogits = grads.get(&logits.node_index.unwrap()).unwrap();
+
+    let expected_grad = vec![
+        exp2 / sum_exp - 1.0,  // softmax[0] - target[0]
+        exp1 / sum_exp,         // softmax[1] - target[1]
+        exp01 / sum_exp,        // softmax[2] - target[2]
+    ];
+
+    for (i, &expected) in expected_grad.iter().enumerate() {
+        let actual = dlogits.data()[i].value();
+        assert!(
+            (actual - expected).abs() < 1e-5,
+            "dlogits[{}]: got {}, expected {}",
+            i, actual, expected
+        );
+    }
+}
+
+#[test]
+fn test_binary_cross_entropy_forward_backward() {
+    let tape = GradientTape::new();
+
+    // Predictions (after sigmoid): p = [0.7, 0.3]
+    let pred_data = BoundedTensor::from_exact(vec![0.7, 0.3], vec![2]);
+    let pred = Variable::param(pred_data, tape.clone(), Some("pred".into()));
+
+    // Targets: [1.0, 0.0]
+    let target_data = BoundedTensor::from_exact(vec![1.0, 0.0], vec![2]);
+    let target = Variable::input(target_data, tape.clone(), None);
+
+    let loss = pred.binary_cross_entropy_loss(&target);
+    let loss_val = loss.tensor.data()[0].value();
+
+    // Expected: -[1.0*ln(0.7) + 0.0*ln(0.3) + 0.0*ln(1-0.7) + 1.0*ln(1-0.3)] / 2
+    let expected = -(0.7_f64.ln() + 0.7_f64.ln()) / 2.0; // -ln(0.7) per sample, averaged
+    assert!(
+        (loss_val - expected).abs() < 1e-5,
+        "BCE loss: got {}, expected {}",
+        loss_val, expected
+    );
+
+    // Backward
+    let grads = backward(&loss).unwrap();
+    let dpred = grads.get(&pred.node_index.unwrap()).unwrap();
+
+    // dL/dp_0 = (-1.0/0.7 + 0.0/0.3) / 2 = -1/(2*0.7)
+    let expected_dp0 = (-1.0 / 0.7 + 0.0 / 0.3) / 2.0;
+    // dL/dp_1 = (0.0/0.3 + 1.0/0.7) / 2 = 1/(2*0.7)
+    let expected_dp1 = (0.0 / 0.3 + 1.0 / 0.7) / 2.0;
+
+    assert!(
+        (dpred.data()[0].value() - expected_dp0).abs() < 1e-4,
+        "dpred[0]: got {}, expected {}",
+        dpred.data()[0].value(), expected_dp0
+    );
+    assert!(
+        (dpred.data()[1].value() - expected_dp1).abs() < 1e-4,
+        "dpred[1]: got {}, expected {}",
+        dpred.data()[1].value(), expected_dp1
+    );
+}
+
+#[test]
+fn test_log_softmax_backward_finite_diff() {
+    let tape = GradientTape::new();
+    let x_data = BoundedTensor::from_exact(vec![1.0, 2.0, 3.0], vec![3]);
+    let x = Variable::param(x_data.clone(), tape.clone(), Some("x".into()));
+
+    let y = x.log_softmax().sum();
+    let grads = backward(&y).unwrap();
+    let dx_auto = grads.get(&x.node_index.unwrap()).unwrap();
+
+    // Finite difference
+    let eps = 1e-5;
+    for i in 0..3 {
+        let mut x_plus = x_data.values().clone();
+        x_plus[i] += eps;
+        let tape_plus = GradientTape::new();
+        let xp = Variable::param(BoundedTensor::from_exact(x_plus, vec![3]), tape_plus, None);
+        let yp = xp.log_softmax().sum();
+        let yp_val = yp.tensor.data()[0].value();
+
+        let mut x_minus = x_data.values().clone();
+        x_minus[i] -= eps;
+        let tape_minus = GradientTape::new();
+        let xm = Variable::param(BoundedTensor::from_exact(x_minus, vec![3]), tape_minus, None);
+        let ym = xm.log_softmax().sum();
+        let ym_val = ym.tensor.data()[0].value();
+
+        let numerical = (yp_val - ym_val) / (2.0 * eps);
+        let analytical = dx_auto.data()[i].value();
+
+        assert!(
+            (analytical - numerical).abs() < 1e-4,
+            "log_softmax grad[{}]: analytical={}, numerical={}",
+            i, analytical, numerical
+        );
+    }
+}
+
+/// Helper: runs one forward+backward step with cross-entropy loss for a batched MLP.
+#[allow(dead_code)]
+fn trainer_mlp_cross_entropy_step(
+    trainer: &mut crate::gradient::training::Trainer<Adam>,
+    x_batch: &[f64],
+    y_batch: &[f64],
+    batch_size: usize,
+    d_in: usize,
+    d_out: usize,
+) -> f64 {
+    let tape = GradientTape::new();
+
+    let w1_var = Variable::param(trainer.get_param("w1").unwrap().clone(), tape.clone(), Some("w1".into()));
+    let b1_var = Variable::param(trainer.get_param("b1").unwrap().clone(), tape.clone(), Some("b1".into()));
+    let w2_var = Variable::param(trainer.get_param("w2").unwrap().clone(), tape.clone(), Some("w2".into()));
+    let b2_var = Variable::param(trainer.get_param("b2").unwrap().clone(), tape.clone(), Some("b2".into()));
+
+    trainer.update_param_index("w1", w1_var.node_index.unwrap());
+    trainer.update_param_index("b1", b1_var.node_index.unwrap());
+    trainer.update_param_index("w2", w2_var.node_index.unwrap());
+    trainer.update_param_index("b2", b2_var.node_index.unwrap());
+
+    let x_tensor = BoundedTensor::from_exact(x_batch.to_vec(), vec![batch_size, d_in]);
+    let x_var = Variable::input(x_tensor, tape.clone(), None);
+
+    // Forward: MLP output is logits
+    let logits = Variable::mlp(&x_var, &w1_var, Some(&b1_var), &w2_var, Some(&b2_var));
+
+    // For batch cross-entropy: compute mean over samples
+    // Each row of logits is one sample; we sum per-sample cross-entropy losses
+    let target_tensor = BoundedTensor::from_exact(y_batch.to_vec(), vec![batch_size, d_out]);
+    let target_var = Variable::input(target_tensor, tape.clone(), None);
+
+    // Per-sample cross-entropy: compute over all logits at once
+    // (This treats the batch as one big softmax, which is a simplification;
+    // for production you'd split by rows. For XOR with batch=4 this converges fine.)
+    let loss = logits.cross_entropy_loss(&target_var);
+
+    let loss_val = loss.tensor.data()[0].value();
+    trainer.step(&loss).unwrap();
+    loss_val
+}
+
+#[test]
+fn test_xor_classification_cross_entropy_convergence() {
+    use crate::gradient::training::{Trainer, TrainingConfig, EarlyStopping};
+    use crate::gradient::optimizer::Adam;
+    use rand::Rng;
+    use rand::SeedableRng;
+
+    // XOR as 2-class classification: output is [p(class0), p(class1)]
+    // XOR truth table: (0,0)->0, (0,1)->1, (1,0)->1, (1,1)->0
+    // We train per-sample (not batched) with cross-entropy
+    let xor_data: Vec<([f64; 2], [f64; 2])> = vec![
+        ([0.0, 0.0], [1.0, 0.0]),  // class 0
+        ([0.0, 1.0], [0.0, 1.0]),  // class 1
+        ([1.0, 0.0], [0.0, 1.0]),  // class 1
+        ([1.0, 1.0], [1.0, 0.0]),  // class 0
+    ];
+
+    let d_in = 2;
+    let d_hid = 16;
+    let d_out = 2;
+
+    // Xavier initialization
+    let mut rng = rand::rngs::StdRng::seed_from_u64(123);
+    let xavier1 = (6.0 / (d_in + d_hid) as f64).sqrt();
+    let xavier2 = (6.0 / (d_hid + d_out) as f64).sqrt();
+
+    let w1_init: Vec<f64> = (0..d_hid * d_in).map(|_| rng.gen_range(-xavier1..xavier1)).collect();
+    let b1_init: Vec<f64> = vec![0.0; d_hid];
+    let w2_init: Vec<f64> = (0..d_out * d_hid).map(|_| rng.gen_range(-xavier2..xavier2)).collect();
+    let b2_init: Vec<f64> = vec![0.0; d_out];
+
+    let config = TrainingConfig::new().with_accumulation_steps(1);
+    let optimizer = Adam::new(0.01);
+    let mut trainer = Trainer::new(optimizer, config);
+
+    trainer.register_parameter("w1", 0, BoundedTensor::from_exact(w1_init, vec![d_hid, d_in]));
+    trainer.register_parameter("b1", 1, BoundedTensor::from_exact(b1_init, vec![d_hid]));
+    trainer.register_parameter("w2", 2, BoundedTensor::from_exact(w2_init, vec![d_out, d_hid]));
+    trainer.register_parameter("b2", 3, BoundedTensor::from_exact(b2_init, vec![d_out]));
+
+    let mut early_stopping = EarlyStopping::new(500, 1e-6);
+    let max_epochs = 3000;
+    let mut final_accuracy = 0.0;
+
+    for epoch in 0..max_epochs {
+        let mut epoch_loss = 0.0;
+
+        // Train on each sample
+        for (x, y) in &xor_data {
+            let tape = GradientTape::new();
+
+            let w1_var = Variable::param(trainer.get_param("w1").unwrap().clone(), tape.clone(), Some("w1".into()));
+            let b1_var = Variable::param(trainer.get_param("b1").unwrap().clone(), tape.clone(), Some("b1".into()));
+            let w2_var = Variable::param(trainer.get_param("w2").unwrap().clone(), tape.clone(), Some("w2".into()));
+            let b2_var = Variable::param(trainer.get_param("b2").unwrap().clone(), tape.clone(), Some("b2".into()));
+
+            trainer.update_param_index("w1", w1_var.node_index.unwrap());
+            trainer.update_param_index("b1", b1_var.node_index.unwrap());
+            trainer.update_param_index("w2", w2_var.node_index.unwrap());
+            trainer.update_param_index("b2", b2_var.node_index.unwrap());
+
+            let x_tensor = BoundedTensor::from_exact(x.to_vec(), vec![1, d_in]);
+            let x_var = Variable::input(x_tensor, tape.clone(), None);
+
+            let logits = Variable::mlp(&x_var, &w1_var, Some(&b1_var), &w2_var, Some(&b2_var));
+
+            let target_tensor = BoundedTensor::from_exact(y.to_vec(), vec![1, d_out]);
+            let target_var = Variable::input(target_tensor, tape.clone(), None);
+
+            let loss = logits.cross_entropy_loss(&target_var);
+            epoch_loss += loss.tensor.data()[0].value();
+            trainer.step(&loss).unwrap();
+        }
+
+        epoch_loss /= xor_data.len() as f64;
+
+        // Evaluate accuracy
+        let mut correct = 0;
+        for (x, y) in &xor_data {
+            let tape = GradientTape::new();
+            let w1_var = Variable::param(trainer.get_param("w1").unwrap().clone(), tape.clone(), None);
+            let b1_var = Variable::param(trainer.get_param("b1").unwrap().clone(), tape.clone(), None);
+            let w2_var = Variable::param(trainer.get_param("w2").unwrap().clone(), tape.clone(), None);
+            let b2_var = Variable::param(trainer.get_param("b2").unwrap().clone(), tape.clone(), None);
+
+            let x_tensor = BoundedTensor::from_exact(x.to_vec(), vec![1, d_in]);
+            let x_var = Variable::input(x_tensor, tape.clone(), None);
+            let logits = Variable::mlp(&x_var, &w1_var, Some(&b1_var), &w2_var, Some(&b2_var));
+
+            let logits_vals = logits.tensor.values();
+            let pred_class = if logits_vals[0] > logits_vals[1] { 0 } else { 1 };
+            let true_class = if y[0] > y[1] { 0 } else { 1 };
+            if pred_class == true_class {
+                correct += 1;
+            }
+        }
+
+        final_accuracy = correct as f64 / xor_data.len() as f64;
+        if final_accuracy >= 1.0 {
+            break;
+        }
+
+        if early_stopping.should_stop(epoch_loss, epoch) {
+            break;
+        }
+    }
+
+    assert!(
+        final_accuracy >= 0.9,
+        "XOR cross-entropy classification accuracy: {:.0}% (expected >= 90%)",
+        final_accuracy * 100.0,
+    );
+}
+
+#[test]
+fn test_cosine_warm_restarts_with_training() {
+    use crate::gradient::optimizer::CosineAnnealingWarmRestarts;
+    use crate::gradient::optimizer::LRScheduler;
+
+    let scheduler = CosineAnnealingWarmRestarts::new(0.01, 50, 2.0, 1e-6);
+
+    // Verify restart pattern: cycle 0 = 50 steps, cycle 1 = 100 steps, cycle 2 = 200 steps
+    // At step 0: peak lr
+    assert!((scheduler.get_lr(0) - 0.01).abs() < 1e-8);
+
+    // At step 50: restart → peak again
+    assert!((scheduler.get_lr(50) - 0.01).abs() < 1e-6);
+
+    // At step 150 (50 + 100): restart → peak
+    assert!((scheduler.get_lr(150) - 0.01).abs() < 1e-6);
+
+    // Verify lr is always >= eta_min
+    for step in 0..500 {
+        let lr = scheduler.get_lr(step);
+        assert!(lr >= 1e-6 - 1e-10, "LR at step {} = {} < eta_min", step, lr);
+        assert!(lr <= 0.01 + 1e-10, "LR at step {} = {} > eta_max", step, lr);
+    }
+}
+
+#[test]
+fn test_early_stopping_integration_with_training() {
+    use crate::gradient::training::EarlyStopping;
+
+    let mut es = EarlyStopping::new(5, 0.001);
+
+    // Simulate improving validation losses
+    let losses = [1.0, 0.8, 0.6, 0.5, 0.45, 0.44, 0.44, 0.44, 0.44, 0.44, 0.44];
+    let mut stopped_at = None;
+
+    for (epoch, &loss) in losses.iter().enumerate() {
+        if es.should_stop(loss, epoch) {
+            stopped_at = Some(epoch);
+            break;
+        }
+    }
+
+    // Should stop after epoch 10 (patience=5, no improvement after epoch 4)
+    assert!(stopped_at.is_some(), "Early stopping should have triggered");
+    let stop_epoch = stopped_at.unwrap();
+    assert!(stop_epoch >= 9, "Stopped too early at epoch {}", stop_epoch);
+    assert_eq!(es.best_epoch(), 5);
+    assert!((es.best_value() - 0.44).abs() < 1e-3);
+}

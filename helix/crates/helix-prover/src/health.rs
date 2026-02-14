@@ -1161,6 +1161,7 @@ mod tests {
 
     #[test]
     fn test_proof_health_check() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let check = ProofHealthCheck::run();
         assert!(check.passed, "ProofHealthCheck should pass: {:?}", check.error);
         assert!(check.proof_size.is_some());

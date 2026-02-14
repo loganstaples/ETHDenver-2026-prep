@@ -122,6 +122,20 @@ pub enum Operation {
         padding: (usize, usize),
         groups: usize,
     },
+    /// Log-softmax: log(softmax(x)) computed numerically stable via log-sum-exp.
+    LogSoftmax(NodeIndex),
+    /// Fused softmax + cross-entropy loss: -sum(targets * log(softmax(logits))).
+    /// Stores (logits_idx, targets_idx). The efficient backward is: softmax(logits) - targets.
+    CrossEntropyLoss {
+        logits: NodeIndex,
+        targets: NodeIndex,
+    },
+    /// Binary cross-entropy loss: -[t*log(p) + (1-t)*log(1-p)].
+    /// Stores (predictions_idx, targets_idx).
+    BinaryCrossEntropyLoss {
+        predictions: NodeIndex,
+        targets: NodeIndex,
+    },
 }
 
 /// Metadata for a node in the computation graph.
@@ -763,6 +777,138 @@ impl Variable {
             Operation::Input
         };
 
+        Self::with_op(result, op, tape)
+    }
+
+    /// Log-softmax: log(softmax(x)), computed with log-sum-exp trick for numerical stability.
+    pub fn log_softmax(&self) -> Variable {
+        let data = self.tensor.data();
+        let n = data.len();
+        if n == 0 {
+            return self.clone();
+        }
+
+        // log-sum-exp trick: log(softmax(x_i)) = x_i - max(x) - log(sum(exp(x_j - max(x))))
+        let max_val = data.iter().map(|v| v.value()).fold(f64::NEG_INFINITY, f64::max);
+        let exp_sum: f64 = data.iter().map(|v| (v.value() - max_val).exp()).sum();
+        let log_sum = exp_sum.ln();
+
+        let result_data: Vec<helix_core::types::BoundedValue<f64>> = data.iter().map(|v| {
+            let log_softmax_val = v.value() - max_val - log_sum;
+            // Error: input error propagates directly (subtraction of constants)
+            let error = v.absolute_error();
+            helix_core::types::BoundedValue::new(log_softmax_val, helix_core::types::ErrorMargin::absolute(error))
+        }).collect();
+
+        let result = helix_core::types::BoundedTensor::new(result_data, self.tensor.shape().clone());
+        let op = if let (Some(idx), Some(_)) = (self.node_index, &self.tape) {
+            Operation::LogSoftmax(idx)
+        } else {
+            Operation::Input
+        };
+        Self::with_op(result, op, self.tape.clone())
+    }
+
+    /// Softmax + cross-entropy loss (fused for numerical stability).
+    ///
+    /// Computes: -sum(targets * log(softmax(logits))) / batch_size
+    /// Backward gradient: (softmax(logits) - targets) / batch_size
+    ///
+    /// `self` is logits (raw, unnormalized scores), `targets` is the target distribution
+    /// (one-hot or soft labels, must sum to 1 per sample).
+    pub fn cross_entropy_loss(&self, targets: &Variable) -> Variable {
+        let logits_data = self.tensor.data();
+        let targets_data = targets.tensor.data();
+        let n = logits_data.len();
+
+        // Compute log-softmax via log-sum-exp trick
+        let max_val = logits_data.iter().map(|v| v.value()).fold(f64::NEG_INFINITY, f64::max);
+        let exp_sum: f64 = logits_data.iter().map(|v| (v.value() - max_val).exp()).sum();
+        let log_sum = exp_sum.ln();
+
+        // loss = -sum(targets * log_softmax) / n_samples
+        // For classification, n_samples = 1 per forward pass (single sample) or batch_size
+        // We compute mean over elements (consistent with how MSE mean works)
+        let mut loss_val = 0.0;
+        let mut loss_err = 0.0;
+        for i in 0..n.min(targets_data.len()) {
+            let log_softmax_i = logits_data[i].value() - max_val - log_sum;
+            let t_i = targets_data[i].value();
+            loss_val -= t_i * log_softmax_i;
+            // Error: |t| * (logit_error) + |log_softmax| * target_error
+            loss_err += t_i.abs() * logits_data[i].absolute_error()
+                + log_softmax_i.abs() * targets_data[i].absolute_error();
+        }
+
+        let result = helix_core::types::BoundedTensor::new(
+            vec![helix_core::types::BoundedValue::new(
+                loss_val,
+                helix_core::types::ErrorMargin::absolute(loss_err),
+            )],
+            vec![1],
+        );
+
+        let tape = merge_tapes(&self.tape, &targets.tape);
+        let op = if let (Some(logits_idx), Some(targets_idx), Some(_)) =
+            (self.node_index, targets.node_index, &tape)
+        {
+            Operation::CrossEntropyLoss {
+                logits: logits_idx,
+                targets: targets_idx,
+            }
+        } else {
+            Operation::Input
+        };
+        Self::with_op(result, op, tape)
+    }
+
+    /// Binary cross-entropy loss.
+    ///
+    /// Computes: -mean(targets * log(predictions) + (1-targets) * log(1-predictions))
+    /// `self` is predictions (after sigmoid), `targets` is binary labels {0, 1}.
+    pub fn binary_cross_entropy_loss(&self, targets: &Variable) -> Variable {
+        let pred_data = self.tensor.data();
+        let targets_data = targets.tensor.data();
+        let n = pred_data.len();
+
+        let eps = 1e-7; // Clamp to avoid log(0)
+        let mut loss_val = 0.0;
+        let mut loss_err = 0.0;
+
+        for i in 0..n.min(targets_data.len()) {
+            let p = pred_data[i].value().clamp(eps, 1.0 - eps);
+            let t = targets_data[i].value();
+            loss_val -= t * p.ln() + (1.0 - t) * (1.0 - p).ln();
+            // Error from prediction uncertainty
+            let dp = 1.0 / (p * (1.0 - p)); // derivative of BCE w.r.t. p
+            loss_err += dp.abs() * pred_data[i].absolute_error()
+                + (p.ln() - (1.0 - p).ln()).abs() * targets_data[i].absolute_error();
+        }
+
+        if n > 0 {
+            loss_val /= n as f64;
+            loss_err /= n as f64;
+        }
+
+        let result = helix_core::types::BoundedTensor::new(
+            vec![helix_core::types::BoundedValue::new(
+                loss_val,
+                helix_core::types::ErrorMargin::absolute(loss_err),
+            )],
+            vec![1],
+        );
+
+        let tape = merge_tapes(&self.tape, &targets.tape);
+        let op = if let (Some(pred_idx), Some(targets_idx), Some(_)) =
+            (self.node_index, targets.node_index, &tape)
+        {
+            Operation::BinaryCrossEntropyLoss {
+                predictions: pred_idx,
+                targets: targets_idx,
+            }
+        } else {
+            Operation::Input
+        };
         Self::with_op(result, op, tape)
     }
 

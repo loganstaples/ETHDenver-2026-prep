@@ -27,9 +27,10 @@ use crate::pipeline::{
 };
 use halo2curves::bn256::Fr;
 use halo2curves::ff::PrimeField;
+use helix_circuits::ml::config::LossFunction;
 use helix_circuits::ml::training_step_v2::{
-    compute_state_hash_v2, compute_witness_v2, MLTrainingStepV2Circuit, MLTrainingStepV2Witness,
-    NUM_PUBLIC_INPUTS,
+    compute_state_hash_v2, compute_witness_v2, compute_witness_v2_cross_entropy,
+    MLTrainingStepV2Circuit, MLTrainingStepV2Witness, NUM_PUBLIC_INPUTS,
 };
 use helix_circuits::verifier::{
     SolidityGenerator, VkData,
@@ -151,6 +152,8 @@ pub struct V2ProverConfig {
     pub use_witness_cache: bool,
     /// Enable detailed tracing.
     pub enable_tracing: bool,
+    /// Loss function type (MSE or CrossEntropy).
+    pub loss_function: helix_circuits::ml::config::LossFunction,
 }
 
 impl Default for V2ProverConfig {
@@ -169,6 +172,7 @@ impl Default for V2ProverConfig {
             deterministic_seed: None,
             use_witness_cache: true,
             enable_tracing: true,
+            loss_function: helix_circuits::ml::config::LossFunction::MSE,
         }
     }
 }
@@ -202,6 +206,12 @@ impl V2ProverConfig {
     /// Enables deterministic proof generation.
     pub fn deterministic(mut self, seed: [u8; 32]) -> Self {
         self.deterministic_seed = Some(seed);
+        self
+    }
+
+    /// Sets the loss function (MSE or CrossEntropy).
+    pub fn with_loss_function(mut self, loss: LossFunction) -> Self {
+        self.loss_function = loss;
         self
     }
 
@@ -744,6 +754,50 @@ impl MLTrainingProverV2 {
         );
         witness.set_error_params(model_id, error_budget);
         witness
+    }
+
+    /// Builds a witness with the specified loss function.
+    ///
+    /// For `LossFunction::MSE`, delegates to `build_witness`.
+    /// For `LossFunction::CrossEntropy`, uses `compute_witness_v2_cross_entropy`.
+    pub fn build_witness_with_loss(
+        d_in: usize,
+        d_hid: usize,
+        d_out: usize,
+        x: &[Fr],
+        target: &[Fr],
+        w1: &[Fr],
+        b1: &[Fr],
+        w2: &[Fr],
+        b2: &[Fr],
+        lr: Fr,
+        step_number: u64,
+        base_error: Fr,
+        loss_function: LossFunction,
+        scale: f64,
+    ) -> MLTrainingStepV2Witness {
+        match loss_function {
+            LossFunction::MSE => {
+                Self::build_witness(d_in, d_hid, d_out, x, target, w1, b1, w2, b2, lr, step_number, base_error)
+            }
+            LossFunction::CrossEntropy => {
+                let old_hash = compute_state_hash_v2(w1, b1, w2, b2);
+
+                // First pass to compute new weights
+                let tmp = compute_witness_v2_cross_entropy(
+                    d_in, d_hid, d_out, x, target, w1, b1, w2, b2, lr,
+                    old_hash, (Fr::zero(), Fr::zero()), step_number, base_error, scale,
+                );
+
+                let new_hash = compute_state_hash_v2(&tmp.w1_new, &tmp.b1_new, &tmp.w2_new, &tmp.b2_new);
+
+                // Second pass with correct new hash
+                compute_witness_v2_cross_entropy(
+                    d_in, d_hid, d_out, x, target, w1, b1, w2, b2, lr,
+                    old_hash, new_hash, step_number, base_error, scale,
+                )
+            }
+        }
     }
 
     /// Computes the witness hash for caching.

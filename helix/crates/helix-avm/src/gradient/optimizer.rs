@@ -557,6 +557,67 @@ impl LRScheduler for OneCycleLR {
     }
 }
 
+/// Cosine annealing with warm restarts (SGDR, Loshchilov & Hutter 2016).
+///
+/// After each restart, the period is multiplied by `t_mult`.
+/// lr(t) = eta_min + 0.5 * (eta_max - eta_min) * (1 + cos(pi * T_cur / T_i))
+///
+/// where T_cur is steps since last restart, T_i is the current period length.
+pub struct CosineAnnealingWarmRestarts {
+    /// Maximum (initial) learning rate.
+    eta_max: f64,
+    /// Minimum learning rate.
+    eta_min: f64,
+    /// Initial restart period (in steps).
+    t_0: usize,
+    /// Period multiplier after each restart.
+    t_mult: f64,
+}
+
+impl CosineAnnealingWarmRestarts {
+    /// Creates a new warm restarts scheduler.
+    ///
+    /// - `eta_max`: Peak learning rate at each restart.
+    /// - `t_0`: Number of steps in the first cycle.
+    /// - `t_mult`: Multiplier for the period after each restart (1.0 = constant period).
+    /// - `eta_min`: Minimum learning rate (default: 0.0).
+    pub fn new(eta_max: f64, t_0: usize, t_mult: f64, eta_min: f64) -> Self {
+        Self {
+            eta_max,
+            eta_min,
+            t_0: t_0.max(1),
+            t_mult: t_mult.max(1.0),
+        }
+    }
+}
+
+impl LRScheduler for CosineAnnealingWarmRestarts {
+    fn get_lr(&self, step: usize) -> f64 {
+        if self.t_mult == 1.0 {
+            // Constant period: simple modular arithmetic
+            let t_cur = step % self.t_0;
+            let progress = t_cur as f64 / self.t_0 as f64;
+            self.eta_min + 0.5 * (self.eta_max - self.eta_min)
+                * (1.0 + (std::f64::consts::PI * progress).cos())
+        } else {
+            // Geometric series of periods: T_0, T_0*T_mult, T_0*T_mult^2, ...
+            // Find which cycle we're in: sum of geometric series = T_0 * (T_mult^n - 1) / (T_mult - 1)
+            let mut t_remaining = step as f64;
+            let mut t_i = self.t_0 as f64;
+
+            loop {
+                if t_remaining < t_i {
+                    let progress = t_remaining / t_i;
+                    return self.eta_min + 0.5 * (self.eta_max - self.eta_min)
+                        * (1.0 + (std::f64::consts::PI * progress).cos());
+                }
+                t_remaining -= t_i;
+                t_i *= self.t_mult;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -674,6 +735,38 @@ mod tests {
         // (1 - 50/100)^2 = 0.25
         assert!((scheduler.get_lr(50) - 0.025).abs() < 1e-10);
         assert!((scheduler.get_lr(100) - 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_cosine_warm_restarts_constant_period() {
+        let scheduler = CosineAnnealingWarmRestarts::new(0.1, 10, 1.0, 0.0);
+
+        // At start of each cycle: eta_max
+        assert!((scheduler.get_lr(0) - 0.1).abs() < 1e-10);
+        assert!((scheduler.get_lr(10) - 0.1).abs() < 1e-10);
+        assert!((scheduler.get_lr(20) - 0.1).abs() < 1e-10);
+
+        // At midpoint of cycle: ~eta_min (cosine at pi = -1, so (1+(-1))/2 = 0)
+        // Actually at step 5: cos(pi * 5/10) = cos(pi/2) = 0, so lr = 0.05
+        let mid = scheduler.get_lr(5);
+        assert!((mid - 0.05).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_cosine_warm_restarts_increasing_period() {
+        let scheduler = CosineAnnealingWarmRestarts::new(0.1, 10, 2.0, 0.001);
+
+        // Start: eta_max
+        assert!((scheduler.get_lr(0) - 0.1).abs() < 1e-10);
+
+        // After first cycle (10 steps), restart at step 10
+        assert!((scheduler.get_lr(10) - 0.1).abs() < 1e-6);
+
+        // Second cycle is 20 steps (10 * 2), restart at step 30
+        assert!((scheduler.get_lr(30) - 0.1).abs() < 1e-6);
+
+        // Third cycle is 40 steps (20 * 2), so step 70 is restart
+        assert!((scheduler.get_lr(70) - 0.1).abs() < 1e-6);
     }
 
     #[test]

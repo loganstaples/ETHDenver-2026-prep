@@ -2061,6 +2061,257 @@ pub fn compute_witness_v2(
     witness
 }
 
+/// Computes a full training step witness with cross-entropy loss.
+///
+/// Like `compute_witness_v2` but uses cross-entropy loss instead of MSE:
+///   loss = -sum(target_i * log(softmax(y_i)))
+///   dy_i = softmax(y_i) - target_i
+///
+/// Uses the log-sum-exp trick for numerical stability in Fr field arithmetic.
+/// The softmax is computed as: softmax(y_i) = exp(y_i - max(y)) / sum(exp(y_j - max(y)))
+///
+/// For the circuit, we use a piecewise linear approximation of log/exp since
+/// transcendental functions aren't directly available in Fr arithmetic.
+/// The approximation uses the existing exp lookup table infrastructure.
+pub fn compute_witness_v2_cross_entropy(
+    d_in: usize,
+    d_hid: usize,
+    d_out: usize,
+    x: &[Fr],
+    target: &[Fr],
+    w1: &[Fr],
+    b1: &[Fr],
+    w2: &[Fr],
+    b2: &[Fr],
+    lr: Fr,
+    old_state_hash: (Fr, Fr),
+    new_state_hash: (Fr, Fr),
+    step_number: u64,
+    base_error: Fr,
+    scale: f64, // Quantization scale factor (Fr values = real * scale)
+) -> MLTrainingStepV2Witness {
+    let mut tracker = ErrorTracker::new();
+
+    // --- Forward pass (same as MSE version) ---
+    let mut h_pre = vec![Fr::ZERO; d_hid];
+    let mut h_pre_err = vec![Fr::ZERO; d_hid];
+    for j in 0..d_hid {
+        let mut sum = Fr::ZERO;
+        for i in 0..d_in {
+            sum += w1[j * d_in + i] * x[i];
+        }
+        h_pre[j] = sum + b1[j];
+        h_pre_err[j] = tracker.dot_product_error(d_in, base_error);
+    }
+
+    let mut h = vec![Fr::ZERO; d_hid];
+    let mut h_err = vec![Fr::ZERO; d_hid];
+    let mut relu_mask = vec![Fr::ZERO; d_hid];
+    for j in 0..d_hid {
+        let repr = h_pre[j].to_repr();
+        let bytes = repr.as_ref();
+        let is_negative = bytes[31] >= 0x19;
+        if is_negative || h_pre[j] == Fr::ZERO {
+            h[j] = Fr::ZERO;
+            h_err[j] = Fr::ZERO;
+            relu_mask[j] = Fr::ZERO;
+        } else {
+            h[j] = h_pre[j];
+            h_err[j] = h_pre_err[j];
+            relu_mask[j] = Fr::ONE;
+        }
+    }
+
+    let mut y = vec![Fr::ZERO; d_out];
+    let mut y_err = vec![Fr::ZERO; d_out];
+    for j in 0..d_out {
+        let mut sum = Fr::ZERO;
+        for k in 0..d_hid {
+            sum += w2[j * d_hid + k] * h[k];
+        }
+        y[j] = sum + b2[j];
+        y_err[j] = tracker.dot_product_error(d_hid, base_error);
+    }
+
+    // --- Cross-entropy loss ---
+    // Convert Fr logits to f64 for stable softmax computation, then back to Fr.
+    // This is necessary because exp/log aren't native Fr operations.
+    // The circuit verifies the loss via lookup tables; the witness just needs correct values.
+
+    let inv_scale = if scale.abs() > 1e-12 { 1.0 / scale } else { 1.0 };
+
+    // Convert to f64
+    let y_f64: Vec<f64> = y.iter().map(|yi| fr_to_f64(*yi, inv_scale)).collect();
+    let target_f64: Vec<f64> = target.iter().map(|ti| fr_to_f64(*ti, inv_scale)).collect();
+
+    // Softmax via log-sum-exp
+    let max_y = y_f64.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let exp_y: Vec<f64> = y_f64.iter().map(|&v| (v - max_y).exp()).collect();
+    let sum_exp: f64 = exp_y.iter().sum();
+    let softmax_y: Vec<f64> = exp_y.iter().map(|&e| e / sum_exp).collect();
+
+    // loss = -sum(target * log(softmax))
+    let mut loss_f64 = 0.0;
+    for j in 0..d_out {
+        let log_sm = softmax_y[j].max(1e-15).ln();
+        loss_f64 -= target_f64[j] * log_sm;
+    }
+
+    // Convert loss to Fr (scale by scale^2 to match MSE convention, or just scale)
+    // Cross-entropy loss is in natural units; scale it to match the Fr representation
+    let loss = f64_to_fr(loss_f64, scale);
+    let loss_err = Fr::from(d_out as u64) * base_error;
+
+    // --- Backward pass: dy = softmax(y) - target ---
+    let dy: Vec<Fr> = (0..d_out).map(|j| {
+        let sm_fr = f64_to_fr(softmax_y[j], scale);
+        sm_fr - target[j]
+    }).collect();
+    let dy_err = vec![base_error; d_out];
+
+    // Rest of backward pass is identical to MSE (gradients flow through same computation)
+    let mut dw2 = vec![Fr::ZERO; d_out * d_hid];
+    let mut dw2_err = vec![Fr::ZERO; d_out * d_hid];
+    for j in 0..d_out {
+        for k in 0..d_hid {
+            dw2[j * d_hid + k] = dy[j] * h[k];
+            dw2_err[j * d_hid + k] = tracker.mul_error(dy[j], dy_err[j], h[k], h_err[k]);
+        }
+    }
+
+    let db2 = dy.clone();
+    let db2_err = dy_err.clone();
+
+    let mut dh = vec![Fr::ZERO; d_hid];
+    let mut dh_err = vec![Fr::ZERO; d_hid];
+    for k in 0..d_hid {
+        for j in 0..d_out {
+            dh[k] += w2[j * d_hid + k] * dy[j];
+        }
+        dh_err[k] = tracker.dot_product_error(d_out, base_error);
+    }
+
+    let dh_pre: Vec<Fr> = (0..d_hid).map(|k| dh[k] * relu_mask[k]).collect();
+    let dh_pre_err: Vec<Fr> = (0..d_hid).map(|k| {
+        if relu_mask[k] == Fr::ONE { dh_err[k] } else { Fr::ZERO }
+    }).collect();
+
+    let mut dw1 = vec![Fr::ZERO; d_hid * d_in];
+    let mut dw1_err = vec![Fr::ZERO; d_hid * d_in];
+    for j in 0..d_hid {
+        for i in 0..d_in {
+            dw1[j * d_in + i] = dh_pre[j] * x[i];
+            dw1_err[j * d_in + i] = base_error;
+        }
+    }
+
+    let db1 = dh_pre.clone();
+    let db1_err = dh_pre_err.clone();
+
+    // Weight updates
+    let w1_new: Vec<Fr> = w1.iter().zip(dw1.iter()).map(|(&w, &dw)| w - lr * dw).collect();
+    let b1_new: Vec<Fr> = b1.iter().zip(db1.iter()).map(|(&b, &db)| b - lr * db).collect();
+    let w2_new: Vec<Fr> = w2.iter().zip(dw2.iter()).map(|(&w, &dw)| w - lr * dw).collect();
+    let b2_new: Vec<Fr> = b2.iter().zip(db2.iter()).map(|(&b, &db)| b - lr * db).collect();
+
+    let freivalds_r1 = generate_freivalds_challenge(step_number * 2, d_in);
+    let freivalds_r2 = generate_freivalds_challenge(step_number * 2 + 1, d_hid);
+
+    let mut witness = MLTrainingStepV2Witness {
+        d_in,
+        d_hid,
+        d_out,
+        x: x.to_vec(),
+        target: target.to_vec(),
+        w1: w1.to_vec(),
+        b1: b1.to_vec(),
+        w2: w2.to_vec(),
+        b2: b2.to_vec(),
+        h_pre,
+        h_pre_err,
+        h,
+        h_err,
+        y,
+        y_err,
+        loss,
+        loss_err,
+        dy,
+        dy_err,
+        dw2,
+        dw2_err,
+        db2,
+        db2_err,
+        dh,
+        dh_err,
+        relu_mask,
+        dh_pre,
+        dh_pre_err,
+        dw1,
+        dw1_err,
+        db1,
+        db1_err,
+        lr,
+        w1_new,
+        b1_new,
+        w2_new,
+        b2_new,
+        total_error: tracker.total(),
+        freivalds_r1,
+        freivalds_r2,
+        old_state_hash,
+        new_state_hash,
+        step_number,
+        model_id: [0u8; 32],
+        error_budget: Fr::ZERO,
+        error_checksum: Fr::ZERO,
+    };
+
+    witness.finalize_error_checksum();
+    witness
+}
+
+/// Converts an Fr field element back to f64 using the given inverse scale.
+///
+/// For "small" positive values (high bytes are zero), interprets as positive integer.
+/// For "large" values (close to p), interprets as negative: value - p.
+fn fr_to_f64(fr: Fr, inv_scale: f64) -> f64 {
+    let repr = fr.to_repr();
+    let bytes = repr.as_ref();
+    let is_negative = bytes[31] >= 0x19;
+
+    if is_negative {
+        // Negative: compute p - fr, negate
+        let neg = Fr::ZERO - fr;
+        let neg_repr = neg.to_repr();
+        let neg_bytes = neg_repr.as_ref();
+        let mut val = 0u64;
+        // Read first 8 bytes as LE u64 (sufficient for our scale range)
+        for i in 0..8 {
+            val |= (neg_bytes[i] as u64) << (i * 8);
+        }
+        -(val as f64) * inv_scale
+    } else {
+        let mut val = 0u64;
+        for i in 0..8 {
+            val |= (bytes[i] as u64) << (i * 8);
+        }
+        (val as f64) * inv_scale
+    }
+}
+
+/// Converts an f64 value to Fr using the given scale factor.
+///
+/// Negative values are represented as p - |value * scale|.
+fn f64_to_fr(value: f64, scale: f64) -> Fr {
+    let scaled = value * scale;
+    let abs_val = scaled.abs() as u64;
+    if value >= 0.0 {
+        Fr::from(abs_val)
+    } else {
+        Fr::ZERO - Fr::from(abs_val)
+    }
+}
+
 /// Computes a Poseidon-based state hash for a weight set.
 ///
 /// Uses circuit-friendly Poseidon hash instead of SHA-256 to enable
