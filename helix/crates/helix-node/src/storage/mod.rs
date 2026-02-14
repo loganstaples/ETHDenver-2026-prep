@@ -2,6 +2,7 @@ pub mod encrypted;
 pub mod ethereum;
 pub mod ipfs;
 pub mod local;
+pub mod model_store;
 
 /// Trait for storage backends.
 pub trait StorageBackend {

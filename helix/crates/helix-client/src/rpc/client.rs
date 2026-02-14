@@ -1092,6 +1092,21 @@ impl HelixRpcClient {
         self.send_request("helix_getModelWeights", Params { model_id, round_id }).await
     }
 
+    /// Download model binary with full metadata via helix_downloadModel
+    pub async fn download_model(
+        &self,
+        model_id: u64,
+        round_id: Option<u64>,
+    ) -> Result<ModelWeightsResponse, RpcError> {
+        #[derive(Serialize)]
+        struct Params {
+            model_id: u64,
+            round_id: Option<u64>,
+        }
+
+        self.send_request("helix_downloadModel", Params { model_id, round_id }).await
+    }
+
     /// Get full training history for a model
     pub async fn get_training_history(
         &self,
@@ -1969,6 +1984,22 @@ impl UnifiedRpcClient {
             })
         } else if let Some(ref client) = self.real_client {
             client.get_model_weights(model_id, round_id).await
+        } else {
+            Err(RpcError::NodeUnavailable("No client available".into()))
+        }
+    }
+
+    /// Download model binary with full metadata.
+    pub async fn download_model(
+        &self,
+        model_id: u64,
+        round_id: Option<u64>,
+    ) -> Result<ModelWeightsResponse, RpcError> {
+        if self.use_mock {
+            // Mock returns same data as get_model_weights
+            self.get_model_weights(model_id, round_id).await
+        } else if let Some(ref client) = self.real_client {
+            client.download_model(model_id, round_id).await
         } else {
             Err(RpcError::NodeUnavailable("No client available".into()))
         }

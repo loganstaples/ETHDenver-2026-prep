@@ -928,6 +928,26 @@ impl NodeRuntime {
         let proof_status = Arc::new(RwLock::new(Vec::<ProofStatusEntry>::new()));
         let round_weights_shared = Arc::new(RwLock::new(Vec::new()));
 
+        // --- Model Store (persistent model weight storage) ---
+        let model_store = {
+            use crate::storage::model_store::{ModelStore, ModelStoreConfig};
+            let data_dir = if self.config.checkpoint_dir.as_os_str().is_empty() {
+                std::path::PathBuf::from("data")
+            } else {
+                self.config.checkpoint_dir.join("model_store")
+            };
+            match ModelStore::new(ModelStoreConfig {
+                data_dir,
+                ..ModelStoreConfig::default()
+            }) {
+                Ok(store) => Some(Arc::new(parking_lot::Mutex::new(store))),
+                Err(e) => {
+                    warn!("Model store unavailable: {}. Weights will not be persisted to disk.", e);
+                    None
+                }
+            }
+        };
+
         let rpc_state = self.build_rpc_state(
             api_snapshot.clone(),
             round_trigger_tx.clone(),
@@ -1205,6 +1225,50 @@ impl NodeRuntime {
                                 let ckpt = aggregated.to_checkpoint(completed_round_id);
                                 if let Ok(bytes) = ckpt.to_bytes() {
                                     *current_checkpoint_bytes.write() = bytes.clone();
+
+                                    // Publish to RPC round_weights (legacy orchestrator path)
+                                    {
+                                        use sha2::{Sha256, Digest};
+                                        let mut hasher = Sha256::new();
+                                        hasher.update(&bytes);
+                                        let hash = hasher.finalize();
+                                        let mut commitment = [0u8; 32];
+                                        commitment.copy_from_slice(&hash);
+                                        let now_ts = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .map(|d| d.as_secs())
+                                            .unwrap_or(0);
+                                        round_weights_shared.write().push(
+                                            crate::api::rpc::RoundWeightEntry {
+                                                round_id: completed_round_id,
+                                                model_id: 0,
+                                                commitment,
+                                                weight_bytes: bytes.clone(),
+                                                loss: 0.0,
+                                                error_bound: 0.0,
+                                                steps_completed: completed_round_id,
+                                                num_contributors: worker_models.len() as u32,
+                                                completed_at: now_ts,
+                                                tx_hash: None,
+                                            },
+                                        );
+                                    }
+
+                                    // Persist to model store (legacy path)
+                                    if let Some(ref store) = model_store {
+                                        use crate::storage::model_store::ModelStoreMetadata;
+                                        let metadata = ModelStoreMetadata {
+                                            num_contributors: worker_models.len() as u32,
+                                            loss: 0.0,
+                                            error_bound: 0.0,
+                                            steps_completed: completed_round_id,
+                                            tx_hash: None,
+                                        };
+                                        if let Err(e) = store.lock().store_model(0, completed_round_id, &bytes, metadata) {
+                                            error!("Failed to persist model (legacy): {}", e);
+                                        }
+                                    }
+
                                     network.broadcast(MessagePayload::Training(
                                         TrainingMessage::UpdatedWeights {
                                             round_id: completed_round_id,
@@ -1322,17 +1386,93 @@ impl NodeRuntime {
                                     *aggregator_model.write() = result.aggregated_model.clone();
                                     total_rounds_completed += 1;
                                     let ckpt = result.aggregated_model.to_checkpoint(round_number);
-                                    if let Ok(bytes) = ckpt.to_bytes() {
-                                        *current_checkpoint_bytes.write() = bytes;
+                                    let weight_bytes = ckpt.to_bytes().unwrap_or_default();
+                                    *current_checkpoint_bytes.write() = weight_bytes.clone();
+
+                                    // Compute SHA-256 commitment of weight bytes
+                                    let commitment = {
+                                        use sha2::{Sha256, Digest};
+                                        let mut hasher = Sha256::new();
+                                        hasher.update(&weight_bytes);
+                                        let hash = hasher.finalize();
+                                        let mut out = [0u8; 32];
+                                        out.copy_from_slice(&hash);
+                                        out
+                                    };
+
+                                    // Determine model ID from on-chain pipeline or default
+                                    let model_id = if let Some(ref pipeline) = on_chain_pipeline {
+                                        pipeline.state().await.model_id.unwrap_or(0)
+                                    } else {
+                                        0
+                                    };
+
+                                    let now_ts = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_secs())
+                                        .unwrap_or(0);
+
+                                    // Publish result to RPC round_weights for retrieval
+                                    {
+                                        let entry = crate::api::rpc::RoundWeightEntry {
+                                            round_id: round_number,
+                                            model_id,
+                                            commitment,
+                                            weight_bytes,
+                                            loss: result.avg_loss,
+                                            error_bound: result.total_error_bound,
+                                            steps_completed: result.steps_completed,
+                                            num_contributors: result.num_contributors as u32,
+                                            completed_at: now_ts,
+                                            tx_hash: result.tx_hash.clone(),
+                                        };
+                                        round_weights_shared.write().push(entry);
+                                    }
+
+                                    // Persist to model store for durable retrieval
+                                    if let Some(ref store) = model_store {
+                                        use crate::storage::model_store::ModelStoreMetadata;
+                                        let metadata = ModelStoreMetadata {
+                                            num_contributors: result.num_contributors as u32,
+                                            loss: result.avg_loss,
+                                            error_bound: result.total_error_bound,
+                                            steps_completed: result.steps_completed,
+                                            tx_hash: result.tx_hash.clone(),
+                                        };
+                                        let wb = current_checkpoint_bytes.read().clone();
+                                        match store.lock().store_model(model_id, round_number, &wb, metadata) {
+                                            Ok(entry) => {
+                                                info!(
+                                                    "Model persisted: model_id={}, round={}, {} bytes, commitment={}",
+                                                    model_id, round_number, entry.size_bytes,
+                                                    hex::encode(entry.commitment),
+                                                );
+                                            }
+                                            Err(e) => {
+                                                error!("Failed to persist model weights: {}", e);
+                                            }
+                                        }
                                     }
 
                                     info!(
-                                        "TrainingJobManager round {} complete: {} contributors, error={:.6}, tx={:?}",
+                                        "TrainingJobManager round {} complete: {} contributors, loss={:.6}, error={:.6}, tx={:?}",
                                         round_number,
                                         result.num_contributors,
+                                        result.avg_loss,
                                         result.total_error_bound,
                                         result.tx_hash,
                                     );
+
+                                    // Finalize round on-chain (triggers reward distribution)
+                                    if let Some(ref pipeline) = on_chain_pipeline {
+                                        match pipeline.finalize_round(round_number).await {
+                                            Ok(tx) => info!("Round {} finalized on-chain: tx={}", round_number, tx),
+                                            Err(e) => {
+                                                // May fail if auto-finalized by submitProof or dispute pending
+                                                warn!("Round {} on-chain finalization skipped: {}", round_number, e);
+                                            }
+                                        }
+                                    }
 
                                     // Save checkpoint
                                     if let Some(ref p) = persistence {

@@ -300,6 +300,84 @@ impl OnChainPipeline {
         }))
     }
 
+    /// Finalizes a round on-chain, triggering model commitment update and reward distribution.
+    ///
+    /// The V3 contract's `_finalizeRound()` internally:
+    /// 1. Updates the model commitment to the best prover's new commitment
+    /// 2. Advances the step counter
+    /// 3. Accumulates error bounds
+    /// 4. Calls ModelRegistry.updateModel() to create a checkpoint
+    /// 5. Registers all participants with the Rewards contract
+    /// 6. Calls Rewards.allocateRoundRewards() to compute 70/20/10 splits
+    ///
+    /// Returns the finalization transaction hash, or None if no chain pipeline.
+    pub async fn finalize_round(&self, round_id: u64) -> anyhow::Result<String> {
+        let state = self.state.read().await;
+        let model_id = state
+            .model_id
+            .ok_or_else(|| anyhow::anyhow!("Model not registered — call initialize() first"))?;
+        drop(state);
+
+        log::info!(
+            "Finalizing round {} for model_id={} on-chain...",
+            round_id,
+            model_id,
+        );
+
+        let receipt = self
+            .sc_client
+            .finalize_round(model_id, round_id)
+            .await?;
+
+        let tx_hash = format!("{:?}", receipt.transaction_hash);
+        let gas_used = receipt.gas_used.map(|g| g.as_u64()).unwrap_or(0);
+
+        log::info!(
+            "Round {} finalized on-chain: tx={}, gas={}",
+            round_id,
+            tx_hash,
+            gas_used,
+        );
+
+        Ok(tx_hash)
+    }
+
+    /// Submits aggregated proofs and then finalizes the round.
+    ///
+    /// This is the complete round completion flow:
+    /// 1. Aggregate worker proofs and submit on-chain
+    /// 2. Finalize the round (triggers rewards allocation)
+    ///
+    /// For single-participant rounds, submitProof already handles finalization.
+    /// This method is for multi-participant rounds where explicit finalization
+    /// is needed after all proofs are collected.
+    pub async fn submit_and_finalize(
+        &self,
+        round_id: u64,
+        worker_proofs: Vec<TrainingProofResultV2>,
+        finalize: bool,
+    ) -> anyhow::Result<Option<OnChainSubmission>> {
+        // Step 1: Submit aggregated proofs
+        let submission = self.submit_aggregated_round(round_id, worker_proofs).await?;
+
+        // Step 2: Finalize if requested (multi-participant rounds)
+        if finalize {
+            match self.finalize_round(round_id).await {
+                Ok(tx) => log::info!("Round {} finalized: tx={}", round_id, tx),
+                Err(e) => {
+                    // Finalization may fail if dispute period hasn't ended yet
+                    // or if round was auto-finalized by submitProof
+                    log::warn!(
+                        "Round {} finalization failed (may be auto-finalized or dispute pending): {}",
+                        round_id, e
+                    );
+                }
+            }
+        }
+
+        Ok(submission)
+    }
+
     /// Processes queued proofs from the RPC `helix_submitProof` endpoint.
     ///
     /// Drains unsubmitted proofs from the queue, decodes them, and submits

@@ -30,6 +30,9 @@ abigen!(
         function unstake(uint256 modelId) external
         function submitProof(uint256 modelId, uint256 roundId, bytes proof, uint256[] publicInputs) external
         function challengeProof(uint256 modelId, uint256 roundId, bytes proof, uint256[] publicInputs) external
+        function finalizeRound(uint256 modelId, uint256 roundId) external
+        function batchFinalizeRounds(uint256 modelId, uint256[] roundIds) external
+        function timeoutRound(uint256 modelId, uint256 roundId) external
         event ProofSubmitted(uint256 indexed modelId, uint256 indexed roundId, address indexed prover, uint256 newCommitment)
         event Slashed(address indexed prover, uint256 indexed modelId, uint256 amount, string reason)
         event RoundCompleted(uint256 indexed modelId, uint256 indexed roundId, uint256 newCommitment)
@@ -390,6 +393,61 @@ impl SCClient {
         );
         let pending_tx = call.send().await?;
         let receipt = pending_tx.await?.ok_or_else(|| anyhow::anyhow!("Tx dropped"))?;
+        Ok(receipt)
+    }
+
+    // ============ Round Finalization ============
+
+    /// Finalizes a completed training round on-chain.
+    /// This triggers model commitment update, reward allocation, and model registry update.
+    pub async fn finalize_round(
+        &self,
+        model_id: u64,
+        round_id: u64,
+    ) -> anyhow::Result<TransactionReceipt> {
+        let call = self.coordinator.finalize_round(
+            U256::from(model_id),
+            U256::from(round_id),
+        );
+        let pending_tx = call.send().await?;
+        let receipt = pending_tx
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Transaction dropped"))?;
+        Ok(receipt)
+    }
+
+    /// Finalizes multiple rounds in a single transaction.
+    pub async fn batch_finalize_rounds(
+        &self,
+        model_id: u64,
+        round_ids: Vec<u64>,
+    ) -> anyhow::Result<TransactionReceipt> {
+        let round_ids_u256: Vec<U256> = round_ids.iter().map(|&r| U256::from(r)).collect();
+        let call = self.coordinator.batch_finalize_rounds(
+            U256::from(model_id),
+            round_ids_u256,
+        );
+        let pending_tx = call.send().await?;
+        let receipt = pending_tx
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Transaction dropped"))?;
+        Ok(receipt)
+    }
+
+    /// Times out a round that has passed its deadline + dispute period.
+    pub async fn timeout_round(
+        &self,
+        model_id: u64,
+        round_id: u64,
+    ) -> anyhow::Result<TransactionReceipt> {
+        let call = self.coordinator.timeout_round(
+            U256::from(model_id),
+            U256::from(round_id),
+        );
+        let pending_tx = call.send().await?;
+        let receipt = pending_tx
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Transaction dropped"))?;
         Ok(receipt)
     }
 

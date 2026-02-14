@@ -80,4 +80,6 @@ tokio-test = "0.4"
 default = ["crypto-sign"]
 dht = ["libp2p-kad"]
 crypto-sign = ["ed25519-dalek"]
+ipfs-fetch = []
+s3-fetch = []
 

@@ -326,6 +326,36 @@ impl HelixClient {
         Ok(weights.commitment)
     }
 
+    /// Download model weights, write to disk, and verify integrity.
+    ///
+    /// Fetches weights from the node, verifies the SHA-256 commitment matches,
+    /// then writes to disk. Returns the full `ModelWeightsResponse` for metadata access.
+    pub async fn download_model_verified(
+        &self,
+        model_id: u64,
+        round_id: Option<u64>,
+        path: impl Into<PathBuf>,
+    ) -> Result<ModelWeightsResponse, HelixError> {
+        let weights = self.rpc.get_model_weights(model_id, round_id).await?;
+
+        // Verify integrity
+        if !Self::verify_model(&weights.weight_bytes, &weights.commitment)? {
+            return Err(HelixError::Other(anyhow::anyhow!(
+                "Model integrity check failed: commitment mismatch"
+            )));
+        }
+
+        let dest = path.into();
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| HelixError::Other(anyhow::anyhow!("Failed to create directory: {}", e)))?;
+        }
+        std::fs::write(&dest, &weights.weight_bytes)
+            .map_err(|e| HelixError::Other(anyhow::anyhow!("Failed to write model file: {}", e)))?;
+
+        Ok(weights)
+    }
+
     /// Verify that local model weights match the on-chain commitment.
     ///
     /// Computes the SHA-256 hash of the weight bytes and compares it to the

@@ -236,6 +236,8 @@ pub struct WorkerJobState {
     pub checkpoint_data: Option<Vec<u8>>,
     /// Error bound achieved by this worker.
     pub error_bound: Option<f64>,
+    /// Loss achieved by this worker.
+    pub loss: Option<f64>,
     /// New model hash after worker training.
     pub new_model_hash: Option<[u8; 32]>,
     /// Steps completed by this worker.
@@ -254,6 +256,7 @@ impl WorkerJobState {
             public_inputs: None,
             checkpoint_data: None,
             error_bound: None,
+            loss: None,
             new_model_hash: None,
             steps_completed: 0,
         }
@@ -407,6 +410,10 @@ pub struct RoundResult {
     pub excluded_workers: Vec<PeerId>,
     /// Total error bound from aggregation.
     pub total_error_bound: f64,
+    /// Average loss across contributing workers (0.0 if not tracked).
+    pub avg_loss: f64,
+    /// Number of training steps completed in this round.
+    pub steps_completed: u64,
     /// On-chain transaction hash (if submitted).
     pub tx_hash: Option<String>,
     /// Wall-clock duration of the round.
@@ -1300,6 +1307,21 @@ impl TrainingJobManager {
                     return;
                 }
 
+                // Extract loss from PI[4] (field element, first 8 LE bytes)
+                let worker_loss = if public_inputs.len() > 4 {
+                    let bytes = &public_inputs[4];
+                    let raw = u64::from_le_bytes(bytes[..8].try_into().unwrap_or([0u8; 8]));
+                    // Loss is stored as fixed-point: value * 2^32 to fit in field element
+                    // For small values (< 2^32), raw IS the scaled value
+                    if raw < (1u64 << 53) {
+                        Some(raw as f64 / (1u64 << 32) as f64)
+                    } else {
+                        Some(0.0) // Very large field element — not a meaningful loss
+                    }
+                } else {
+                    None
+                };
+
                 // Store proof data
                 if let Some(worker) = self.workers.get_mut(&peer_id) {
                     worker.proof_submitted_at = Some(Instant::now());
@@ -1307,6 +1329,7 @@ impl TrainingJobManager {
                     worker.proof = Some(proof);
                     worker.public_inputs = Some(public_inputs);
                     worker.error_bound = Some(error_bound);
+                    worker.loss = worker_loss;
                     worker.new_model_hash = Some(new_model_hash);
                     worker.checkpoint_data = Some(checkpoint_data);
                     worker.steps_completed = steps_completed;
@@ -1744,6 +1767,24 @@ impl TrainingJobManager {
             duration.as_secs_f64(),
         );
 
+        // Compute average loss and total steps from worker submissions
+        let (avg_loss, total_steps) = {
+            let losses: Vec<f64> = self.workers.values()
+                .filter(|w| w.proof_submitted_at.is_some())
+                .filter_map(|w| w.loss)
+                .collect();
+            let total_steps: u64 = self.workers.values()
+                .filter(|w| w.proof_submitted_at.is_some())
+                .map(|w| w.steps_completed as u64)
+                .sum();
+            let avg = if losses.is_empty() {
+                0.0
+            } else {
+                losses.iter().sum::<f64>() / losses.len() as f64
+            };
+            (avg, total_steps)
+        };
+
         let result = RoundResult {
             round_id: self.round_id,
             aggregated_model: aggregation.aggregated_model,
@@ -1751,6 +1792,8 @@ impl TrainingJobManager {
             num_contributors: aggregation.contributors.len(),
             excluded_workers: self.excluded_workers.clone(),
             total_error_bound: aggregation.total_error_bound,
+            avg_loss,
+            steps_completed: total_steps,
             tx_hash: self.tx_hash.clone(),
             duration,
         };

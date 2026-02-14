@@ -407,6 +407,7 @@ async fn rpc_handler(
         "helix_getModelWeights" => handle_get_model_weights(&state, &req.params, &id),
         "helix_getTrainingHistory" => handle_get_training_history(&state, &req.params, &id),
         "helix_getTrainingReport" => handle_get_training_report(&state, &req.params, &id),
+        "helix_downloadModel" => handle_download_model(&state, &req.params, &id),
         // Worker daemon handlers
         "helix_getWorkerStatus" => handle_get_worker_status(&state, &id),
         "helix_getEarnings" => handle_get_earnings(&state, &id),
@@ -889,11 +890,39 @@ fn handle_get_training_result(
         .and_then(|v| v.as_u64())
         .unwrap_or(snap.completed_rounds);
 
-    // Check if we have an aggregation result for this round
+    // First check round_weights for real data from completed training
+    let weights = state.round_weights.read();
+    if let Some(entry) = weights.iter().find(|w| w.round_id == round_id) {
+        let result = serde_json::json!({
+            "available": true,
+            "round_id": entry.round_id,
+            "worker_count": entry.num_contributors as u64,
+            "loss": entry.loss,
+            "error_bound": entry.error_bound,
+            "model_dims": null,
+            "step_number": entry.steps_completed
+        });
+        return JsonRpcResponse::success(id.clone(), result);
+    }
+
+    // Fall back to latest completed round's data
+    if let Some(latest) = weights.last() {
+        let result = serde_json::json!({
+            "available": true,
+            "round_id": latest.round_id,
+            "worker_count": latest.num_contributors as u64,
+            "loss": latest.loss,
+            "error_bound": latest.error_bound,
+            "model_dims": null,
+            "step_number": latest.steps_completed
+        });
+        return JsonRpcResponse::success(id.clone(), result);
+    }
+
+    // Check aggregation results as fallback
     let agg_results = state.aggregation_results.read();
     let has_agg = agg_results.iter().any(|r| r.round_id == round_id);
 
-    // Return client-compatible TrainingResultData shape
     let result = serde_json::json!({
         "available": has_agg || snap.completed_rounds > 0,
         "round_id": round_id,
@@ -1425,6 +1454,62 @@ fn handle_get_training_report(
     });
 
     JsonRpcResponse::success(id.clone(), result)
+}
+
+// ============================================================================
+// Download Model Handler
+// ============================================================================
+
+fn handle_download_model(
+    state: &RpcState,
+    params: &serde_json::Value,
+    id: &serde_json::Value,
+) -> JsonRpcResponse {
+    let model_id = params
+        .get("model_id")
+        .and_then(|v| v.as_u64())
+        .or_else(|| *state.model_id.read());
+    let round_id = params.get("round_id").and_then(|v| v.as_u64());
+
+    let weights = state.round_weights.read();
+
+    let entry = match round_id {
+        Some(rid) => weights.iter().find(|w| {
+            w.round_id == rid && model_id.map_or(true, |mid| w.model_id == mid)
+        }),
+        None => {
+            weights.iter().filter(|w| model_id.map_or(true, |mid| w.model_id == mid)).last()
+        }
+    };
+
+    match entry {
+        Some(e) => {
+            let result = serde_json::json!({
+                "available": true,
+                "round_id": e.round_id,
+                "model_id": e.model_id,
+                "commitment": format!("0x{}", hex::encode(e.commitment)),
+                "weight_bytes": e.weight_bytes,
+                "size_bytes": e.weight_bytes.len(),
+                "loss": e.loss,
+                "error_bound": e.error_bound,
+                "steps_completed": e.steps_completed,
+                "num_contributors": e.num_contributors,
+                "completed_at": e.completed_at,
+                "tx_hash": e.tx_hash,
+                "format": "helix-checkpoint-v1",
+            });
+            JsonRpcResponse::success(id.clone(), result)
+        }
+        None => JsonRpcResponse::error(
+            id.clone(),
+            -32001,
+            format!(
+                "No model found for model_id={:?}, round_id={:?}",
+                model_id, round_id,
+            ),
+        ),
+    }
 }
 
 // ============================================================================
