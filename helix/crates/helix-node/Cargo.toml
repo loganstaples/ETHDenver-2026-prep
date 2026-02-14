@@ -80,6 +80,7 @@ tokio-test = "0.4"
 default = ["crypto-sign"]
 dht = ["libp2p-kad"]
 crypto-sign = ["ed25519-dalek"]
+mpc-training = ["helix-mpc/network-mpc"]
 ipfs-fetch = []
 s3-fetch = []
 

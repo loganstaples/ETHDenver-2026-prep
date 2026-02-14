@@ -481,6 +481,35 @@ impl MpcSessionOrchestrator {
     pub fn persistence(&self) -> Option<&SessionPersistence> {
         self.persistence.as_ref()
     }
+
+    /// Creates a mesh of `NodeTransport` instances for the active session's parties.
+    ///
+    /// Returns `None` if there is no active session. Each transport is connected
+    /// to all other parties via in-memory channels. In a multi-node deployment,
+    /// the caller should bridge these channels to the real P2P connections via
+    /// `ConnectionPoolBridge`.
+    ///
+    /// The returned vector is indexed by party position in the session (not global
+    /// party index). Use `active_session().parties` to map position → party index.
+    pub fn create_transport_mesh(
+        &self,
+    ) -> Option<Vec<helix_mpc::session::node_transport::NodeTransport>> {
+        let session = self.active_session.as_ref()?;
+        if !session.active {
+            return None;
+        }
+
+        let parties: Vec<PartyId> = session
+            .parties
+            .iter()
+            .map(|&idx| PartyId::from_index(idx))
+            .collect();
+
+        Some(helix_mpc::session::node_transport::NodeTransport::create_mesh(
+            &parties,
+            &session.session_id,
+        ))
+    }
 }
 
 /// Events emitted by health checks.

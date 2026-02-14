@@ -29,6 +29,7 @@ pub mod session_manager;
 pub mod mpc;
 pub mod mpc_session;
 pub mod orchestrator;
+pub mod private_training;
 pub mod verification;
 pub mod state_machine;
 pub mod synchronization;
@@ -174,6 +175,15 @@ pub use round_manager::{
     WorkerProofSubmission, ProofTracker, RoundManagerState, RoundManagerEvent,
     AggregatedResult, RoundManagerConfig, RoundManager as AggregatorRoundManager,
     RoundManagerError, compute_model_commitment,
+};
+
+pub use private_training::{
+    TrainingMode, PrivateTrainingConfig, PrivateTrainingSession,
+    PrivateTrainingWorker, PrivateTrainingCoordinator,
+    PrivateTrainingRoundResult, StepSummary, TrainingSample,
+    CleartextStepResult,
+    run_private_training_round, run_cleartext_training_step,
+    mlp_to_mpc_weights, mpc_to_mlp_model,
 };
 
 pub use dataset_sync::{
