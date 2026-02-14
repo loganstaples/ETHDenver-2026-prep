@@ -1,6 +1,7 @@
 pub mod api;
 pub mod circuit_breaker;
 pub mod config;
+pub mod coordination;
 pub mod data;
 pub mod identity;
 pub mod metrics;
