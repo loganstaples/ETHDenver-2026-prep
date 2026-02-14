@@ -40,6 +40,9 @@ use crate::training::distribution::{
     DistributionTracker, ModelPackage, ModelPackageBuilder,
     CHUNKED_TRANSFER_THRESHOLD, MAX_CHUNK_SIZE,
 };
+use crate::training::fault_recovery::{
+    RetryPolicy, TransactionRetryManager, TransactionError,
+};
 use crate::training::orchestrator::{OrchestratorEvent, TrainingOrchestrator};
 
 // ============================================================================
@@ -1582,8 +1585,16 @@ impl TrainingJobManager {
             aggregation.contributors.len(),
         );
 
-        // Start the round on-chain if not already started
-        match pipeline.start_round_on_chain().await {
+        // Start the round on-chain if not already started (with retry)
+        let tx_retry = TransactionRetryManager::default_policy();
+        let pipeline_for_start = pipeline.clone();
+        let round_id = self.round_id;
+        match tx_retry.submit_with_retry("start_round_on_chain", || {
+            let p = pipeline_for_start.clone();
+            async move {
+                p.start_round_on_chain().await.map_err(|e| anyhow::anyhow!("{}", e))
+            }
+        }).await {
             Ok(on_chain_round) => {
                 info!(
                     "Round {}: on-chain round {} started",
@@ -1600,8 +1611,6 @@ impl TrainingJobManager {
         }
 
         // Build TrainingProofResultV2 entries from worker submissions
-        // For now, use the aggregated commitment as the submission
-        // The OnChainPipeline handles RLC aggregation internally
         let worker_proofs = self.build_worker_proofs();
 
         if worker_proofs.is_empty() {
@@ -1609,7 +1618,18 @@ impl TrainingJobManager {
             return Ok(());
         }
 
-        match pipeline.submit_aggregated_round(self.round_id, worker_proofs).await {
+        // Submit aggregated proof with retry logic
+        let pipeline_for_submit = pipeline.clone();
+        let proofs_for_submit = worker_proofs;
+        match tx_retry.submit_with_retry("submit_aggregated_round", || {
+            let p = pipeline_for_submit.clone();
+            let proofs = proofs_for_submit.clone();
+            let rid = round_id;
+            async move {
+                p.submit_aggregated_round(rid, proofs).await
+                    .map_err(|e| anyhow::anyhow!("{}", e))
+            }
+        }).await {
             Ok(Some(submission)) => {
                 self.tx_hash = Some(submission.tx_hash.clone());
                 info!(
@@ -1632,15 +1652,22 @@ impl TrainingJobManager {
                 );
             }
             Err(e) => {
-                let err = JobError::OnChainSubmissionFailed(e.to_string());
                 // Don't fail the round for on-chain issues — the training result is still valid
-                warn!("Round {}: on-chain submission failed: {}", self.round_id, e);
+                warn!("Round {}: on-chain submission failed after retries: {}", self.round_id, e);
                 let _ = self.event_tx.send(JobEvent::RoundFailed {
                     round_id: self.round_id,
                     phase: JobPhase::Submitting,
-                    reason: err.to_string(),
+                    reason: format!("on-chain submission failed: {}", e),
                 });
             }
+        }
+
+        let (submitted, failed) = tx_retry.stats();
+        if failed > 0 {
+            warn!(
+                "Round {}: transaction stats: {} submitted, {} failed",
+                self.round_id, submitted, failed
+            );
         }
 
         Ok(())

@@ -34,6 +34,7 @@ pub mod verification;
 pub mod state_machine;
 pub mod synchronization;
 pub mod fault_tolerance;
+pub mod fault_recovery;
 pub mod distributed_coordinator;
 pub mod consensus;
 pub mod persistence;
@@ -129,6 +130,12 @@ pub use fault_tolerance::{
     WorkerHealth, WorkerHealthInfo, FaultToleranceConfig,
     FailureDetector, RecoveryCoordinator, RecoveryState as FaultRecoveryState, RecoveryAttempt,
     FaultToleranceManager, FaultEvent, WorkerReplacement, ReplacementAction,
+};
+
+pub use fault_recovery::{
+    RetryPolicy, ProofRetryManager, TransactionRetryManager, TransactionError,
+    WorkerFailureHandler, FailureAction, RoundTimeoutManager,
+    GracefulShutdownCoordinator, FaultRecoveryConfig,
 };
 
 pub use distributed_checkpoint::{

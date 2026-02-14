@@ -1283,6 +1283,16 @@ impl NodeRuntime {
             TrainingJobManager, TrainingJobConfig, WorkerMessage,
             network_event_to_worker_message,
         };
+        use crate::training::fault_recovery::{
+            GracefulShutdownCoordinator, WorkerFailureHandler, FaultRecoveryConfig,
+        };
+
+        // --- Fault Recovery ---
+        let fault_recovery_config = FaultRecoveryConfig::from_min_workers(t.min_workers);
+        let shutdown_coordinator = Arc::new(GracefulShutdownCoordinator::new());
+        let _worker_failure_handler = WorkerFailureHandler::new(fault_recovery_config.min_workers);
+        let _shutdown_handle = shutdown_coordinator.install_signal_handlers();
+        info!("Graceful shutdown coordinator installed");
 
         let mut round_number = 0u64;
         let mut total_rounds_completed = 0u64;
@@ -1453,6 +1463,15 @@ impl NodeRuntime {
                     tokio::select! {
                         _ = round_trigger_rx.recv() => {
                             round_number += 1;
+
+                            // Check graceful shutdown before starting new round
+                            if !shutdown_coordinator.should_accept_new_round() {
+                                info!("Shutdown requested, declining new round {}", round_number);
+                                round_number -= 1;
+                                continue;
+                            }
+
+                            shutdown_coordinator.register_active_round(round_number);
                             info!("=== Round {} triggered via RPC ===", round_number);
 
                             // Build job config from node config
@@ -1664,6 +1683,9 @@ impl NodeRuntime {
                                     error!("TrainingJobManager round {} failed: {}", round_number, e);
                                 }
                             }
+
+                            // Clear active round for shutdown coordinator
+                            shutdown_coordinator.clear_active_round();
 
                             // Clean up the forwarding task
                             forward_handle.abort();

@@ -31,6 +31,7 @@ pub mod multiplexer;
 pub mod network;
 pub mod node_transport;
 pub mod party_selection;
+pub mod recovery;
 pub mod registry;
 pub mod secure_channel;
 pub mod transport;
@@ -64,6 +65,10 @@ pub use checkpoint::{SessionCheckpoint, SessionPersistence};
 pub use health::{HealthConfig, HealthEvent, HealthStatus, PartyHealthMonitor};
 pub use node_transport::{
     MPCMessageRouter, NodeConnectionBridge, NodeTransport, PeerMapping, TaggedMessage,
+};
+pub use recovery::{
+    RecoveryConfig, RecoveryOutcome, RecoveryStats, RestartPlan,
+    SessionRecoveryCoordinator,
 };
 pub use registry::{
     PartyCapabilities, PartyRegistry, PartyStatus, RegisteredParty, RegistryConfig,
