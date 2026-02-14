@@ -201,6 +201,8 @@ contract TrainingDAO is ReentrancyGuard {
     /// @notice Create a parameter change proposal
     /// @dev Validates parameter bounds before creating proposal to prevent governance attacks
     ///      that could set dangerous parameters (e.g., zero batch size, extreme error bounds).
+    ///      Uses the next proposal ID to pre-encode calldata BEFORE creating the proposal,
+    ///      ensuring atomic proposal+calldata creation.
     /// @param description Description of changes
     /// @param params New training parameters
     /// @return proposalId ID of the created proposal
@@ -210,24 +212,33 @@ contract TrainingDAO is ReentrancyGuard {
     ) external returns (uint256 proposalId) {
         // Validate parameter bounds to prevent governance attacks with dangerous values
         require(params.learningRate > 0, "Learning rate must be positive");
+        require(params.learningRate <= 1e18, "Learning rate too high");
         require(params.batchSize > 0, "Batch size must be positive");
+        require(params.batchSize <= 10000, "Batch size too large");
         require(params.maxErrorBound > 0, "Max error bound must be positive");
+        require(params.minParticipants > 0, "Min participants must be positive");
         require(params.roundDuration >= 5 minutes, "Round duration too short");
         require(params.roundDuration <= 30 days, "Round duration too long");
 
-        // Create the proposal first, get the real ID back
+        // Pre-compute the proposal ID (proposalCount + 1, matching createProposal's ++proposalCount)
+        uint256 nextProposalId = proposalCount + 1;
+
+        // Store params BEFORE creating proposal so they're available at execution time
+        parameterProposals[nextProposalId] = params;
+
+        // Encode calldata with the known next proposal ID
+        bytes memory encodedCallData = abi.encodeWithSignature("applyParameters(uint256)", nextProposalId);
+
+        // Create proposal with correct calldata upfront — no post-hoc mutation needed
         proposalId = createProposal(
             ProposalType.ParameterChange,
             description,
             address(this),
-            "" // placeholder calldata
+            encodedCallData
         );
 
-        // Store params keyed by the real proposal ID
-        parameterProposals[proposalId] = params;
-
-        // Update the calldata with the correct proposal ID
-        proposals[proposalId].callData = abi.encodeWithSignature("applyParameters(uint256)", proposalId);
+        // Sanity check: our prediction must match the actual ID
+        require(proposalId == nextProposalId, "Proposal ID mismatch");
     }
 
     /// @notice Cast a vote on a proposal

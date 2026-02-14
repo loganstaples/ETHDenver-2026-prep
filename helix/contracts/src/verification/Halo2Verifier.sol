@@ -109,6 +109,211 @@ contract Halo2Verifier is IHelixVerifier {
         return true;
     }
 
+    // ============ Batch Pairing Verification ============
+
+    /// @notice Batch-verify proofs using aggregated BN254 pairing check
+    /// @dev Accepts pre-computed pairing check points from off-chain SHPLONK verification.
+    ///      For each proof's SHPLONK verification, the pairing equation is:
+    ///        e(LHS_i, G2) * e(RHS_i, -S*G2) == 1
+    ///      where LHS_i is the accumulated MSM result and RHS_i is the W' opening proof point.
+    ///
+    ///      This function:
+    ///        1. Validates proof lengths and RHS points match W' from each proof (last 64 bytes)
+    ///        2. Validates all LHS points are on the BN254 G1 curve
+    ///        3. Fully verifies one random proof through the core verifier (spot check)
+    ///        4. Aggregates all pairing points using Random Linear Combination (RLC):
+    ///           e(Σ r^i * LHS_i, G2) * e(Σ r^i * RHS_i, -S*G2) == 1
+    ///        5. Executes a single ecPairing precompile call
+    ///
+    ///      Gas savings: Only 1 full verification (~7.5M) + aggregation + 1 pairing (~200k total)
+    ///      instead of N full verifications. ~60%+ savings for N>=3.
+    ///
+    ///      Security: Spot-check provides 1/N detection probability per bad proof. Combined with
+    ///      staking/slashing and the cryptographic difficulty of crafting valid pairing points for
+    ///      invalid proofs, this provides strong economic security. For full verification of all
+    ///      proofs without probabilistic security, use batchVerify() instead.
+    ///
+    /// @param proofs Array of ZK proof bytes (1856 bytes each for SHPLONK)
+    /// @param publicInputsArray Public inputs for each proof (8 elements each)
+    /// @param pairingLHS Pre-computed LHS G1 points [x,y] from SHPLONK MSM (off-chain)
+    /// @param pairingRHS Pre-computed RHS G1 points [x,y] (W' opening proof points)
+    /// @return allValid True if batch pairing check and spot check both pass
+    function batchVerifyPairing(
+        bytes[] memory proofs,
+        uint256[][] memory publicInputsArray,
+        uint256[2][] memory pairingLHS,
+        uint256[2][] memory pairingRHS
+    ) external view returns (bool allValid) {
+        uint256 n = proofs.length;
+        require(n > 0, "Empty batch");
+        require(
+            n == publicInputsArray.length && n == pairingLHS.length && n == pairingRHS.length,
+            "Length mismatch"
+        );
+
+        // Single proof: just verify normally through core verifier
+        if (n == 1) {
+            try core.verifyProof(vk, proofs[0], publicInputsArray[0]) returns (bool result) {
+                return result;
+            } catch {
+                return false;
+            }
+        }
+
+        // Step 1: Validate proof lengths and RHS points match W' from proof bytes
+        // (Cheap validation before expensive spot check)
+        for (uint256 i = 0; i < n; i++) {
+            bytes memory proof = proofs[i];
+            uint256 proofLen = proof.length;
+            require(proofLen >= 128, "Proof too short");
+
+            uint256 wPrimeX;
+            uint256 wPrimeY;
+            assembly {
+                let proofData := add(proof, 0x20)
+                wPrimeX := mload(add(proofData, sub(proofLen, 0x40)))
+                wPrimeY := mload(add(proofData, sub(proofLen, 0x20)))
+            }
+            require(
+                pairingRHS[i][0] == wPrimeX && pairingRHS[i][1] == wPrimeY,
+                "RHS does not match W' in proof"
+            );
+        }
+
+        // Step 2: Validate all LHS points are on BN254 G1 curve (y^2 = x^3 + 3 mod p)
+        uint256 BN254_P = 21888242871839275222246405745257275088696311157297823662689037894645226208583;
+        for (uint256 i = 0; i < n; i++) {
+            uint256 x = pairingLHS[i][0];
+            uint256 y = pairingLHS[i][1];
+            if (x == 0 && y == 0) continue; // Point at infinity is valid
+            require(x < BN254_P && y < BN254_P, "LHS point not in field");
+            uint256 lhsCheck = mulmod(y, y, BN254_P);
+            uint256 rhsCheck = addmod(mulmod(x, mulmod(x, x, BN254_P), BN254_P), 3, BN254_P);
+            require(lhsCheck == rhsCheck, "LHS point not on curve");
+        }
+
+        // Step 3: Spot check — fully verify one random proof through the core verifier
+        uint256 spotIndex = uint256(keccak256(abi.encodePacked(
+            block.prevrandao, block.timestamp, msg.sender, n
+        ))) % n;
+
+        try core.verifyProof(vk, proofs[spotIndex], publicInputsArray[spotIndex]) returns (bool result) {
+            if (!result) return false;
+        } catch {
+            return false;
+        }
+
+        // Step 4: RLC aggregation and single ecPairing
+        return _batchPairingCheck(pairingLHS, pairingRHS, n);
+    }
+
+    /// @notice Internal: Aggregate pairing points with RLC and execute single ecPairing
+    /// @dev Uses Horner's method for efficient polynomial evaluation of RLC:
+    ///      acc = P[n-1]; for i=n-2..0: acc = r*acc + P[i]
+    ///      Then checks e(LHS_agg, G2) * e(RHS_agg, -S*G2) == 1
+    ///      G2 and -S*G2 are read from the VK contract via extcodecopy.
+    function _batchPairingCheck(
+        uint256[2][] memory lhs,
+        uint256[2][] memory rhs,
+        uint256 n
+    ) internal view returns (bool) {
+        address _vk = vk;
+        bool result;
+
+        assembly {
+            let BN254_R := 21888242871839275222246405745257275088548364400416034343698204186575808495617
+
+            // --- Generate RLC challenge from keccak256 of all pairing points ---
+            let freePtr := mload(0x40)
+            let hashLen := mul(n, 0x80) // 4 * 32 bytes per proof
+
+            for { let i := 0 } lt(i, n) { i := add(i, 1) } {
+                let lhsPtr := mload(add(add(lhs, 0x20), mul(i, 0x20)))
+                let rhsPtr := mload(add(add(rhs, 0x20), mul(i, 0x20)))
+                let offset := add(freePtr, mul(i, 0x80))
+                mstore(offset, mload(lhsPtr))
+                mstore(add(offset, 0x20), mload(add(lhsPtr, 0x20)))
+                mstore(add(offset, 0x40), mload(rhsPtr))
+                mstore(add(offset, 0x60), mload(add(rhsPtr, 0x20)))
+            }
+
+            let challenge := mod(keccak256(freePtr, hashLen), BN254_R)
+            // Ensure challenge is non-zero for security
+            if iszero(challenge) { challenge := 1 }
+
+            // --- Horner's method aggregation ---
+            // Start with the last point pair
+            let lastIdx := sub(n, 1)
+            let lastLhsPtr := mload(add(add(lhs, 0x20), mul(lastIdx, 0x20)))
+            let lastRhsPtr := mload(add(add(rhs, 0x20), mul(lastIdx, 0x20)))
+
+            // Working memory area (after hash data)
+            let work := add(freePtr, hashLen)
+
+            let acc_lhs_x := mload(lastLhsPtr)
+            let acc_lhs_y := mload(add(lastLhsPtr, 0x20))
+            let acc_rhs_x := mload(lastRhsPtr)
+            let acc_rhs_y := mload(add(lastRhsPtr, 0x20))
+
+            let ok := 1
+
+            // Iterate from n-2 down to 0
+            for { let j := sub(n, 1) } gt(j, 0) { } {
+                j := sub(j, 1)
+
+                // acc_lhs = ecMul(acc_lhs, challenge)
+                mstore(work, acc_lhs_x)
+                mstore(add(work, 0x20), acc_lhs_y)
+                mstore(add(work, 0x40), challenge)
+                ok := and(ok, staticcall(gas(), 0x07, work, 0x60, work, 0x40))
+
+                // acc_lhs = ecAdd(result, lhs[j])
+                let jLhsPtr := mload(add(add(lhs, 0x20), mul(j, 0x20)))
+                mstore(add(work, 0x40), mload(jLhsPtr))
+                mstore(add(work, 0x60), mload(add(jLhsPtr, 0x20)))
+                ok := and(ok, staticcall(gas(), 0x06, work, 0x80, work, 0x40))
+                acc_lhs_x := mload(work)
+                acc_lhs_y := mload(add(work, 0x20))
+
+                // acc_rhs = ecMul(acc_rhs, challenge)
+                mstore(work, acc_rhs_x)
+                mstore(add(work, 0x20), acc_rhs_y)
+                mstore(add(work, 0x40), challenge)
+                ok := and(ok, staticcall(gas(), 0x07, work, 0x60, work, 0x40))
+
+                // acc_rhs = ecAdd(result, rhs[j])
+                let jRhsPtr := mload(add(add(rhs, 0x20), mul(j, 0x20)))
+                mstore(add(work, 0x40), mload(jRhsPtr))
+                mstore(add(work, 0x60), mload(add(jRhsPtr, 0x20)))
+                ok := and(ok, staticcall(gas(), 0x06, work, 0x80, work, 0x40))
+                acc_rhs_x := mload(work)
+                acc_rhs_y := mload(add(work, 0x20))
+            }
+
+            // --- Prepare ecPairing input (2 pairs = 384 bytes) ---
+            let pairingInput := work
+
+            // Pair 1: (acc_lhs, G2)
+            mstore(pairingInput, acc_lhs_x)
+            mstore(add(pairingInput, 0x20), acc_lhs_y)
+            // Read G2 from VK contract (offset 0x01a0, 128 bytes: g2_x_1, g2_x_2, g2_y_1, g2_y_2)
+            extcodecopy(_vk, add(pairingInput, 0x40), 0x01a0, 0x80)
+
+            // Pair 2: (acc_rhs, neg_S_G2)
+            mstore(add(pairingInput, 0xc0), acc_rhs_x)
+            mstore(add(pairingInput, 0xe0), acc_rhs_y)
+            // Read neg_S_G2 from VK contract (offset 0x0220, 128 bytes)
+            extcodecopy(_vk, add(pairingInput, 0x100), 0x0220, 0x80)
+
+            // --- Execute ecPairing precompile (0x08) ---
+            // Input: 384 bytes (2 pairs), Output: 32 bytes (1 = valid, 0 = invalid)
+            ok := and(ok, staticcall(gas(), 0x08, pairingInput, 0x180, pairingInput, 0x20))
+            result := and(ok, mload(pairingInput))
+        }
+
+        return result;
+    }
+
     // ============ Gas Estimation ============
 
     /// @notice Estimate gas for single proof verification
@@ -121,7 +326,7 @@ contract Halo2Verifier is IHelixVerifier {
         gasUsed = gasBefore - gasleft();
     }
 
-    /// @notice Estimate gas for batch proof verification
+    /// @notice Estimate gas for batch proof verification (sequential)
     function estimateBatchVerifyGas(
         bytes[] memory proofs,
         uint256[][] memory publicInputsArray

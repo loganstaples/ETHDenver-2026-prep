@@ -8,7 +8,12 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /// @title HelixCoordinatorV2
 /// @notice Gas-optimized coordinator for model registration, proof submission, staking, and slashing
-/// @dev Supports real ZK proof verification with economic security
+/// @dev DEPRECATED: Use HelixCoordinatorV3 for new deployments.
+///      V3 adds token-based staking (Staking.sol), reward distribution (Rewards.sol),
+///      model registry integration, aggregated proof support, and multi-participant rounds.
+///      This contract is maintained for backward compatibility only.
+///
+///      Supports real ZK proof verification with economic security
 ///      Storage layout optimized for gas efficiency with struct packing
 ///      Includes multi-sig emergency pause mechanism with time-locked recovery
 ///      and comprehensive challenger reward distribution

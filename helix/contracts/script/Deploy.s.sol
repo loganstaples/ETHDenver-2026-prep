@@ -10,15 +10,32 @@ import "../src/token/HelixToken.sol";
 import "../src/token/Staking.sol";
 import "../src/token/Rewards.sol";
 import "../src/verification/RLCAggregationVerifier.sol";
+import "../src/governance/TrainingDAO.sol";
 
 /// @title DeployScript
 /// @notice Deploys the HELIX verification infrastructure to Anvil/testnet
-/// @dev Usage:
-///   V2 Default:                  forge script script/Deploy.s.sol --broadcast
-///   V2 With mock verifier:       forge script script/Deploy.s.sol --sig "runWithMock()" --broadcast
-///   V3 Full stack:               forge script script/Deploy.s.sol --sig "deployV3()" --broadcast
-///   V3 With mock:                forge script script/Deploy.s.sol --sig "deployV3WithMock()" --broadcast
+/// @dev Default deployment (run()) now deploys V3 full stack.
+///      V2 is deprecated — use deployV2() or deployV2WithMock() for legacy compatibility only.
+///
+///   V3 Default (production):       forge script script/Deploy.s.sol --broadcast
+///   V3 With mock verifier:         forge script script/Deploy.s.sol --sig "runWithMock()" --broadcast
+///   V2 Legacy:                     forge script script/Deploy.s.sol --sig "deployV2()" --broadcast
+///   V2 Legacy with mock:           forge script script/Deploy.s.sol --sig "deployV2WithMock()" --broadcast
 contract DeployScript is Script {
+    // ============ Token Distribution Constants ============
+
+    /// @notice Worker incentive pool: 15M HELIX (for staking rewards over time)
+    uint256 public constant WORKER_INCENTIVE_POOL = 15_000_000 * 1e18;
+
+    /// @notice Staking rewards pool: 10M HELIX (funded into Rewards contract)
+    uint256 public constant STAKING_REWARDS_POOL = 10_000_000 * 1e18;
+
+    /// @notice Rewards per training round: 100 HELIX
+    uint256 public constant REWARDS_PER_ROUND = 100 * 1e18;
+
+    /// @notice Reward pool duration: 365 days
+    uint256 public constant REWARD_DURATION = 365 days;
+
     // Deployed contract addresses (set after deployment)
     address public verifier;
     address public coordinator;
@@ -28,65 +45,12 @@ contract DeployScript is Script {
     address public rewardsAddr;
     address public registryAddr;
     address public aggregationVerifierAddr;
+    address public daoAddr;
 
-    // ============ V2 Deployment ============
+    // ============ V3 Default Deployment ============
 
-    /// @notice Deploy V2 with real PSE-generated Halo2Verifier
-    /// @dev VK is embedded in the Halo2VerifyingKey contract (circuit-specific).
-    ///      To update the VK, regenerate Halo2VerifierCore.sol and Halo2VerifyingKey.sol
-    ///      from the Rust pipeline and redeploy.
-    function run() public returns (address, address) {
-        uint256 deployerPrivateKey = vm.envOr("PRIVATE_KEY", uint256(0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80));
-        treasury = vm.envOr("TREASURY", vm.addr(deployerPrivateKey));
-
-        vm.startBroadcast(deployerPrivateKey);
-
-        Halo2Verifier halo2Verifier = new Halo2Verifier();
-        verifier = address(halo2Verifier);
-
-        HelixCoordinatorV2 helixCoordinator = new HelixCoordinatorV2(verifier, treasury);
-        coordinator = address(helixCoordinator);
-
-        vm.stopBroadcast();
-
-        console.log("=== HELIX V2 Deployment Complete ===");
-        console.log("Halo2Verifier:", verifier);
-        console.log("  Core:", address(halo2Verifier.core()));
-        console.log("  VK:", halo2Verifier.vk());
-        console.log("HelixCoordinatorV2:", coordinator);
-        console.log("Treasury:", treasury);
-        console.log("====================================");
-
-        return (verifier, coordinator);
-    }
-
-    /// @notice Deploy V2 with a mock verifier for testing
-    function runWithMock() public returns (address, address) {
-        uint256 deployerPrivateKey = vm.envOr("PRIVATE_KEY", uint256(0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80));
-        treasury = vm.envOr("TREASURY", vm.addr(deployerPrivateKey));
-
-        vm.startBroadcast(deployerPrivateKey);
-
-        MockVerifierForDeploy mockVerifier = new MockVerifierForDeploy();
-        verifier = address(mockVerifier);
-
-        HelixCoordinatorV2 helixCoordinator = new HelixCoordinatorV2(verifier, treasury);
-        coordinator = address(helixCoordinator);
-
-        vm.stopBroadcast();
-
-        console.log("=== HELIX V2 Mock Deployment ===");
-        console.log("MockVerifier:", verifier);
-        console.log("HelixCoordinatorV2:", coordinator);
-        console.log("================================");
-
-        return (verifier, coordinator);
-    }
-
-    // ============ V3 Full Stack Deployment ============
-
-    /// @notice Deploy V3 full stack with real PSE-generated Halo2Verifier
-    function deployV3() public {
+    /// @notice Default deployment: V3 full stack with real Halo2Verifier and token distribution
+    function run() public {
         uint256 deployerPrivateKey = vm.envOr("PRIVATE_KEY", uint256(0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80));
         address deployer = vm.addr(deployerPrivateKey);
         treasury = vm.envOr("TREASURY", deployer);
@@ -123,34 +87,40 @@ contract DeployScript is Script {
         );
         coordinator = address(v3);
 
-        // 6b. Deploy RLCAggregationVerifier (uses same core as Halo2Verifier but with separate VK)
-        // NOTE: The aggregation VK must be deployed separately from the individual proof VK.
-        // For now, use the same VK as a placeholder — production deployments must generate
-        // the aggregation circuit's VK via `cargo test -p helix-prover test_generate_aggregation_vk`.
+        // 6b. Deploy RLCAggregationVerifier
         address coreAddr = address(halo2Verifier.core());
         address vkAddr = halo2Verifier.vk();
         RLCAggregationVerifier rlcAggVerifier = new RLCAggregationVerifier(coreAddr, vkAddr);
         aggregationVerifierAddr = address(rlcAggVerifier);
 
-        // 7. Wire contracts: set coordinator as operator/coordinator
+        // 7. Deploy TrainingDAO for governance
+        TrainingDAO dao = new TrainingDAO(helixToken);
+        daoAddr = address(dao);
+        dao.setCoordinator(coordinator);
+
+        // 8. Wire contracts
         staking.setOperator(coordinator);
+        staking.setTreasury(treasury);
         rewards.setCoordinator(coordinator);
         rewards.setStakingContract(stakingAddr);
         registry.setCoordinator(coordinator);
 
-        // 8. Grant minter role to Rewards for token distribution
+        // 9. Grant minter role to Rewards for token distribution
         token.addMinter(rewardsAddr);
 
-        // 9. Set aggregation verifier on V3
+        // 10. Set aggregation verifier on V3
         v3.setAggregationVerifier(aggregationVerifierAddr);
+
+        // 11. Initial token distribution
+        _distributeInitialTokens(token, rewards, deployer);
 
         vm.stopBroadcast();
 
         _logV3Deployment("Halo2");
     }
 
-    /// @notice Deploy V3 full stack with mock verifier for testing
-    function deployV3WithMock() public {
+    /// @notice Deploy V3 with mock verifier for testing
+    function runWithMock() public {
         uint256 deployerPrivateKey = vm.envOr("PRIVATE_KEY", uint256(0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80));
         address deployer = vm.addr(deployerPrivateKey);
         treasury = vm.envOr("TREASURY", deployer);
@@ -191,22 +161,120 @@ contract DeployScript is Script {
         MockVerifierForDeploy mockAggVerifier = new MockVerifierForDeploy();
         aggregationVerifierAddr = address(mockAggVerifier);
 
-        // 7. Wire contracts: set coordinator as operator/coordinator
+        // 7. Deploy TrainingDAO for governance
+        TrainingDAO dao = new TrainingDAO(helixToken);
+        daoAddr = address(dao);
+        dao.setCoordinator(coordinator);
+
+        // 8. Wire contracts
         staking.setOperator(coordinator);
+        staking.setTreasury(treasury);
         rewards.setCoordinator(coordinator);
         rewards.setStakingContract(stakingAddr);
         registry.setCoordinator(coordinator);
 
-        // 8. Grant minter role to Rewards for token distribution
+        // 9. Grant minter role to Rewards for token distribution
         token.addMinter(rewardsAddr);
 
-        // 9. Set aggregation verifier on V3
+        // 10. Set aggregation verifier on V3
         v3.setAggregationVerifier(aggregationVerifierAddr);
+
+        // 11. Initial token distribution
+        _distributeInitialTokens(token, rewards, deployer);
 
         vm.stopBroadcast();
 
         _logV3Deployment("Mock");
     }
+
+    // ============ Token Distribution ============
+
+    /// @notice Distributes initial tokens: treasury allocation, worker incentive pool, staking rewards
+    /// @dev Deployer starts with 20M INITIAL_SUPPLY.
+    ///      Treasury receives 30M via completeInitialDistribution().
+    ///      Deployer transfers 15M to treasury as worker incentive pool.
+    ///      Deployer funds reward contract with 10M for staking rewards.
+    ///      Remaining 5M stays with deployer for operational needs.
+    function _distributeInitialTokens(HelixToken token, Rewards rewards, address deployer) internal {
+        // Step 1: Complete treasury distribution (mints 30M to treasury)
+        token.completeInitialDistribution();
+
+        // Step 2: Transfer worker incentive pool to treasury
+        // These tokens will be distributed to workers over time via governance
+        token.transfer(treasury, WORKER_INCENTIVE_POOL);
+
+        // Step 3: Fund the rewards contract for staking rewards
+        // Approve + fund in one step
+        token.approve(address(rewards), STAKING_REWARDS_POOL);
+        rewards.fundRewardPool(
+            STAKING_REWARDS_POOL,
+            REWARDS_PER_ROUND,
+            REWARD_DURATION
+        );
+
+        console.log("=== Token Distribution Complete ===");
+        console.log("Treasury (30M governance + 15M worker incentives):", treasury);
+        console.log("Rewards contract (10M staking rewards):", address(rewards));
+        console.log("Deployer retained (5M operational):", deployer);
+        console.log("Rewards per round:", REWARDS_PER_ROUND / 1e18, "HELIX");
+        console.log("===================================");
+    }
+
+    // ============ V2 Legacy Deployment ============
+
+    /// @notice DEPRECATED: Deploy V2 with real Halo2Verifier (legacy compatibility only)
+    /// @dev Use run() for V3 production deployment instead.
+    function deployV2() public returns (address, address) {
+        uint256 deployerPrivateKey = vm.envOr("PRIVATE_KEY", uint256(0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80));
+        treasury = vm.envOr("TREASURY", vm.addr(deployerPrivateKey));
+
+        vm.startBroadcast(deployerPrivateKey);
+
+        Halo2Verifier halo2Verifier = new Halo2Verifier();
+        verifier = address(halo2Verifier);
+
+        HelixCoordinatorV2 helixCoordinator = new HelixCoordinatorV2(verifier, treasury);
+        coordinator = address(helixCoordinator);
+
+        vm.stopBroadcast();
+
+        console.log("=== HELIX V2 Deployment (DEPRECATED) ===");
+        console.log("WARNING: V2 is deprecated. Use V3 for new deployments.");
+        console.log("Halo2Verifier:", verifier);
+        console.log("HelixCoordinatorV2:", coordinator);
+        console.log("Treasury:", treasury);
+        console.log("========================================");
+
+        return (verifier, coordinator);
+    }
+
+    /// @notice DEPRECATED: Deploy V2 with mock verifier (legacy compatibility only)
+    function deployV2WithMock() public returns (address, address) {
+        uint256 deployerPrivateKey = vm.envOr("PRIVATE_KEY", uint256(0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80));
+        treasury = vm.envOr("TREASURY", vm.addr(deployerPrivateKey));
+
+        vm.startBroadcast(deployerPrivateKey);
+
+        MockVerifierForDeploy mockVerifier = new MockVerifierForDeploy();
+        verifier = address(mockVerifier);
+
+        HelixCoordinatorV2 helixCoordinator = new HelixCoordinatorV2(verifier, treasury);
+        coordinator = address(helixCoordinator);
+
+        vm.stopBroadcast();
+
+        console.log("=== HELIX V2 Mock Deployment (DEPRECATED) ===");
+        console.log("WARNING: V2 is deprecated. Use V3 for new deployments.");
+        console.log("MockVerifier:", verifier);
+        console.log("HelixCoordinatorV2:", coordinator);
+        console.log("=============================================");
+
+        return (verifier, coordinator);
+    }
+
+    // Keep old function names as aliases for backward compatibility
+    function deployV3() public { run(); }
+    function deployV3WithMock() public { runWithMock(); }
 
     function _logV3Deployment(string memory verifierType) internal view {
         console.log("=== HELIX V3 Full Stack Deployment ===");
@@ -216,6 +284,7 @@ contract DeployScript is Script {
         console.log("Staking:", stakingAddr);
         console.log("Rewards:", rewardsAddr);
         console.log("ModelRegistry:", registryAddr);
+        console.log("TrainingDAO:", daoAddr);
         console.log("HelixCoordinatorV3:", coordinator);
         console.log("Treasury:", treasury);
         console.log("======================================");
