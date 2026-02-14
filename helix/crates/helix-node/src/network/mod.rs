@@ -9,13 +9,19 @@
 //! - Wire format serialization
 //! - mDNS-based local discovery
 //! - Network security and hardening
+//! - P2P handshake protocol for peer authentication
+//! - Connection manager for full-lifecycle peer management
+//! - Peer registry with health monitoring
 
+pub mod connection_manager;
 pub mod discovery;
 pub mod eclipse;
 pub mod gossip;
+pub mod handshake;
 pub mod mdns_discovery;
 pub mod messages;
 pub mod partition_detect;
+pub mod peer_registry;
 pub mod rate_limit;
 pub mod reputation;
 pub mod runner;
@@ -61,4 +67,15 @@ pub use reputation::{
 };
 pub use sybil::{
     PeerStake, SelectionResult, SybilResistanceConfig, SybilResistantSelector,
+};
+
+// P2P connection management re-exports
+pub use handshake::{
+    HandshakeError, HandshakeMessage, HandshakeResult, HANDSHAKE_VERSION,
+};
+pub use peer_registry::{
+    PeerHealth, PeerRegistry, PeerSnapshot, RegisteredPeer, RegistryStats,
+};
+pub use connection_manager::{
+    ConnectionManager, ConnectionManagerConfig, ConnectionManagerError, P2PEvent,
 };
