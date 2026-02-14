@@ -170,6 +170,11 @@ impl ModelManifest {
             .find(|e| e.model_id == model_id && e.round_id == round_id)
     }
 
+    /// Returns all entries across all models (in insertion order).
+    pub fn all_entries(&self) -> Vec<ModelManifestEntry> {
+        self.entries.clone()
+    }
+
     /// Returns all entries for the given model ID, sorted by round_id ascending.
     pub fn get_all(&self, model_id: u64) -> Vec<&ModelManifestEntry> {
         let mut matched: Vec<&ModelManifestEntry> = self
@@ -1053,11 +1058,33 @@ impl ModelStore {
     pub fn get_latest_entry(&self, model_id: u64) -> Option<ModelManifestEntry> {
         self.manifest.get_latest(model_id).cloned()
     }
+
+    /// Returns all manifest entries across all models and rounds.
+    ///
+    /// Entries are in insertion order (not sorted). Callers may sort by
+    /// model_id or round_id as needed.
+    pub fn get_all_manifest_entries(&self) -> Vec<ModelManifestEntry> {
+        self.manifest.all_entries()
+    }
+
+    /// Returns a list of distinct model IDs that have at least one stored checkpoint.
+    pub fn list_model_ids(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self
+            .manifest
+            .all_entries()
+            .iter()
+            .map(|e| e.model_id)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
 }
 
 /// Additional metadata provided by the caller when storing a model.
 ///
 /// These fields are not derivable from the raw weight data alone.
+#[derive(Clone)]
 pub struct ModelStoreMetadata {
     /// Number of workers that contributed to this round.
     pub num_contributors: u32,
@@ -1709,6 +1736,127 @@ mod tests {
     fn test_s3_stub_returns_unavailable() {
         let result = S3ModelStore::new("bucket", "us-east-1", "/tmp/cache");
         assert!(matches!(result, Err(ModelStoreError::BackendUnavailable(_))));
+    }
+
+    // ---- Tests for new methods ----
+
+    #[test]
+    fn test_manifest_all_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manifest = ModelManifest::new(dir.path().join("manifest.json"));
+
+        manifest.add_entry(make_entry(1, 1));
+        manifest.add_entry(make_entry(2, 1));
+        manifest.add_entry(make_entry(1, 2));
+
+        let all = manifest.all_entries();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].model_id, 1);
+        assert_eq!(all[0].round_id, 1);
+        assert_eq!(all[1].model_id, 2);
+        assert_eq!(all[2].round_id, 2);
+    }
+
+    #[test]
+    fn test_manifest_all_entries_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = ModelManifest::new(dir.path().join("manifest.json"));
+        assert!(manifest.all_entries().is_empty());
+    }
+
+    #[test]
+    fn test_store_get_all_manifest_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = ModelStore::new(ModelStoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..ModelStoreConfig::default()
+        }).unwrap();
+
+        let metadata = ModelStoreMetadata {
+            num_contributors: 2,
+            loss: 0.1,
+            error_bound: 0.01,
+            steps_completed: 10,
+            tx_hash: None,
+        };
+
+        store.store_model(1, 1, b"weights-1-1", metadata).unwrap();
+        let metadata2 = ModelStoreMetadata {
+            num_contributors: 3,
+            loss: 0.05,
+            error_bound: 0.005,
+            steps_completed: 20,
+            tx_hash: Some("0xabc".into()),
+        };
+        store.store_model(1, 2, b"weights-1-2", metadata2).unwrap();
+        store.store_model(2, 1, b"weights-2-1", ModelStoreMetadata {
+            num_contributors: 1, loss: 0.2, error_bound: 0.02,
+            steps_completed: 5, tx_hash: None,
+        }).unwrap();
+
+        let all = store.get_all_manifest_entries();
+        assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn test_store_list_model_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = ModelStore::new(ModelStoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..ModelStoreConfig::default()
+        }).unwrap();
+
+        let m = ModelStoreMetadata {
+            num_contributors: 1, loss: 0.1, error_bound: 0.01,
+            steps_completed: 1, tx_hash: None,
+        };
+
+        store.store_model(3, 1, b"w1", m.clone()).unwrap();
+        store.store_model(1, 1, b"w2", m.clone()).unwrap();
+        store.store_model(3, 2, b"w3", m).unwrap();
+
+        let ids = store.list_model_ids();
+        assert_eq!(ids, vec![1, 3]);
+    }
+
+    #[test]
+    fn test_store_restore_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Store some models
+        {
+            let mut store = ModelStore::new(ModelStoreConfig {
+                data_dir: dir.path().to_path_buf(),
+                ..ModelStoreConfig::default()
+            }).unwrap();
+
+            let m = ModelStoreMetadata {
+                num_contributors: 2, loss: 0.05, error_bound: 0.001,
+                steps_completed: 50, tx_hash: None,
+            };
+            store.store_model(1, 1, b"first-weights", m.clone()).unwrap();
+            store.store_model(1, 2, b"second-weights", m).unwrap();
+        }
+
+        // Reopen and verify data persisted
+        {
+            let store = ModelStore::new(ModelStoreConfig {
+                data_dir: dir.path().to_path_buf(),
+                ..ModelStoreConfig::default()
+            }).unwrap();
+
+            let all = store.get_all_manifest_entries();
+            assert_eq!(all.len(), 2);
+
+            let loaded = store.load_model(1, 1).unwrap();
+            assert_eq!(loaded, b"first-weights");
+
+            let loaded2 = store.load_model(1, 2).unwrap();
+            assert_eq!(loaded2, b"second-weights");
+
+            let latest = store.get_latest_entry(1).unwrap();
+            assert_eq!(latest.round_id, 2);
+        }
     }
 
     // ---- Helper functions ----

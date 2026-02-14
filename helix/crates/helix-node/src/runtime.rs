@@ -239,6 +239,7 @@ impl NodeRuntime {
         round_trigger_tx: broadcast::Sender<()>,
         proof_status: Arc<RwLock<Vec<ProofStatusEntry>>>,
         round_weights: Arc<RwLock<Vec<crate::api::rpc::RoundWeightEntry>>>,
+        model_store: Option<Arc<parking_lot::Mutex<crate::storage::model_store::ModelStore>>>,
     ) -> Arc<RpcState> {
         let (stop_trigger_tx, _) = broadcast::channel::<()>(16);
         Arc::new(RpcState {
@@ -270,6 +271,7 @@ impl NodeRuntime {
             round_weights,
             worker_daemon: None,
             node_metrics: self.node_metrics.clone(),
+            model_store,
         })
     }
 
@@ -339,6 +341,7 @@ impl NodeRuntime {
             round_trigger_tx.clone(),
             proof_status.clone(),
             round_weights.clone(),
+            None, // Workers don't need persistent model store
         );
         // Inject worker daemon into RPC state
         if let Some(state) = Arc::get_mut(&mut rpc_state) {
@@ -974,11 +977,50 @@ impl NodeRuntime {
             }
         };
 
+        // Restore persisted round weights into the in-memory store for RPC access
+        if let Some(ref store) = model_store {
+            let store_guard = store.lock();
+            let entries = store_guard.get_all_manifest_entries();
+            let mut restored = 0usize;
+            for manifest_entry in &entries {
+                // Load weight bytes from disk and populate round_weights
+                match store_guard.load_model(manifest_entry.model_id, manifest_entry.round_id) {
+                    Ok(weight_bytes) => {
+                        round_weights_shared.write().push(
+                            crate::api::rpc::RoundWeightEntry {
+                                round_id: manifest_entry.round_id,
+                                model_id: manifest_entry.model_id,
+                                commitment: manifest_entry.commitment,
+                                weight_bytes,
+                                loss: manifest_entry.loss,
+                                error_bound: manifest_entry.error_bound,
+                                steps_completed: manifest_entry.steps_completed,
+                                num_contributors: manifest_entry.num_contributors,
+                                completed_at: manifest_entry.completed_at,
+                                tx_hash: manifest_entry.tx_hash.clone(),
+                            },
+                        );
+                        restored += 1;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to restore weights for model_{}/round_{}: {}",
+                            manifest_entry.model_id, manifest_entry.round_id, e,
+                        );
+                    }
+                }
+            }
+            if restored > 0 {
+                info!("Restored {} round weight entries from persistent store", restored);
+            }
+        }
+
         let rpc_state = self.build_rpc_state(
             api_snapshot.clone(),
             round_trigger_tx.clone(),
             proof_status.clone(),
             round_weights_shared.clone(),
+            model_store.clone(),
         );
 
         let rpc_addr: SocketAddr = format!("0.0.0.0:{}", self.config.rpc_port).parse()?;

@@ -288,6 +288,8 @@ pub struct RpcState {
     pub worker_daemon: Option<Arc<crate::worker::WorkerDaemon>>,
     /// Node-wide atomic metrics (for helix_getMetrics RPC).
     pub node_metrics: Arc<NodeMetrics>,
+    /// Persistent model weight storage (disk-backed, for cross-restart retrieval).
+    pub model_store: Option<Arc<parking_lot::Mutex<crate::storage::model_store::ModelStore>>>,
 }
 
 /// Tracks proof status per round.
@@ -412,6 +414,9 @@ async fn rpc_handler(
         "helix_getTrainingHistory" => handle_get_training_history(&state, &req.params, &id),
         "helix_getTrainingReport" => handle_get_training_report(&state, &req.params, &id),
         "helix_downloadModel" => handle_download_model(&state, &req.params, &id),
+        // Model weight management
+        "helix_uploadModel" => handle_upload_model(&state, &req.params, &id),
+        "helix_listCheckpoints" => handle_list_checkpoints(&state, &req.params, &id),
         // Metrics handler
         "helix_getMetrics" => handle_get_metrics(&state, &id),
         // Worker daemon handlers
@@ -1312,6 +1317,7 @@ fn handle_get_model_weights(
         .or_else(|| *state.model_id.read());
     let round_id = params.get("round_id").and_then(|v| v.as_u64());
 
+    // First: check in-memory round_weights
     let weights = state.round_weights.read();
 
     let entry = match round_id {
@@ -1324,42 +1330,91 @@ fn handle_get_model_weights(
         }
     };
 
-    match entry {
-        Some(e) => {
-            let result = serde_json::json!({
-                "available": true,
-                "round_id": e.round_id,
-                "model_id": e.model_id,
-                "commitment": format!("0x{}", hex::encode(e.commitment)),
-                "size_bytes": e.weight_bytes.len(),
-                "loss": e.loss,
-                "error_bound": e.error_bound,
-                "steps_completed": e.steps_completed,
-                "num_contributors": e.num_contributors,
-                "completed_at": e.completed_at,
-                "tx_hash": e.tx_hash,
-                "weight_bytes": e.weight_bytes,
-            });
-            JsonRpcResponse::success(id.clone(), result)
-        }
-        None => {
-            let result = serde_json::json!({
-                "available": false,
-                "round_id": round_id.unwrap_or(0),
-                "model_id": model_id.unwrap_or(0),
-                "commitment": null,
-                "size_bytes": 0,
-                "loss": 0.0,
-                "error_bound": 0.0,
-                "steps_completed": 0,
-                "num_contributors": 0,
-                "completed_at": 0,
-                "tx_hash": null,
-                "weight_bytes": [],
-            });
-            JsonRpcResponse::success(id.clone(), result)
+    if let Some(e) = entry {
+        let result = serde_json::json!({
+            "available": true,
+            "round_id": e.round_id,
+            "model_id": e.model_id,
+            "commitment": format!("0x{}", hex::encode(e.commitment)),
+            "size_bytes": e.weight_bytes.len(),
+            "loss": e.loss,
+            "error_bound": e.error_bound,
+            "steps_completed": e.steps_completed,
+            "num_contributors": e.num_contributors,
+            "completed_at": e.completed_at,
+            "tx_hash": e.tx_hash,
+            "weight_bytes": e.weight_bytes,
+        });
+        return JsonRpcResponse::success(id.clone(), result);
+    }
+    drop(weights); // release read lock before model_store lock
+
+    // Fallback: check persistent model store
+    if let Some(ref store) = state.model_store {
+        let store_guard = store.lock();
+        let manifest_entry = match (model_id, round_id) {
+            (Some(mid), Some(rid)) => store_guard.get_manifest_entry(mid, rid),
+            (Some(mid), None) => store_guard.get_latest_entry(mid),
+            (None, Some(rid)) => {
+                // Search all models for this round_id
+                store_guard.get_all_manifest_entries()
+                    .into_iter()
+                    .find(|e| e.round_id == rid)
+            }
+            (None, None) => {
+                // Return the latest entry across all models
+                store_guard.get_all_manifest_entries()
+                    .into_iter()
+                    .max_by_key(|e| e.completed_at)
+            }
+        };
+
+        if let Some(me) = manifest_entry {
+            match store_guard.load_model(me.model_id, me.round_id) {
+                Ok(weight_bytes) => {
+                    let result = serde_json::json!({
+                        "available": true,
+                        "round_id": me.round_id,
+                        "model_id": me.model_id,
+                        "commitment": format!("0x{}", hex::encode(me.commitment)),
+                        "size_bytes": weight_bytes.len(),
+                        "loss": me.loss,
+                        "error_bound": me.error_bound,
+                        "steps_completed": me.steps_completed,
+                        "num_contributors": me.num_contributors,
+                        "completed_at": me.completed_at,
+                        "tx_hash": me.tx_hash,
+                        "weight_bytes": weight_bytes,
+                        "source": "persistent_store",
+                    });
+                    return JsonRpcResponse::success(id.clone(), result);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Manifest entry found but load failed for model_{}/round_{}: {}",
+                        me.model_id, me.round_id, e,
+                    );
+                }
+            }
         }
     }
+
+    // Not found anywhere
+    let result = serde_json::json!({
+        "available": false,
+        "round_id": round_id.unwrap_or(0),
+        "model_id": model_id.unwrap_or(0),
+        "commitment": null,
+        "size_bytes": 0,
+        "loss": 0.0,
+        "error_bound": 0.0,
+        "steps_completed": 0,
+        "num_contributors": 0,
+        "completed_at": 0,
+        "tx_hash": null,
+        "weight_bytes": [],
+    });
+    JsonRpcResponse::success(id.clone(), result)
 }
 
 fn handle_get_training_history(
@@ -1485,6 +1540,7 @@ fn handle_download_model(
         .or_else(|| *state.model_id.read());
     let round_id = params.get("round_id").and_then(|v| v.as_u64());
 
+    // First: check in-memory round_weights
     let weights = state.round_weights.read();
 
     let entry = match round_id {
@@ -1496,34 +1552,258 @@ fn handle_download_model(
         }
     };
 
-    match entry {
-        Some(e) => {
-            let result = serde_json::json!({
-                "available": true,
-                "round_id": e.round_id,
+    if let Some(e) = entry {
+        let result = serde_json::json!({
+            "available": true,
+            "round_id": e.round_id,
+            "model_id": e.model_id,
+            "commitment": format!("0x{}", hex::encode(e.commitment)),
+            "weight_bytes": e.weight_bytes,
+            "size_bytes": e.weight_bytes.len(),
+            "loss": e.loss,
+            "error_bound": e.error_bound,
+            "steps_completed": e.steps_completed,
+            "num_contributors": e.num_contributors,
+            "completed_at": e.completed_at,
+            "tx_hash": e.tx_hash,
+            "format": "helix-checkpoint-v1",
+        });
+        return JsonRpcResponse::success(id.clone(), result);
+    }
+    drop(weights); // release read lock
+
+    // Fallback: check persistent model store
+    if let Some(ref store) = state.model_store {
+        let store_guard = store.lock();
+        let manifest_entry = match (model_id, round_id) {
+            (Some(mid), Some(rid)) => store_guard.get_manifest_entry(mid, rid),
+            (Some(mid), None) => store_guard.get_latest_entry(mid),
+            (None, Some(rid)) => {
+                store_guard.get_all_manifest_entries()
+                    .into_iter()
+                    .find(|e| e.round_id == rid)
+            }
+            (None, None) => {
+                store_guard.get_all_manifest_entries()
+                    .into_iter()
+                    .max_by_key(|e| e.completed_at)
+            }
+        };
+
+        if let Some(me) = manifest_entry {
+            match store_guard.load_model(me.model_id, me.round_id) {
+                Ok(weight_bytes) => {
+                    let result = serde_json::json!({
+                        "available": true,
+                        "round_id": me.round_id,
+                        "model_id": me.model_id,
+                        "commitment": format!("0x{}", hex::encode(me.commitment)),
+                        "weight_bytes": weight_bytes,
+                        "size_bytes": me.size_bytes,
+                        "loss": me.loss,
+                        "error_bound": me.error_bound,
+                        "steps_completed": me.steps_completed,
+                        "num_contributors": me.num_contributors,
+                        "completed_at": me.completed_at,
+                        "tx_hash": me.tx_hash,
+                        "format": "helix-checkpoint-v1",
+                        "source": "persistent_store",
+                    });
+                    return JsonRpcResponse::success(id.clone(), result);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Manifest entry found but load failed for model_{}/round_{}: {}",
+                        me.model_id, me.round_id, e,
+                    );
+                }
+            }
+        }
+    }
+
+    JsonRpcResponse::error(
+        id.clone(),
+        -32001,
+        format!(
+            "No model found for model_id={:?}, round_id={:?}",
+            model_id, round_id,
+        ),
+    )
+}
+
+// ============================================================================
+// Model Weight Management Handlers
+// ============================================================================
+
+/// Upload model weights to the persistent store.
+///
+/// Params:
+///   - `weight_bytes`: Vec<u8> (JSON array of bytes) — serialized ModelCheckpoint
+///   - `model_id`: u64 (optional, default 0)
+///   - `round_id`: u64 (optional, default 0 — used for "initial" weights)
+///
+/// Returns the commitment hash and storage metadata.
+fn handle_upload_model(
+    state: &RpcState,
+    params: &serde_json::Value,
+    id: &serde_json::Value,
+) -> JsonRpcResponse {
+    let store = match &state.model_store {
+        Some(s) => s,
+        None => {
+            return JsonRpcResponse::error(
+                id.clone(),
+                -32000,
+                "Model store not available on this node".to_string(),
+            );
+        }
+    };
+
+    // Extract weight_bytes — accept JSON array of u8 values
+    let weight_bytes: Vec<u8> = match params.get("weight_bytes").and_then(|v| {
+        serde_json::from_value::<Vec<u8>>(v.clone()).ok()
+    }) {
+        Some(bytes) if !bytes.is_empty() => bytes,
+        _ => {
+            return JsonRpcResponse::invalid_params(
+                id.clone(),
+                "weight_bytes is required (non-empty byte array)",
+            );
+        }
+    };
+
+    // Validate that the bytes are a valid ModelCheckpoint
+    if let Err(e) = helix_core::ModelCheckpoint::from_bytes(&weight_bytes) {
+        return JsonRpcResponse::error(
+            id.clone(),
+            -32002,
+            format!("Invalid checkpoint data: {}", e),
+        );
+    }
+
+    let model_id = params
+        .get("model_id")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let round_id = params
+        .get("round_id")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    // Compute commitment
+    let commitment: [u8; 32] = {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(&weight_bytes).into()
+    };
+
+    // Store in the persistent backend
+    let metadata = crate::storage::model_store::ModelStoreMetadata {
+        num_contributors: 0,
+        loss: 0.0,
+        error_bound: 0.0,
+        steps_completed: 0,
+        tx_hash: None,
+    };
+
+    match store.lock().store_model(model_id, round_id, &weight_bytes, metadata) {
+        Ok(entry) => {
+            // Also add to in-memory round_weights so it's immediately available via RPC
+            let now_ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            state.round_weights.write().push(RoundWeightEntry {
+                round_id,
+                model_id,
+                commitment,
+                weight_bytes,
+                loss: 0.0,
+                error_bound: 0.0,
+                steps_completed: 0,
+                num_contributors: 0,
+                completed_at: now_ts,
+                tx_hash: None,
+            });
+
+            JsonRpcResponse::success(
+                id.clone(),
+                serde_json::json!({
+                    "stored": true,
+                    "model_id": model_id,
+                    "round_id": round_id,
+                    "commitment": format!("0x{}", hex::encode(entry.commitment)),
+                    "size_bytes": entry.size_bytes,
+                    "storage_backend": entry.storage_backend,
+                    "storage_location": entry.storage_location,
+                }),
+            )
+        }
+        Err(e) => JsonRpcResponse::error(
+            id.clone(),
+            -32000,
+            format!("Failed to store model: {}", e),
+        ),
+    }
+}
+
+/// List all persisted model checkpoints.
+///
+/// Params:
+///   - `model_id`: u64 (optional — filter to a specific model)
+///
+/// Returns a list of checkpoint metadata (no weight bytes).
+fn handle_list_checkpoints(
+    state: &RpcState,
+    params: &serde_json::Value,
+    id: &serde_json::Value,
+) -> JsonRpcResponse {
+    let store = match &state.model_store {
+        Some(s) => s,
+        None => {
+            return JsonRpcResponse::error(
+                id.clone(),
+                -32000,
+                "Model store not available on this node".to_string(),
+            );
+        }
+    };
+
+    let filter_model_id = params.get("model_id").and_then(|v| v.as_u64());
+
+    let store_guard = store.lock();
+    let entries = store_guard.get_all_manifest_entries();
+
+    let checkpoints: Vec<serde_json::Value> = entries
+        .iter()
+        .filter(|e| filter_model_id.map_or(true, |mid| e.model_id == mid))
+        .map(|e| {
+            serde_json::json!({
                 "model_id": e.model_id,
+                "round_id": e.round_id,
                 "commitment": format!("0x{}", hex::encode(e.commitment)),
-                "weight_bytes": e.weight_bytes,
-                "size_bytes": e.weight_bytes.len(),
+                "size_bytes": e.size_bytes,
+                "storage_backend": e.storage_backend,
                 "loss": e.loss,
                 "error_bound": e.error_bound,
                 "steps_completed": e.steps_completed,
                 "num_contributors": e.num_contributors,
                 "completed_at": e.completed_at,
                 "tx_hash": e.tx_hash,
-                "format": "helix-checkpoint-v1",
-            });
-            JsonRpcResponse::success(id.clone(), result)
-        }
-        None => JsonRpcResponse::error(
-            id.clone(),
-            -32001,
-            format!(
-                "No model found for model_id={:?}, round_id={:?}",
-                model_id, round_id,
-            ),
-        ),
-    }
+            })
+        })
+        .collect();
+
+    let model_ids = store_guard.list_model_ids();
+
+    JsonRpcResponse::success(
+        id.clone(),
+        serde_json::json!({
+            "checkpoints": checkpoints,
+            "total": checkpoints.len(),
+            "model_ids": model_ids,
+        }),
+    )
 }
 
 // ============================================================================
@@ -1663,6 +1943,7 @@ pub fn create_default_rpc_state(
         round_weights: Arc::new(RwLock::new(Vec::new())),
         worker_daemon: None,
         node_metrics: NodeMetrics::new(),
+        model_store: None,
     })
 }
 
@@ -1721,6 +2002,7 @@ mod tests {
             round_weights: Arc::new(RwLock::new(Vec::new())),
             worker_daemon: None,
             node_metrics: NodeMetrics::new(),
+            model_store: None,
         })
     }
 
@@ -2461,5 +2743,309 @@ mod tests {
         let response = handle_submit_proof(&state, &params, &null_id());
         assert!(response.error.is_some());
         assert_eq!(response.error.unwrap().code, -32602);
+    }
+
+    // ---- Model weight management tests ----
+
+    fn create_test_state_with_store() -> (Arc<RpcState>, tempfile::TempDir) {
+        use crate::storage::model_store::{ModelStore, ModelStoreConfig};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(ModelStoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..ModelStoreConfig::default()
+        })
+        .unwrap();
+
+        let (tx, _) = broadcast::channel(16);
+        let (stop_tx, _) = broadcast::channel(16);
+        let state = Arc::new(RpcState {
+            snapshot: Arc::new(RwLock::new(OrchestratorSnapshot::default())),
+            round_trigger_tx: tx,
+            stop_trigger_tx: stop_tx,
+            node_role: "aggregator".to_string(),
+            start_time: std::time::Instant::now(),
+            proof_status: Arc::new(RwLock::new(Vec::new())),
+            proof_queue: Arc::new(RwLock::new(Vec::new())),
+            node_config: Arc::new(RwLock::new(NodeConfigSnapshot::default())),
+            aggregation_results: Arc::new(RwLock::new(Vec::new())),
+            mpc_status: Arc::new(RwLock::new(MPCStatusSnapshot::default())),
+            model_id: Arc::new(RwLock::new(Some(1))),
+            rpc_addr: "127.0.0.1:9002".to_string(),
+            rate_limiter: Arc::new(RwLock::new(RpcRateLimiter::default())),
+            round_weights: Arc::new(RwLock::new(Vec::new())),
+            worker_daemon: None,
+            node_metrics: NodeMetrics::new(),
+            model_store: Some(Arc::new(parking_lot::Mutex::new(store))),
+        });
+
+        (state, dir)
+    }
+
+    /// Creates a valid ModelCheckpoint byte array for testing.
+    fn make_test_checkpoint_bytes() -> Vec<u8> {
+        use helix_core::ModelCheckpoint;
+        use helix_core::data::checkpoint::{CheckpointLayer, CheckpointTensor};
+
+        let ckpt = ModelCheckpoint::new(
+            [0u8; 32], // model_id
+            0,          // step_number
+            0,          // timestamp
+            vec![CheckpointLayer {
+                name: "fc1".to_string(),
+                tensors: vec![CheckpointTensor {
+                    name: "weight".to_string(),
+                    shape: vec![2, 2],
+                    data: vec![0.1, 0.2, 0.3, 0.4],
+                }],
+            }],
+        );
+        ckpt.to_bytes().unwrap()
+    }
+
+    #[test]
+    fn test_upload_model_success() {
+        let (state, _dir) = create_test_state_with_store();
+        let ckpt_bytes = make_test_checkpoint_bytes();
+
+        let params = serde_json::json!({
+            "weight_bytes": ckpt_bytes,
+            "model_id": 1,
+            "round_id": 0,
+        });
+
+        let response = handle_upload_model(&state, &params, &null_id());
+        assert!(response.result.is_some(), "Expected success, got error: {:?}", response.error);
+
+        let result = response.result.unwrap();
+        assert_eq!(result["stored"], true);
+        assert_eq!(result["model_id"], 1);
+        assert_eq!(result["round_id"], 0);
+        assert!(result["commitment"].as_str().unwrap().starts_with("0x"));
+        assert!(result["size_bytes"].as_u64().unwrap() > 0);
+        assert_eq!(result["storage_backend"], "local");
+
+        // Verify it's also in round_weights (in-memory)
+        let weights = state.round_weights.read();
+        assert_eq!(weights.len(), 1);
+        assert_eq!(weights[0].model_id, 1);
+        assert_eq!(weights[0].round_id, 0);
+    }
+
+    #[test]
+    fn test_upload_model_invalid_checkpoint() {
+        let (state, _dir) = create_test_state_with_store();
+        let params = serde_json::json!({
+            "weight_bytes": vec![1u8, 2, 3, 4], // not a valid checkpoint
+            "model_id": 1,
+        });
+
+        let response = handle_upload_model(&state, &params, &null_id());
+        assert!(response.error.is_some());
+        assert_eq!(response.error.unwrap().code, -32002);
+    }
+
+    #[test]
+    fn test_upload_model_empty_bytes() {
+        let (state, _dir) = create_test_state_with_store();
+        let params = serde_json::json!({
+            "weight_bytes": Vec::<u8>::new(),
+        });
+
+        let response = handle_upload_model(&state, &params, &null_id());
+        assert!(response.error.is_some());
+        assert_eq!(response.error.unwrap().code, -32602); // invalid params
+    }
+
+    #[test]
+    fn test_upload_model_no_store() {
+        let state = create_test_state(); // no model_store
+        let params = serde_json::json!({
+            "weight_bytes": make_test_checkpoint_bytes(),
+        });
+
+        let response = handle_upload_model(&state, &params, &null_id());
+        assert!(response.error.is_some());
+        assert_eq!(response.error.unwrap().code, -32000);
+    }
+
+    #[test]
+    fn test_list_checkpoints_empty() {
+        let (state, _dir) = create_test_state_with_store();
+        let params = serde_json::json!({});
+
+        let response = handle_list_checkpoints(&state, &params, &null_id());
+        assert!(response.result.is_some());
+
+        let result = response.result.unwrap();
+        assert_eq!(result["total"], 0);
+        assert!(result["checkpoints"].as_array().unwrap().is_empty());
+        assert!(result["model_ids"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_list_checkpoints_after_upload() {
+        let (state, _dir) = create_test_state_with_store();
+        let ckpt_bytes = make_test_checkpoint_bytes();
+
+        // Upload two checkpoints
+        let params1 = serde_json::json!({
+            "weight_bytes": ckpt_bytes,
+            "model_id": 1,
+            "round_id": 1,
+        });
+        handle_upload_model(&state, &params1, &null_id());
+
+        let params2 = serde_json::json!({
+            "weight_bytes": ckpt_bytes,
+            "model_id": 1,
+            "round_id": 2,
+        });
+        handle_upload_model(&state, &params2, &null_id());
+
+        // List all
+        let response = handle_list_checkpoints(&state, &serde_json::json!({}), &null_id());
+        let result = response.result.unwrap();
+        assert_eq!(result["total"], 2);
+        assert_eq!(result["model_ids"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_list_checkpoints_filter_by_model() {
+        let (state, _dir) = create_test_state_with_store();
+        let ckpt_bytes = make_test_checkpoint_bytes();
+
+        handle_upload_model(&state, &serde_json::json!({
+            "weight_bytes": ckpt_bytes, "model_id": 1, "round_id": 1,
+        }), &null_id());
+
+        handle_upload_model(&state, &serde_json::json!({
+            "weight_bytes": ckpt_bytes, "model_id": 2, "round_id": 1,
+        }), &null_id());
+
+        // Filter to model 1 only
+        let response = handle_list_checkpoints(
+            &state,
+            &serde_json::json!({"model_id": 1}),
+            &null_id(),
+        );
+        let result = response.result.unwrap();
+        assert_eq!(result["total"], 1);
+    }
+
+    #[test]
+    fn test_get_model_weights_disk_fallback() {
+        let (state, _dir) = create_test_state_with_store();
+        let ckpt_bytes = make_test_checkpoint_bytes();
+
+        // Upload directly to model store (bypassing in-memory round_weights)
+        {
+            use crate::storage::model_store::ModelStoreMetadata;
+            let mut store = state.model_store.as_ref().unwrap().lock();
+            store
+                .store_model(
+                    1,
+                    5,
+                    &ckpt_bytes,
+                    ModelStoreMetadata {
+                        num_contributors: 3,
+                        loss: 0.02,
+                        error_bound: 0.001,
+                        steps_completed: 50,
+                        tx_hash: Some("0xabc123".into()),
+                    },
+                )
+                .unwrap();
+        }
+
+        // round_weights is empty — should fall back to disk
+        assert!(state.round_weights.read().is_empty());
+
+        let params = serde_json::json!({"model_id": 1, "round_id": 5});
+        let response = handle_get_model_weights(&state, &params, &null_id());
+        let result = response.result.unwrap();
+
+        assert_eq!(result["available"], true);
+        assert_eq!(result["model_id"], 1);
+        assert_eq!(result["round_id"], 5);
+        assert_eq!(result["loss"], 0.02);
+        assert_eq!(result["num_contributors"], 3);
+        assert_eq!(result["source"], "persistent_store");
+        // weight_bytes should be present
+        assert!(!result["weight_bytes"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_download_model_disk_fallback() {
+        let (state, _dir) = create_test_state_with_store();
+        let ckpt_bytes = make_test_checkpoint_bytes();
+
+        // Store directly to disk
+        {
+            use crate::storage::model_store::ModelStoreMetadata;
+            let mut store = state.model_store.as_ref().unwrap().lock();
+            store
+                .store_model(
+                    2,
+                    3,
+                    &ckpt_bytes,
+                    ModelStoreMetadata {
+                        num_contributors: 1,
+                        loss: 0.1,
+                        error_bound: 0.01,
+                        steps_completed: 10,
+                        tx_hash: None,
+                    },
+                )
+                .unwrap();
+        }
+
+        let params = serde_json::json!({"model_id": 2, "round_id": 3});
+        let response = handle_download_model(&state, &params, &null_id());
+        assert!(response.result.is_some(), "Expected success, got error: {:?}", response.error);
+
+        let result = response.result.unwrap();
+        assert_eq!(result["available"], true);
+        assert_eq!(result["model_id"], 2);
+        assert_eq!(result["format"], "helix-checkpoint-v1");
+        assert_eq!(result["source"], "persistent_store");
+    }
+
+    #[test]
+    fn test_download_model_not_found() {
+        let (state, _dir) = create_test_state_with_store();
+        let params = serde_json::json!({"model_id": 999, "round_id": 1});
+        let response = handle_download_model(&state, &params, &null_id());
+        assert!(response.error.is_some());
+        assert_eq!(response.error.unwrap().code, -32001);
+    }
+
+    #[test]
+    fn test_get_model_weights_latest_from_disk() {
+        let (state, _dir) = create_test_state_with_store();
+        let ckpt_bytes = make_test_checkpoint_bytes();
+
+        // Store two rounds to disk
+        {
+            use crate::storage::model_store::ModelStoreMetadata;
+            let mut store = state.model_store.as_ref().unwrap().lock();
+            store.store_model(1, 1, &ckpt_bytes, ModelStoreMetadata {
+                num_contributors: 1, loss: 0.5, error_bound: 0.1,
+                steps_completed: 10, tx_hash: None,
+            }).unwrap();
+            store.store_model(1, 2, &ckpt_bytes, ModelStoreMetadata {
+                num_contributors: 2, loss: 0.1, error_bound: 0.01,
+                steps_completed: 20, tx_hash: Some("0xdef".into()),
+            }).unwrap();
+        }
+
+        // Request latest (no round_id)
+        let params = serde_json::json!({"model_id": 1});
+        let response = handle_get_model_weights(&state, &params, &null_id());
+        let result = response.result.unwrap();
+
+        assert_eq!(result["available"], true);
+        assert_eq!(result["round_id"], 2);
+        assert_eq!(result["loss"], 0.1);
     }
 }
