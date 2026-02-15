@@ -211,7 +211,11 @@ impl Fr {
 
     /// Creates a field element from an f64 using fixed-point representation.
     ///
-    /// The value is scaled by 2^64 before being stored.
+    /// The value is scaled by 2^64, then aligned to the nearest multiple of 2^32.
+    /// This alignment ensures that the product of any two `from_f64` values is
+    /// divisible by 2^64, which makes `mpc_scale` (modular inverse of 2^64) exact.
+    /// The precision loss is negligible (~2^{-32} ≈ 2.3e-10), far exceeding the
+    /// ~2^{-23} precision of float32 used in typical neural network training.
     #[inline]
     pub fn from_f64(val: f64) -> Self {
         if val == 0.0 {
@@ -224,8 +228,10 @@ impl Fr {
         // Scale by 2^64
         let scaled = abs_val * (FIXED_POINT_SCALE as f64);
 
-        // Convert to field element
-        let int_part = scaled as u128;
+        // Align to 2^32 boundary: clear lower 32 bits.
+        // This guarantees product of two from_f64 values is divisible by 2^64,
+        // making mpc_scale's modular inverse division exact.
+        let int_part = (scaled as u128) & !((1u128 << 32) - 1);
         let result = Self::from_u128(int_part);
 
         if is_negative {
@@ -307,24 +313,47 @@ impl Fr {
         }
     }
 
-    /// MPC-safe multiplication of a secret share by a fixed-point public value.
+    /// Fixed-point multiplication that works for both small values and MPC shares.
     ///
-    /// Given `self` = a secret share (arbitrary field element) and `public_fp` =
-    /// a fixed-point encoded public value (from `from_f64`), computes:
-    ///   `result = self * public_fp * (2^64)^{-1} mod r`
+    /// Computes `floor(self * other / 2^64)` in the fixed-point sense:
+    /// - When both operands are small (< 2^96 in absolute value), uses exact
+    ///   byte-shift truncation (same as `fixed_mul`). This handles the common
+    ///   case of two fixed-point encoded values correctly.
+    /// - When at least one operand is large (e.g., a random MPC share), uses
+    ///   modular inverse `self * other * (2^64)^{-1} mod r`. This is algebraically
+    ///   exact for share-by-public multiplication because the 2^64 factors cancel.
     ///
-    /// This is equivalent to `fixed_mul` but uses modular inverse instead of
-    /// byte-shift truncation, making it:
-    /// - **Correct for all field element sizes** (including random MPC shares)
-    /// - **Linear** (sum of scaled shares = scaled sum), which is required for
-    ///   additive secret sharing to work correctly
-    ///
-    /// Use this instead of `fixed_mul` whenever one or both operands might be
-    /// large random field elements (e.g., secret shares in MPC protocols).
+    /// **Linear**: `sum(share_i.mpc_scale(x)) == sum(share_i).mpc_scale(x)`,
+    /// which is required for additive secret sharing.
     #[inline]
-    pub fn mpc_scale(&self, public_fp: &Self) -> Self {
-        let product = Fr(self.0 * public_fp.0);
-        Fr(product.0 * Self::inv_2_64().0)
+    pub fn mpc_scale(&self, other: &Self) -> Self {
+        // Check if both operands are "small" after sign normalization.
+        // Small = fits in 96 bits (absolute value). Their product < 2^192 < r,
+        // so field multiplication equals integer multiplication (no mod reduction),
+        // and byte-shift truncation gives the exact floor(a*b / 2^64).
+        let self_neg = self.is_negative().to_bool();
+        let other_neg = other.is_negative().to_bool();
+
+        let abs_self = if self_neg { self.neg() } else { *self };
+        let abs_other = if other_neg { other.neg() } else { *other };
+
+        let a_bytes = abs_self.to_bytes_le();
+        let b_bytes = abs_other.to_bytes_le();
+
+        let a_small = a_bytes[12..32].iter().all(|&x| x == 0);
+        let b_small = b_bytes[12..32].iter().all(|&x| x == 0);
+
+        if a_small && b_small {
+            // Both small: delegate to fixed_mul (byte-shift truncation with sign handling).
+            self.fixed_mul(other)
+        } else {
+            // At least one large (MPC share): use modular inverse.
+            // This is correct when one operand is a random share and the other is
+            // a fixed-point public value, because the (2^64) and (2^64)^{-1} cancel
+            // exactly in the field.
+            let product = Fr(self.0 * other.0);
+            Fr(product.0 * Self::inv_2_64().0)
+        }
     }
 
     /// Returns (2^64)^{-1} mod r, cached after first computation.

@@ -309,7 +309,7 @@ mod tests {
         // Softmax should sum to 1.
         let total: f64 = result.iter().sum();
         assert!(
-            (total - 1.0).abs() < 1e-10,
+            (total - 1.0).abs() < 1e-8,
             "Softmax doesn't sum to 1: {}",
             total,
         );

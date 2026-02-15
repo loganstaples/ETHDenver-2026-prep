@@ -877,8 +877,10 @@ mod tests_advanced {
         assert_eq!(agg.party_commitments.len(), 2);
         assert!((agg.total_error_bound - 0.03).abs() < 0.001);
 
-        // Verify homomorphic sum: (0.1+0.2) + (0.3+0.4) = 1.0
-        let total_sum = Fr::from_f64(1.0);
+        // Verify homomorphic sum: commit(sum1) + commit(sum2) = commit(sum1 + sum2)
+        let sum1: f64 = gradients1.iter().sum();
+        let sum2: f64 = gradients2.iter().sum();
+        let total_sum = Fr::add(&Fr::from_f64(sum1), &Fr::from_f64(sum2));
         let total_blind = Fr::add(&r1, &r2);
         assert!(agg.verify_sum(&total_sum, &total_blind));
     }
