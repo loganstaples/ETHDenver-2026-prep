@@ -5,6 +5,7 @@ import "forge-std/Script.sol";
 import "../src/verification/Halo2Verifier.sol";
 import "../src/core/HelixCoordinatorV2.sol";
 import "../src/core/HelixCoordinatorV3.sol";
+import "../src/core/HelixCoordinatorV4.sol";
 import "../src/core/ModelRegistry.sol";
 import "../src/token/HelixToken.sol";
 import "../src/token/Staking.sol";
@@ -16,9 +17,12 @@ import "../src/governance/TrainingDAO.sol";
 /// @notice Deploys the HELIX verification infrastructure to Anvil/testnet
 /// @dev Default deployment (run()) now deploys V3 full stack.
 ///      V2 is deprecated — use deployV2() or deployV2WithMock() for legacy compatibility only.
+///      V4 is for MPC-primary architecture — use deployV4() or deployV4WithMock().
 ///
 ///   V3 Default (production):       forge script script/Deploy.s.sol --broadcast
 ///   V3 With mock verifier:         forge script script/Deploy.s.sol --sig "runWithMock()" --broadcast
+///   V4 MPC-primary:               forge script script/Deploy.s.sol --sig "deployV4()" --broadcast
+///   V4 MPC-primary with mock:     forge script script/Deploy.s.sol --sig "deployV4WithMock()" --broadcast
 ///   V2 Legacy:                     forge script script/Deploy.s.sol --sig "deployV2()" --broadcast
 ///   V2 Legacy with mock:           forge script script/Deploy.s.sol --sig "deployV2WithMock()" --broadcast
 contract DeployScript is Script {
@@ -39,6 +43,7 @@ contract DeployScript is Script {
     // Deployed contract addresses (set after deployment)
     address public verifier;
     address public coordinator;
+    address public coordinatorV4;
     address public treasury;
     address public helixToken;
     address public stakingAddr;
@@ -275,6 +280,62 @@ contract DeployScript is Script {
     // Keep old function names as aliases for backward compatibility
     function deployV3() public { run(); }
     function deployV3WithMock() public { runWithMock(); }
+
+    // ============ V4 MPC-Primary Deployment ============
+
+    /// @notice Deploy V4 MPC-primary coordinator with real Halo2Verifier (for optional ZK)
+    /// @dev V4 uses native ETH for per-job staking and payments.
+    ///      The Halo2Verifier is optional — only needed if jobs enable ZK proofs.
+    function deployV4() public returns (address) {
+        uint256 deployerPrivateKey = vm.envOr("PRIVATE_KEY", uint256(0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80));
+        treasury = vm.envOr("TREASURY", vm.addr(deployerPrivateKey));
+
+        vm.startBroadcast(deployerPrivateKey);
+
+        // 1. Deploy Halo2Verifier (optional, for submitCheckpointWithProof)
+        Halo2Verifier halo2Verifier = new Halo2Verifier();
+        verifier = address(halo2Verifier);
+
+        // 2. Deploy HelixCoordinatorV4
+        HelixCoordinatorV4 v4 = new HelixCoordinatorV4(treasury, verifier);
+        coordinatorV4 = address(v4);
+
+        vm.stopBroadcast();
+
+        console.log("=== HELIX V4 MPC-Primary Deployment ===");
+        console.log("Halo2Verifier (optional ZK):", verifier);
+        console.log("HelixCoordinatorV4:", coordinatorV4);
+        console.log("Treasury:", treasury);
+        console.log("========================================");
+
+        return coordinatorV4;
+    }
+
+    /// @notice Deploy V4 MPC-primary coordinator with mock verifier (for testing)
+    function deployV4WithMock() public returns (address) {
+        uint256 deployerPrivateKey = vm.envOr("PRIVATE_KEY", uint256(0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80));
+        treasury = vm.envOr("TREASURY", vm.addr(deployerPrivateKey));
+
+        vm.startBroadcast(deployerPrivateKey);
+
+        // 1. Deploy MockVerifier
+        MockVerifierForDeploy mockVerifier = new MockVerifierForDeploy();
+        verifier = address(mockVerifier);
+
+        // 2. Deploy HelixCoordinatorV4
+        HelixCoordinatorV4 v4 = new HelixCoordinatorV4(treasury, verifier);
+        coordinatorV4 = address(v4);
+
+        vm.stopBroadcast();
+
+        console.log("=== HELIX V4 Mock MPC-Primary Deployment ===");
+        console.log("MockVerifier:", verifier);
+        console.log("HelixCoordinatorV4:", coordinatorV4);
+        console.log("Treasury:", treasury);
+        console.log("=============================================");
+
+        return coordinatorV4;
+    }
 
     function _logV3Deployment(string memory verifierType) internal view {
         console.log("=== HELIX V3 Full Stack Deployment ===");
