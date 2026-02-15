@@ -13,6 +13,7 @@ pub mod orchestrator;
 pub mod progress;
 pub mod rpc;
 pub mod session;
+pub mod share_distributor;
 pub mod visualization;
 pub mod wallet;
 

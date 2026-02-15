@@ -33,6 +33,7 @@ pub mod proofs;
 pub mod protocols;
 pub mod security;
 pub mod session;
+pub mod share_distribution;
 pub mod sharing;
 pub mod types;
 pub mod verification;
@@ -40,3 +41,8 @@ pub mod verification;
 pub use error::MPCError;
 pub use field::{Fr, FieldElement, CtChoice, SecureBuffer, SecureVec};
 pub use types::{MPCConfig, PartyId, ShareId};
+pub use share_distribution::{
+    ShareDistributor, ShareReceiver, CheckpointCommitment, WeightReconstructor,
+    EncryptedShare, WeightShare, DistributionResult, VectorCommitment, CommitmentShare,
+    encrypt_share_for_owner, generate_x25519_keypair,
+};

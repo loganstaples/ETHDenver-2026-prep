@@ -3665,6 +3665,7 @@ dependencies = [
  "helix-avm",
  "helix-circuits",
  "helix-core",
+ "helix-mpc",
  "helix-prover",
  "hex",
  "hidapi",
