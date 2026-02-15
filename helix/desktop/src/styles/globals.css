@@ -1,40 +1,38 @@
 @import "tailwindcss";
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@200;300;400;500;600&display=swap');
 
 @theme {
   /* Surfaces */
+  --color-bg-void: #050505;
   --color-bg-primary: #0A0A0A;
-  --color-bg-panel: #0F0F0F;
-  --color-bg-elevated: #111111;
-  --color-bg-header: #080808;
-  --color-bg-hover: #1A1A1A;
+  --color-bg-card: #0A0A0A;
+  --color-bg-card-hover: #111111;
+  --color-bg-elevated: #141414;
+  --color-bg-overlay: rgba(5, 5, 5, 0.85);
 
   /* Borders */
-  --color-border-grid: #1A1A1A;
-  --color-border-primary: #1F1F1F;
-  --color-border-secondary: #2A2A2A;
+  --color-border-subtle: #1A1A1A;
+  --color-border-hover: #252525;
   --color-border-focus: #333333;
 
   /* Text */
-  --color-text-bright: #FFFFFF;
-  --color-text-primary: #FAFAFA;
-  --color-text-secondary: #888888;
-  --color-text-tertiary: #555555;
-  --color-text-muted: #333333;
-  --color-text-disabled: #444444;
+  --color-text-primary: #FFFFFF;
+  --color-text-secondary: #A0A0A0;
+  --color-text-tertiary: #505050;
+  --color-text-disabled: #333333;
 
-  /* Accent */
-  --color-accent: #FFFFFF;
-  --color-accent-muted: #888888;
+  /* Accent - Emerald */
+  --color-accent: #34D399;
+  --color-accent-dim: rgba(52, 211, 153, 0.15);
+  --color-accent-glow: rgba(52, 211, 153, 0.08);
 
   /* Status */
-  --color-status-active: #22C55E;
+  --color-status-healthy: #22C55E;
   --color-status-warning: #EAB308;
   --color-status-error: #EF4444;
-  --color-status-idle: #555555;
 }
 
-/* ── Fonts ── */
+/* Fonts */
 @font-face {
   font-family: 'Inter';
   font-style: normal;
@@ -43,9 +41,7 @@
   src: url('https://rsms.me/inter/font-files/InterVariable.woff2') format('woff2');
 }
 
-/* JetBrains Mono loaded via @import above */
-
-/* ── Reset ── */
+/* Reset */
 * {
   margin: 0;
   padding: 0;
@@ -63,47 +59,44 @@ body {
   font-size: 13px;
   line-height: 1.4;
   color: var(--color-text-primary);
-  background-color: var(--color-bg-primary);
+  background-color: var(--color-bg-void);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-/* ── Typography Classes ── */
+/* Typography */
 .font-mono {
-  font-family: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
+  font-family: 'JetBrains Mono', 'SF Mono', monospace;
 }
 
-.font-ui {
-  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-}
-
-.text-hero {
+.text-metric-hero {
   font-family: 'JetBrains Mono', monospace;
-  font-size: 48px;
-  font-weight: 700;
+  font-size: 42px;
+  font-weight: 200;
   font-variant-numeric: tabular-nums;
   line-height: 1;
+  letter-spacing: -0.02em;
 }
 
 .text-metric-lg {
   font-family: 'JetBrains Mono', monospace;
   font-size: 28px;
-  font-weight: 600;
+  font-weight: 300;
   font-variant-numeric: tabular-nums;
   line-height: 1.1;
 }
 
 .text-metric-md {
   font-family: 'JetBrains Mono', monospace;
-  font-size: 20px;
-  font-weight: 500;
+  font-size: 18px;
+  font-weight: 400;
   font-variant-numeric: tabular-nums;
   line-height: 1.2;
 }
 
 .text-metric-sm {
   font-family: 'JetBrains Mono', monospace;
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 400;
   font-variant-numeric: tabular-nums;
   line-height: 1.3;
@@ -114,7 +107,16 @@ body {
   font-size: 11px;
   font-weight: 500;
   text-transform: uppercase;
-  letter-spacing: 0.05em;
+  letter-spacing: 0.08em;
+  line-height: 1;
+}
+
+.text-label-sm {
+  font-family: 'Inter', sans-serif;
+  font-size: 10px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
   line-height: 1;
 }
 
@@ -122,32 +124,17 @@ body {
   font-family: 'Inter', sans-serif;
   font-size: 13px;
   font-weight: 400;
-  line-height: 1.4;
-}
-
-.text-caption {
-  font-family: 'Inter', sans-serif;
-  font-size: 10px;
-  font-weight: 400;
-  line-height: 1.2;
-}
-
-.text-mono-data {
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 12px;
-  font-weight: 400;
-  font-variant-numeric: tabular-nums;
-  line-height: 1.4;
+  line-height: 1.5;
 }
 
 .tabular-nums {
   font-variant-numeric: tabular-nums;
 }
 
-/* ── Scrollbar ── */
+/* Scrollbar */
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 4px;
+  height: 4px;
 }
 
 ::-webkit-scrollbar-track {
@@ -155,15 +142,31 @@ body {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: var(--color-border-primary);
-  border-radius: 0;
+  background: var(--color-border-subtle);
+  border-radius: 2px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: var(--color-border-focus);
+  background: var(--color-border-hover);
 }
 
-/* ── Animations ── */
+/* Orb Animations */
+@keyframes orb-glow-pulse {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 0.7; }
+}
+
+@keyframes orb-ring-rotate {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+@keyframes orb-ring-spin-up {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(1080deg); }
+}
+
+/* Status Dot */
 @keyframes pulse-dot {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.4; }
@@ -171,32 +174,4 @@ body {
 
 .animate-pulse-dot {
   animation: pulse-dot 2s ease-in-out infinite;
-}
-
-@keyframes orbit {
-  from { transform: rotate(0deg) translateX(90px) rotate(0deg); }
-  to { transform: rotate(360deg) translateX(90px) rotate(-360deg); }
-}
-
-.animate-orbit {
-  animation: orbit 8s linear infinite;
-}
-
-.animate-orbit-fast {
-  animation: orbit 2s linear infinite;
-}
-
-@keyframes fade-in-up {
-  from {
-    opacity: 0;
-    transform: translateY(-8px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
-.animate-fade-in-up {
-  animation: fade-in-up 200ms ease-out forwards;
 }
