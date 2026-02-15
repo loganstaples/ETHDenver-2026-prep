@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
 use parking_lot::{Mutex, RwLock};
 
-use crate::beaver::dealer::TrustedDealer;
+use crate::beaver::dealer::{TrustedDealer, DistributedDealer};
 use crate::beaver::distributed::DistributedTripleGen;
 use crate::beaver::pool::{BeaverPool, MatrixDims};
 use crate::beaver::triple::{BeaverTriple, MatrixBeaverTriple, VectorBeaverTriple};
@@ -46,11 +46,19 @@ use crate::error::{MPCError, MPCResult};
 /// Source of Beaver triple generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TripleSource {
-    /// Centralized generation using a trusted dealer (demo/testing).
+    /// Centralized generation using a trusted dealer (demo/testing only).
+    /// A single entity sees all triples — NOT suitable for production.
     TrustedDealer,
-    /// Distributed generation using the pairwise cross-term protocol in Fr.
-    /// No trusted party required — all arithmetic in BN254 scalar field.
+    /// Single-process simulation of distributed generation.
+    /// Uses the pairwise cross-term protocol (math is correct) but all parties
+    /// run in one process so there is no real security. Useful for testing and
+    /// benchmarking the protocol without network overhead.
     Distributed,
+    /// Distributed generation using the pairwise cross-term protocol with
+    /// SHA-256 commitments. No trusted party. Runs in a single process but
+    /// uses independent per-party RNGs and produces verifiable commitments
+    /// for each cross-term mask. This is the recommended non-network option.
+    DistributedDealer,
 }
 
 /// Configuration for the Beaver triple pipeline.
@@ -134,7 +142,25 @@ impl PipelineConfig {
     }
 
     /// Configuration with distributed (trustless) triple generation.
+    ///
+    /// Uses the `DistributedDealer` which runs the pairwise cross-term protocol
+    /// with SHA-256 commitments. No trusted party — each party uses independent
+    /// randomness. This is the recommended production configuration when parties
+    /// are in the same process (for actual network distribution, use
+    /// `NetworkDistributedDealer` directly).
     pub fn distributed(num_workers: usize) -> Self {
+        Self {
+            triple_source: TripleSource::DistributedDealer,
+            num_workers,
+            ..Self::default()
+        }
+    }
+
+    /// Configuration with simulated distributed generation.
+    ///
+    /// Uses `DistributedTripleGen::simulate_distributed_batch` — single-process
+    /// simulation with correct protocol math but no real security separation.
+    pub fn distributed_simulated(num_workers: usize) -> Self {
         Self {
             triple_source: TripleSource::Distributed,
             num_workers,
@@ -408,6 +434,11 @@ impl BeaverPipeline {
         triple_source: TripleSource,
     ) {
         let mut dealer = TrustedDealer::new();
+        let mut dist_dealer: Option<DistributedDealer> = if triple_source == TripleSource::DistributedDealer {
+            Some(DistributedDealer::new(num_parties))
+        } else {
+            None
+        };
         let mut distributed_seed: u64 = 0;
         stats.active_workers.fetch_add(1, Ordering::SeqCst);
 
@@ -434,6 +465,9 @@ impl BeaverPipeline {
                                         distributed_seed,
                                     )
                                 }
+                                TripleSource::DistributedDealer => {
+                                    dist_dealer.as_mut().unwrap().generate_scalar_triples(count, num_parties)
+                                }
                             };
                             stats.triples_generated.fetch_add(count as u64, Ordering::SeqCst);
                             let _ = result_tx.send(GeneratedTriples::Scalar(triples));
@@ -445,7 +479,12 @@ impl BeaverPipeline {
                             }
 
                             for _ in 0..count {
-                                let triples = dealer.generate_vector_triple(dim, num_parties);
+                                let triples = match triple_source {
+                                    TripleSource::DistributedDealer => {
+                                        dist_dealer.as_mut().unwrap().generate_vector_triple(dim, num_parties)
+                                    }
+                                    _ => dealer.generate_vector_triple(dim, num_parties),
+                                };
                                 for (i, t) in triples.into_iter().enumerate() {
                                     all_triples[i].push(t);
                                 }
@@ -461,7 +500,12 @@ impl BeaverPipeline {
                             }
 
                             for _ in 0..count {
-                                let triples = dealer.generate_matrix_triple(m, k, n, num_parties);
+                                let triples = match triple_source {
+                                    TripleSource::DistributedDealer => {
+                                        dist_dealer.as_mut().unwrap().generate_matrix_triple(m, k, n, num_parties)
+                                    }
+                                    _ => dealer.generate_matrix_triple(m, k, n, num_parties),
+                                };
                                 for (i, t) in triples.into_iter().enumerate() {
                                     all_triples[i].push(t);
                                 }

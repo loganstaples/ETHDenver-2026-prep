@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use tracing::{info, instrument};
 
-use crate::beaver::dealer::TrustedDealer;
+use crate::beaver::dealer::{TrustedDealer, DistributedDealer};
 use crate::beaver::pool::BeaverPool;
 use crate::error::{MPCError, MPCResult};
 use crate::protocols::reshare::Resharing;
@@ -192,6 +192,13 @@ impl MPCSession {
     }
 
     /// Runs the preprocessing phase: generates Beaver triples.
+    ///
+    /// Uses the `DistributedDealer` by default, which runs the pairwise
+    /// cross-term protocol with no trusted party. Each party has independent
+    /// randomness and SHA-256 commitments enable post-hoc verification.
+    ///
+    /// For testing or fast local demos, use [`preprocess_with_trusted_dealer`]
+    /// which uses a centralized `TrustedDealer` instead.
     #[instrument(skip_all, level = "info", fields(hidden_dim = hidden_dim, num_layers = num_layers))]
     pub fn preprocess(
         &mut self,
@@ -205,16 +212,76 @@ impl MPCSession {
             )));
         }
 
-        // Use cryptographic randomness for Beaver triples (not a fixed seed).
-        // Fixed seeds make all triples predictable, breaking MPC security.
-        let mut dealer = TrustedDealer::new();
+        // Use DistributedDealer: no trusted party, pairwise cross-term protocol
+        // with independent per-party RNGs and SHA-256 commitments.
+        let mut dealer = DistributedDealer::new(self.config.num_parties);
 
+        // Generate scalar triples needed for each layer
+        let scalars_needed = num_layers * hidden_dim * 4;
+        let scalar_batches = dealer.generate_scalar_triples(scalars_needed, self.config.num_parties);
+        for (i, pool) in self.pools.iter_mut().enumerate() {
+            pool.fill_scalar(scalar_batches[i].clone());
+        }
+
+        // Generate matrix triples for attention and MLP projections
+        let mlp_dim = hidden_dim * 4;
+        for _ in 0..num_layers {
+            // Attention: Q, K, V, O projections [hidden, hidden] @ [hidden, hidden]
+            for _ in 0..4 {
+                let triples = dealer.generate_matrix_triple(
+                    hidden_dim, hidden_dim, hidden_dim, self.config.num_parties,
+                );
+                for (i, pool) in self.pools.iter_mut().enumerate() {
+                    pool.fill_matrix(hidden_dim, hidden_dim, hidden_dim, vec![triples[i].clone()]);
+                }
+            }
+
+            // MLP up: [hidden, hidden] @ [hidden, 4*hidden] -> [hidden, 4*hidden]
+            let up_triples = dealer.generate_matrix_triple(
+                hidden_dim, hidden_dim, mlp_dim, self.config.num_parties,
+            );
+            for (i, pool) in self.pools.iter_mut().enumerate() {
+                pool.fill_matrix(hidden_dim, hidden_dim, mlp_dim, vec![up_triples[i].clone()]);
+            }
+
+            // MLP down: [hidden, 4*hidden] @ [4*hidden, hidden] -> [hidden, hidden]
+            let down_triples = dealer.generate_matrix_triple(
+                hidden_dim, mlp_dim, hidden_dim, self.config.num_parties,
+            );
+            for (i, pool) in self.pools.iter_mut().enumerate() {
+                pool.fill_matrix(hidden_dim, mlp_dim, hidden_dim, vec![down_triples[i].clone()]);
+            }
+        }
+
+        self.phase = MPCPhase::InputSharing;
+        info!("Preprocessing complete (DistributedDealer), transitioning to InputSharing phase");
+        Ok(())
+    }
+
+    /// Runs the preprocessing phase using a TrustedDealer.
+    ///
+    /// This is faster than the distributed protocol but requires trusting a single
+    /// entity to generate all triples honestly. Suitable for testing and demos.
+    #[instrument(skip_all, level = "info", fields(hidden_dim = hidden_dim, num_layers = num_layers))]
+    pub fn preprocess_with_trusted_dealer(
+        &mut self,
+        hidden_dim: usize,
+        num_layers: usize,
+    ) -> MPCResult<()> {
+        if self.phase != MPCPhase::Preprocessing {
+            return Err(MPCError::SessionError(format!(
+                "Cannot preprocess in phase {:?}",
+                self.phase,
+            )));
+        }
+
+        let mut dealer = TrustedDealer::new();
         for pool in &mut self.pools {
             pool.fill_for_training_step(&mut dealer, hidden_dim, num_layers);
         }
 
         self.phase = MPCPhase::InputSharing;
-        info!("Preprocessing complete, transitioning to InputSharing phase");
+        info!("Preprocessing complete (TrustedDealer), transitioning to InputSharing phase");
         Ok(())
     }
 
@@ -324,18 +391,33 @@ impl MPCSession {
     }
 
     /// Replenishes Beaver triples for the next training step.
+    ///
+    /// Uses the `DistributedDealer` (no trusted party). For testing with a
+    /// centralized dealer, use [`replenish_triples_with_trusted_dealer`].
     pub fn replenish_triples(
         &mut self,
         hidden_dim: usize,
         num_layers: usize,
     ) -> MPCResult<()> {
-        // Use cryptographic randomness — fixed seeds make triples predictable.
-        let mut dealer = TrustedDealer::new();
+        let mut dealer = DistributedDealer::new(self.config.num_parties);
+        let scalars_needed = num_layers * hidden_dim * 4;
+        let scalar_batches = dealer.generate_scalar_triples(scalars_needed, self.config.num_parties);
+        for (i, pool) in self.pools.iter_mut().enumerate() {
+            pool.fill_scalar(scalar_batches[i].clone());
+        }
+        Ok(())
+    }
 
+    /// Replenishes Beaver triples using a TrustedDealer (for testing/demos).
+    pub fn replenish_triples_with_trusted_dealer(
+        &mut self,
+        hidden_dim: usize,
+        num_layers: usize,
+    ) -> MPCResult<()> {
+        let mut dealer = TrustedDealer::new();
         for pool in &mut self.pools {
             pool.fill_for_training_step(&mut dealer, hidden_dim, num_layers);
         }
-
         Ok(())
     }
 

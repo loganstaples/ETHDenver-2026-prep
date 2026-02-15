@@ -573,6 +573,137 @@ impl DistributedDealer {
 
         shares
     }
+
+    /// Generates shares of a matrix Beaver triple for matmul A[m,k] @ B[k,n] = C[m,n]
+    /// using the pairwise cross-term protocol.
+    ///
+    /// # Protocol
+    ///
+    /// 1. Each party `i` samples random A_i[m,k] and B_i[k,n]
+    /// 2. Each party computes local product: C_i = A_i @ B_i
+    /// 3. For each pair (i,j) where i != j:
+    ///    - Compute cross-term: X_ij = A_i @ B_j
+    ///    - Party i picks random mask R_ij[m,n]
+    ///    - Party i adds R_ij to their C_i
+    ///    - Party j adds (X_ij - R_ij) to their C_j
+    ///
+    /// Result: sum(C_i) = sum_{i,j}(A_i @ B_j) = (sum A_i) @ (sum B_j) = A @ B
+    pub fn generate_matrix_triple(
+        &mut self,
+        m: usize,
+        k: usize,
+        n: usize,
+        num_parties: usize,
+    ) -> Vec<MatrixBeaverTriple> {
+        assert_eq!(
+            num_parties, self.num_parties,
+            "num_parties ({}) must match dealer's party count ({})",
+            num_parties, self.num_parties,
+        );
+
+        let np = self.num_parties;
+
+        // Phase 1: Each party samples random A_i[m,k] and B_i[k,n]
+        let mut a_matrices: Vec<Vec<Fr>> = Vec::with_capacity(np);
+        let mut b_matrices: Vec<Vec<Fr>> = Vec::with_capacity(np);
+        let mut c_matrices: Vec<Vec<Fr>> = Vec::with_capacity(np);
+
+        for party in 0..np {
+            let a_i: Vec<Fr> = (0..m * k).map(|_| self.random_value(party)).collect();
+            let b_i: Vec<Fr> = (0..k * n).map(|_| self.random_value(party)).collect();
+
+            // Local product: C_i = A_i @ B_i using mpc_scale
+            let mut c_i = vec![Fr::ZERO; m * n];
+            for row in 0..m {
+                for col in 0..n {
+                    let mut sum = Fr::ZERO;
+                    for l in 0..k {
+                        sum = Fr::add(&sum, &exact_fixed_mul(&a_i[row * k + l], &b_i[l * n + col]));
+                    }
+                    c_i[row * n + col] = sum;
+                }
+            }
+
+            a_matrices.push(a_i);
+            b_matrices.push(b_i);
+            c_matrices.push(c_i);
+        }
+
+        // Phase 2: Pairwise cross-term generation
+        // For each pair (i,j) where i != j, compute cross_term = A_i @ B_j
+        // and split it between parties i and j using random masks.
+        for i in 0..np {
+            for j in 0..np {
+                if i == j {
+                    continue;
+                }
+
+                // Compute cross-term matrix: A_i @ B_j
+                for row in 0..m {
+                    for col in 0..n {
+                        let mut cross_elem = Fr::ZERO;
+                        for l in 0..k {
+                            cross_elem = Fr::add(
+                                &cross_elem,
+                                &exact_fixed_mul(&a_matrices[i][row * k + l], &b_matrices[j][l * n + col]),
+                            );
+                        }
+
+                        // Party i picks random mask r_ij for this element
+                        let r_ij = Fr::random(&mut self.rngs[i]);
+
+                        // Party i adds r_ij to their C_i
+                        c_matrices[i][row * n + col] = Fr::add(&c_matrices[i][row * n + col], &r_ij);
+
+                        // Party j adds (cross_term - r_ij) to their C_j
+                        let correction = Fr::sub(&cross_elem, &r_ij);
+                        c_matrices[j][row * n + col] = Fr::add(&c_matrices[j][row * n + col], &correction);
+                    }
+                }
+            }
+        }
+
+        // Build MatrixBeaverTriple shares
+        (0..np)
+            .map(|i| MatrixBeaverTriple::new(
+                a_matrices[i].clone(),
+                b_matrices[i].clone(),
+                c_matrices[i].clone(),
+                m,
+                k,
+                n,
+            ))
+            .collect()
+    }
+
+    /// Generates a batch of matrix triples for the same dimensions.
+    pub fn generate_matrix_triples(
+        &mut self,
+        count: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+        num_parties: usize,
+    ) -> Vec<Vec<MatrixBeaverTriple>> {
+        assert_eq!(
+            num_parties, self.num_parties,
+            "num_parties ({}) must match dealer's party count ({})",
+            num_parties, self.num_parties,
+        );
+
+        let mut per_party: Vec<Vec<MatrixBeaverTriple>> = (0..num_parties)
+            .map(|_| Vec::with_capacity(count))
+            .collect();
+
+        for _ in 0..count {
+            let shares = self.generate_matrix_triple(m, k, n, num_parties);
+            for (i, share) in shares.into_iter().enumerate() {
+                per_party[i].push(share);
+            }
+        }
+
+        per_party
+    }
 }
 
 #[cfg(test)]
@@ -888,6 +1019,94 @@ mod tests {
             (got2 - 0.25).abs() < 1e-5,
             "0.5 * 0.5 via exact_fixed_mul = {} (expected ~0.25)", got2,
         );
+    }
+
+    #[test]
+    fn test_distributed_matrix_triple() {
+        let (m, k, n) = (3, 4, 2);
+        let mut dealer = DistributedDealer::with_seed(3, 800);
+        let shares = dealer.generate_matrix_triple(m, k, n, 3);
+
+        assert_eq!(shares.len(), 3);
+        assert_eq!(shares[0].m, m);
+        assert_eq!(shares[0].k, k);
+        assert_eq!(shares[0].n, n);
+
+        // Reconstruct A[m,k], B[k,n], C[m,n] from additive shares
+        let mut a = vec![Fr::ZERO; m * k];
+        let mut b = vec![Fr::ZERO; k * n];
+        let mut c = vec![Fr::ZERO; m * n];
+
+        for s in &shares {
+            for idx in 0..m * k {
+                a[idx] = Fr::add(&a[idx], &s.a[idx]);
+            }
+            for idx in 0..k * n {
+                b[idx] = Fr::add(&b[idx], &s.b[idx]);
+            }
+            for idx in 0..m * n {
+                c[idx] = Fr::add(&c[idx], &s.c[idx]);
+            }
+        }
+
+        // Verify C = A @ B using mpc_scale
+        for row in 0..m {
+            for col in 0..n {
+                let mut expected = Fr::ZERO;
+                for l in 0..k {
+                    expected = Fr::add(&expected, &a[row * k + l].mpc_scale(&b[l * n + col]));
+                }
+                assert!(
+                    c[row * n + col].ct_eq(&expected).to_bool(),
+                    "Distributed matrix triple [{},{}] incorrect",
+                    row, col,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_distributed_matrix_triple_batch() {
+        let (m, k, n) = (2, 3, 2);
+        let mut dealer = DistributedDealer::with_seed(3, 900);
+        let per_party = dealer.generate_matrix_triples(10, m, k, n, 3);
+
+        assert_eq!(per_party.len(), 3);
+        assert_eq!(per_party[0].len(), 10);
+
+        for idx in 0..10 {
+            // Reconstruct A, B, C for each triple
+            let mut a = vec![Fr::ZERO; m * k];
+            let mut b = vec![Fr::ZERO; k * n];
+            let mut c = vec![Fr::ZERO; m * n];
+
+            for p in 0..3 {
+                for i in 0..m * k {
+                    a[i] = Fr::add(&a[i], &per_party[p][idx].a[i]);
+                }
+                for i in 0..k * n {
+                    b[i] = Fr::add(&b[i], &per_party[p][idx].b[i]);
+                }
+                for i in 0..m * n {
+                    c[i] = Fr::add(&c[i], &per_party[p][idx].c[i]);
+                }
+            }
+
+            // Verify C = A @ B
+            for row in 0..m {
+                for col in 0..n {
+                    let mut expected = Fr::ZERO;
+                    for l in 0..k {
+                        expected = Fr::add(&expected, &a[row * k + l].mpc_scale(&b[l * n + col]));
+                    }
+                    assert!(
+                        c[row * n + col].ct_eq(&expected).to_bool(),
+                        "Distributed matrix batch triple {} [{},{}] incorrect",
+                        idx, row, col,
+                    );
+                }
+            }
+        }
     }
 
     /// Verifies that TrustedDealer and DistributedDealer produce compatible triples.
