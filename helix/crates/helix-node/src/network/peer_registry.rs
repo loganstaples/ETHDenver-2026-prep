@@ -57,6 +57,10 @@ pub struct RegisteredPeer {
     pub listen_addr: SocketAddr,
     /// Peer's ed25519 public key, if provided during handshake.
     pub public_key: Option<Vec<u8>>,
+    /// Peer's x25519 public key for MPC key exchange, if provided.
+    pub x25519_pubkey: Option<Vec<u8>>,
+    /// Peer's Ethereum address for on-chain identity, if provided.
+    pub eth_address: Option<Vec<u8>>,
     /// When this peer connected.
     pub connected_at: Instant,
     /// Last time we received a heartbeat (or any message).
@@ -79,6 +83,8 @@ pub struct PeerSnapshot {
     pub capabilities: NodeCapabilities,
     pub listen_addr: SocketAddr,
     pub public_key: Option<Vec<u8>>,
+    pub x25519_pubkey: Option<Vec<u8>>,
+    pub eth_address: Option<Vec<u8>>,
     pub connected_at: Instant,
     pub last_heartbeat: Instant,
     pub health: PeerHealth,
@@ -96,6 +102,8 @@ impl RegisteredPeer {
             capabilities: self.capabilities.clone(),
             listen_addr: self.listen_addr,
             public_key: self.public_key.clone(),
+            x25519_pubkey: self.x25519_pubkey.clone(),
+            eth_address: self.eth_address.clone(),
             connected_at: self.connected_at,
             last_heartbeat: self.last_heartbeat,
             health: self.health,
@@ -141,6 +149,20 @@ impl PeerRegistry {
         listen_addr: SocketAddr,
         public_key: Option<Vec<u8>>,
     ) -> bool {
+        self.register_full(peer_id, role, capabilities, listen_addr, public_key, None, None)
+    }
+
+    /// Registers a new peer with full MPC identity info. Returns false if at capacity.
+    pub fn register_full(
+        &self,
+        peer_id: PeerId,
+        role: NodeRole,
+        capabilities: NodeCapabilities,
+        listen_addr: SocketAddr,
+        public_key: Option<Vec<u8>>,
+        x25519_pubkey: Option<Vec<u8>>,
+        eth_address: Option<Vec<u8>>,
+    ) -> bool {
         let mut peers = self.peers.write();
 
         // Allow re-registration (update existing)
@@ -150,6 +172,12 @@ impl PeerRegistry {
                 existing.capabilities = capabilities;
                 existing.listen_addr = listen_addr;
                 existing.public_key = public_key;
+                if x25519_pubkey.is_some() {
+                    existing.x25519_pubkey = x25519_pubkey;
+                }
+                if eth_address.is_some() {
+                    existing.eth_address = eth_address;
+                }
                 existing.last_heartbeat = Instant::now();
                 existing.health = PeerHealth::Healthy;
             }
@@ -168,6 +196,8 @@ impl PeerRegistry {
             capabilities,
             listen_addr,
             public_key,
+            x25519_pubkey,
+            eth_address,
             connected_at: now,
             last_heartbeat: now,
             health: PeerHealth::Healthy,
@@ -286,7 +316,7 @@ impl PeerRegistry {
             if elapsed < heartbeat_timeout {
                 peer.health = PeerHealth::Healthy;
             } else {
-                let missed = (elapsed.as_secs() / heartbeat_timeout.as_secs().max(1)) as u32;
+                let missed = (elapsed.as_millis() / heartbeat_timeout.as_millis().max(1)) as u32;
                 if missed > max_missed {
                     if !peer.health.is_disconnected() {
                         disconnected.push(peer.peer_id.clone());

@@ -18,4 +18,5 @@ pub mod trainer;
 pub mod training;
 pub mod sc_client;
 pub mod round_commit;
+pub mod session_coordinator;
 pub mod worker;

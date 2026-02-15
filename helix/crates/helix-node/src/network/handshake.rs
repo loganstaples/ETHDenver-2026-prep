@@ -47,6 +47,10 @@ pub enum HandshakeMessage {
         public_key: Option<Vec<u8>>,
         /// Random nonce for liveness proof (responder must echo it).
         nonce: [u8; 32],
+        /// Optional x25519 public key (32 bytes) for MPC key exchange.
+        x25519_pubkey: Option<Vec<u8>>,
+        /// Optional Ethereum address (20 bytes) for on-chain identity.
+        eth_address: Option<Vec<u8>>,
     },
     /// Sent by the responder (inbound acceptor) to confirm the handshake.
     Ack {
@@ -64,6 +68,10 @@ pub enum HandshakeMessage {
         public_key: Option<Vec<u8>>,
         /// Echo of the initiator's nonce (proves the responder actually read our Init).
         nonce_echo: [u8; 32],
+        /// Optional x25519 public key (32 bytes) for MPC key exchange.
+        x25519_pubkey: Option<Vec<u8>>,
+        /// Optional Ethereum address (20 bytes) for on-chain identity.
+        eth_address: Option<Vec<u8>>,
     },
     /// Sent by the responder to reject the handshake.
     Reject {
@@ -85,6 +93,10 @@ pub struct HandshakeResult {
     pub listen_addr: String,
     /// Remote peer's ed25519 public key, if provided.
     pub public_key: Option<Vec<u8>>,
+    /// Remote peer's x25519 public key for MPC key exchange, if provided.
+    pub x25519_pubkey: Option<Vec<u8>>,
+    /// Remote peer's Ethereum address for on-chain identity, if provided.
+    pub eth_address: Option<Vec<u8>>,
 }
 
 /// Handshake errors.
@@ -122,6 +134,8 @@ pub async fn perform_handshake_outbound<S: AsyncRead + AsyncWrite + Unpin>(
     listen_addr: &str,
     public_key: Option<&[u8]>,
     timeout: Duration,
+    x25519_pubkey: Option<&[u8]>,
+    eth_address: Option<&[u8]>,
 ) -> Result<HandshakeResult, HandshakeError> {
     // Generate random nonce
     let mut nonce = [0u8; 32];
@@ -135,6 +149,8 @@ pub async fn perform_handshake_outbound<S: AsyncRead + AsyncWrite + Unpin>(
         listen_addr: listen_addr.to_string(),
         public_key: public_key.map(|k| k.to_vec()),
         nonce,
+        x25519_pubkey: x25519_pubkey.map(|k| k.to_vec()),
+        eth_address: eth_address.map(|a| a.to_vec()),
     };
 
     // Send Init
@@ -154,6 +170,8 @@ pub async fn perform_handshake_outbound<S: AsyncRead + AsyncWrite + Unpin>(
             listen_addr: remote_addr,
             public_key: remote_pk,
             nonce_echo,
+            x25519_pubkey: remote_x25519,
+            eth_address: remote_eth,
         } => {
             // Verify protocol version
             if protocol_version != HANDSHAKE_VERSION {
@@ -174,6 +192,8 @@ pub async fn perform_handshake_outbound<S: AsyncRead + AsyncWrite + Unpin>(
                 capabilities: remote_caps,
                 listen_addr: remote_addr,
                 public_key: remote_pk,
+                x25519_pubkey: remote_x25519,
+                eth_address: remote_eth,
             })
         }
         HandshakeMessage::Reject { reason } => {
@@ -202,6 +222,8 @@ pub async fn perform_handshake_inbound<S: AsyncRead + AsyncWrite + Unpin>(
     timeout: Duration,
     max_peers: usize,
     current_peers: usize,
+    x25519_pubkey: Option<&[u8]>,
+    eth_address: Option<&[u8]>,
 ) -> Result<HandshakeResult, HandshakeError> {
     // Read Init with timeout
     let init = tokio::time::timeout(timeout, read_handshake_message(stream))
@@ -217,6 +239,8 @@ pub async fn perform_handshake_inbound<S: AsyncRead + AsyncWrite + Unpin>(
             listen_addr: remote_addr,
             public_key: remote_pk,
             nonce,
+            x25519_pubkey: remote_x25519,
+            eth_address: remote_eth,
         } => {
             // Check protocol version
             if protocol_version != HANDSHAKE_VERSION {
@@ -254,6 +278,8 @@ pub async fn perform_handshake_inbound<S: AsyncRead + AsyncWrite + Unpin>(
                 listen_addr: listen_addr.to_string(),
                 public_key: public_key.map(|k| k.to_vec()),
                 nonce_echo: nonce,
+                x25519_pubkey: x25519_pubkey.map(|k| k.to_vec()),
+                eth_address: eth_address.map(|a| a.to_vec()),
             };
             write_handshake_message(stream, &ack).await?;
 
@@ -263,6 +289,8 @@ pub async fn perform_handshake_inbound<S: AsyncRead + AsyncWrite + Unpin>(
                 capabilities: remote_caps,
                 listen_addr: remote_addr,
                 public_key: remote_pk,
+                x25519_pubkey: remote_x25519,
+                eth_address: remote_eth,
             })
         }
         HandshakeMessage::Ack { .. } => {
@@ -375,6 +403,8 @@ mod tests {
                     "127.0.0.1:9001",
                     None,
                     HANDSHAKE_TIMEOUT,
+                    None,
+                    None,
                 ).await
             }
         });
@@ -393,6 +423,8 @@ mod tests {
                     HANDSHAKE_TIMEOUT,
                     50,
                     0,
+                    None,
+                    None,
                 ).await
             }
         });
@@ -430,6 +462,8 @@ mod tests {
                     "127.0.0.1:9001",
                     Some(&pk),
                     HANDSHAKE_TIMEOUT,
+                    None,
+                    None,
                 ).await
             }
         });
@@ -447,6 +481,8 @@ mod tests {
                     HANDSHAKE_TIMEOUT,
                     50,
                     0,
+                    None,
+                    None,
                 ).await
             }
         });
@@ -472,6 +508,8 @@ mod tests {
                 "127.0.0.1:9001",
                 None,
                 HANDSHAKE_TIMEOUT,
+                None,
+                None,
             ).await
         });
 
@@ -487,6 +525,8 @@ mod tests {
                 HANDSHAKE_TIMEOUT,
                 5,
                 5,
+                None,
+                None,
             ).await
         });
 
@@ -514,6 +554,8 @@ mod tests {
             "127.0.0.1:9001",
             None,
             Duration::from_millis(100),
+            None,
+            None,
         ).await;
 
         assert!(matches!(result, Err(HandshakeError::Timeout(_))));
@@ -534,6 +576,8 @@ mod tests {
             "127.0.0.1:9001",
             None,
             HANDSHAKE_TIMEOUT,
+            None,
+            None,
         ).await;
 
         assert!(result.is_err());
@@ -551,6 +595,8 @@ mod tests {
             listen_addr: "127.0.0.1:9000".to_string(),
             public_key: Some(vec![42u8; 32]),
             nonce: [0xAB; 32],
+            x25519_pubkey: Some(vec![0xCC; 32]),
+            eth_address: Some(vec![0xDD; 20]),
         };
 
         write_handshake_message(&mut writer, &msg).await.unwrap();
@@ -559,10 +605,12 @@ mod tests {
         let received = read_handshake_message(&mut reader).await.unwrap();
 
         match received {
-            HandshakeMessage::Init { peer_id, nonce, public_key, .. } => {
+            HandshakeMessage::Init { peer_id, nonce, public_key, x25519_pubkey, eth_address, .. } => {
                 assert_eq!(peer_id, PeerId::from_string("test-peer"));
                 assert_eq!(nonce, [0xAB; 32]);
                 assert_eq!(public_key.unwrap(), vec![42u8; 32]);
+                assert_eq!(x25519_pubkey.unwrap(), vec![0xCC; 32]);
+                assert_eq!(eth_address.unwrap(), vec![0xDD; 20]);
             }
             _ => panic!("Expected Init message"),
         }

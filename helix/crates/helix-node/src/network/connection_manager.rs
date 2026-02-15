@@ -80,6 +80,10 @@ pub struct ConnectionManagerConfig {
     pub listen_addr: SocketAddr,
     /// Optional ed25519 public key bytes for identity verification.
     pub public_key: Option<Vec<u8>>,
+    /// Optional x25519 public key bytes for MPC key exchange.
+    pub x25519_pubkey: Option<Vec<u8>>,
+    /// Optional Ethereum address bytes for on-chain identity.
+    pub eth_address: Option<Vec<u8>>,
     /// Interval between heartbeat sends.
     pub heartbeat_interval: Duration,
     /// How long to wait before considering a peer's heartbeat late.
@@ -108,6 +112,8 @@ impl Default for ConnectionManagerConfig {
             capabilities: NodeCapabilities::default(),
             listen_addr: "127.0.0.1:0".parse().unwrap(),
             public_key: None,
+            x25519_pubkey: None,
+            eth_address: None,
             heartbeat_interval: Duration::from_secs(5),
             heartbeat_timeout: Duration::from_secs(15),
             max_missed_heartbeats: 3,
@@ -300,6 +306,8 @@ impl ConnectionManager {
             &listen_addr_str,
             self.config.public_key.as_deref(),
             self.config.handshake_timeout,
+            self.config.x25519_pubkey.as_deref(),
+            self.config.eth_address.as_deref(),
         )
         .await?;
 
@@ -313,13 +321,15 @@ impl ConnectionManager {
         // Parse listen addr for registry
         let peer_listen_addr: SocketAddr = result.listen_addr.parse().unwrap_or(addr);
 
-        // Register in peer registry
-        if !self.registry.register(
+        // Register in peer registry with full MPC identity info
+        if !self.registry.register_full(
             peer_id.clone(),
             result.role,
             result.capabilities.clone(),
             peer_listen_addr,
             result.public_key.clone(),
+            result.x25519_pubkey.clone(),
+            result.eth_address.clone(),
         ) {
             return Err(ConnectionManagerError::RegistryFull);
         }
@@ -346,11 +356,14 @@ impl ConnectionManager {
         peer_id: &PeerId,
         message: NetworkMessage,
     ) -> Result<(), ConnectionManagerError> {
-        let conns = self.connections.read();
-        let conn = conns.get(peer_id)
-            .ok_or_else(|| ConnectionManagerError::PeerNotFound(peer_id.to_string()))?;
+        let send_tx = {
+            let conns = self.connections.read();
+            let conn = conns.get(peer_id)
+                .ok_or_else(|| ConnectionManagerError::PeerNotFound(peer_id.to_string()))?;
+            conn.send_tx.clone()
+        };
 
-        conn.send_tx.send(message).await
+        send_tx.send(message).await
             .map_err(|_| ConnectionManagerError::ConnectionClosed)?;
 
         self.registry.record_message_sent(peer_id);
@@ -491,6 +504,8 @@ impl ConnectionManager {
             config.handshake_timeout,
             config.max_peers,
             current_peers,
+            config.x25519_pubkey.as_deref(),
+            config.eth_address.as_deref(),
         )
         .await;
 
@@ -506,13 +521,15 @@ impl ConnectionManager {
 
                 let peer_listen_addr: SocketAddr = hs_result.listen_addr.parse().unwrap_or(addr);
 
-                // Register in peer registry
-                if !registry.register(
+                // Register in peer registry with full MPC identity info
+                if !registry.register_full(
                     peer_id.clone(),
                     hs_result.role,
                     hs_result.capabilities.clone(),
                     peer_listen_addr,
                     hs_result.public_key.clone(),
+                    hs_result.x25519_pubkey.clone(),
+                    hs_result.eth_address.clone(),
                 ) {
                     tracing::warn!("Registry full, dropping inbound from {}", peer_id);
                     return;
@@ -836,19 +853,23 @@ impl ConnectionManager {
                                 &listen_addr_str,
                                 config.public_key.as_deref(),
                                 config.handshake_timeout,
+                                config.x25519_pubkey.as_deref(),
+                                config.eth_address.as_deref(),
                             ).await {
                                 Ok(result) => {
                                     let actual_peer_id = result.peer_id.clone();
                                     let peer_listen_addr: SocketAddr =
                                         result.listen_addr.parse().unwrap_or(entry.addr);
 
-                                    // Register in peer registry
-                                    registry.register(
+                                    // Register in peer registry with full MPC identity info
+                                    registry.register_full(
                                         actual_peer_id.clone(),
                                         result.role,
                                         result.capabilities.clone(),
                                         peer_listen_addr,
                                         result.public_key.clone(),
+                                        result.x25519_pubkey.clone(),
+                                        result.eth_address.clone(),
                                     );
 
                                     // Set up connection
