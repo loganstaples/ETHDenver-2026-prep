@@ -10,6 +10,7 @@ parallel = ["rayon"]
 metal = ["helix-prover/metal"]
 network-mpc = []
 simulation = []
+chain = ["ethers"]
 
 [dependencies]
 helix-core = { path = "../helix-core" }
@@ -56,7 +57,14 @@ bytes = "1.5"
 clap = { version = "4.0", features = ["derive"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Ethereum interaction (optional, for on-chain blame report submission)
+ethers = { version = "2.0.14", optional = true, features = ["ws"] }
+hex = "0.4"
+tiny-keccak = { version = "2.0", features = ["keccak"] }
+k256 = { version = "0.13", features = ["ecdsa"] }
+
 [dev-dependencies]
+ethers = { version = "2.0.14", features = ["ws"] }
 tokio-test = "0.4"
 tempfile = "3.10"
 criterion = { version = "0.5", features = ["html_reports"] }

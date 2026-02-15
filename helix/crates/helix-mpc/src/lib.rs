@@ -21,7 +21,9 @@
 #![allow(unexpected_cfgs)]
 
 pub mod beaver;
+pub mod blame_report;
 pub mod checkpoint_attestation;
+pub mod cheater_recovery;
 pub mod e2e_integration;
 pub mod error;
 pub mod error_containment;
@@ -42,6 +44,7 @@ pub mod resilience;
 pub mod security;
 pub mod session;
 pub mod share_distribution;
+pub mod share_redistribution;
 pub mod sharing;
 pub mod types;
 pub mod verification;
