@@ -17,6 +17,7 @@ use helix_mpc::Fr as MpcFr;
 use crate::aggregator_proof_pipeline::{
     AggregatorProofPipeline, ProofPipelineError, ProofSubmissionResult,
 };
+use crate::training::checkpoint_manager::{CheckpointProvingManager, CheckpointProvingConfig, StepAction};
 use crate::network::messages::{
     GradientMessage, MessagePayload, NetworkMessage, NodeCapabilities, PeerId, TrainingMessage,
     TrainingParams,
@@ -181,6 +182,8 @@ pub struct AggregatorNode {
     seen_proof_hashes: Arc<RwLock<Vec<[u8; 32]>>>,
     /// Maximum number of proof hashes to cache.
     max_proof_cache_size: usize,
+    /// Checkpoint manager for checkpoint-based proving.
+    checkpoint_manager: Option<CheckpointProvingManager>,
 }
 
 /// Aggregator statistics.
@@ -214,6 +217,7 @@ impl AggregatorNode {
             worker_allowlist: Arc::new(RwLock::new(HashSet::new())),
             seen_proof_hashes: Arc::new(RwLock::new(Vec::new())),
             max_proof_cache_size: 10_000,
+            checkpoint_manager: None,
         }
     }
 
@@ -233,6 +237,26 @@ impl AggregatorNode {
     pub fn with_proof_pipeline(mut self, pipeline: Arc<AggregatorProofPipeline>) -> Self {
         self.proof_pipeline = Some(pipeline);
         self
+    }
+
+    /// Configures checkpoint-based proving.
+    ///
+    /// When set, the aggregator tracks training steps and only generates
+    /// ZK proofs at checkpoint boundaries (every N steps) or when the
+    /// accumulated error exceeds the configured threshold.
+    pub fn with_checkpoint_config(mut self, config: CheckpointProvingConfig) -> Self {
+        self.checkpoint_manager = Some(CheckpointProvingManager::new(config));
+        self
+    }
+
+    /// Returns a reference to the checkpoint manager, if configured.
+    pub fn checkpoint_manager(&self) -> Option<&CheckpointProvingManager> {
+        self.checkpoint_manager.as_ref()
+    }
+
+    /// Returns a mutable reference to the checkpoint manager, if configured.
+    pub fn checkpoint_manager_mut(&mut self) -> Option<&mut CheckpointProvingManager> {
+        self.checkpoint_manager.as_mut()
     }
 
     /// Registers a worker as authorized to participate.

@@ -1,6 +1,6 @@
 use parking_lot::RwLock;
 use serde::Serialize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 #[derive(Debug, Serialize, Clone)]
@@ -22,6 +22,10 @@ pub struct TrainingStatus {
     pub proofs_generated: u64,
     pub total_earned: f64,
     pub session_earned: f64,
+    pub model_name: String,
+    pub current_loss: Option<f64>,
+    pub current_step: Option<u64>,
+    pub total_steps: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -58,6 +62,21 @@ pub struct NodeConfig {
     pub use_tls: bool,
 }
 
+#[derive(Debug, Serialize, Clone)]
+pub struct ActivityEvent {
+    pub id: u64,
+    pub timestamp: String,
+    pub message: String,
+    pub event_type: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct SessionInfo {
+    pub start_time: String,
+    pub duration_secs: u64,
+    pub earnings_rate_per_hour: f64,
+}
+
 pub struct AppState {
     pub node_running: AtomicBool,
     pub start_time: RwLock<Option<Instant>>,
@@ -66,6 +85,8 @@ pub struct AppState {
     pub training_status: RwLock<TrainingStatus>,
     pub peers: RwLock<Vec<PeerInfo>>,
     pub system_metrics: RwLock<SystemMetrics>,
+    pub activity_log: RwLock<Vec<ActivityEvent>>,
+    pub activity_counter: AtomicU64,
 }
 
 impl AppState {
@@ -96,6 +117,10 @@ impl AppState {
                 proofs_generated: 0,
                 total_earned: 0.0,
                 session_earned: 0.0,
+                model_name: String::new(),
+                current_loss: None,
+                current_step: None,
+                total_steps: None,
             }),
             peers: RwLock::new(Vec::new()),
             system_metrics: RwLock::new(SystemMetrics {
@@ -106,6 +131,8 @@ impl AppState {
                 gpu_memory_used_mb: None,
                 gpu_memory_total_mb: None,
             }),
+            activity_log: RwLock::new(Vec::new()),
+            activity_counter: AtomicU64::new(0),
         }
     }
 
@@ -118,5 +145,22 @@ impl AppState {
             .read()
             .map(|t| t.elapsed().as_secs())
             .unwrap_or(0)
+    }
+
+    pub fn push_activity(&self, message: String, event_type: &str) {
+        let id = self.activity_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let event = ActivityEvent {
+            id,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            message,
+            event_type: event_type.to_string(),
+        };
+        let mut log = self.activity_log.write();
+        log.push(event);
+        // Keep at most 200 events
+        if log.len() > 200 {
+            let excess = log.len() - 200;
+            log.drain(0..excess);
+        }
     }
 }

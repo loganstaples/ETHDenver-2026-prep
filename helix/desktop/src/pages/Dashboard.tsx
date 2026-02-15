@@ -50,10 +50,10 @@ export function Dashboard() {
       status.running
         ? [
             {
-              id: "1",
+              id: 1,
               timestamp: formatTimestamp(new Date()),
               message: "Node started, connecting to network...",
-              type: "info",
+              event_type: "info",
             },
           ]
         : [],

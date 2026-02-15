@@ -70,6 +70,8 @@ pub async fn run_mpc_training(
         beaver_batch_size: 512,
         generate_proofs,
         base_error: 1e-6,
+        checkpoint_interval: 1,
+        mac_config: None,
     };
 
     // Create initial weights (same as non-MPC for comparison)

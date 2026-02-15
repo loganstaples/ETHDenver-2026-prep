@@ -5,6 +5,8 @@ import type {
   SystemMetrics,
   PeerInfo,
   NodeConfig,
+  ActivityEvent,
+  SessionInfo,
 } from "./types";
 
 export async function getNodeStatus(): Promise<NodeStatus> {
@@ -37,4 +39,12 @@ export async function getConfig(): Promise<NodeConfig> {
 
 export async function setConfig(config: NodeConfig): Promise<void> {
   return invoke("set_config", { config });
+}
+
+export async function getActivityLog(sinceId?: number): Promise<ActivityEvent[]> {
+  return invoke("get_activity_log", { sinceId: sinceId ?? null });
+}
+
+export async function getSessionInfo(): Promise<SessionInfo> {
+  return invoke("get_session_info");
 }

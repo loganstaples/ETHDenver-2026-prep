@@ -125,6 +125,8 @@ impl PrivateTrainingConfig {
             beaver_batch_size: self.beaver_batch_size,
             generate_proofs: self.generate_proofs,
             base_error: self.base_error,
+            checkpoint_interval: 1,
+            mac_config: None,
         }
     }
 }

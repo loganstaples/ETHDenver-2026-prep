@@ -43,6 +43,7 @@ pub mod dataset_sync;
 pub mod multi_round;
 pub mod job_manager;
 pub mod distribution;
+pub mod checkpoint_manager;
 
 // Re-export key types
 pub use round::{
@@ -203,6 +204,10 @@ pub use job_manager::{
     TrainingJobManager, TrainingJobConfig, JobPhase, JobEvent, JobError, JobSnapshot,
     RoundResult as JobRoundResult, WorkerMessage, WorkerJobState,
     network_event_to_worker_message,
+};
+
+pub use checkpoint_manager::{
+    CheckpointProvingConfig, CheckpointProvingManager, CheckpointWeights, StepAction,
 };
 
 pub use distribution::{

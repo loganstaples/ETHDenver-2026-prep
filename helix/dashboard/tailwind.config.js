@@ -10,8 +10,13 @@ module.exports = {
             colors: {
                 'helix-bg': '#09090b',
                 'helix-surface': '#111113',
+                'helix-surface2': '#161618',
                 'helix-border': '#1e1e22',
+                'helix-border2': '#2a2a2e',
                 'helix-muted': '#63636e',
+                'helix-dim': '#3e3e44',
+                'helix-text': '#fafafa',
+                'helix-text2': '#a1a1a6',
             },
             fontFamily: {
                 sans: ['var(--font-geist-sans)'],

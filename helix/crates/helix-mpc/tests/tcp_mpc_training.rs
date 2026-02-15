@@ -158,6 +158,8 @@ async fn test_tcp_three_party_training_step() {
         beaver_batch_size: 256,
         generate_proofs: false,
         base_error: 1e-6,
+        checkpoint_interval: 1,
+        mac_config: None,
     };
 
     let initial_weights = ModelWeights::from_f64(
@@ -234,6 +236,8 @@ async fn test_tcp_three_party_multi_step_with_resharing() {
         beaver_batch_size: 512,
         generate_proofs: false,
         base_error: 1e-6,
+        checkpoint_interval: 1,
+        mac_config: None,
     };
 
     let initial_weights = ModelWeights::from_f64(

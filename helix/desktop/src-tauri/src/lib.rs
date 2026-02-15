@@ -1,4 +1,5 @@
 mod commands;
+mod simulation;
 mod state;
 
 use state::AppState;
@@ -19,6 +20,8 @@ pub fn run() {
             commands::network::get_peers,
             commands::config::get_config,
             commands::config::set_config,
+            commands::activity::get_activity_log,
+            commands::session::get_session_info,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

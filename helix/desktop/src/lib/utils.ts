@@ -19,6 +19,13 @@ export function formatUptime(totalSeconds: number): string {
   return `${seconds}s`;
 }
 
+export function formatSessionTimer(totalSeconds: number): string {
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
 export function formatBytes(mb: number): string {
   if (mb >= 1024) {
     return `${(mb / 1024).toFixed(1)} GB`;
@@ -42,4 +49,10 @@ export function formatTimestamp(date: Date): string {
     minute: "2-digit",
     second: "2-digit",
   });
+}
+
+export function formatCompactNumber(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+  return n.toLocaleString();
 }

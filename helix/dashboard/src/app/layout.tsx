@@ -1,5 +1,5 @@
 import { Providers } from "@/components/Providers";
-import { Layout } from "@/components/Layout";
+import AppShell from "@/components/layout/AppShell";
 import './globals.css';
 import { GeistSans } from 'geist/font/sans';
 import { GeistMono } from 'geist/font/mono';
@@ -18,7 +18,7 @@ export default function RootLayout({
         <html lang="en" className={`${GeistSans.variable} ${GeistMono.variable}`}>
             <body className="font-sans">
                 <Providers>
-                    <Layout>{children}</Layout>
+                    <AppShell>{children}</AppShell>
                 </Providers>
             </body>
         </html>

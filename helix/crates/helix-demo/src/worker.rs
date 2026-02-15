@@ -155,6 +155,9 @@ fn create_small_model(d_in: usize, d_hid: usize, d_out: usize, seed: u64) -> Mlp
 }
 
 /// Runs `num_workers` training threads in parallel, each generating real ZK proofs.
+///
+/// When `checkpoint_interval > 1`, workers only generate proofs at checkpoint boundaries
+/// (steps that are multiples of the interval), reducing proving overhead significantly.
 pub async fn run_workers(
     num_workers: usize,
     steps_per_worker: usize,
@@ -162,6 +165,7 @@ pub async fn run_workers(
     lr: f64,
     base_seed: u64,
     dataset: &[(Vec<f64>, Vec<f64>)],
+    checkpoint_interval: u64,
 ) -> Result<Vec<WorkerResult>> {
     let dataset = dataset.to_vec();
 
@@ -172,7 +176,7 @@ pub async fn run_workers(
         let seed = base_seed + worker_id as u64;
 
         let handle = tokio::task::spawn_blocking(move || {
-            run_single_worker(worker_id, steps_per_worker, d_hid, lr, seed, &dataset)
+            run_single_worker(worker_id, steps_per_worker, d_hid, lr, seed, &dataset, checkpoint_interval)
         });
         handles.push(handle);
     }
@@ -194,7 +198,12 @@ fn proof_cache_key(step: usize, dataset_idx: usize) -> u64 {
     h
 }
 
-/// Single worker training loop with real proof generation.
+/// Single worker training loop with checkpoint-aware proof generation.
+///
+/// When `checkpoint_interval == 1`, every step generates a proof (original behavior).
+/// When `checkpoint_interval > 1`, proofs are only generated at checkpoint boundaries
+/// (steps that are multiples of the interval). Between checkpoints, the worker performs
+/// training without proof generation, relying on MPC consensus for integrity.
 fn run_single_worker(
     worker_id: usize,
     num_steps: usize,
@@ -202,9 +211,11 @@ fn run_single_worker(
     lr: f64,
     seed: u64,
     dataset: &[(Vec<f64>, Vec<f64>)],
+    checkpoint_interval: u64,
 ) -> Result<WorkerResult> {
     let d_in = 2;
     let d_out = 1;
+    let interval = checkpoint_interval.max(1) as usize;
 
     // Use small weights matching circuit constraints
     let model = create_small_model(d_in, d_hid, d_out, seed);
@@ -222,60 +233,78 @@ fn run_single_worker(
     // Simple proof cache: maps cache_key → EvmProofBundle
     let mut proof_cache: HashMap<u64, EvmProofBundle> = HashMap::new();
 
+    // Track checkpoint progress
+    let mut checkpoint_count = 0usize;
+    let total_checkpoints = (num_steps + interval - 1) / interval;
+
     for step in 0..num_steps {
         let dataset_idx = step % dataset.len();
         let (x, target) = &dataset[dataset_idx];
-        let cache_key = proof_cache_key(step, dataset_idx);
 
-        let step_start = Instant::now();
-        let result = trainer.train_step(x, target)?;
-        let step_time = step_start.elapsed();
+        // Determine if this step is a checkpoint boundary (1-indexed step is multiple of interval)
+        let is_checkpoint = (step + 1) % interval == 0 || step == num_steps - 1;
 
-        losses.push(result.loss);
-        total_prove_time += step_time;
-        proofs_generated += 1;
+        if is_checkpoint {
+            // Checkpoint step: generate proof
+            let cache_key = proof_cache_key(step, dataset_idx);
+            let step_start = Instant::now();
+            let result = trainer.train_step(x, target)?;
+            let step_time = step_start.elapsed();
 
-        // Self-verification: the Trainer's prover already self-verifies.
-        if result.proof_result.verified {
-            proofs_verified += 1;
-        }
+            losses.push(result.loss);
+            total_prove_time += step_time;
+            proofs_generated += 1;
+            checkpoint_count += 1;
 
-        // Collect EVM bundles for first few steps (for on-chain submission).
-        // The Trainer now creates EvmProofBundle internally.
-        if step < 3 {
-            // Check cache first
-            if let Some(cached) = proof_cache.get(&cache_key) {
-                evm_bundles.push(cached.clone());
-                cache_hits += 1;
-            } else if let Some(bundle) = result.evm_bundle.clone() {
-                // Validate EVM proof format: must be at least 320 bytes
-                if bundle.evm_proof.len() >= 320 {
-                    proof_cache.insert(cache_key, bundle.clone());
-                    evm_bundles.push(bundle);
+            if result.proof_result.verified {
+                proofs_verified += 1;
+            }
+
+            // Collect EVM bundles for on-chain submission (first few checkpoints)
+            if evm_bundles.len() < 3 {
+                if let Some(cached) = proof_cache.get(&cache_key) {
+                    evm_bundles.push(cached.clone());
+                    cache_hits += 1;
+                } else if let Some(bundle) = result.evm_bundle.clone() {
+                    if bundle.evm_proof.len() >= 320 {
+                        proof_cache.insert(cache_key, bundle.clone());
+                        evm_bundles.push(bundle);
+                    } else {
+                        tracing::warn!(
+                            "Worker {}: step {} produced undersized proof ({} bytes, expected >=320)",
+                            worker_id, step, bundle.evm_proof.len(),
+                        );
+                    }
                 } else {
                     tracing::warn!(
-                        "Worker {}: step {} produced undersized proof ({} bytes, expected >=320)",
-                        worker_id, step, bundle.evm_proof.len(),
+                        "Worker {}: step {} EVM bundle not available",
+                        worker_id, step,
                     );
                 }
-            } else {
-                tracing::warn!(
-                    "Worker {}: step {} EVM bundle not available",
-                    worker_id, step,
+            }
+
+            if interval > 1 {
+                tracing::debug!(
+                    "Worker {}: Checkpoint {}/{} at step {}, loss={:.6}, proof_time={:.0}ms",
+                    worker_id, checkpoint_count, total_checkpoints, step + 1,
+                    result.loss, step_time.as_millis(),
                 );
             }
+        } else {
+            // Non-checkpoint step: train without proof generation
+            let loss = trainer.train_step_unproved(x, target);
+            losses.push(loss);
         }
 
         // Progress reporting every 5 steps
         if (step + 1) % 5 == 0 || step == num_steps - 1 {
             tracing::debug!(
-                "Worker {}: step {}/{}, loss={:.6}, verified={}, proof_time={:.0}ms",
+                "Worker {}: step {}/{}, loss={:.6}{}",
                 worker_id,
                 step + 1,
                 num_steps,
-                result.loss,
-                result.proof_result.verified,
-                step_time.as_millis(),
+                losses.last().unwrap_or(&0.0),
+                if is_checkpoint { " [checkpoint]" } else { "" },
             );
         }
     }

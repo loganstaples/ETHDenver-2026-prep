@@ -4,7 +4,7 @@
 
 :root {
   --foreground: #fafafa;
-  --background: #09090b; /* Zinc 950 */
+  --background: #09090b;
 }
 
 body {
@@ -18,13 +18,33 @@ body {
   .glass {
     @apply bg-white/[0.02] backdrop-blur-md border border-white/[0.05];
   }
-  
+
   .glass-hover {
     @apply hover:bg-white/[0.04] transition-colors duration-200;
   }
 
   .card-gradient {
     @apply bg-gradient-to-b from-white/[0.04] to-transparent;
+  }
+
+  .gradient-top-edge {
+    @apply absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-white/20 to-transparent;
+  }
+
+  .page-title {
+    @apply text-xl font-semibold tracking-tight text-white;
+  }
+
+  .section-header {
+    @apply text-sm font-medium text-white;
+  }
+
+  .label-text {
+    @apply text-2xs text-helix-muted uppercase tracking-wider;
+  }
+
+  .data-text {
+    @apply font-mono text-2xl font-semibold text-white tracking-tight;
   }
 }
 

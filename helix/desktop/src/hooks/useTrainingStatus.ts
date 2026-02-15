@@ -14,10 +14,14 @@ export function useTrainingStatus() {
     proofs_generated: 0,
     total_earned: 0,
     session_earned: 0,
+    model_name: "",
+    current_loss: null,
+    current_step: null,
+    total_steps: null,
   });
 
   useEffect(() => {
-    const fetch = async () => {
+    const poll = async () => {
       try {
         const t = await getTrainingStatus();
         setTraining(t);
@@ -26,8 +30,8 @@ export function useTrainingStatus() {
       }
     };
 
-    fetch();
-    const interval = setInterval(fetch, POLL_INTERVAL);
+    poll();
+    const interval = setInterval(poll, POLL_INTERVAL);
     return () => clearInterval(interval);
   }, []);
 

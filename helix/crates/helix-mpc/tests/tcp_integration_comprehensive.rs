@@ -209,6 +209,8 @@ async fn test_tcp_four_party_training_step() {
         beaver_batch_size: 256,
         generate_proofs: false,
         base_error: 1e-6,
+        checkpoint_interval: 1,
+        mac_config: None,
     };
 
     let initial_weights = ModelWeights::from_f64(
@@ -288,6 +290,8 @@ async fn test_tcp_four_party_multi_step_with_resharing() {
         beaver_batch_size: 512,
         generate_proofs: false,
         base_error: 1e-6,
+        checkpoint_interval: 1,
+        mac_config: None,
     };
 
     let initial_weights = ModelWeights::from_f64(
@@ -416,6 +420,8 @@ async fn test_tcp_four_party_verify_step_interface() {
         beaver_batch_size: 256,
         generate_proofs: false,
         base_error: 1e-6,
+        checkpoint_interval: 1,
+        mac_config: None,
     };
 
     let initial_weights = ModelWeights::from_f64(
@@ -488,6 +494,8 @@ async fn test_tcp_four_party_full_pipeline() {
         beaver_batch_size: 512,
         generate_proofs: false, // Halo2 circuit proofs require circuit-compatible weights
         base_error: 1e-6,
+        checkpoint_interval: 1,
+        mac_config: None,
     };
 
     let initial_weights = ModelWeights::from_f64(
@@ -604,6 +612,8 @@ async fn test_tcp_four_party_authenticated_training() {
         beaver_batch_size: 256,
         generate_proofs: false,
         base_error: 1e-6,
+        checkpoint_interval: 1,
+        mac_config: None,
     };
 
     let initial_weights = ModelWeights::from_f64(
@@ -690,6 +700,8 @@ async fn test_tcp_five_party_training() {
         beaver_batch_size: 256,
         generate_proofs: false,
         base_error: 1e-6,
+        checkpoint_interval: 1,
+        mac_config: None,
     };
 
     let initial_weights = ModelWeights::from_f64(
@@ -783,6 +795,8 @@ async fn test_tcp_four_party_weight_reconstruction_after_training() {
         beaver_batch_size: 512,
         generate_proofs: false,
         base_error: 1e-6,
+        checkpoint_interval: 1,
+        mac_config: None,
     };
 
     let initial_weights = ModelWeights::from_f64(

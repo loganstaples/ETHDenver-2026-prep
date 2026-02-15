@@ -1,25 +1,52 @@
-import { Outlet } from "react-router-dom";
-import { Sidebar } from "./Sidebar";
-import { StatusBar } from "./StatusBar";
+import { useState, useCallback } from "react";
+import { AnimatePresence } from "framer-motion";
 import { useNodeStatus } from "../../hooks/useNodeStatus";
-import { formatUptime } from "../../lib/utils";
+import { LaunchPad } from "../launch/LaunchPad";
+import { CommandCenter } from "../dashboard/CommandCenter";
+import { SettingsPanel } from "../dashboard/SettingsPanel";
+import { SlideOver } from "../ui/SlideOver";
 
 export function AppShell() {
-  const { status } = useNodeStatus();
+  const { status, start, stop } = useNodeStatus();
+  const [settingsOpen, setSettingsOpen] = useState(false);
+
+  const handleStart = useCallback(async () => {
+    await start();
+  }, [start]);
+
+  const handleStop = useCallback(async () => {
+    await stop();
+  }, [stop]);
+
+  const openSettings = useCallback(() => setSettingsOpen(true), []);
+  const closeSettings = useCallback(() => setSettingsOpen(false), []);
 
   return (
-    <div className="h-full flex flex-col bg-bg-primary">
-      <div className="flex flex-1 overflow-hidden">
-        <Sidebar nodeRunning={status.running} />
-        <main className="flex-1 overflow-y-auto p-6">
-          <Outlet />
-        </main>
-      </div>
-      <StatusBar
-        nodeRunning={status.running}
-        peerCount={status.connected_peers}
-        uptime={formatUptime(status.uptime_secs)}
-      />
+    <div className="h-full w-full bg-bg-primary overflow-hidden">
+      <AnimatePresence mode="wait">
+        {!status.running ? (
+          <LaunchPad
+            key="launchpad"
+            onStart={handleStart}
+            onOpenSettings={openSettings}
+          />
+        ) : (
+          <CommandCenter
+            key="command-center"
+            status={status}
+            onStop={handleStop}
+            onOpenSettings={openSettings}
+          />
+        )}
+      </AnimatePresence>
+
+      <SlideOver
+        open={settingsOpen}
+        onClose={closeSettings}
+        title="SETTINGS"
+      >
+        <SettingsPanel />
+      </SlideOver>
     </div>
   );
 }

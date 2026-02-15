@@ -59,7 +59,10 @@ contract ModelRegistry {
 
     /// @notice Model architecture metadata per model ID
     mapping(uint256 => ModelArchitecture) public modelArchitectures;
-    
+
+    /// @notice Per-model checkpoint proving interval
+    mapping(uint256 => uint32) public modelCheckpointIntervals;
+
     /// @notice Owner for admin functions
     address public owner;
     
@@ -88,6 +91,7 @@ contract ModelRegistry {
     event ModelDeactivated(uint256 indexed modelId);
     event ModelReactivated(uint256 indexed modelId);
     event OwnershipTransferred(uint256 indexed modelId, address indexed oldOwner, address indexed newOwner);
+    event CheckpointIntervalSet(uint256 indexed modelId, uint32 interval);
     
     modifier onlyOwner() {
         require(msg.sender == owner, "Only owner");
@@ -399,6 +403,18 @@ contract ModelRegistry {
     /// @return The version index in the checkpoints array
     function getVersionForCommitment(uint256 modelId, bytes32 commitment) external view returns (uint256) {
         return commitmentToVersion[modelId][commitment];
+    }
+
+    /// @notice Set checkpoint interval for a model
+    /// @dev Only callable by coordinator or contract owner
+    function setCheckpointInterval(uint256 modelId, uint32 interval) external onlyCoordinator {
+        modelCheckpointIntervals[modelId] = interval;
+        emit CheckpointIntervalSet(modelId, interval);
+    }
+
+    /// @notice Get checkpoint interval for a model
+    function getCheckpointInterval(uint256 modelId) external view returns (uint32) {
+        return modelCheckpointIntervals[modelId];
     }
 
     /// @notice Set coordinator address

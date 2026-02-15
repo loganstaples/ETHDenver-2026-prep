@@ -3761,6 +3761,7 @@ dependencies = [
  "env_logger",
  "log",
  "parking_lot",
+ "rand 0.8.5",
  "serde",
  "serde_json",
  "sysinfo",

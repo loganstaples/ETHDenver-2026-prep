@@ -225,6 +225,7 @@ use_freivalds = true
 batch_proofs = true
 proof_compression = false
 verification_timeout_secs = 60
+checkpoint_proving_interval = 1  # Generate ZK proof every N steps (1 = every step)
 
 [checkpoint]
 enabled = true
@@ -715,11 +716,16 @@ pub struct ProofSettings {
     /// Verification timeout in seconds
     #[serde(default = "default_verify_timeout")]
     pub verification_timeout_secs: u64,
+    /// Checkpoint proving interval: generate ZK proof every N steps (1 = every step).
+    /// Higher values reduce proving overhead by using MPC consensus between checkpoints.
+    #[serde(default = "default_checkpoint_proving_interval")]
+    pub checkpoint_proving_interval: u32,
 }
 
 fn default_error_bound() -> f64 { 1000.0 }
 fn default_circuit_k() -> u32 { 12 }
 fn default_verify_timeout() -> u64 { 60 }
+fn default_checkpoint_proving_interval() -> u32 { 1 }
 
 impl Default for ProofSettings {
     fn default() -> Self {
@@ -731,6 +737,7 @@ impl Default for ProofSettings {
             batch_proofs: false,
             proof_compression: false,
             verification_timeout_secs: 60,
+            checkpoint_proving_interval: 1,
         }
     }
 }

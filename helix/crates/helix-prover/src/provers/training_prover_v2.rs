@@ -802,6 +802,62 @@ impl MLTrainingProverV2 {
         }
     }
 
+    /// Builds a witness for a checkpoint proof covering multiple training steps.
+    ///
+    /// Unlike `build_witness` which proves step N-1 → step N, this builds a witness
+    /// for a checkpoint proof at a specific interval boundary. The proof covers a
+    /// single forward/backward pass using the checkpoint-start weights, with the
+    /// `accumulated_error` accounting for all N steps in the interval.
+    ///
+    /// The checkpoint-end weights (`new_w1`, etc.) are NOT used in the circuit
+    /// computation (the circuit re-derives new weights via gradient descent).
+    /// They are accepted for API completeness and future multi-step circuit support.
+    ///
+    /// # Arguments
+    /// * `d_in`, `d_hid`, `d_out` — model dimensions
+    /// * `x`, `target` — representative input/target for the checkpoint proof
+    /// * `old_w1`, `old_b1`, `old_w2`, `old_b2` — weights at checkpoint START
+    /// * `_new_w1`, `_new_b1`, `_new_w2`, `_new_b2` — weights at checkpoint END (reserved)
+    /// * `lr` — learning rate
+    /// * `checkpoint_step` — step number for this checkpoint (e.g. 10, 20, 30)
+    /// * `accumulated_error` — total error accumulated over the interval
+    /// * `model_id` — on-chain model ID (32-byte LE)
+    /// * `error_budget` — the contract's maxErrorBound
+    pub fn build_checkpoint_witness(
+        d_in: usize,
+        d_hid: usize,
+        d_out: usize,
+        x: &[Fr],
+        target: &[Fr],
+        old_w1: &[Fr],
+        old_b1: &[Fr],
+        old_w2: &[Fr],
+        old_b2: &[Fr],
+        _new_w1: &[Fr],
+        _new_b1: &[Fr],
+        _new_w2: &[Fr],
+        _new_b2: &[Fr],
+        lr: Fr,
+        checkpoint_step: u64,
+        accumulated_error: Fr,
+        model_id: [u8; 32],
+        error_budget: Fr,
+    ) -> MLTrainingStepV2Witness {
+        // Delegate to build_witness_with_params using checkpoint-start weights.
+        // The circuit performs one forward/backward pass from old weights;
+        // accumulated_error is used as base_error to account for the full interval.
+        Self::build_witness_with_params(
+            d_in, d_hid, d_out,
+            x, target,
+            old_w1, old_b1, old_w2, old_b2,
+            lr,
+            checkpoint_step,
+            accumulated_error,
+            model_id,
+            error_budget,
+        )
+    }
+
     /// Computes the witness hash for caching.
     pub fn compute_witness_hash(witness: &MLTrainingStepV2Witness) -> WitnessHash {
         WitnessHashBuilder::new()
@@ -2398,5 +2454,62 @@ mod tests {
 
         assert_eq!(proofs.len(), num_steps, "should have {} proofs", num_steps);
         println!("All {} steps proved and verified successfully!", num_steps);
+    }
+
+    #[test]
+    fn test_build_checkpoint_witness() {
+        use halo2curves::bn256::Fr;
+        use halo2curves::ff::Field;
+
+        let d_in = 2;
+        let d_hid = 2;
+        let d_out = 1;
+
+        // Checkpoint-start weights
+        let old_w1 = vec![Fr::from(1u64), Fr::from(2u64), Fr::from(3u64), Fr::from(4u64)];
+        let old_b1 = vec![Fr::zero(), Fr::zero()];
+        let old_w2 = vec![Fr::from(1u64), Fr::from(1u64)];
+        let old_b2 = vec![Fr::zero()];
+
+        // Checkpoint-end weights (different — simulating N steps of training)
+        let new_w1 = vec![Fr::from(5u64), Fr::from(6u64), Fr::from(7u64), Fr::from(8u64)];
+        let new_b1 = vec![Fr::from(1u64), Fr::from(1u64)];
+        let new_w2 = vec![Fr::from(2u64), Fr::from(2u64)];
+        let new_b2 = vec![Fr::from(1u64)];
+
+        let x = vec![Fr::from(1u64), Fr::from(2u64)];
+        let target = vec![Fr::from(1u64)];
+        let lr = Fr::from(1u64);
+        let checkpoint_step = 10u64;
+        let accumulated_error = Fr::from(100u64);
+        let model_id = [0u8; 32];
+        let error_budget = Fr::from(1000u64);
+
+        let witness = MLTrainingProverV2::build_checkpoint_witness(
+            d_in, d_hid, d_out,
+            &x, &target,
+            &old_w1, &old_b1, &old_w2, &old_b2,
+            &new_w1, &new_b1, &new_w2, &new_b2,
+            lr, checkpoint_step, accumulated_error,
+            model_id, error_budget,
+        );
+
+        // Verify checkpoint-specific fields
+        assert_eq!(witness.step_number, checkpoint_step, "step_number should be checkpoint step");
+        assert_eq!(witness.d_in, d_in);
+        assert_eq!(witness.d_hid, d_hid);
+        assert_eq!(witness.d_out, d_out);
+        assert_eq!(witness.model_id, model_id);
+        assert_eq!(witness.error_budget, error_budget);
+
+        // Old weights should match checkpoint-start
+        assert_eq!(witness.w1, old_w1);
+        assert_eq!(witness.b1, old_b1);
+        assert_eq!(witness.w2, old_w2);
+        assert_eq!(witness.b2, old_b2);
+
+        // Old state hash should be derived from checkpoint-start weights
+        let expected_old_hash = compute_state_hash_v2(&old_w1, &old_b1, &old_w2, &old_b2);
+        assert_eq!(witness.old_state_hash, expected_old_hash);
     }
 }

@@ -1,10 +1,19 @@
+'use client';
+
+import { ConnectButton } from '@rainbow-me/rainbowkit';
+import Breadcrumbs from './Breadcrumbs';
+
 export default function Header() {
-    return (
-        <header className="bg-helix-surface border-b border-helix-border h-12 px-5 flex items-center justify-between">
-            <span className="text-[13px] font-semibold text-white tracking-tight">HELIX</span>
-            <button className="bg-white text-black text-[13px] font-medium px-3 py-1.5 rounded-[4px] hover:bg-white/90 transition-colors">
-                Connect Wallet
-            </button>
-        </header>
-    );
+  return (
+    <header className="h-14 bg-helix-bg/80 backdrop-blur-sm sticky top-0 z-40 border-b border-helix-border">
+      <div className="flex items-center justify-between h-full px-6">
+        <Breadcrumbs />
+        <ConnectButton
+          showBalance={false}
+          chainStatus="icon"
+          accountStatus="address"
+        />
+      </div>
+    </header>
+  );
 }

@@ -23,9 +23,9 @@ export function RecentActivity({ events }: RecentActivityProps) {
               <span
                 className={cn(
                   "text-sm",
-                  event.type === "error"
+                  event.event_type === "error"
                     ? "text-status-error"
-                    : event.type === "warning"
+                    : event.event_type === "warning"
                       ? "text-status-warning"
                       : "text-text-secondary"
                 )}

@@ -269,6 +269,8 @@ async fn test_mpc_training_step_over_p2p() {
         beaver_batch_size: 256,
         generate_proofs: false,
         base_error: 1e-6,
+        checkpoint_interval: 1,
+        mac_config: None,
     };
 
     let initial_weights = ModelWeights::from_f64(
@@ -380,6 +382,8 @@ async fn test_mpc_multi_step_training_over_p2p() {
         beaver_batch_size: 512,
         generate_proofs: false,
         base_error: 1e-6,
+        checkpoint_interval: 1,
+        mac_config: None,
     };
 
     let initial_weights = ModelWeights::from_f64(

@@ -15,6 +15,10 @@ export interface TrainingStatus {
   proofs_generated: number;
   total_earned: number;
   session_earned: number;
+  model_name: string;
+  current_loss: number | null;
+  current_step: number | null;
+  total_steps: number | null;
 }
 
 export interface SystemMetrics {
@@ -49,8 +53,14 @@ export interface NodeConfig {
 }
 
 export interface ActivityEvent {
-  id: string;
+  id: number;
   timestamp: string;
   message: string;
-  type: "info" | "success" | "warning" | "error";
+  event_type: "info" | "success" | "warning" | "error" | "earn";
+}
+
+export interface SessionInfo {
+  start_time: string;
+  duration_secs: number;
+  earnings_rate_per_hour: number;
 }

@@ -373,6 +373,90 @@ impl CircuitBridge {
     pub fn prove_batch(&self, witnesses: &[ReconstructedWitness]) -> MPCResult<Vec<Halo2ProofResult>> {
         witnesses.iter().map(|w| self.prove(w)).collect()
     }
+
+    /// Generates a ZK proof for a checkpoint, using explicit old/new weights.
+    ///
+    /// Unlike `prove()` which takes a single witness with old weights and computes
+    /// new weights internally, this method takes explicit old weights (from checkpoint
+    /// start) and the current weights (checkpoint end). The proof covers the state
+    /// transition across the entire checkpoint interval.
+    ///
+    /// # Arguments
+    /// * `old_w1`, etc. -- weight values at checkpoint start (must be reconstructed first)
+    /// * `new_w1`, etc. -- weight values at checkpoint end (must be reconstructed first)
+    /// * `input`, `target` -- representative training data for the circuit witness
+    /// * `checkpoint_step` -- step number for the checkpoint
+    /// * `accumulated_error` -- total error over the interval
+    #[instrument(skip(self, old_w1, old_b1, old_w2, old_b2, new_w1, new_b1, new_w2, new_b2, input, target), level = "info", fields(
+        d_in = self.config.d_in,
+        d_hid = self.config.d_hid,
+        d_out = self.config.d_out,
+        step = checkpoint_step,
+    ))]
+    pub fn prove_checkpoint(
+        &self,
+        old_w1: &[Fr], old_b1: &[Fr], old_w2: &[Fr], old_b2: &[Fr],
+        new_w1: &[Fr], new_b1: &[Fr], new_w2: &[Fr], new_b2: &[Fr],
+        input: &[f64], target: &[f64],
+        checkpoint_step: u64,
+        accumulated_error: f64,
+    ) -> MPCResult<Halo2ProofResult> {
+        let start = Instant::now();
+
+        // Convert to Halo2 Fr types
+        let x: Vec<_> = input.iter().map(|&v| *Fr::from_f64(v).inner()).collect();
+        let target_h: Vec<_> = target.iter().map(|&v| *Fr::from_f64(v).inner()).collect();
+        let w1: Vec<_> = old_w1.iter().map(|f| *f.inner()).collect();
+        let b1: Vec<_> = old_b1.iter().map(|f| *f.inner()).collect();
+        let w2: Vec<_> = old_w2.iter().map(|f| *f.inner()).collect();
+        let b2: Vec<_> = old_b2.iter().map(|f| *f.inner()).collect();
+        let base_error = *Fr::from_f64(accumulated_error).inner();
+
+        let old_hash = compute_state_hash_v2(&w1, &b1, &w2, &b2);
+
+        let new_w1_h: Vec<_> = new_w1.iter().map(|f| *f.inner()).collect();
+        let new_b1_h: Vec<_> = new_b1.iter().map(|f| *f.inner()).collect();
+        let new_w2_h: Vec<_> = new_w2.iter().map(|f| *f.inner()).collect();
+        let new_b2_h: Vec<_> = new_b2.iter().map(|f| *f.inner()).collect();
+        let new_hash = compute_state_hash_v2(&new_w1_h, &new_b1_h, &new_w2_h, &new_b2_h);
+
+        // Build circuit witness (computes forward/backward from old weights)
+        let circuit_witness = compute_witness_v2(
+            self.config.d_in,
+            self.config.d_hid,
+            self.config.d_out,
+            &x, &target_h, &w1, &b1, &w2, &b2,
+            *Fr::from_f64(0.01).inner(), // learning rate (not critical for checkpoint)
+            old_hash, new_hash,
+            checkpoint_step, base_error,
+        );
+
+        // Generate proof
+        let proof_result = self.prover.prove(&circuit_witness)
+            .map_err(|e| MPCError::ProtocolError(format!("Checkpoint proof generation failed: {}", e)))?;
+
+        let elapsed = start.elapsed().as_millis() as u64;
+
+        info!(
+            step = checkpoint_step,
+            proof_size = proof_result.proof.len(),
+            time_ms = elapsed,
+            "Checkpoint proof generated"
+        );
+
+        let old_fr = (Fr::from_inner(old_hash.0), Fr::from_inner(old_hash.1));
+        let new_fr = (Fr::from_inner(new_hash.0), Fr::from_inner(new_hash.1));
+
+        Ok(Halo2ProofResult::new(
+            proof_result.proof,
+            proof_result.public_inputs.iter().map(|f| Fr::from_inner(*f)).collect(),
+            old_fr, new_fr,
+            Fr::from_inner(proof_result.loss),
+            Fr::from_f64(accumulated_error),
+            checkpoint_step,
+            elapsed,
+        ))
+    }
 }
 
 /// Thread-safe wrapper for CircuitBridge.
@@ -960,5 +1044,45 @@ mod tests {
         // Values are ~0.01-1.0, so a bound of 0.001 should fail.
         let result = CircuitBridge::validate_witness_precision(&witness, 0.001);
         assert!(result.is_err());
+    }
+
+    /// Tests checkpoint proof generation with explicit old/new weights.
+    /// This test is slow (actual Halo2 proof generation), so it is marked #[ignore].
+    /// Run with: cargo test -p helix-mpc --release -- --ignored test_prove_checkpoint
+    #[test]
+    #[ignore]
+    fn test_prove_checkpoint() {
+        let bridge = CircuitBridge::for_model(2, 2, 1);
+
+        // Create old/new weights (small values to stay within circuit range)
+        let old_w1: Vec<Fr> = vec![Fr::from_f64(0.1); 4];
+        let old_b1: Vec<Fr> = vec![Fr::from_f64(0.01); 2];
+        let old_w2: Vec<Fr> = vec![Fr::from_f64(0.1); 2];
+        let old_b2: Vec<Fr> = vec![Fr::from_f64(0.01); 1];
+
+        // Slightly different new weights (simulating a weight update)
+        let new_w1: Vec<Fr> = vec![Fr::from_f64(0.099); 4];
+        let new_b1: Vec<Fr> = vec![Fr::from_f64(0.0099); 2];
+        let new_w2: Vec<Fr> = vec![Fr::from_f64(0.099); 2];
+        let new_b2: Vec<Fr> = vec![Fr::from_f64(0.0099); 1];
+
+        let input = &[0.5, 0.5];
+        let target = &[1.0];
+
+        let result = bridge.prove_checkpoint(
+            &old_w1, &old_b1, &old_w2, &old_b2,
+            &new_w1, &new_b1, &new_w2, &new_b2,
+            input, target,
+            10, // checkpoint_step
+            0.001, // accumulated_error
+        ).unwrap();
+
+        assert!(!result.proof.is_empty(), "Checkpoint proof should not be empty");
+        assert_eq!(result.step_number, 10, "Step number should match checkpoint_step");
+        assert!(result.proof_size_bytes > 0, "Proof size should be > 0");
+        assert!(result.generation_time_ms > 0, "Generation time should be > 0");
+
+        // Verify the proof
+        assert!(bridge.verify(&result).unwrap(), "Checkpoint proof should verify");
     }
 }

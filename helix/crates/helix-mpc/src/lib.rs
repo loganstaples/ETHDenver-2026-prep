@@ -24,6 +24,7 @@ pub mod beaver;
 pub mod error;
 pub mod field;
 pub mod integration;
+pub mod mac_verification;
 pub mod mpc_trainer;
 pub mod nn;
 pub mod poseidon;

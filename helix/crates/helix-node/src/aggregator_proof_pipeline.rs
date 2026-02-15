@@ -144,6 +144,8 @@ pub struct ProofPipelineConfig {
     pub default_input: Vec<Fr>,
     /// Representative training target (d_out elements).
     pub default_target: Vec<Fr>,
+    /// Checkpoint proving interval (1 = every step generates a proof).
+    pub checkpoint_interval: u64,
 }
 
 impl ProofPipelineConfig {
@@ -169,6 +171,7 @@ impl ProofPipelineConfig {
             },
             default_input: vec![Fr::from(1u64), Fr::from(1u64)],
             default_target: vec![Fr::from(5u64)],
+            checkpoint_interval: 1,
         }
     }
 }
@@ -496,6 +499,166 @@ impl AggregatorProofPipeline {
             old_commitment,
             new_commitment,
             step_number,
+            round_id,
+        })
+    }
+
+    /// Generates a ZK proof for a checkpoint and submits it on-chain.
+    ///
+    /// Unlike `prove_and_submit` which proves a single step from current weights,
+    /// this proves the state transition from explicit checkpoint-start weights to
+    /// the current weights, with accumulated error covering the full interval.
+    pub async fn prove_and_submit_checkpoint(
+        &self,
+        round_id: u64,
+        checkpoint_w1: &[Fr],
+        checkpoint_b1: &[Fr],
+        checkpoint_w2: &[Fr],
+        checkpoint_b2: &[Fr],
+        checkpoint_step: u64,
+        accumulated_error: Fr,
+        training_input: Option<&[Fr]>,
+        training_target: Option<&[Fr]>,
+    ) -> Result<ProofSubmissionResult, ProofPipelineError> {
+        let start = Instant::now();
+        let x = training_input.unwrap_or(&self.config.default_input);
+        let target = training_target.unwrap_or(&self.config.default_target);
+
+        let model_id_bytes = {
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&self.config.model_id.to_le_bytes());
+            bytes
+        };
+
+        info!(
+            round_id,
+            checkpoint_step,
+            "Generating checkpoint ZK proof"
+        );
+
+        // Read current (post-training) weights for the checkpoint end state
+        let current_state = self.model_state.read().await.clone();
+
+        // Build witness using checkpoint-start weights
+        let witness = MLTrainingProverV2::build_checkpoint_witness(
+            self.config.d_in,
+            self.config.d_hid,
+            self.config.d_out,
+            x,
+            target,
+            checkpoint_w1,
+            checkpoint_b1,
+            checkpoint_w2,
+            checkpoint_b2,
+            // new weights (reserved, unused by circuit)
+            &current_state.w1,
+            &current_state.b1,
+            &current_state.w2,
+            &current_state.b2,
+            self.config.learning_rate,
+            checkpoint_step,
+            accumulated_error,
+            model_id_bytes,
+            self.config.max_error_bound,
+        );
+
+        // Generate proof
+        let proof_result = self.prover.prove(&witness).map_err(|e| {
+            error!(round_id, checkpoint_step, error = %e, "Checkpoint proof generation failed");
+            ProofPipelineError::ProofGenerationFailed(e.to_string())
+        })?;
+
+        let proof_gen_time = proof_result.generation_time;
+        let proof_size = proof_result.proof.len();
+
+        info!(
+            round_id,
+            checkpoint_step,
+            proof_size,
+            proof_gen_time_ms = proof_gen_time.as_millis() as u64,
+            "Checkpoint ZK proof generated"
+        );
+
+        // Convert public inputs to U256 for on-chain submission
+        let pi = &proof_result.public_inputs;
+        if pi.len() < 8 {
+            return Err(ProofPipelineError::ProofGenerationFailed(format!(
+                "Expected 8 public inputs, got {}",
+                pi.len()
+            )));
+        }
+
+        let inputs = TrainingProofInputs {
+            old_hash_lo: fr_to_u256(&pi[0]),
+            old_hash_hi: fr_to_u256(&pi[1]),
+            new_hash_lo: fr_to_u256(&pi[2]),
+            new_hash_hi: fr_to_u256(&pi[3]),
+            loss: fr_to_u256(&pi[4]),
+            error_bound: fr_to_u256(&pi[5]),
+            step_number: fr_to_u256(&pi[6]),
+            error_checksum: fr_to_u256(&pi[7]),
+        };
+
+        info!(
+            round_id,
+            model_id = self.config.model_id,
+            "Submitting checkpoint proof on-chain"
+        );
+
+        let receipt = self
+            .sc_client
+            .submit_proof(
+                self.config.model_id,
+                round_id,
+                proof_result.proof.clone(),
+                &inputs,
+            )
+            .await
+            .map_err(|e| {
+                error!(round_id, error = %e, "On-chain checkpoint submission failed");
+                ProofPipelineError::SubmissionFailed(e.to_string())
+            })?;
+
+        let tx_hash = format!("{:?}", receipt.transaction_hash);
+        let block_number = receipt.block_number.map(|b| b.as_u64()).unwrap_or(0);
+        let gas_used = receipt.gas_used.map(|g| g.as_u64()).unwrap_or(0);
+
+        let old_commitment =
+            compute_state_hash_v2(checkpoint_w1, checkpoint_b1, checkpoint_w2, checkpoint_b2);
+        let new_commitment = witness.new_state_hash;
+
+        // Advance model state
+        {
+            let mut state = self.model_state.write().await;
+            state.w1 = witness.w1_new.clone();
+            state.b1 = witness.b1_new.clone();
+            state.w2 = witness.w2_new.clone();
+            state.b2 = witness.b2_new.clone();
+            state.commitment = new_commitment;
+            state.step_number = checkpoint_step;
+        }
+
+        *self.proofs_submitted.write().await += 1;
+
+        info!(
+            round_id,
+            checkpoint_step,
+            tx_hash = %tx_hash,
+            block_number,
+            gas_used,
+            total_time_ms = start.elapsed().as_millis() as u64,
+            "Checkpoint proof accepted on-chain"
+        );
+
+        Ok(ProofSubmissionResult {
+            tx_hash,
+            block_number,
+            gas_used,
+            proof_size,
+            proof_generation_time: proof_gen_time,
+            old_commitment,
+            new_commitment,
+            step_number: checkpoint_step,
             round_id,
         })
     }

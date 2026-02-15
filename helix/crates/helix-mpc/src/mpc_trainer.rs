@@ -36,6 +36,10 @@ use crate::proofs::{
     AggregationProof, ShareValidityProof,
     ShareValidityVerifier,
 };
+use crate::mac_verification::{
+    self, AuthenticatedBeaverTriple, MACCheckResult, MACFailureReport, MACState,
+    MACVerificationConfig, TrainingCheckpoint,
+};
 use crate::protocols::arithmetic::SecureArithmetic;
 use crate::protocols::reshare::Resharing;
 use crate::security::commitment::BlindingGenerator;
@@ -70,6 +74,10 @@ pub struct MPCTrainerConfig {
     pub generate_proofs: bool,
     /// Base error bound per operation.
     pub base_error: f64,
+    /// Checkpoint proving interval: generate ZK proof every N steps (1 = every step).
+    pub checkpoint_interval: u64,
+    /// SPDZ MAC verification configuration. None = disabled.
+    pub mac_config: Option<MACVerificationConfig>,
 }
 
 impl Default for MPCTrainerConfig {
@@ -84,6 +92,8 @@ impl Default for MPCTrainerConfig {
             beaver_batch_size: 256,
             generate_proofs: false,
             base_error: 1e-6,
+            checkpoint_interval: 1,
+            mac_config: None,
         }
     }
 }
@@ -98,6 +108,25 @@ impl MPCTrainerConfig {
             num_parties,
             ..Default::default()
         }
+    }
+
+    /// Creates a config with MAC verification enabled.
+    pub fn with_mac(mut self, check_interval: u64) -> Self {
+        self.mac_config = Some(MACVerificationConfig {
+            check_interval,
+            ..MACVerificationConfig::default()
+        });
+        self
+    }
+
+    /// Creates a config with MAC verification using a specific seed.
+    pub fn with_mac_seed(mut self, check_interval: u64, mac_seed: u64) -> Self {
+        self.mac_config = Some(MACVerificationConfig {
+            check_interval,
+            enable_cheater_identification: true,
+            mac_seed,
+        });
+        self
     }
 }
 
@@ -138,6 +167,22 @@ pub enum TrainingMessage {
         /// Concatenated old + new weight shares.
         shares: Vec<u8>,
     },
+    /// MAC initialization: alpha share + MAC shares for weights.
+    MACInit {
+        alpha_share: Vec<u8>,
+        w1_macs: Vec<u8>,
+        b1_macs: Vec<u8>,
+        w2_macs: Vec<u8>,
+        b2_macs: Vec<u8>,
+    },
+    /// Triple shares for Beaver authentication (sent to party 0).
+    TripleShares {
+        shares: Vec<u8>,
+    },
+    /// MAC shares for authenticated Beaver triples (from party 0).
+    TripleMACShares {
+        mac_shares: Vec<u8>,
+    },
 }
 
 impl TrainingMessage {
@@ -173,6 +218,37 @@ pub struct MPCTrainingStepResult {
     /// contract. Only the designated prover party (party 0) generates this;
     /// other parties get None.
     pub on_chain_proof: Option<Halo2ProofResult>,
+}
+
+/// Result of a single training step without proof generation.
+/// This is the lightweight result used between checkpoints.
+#[derive(Debug)]
+pub struct UnprovedStepResult {
+    /// Training step number.
+    pub step: u64,
+    /// Loss value (reconstructed).
+    pub loss: f64,
+    /// Error for this step.
+    pub step_error: f64,
+    /// Whether re-sharing was performed this step.
+    pub reshared: bool,
+}
+
+/// Result of a complete checkpoint epoch (N training steps + proof).
+#[derive(Debug)]
+pub struct MPCCheckpointResult {
+    /// First step in this checkpoint interval.
+    pub start_step: u64,
+    /// Last step in this checkpoint interval.
+    pub end_step: u64,
+    /// Per-step losses.
+    pub losses: Vec<f64>,
+    /// Total accumulated error over the interval.
+    pub total_error: f64,
+    /// ZK proof generated at the checkpoint (party 0 only; None for other parties).
+    pub proof: Option<Halo2ProofResult>,
+    /// Per-step reshare flags.
+    pub reshared_steps: Vec<bool>,
 }
 
 /// Per-party MPC trainer state.
@@ -211,6 +287,16 @@ pub struct MPCTrainer<T: MPCTransport> {
     agg_prover: AggregationProver,
     /// Generator for blinding factors used in commitments.
     blinding_gen: BlindingGenerator,
+    /// SPDZ MAC state (None if MAC verification is disabled).
+    mac_state: Option<MACState>,
+    /// Full alpha value (known only to party 0 during MAC setup).
+    mac_alpha: Option<Fr>,
+    /// Authenticated Beaver triples with MAC shares.
+    auth_beaver_triples: Vec<AuthenticatedBeaverTriple>,
+    /// Cursor for authenticated Beaver triple consumption.
+    auth_beaver_cursor: usize,
+    /// RNG for MAC-specific randomness (separate from training RNG).
+    mac_rng: ChaCha20Rng,
 }
 
 impl<T: MPCTransport> MPCTrainer<T> {
@@ -223,6 +309,7 @@ impl<T: MPCTransport> MPCTrainer<T> {
     ) -> Self {
         let party_id = transport.party_id().clone();
         let party_seed = seed.wrapping_add((party_index as u64).wrapping_mul(0x9E3779B97F4A7C15));
+        let mac_seed = config.mac_config.as_ref().map(|c| c.mac_seed).unwrap_or(0);
 
         Self {
             config,
@@ -241,6 +328,11 @@ impl<T: MPCTransport> MPCTrainer<T> {
             share_prover: ShareValidityProver::with_seed(seed),
             agg_prover: AggregationProver::with_seed(seed),
             blinding_gen: BlindingGenerator::with_seed(seed),
+            mac_state: None,
+            mac_alpha: None,
+            auth_beaver_triples: Vec::new(),
+            auth_beaver_cursor: 0,
+            mac_rng: ChaCha20Rng::seed_from_u64(mac_seed),
         }
     }
 
@@ -332,6 +424,129 @@ impl<T: MPCTransport> MPCTrainer<T> {
         }
 
         info!(party = self.party_index, "Weight shares initialized");
+
+        // ---- MAC initialization (if enabled) ----
+        if self.config.mac_config.is_some() {
+            self.initialize_mac_shares().await?;
+        }
+
+        Ok(())
+    }
+
+    /// Initializes SPDZ MAC shares for all weight elements.
+    ///
+    /// Protocol:
+    /// 1. All parties send their weight shares to party 0
+    /// 2. Party 0 reconstructs the full weights
+    /// 3. Party 0 generates α, computes MAC(W) = α·W for each weight
+    /// 4. Party 0 creates additive MAC shares and distributes them
+    ///
+    /// This ensures the MAC invariant: sum(mac_i) = α · sum(weight_i) = α · W.
+    async fn initialize_mac_shares(&mut self) -> MPCResult<()> {
+        let n = self.config.num_parties;
+        let dealer = PartyId::from_index(0);
+
+        if self.party_index != 0 {
+            // Non-dealer: send weight shares to party 0 for reconstruction.
+            let all_weights: Vec<Fr> = self.w1.iter()
+                .chain(self.b1.iter())
+                .chain(self.w2.iter())
+                .chain(self.b2.iter())
+                .cloned()
+                .collect();
+            let msg = TrainingMessage::WeightUpdate {
+                w1: SecureArithmetic::serialize_share_batch(&self.w1),
+                b1: SecureArithmetic::serialize_share_batch(&self.b1),
+                w2: SecureArithmetic::serialize_share_batch(&self.w2),
+                b2: SecureArithmetic::serialize_share_batch(&self.b2),
+            };
+            self.transport.send(&dealer, &msg.encode()).await?;
+
+            // Receive MAC init from party 0.
+            let data = self.transport.recv(&dealer).await?;
+            let msg = TrainingMessage::decode(&data)?;
+
+            if let TrainingMessage::MACInit {
+                alpha_share, w1_macs, b1_macs, w2_macs, b2_macs,
+            } = msg {
+                let alpha_s = SecureArithmetic::deserialize_share_batch(&alpha_share)?;
+                self.mac_state = Some(MACState::new(alpha_s[0]));
+                let ms = self.mac_state.as_mut().unwrap();
+                ms.w1_macs = SecureArithmetic::deserialize_share_batch(&w1_macs)?;
+                ms.b1_macs = SecureArithmetic::deserialize_share_batch(&b1_macs)?;
+                ms.w2_macs = SecureArithmetic::deserialize_share_batch(&w2_macs)?;
+                ms.b2_macs = SecureArithmetic::deserialize_share_batch(&b2_macs)?;
+            } else {
+                return Err(MPCError::ProtocolError("expected MACInit message".into()));
+            }
+        } else {
+            // Party 0: reconstruct full weights from all shares.
+            let mut full_w1 = self.w1.clone();
+            let mut full_b1 = self.b1.clone();
+            let mut full_w2 = self.w2.clone();
+            let mut full_b2 = self.b2.clone();
+
+            let peers = self.transport.peers();
+            for peer in &peers {
+                let data = self.transport.recv(peer).await?;
+                let msg = TrainingMessage::decode(&data)?;
+                if let TrainingMessage::WeightUpdate { w1, b1, w2, b2 } = msg {
+                    let pw1 = SecureArithmetic::deserialize_share_batch(&w1)?;
+                    let pb1 = SecureArithmetic::deserialize_share_batch(&b1)?;
+                    let pw2 = SecureArithmetic::deserialize_share_batch(&w2)?;
+                    let pb2 = SecureArithmetic::deserialize_share_batch(&b2)?;
+                    for i in 0..full_w1.len() { full_w1[i] = Fr::add(&full_w1[i], &pw1[i]); }
+                    for i in 0..full_b1.len() { full_b1[i] = Fr::add(&full_b1[i], &pb1[i]); }
+                    for i in 0..full_w2.len() { full_w2[i] = Fr::add(&full_w2[i], &pw2[i]); }
+                    for i in 0..full_b2.len() { full_b2[i] = Fr::add(&full_b2[i], &pb2[i]); }
+                } else {
+                    return Err(MPCError::ProtocolError(
+                        "expected WeightUpdate for MAC reconstruction".into(),
+                    ));
+                }
+            }
+
+            // Generate alpha and shares.
+            let (alpha, alpha_shares) =
+                mac_verification::generate_alpha_shares(n, &mut self.mac_rng);
+            self.mac_alpha = Some(alpha);
+
+            // Generate MAC shares for the FULL (reconstructed) weights.
+            let w1_mac_shares = mac_verification::generate_mac_shares(&alpha, &full_w1, n, &mut self.mac_rng);
+            let b1_mac_shares = mac_verification::generate_mac_shares(&alpha, &full_b1, n, &mut self.mac_rng);
+            let w2_mac_shares = mac_verification::generate_mac_shares(&alpha, &full_w2, n, &mut self.mac_rng);
+            let b2_mac_shares = mac_verification::generate_mac_shares(&alpha, &full_b2, n, &mut self.mac_rng);
+
+            // Keep our own MAC state.
+            self.mac_state = Some(MACState::new(alpha_shares[0]));
+            let ms = self.mac_state.as_mut().unwrap();
+            ms.w1_macs = w1_mac_shares[0].clone();
+            ms.b1_macs = b1_mac_shares[0].clone();
+            ms.w2_macs = w2_mac_shares[0].clone();
+            ms.b2_macs = b2_mac_shares[0].clone();
+
+            // Send MAC init to each peer.
+            for (i, peer) in peers.iter().enumerate() {
+                let peer_idx = i + 1;
+                let msg = TrainingMessage::MACInit {
+                    alpha_share: SecureArithmetic::serialize_share_batch(&[alpha_shares[peer_idx]]),
+                    w1_macs: SecureArithmetic::serialize_share_batch(&w1_mac_shares[peer_idx]),
+                    b1_macs: SecureArithmetic::serialize_share_batch(&b1_mac_shares[peer_idx]),
+                    w2_macs: SecureArithmetic::serialize_share_batch(&w2_mac_shares[peer_idx]),
+                    b2_macs: SecureArithmetic::serialize_share_batch(&b2_mac_shares[peer_idx]),
+                };
+                self.transport.send(peer, &msg.encode()).await?;
+            }
+
+            info!("Dealer: MAC shares distributed (full weight reconstruction)");
+        }
+
+        // Save initial checkpoint.
+        if let Some(ref mut ms) = self.mac_state {
+            ms.save_checkpoint(0, &self.w1, &self.b1, &self.w2, &self.b2, 0, 0);
+        }
+
+        info!(party = self.party_index, "MAC shares initialized");
         Ok(())
     }
 
@@ -408,6 +623,29 @@ impl<T: MPCTransport> MPCTrainer<T> {
             }
 
             new_triples.push(BeaverTriple::new(a_i, b_i, c_i));
+        }
+
+        // Authenticate triples with MAC shares if MAC verification is enabled.
+        if self.mac_state.is_some() {
+            let alpha = if self.party_index == 0 {
+                self.mac_alpha.unwrap_or(Fr::ZERO)
+            } else {
+                Fr::ZERO // Non-dealer doesn't need alpha for authenticate_beaver_triples
+            };
+            let auth = mac_verification::authenticate_beaver_triples(
+                &self.transport,
+                &new_triples,
+                &alpha,
+                self.party_index,
+                self.config.num_parties,
+                &mut self.mac_rng,
+            ).await?;
+            self.auth_beaver_triples.extend(auth);
+            info!(
+                party = self.party_index,
+                auth_total = self.auth_beaver_triples.len(),
+                "Beaver triples authenticated"
+            );
         }
 
         self.beaver_triples.extend(new_triples);
@@ -919,6 +1157,241 @@ impl<T: MPCTransport> MPCTrainer<T> {
             share_validity_proof: sv_proof,
             aggregation_proof: agg_proof,
             on_chain_proof,
+        })
+    }
+
+    // ========================================================================
+    // Phase 4b: Checkpoint epoch mode
+    // ========================================================================
+
+    /// Performs a single training step without generating any proofs.
+    ///
+    /// This is the hot path between checkpoints: pure MPC training with no
+    /// weight reconstruction or proof generation. Between checkpoints, parties
+    /// only run the forward/backward pass and update weight shares.
+    ///
+    /// The step still performs re-sharing if the reshare interval is reached.
+    #[instrument(skip(self, input, target), level = "debug", fields(
+        party = self.party_index,
+        step = self.current_step,
+    ))]
+    pub async fn training_step_unproved(
+        &mut self,
+        input: &[f64],
+        target: &[f64],
+    ) -> MPCResult<UnprovedStepResult> {
+        let step = self.current_step;
+        let d_in = self.config.d_in;
+        let d_hid = self.config.d_hid;
+        let d_out = self.config.d_out;
+
+        // Convert input/target to field elements (public).
+        let x: Vec<Fr> = input.iter().map(|&v| Fr::from_f64(v)).collect();
+        let target_fr: Vec<Fr> = target.iter().map(|&v| Fr::from_f64(v)).collect();
+
+        // ---- Forward pass (same as training_step) ----
+        let mut h_pre_share = vec![Fr::ZERO; d_hid];
+        for i in 0..d_hid {
+            let mut sum = Fr::ZERO;
+            for j in 0..d_in {
+                let contrib = self.w1[i * d_in + j].mpc_scale(&x[j]);
+                sum = Fr::add(&sum, &contrib);
+            }
+            h_pre_share[i] = Fr::add(&sum, &self.b1[i]);
+        }
+
+        let (h_share, relu_mask_share) = self.secure_relu(&h_pre_share).await?;
+
+        let mut y_share = vec![Fr::ZERO; d_out];
+        for i in 0..d_out {
+            let mut sum = Fr::ZERO;
+            for j in 0..d_hid {
+                let prod = self.secure_multiply(
+                    &self.w2[i * d_hid + j].clone(),
+                    &h_share[j],
+                ).await?;
+                sum = Fr::add(&sum, &prod);
+            }
+            y_share[i] = Fr::add(&sum, &self.b2[i]);
+        }
+
+        // Reconstruct y for loss computation
+        let peers = self.transport.peers();
+        let y_bytes = SecureArithmetic::serialize_share_batch(&y_share);
+        self.transport.broadcast(&y_bytes).await?;
+
+        let mut y_reconstructed = y_share.clone();
+        for peer in &peers {
+            let msg = self.transport.recv(peer).await?;
+            let peer_y = SecureArithmetic::deserialize_share_batch(&msg)?;
+            for i in 0..d_out {
+                y_reconstructed[i] = Fr::add(&y_reconstructed[i], &peer_y[i]);
+            }
+        }
+
+        let mut loss = 0.0_f64;
+        let mut dy: Vec<Fr> = vec![Fr::ZERO; d_out];
+        for i in 0..d_out {
+            let diff = Fr::sub(&y_reconstructed[i], &target_fr[i]);
+            let diff_f64 = diff.to_f64();
+            loss += 0.5 * diff_f64 * diff_f64;
+            dy[i] = diff;
+        }
+
+        // ---- Backward pass ----
+        let mut dw2_share = vec![Fr::ZERO; d_out * d_hid];
+        for i in 0..d_out {
+            for j in 0..d_hid {
+                dw2_share[i * d_hid + j] = h_share[j].mpc_scale(&dy[i]);
+            }
+        }
+
+        let db2_share: Vec<Fr> = if self.party_index == 0 {
+            dy.clone()
+        } else {
+            vec![Fr::ZERO; d_out]
+        };
+
+        let mut dh_share = vec![Fr::ZERO; d_hid];
+        for j in 0..d_hid {
+            let mut sum = Fr::ZERO;
+            for i in 0..d_out {
+                let contrib = self.w2[i * d_hid + j].mpc_scale(&dy[i]);
+                sum = Fr::add(&sum, &contrib);
+            }
+            dh_share[j] = sum;
+        }
+
+        let dh_pre_share = self.secure_vector_multiply(
+            &dh_share,
+            &relu_mask_share,
+        ).await?;
+
+        let mut dw1_share = vec![Fr::ZERO; d_hid * d_in];
+        for i in 0..d_hid {
+            for j in 0..d_in {
+                dw1_share[i * d_in + j] = dh_pre_share[i].mpc_scale(&x[j]);
+            }
+        }
+
+        let db1_share = dh_pre_share.clone();
+
+        // ---- Weight update ----
+        let lr = Fr::from_f64(self.config.learning_rate);
+        for i in 0..self.w1.len() {
+            let update = lr.mpc_scale(&dw1_share[i]);
+            self.w1[i] = Fr::sub(&self.w1[i], &update);
+        }
+        for i in 0..self.b1.len() {
+            let update = lr.mpc_scale(&db1_share[i]);
+            self.b1[i] = Fr::sub(&self.b1[i], &update);
+        }
+        for i in 0..self.w2.len() {
+            let update = lr.mpc_scale(&dw2_share[i]);
+            self.w2[i] = Fr::sub(&self.w2[i], &update);
+        }
+        for i in 0..self.b2.len() {
+            let update = lr.mpc_scale(&db2_share[i]);
+            self.b2[i] = Fr::sub(&self.b2[i], &update);
+        }
+
+        // ---- Re-sharing ----
+        let reshared = if Resharing::should_reshare(step + 1, self.config.reshare_interval) {
+            self.reshare_weights().await?;
+            true
+        } else {
+            false
+        };
+
+        // Compute step error
+        let num_ops = (d_hid * d_in + d_hid + d_out * d_hid + d_out) as f64;
+        let step_error = self.config.base_error * num_ops;
+
+        self.current_step += 1;
+
+        debug!(
+            step = step,
+            party = self.party_index,
+            loss = loss,
+            reshared = reshared,
+            "Unproved training step completed"
+        );
+
+        Ok(UnprovedStepResult {
+            step,
+            loss,
+            step_error,
+            reshared,
+        })
+    }
+
+    /// Runs a complete checkpoint epoch: N training steps with proof at the end.
+    ///
+    /// This is the primary API for checkpoint-based training:
+    /// 1. Runs `checkpoint_interval` training steps without proof generation
+    /// 2. At the final step: uses the full `training_step` with proof generation
+    /// 3. Returns the checkpoint result with accumulated metrics
+    ///
+    /// If `checkpoint_interval` is 1, behaves identically to a single `training_step`.
+    ///
+    /// Before calling this method, ensure enough Beaver triples are available
+    /// for `checkpoint_interval` training steps. Each step consumes approximately
+    /// `d_hid + d_out * d_hid + d_hid` triples.
+    #[instrument(skip(self, data), level = "info", fields(
+        party = self.party_index,
+        start_step = self.current_step,
+    ))]
+    pub async fn training_epoch(
+        &mut self,
+        data: &[(Vec<f64>, Vec<f64>)],
+    ) -> MPCResult<MPCCheckpointResult> {
+        let interval = self.config.checkpoint_interval.max(1);
+        let start_step = self.current_step;
+
+        let mut losses = Vec::with_capacity(interval as usize);
+        let mut total_error = 0.0;
+        let mut reshared_steps = Vec::with_capacity(interval as usize);
+
+        let steps_to_run = interval as usize;
+        for i in 0..steps_to_run {
+            let data_idx = i % data.len();
+            let (input, target) = &data[data_idx];
+
+            if i < steps_to_run - 1 || !self.config.generate_proofs {
+                // Unproved step (the fast path)
+                let result = self.training_step_unproved(input, target).await?;
+                losses.push(result.loss);
+                total_error += result.step_error;
+                reshared_steps.push(result.reshared);
+            } else {
+                // Last step: use full training_step with proof generation
+                let result = self.training_step(input, target).await?;
+                losses.push(result.loss);
+                total_error += result.total_error;
+                reshared_steps.push(result.reshared);
+
+                // The proof from the last step serves as the checkpoint proof
+                let end_step = self.current_step - 1; // step was incremented
+                return Ok(MPCCheckpointResult {
+                    start_step,
+                    end_step,
+                    losses,
+                    total_error,
+                    proof: result.on_chain_proof,
+                    reshared_steps,
+                });
+            }
+        }
+
+        // If proofs are disabled, still return a result with no proof
+        let end_step = self.current_step - 1;
+        Ok(MPCCheckpointResult {
+            start_step,
+            end_step,
+            losses,
+            total_error,
+            proof: None,
+            reshared_steps,
         })
     }
 
@@ -1506,6 +1979,600 @@ impl<T: MPCTransport> MPCTrainer<T> {
         Ok(results)
     }
 
+    // ========================================================================
+    // SPDZ MAC: Authenticated Beaver multiplication
+    // ========================================================================
+
+    /// Takes the next authenticated Beaver triple.
+    fn take_auth_triple(&mut self) -> MPCResult<AuthenticatedBeaverTriple> {
+        if self.auth_beaver_cursor >= self.auth_beaver_triples.len() {
+            return Err(MPCError::BeaverPoolExhausted {
+                requested: 1,
+                available: 0,
+            });
+        }
+        let triple = self.auth_beaver_triples[self.auth_beaver_cursor].clone();
+        self.auth_beaver_cursor += 1;
+        Ok(triple)
+    }
+
+    /// Remaining authenticated Beaver triples.
+    pub fn auth_beaver_triples_remaining(&self) -> usize {
+        self.auth_beaver_triples.len().saturating_sub(self.auth_beaver_cursor)
+    }
+
+    /// Authenticated scalar Beaver multiply: returns (value, mac).
+    ///
+    /// Same as `secure_multiply` but also computes the MAC share of the
+    /// result using the authenticated Beaver triple.
+    async fn secure_multiply_authenticated(
+        &mut self,
+        x_share: &Fr,
+        x_mac: &Fr,
+        y_share: &Fr,
+        y_mac: &Fr,
+    ) -> MPCResult<(Fr, Fr)> {
+        let auth_triple = self.take_auth_triple()?;
+        // Also consume a regular triple to keep cursors aligned.
+        let _regular_triple = self.take_triple()?;
+
+        let (d_share, e_share) = SecureArithmetic::beaver_mask(
+            x_share, y_share, &auth_triple.triple,
+        );
+
+        // Broadcast d/e shares.
+        let batch = SecureArithmetic::serialize_share_batch(&[d_share, e_share]);
+        self.transport.broadcast(&batch).await?;
+
+        let mut total_d = d_share;
+        let mut total_e = e_share;
+        let peers = self.transport.peers();
+        for peer in &peers {
+            let msg = self.transport.recv(peer).await?;
+            let shares = SecureArithmetic::deserialize_share_batch(&msg)?;
+            if shares.len() < 2 {
+                return Err(MPCError::CommunicationError(
+                    "expected 2 shares in Beaver mask".into(),
+                ));
+            }
+            total_d = Fr::add(&total_d, &shares[0]);
+            total_e = Fr::add(&total_e, &shares[1]);
+        }
+
+        // Accumulate opened d and e for later MAC verification.
+        // MAC(d) = MAC(x) - MAC(a), since d = x - a.
+        if let Some(ref mut ms) = self.mac_state {
+            let mac_d = Fr::sub(x_mac, &auth_triple.mac_a);
+            let mac_e = Fr::sub(y_mac, &auth_triple.mac_b);
+            ms.accumulate_opened(total_d, mac_d);
+            ms.accumulate_opened(total_e, mac_e);
+        }
+
+        let alpha_share = self.mac_state.as_ref()
+            .map(|ms| ms.alpha_share)
+            .unwrap_or(Fr::ZERO);
+
+        let (value, mac) = auth_triple.authenticated_multiply(
+            &total_d, &total_e, self.party_index, &alpha_share,
+        );
+
+        Ok((value, mac))
+    }
+
+    /// Authenticated vector Beaver multiply: returns (values, macs).
+    async fn secure_vector_multiply_authenticated(
+        &mut self,
+        x_shares: &[Fr],
+        x_macs: &[Fr],
+        y_shares: &[Fr],
+        y_macs: &[Fr],
+    ) -> MPCResult<(Vec<Fr>, Vec<Fr>)> {
+        let dim = x_shares.len();
+        assert_eq!(y_shares.len(), dim);
+        assert_eq!(x_macs.len(), dim);
+        assert_eq!(y_macs.len(), dim);
+
+        let mut auth_triples = Vec::with_capacity(dim);
+        for _ in 0..dim {
+            auth_triples.push(self.take_auth_triple()?);
+            let _ = self.take_triple()?;
+        }
+
+        // Compute all d/e masks.
+        let regular_triples: Vec<_> = auth_triples.iter().map(|at| at.triple.clone()).collect();
+        let (d_batch, e_batch) =
+            SecureArithmetic::batched_beaver_mask(x_shares, y_shares, &regular_triples);
+
+        // Broadcast.
+        let all_shares: Vec<Fr> = d_batch.iter().chain(e_batch.iter()).cloned().collect();
+        let batch_msg = SecureArithmetic::serialize_share_batch(&all_shares);
+        self.transport.broadcast(&batch_msg).await?;
+
+        let mut total_d = d_batch;
+        let mut total_e = e_batch;
+        let peers = self.transport.peers();
+        for peer in &peers {
+            let msg = self.transport.recv(peer).await?;
+            let shares = SecureArithmetic::deserialize_share_batch(&msg)?;
+            if shares.len() < 2 * dim {
+                return Err(MPCError::CommunicationError(format!(
+                    "expected {} shares, got {}", 2 * dim, shares.len()
+                )));
+            }
+            for j in 0..dim {
+                total_d[j] = Fr::add(&total_d[j], &shares[j]);
+                total_e[j] = Fr::add(&total_e[j], &shares[dim + j]);
+            }
+        }
+
+        // Accumulate opened values.
+        if let Some(ref mut ms) = self.mac_state {
+            for j in 0..dim {
+                let mac_d = Fr::sub(&x_macs[j], &auth_triples[j].mac_a);
+                let mac_e = Fr::sub(&y_macs[j], &auth_triples[j].mac_b);
+                ms.accumulate_opened(total_d[j], mac_d);
+                ms.accumulate_opened(total_e[j], mac_e);
+            }
+        }
+
+        let alpha_share = self.mac_state.as_ref()
+            .map(|ms| ms.alpha_share)
+            .unwrap_or(Fr::ZERO);
+
+        let mut values = Vec::with_capacity(dim);
+        let mut macs = Vec::with_capacity(dim);
+        for j in 0..dim {
+            let (v, m) = auth_triples[j].authenticated_multiply(
+                &total_d[j], &total_e[j], self.party_index, &alpha_share,
+            );
+            values.push(v);
+            macs.push(m);
+        }
+
+        Ok((values, macs))
+    }
+
+    // ========================================================================
+    // SPDZ MAC: Training step with MAC tracking
+    // ========================================================================
+
+    /// Performs a training step with full SPDZ MAC tracking.
+    ///
+    /// Mirrors `training_step_unproved` but additionally:
+    /// - Computes MAC shares for all intermediate values
+    /// - Uses authenticated Beaver triples for multiplications
+    /// - Records opened values for batch verification
+    /// - Runs the sigma check at the configured interval
+    /// - On MAC failure: identifies cheater, halts, and rolls back
+    #[instrument(skip(self, input, target), level = "debug", fields(
+        party = self.party_index,
+        step = self.current_step,
+    ))]
+    pub async fn training_step_with_mac(
+        &mut self,
+        input: &[f64],
+        target: &[f64],
+    ) -> MPCResult<UnprovedStepResult> {
+        let step = self.current_step;
+        let d_in = self.config.d_in;
+        let d_hid = self.config.d_hid;
+        let d_out = self.config.d_out;
+
+        let x: Vec<Fr> = input.iter().map(|&v| Fr::from_f64(v)).collect();
+        let target_fr: Vec<Fr> = target.iter().map(|&v| Fr::from_f64(v)).collect();
+
+        // Get MAC state references.
+        let alpha_share = self.mac_state.as_ref()
+            .map(|ms| ms.alpha_share)
+            .unwrap_or(Fr::ZERO);
+
+        // ---- Forward pass with MAC tracking ----
+        // h_pre = W1 @ x + b1 (linear in shares: scale by public x)
+        let mut h_pre_share = vec![Fr::ZERO; d_hid];
+        let mut h_pre_mac = vec![Fr::ZERO; d_hid];
+        {
+            let ms = self.mac_state.as_ref().unwrap();
+            for i in 0..d_hid {
+                let mut sum = Fr::ZERO;
+                let mut mac_sum = Fr::ZERO;
+                for j in 0..d_in {
+                    let contrib = self.w1[i * d_in + j].mpc_scale(&x[j]);
+                    sum = Fr::add(&sum, &contrib);
+                    let mac_contrib = ms.w1_macs[i * d_in + j].mpc_scale(&x[j]);
+                    mac_sum = Fr::add(&mac_sum, &mac_contrib);
+                }
+                h_pre_share[i] = Fr::add(&sum, &self.b1[i]);
+                h_pre_mac[i] = Fr::add(&mac_sum, &ms.b1_macs[i]);
+            }
+        }
+
+        // Secure ReLU with MAC tracking.
+        // Sign mask is generated by party 0. We create MAC shares for it using
+        // the "public constant" pattern since party 0 knows the sign values.
+        let relu_mask_share = self.secure_sign_bit_vector(&h_pre_share).await?;
+        // For sign mask MACs: each party computes alpha_i * sign_value.
+        // But only party 0 knows sign_value. So party 0 must distribute MAC shares.
+        // For simplicity (and matching the trust model), we compute: mac_i = alpha_i * relu_mask_i_reconstructed.
+        // Since relu_mask is additive-shared with party 0 holding value and others 0,
+        // the MAC is alpha_i * full_value. We approximate by broadcasting the sign from party 0.
+        //
+        // The sign mask reconstruction is implicitly done: party 0 holds the value,
+        // others hold 0. For MAC: all parties set mac_sign_i = alpha_i * sign_value.
+        // Party 0 broadcasts the sign values so all parties can compute their MAC.
+        let relu_mask_mac: Vec<Fr>;
+        {
+            let sign_bytes = SecureArithmetic::serialize_share_batch(&relu_mask_share);
+            self.transport.broadcast(&sign_bytes).await?;
+
+            let mut reconstructed_sign = relu_mask_share.clone();
+            let peers = self.transport.peers();
+            for peer in &peers {
+                let msg = self.transport.recv(peer).await?;
+                let peer_sign = SecureArithmetic::deserialize_share_batch(&msg)?;
+                for i in 0..d_hid {
+                    reconstructed_sign[i] = Fr::add(&reconstructed_sign[i], &peer_sign[i]);
+                }
+            }
+            // Each party computes: mac_sign_i = alpha_i * sign_value
+            relu_mask_mac = reconstructed_sign.iter()
+                .map(|sv| Fr::mul(&alpha_share, sv))
+                .collect();
+        }
+
+        // h = h_pre * relu_mask via authenticated Beaver multiply.
+        let (h_share, h_mac) = self.secure_vector_multiply_authenticated(
+            &h_pre_share, &h_pre_mac,
+            &relu_mask_share, &relu_mask_mac,
+        ).await?;
+
+        // y = W2 @ h + b2 (shared-times-shared matmul).
+        let mut y_share = vec![Fr::ZERO; d_out];
+        let mut y_mac = vec![Fr::ZERO; d_out];
+        for i in 0..d_out {
+            let mut sum = Fr::ZERO;
+            let mut mac_sum = Fr::ZERO;
+            for j in 0..d_hid {
+                let w2_mac = self.mac_state.as_ref().unwrap().w2_macs[i * d_hid + j];
+                let (prod, prod_mac) = self.secure_multiply_authenticated(
+                    &self.w2[i * d_hid + j].clone(), &w2_mac,
+                    &h_share[j], &h_mac[j],
+                ).await?;
+                sum = Fr::add(&sum, &prod);
+                mac_sum = Fr::add(&mac_sum, &prod_mac);
+            }
+            let b2_mac = self.mac_state.as_ref().unwrap().b2_macs[i];
+            y_share[i] = Fr::add(&sum, &self.b2[i]);
+            y_mac[i] = Fr::add(&mac_sum, &b2_mac);
+        }
+
+        // Reconstruct y for loss computation.
+        let peers = self.transport.peers();
+        let y_bytes = SecureArithmetic::serialize_share_batch(&y_share);
+        self.transport.broadcast(&y_bytes).await?;
+
+        let mut y_reconstructed = y_share.clone();
+        for peer in &peers {
+            let msg = self.transport.recv(peer).await?;
+            let peer_y = SecureArithmetic::deserialize_share_batch(&msg)?;
+            for i in 0..d_out {
+                y_reconstructed[i] = Fr::add(&y_reconstructed[i], &peer_y[i]);
+            }
+        }
+
+        // Accumulate opened y for MAC verification.
+        if let Some(ref mut ms) = self.mac_state {
+            for i in 0..d_out {
+                ms.accumulate_opened(y_reconstructed[i], y_mac[i]);
+            }
+        }
+
+        let mut loss = 0.0_f64;
+        let mut dy: Vec<Fr> = vec![Fr::ZERO; d_out];
+        for i in 0..d_out {
+            let diff = Fr::sub(&y_reconstructed[i], &target_fr[i]);
+            let diff_f64 = diff.to_f64();
+            loss += 0.5 * diff_f64 * diff_f64;
+            dy[i] = diff;
+        }
+
+        // ---- Backward pass with MAC tracking ----
+        // dW2 = outer(dy, h): dy is public, h is shared → scale by public
+        let mut dw2_share = vec![Fr::ZERO; d_out * d_hid];
+        let mut dw2_mac = vec![Fr::ZERO; d_out * d_hid];
+        for i in 0..d_out {
+            for j in 0..d_hid {
+                dw2_share[i * d_hid + j] = h_share[j].mpc_scale(&dy[i]);
+                dw2_mac[i * d_hid + j] = h_mac[j].mpc_scale(&dy[i]);
+            }
+        }
+
+        // db2 = dy (public, only party 0 holds value)
+        let db2_share: Vec<Fr> = if self.party_index == 0 {
+            dy.clone()
+        } else {
+            vec![Fr::ZERO; d_out]
+        };
+        // MAC for db2: all parties add alpha_i * dy[i]
+        let db2_mac: Vec<Fr> = dy.iter()
+            .map(|d| Fr::mul(&alpha_share, d))
+            .collect();
+
+        // dh = W2^T @ dy (W2 shared, dy public → scale by public)
+        let mut dh_share = vec![Fr::ZERO; d_hid];
+        let mut dh_mac = vec![Fr::ZERO; d_hid];
+        for j in 0..d_hid {
+            let mut sum = Fr::ZERO;
+            let mut mac_sum = Fr::ZERO;
+            for i in 0..d_out {
+                let w2_mac = self.mac_state.as_ref().unwrap().w2_macs[i * d_hid + j];
+                sum = Fr::add(&sum, &self.w2[i * d_hid + j].mpc_scale(&dy[i]));
+                mac_sum = Fr::add(&mac_sum, &w2_mac.mpc_scale(&dy[i]));
+            }
+            dh_share[j] = sum;
+            dh_mac[j] = mac_sum;
+        }
+
+        // dh_pre = dh * relu_mask (both shared → authenticated Beaver multiply)
+        let (dh_pre_share, dh_pre_mac) = self.secure_vector_multiply_authenticated(
+            &dh_share, &dh_mac,
+            &relu_mask_share, &relu_mask_mac,
+        ).await?;
+
+        // dW1 = outer(dh_pre, x): dh_pre shared, x public → scale by public
+        let mut dw1_share = vec![Fr::ZERO; d_hid * d_in];
+        let mut dw1_mac = vec![Fr::ZERO; d_hid * d_in];
+        for i in 0..d_hid {
+            for j in 0..d_in {
+                dw1_share[i * d_in + j] = dh_pre_share[i].mpc_scale(&x[j]);
+                dw1_mac[i * d_in + j] = dh_pre_mac[i].mpc_scale(&x[j]);
+            }
+        }
+
+        // db1 = dh_pre
+        let db1_share = dh_pre_share.clone();
+        let db1_mac = dh_pre_mac.clone();
+
+        // ---- Weight update: W -= lr * dW ----
+        let lr = Fr::from_f64(self.config.learning_rate);
+        for i in 0..self.w1.len() {
+            let update = lr.mpc_scale(&dw1_share[i]);
+            self.w1[i] = Fr::sub(&self.w1[i], &update);
+        }
+        for i in 0..self.b1.len() {
+            let update = lr.mpc_scale(&db1_share[i]);
+            self.b1[i] = Fr::sub(&self.b1[i], &update);
+        }
+        for i in 0..self.w2.len() {
+            let update = lr.mpc_scale(&dw2_share[i]);
+            self.w2[i] = Fr::sub(&self.w2[i], &update);
+        }
+        for i in 0..self.b2.len() {
+            let update = lr.mpc_scale(&db2_share[i]);
+            self.b2[i] = Fr::sub(&self.b2[i], &update);
+        }
+
+        // ---- MAC weight update: MAC_W -= lr * MAC_dW ----
+        if let Some(ref mut ms) = self.mac_state {
+            for i in 0..ms.w1_macs.len() {
+                let mac_update = lr.mpc_scale(&dw1_mac[i]);
+                ms.w1_macs[i] = Fr::sub(&ms.w1_macs[i], &mac_update);
+            }
+            for i in 0..ms.b1_macs.len() {
+                let mac_update = lr.mpc_scale(&db1_mac[i]);
+                ms.b1_macs[i] = Fr::sub(&ms.b1_macs[i], &mac_update);
+            }
+            for i in 0..ms.w2_macs.len() {
+                let mac_update = lr.mpc_scale(&dw2_mac[i]);
+                ms.w2_macs[i] = Fr::sub(&ms.w2_macs[i], &mac_update);
+            }
+            for i in 0..ms.b2_macs.len() {
+                let mac_update = lr.mpc_scale(&db2_mac[i]);
+                ms.b2_macs[i] = Fr::sub(&ms.b2_macs[i], &mac_update);
+            }
+        }
+
+        // ---- Re-sharing ----
+        let reshared = if Resharing::should_reshare(step + 1, self.config.reshare_interval) {
+            self.reshare_weights().await?;
+            // Re-share MACs alongside weights (same zero-share protocol).
+            if self.mac_state.is_some() {
+                self.reshare_mac_weights().await?;
+            }
+            true
+        } else {
+            false
+        };
+
+        let num_ops = (d_hid * d_in + d_hid + d_out * d_hid + d_out) as f64;
+        let step_error = self.config.base_error * num_ops;
+
+        self.current_step += 1;
+
+        // ---- MAC verification check ----
+        if let Some(ref mac_cfg) = self.config.mac_config {
+            if mac_cfg.check_interval > 0 && self.current_step % mac_cfg.check_interval == 0 {
+                let check_result = self.run_mac_check().await?;
+                if let MACCheckResult::Failed { report, .. } = check_result {
+                    // Halt: rollback to last checkpoint and return error.
+                    warn!(
+                        step = step,
+                        cheater = ?report.identified_cheater,
+                        "MAC check failed — halting training"
+                    );
+                    self.rollback_to_checkpoint();
+                    return Err(MPCError::MACCheckFailed {
+                        step,
+                        cheater: report.identified_cheater,
+                    });
+                }
+
+                // Save checkpoint on success.
+                if let Some(ref mut ms) = self.mac_state {
+                    ms.save_checkpoint(
+                        self.current_step,
+                        &self.w1, &self.b1, &self.w2, &self.b2,
+                        self.beaver_cursor, self.auth_beaver_cursor,
+                    );
+                }
+            }
+        }
+
+        debug!(
+            step = step,
+            party = self.party_index,
+            loss = loss,
+            "MAC-verified training step completed"
+        );
+
+        Ok(UnprovedStepResult {
+            step,
+            loss,
+            step_error,
+            reshared,
+        })
+    }
+
+    // ========================================================================
+    // SPDZ MAC: Verification and rollback
+    // ========================================================================
+
+    /// Runs the full MAC verification check (sigma protocol + identification).
+    async fn run_mac_check(&mut self) -> MPCResult<MACCheckResult> {
+        let weight_shares: Vec<Fr> = self.w1.iter()
+            .chain(self.b1.iter())
+            .chain(self.w2.iter())
+            .chain(self.b2.iter())
+            .cloned()
+            .collect();
+
+        let enable_id = self.config.mac_config.as_ref()
+            .map(|c| c.enable_cheater_identification)
+            .unwrap_or(false);
+
+        let mac_state = self.mac_state.as_mut().unwrap();
+        mac_verification::full_mac_check(
+            &self.transport,
+            &weight_shares,
+            mac_state,
+            self.current_step,
+            self.config.num_parties,
+            "default-session",
+            enable_id,
+        ).await
+    }
+
+    /// Rolls back to the last verified checkpoint.
+    fn rollback_to_checkpoint(&mut self) {
+        if let Some(ref mut ms) = self.mac_state {
+            if let Some(cp) = ms.rollback() {
+                self.w1 = cp.w1;
+                self.b1 = cp.b1;
+                self.w2 = cp.w2;
+                self.b2 = cp.b2;
+                self.beaver_cursor = cp.beaver_cursor;
+                self.auth_beaver_cursor = cp.auth_beaver_cursor;
+                self.current_step = cp.step;
+                info!(step = cp.step, "Rolled back to checkpoint");
+            }
+        }
+    }
+
+    /// Re-shares MAC weight shares (same zero-share protocol as value resharing).
+    async fn reshare_mac_weights(&mut self) -> MPCResult<()> {
+        let ms = self.mac_state.as_mut().unwrap();
+        let n = self.config.num_parties;
+        let all_macs_len = ms.w1_macs.len() + ms.b1_macs.len() + ms.w2_macs.len() + ms.b2_macs.len();
+
+        let mut zero_shares_per_peer: Vec<Vec<Fr>> = vec![Vec::with_capacity(all_macs_len); n];
+        for _elem in 0..all_macs_len {
+            let zs = Resharing::generate_zero_shares(n, &mut self.mac_rng);
+            for (j, share) in zs.into_iter().enumerate() {
+                zero_shares_per_peer[j].push(share);
+            }
+        }
+
+        let my_zeros = &zero_shares_per_peer[self.party_index];
+        let mut offset = 0;
+        for i in 0..ms.w1_macs.len() {
+            ms.w1_macs[i] = Fr::add(&ms.w1_macs[i], &my_zeros[offset + i]);
+        }
+        offset += ms.w1_macs.len();
+        for i in 0..ms.b1_macs.len() {
+            ms.b1_macs[i] = Fr::add(&ms.b1_macs[i], &my_zeros[offset + i]);
+        }
+        offset += ms.b1_macs.len();
+        for i in 0..ms.w2_macs.len() {
+            ms.w2_macs[i] = Fr::add(&ms.w2_macs[i], &my_zeros[offset + i]);
+        }
+        offset += ms.w2_macs.len();
+        for i in 0..ms.b2_macs.len() {
+            ms.b2_macs[i] = Fr::add(&ms.b2_macs[i], &my_zeros[offset + i]);
+        }
+
+        let peers = self.transport.peers();
+        for (i, peer) in peers.iter().enumerate() {
+            let peer_idx = if i < self.party_index { i } else { i + 1 };
+            let msg = TrainingMessage::ReshareZeros {
+                values: SecureArithmetic::serialize_share_batch(&zero_shares_per_peer[peer_idx]),
+            };
+            self.transport.send(peer, &msg.encode()).await?;
+        }
+
+        let ms = self.mac_state.as_mut().unwrap();
+        for peer in &peers {
+            let data = self.transport.recv(peer).await?;
+            let msg = TrainingMessage::decode(&data)?;
+            if let TrainingMessage::ReshareZeros { values } = msg {
+                let peer_zeros = SecureArithmetic::deserialize_share_batch(&values)?;
+                if peer_zeros.len() != all_macs_len {
+                    return Err(MPCError::ResharingFailed(format!(
+                        "expected {} MAC zero-shares, got {}",
+                        all_macs_len, peer_zeros.len()
+                    )));
+                }
+                let mut offset = 0;
+                for i in 0..ms.w1_macs.len() {
+                    ms.w1_macs[i] = Fr::add(&ms.w1_macs[i], &peer_zeros[offset + i]);
+                }
+                offset += ms.w1_macs.len();
+                for i in 0..ms.b1_macs.len() {
+                    ms.b1_macs[i] = Fr::add(&ms.b1_macs[i], &peer_zeros[offset + i]);
+                }
+                offset += ms.b1_macs.len();
+                for i in 0..ms.w2_macs.len() {
+                    ms.w2_macs[i] = Fr::add(&ms.w2_macs[i], &peer_zeros[offset + i]);
+                }
+                offset += ms.w2_macs.len();
+                for i in 0..ms.b2_macs.len() {
+                    ms.b2_macs[i] = Fr::add(&ms.b2_macs[i], &peer_zeros[offset + i]);
+                }
+            } else {
+                return Err(MPCError::ProtocolError("expected ReshareZeros for MAC".into()));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Returns the current MAC state, if MAC verification is enabled.
+    pub fn mac_state(&self) -> Option<&MACState> {
+        self.mac_state.as_ref()
+    }
+
+    /// Returns the last MAC failure report, if any.
+    pub fn mac_enabled(&self) -> bool {
+        self.mac_state.is_some()
+    }
+
+    /// Corrupts this party's weight share (for testing cheater detection).
+    /// DO NOT use in production.
+    #[doc(hidden)]
+    pub fn corrupt_weight_share(&mut self, index: usize, delta: Fr) {
+        if index < self.w1.len() {
+            self.w1[index] = Fr::add(&self.w1[index], &delta);
+        }
+    }
+
     /// Returns the current weight shares for debugging/verification.
     pub fn weight_shares(&self) -> (&[Fr], &[Fr], &[Fr], &[Fr]) {
         (&self.w1, &self.b1, &self.w2, &self.b2)
@@ -1712,6 +2779,8 @@ mod tests {
             beaver_batch_size: 512, // increased for secure ReLU + matmul
             generate_proofs: false,
             base_error: 1e-6,
+            checkpoint_interval: 1,
+            mac_config: None,
         };
 
         let initial_weights = ModelWeights::from_f64(
@@ -1780,6 +2849,8 @@ mod tests {
             beaver_batch_size: 1024, // increased for secure training
             generate_proofs: false,
             base_error: 1e-6,
+            checkpoint_interval: 1,
+            mac_config: None,
         };
 
         let initial_weights = ModelWeights::from_f64(
@@ -1872,6 +2943,8 @@ mod tests {
             beaver_batch_size: 512, // increased for secure training
             generate_proofs: false, // Disable full Halo2 proof (circuit-compat issue)
             base_error: 1e-6,
+            checkpoint_interval: 1,
+            mac_config: None,
         };
 
         let initial_weights = ModelWeights::from_f64(
@@ -2008,6 +3081,8 @@ mod tests {
             beaver_batch_size: 2048, // increased for secure training (5 steps)
             generate_proofs: false,
             base_error: 1e-6,
+            checkpoint_interval: 1,
+            mac_config: None,
         };
 
         let initial_weights = ModelWeights::from_f64(
@@ -2080,6 +3155,8 @@ mod tests {
             beaver_batch_size: 512,
             generate_proofs: true, // Enable on-chain proof generation
             base_error: 1e-6,
+            checkpoint_interval: 1,
+            mac_config: None,
         };
 
         // Use tiny weights in the 0.001 range so they quantize to small Fr
@@ -2182,6 +3259,8 @@ mod tests {
             beaver_batch_size: 512,
             generate_proofs: false, // Proofs disabled
             base_error: 1e-6,
+            checkpoint_interval: 1,
+            mac_config: None,
         };
 
         let initial_weights = ModelWeights::from_f64(
@@ -2223,5 +3302,252 @@ mod tests {
                 party_index
             );
         }
+    }
+
+    #[test]
+    fn test_checkpoint_config_default() {
+        let config = MPCTrainerConfig::default();
+        assert_eq!(config.checkpoint_interval, 1, "Default checkpoint_interval should be 1");
+
+        let small = MPCTrainerConfig::small(3);
+        assert_eq!(small.checkpoint_interval, 1, "small() should inherit default checkpoint_interval of 1");
+    }
+
+    #[tokio::test]
+    async fn test_unproved_step_result() {
+        let num_parties = 3;
+        let parties = test_parties(num_parties);
+        let transports = LocalTransport::create_mesh(&parties);
+
+        let config = MPCTrainerConfig {
+            d_in: 2,
+            d_hid: 2,
+            d_out: 1,
+            learning_rate: 0.01,
+            num_parties,
+            reshare_interval: 0,
+            beaver_batch_size: 512,
+            generate_proofs: false,
+            base_error: 1e-6,
+            checkpoint_interval: 1,
+            mac_config: None,
+        };
+
+        let initial_weights = ModelWeights::from_f64(
+            &[0.1, 0.2, 0.3, 0.4],
+            &[0.01, 0.02],
+            &[0.5, 0.6],
+            &[0.03],
+        );
+
+        let input = vec![1.0, 0.5];
+        let target = vec![1.0];
+
+        let mut handles = Vec::new();
+        for (i, transport) in transports.into_iter().enumerate() {
+            let cfg = config.clone();
+            let weights = if i == 0 {
+                Some(initial_weights.clone())
+            } else {
+                None
+            };
+            let inp = input.clone();
+            let tgt = target.clone();
+
+            let handle = tokio::spawn(async move {
+                let mut trainer = MPCTrainer::new(cfg, transport, i, 42);
+                trainer.share_weights(weights).await.unwrap();
+                trainer.generate_beaver_triples(512).await.unwrap();
+                let result = trainer.training_step_unproved(&inp, &tgt).await.unwrap();
+                (result.step, result.loss, result.reshared, result.step_error, trainer.current_step())
+            });
+            handles.push(handle);
+        }
+
+        let mut losses = Vec::new();
+        for handle in handles {
+            let (step, loss, reshared, step_error, current_step) = handle.await.unwrap();
+            assert_eq!(step, 0, "Step should be 0");
+            assert_eq!(current_step, 1, "current_step should be incremented to 1");
+            assert!(!reshared, "Should not reshare with interval=0");
+            assert!(loss.is_finite(), "Loss should be finite, got {}", loss);
+            assert!(step_error > 0.0, "Step error should be positive");
+            losses.push(loss);
+        }
+
+        // All parties should compute the same loss (y is reconstructed for loss).
+        for i in 1..losses.len() {
+            assert!(
+                (losses[i] - losses[0]).abs() < 0.01,
+                "Loss mismatch: party 0 = {}, party {} = {}",
+                losses[0], i, losses[i]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_training_epoch_no_proofs() {
+        let num_parties = 3;
+        let parties = test_parties(num_parties);
+        let transports = LocalTransport::create_mesh(&parties);
+
+        let config = MPCTrainerConfig {
+            d_in: 2,
+            d_hid: 2,
+            d_out: 1,
+            learning_rate: 0.01,
+            num_parties,
+            reshare_interval: 0,
+            beaver_batch_size: 2048,
+            generate_proofs: false,
+            base_error: 1e-6,
+            checkpoint_interval: 3, // Run 3 steps per epoch
+            mac_config: None,
+        };
+
+        let initial_weights = ModelWeights::from_f64(
+            &[0.1, 0.2, 0.3, 0.4],
+            &[0.01, 0.02],
+            &[0.5, 0.6],
+            &[0.03],
+        );
+
+        let data = vec![
+            (vec![1.0, 0.5], vec![1.0]),
+            (vec![0.5, 1.0], vec![0.0]),
+            (vec![1.0, 1.0], vec![1.0]),
+        ];
+
+        let mut handles = Vec::new();
+        for (i, transport) in transports.into_iter().enumerate() {
+            let cfg = config.clone();
+            let weights = if i == 0 {
+                Some(initial_weights.clone())
+            } else {
+                None
+            };
+            let d = data.clone();
+
+            let handle = tokio::spawn(async move {
+                let mut trainer = MPCTrainer::new(cfg, transport, i, 42);
+                trainer.share_weights(weights).await.unwrap();
+                trainer.generate_beaver_triples(2048).await.unwrap();
+                let result = trainer.training_epoch(&d).await.unwrap();
+                (result, trainer.current_step())
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            let (result, current_step) = handle.await.unwrap();
+
+            assert_eq!(result.start_step, 0, "Should start at step 0");
+            assert_eq!(result.end_step, 2, "Should end at step 2 (3 steps: 0, 1, 2)");
+            assert_eq!(result.losses.len(), 3, "Should have 3 losses");
+            assert_eq!(result.reshared_steps.len(), 3, "Should have 3 reshare flags");
+            assert!(result.total_error > 0.0, "Total error should be positive");
+            assert!(result.proof.is_none(), "No proof when generate_proofs=false");
+            assert_eq!(current_step, 3, "current_step should be 3 after 3 steps");
+
+            // All losses should be finite
+            for (i, loss) in result.losses.iter().enumerate() {
+                assert!(loss.is_finite(), "Loss at step {} should be finite, got {}", i, loss);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_interval_one_equivalent() {
+        // Verify that checkpoint_interval=1 with training_epoch produces
+        // similar results to a single training_step.
+        let num_parties = 3;
+        let parties = test_parties(num_parties);
+        let transports = LocalTransport::create_mesh(&parties);
+
+        let config = MPCTrainerConfig {
+            d_in: 2,
+            d_hid: 2,
+            d_out: 1,
+            learning_rate: 0.01,
+            num_parties,
+            reshare_interval: 0,
+            beaver_batch_size: 512,
+            generate_proofs: false,
+            base_error: 1e-6,
+            checkpoint_interval: 1, // epoch = single step
+            mac_config: None,
+        };
+
+        let initial_weights = ModelWeights::from_f64(
+            &[0.1, 0.2, 0.3, 0.4],
+            &[0.01, 0.02],
+            &[0.5, 0.6],
+            &[0.03],
+        );
+
+        let data = vec![(vec![1.0, 0.5], vec![1.0])];
+
+        // Run training_epoch with interval=1 on one set of parties.
+        let mut epoch_handles = Vec::new();
+        for (i, transport) in transports.into_iter().enumerate() {
+            let cfg = config.clone();
+            let weights = if i == 0 {
+                Some(initial_weights.clone())
+            } else {
+                None
+            };
+            let d = data.clone();
+
+            let handle = tokio::spawn(async move {
+                let mut trainer = MPCTrainer::new(cfg, transport, i, 42);
+                trainer.share_weights(weights).await.unwrap();
+                trainer.generate_beaver_triples(512).await.unwrap();
+                let result = trainer.training_epoch(&d).await.unwrap();
+                result
+            });
+            epoch_handles.push(handle);
+        }
+
+        // Run training_step on another set of parties with the same seed.
+        let parties2 = test_parties(num_parties);
+        let transports2 = LocalTransport::create_mesh(&parties2);
+
+        let mut step_handles = Vec::new();
+        for (i, transport) in transports2.into_iter().enumerate() {
+            let cfg = config.clone();
+            let weights = if i == 0 {
+                Some(initial_weights.clone())
+            } else {
+                None
+            };
+            let inp = data[0].0.clone();
+            let tgt = data[0].1.clone();
+
+            let handle = tokio::spawn(async move {
+                let mut trainer = MPCTrainer::new(cfg, transport, i, 42);
+                trainer.share_weights(weights).await.unwrap();
+                trainer.generate_beaver_triples(512).await.unwrap();
+                let result = trainer.training_step(&inp, &tgt).await.unwrap();
+                result
+            });
+            step_handles.push(handle);
+        }
+
+        // Compare party 0's results.
+        let epoch_result = epoch_handles.into_iter().next().unwrap().await.unwrap();
+        let step_result = step_handles.into_iter().next().unwrap().await.unwrap();
+
+        assert_eq!(epoch_result.losses.len(), 1, "Epoch with interval=1 should have 1 loss");
+        assert_eq!(epoch_result.start_step, 0);
+        assert_eq!(epoch_result.end_step, 0);
+
+        // The losses should match since they're the same computation
+        // with the same seed and same data.
+        assert!(
+            (epoch_result.losses[0] - step_result.loss).abs() < 0.001,
+            "Epoch loss ({}) should match step loss ({}) within tolerance",
+            epoch_result.losses[0],
+            step_result.loss,
+        );
     }
 }

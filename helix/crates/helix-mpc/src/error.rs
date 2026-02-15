@@ -106,6 +106,9 @@ pub enum MPCError {
 
     #[error("replay attack detected: duplicate sequence {sequence} from party {party}")]
     ReplayAttack { sequence: u64, party: PartyId },
+
+    #[error("MAC verification failed at step {step}: cheater identified as party {cheater:?}")]
+    MACCheckFailed { step: u64, cheater: Option<usize> },
 }
 
 /// Result type for MPC operations.

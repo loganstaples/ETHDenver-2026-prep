@@ -130,6 +130,8 @@ async fn test_distributed_vs_trusted_dealer_training() {
         beaver_batch_size: 256,
         generate_proofs: false,
         base_error: 1e-6,
+        checkpoint_interval: 1,
+        mac_config: None,
     };
 
     let initial_weights = ModelWeights::from_f64(

@@ -99,6 +99,11 @@ struct Args {
     /// Path to model architecture config (JSON file)
     #[arg(long)]
     model_config: Option<PathBuf>,
+
+    /// Checkpoint proving interval: generate ZK proof every N steps (1 = every step).
+    /// Higher values reduce proving overhead by using MPC consensus between checkpoints.
+    #[arg(long, default_value = "1")]
+    checkpoint_interval: u64,
 }
 
 /// Parses CLI dataset args into a `DatasetSource`.
@@ -235,12 +240,17 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // ── Phase 3: Distributed Training ────────────────────────────────────
+    let checkpoint_desc = if args.checkpoint_interval > 1 {
+        format!(", checkpoint every {} steps", args.checkpoint_interval)
+    } else {
+        String::new()
+    };
     display::phase(
         3,
         "DISTRIBUTED TRAINING",
         &format!(
-            "{} workers x {} steps (lr={}, arch={}x{}x{})",
-            args.workers, args.steps, args.lr, arch.d_in, arch.d_hid, arch.d_out
+            "{} workers x {} steps (lr={}, arch={}x{}x{}{})",
+            args.workers, args.steps, args.lr, arch.d_in, arch.d_hid, arch.d_out, checkpoint_desc
         ),
     );
 
@@ -264,6 +274,7 @@ async fn main() -> anyhow::Result<()> {
         args.lr,
         args.seed,
         &dataset,
+        args.checkpoint_interval,
     )
     .await?;
 

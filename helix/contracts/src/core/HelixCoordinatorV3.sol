@@ -220,6 +220,15 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
     /// @notice Maximum accumulated error allowed per model (0 = no limit)
     mapping(uint256 => uint256) public modelMaxAccumulatedError;
 
+    /// @notice Per-model checkpoint proving interval (proof required every N steps)
+    mapping(uint256 => uint32) public modelCheckpointInterval;
+
+    /// @notice Maximum allowed checkpoint interval
+    uint32 public constant MAX_CHECKPOINT_INTERVAL = 1000;
+
+    /// @notice Default checkpoint interval (every step — backward compatible)
+    uint32 public constant DEFAULT_CHECKPOINT_INTERVAL = 1;
+
     // ============ Events ============
 
     event ModelRegistered(
@@ -292,6 +301,8 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
         uint256 totalError,
         uint256 totalLoss
     );
+
+    event CheckpointIntervalUpdated(uint256 indexed modelId, uint32 oldInterval, uint32 newInterval);
 
     /// @notice Emitted when a proof is accepted with full details
     event ProofAccepted(
@@ -426,7 +437,44 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
             active: true
         });
 
+        modelCheckpointInterval[modelId] = DEFAULT_CHECKPOINT_INTERVAL;
+
         // Register in ModelRegistry for checkpoint history with architecture
+        modelRegistry.registerModel(
+            name, description, ipfsHash, bytes32(initialCommitment),
+            ModelRegistry.ModelArchitecture(dIn, dHidden, dOut, numLayers, activationType)
+        );
+
+        emit ModelRegistered(modelId, msg.sender, initialCommitment, ipfsHash);
+    }
+
+    /// @notice Registers a new model with a custom checkpoint proving interval
+    function registerModelWithCheckpoint(
+        string memory name,
+        string memory description,
+        string memory ipfsHash,
+        uint256 initialCommitment,
+        uint32 dIn,
+        uint32 dHidden,
+        uint32 dOut,
+        uint32 numLayers,
+        uint8 activationType,
+        uint32 checkpointInterval
+    ) external whenNotPaused nonReentrant returns (uint256 modelId) {
+        require(checkpointInterval > 0 && checkpointInterval <= MAX_CHECKPOINT_INTERVAL, "Invalid checkpoint interval");
+
+        modelId = nextModelId++;
+
+        models[modelId] = Model({
+            ipfsHash: ipfsHash,
+            currentCommitment: initialCommitment,
+            owner: msg.sender,
+            currentRound: 0,
+            active: true
+        });
+
+        modelCheckpointInterval[modelId] = checkpointInterval;
+
         modelRegistry.registerModel(
             name, description, ipfsHash, bytes32(initialCommitment),
             ModelRegistry.ModelArchitecture(dIn, dHidden, dOut, numLayers, activationType)
@@ -505,7 +553,8 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
         });
 
         // Set expected step number for proofs in this round
-        roundExpectedStep[modelId][roundId] = lastStepNumber[modelId] + 1;
+        uint32 interval = _getCheckpointInterval(modelId);
+        roundExpectedStep[modelId][roundId] = lastStepNumber[modelId] + interval;
 
         // Set error budget if specified
         if (maxErrorBudget > 0) {
@@ -607,14 +656,15 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
         // Step number sequencing
         uint256 proofStep = publicInputs[6];
         uint256 expectedStep = roundExpectedStep[modelId][roundId];
+        uint32 interval = _getCheckpointInterval(modelId);
         if (expectedStep == 0) {
-            expectedStep = lastStepNumber[modelId] + 1;
+            expectedStep = lastStepNumber[modelId] + interval;
         }
         require(proofStep == expectedStep, "Step number mismatch");
 
-        // Error bound
+        // Error bound (scales with checkpoint interval)
         uint256 stepErrorBound = publicInputs[5];
-        require(stepErrorBound <= maxErrorBound, "Error bound exceeds maximum");
+        require(stepErrorBound <= maxErrorBound * interval, "Error bound exceeds maximum");
 
         // Error checksum
         uint256 expectedChecksum = _computeErrorChecksum(
@@ -743,7 +793,8 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
         uint256 proofStep = publicInputs[6];
         uint256 expectedStep = roundExpectedStep[modelId][roundId];
         if (expectedStep == 0) {
-            expectedStep = lastStepNumber[modelId] + 1;
+            uint32 interval = _getCheckpointInterval(modelId);
+            expectedStep = lastStepNumber[modelId] + interval;
         }
         require(proofStep == expectedStep, "Step number mismatch");
 
@@ -830,7 +881,8 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
             // Advance step counter by numSteps
             uint256 expectedStep = roundExpectedStep[modelId][roundId];
             if (expectedStep == 0) {
-                expectedStep = lastStepNumber[modelId] + 1;
+                uint32 interval = _getCheckpointInterval(modelId);
+                expectedStep = lastStepNumber[modelId] + interval;
             }
             lastStepNumber[modelId] = expectedStep + numSteps - 1;
 
@@ -982,7 +1034,8 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
         // Advance step counter on finalization
         uint256 expectedStep = roundExpectedStep[modelId][roundId];
         if (expectedStep == 0) {
-            expectedStep = lastStepNumber[modelId] + 1;
+            uint32 interval = _getCheckpointInterval(modelId);
+            expectedStep = lastStepNumber[modelId] + interval;
         }
         lastStepNumber[modelId] = expectedStep;
 
@@ -1187,6 +1240,36 @@ contract HelixCoordinatorV3 is ReentrancyGuard {
         if (roundHalted[modelId][roundId]) {
             roundHalted[modelId][roundId] = false;
         }
+    }
+
+    // ============ Checkpoint Interval Management ============
+
+    /// @notice Sets the checkpoint proving interval for a model
+    /// @dev Only callable by model owner, cannot change during an active round
+    function setCheckpointInterval(uint256 modelId, uint32 newInterval) external whenNotPaused nonReentrant {
+        require(models[modelId].owner == msg.sender, "Only model owner");
+        require(newInterval > 0 && newInterval <= MAX_CHECKPOINT_INTERVAL, "Invalid checkpoint interval");
+
+        // Prevent changing during active round
+        uint32 currentRound = models[modelId].currentRound;
+        if (currentRound > 0) {
+            require(rounds[modelId][currentRound].isCompleted, "Cannot change during active round");
+        }
+
+        uint32 oldInterval = modelCheckpointInterval[modelId];
+        modelCheckpointInterval[modelId] = newInterval;
+        emit CheckpointIntervalUpdated(modelId, oldInterval, newInterval);
+    }
+
+    /// @notice Returns the checkpoint interval for a model (defaults to 1 if unset)
+    function getCheckpointInterval(uint256 modelId) external view returns (uint32) {
+        return _getCheckpointInterval(modelId);
+    }
+
+    /// @dev Internal helper to get checkpoint interval with default
+    function _getCheckpointInterval(uint256 modelId) internal view returns (uint32) {
+        uint32 interval = modelCheckpointInterval[modelId];
+        return interval == 0 ? DEFAULT_CHECKPOINT_INTERVAL : interval;
     }
 
     // ============ Error Checksum ============

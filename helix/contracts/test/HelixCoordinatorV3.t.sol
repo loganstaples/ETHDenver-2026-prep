@@ -513,6 +513,213 @@ contract HelixCoordinatorV3Test is Test {
         (uint256 amount,,,) = staking.getStakeInfo(staker);
         return amount;
     }
+
+    // ============ Checkpoint Interval Tests ============
+
+    function test_RegisterModelDefaultCheckpointInterval() public {
+        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", 100, 4, 8, 2, 2, 0);
+        assertEq(coordinator.getCheckpointInterval(modelId), 1);
+        assertEq(coordinator.modelCheckpointInterval(modelId), 1);
+    }
+
+    function test_RegisterModelWithCheckpointInterval() public {
+        uint256 oldHashLo = 12345;
+        uint256 oldHashHi = 67890;
+        uint256 correctCommitment = uint256(keccak256(abi.encodePacked(oldHashLo, oldHashHi)));
+
+        uint256 modelId = coordinator.registerModelWithCheckpoint(
+            "Model", "desc", "hash", correctCommitment, 4, 8, 2, 2, 0, 10
+        );
+        assertEq(coordinator.getCheckpointInterval(modelId), 10);
+    }
+
+    function test_RegisterModelZeroIntervalReverts() public {
+        vm.expectRevert("Invalid checkpoint interval");
+        coordinator.registerModelWithCheckpoint(
+            "Model", "desc", "hash", 100, 4, 8, 2, 2, 0, 0
+        );
+    }
+
+    function test_RegisterModelExceedsMaxIntervalReverts() public {
+        vm.expectRevert("Invalid checkpoint interval");
+        coordinator.registerModelWithCheckpoint(
+            "Model", "desc", "hash", 100, 4, 8, 2, 2, 0, 1001
+        );
+    }
+
+    function test_StepSequencingWithCheckpointInterval() public {
+        uint256 oldHashLo = 12345;
+        uint256 oldHashHi = 67890;
+        uint256 correctCommitment = uint256(keccak256(abi.encodePacked(oldHashLo, oldHashHi)));
+
+        // Register with interval=5 (proof required every 5 steps)
+        uint256 modelId = coordinator.registerModelWithCheckpoint(
+            "Model", "desc", "hash", correctCommitment, 4, 8, 2, 2, 0, 5
+        );
+        coordinator.startRound(modelId, ROUND_DURATION);
+
+        // Step should be 5 (0 + interval=5)
+        uint256[] memory publicInputs = _buildPublicInputs(oldHashLo, oldHashHi, 99999, 88888, 100, 10, 5, modelId);
+        bytes memory proof = ProofFixtureHardcoded.createValidProof();
+
+        vm.prank(prover1);
+        coordinator.submitProof(modelId, 1, proof, publicInputs);
+
+        // Verify step advanced to 5
+        assertEq(coordinator.lastStepNumber(modelId), 5);
+    }
+
+    function test_WrongStepNumberWithIntervalReverts() public {
+        uint256 oldHashLo = 12345;
+        uint256 oldHashHi = 67890;
+        uint256 correctCommitment = uint256(keccak256(abi.encodePacked(oldHashLo, oldHashHi)));
+
+        // Register with interval=5
+        uint256 modelId = coordinator.registerModelWithCheckpoint(
+            "Model", "desc", "hash", correctCommitment, 4, 8, 2, 2, 0, 5
+        );
+        coordinator.startRound(modelId, ROUND_DURATION);
+
+        // Try submitting with step=1 (should be step=5 with interval=5)
+        uint256[] memory publicInputs = _buildPublicInputs(oldHashLo, oldHashHi, 99999, 88888, 100, 10, 1, modelId);
+        bytes memory proof = ProofFixtureHardcoded.createValidProof();
+
+        vm.prank(prover1);
+        vm.expectRevert("Step number mismatch");
+        coordinator.submitProof(modelId, 1, proof, publicInputs);
+    }
+
+    function test_ErrorBoundScalesWithInterval() public {
+        uint256 oldHashLo = 12345;
+        uint256 oldHashHi = 67890;
+        uint256 correctCommitment = uint256(keccak256(abi.encodePacked(oldHashLo, oldHashHi)));
+
+        // Register with interval=10
+        uint256 modelId = coordinator.registerModelWithCheckpoint(
+            "Model", "desc", "hash", correctCommitment, 4, 8, 2, 2, 0, 10
+        );
+
+        // Set a low maxErrorBound
+        coordinator.setMaxErrorBound(100);
+
+        coordinator.startRound(modelId, ROUND_DURATION);
+
+        // Error bound of 500 should be accepted (100 * interval=10 = 1000 max)
+        uint256[] memory publicInputs = _buildPublicInputs(oldHashLo, oldHashHi, 99999, 88888, 100, 500, 10, modelId);
+        bytes memory proof = ProofFixtureHardcoded.createValidProof();
+
+        vm.prank(prover1);
+        coordinator.submitProof(modelId, 1, proof, publicInputs);
+
+        assertEq(coordinator.getAccumulatedErrorBound(modelId), 500);
+    }
+
+    function test_ErrorBoundExceedsScaledMaxReverts() public {
+        uint256 oldHashLo = 12345;
+        uint256 oldHashHi = 67890;
+        uint256 correctCommitment = uint256(keccak256(abi.encodePacked(oldHashLo, oldHashHi)));
+
+        // Register with interval=5
+        uint256 modelId = coordinator.registerModelWithCheckpoint(
+            "Model", "desc", "hash", correctCommitment, 4, 8, 2, 2, 0, 5
+        );
+
+        // Set maxErrorBound to 100 (so max for interval=5 is 500)
+        coordinator.setMaxErrorBound(100);
+
+        coordinator.startRound(modelId, ROUND_DURATION);
+
+        // Error bound of 501 should fail (100 * 5 = 500 max)
+        uint256[] memory publicInputs = _buildPublicInputs(oldHashLo, oldHashHi, 99999, 88888, 100, 501, 5, modelId);
+        bytes memory proof = ProofFixtureHardcoded.createValidProof();
+
+        vm.prank(prover1);
+        vm.expectRevert("Error bound exceeds maximum");
+        coordinator.submitProof(modelId, 1, proof, publicInputs);
+    }
+
+    function test_SetCheckpointInterval() public {
+        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", 100, 4, 8, 2, 2, 0);
+        assertEq(coordinator.getCheckpointInterval(modelId), 1);
+
+        coordinator.setCheckpointInterval(modelId, 20);
+        assertEq(coordinator.getCheckpointInterval(modelId), 20);
+    }
+
+    function test_SetCheckpointIntervalOnlyOwner() public {
+        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", 100, 4, 8, 2, 2, 0);
+
+        vm.prank(prover1);
+        vm.expectRevert("Only model owner");
+        coordinator.setCheckpointInterval(modelId, 10);
+    }
+
+    function test_SetCheckpointIntervalDuringActiveRoundReverts() public {
+        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", 100, 4, 8, 2, 2, 0);
+        coordinator.startRound(modelId, ROUND_DURATION);
+
+        vm.expectRevert("Cannot change during active round");
+        coordinator.setCheckpointInterval(modelId, 10);
+    }
+
+    function test_CrossRoundCheckpointContinuity() public {
+        uint256 oldHashLo = 12345;
+        uint256 oldHashHi = 67890;
+        uint256 correctCommitment = uint256(keccak256(abi.encodePacked(oldHashLo, oldHashHi)));
+
+        // Register with interval=3
+        uint256 modelId = coordinator.registerModelWithCheckpoint(
+            "Model", "desc", "hash", correctCommitment, 4, 8, 2, 2, 0, 3
+        );
+
+        // Round 1: step should be 3
+        coordinator.startRound(modelId, ROUND_DURATION);
+
+        uint256 newHashLo1 = 99999;
+        uint256 newHashHi1 = 88888;
+        uint256[] memory publicInputs1 = _buildPublicInputs(oldHashLo, oldHashHi, newHashLo1, newHashHi1, 100, 10, 3, modelId);
+        bytes memory proof1 = ProofFixtureHardcoded.createValidProof();
+
+        vm.prank(prover1);
+        coordinator.submitProof(modelId, 1, proof1, publicInputs1);
+        assertEq(coordinator.lastStepNumber(modelId), 3);
+
+        // Round 2: step should be 6 (3 + interval=3)
+        uint256 newCommitment1 = uint256(keccak256(abi.encodePacked(newHashLo1, newHashHi1)));
+        coordinator.startRound(modelId, ROUND_DURATION);
+
+        // Need new commitment as old hash
+        uint256 newHashLo2 = 77777;
+        uint256 newHashHi2 = 66666;
+        uint256[] memory publicInputs2 = _buildPublicInputs(newHashLo1, newHashHi1, newHashLo2, newHashHi2, 90, 8, 6, modelId);
+        bytes memory proof2 = ProofFixtureHardcoded.createValidProof();
+
+        vm.prank(prover1);
+        coordinator.submitProof(modelId, 2, proof2, publicInputs2);
+        assertEq(coordinator.lastStepNumber(modelId), 6);
+    }
+
+    function test_CheckpointIntervalBackwardCompat() public {
+        // Standard registration (no checkpoint parameter) should work exactly as before
+        uint256 oldHashLo = 12345;
+        uint256 oldHashHi = 67890;
+        uint256 correctCommitment = uint256(keccak256(abi.encodePacked(oldHashLo, oldHashHi)));
+
+        uint256 modelId = coordinator.registerModel("Model", "desc", "hash", correctCommitment, 4, 8, 2, 2, 0);
+        assertEq(coordinator.getCheckpointInterval(modelId), 1);
+
+        coordinator.startRound(modelId, ROUND_DURATION);
+
+        // Step=1 should work (interval=1, backward compatible)
+        uint256[] memory publicInputs = _buildPublicInputs(oldHashLo, oldHashHi, 99999, 88888, 100, 10, 1, modelId);
+        bytes memory proof = ProofFixtureHardcoded.createValidProof();
+
+        vm.prank(prover1);
+        coordinator.submitProof(modelId, 1, proof, publicInputs);
+
+        assertEq(coordinator.lastStepNumber(modelId), 1);
+        assertEq(coordinator.getAccumulatedErrorBound(modelId), 10);
+    }
 }
 
 /// @notice Mock verifier for V3 tests
