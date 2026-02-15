@@ -17,6 +17,9 @@ pub mod chain;
 #[cfg(feature = "chain")]
 pub mod chain_v3;
 
+#[cfg(feature = "chain")]
+pub mod chain_v4;
+
 pub mod client;
 
 #[cfg(feature = "chain")]
@@ -26,6 +29,14 @@ pub use chain::{ChainClient, ChainCircuitBreaker, ChainCircuitState, ChainModelS
 pub use chain_v3::{
     ChainClientV3, ChainRoundExtState, ChainV3StakeInfo,
     ChainRewardPoolInfo, ChainParticipantStats, ForgeDeployResultV3,
+};
+
+#[cfg(feature = "chain")]
+pub use chain_v4::{
+    ChainClientV4, V4DeployResult, V4JobSummary, V4WorkerInfo,
+    V4Checkpoint, V4MACFailureReport,
+    build_checkpoint_message, build_mac_failure_message, build_completion_message,
+    sign_checkpoint, sign_mac_failure, sign_completion,
 };
 
 pub use client::{

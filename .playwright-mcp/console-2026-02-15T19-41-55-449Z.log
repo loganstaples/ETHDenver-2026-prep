@@ -1,0 +1,43 @@
+[  131378ms] [ERROR] Failed to load resource: the server responded with a status of 500 (Internal Server Error) @ http://localhost:1420/src/components/settings/SettingsOverlay.tsx?t=1771184646809:0
+[  131378ms] [ERROR] [vite] Failed to reload /src/components/settings/SettingsOverlay.tsx. This could be due to syntax errors or importing non-existent modules. (see errors above) @ http://localhost:1420/@vite/client:881
+[  139267ms] TypeError: Cannot read properties of null (reading 'cpu_threads')
+    at SettingsOverlay (http://localhost:1420/src/components/settings/SettingsOverlay.tsx?t=1771184654675:183:143)
+    at renderWithHooks (http://localhost:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=a4e4de28:11596:26)
+    at updateFunctionComponent (http://localhost:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=a4e4de28:14630:28)
+    at beginWork (http://localhost:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=a4e4de28:15972:22)
+    at HTMLUnknownElement.callCallback2 (http://localhost:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=a4e4de28:3680:22)
+    at Object.invokeGuardedCallbackDev (http://localhost:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=a4e4de28:3705:24)
+    at invokeGuardedCallback (http://localhost:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=a4e4de28:3739:39)
+    at beginWork$1 (http://localhost:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=a4e4de28:19818:15)
+    at performUnitOfWork (http://localhost:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=a4e4de28:19251:20)
+    at workLoopSync (http://localhost:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=a4e4de28:19190:13)
+[  139268ms] TypeError: Cannot read properties of null (reading 'cpu_threads')
+    at SettingsOverlay (http://localhost:1420/src/components/settings/SettingsOverlay.tsx?t=1771184654675:183:143)
+    at renderWithHooks (http://localhost:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=a4e4de28:11596:26)
+    at updateFunctionComponent (http://localhost:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=a4e4de28:14630:28)
+    at beginWork (http://localhost:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=a4e4de28:15972:22)
+    at HTMLUnknownElement.callCallback2 (http://localhost:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=a4e4de28:3680:22)
+    at Object.invokeGuardedCallbackDev (http://localhost:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=a4e4de28:3705:24)
+    at invokeGuardedCallback (http://localhost:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=a4e4de28:3739:39)
+    at beginWork$1 (http://localhost:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=a4e4de28:19818:15)
+    at performUnitOfWork (http://localhost:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=a4e4de28:19251:20)
+    at workLoopSync (http://localhost:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=a4e4de28:19190:13)
+[  139268ms] [ERROR] The above error occurred in the <SettingsOverlay> component:
+
+    at SettingsOverlay (http://localhost:1420/src/components/settings/SettingsOverlay.tsx?t=1771184654675:111:35)
+    at div
+    at App (http://localhost:1420/src/App.tsx?t=1771184483960:27:73)
+
+Consider adding an error boundary to your tree to customize error handling behavior.
+Visit https://reactjs.org/link/error-boundaries to learn more about error boundaries. @ http://localhost:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=a4e4de28:14079
+[  139268ms] TypeError: Cannot read properties of null (reading 'cpu_threads')
+    at SettingsOverlay (http://localhost:1420/src/components/settings/SettingsOverlay.tsx?t=1771184654675:183:143)
+    at renderWithHooks (http://localhost:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=a4e4de28:11596:26)
+    at updateFunctionComponent (http://localhost:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=a4e4de28:14630:28)
+    at beginWork (http://localhost:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=a4e4de28:15972:22)
+    at beginWork$1 (http://localhost:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=a4e4de28:19806:22)
+    at performUnitOfWork (http://localhost:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=a4e4de28:19251:20)
+    at workLoopSync (http://localhost:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=a4e4de28:19190:13)
+    at renderRootSync (http://localhost:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=a4e4de28:19169:15)
+    at recoverFromConcurrentError (http://localhost:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=a4e4de28:18786:28)
+    at performSyncWorkOnRoot (http://localhost:1420/node_modules/.vite/deps/chunk-NXESFFTV.js?v=a4e4de28:18932:28)
