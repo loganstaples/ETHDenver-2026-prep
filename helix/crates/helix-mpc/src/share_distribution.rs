@@ -107,6 +107,14 @@ pub struct VectorCommitment {
 }
 
 impl VectorCommitment {
+    /// Produces a deterministic 32-byte hash of the aggregate commitment.
+    ///
+    /// This is used for on-chain storage as a Solidity `bytes32` value.
+    /// Delegates to `PedersenCommitment::to_bytes32()` on the aggregate point.
+    pub fn to_bytes32(&self) -> [u8; 32] {
+        self.aggregate.to_bytes32()
+    }
+
     /// Verifies the full commitment against known values and blindings.
     pub fn verify(
         &self,

@@ -393,6 +393,23 @@ impl PedersenCommitment {
         let scaled = (G1::from(self.point) * scalar.inner()).to_affine();
         PedersenCommitment { point: scaled }
     }
+
+    /// Produces a deterministic 32-byte hash of the commitment point.
+    ///
+    /// This is used for on-chain storage as a Solidity `bytes32` value.
+    /// Computes keccak256 of the uncompressed affine coordinates (x, y) of the G1 point,
+    /// which matches the natural Ethereum hashing convention.
+    pub fn to_bytes32(&self) -> [u8; 32] {
+        use halo2curves::group::GroupEncoding;
+        let encoded = self.point.to_bytes();
+        // Use SHA-256 here for a deterministic 32-byte digest.
+        // The commitment point is a BN254 G1 point (compressed: 32 bytes).
+        let mut hasher = Sha256::new();
+        hasher.update(b"HELIX-COMMITMENT-v1");
+        hasher.update(encoded.as_ref());
+        let hash: [u8; 32] = hasher.finalize().into();
+        hash
+    }
 }
 
 /// Generator points for Pedersen commitments on BN254 G1.

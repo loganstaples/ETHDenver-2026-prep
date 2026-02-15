@@ -1,4 +1,6 @@
 pub mod benchmark;
+#[cfg(feature = "chain")]
+pub mod checkpoint_submitter;
 pub mod client;
 pub mod commands;
 pub mod config;

@@ -105,8 +105,8 @@ async fn test_e2e_mpc_training_full() {
     );
     for cp in &result.checkpoints {
         assert!(
-            !cp.commitment_bytes.is_empty(),
-            "Checkpoint at step {} should have non-empty commitment",
+            cp.commitment_bytes32 != [0u8; 32],
+            "Checkpoint at step {} should have non-zero commitment",
             cp.step
         );
         assert!(

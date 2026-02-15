@@ -20,6 +20,9 @@ use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use crate::checkpoint_attestation::{
+    CheckpointAttestationConfig, CheckpointAttestationManager, OnChainCheckpoint,
+};
 use crate::error::MPCError;
 use crate::field::Fr;
 use crate::mac_verification::{MACFailureReport, MACVerificationConfig};
@@ -27,7 +30,6 @@ use crate::mpc_trainer::{MPCTrainer, MPCTrainerConfig, ModelWeights};
 use crate::security::commitment::PedersenGenerators;
 use crate::session::node_transport::NodeTransport;
 use crate::session::transport::LocalTransport;
-use crate::share_distribution::{CheckpointCommitment, CommitmentShare, WeightShare};
 use crate::types::PartyId;
 
 // ============================================================================
@@ -143,8 +145,8 @@ pub struct FinalWeights {
 pub struct CheckpointRecord {
     /// Training step at which this checkpoint was taken.
     pub step: usize,
-    /// Serialized aggregate commitment bytes.
-    pub commitment_bytes: Vec<u8>,
+    /// Combined Pedersen commitment hash (bytes32, for on-chain `weightCommitment`).
+    pub commitment_bytes32: [u8; 32],
     /// Loss at this checkpoint.
     pub loss: f64,
 }
@@ -652,7 +654,8 @@ struct PartyResult {
     final_b1: Vec<Fr>,
     final_w2: Vec<Fr>,
     final_b2: Vec<Fr>,
-    checkpoint_commitments: Vec<(usize, CommitmentShare, f64)>,
+    /// Combined on-chain checkpoints (exchanged and combined during training).
+    checkpoints: Vec<OnChainCheckpoint>,
 }
 
 /// Runs training for a single party.
@@ -697,10 +700,15 @@ async fn run_party_training<T: crate::session::transport::MPCTransport + 'static
     let mut cheater_detected: Option<CheaterRecord> = None;
     let mut steps_completed = 0usize;
 
-    // Checkpoint state.
+    // Checkpoint attestation manager: handles exchange + combine during training.
     let generators = PedersenGenerators::default();
-    let checkpoint_system = CheckpointCommitment::with_generators(generators);
-    let mut checkpoint_commitments: Vec<(usize, CommitmentShare, f64)> = Vec::new();
+    let attestation_config = CheckpointAttestationConfig {
+        generators,
+        num_parties: config.num_parties,
+        party_index,
+    };
+    let attestation_manager = CheckpointAttestationManager::new(attestation_config);
+    let mut checkpoints: Vec<OnChainCheckpoint> = Vec::new();
     let mut rng = ChaCha20Rng::seed_from_u64(seed.wrapping_add(party_index as u64 * 1000));
 
     for step in 0..num_steps {
@@ -772,7 +780,7 @@ async fn run_party_training<T: crate::session::transport::MPCTransport + 'static
             "Training step completed"
         );
 
-        // Pedersen checkpoint at configured intervals.
+        // Pedersen checkpoint at configured intervals: exchange + combine via transport.
         if checkpoint_interval > 0 && (step + 1) % checkpoint_interval == 0 {
             let (w1, b1, w2, b2) = trainer.weight_shares();
             let all_weights: Vec<Fr> = w1.iter()
@@ -786,24 +794,25 @@ async fn run_party_training<T: crate::session::transport::MPCTransport + 'static
                 .map(|_| Fr::random(&mut rng))
                 .collect();
 
-            let weight_share = WeightShare {
-                party: PartyId::from_index(party_index),
-                index: party_index,
-                data: all_weights,
-                shape: vec![w1.len() + b1.len() + w2.len() + b2.len()],
-            };
+            let checkpoint = attestation_manager
+                .create_checkpoint(
+                    &all_weights,
+                    &blindings,
+                    step + 1,
+                    step_result.loss,
+                    trainer.transport(),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("checkpoint attestation failed: {}", e))?;
 
-            let commitment_share = checkpoint_system
-                .compute_share(&weight_share, &blindings)
-                .map_err(|e| anyhow::anyhow!("checkpoint commitment failed: {}", e))?;
-
-            checkpoint_commitments.push((step + 1, commitment_share, step_result.loss));
-
-            debug!(
+            info!(
                 party = party_index,
                 step = step + 1,
-                "Pedersen checkpoint computed"
+                loss = step_result.loss,
+                "On-chain checkpoint created and exchanged"
             );
+
+            checkpoints.push(checkpoint);
         }
     }
 
@@ -828,7 +837,7 @@ async fn run_party_training<T: crate::session::transport::MPCTransport + 'static
         final_b1: final_b1.to_vec(),
         final_w2: final_w2.to_vec(),
         final_b2: final_b2.to_vec(),
-        checkpoint_commitments,
+        checkpoints,
     })
 }
 
@@ -886,41 +895,27 @@ async fn collect_results(
         b2: b2_sum.iter().map(|fr| fr.to_f64()).collect(),
     };
 
-    // Combine Pedersen checkpoints across parties.
-    let checkpoint_system = CheckpointCommitment::new();
-    let mut checkpoints: Vec<CheckpointRecord> = Vec::new();
+    // Checkpoints were already exchanged and combined during training.
+    // All parties should agree on the same commitments — take party 0's records.
+    let checkpoints: Vec<CheckpointRecord> = party_results[0]
+        .checkpoints
+        .iter()
+        .map(|cp| CheckpointRecord {
+            step: cp.step,
+            commitment_bytes32: cp.commitment_bytes32,
+            loss: cp.loss,
+        })
+        .collect();
 
-    // Group checkpoint commitments by step.
-    let max_checkpoints = party_results[0].checkpoint_commitments.len();
-    for cp_idx in 0..max_checkpoints {
-        let step = party_results[0].checkpoint_commitments[cp_idx].0;
-        let loss = party_results[0].checkpoint_commitments[cp_idx].2;
-
-        let mut commitment_shares: Vec<CommitmentShare> = Vec::new();
-        for pr in &party_results {
-            if cp_idx < pr.checkpoint_commitments.len() {
-                commitment_shares.push(pr.checkpoint_commitments[cp_idx].1.clone());
-            }
-        }
-
-        if commitment_shares.len() == num_workers {
-            match checkpoint_system.combine_shares(&commitment_shares) {
-                Ok(combined) => {
-                    // Serialize the aggregate commitment for the record.
-                    let commitment_bytes = format!(
-                        "checkpoint-step-{}-parties-{}",
-                        step, num_workers
-                    ).into_bytes();
-
-                    checkpoints.push(CheckpointRecord {
-                        step,
-                        commitment_bytes,
-                        loss,
-                    });
-                }
-                Err(e) => {
-                    warn!(step = step, error = %e, "Failed to combine checkpoint shares");
-                }
+    // Verify all parties agree on checkpoint commitments.
+    for pr in &party_results[1..] {
+        for (i, cp) in pr.checkpoints.iter().enumerate() {
+            if i < checkpoints.len() && cp.commitment_bytes32 != checkpoints[i].commitment_bytes32 {
+                warn!(
+                    party = pr.party_index,
+                    step = cp.step,
+                    "Checkpoint commitment mismatch between parties"
+                );
             }
         }
     }

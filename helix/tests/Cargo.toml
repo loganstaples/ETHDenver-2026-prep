@@ -228,6 +228,11 @@ name = "e2e_cheater_detection"
 path = "integration/e2e_cheater_detection.rs"
 required-features = ["integration"]
 
+[[test]]
+name = "e2e_onchain_checkpoint"
+path = "integration/e2e_onchain_checkpoint.rs"
+required-features = ["integration"]
+
 # ============================================================================
 # E2E Resilience Tests (Stage 8)
 # ============================================================================
@@ -242,7 +247,7 @@ parallel = ["rayon"]
 metal = ["helix-prover/metal"]
 on-chain = ["ethers"]
 full-pipeline = ["on-chain"]
-integration = ["on-chain"]
+integration = ["on-chain", "helix-client/chain", "helix-mpc/network-mpc"]
 
 [dependencies.rayon]
 version = "1.10"

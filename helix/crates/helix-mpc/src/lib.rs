@@ -21,6 +21,7 @@
 #![allow(unexpected_cfgs)]
 
 pub mod beaver;
+pub mod checkpoint_attestation;
 pub mod e2e_integration;
 pub mod error;
 pub mod error_containment;
