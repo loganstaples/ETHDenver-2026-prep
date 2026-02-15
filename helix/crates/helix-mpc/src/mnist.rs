@@ -3,12 +3,15 @@
 //! Provides end-to-end MPC training for a 784→32→10 MLP on MNIST data,
 //! including:
 //!
+//! - Real MNIST data loading (download + disk cache + IDX parsing)
 //! - Synthetic MNIST data generation for deterministic testing
 //! - Optimized batched forward/backward pass at MNIST scale
 //! - Loss revelation protocol (jointly reveal scalar loss without leaking weights)
 //! - Periodic accuracy evaluation via MPC inference
-//! - Softmax + cross-entropy loss for proper classification training
+//! - Mini-batch and single-sample SGD for native training
 //! - Native (non-MPC) trainer for correctness comparison
+
+use std::path::{Path, PathBuf};
 
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
@@ -238,6 +241,357 @@ impl MnistDataset {
             .map(|s| (s.pixels.clone(), s.label.clone()))
             .collect()
     }
+
+    /// Returns the default cache directory for MNIST data.
+    ///
+    /// Priority: `$HELIX_DATA_DIR/mnist/`, then `~/.helix/data/mnist/`.
+    pub fn default_cache_dir() -> PathBuf {
+        if let Ok(dir) = std::env::var("HELIX_DATA_DIR") {
+            return PathBuf::from(dir).join("mnist");
+        }
+        dirs_or_home().join(".helix").join("data").join("mnist")
+    }
+
+    /// Loads the real MNIST dataset from disk cache, downloading if necessary.
+    ///
+    /// This loads the standard MNIST dataset (60K train + 10K test) from Yann
+    /// LeCun's IDX format files. Files are downloaded from a reliable mirror
+    /// and cached on disk for subsequent runs.
+    ///
+    /// Pixel values are normalized to [0, 1] (divided by 255). Labels are
+    /// converted to one-hot encoding.
+    ///
+    /// Requires the `real-mnist` feature (enabled by default).
+    #[cfg(feature = "real-mnist")]
+    pub fn load_real(cache_dir: Option<&Path>) -> Result<Self, MnistLoadError> {
+        let dir = cache_dir
+            .map(PathBuf::from)
+            .unwrap_or_else(Self::default_cache_dir);
+        std::fs::create_dir_all(&dir).map_err(|e| MnistLoadError::Io(e.to_string()))?;
+
+        ensure_mnist_files(&dir)?;
+
+        let train_images = parse_idx_images(&dir.join(TRAIN_IMAGES_FILE))?;
+        let train_labels = parse_idx_labels(&dir.join(TRAIN_LABELS_FILE))?;
+        let test_images = parse_idx_images(&dir.join(TEST_IMAGES_FILE))?;
+        let test_labels = parse_idx_labels(&dir.join(TEST_LABELS_FILE))?;
+
+        if train_images.len() != train_labels.len() {
+            return Err(MnistLoadError::Parse(format!(
+                "Train images ({}) and labels ({}) count mismatch",
+                train_images.len(), train_labels.len()
+            )));
+        }
+        if test_images.len() != test_labels.len() {
+            return Err(MnistLoadError::Parse(format!(
+                "Test images ({}) and labels ({}) count mismatch",
+                test_images.len(), test_labels.len()
+            )));
+        }
+
+        let train = build_samples(train_images, train_labels);
+        let test = build_samples(test_images, test_labels);
+
+        info!(
+            train_size = train.len(),
+            test_size = test.len(),
+            "Loaded real MNIST dataset"
+        );
+
+        Ok(MnistDataset { train, test })
+    }
+
+    /// Loads real MNIST, returning only a subset of the data for faster
+    /// training/testing. Samples are drawn sequentially from the front.
+    #[cfg(feature = "real-mnist")]
+    pub fn load_real_subset(
+        train_size: usize,
+        test_size: usize,
+        cache_dir: Option<&Path>,
+    ) -> Result<Self, MnistLoadError> {
+        let full = Self::load_real(cache_dir)?;
+        let train = full.train.into_iter().take(train_size).collect();
+        let test = full.test.into_iter().take(test_size).collect();
+        Ok(MnistDataset { train, test })
+    }
+
+    /// Loads real MNIST with shuffled subsets for better class balance.
+    #[cfg(feature = "real-mnist")]
+    pub fn load_real_shuffled(
+        train_size: usize,
+        test_size: usize,
+        seed: u64,
+        cache_dir: Option<&Path>,
+    ) -> Result<Self, MnistLoadError> {
+        use rand::seq::SliceRandom;
+
+        let full = Self::load_real(cache_dir)?;
+        let mut rng = ChaCha20Rng::seed_from_u64(seed);
+
+        let mut train = full.train;
+        train.shuffle(&mut rng);
+        train.truncate(train_size);
+
+        let mut test = full.test;
+        test.shuffle(&mut rng);
+        test.truncate(test_size);
+
+        Ok(MnistDataset { train, test })
+    }
+}
+
+/// Returns the user's home directory, or /tmp as fallback.
+fn dirs_or_home() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp"))
+}
+
+// ============================================================================
+// Real MNIST Loading (requires "real-mnist" feature)
+// ============================================================================
+
+/// Error type for MNIST loading operations.
+#[derive(Debug)]
+pub enum MnistLoadError {
+    /// Network/download error.
+    Download(String),
+    /// File I/O error.
+    Io(String),
+    /// IDX format parsing error.
+    Parse(String),
+}
+
+impl std::fmt::Display for MnistLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MnistLoadError::Download(e) => write!(f, "MNIST download error: {}", e),
+            MnistLoadError::Io(e) => write!(f, "MNIST I/O error: {}", e),
+            MnistLoadError::Parse(e) => write!(f, "MNIST parse error: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for MnistLoadError {}
+
+impl From<MnistLoadError> for MPCError {
+    fn from(e: MnistLoadError) -> Self {
+        MPCError::CommunicationError(e.to_string())
+    }
+}
+
+/// MNIST file names (uncompressed, after gzip decompression).
+const TRAIN_IMAGES_FILE: &str = "train-images-idx3-ubyte";
+const TRAIN_LABELS_FILE: &str = "train-labels-idx1-ubyte";
+const TEST_IMAGES_FILE: &str = "t10k-images-idx3-ubyte";
+const TEST_LABELS_FILE: &str = "t10k-labels-idx1-ubyte";
+
+/// MNIST mirror URLs (tried in order).
+#[cfg(feature = "real-mnist")]
+const MNIST_MIRRORS: &[&str] = &[
+    "https://ossci-datasets.s3.amazonaws.com/mnist/",
+    "https://storage.googleapis.com/cvdf-datasets/mnist/",
+];
+
+/// MNIST compressed file names (as served by mirrors).
+#[cfg(feature = "real-mnist")]
+const MNIST_GZ_FILES: &[(&str, &str)] = &[
+    ("train-images-idx3-ubyte.gz", TRAIN_IMAGES_FILE),
+    ("train-labels-idx1-ubyte.gz", TRAIN_LABELS_FILE),
+    ("t10k-images-idx3-ubyte.gz", TEST_IMAGES_FILE),
+    ("t10k-labels-idx1-ubyte.gz", TEST_LABELS_FILE),
+];
+
+/// Ensures all four MNIST IDX files exist in the cache directory.
+/// Downloads and decompresses any that are missing.
+#[cfg(feature = "real-mnist")]
+fn ensure_mnist_files(cache_dir: &Path) -> Result<(), MnistLoadError> {
+    for &(gz_name, uncompressed_name) in MNIST_GZ_FILES {
+        let uncompressed_path = cache_dir.join(uncompressed_name);
+        if uncompressed_path.exists() {
+            debug!(file = uncompressed_name, "MNIST file already cached");
+            continue;
+        }
+
+        info!(file = gz_name, "Downloading MNIST file...");
+        let compressed = download_with_mirrors(gz_name)?;
+        let decompressed = decompress_gz(&compressed)?;
+
+        std::fs::write(&uncompressed_path, &decompressed)
+            .map_err(|e| MnistLoadError::Io(format!("write {}: {}", uncompressed_name, e)))?;
+
+        info!(
+            file = uncompressed_name,
+            bytes = decompressed.len(),
+            "MNIST file cached"
+        );
+    }
+    Ok(())
+}
+
+/// Downloads a file from MNIST mirrors, trying each in order.
+#[cfg(feature = "real-mnist")]
+fn download_with_mirrors(filename: &str) -> Result<Vec<u8>, MnistLoadError> {
+    use std::io::Read;
+    let mut last_error = String::new();
+
+    for mirror in MNIST_MIRRORS {
+        let url = format!("{}{}", mirror, filename);
+        debug!(url = %url, "Trying MNIST mirror");
+
+        match ureq::get(&url).call() {
+            Ok(response) => {
+                let mut buf = Vec::new();
+                response
+                    .into_reader()
+                    .read_to_end(&mut buf)
+                    .map_err(|e| MnistLoadError::Download(format!("read {}: {}", url, e)))?;
+                info!(url = %url, bytes = buf.len(), "Downloaded MNIST file");
+                return Ok(buf);
+            }
+            Err(e) => {
+                last_error = format!("{}: {}", url, e);
+                warn!(url = %url, error = %e, "Mirror failed, trying next");
+            }
+        }
+    }
+
+    Err(MnistLoadError::Download(format!(
+        "All mirrors failed. Last error: {}", last_error
+    )))
+}
+
+/// Decompresses gzip data.
+#[cfg(feature = "real-mnist")]
+fn decompress_gz(data: &[u8]) -> Result<Vec<u8>, MnistLoadError> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
+    let mut decoder = GzDecoder::new(data);
+    let mut decompressed = Vec::new();
+    decoder
+        .read_to_end(&mut decompressed)
+        .map_err(|e| MnistLoadError::Parse(format!("gzip decompression: {}", e)))?;
+    Ok(decompressed)
+}
+
+/// Parses an IDX3 image file into a vector of 784-element f64 pixel vectors.
+///
+/// IDX format: magic(4B) | num_images(4B) | rows(4B) | cols(4B) | pixels...
+/// All integers are big-endian. Pixels are unsigned bytes [0, 255].
+/// Output pixels are normalized to [0.0, 1.0].
+fn parse_idx_images(path: &Path) -> Result<Vec<Vec<f64>>, MnistLoadError> {
+    let data = std::fs::read(path)
+        .map_err(|e| MnistLoadError::Io(format!("read {}: {}", path.display(), e)))?;
+
+    if data.len() < 16 {
+        return Err(MnistLoadError::Parse("IDX3 file too short for header".into()));
+    }
+
+    let magic = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+    if magic != 0x00000803 {
+        return Err(MnistLoadError::Parse(format!(
+            "Invalid IDX3 magic: 0x{:08X} (expected 0x00000803)", magic
+        )));
+    }
+
+    let num_images = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
+    let rows = u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
+    let cols = u32::from_be_bytes([data[12], data[13], data[14], data[15]]) as usize;
+    let pixels_per_image = rows * cols;
+
+    let expected_size = 16 + num_images * pixels_per_image;
+    if data.len() < expected_size {
+        return Err(MnistLoadError::Parse(format!(
+            "IDX3 file truncated: {} bytes (expected {})", data.len(), expected_size
+        )));
+    }
+
+    let mut images = Vec::with_capacity(num_images);
+    for i in 0..num_images {
+        let offset = 16 + i * pixels_per_image;
+        let pixels: Vec<f64> = data[offset..offset + pixels_per_image]
+            .iter()
+            .map(|&byte| byte as f64 / 255.0)
+            .collect();
+        images.push(pixels);
+    }
+
+    Ok(images)
+}
+
+/// Parses an IDX1 label file into a vector of label indices (0-9).
+///
+/// IDX format: magic(4B) | num_labels(4B) | labels...
+/// All integers are big-endian. Labels are unsigned bytes [0, 9].
+fn parse_idx_labels(path: &Path) -> Result<Vec<usize>, MnistLoadError> {
+    let data = std::fs::read(path)
+        .map_err(|e| MnistLoadError::Io(format!("read {}: {}", path.display(), e)))?;
+
+    if data.len() < 8 {
+        return Err(MnistLoadError::Parse("IDX1 file too short for header".into()));
+    }
+
+    let magic = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+    if magic != 0x00000801 {
+        return Err(MnistLoadError::Parse(format!(
+            "Invalid IDX1 magic: 0x{:08X} (expected 0x00000801)", magic
+        )));
+    }
+
+    let num_labels = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
+    let expected_size = 8 + num_labels;
+    if data.len() < expected_size {
+        return Err(MnistLoadError::Parse(format!(
+            "IDX1 file truncated: {} bytes (expected {})", data.len(), expected_size
+        )));
+    }
+
+    let labels: Vec<usize> = data[8..8 + num_labels]
+        .iter()
+        .map(|&byte| byte as usize)
+        .collect();
+
+    // Validate all labels are 0-9
+    for (i, &label) in labels.iter().enumerate() {
+        if label > 9 {
+            return Err(MnistLoadError::Parse(format!(
+                "Invalid label {} at index {} (expected 0-9)", label, i
+            )));
+        }
+    }
+
+    Ok(labels)
+}
+
+/// Builds MnistSample vectors from parsed images and labels.
+fn build_samples(images: Vec<Vec<f64>>, labels: Vec<usize>) -> Vec<MnistSample> {
+    images
+        .into_iter()
+        .zip(labels.into_iter())
+        .map(|(pixels, digit)| {
+            let mut label = vec![0.0; 10];
+            label[digit] = 1.0;
+            MnistSample { pixels, label, digit }
+        })
+        .collect()
+}
+
+/// Loads real MNIST from pre-existing IDX files on disk (no download).
+///
+/// Use this when you've already downloaded the MNIST files or have them
+/// from another source. The directory must contain the four uncompressed
+/// IDX files.
+pub fn load_mnist_from_dir(dir: &Path) -> Result<MnistDataset, MnistLoadError> {
+    let train_images = parse_idx_images(&dir.join(TRAIN_IMAGES_FILE))?;
+    let train_labels = parse_idx_labels(&dir.join(TRAIN_LABELS_FILE))?;
+    let test_images = parse_idx_images(&dir.join(TEST_IMAGES_FILE))?;
+    let test_labels = parse_idx_labels(&dir.join(TEST_LABELS_FILE))?;
+
+    let train = build_samples(train_images, train_labels);
+    let test = build_samples(test_images, test_labels);
+
+    Ok(MnistDataset { train, test })
 }
 
 // ============================================================================
@@ -272,11 +626,12 @@ pub struct NativeStepResult {
 }
 
 impl NativeTrainer {
-    /// Creates a new native trainer with random Xavier-initialized weights.
+    /// Creates a new native trainer with Kaiming/He-initialized weights (optimal for ReLU).
     pub fn new(d_in: usize, d_hid: usize, d_out: usize, learning_rate: f64, seed: u64) -> Self {
         let mut rng = ChaCha20Rng::seed_from_u64(seed);
-        let w1_scale = (2.0 / (d_in + d_hid) as f64).sqrt();
-        let w2_scale = (2.0 / (d_hid + d_out) as f64).sqrt();
+        // He initialization: scale = sqrt(2 / fan_in) — optimal for ReLU activations
+        let w1_scale = (2.0 / d_in as f64).sqrt();
+        let w2_scale = (2.0 / d_hid as f64).sqrt();
 
         Self {
             d_in,
@@ -427,6 +782,122 @@ impl NativeTrainer {
             step,
             loss,
             probabilities: y,
+        }
+    }
+
+    /// Runs a mini-batch training step with MSE loss.
+    ///
+    /// Computes the average gradient over `batch` samples and applies a single
+    /// weight update. This converges much faster per step than single-sample SGD
+    /// because it reduces gradient variance.
+    ///
+    /// The loss returned is the average loss over the batch.
+    pub fn training_step_batch_mse(
+        &mut self,
+        batch: &[(Vec<f64>, Vec<f64>)],
+        step: u64,
+    ) -> NativeStepResult {
+        let d_in = self.d_in;
+        let d_hid = self.d_hid;
+        let d_out = self.d_out;
+        let batch_size = batch.len() as f64;
+
+        // Accumulators for averaged gradients
+        let mut dw1_acc = vec![0.0f64; d_hid * d_in];
+        let mut db1_acc = vec![0.0f64; d_hid];
+        let mut dw2_acc = vec![0.0f64; d_out * d_hid];
+        let mut db2_acc = vec![0.0f64; d_out];
+        let mut total_loss = 0.0f64;
+        let mut last_y = vec![0.0f64; d_out];
+
+        for (input, target) in batch {
+            // Forward: h_pre = W1 @ x + b1
+            let mut h_pre = vec![0.0f64; d_hid];
+            for i in 0..d_hid {
+                let mut sum = 0.0;
+                for j in 0..d_in {
+                    sum += self.w1[i * d_in + j] * input[j];
+                }
+                h_pre[i] = sum + self.b1[i];
+            }
+
+            // ReLU
+            let mut h = vec![0.0f64; d_hid];
+            let mut relu_mask = vec![0.0f64; d_hid];
+            for i in 0..d_hid {
+                if h_pre[i] >= 0.0 {
+                    h[i] = h_pre[i];
+                    relu_mask[i] = 1.0;
+                }
+            }
+
+            // y = W2 @ h + b2
+            let mut y = vec![0.0f64; d_out];
+            for i in 0..d_out {
+                let mut sum = 0.0;
+                for j in 0..d_hid {
+                    sum += self.w2[i * d_hid + j] * h[j];
+                }
+                y[i] = sum + self.b2[i];
+            }
+
+            // MSE Loss
+            let mut dy = vec![0.0f64; d_out];
+            for i in 0..d_out {
+                let diff = y[i] - target[i];
+                total_loss += 0.5 * diff * diff;
+                dy[i] = diff;
+            }
+
+            // Backward: accumulate gradients
+            for i in 0..d_out {
+                for j in 0..d_hid {
+                    dw2_acc[i * d_hid + j] += dy[i] * h[j];
+                }
+                db2_acc[i] += dy[i];
+            }
+
+            let mut dh = vec![0.0f64; d_hid];
+            for j in 0..d_hid {
+                for i in 0..d_out {
+                    dh[j] += self.w2[i * d_hid + j] * dy[i];
+                }
+            }
+
+            let mut dh_pre = vec![0.0f64; d_hid];
+            for i in 0..d_hid {
+                dh_pre[i] = dh[i] * relu_mask[i];
+            }
+
+            for i in 0..d_hid {
+                for j in 0..d_in {
+                    dw1_acc[i * d_in + j] += dh_pre[i] * input[j];
+                }
+                db1_acc[i] += dh_pre[i];
+            }
+
+            last_y = y;
+        }
+
+        // Average gradients and apply update
+        let lr_scaled = self.learning_rate / batch_size;
+        for i in 0..self.w1.len() {
+            self.w1[i] -= lr_scaled * dw1_acc[i];
+        }
+        for i in 0..self.b1.len() {
+            self.b1[i] -= lr_scaled * db1_acc[i];
+        }
+        for i in 0..self.w2.len() {
+            self.w2[i] -= lr_scaled * dw2_acc[i];
+        }
+        for i in 0..self.b2.len() {
+            self.b2[i] -= lr_scaled * db2_acc[i];
+        }
+
+        NativeStepResult {
+            step,
+            loss: total_loss / batch_size,
+            probabilities: last_y,
         }
     }
 
@@ -861,6 +1332,143 @@ mod tests {
         let count = triples_per_step(32, 10);
         // 32 (ReLU) + 320 (W2@h) + 32 (backward) + 32 (overhead) = 416
         assert_eq!(count, 32 + 320 + 32 + 32);
+    }
+
+    #[cfg(feature = "real-mnist")]
+    #[test]
+    fn test_load_real_mnist() {
+        let dataset = MnistDataset::load_real(None).expect("Failed to load real MNIST");
+        assert_eq!(dataset.train.len(), 60000, "MNIST train set should have 60K samples");
+        assert_eq!(dataset.test.len(), 10000, "MNIST test set should have 10K samples");
+
+        // Validate sample structure
+        for sample in dataset.train.iter().take(100) {
+            assert_eq!(sample.pixels.len(), 784);
+            assert_eq!(sample.label.len(), 10);
+            assert!(sample.digit < 10);
+            assert_eq!(sample.label[sample.digit], 1.0);
+            let label_sum: f64 = sample.label.iter().sum();
+            assert!((label_sum - 1.0).abs() < 1e-10);
+            for &p in &sample.pixels {
+                assert!(p >= 0.0 && p <= 1.0, "Pixel {} out of range", p);
+            }
+        }
+
+        // Check class balance (MNIST is roughly balanced)
+        let mut counts = [0usize; 10];
+        for sample in &dataset.train {
+            counts[sample.digit] += 1;
+        }
+        for (digit, &count) in counts.iter().enumerate() {
+            assert!(
+                count > 4000 && count < 8000,
+                "Digit {} has {} training samples (expected ~5000-7000)",
+                digit, count
+            );
+        }
+    }
+
+    #[cfg(feature = "real-mnist")]
+    #[test]
+    fn test_load_real_mnist_subset() {
+        let dataset = MnistDataset::load_real_subset(1000, 200, None)
+            .expect("Failed to load MNIST subset");
+        assert_eq!(dataset.train.len(), 1000);
+        assert_eq!(dataset.test.len(), 200);
+    }
+
+    #[cfg(feature = "real-mnist")]
+    #[test]
+    fn test_load_real_mnist_shuffled() {
+        let d1 = MnistDataset::load_real_shuffled(100, 20, 42, None)
+            .expect("Failed to load shuffled MNIST");
+        let d2 = MnistDataset::load_real_shuffled(100, 20, 99, None)
+            .expect("Failed to load shuffled MNIST");
+
+        // Different seeds should give different orderings
+        let d1_digits: Vec<usize> = d1.train.iter().map(|s| s.digit).collect();
+        let d2_digits: Vec<usize> = d2.train.iter().map(|s| s.digit).collect();
+        assert_ne!(d1_digits, d2_digits, "Different seeds should give different orderings");
+    }
+
+    #[cfg(feature = "real-mnist")]
+    #[test]
+    fn test_native_trainer_real_mnist_converges() {
+        // Load a subset of real MNIST
+        let dataset = MnistDataset::load_real_shuffled(5000, 1000, 42, None)
+            .expect("Failed to load MNIST");
+        let train_pairs = MnistDataset::as_training_pairs(&dataset.train);
+        let test_pairs = MnistDataset::as_training_pairs(&dataset.test);
+
+        // lr=0.1 with batch_size=32 and He init converges well on MNIST
+        let mut trainer = NativeTrainer::new(784, 32, 10, 0.1, 42);
+
+        // Train with mini-batches — 10 epochs is enough for >85%
+        let batch_size = 32;
+        let num_epochs = 10;
+        let batches_per_epoch = train_pairs.len() / batch_size;
+        let total_steps = num_epochs * batches_per_epoch;
+
+        let mut losses = Vec::new();
+        for step in 0..total_steps {
+            let batch_start = (step % batches_per_epoch) * batch_size;
+            let batch_end = batch_start + batch_size;
+            let batch = &train_pairs[batch_start..batch_end];
+            let result = trainer.training_step_batch_mse(batch, step as u64);
+            losses.push(result.loss);
+
+            if step % 100 == 0 {
+                let acc = trainer.evaluate(&test_pairs[..200]);
+                debug!(step = step, loss = result.loss, accuracy = acc, "Training progress");
+            }
+        }
+
+        // Loss should decrease
+        let n = losses.len().min(50);
+        let early_avg: f64 = losses[..n].iter().sum::<f64>() / n as f64;
+        let late_avg: f64 = losses[losses.len()-n..].iter().sum::<f64>() / n as f64;
+        assert!(
+            late_avg < early_avg,
+            "Loss should decrease on real MNIST: early={:.4}, late={:.4}",
+            early_avg, late_avg
+        );
+
+        // Evaluate accuracy — should be well above random (10%)
+        let accuracy = trainer.evaluate(&test_pairs);
+        eprintln!("Real MNIST native accuracy after {} steps: {:.1}%", total_steps, accuracy * 100.0);
+        assert!(
+            accuracy > 0.80,
+            "Native trainer accuracy {:.1}% should be > 80% on real MNIST after {} mini-batch steps",
+            accuracy * 100.0, total_steps
+        );
+    }
+
+    #[test]
+    fn test_native_batch_training() {
+        // Test mini-batch training on synthetic data
+        let dataset = MnistDataset::generate(200, 50, 42);
+        let train_pairs = MnistDataset::as_training_pairs(&dataset.train);
+        let test_pairs = MnistDataset::as_training_pairs(&dataset.test);
+
+        let mut trainer = NativeTrainer::new(784, 32, 10, 0.05, 42);
+
+        let batch_size = 20;
+        let num_steps = 50;
+        let mut losses = Vec::new();
+        for step in 0..num_steps {
+            let batch_start = (step * batch_size) % train_pairs.len();
+            let batch_end = (batch_start + batch_size).min(train_pairs.len());
+            let batch = &train_pairs[batch_start..batch_end];
+            let result = trainer.training_step_batch_mse(batch, step as u64);
+            losses.push(result.loss);
+        }
+
+        let accuracy = trainer.evaluate(&test_pairs);
+        assert!(
+            accuracy > 0.3,
+            "Batch trainer should reach > 30% on synthetic: got {:.1}%",
+            accuracy * 100.0
+        );
     }
 
     #[test]

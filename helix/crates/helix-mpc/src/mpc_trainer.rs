@@ -2659,11 +2659,11 @@ pub struct ModelWeights {
 }
 
 impl ModelWeights {
-    /// Creates random initial weights.
+    /// Creates random initial weights using Kaiming/He initialization (optimal for ReLU).
     pub fn random(d_in: usize, d_hid: usize, d_out: usize, rng: &mut impl Rng) -> Self {
-        // Xavier initialization.
-        let w1_scale = (2.0 / (d_in + d_hid) as f64).sqrt();
-        let w2_scale = (2.0 / (d_hid + d_out) as f64).sqrt();
+        // He initialization: scale = sqrt(2/fan_in) — optimal for ReLU activations
+        let w1_scale = (2.0 / d_in as f64).sqrt();
+        let w2_scale = (2.0 / d_hid as f64).sqrt();
 
         Self {
             w1: (0..d_hid * d_in)

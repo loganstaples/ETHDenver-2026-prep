@@ -62,22 +62,41 @@ impl DemoRunner {
         println!();
 
         // ================================================================
-        // Phase 1: Generate MNIST Dataset
+        // Phase 1: Load/Generate MNIST Dataset
         // ================================================================
-        display::phase("Phase 1: MNIST Dataset Generation");
-
         let phase1_start = Instant::now();
-        let dataset = MnistDataset::generate(
-            self.args.train_size,
-            self.args.test_size,
-            self.args.seed,
-        );
-        display::success(&format!(
-            "Generated {} training + {} test samples ({:.1}ms)",
-            dataset.train.len(),
-            dataset.test.len(),
-            phase1_start.elapsed().as_secs_f64() * 1000.0,
-        ));
+
+        let dataset = if self.args.real_mnist {
+            display::phase("Phase 1: Real MNIST Dataset Loading");
+            let cache_dir = self.args.mnist_cache_dir.as_ref().map(std::path::Path::new);
+            let full = MnistDataset::load_real_shuffled(
+                self.args.train_size,
+                self.args.test_size,
+                self.args.seed,
+                cache_dir,
+            ).context("Failed to load real MNIST data")?;
+            display::success(&format!(
+                "Loaded {} training + {} test real MNIST samples ({:.1}ms)",
+                full.train.len(),
+                full.test.len(),
+                phase1_start.elapsed().as_secs_f64() * 1000.0,
+            ));
+            full
+        } else {
+            display::phase("Phase 1: Synthetic MNIST Dataset Generation");
+            let ds = MnistDataset::generate(
+                self.args.train_size,
+                self.args.test_size,
+                self.args.seed,
+            );
+            display::success(&format!(
+                "Generated {} training + {} test synthetic samples ({:.1}ms)",
+                ds.train.len(),
+                ds.test.len(),
+                phase1_start.elapsed().as_secs_f64() * 1000.0,
+            ));
+            ds
+        };
         display::info(&format!(
             "Architecture: {} -> {} (ReLU) -> {} (argmax)",
             D_IN, D_HID, D_OUT,

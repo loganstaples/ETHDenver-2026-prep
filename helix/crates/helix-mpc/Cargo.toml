@@ -5,12 +5,13 @@ edition = "2021"
 description = "Multi-Party Computation engine for HELIX trustless AI training"
 
 [features]
-default = ["parallel"]
+default = ["parallel", "real-mnist"]
 parallel = ["rayon"]
 metal = ["helix-prover/metal"]
 network-mpc = []
 simulation = []
 chain = ["ethers"]
+real-mnist = ["ureq", "flate2"]
 
 [dependencies]
 helix-core = { path = "../helix-core" }
@@ -56,6 +57,10 @@ futures = "0.3"
 bytes = "1.5"
 clap = { version = "4.0", features = ["derive"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Real MNIST dataset download and decompression (optional)
+ureq = { version = "2.9", optional = true }
+flate2 = { version = "1.0", optional = true }
 
 # Ethereum interaction (optional, for on-chain blame report submission)
 ethers = { version = "2.0.14", optional = true, features = ["ws"] }

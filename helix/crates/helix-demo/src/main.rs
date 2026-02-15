@@ -71,6 +71,14 @@ pub struct Args {
     /// Number of test samples to generate
     #[arg(long, default_value = "200")]
     pub test_size: usize,
+
+    /// Use real MNIST data (downloads and caches on first run)
+    #[arg(long)]
+    pub real_mnist: bool,
+
+    /// Custom directory for MNIST data cache
+    #[arg(long)]
+    pub mnist_cache_dir: Option<String>,
 }
 
 #[tokio::main]
