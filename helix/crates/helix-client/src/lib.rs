@@ -8,6 +8,7 @@ pub mod error;
 pub mod health;
 pub mod help;
 pub mod model;
+pub mod mpc_orchestration;
 pub mod orchestration;
 pub mod orchestrator;
 pub mod progress;

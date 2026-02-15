@@ -40,7 +40,8 @@ curve25519-dalek = "4.1"
 num-bigint = { version = "0.4", features = ["rand", "serde"] }
 num-traits = "0.2"
 num-integer = "0.1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util", "signal"] }
+anyhow = "1.0"
 tokio-rustls = "0.26"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2.1"

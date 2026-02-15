@@ -9,6 +9,7 @@ pub mod positional;
 pub mod softmax;
 pub mod batch;
 pub mod proof_aggregation;
+pub mod state_transition;
 pub mod training_step_v2;
 pub mod training_step_v3;
 pub mod transformer;

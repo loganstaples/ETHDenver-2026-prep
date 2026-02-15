@@ -214,6 +214,28 @@ required-features = ["integration"]
 name = "result_collection"
 path = "integration/result_collection.rs"
 
+# ============================================================================
+# E2E Integration Tests (Stage 7)
+# ============================================================================
+
+[[test]]
+name = "e2e_mpc_integration"
+path = "integration/e2e_mpc_integration.rs"
+required-features = ["integration"]
+
+[[test]]
+name = "e2e_cheater_detection"
+path = "integration/e2e_cheater_detection.rs"
+required-features = ["integration"]
+
+# ============================================================================
+# E2E Resilience Tests (Stage 8)
+# ============================================================================
+
+[[test]]
+name = "e2e_resilience"
+path = "integration/e2e_resilience.rs"
+
 [features]
 default = []
 parallel = ["rayon"]

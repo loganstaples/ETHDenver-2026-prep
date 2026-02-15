@@ -2,54 +2,27 @@
 name = "helix-demo"
 version = "0.1.0"
 edition = "2021"
-description = "End-to-end demo binary for HELIX trustless ML training"
+description = "HELIX MPC Training Demo for ETHDenver 2026"
 
 [[bin]]
 name = "helix-demo"
 path = "src/main.rs"
 
 [dependencies]
-# HELIX crates
 helix-core = { path = "../helix-core" }
 helix-avm = { path = "../helix-avm" }
-helix-circuits = { path = "../helix-circuits" }
-helix-prover = { path = "../helix-prover" }
-helix-node = { path = "../helix-node" }
 helix-mpc = { path = "../helix-mpc" }
+helix-client = { path = "../helix-client", default-features = false }
 
-# Async runtime
-tokio = { version = "1", features = ["full", "macros", "rt-multi-thread", "sync", "time", "process"] }
-
-# Ethereum
-ethers = { version = "2.0", features = ["ws"] }
-hex = "0.4"
-
-# Cryptography
-sha2 = "0.10"
-rand = "0.8"
-rand_chacha = "0.3"
-halo2curves = "0.7.0"
-
-# System
-libc = "0.2"
-
-# Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-
-# Error handling
+tokio = { version = "1", features = ["full", "signal"] }
+clap = { version = "4.0", features = ["derive"] }
+colored = "2.0"
+indicatif = "0.17"
 anyhow = "1.0"
-thiserror = "2.0"
-
-# CLI
-clap = { version = "4", features = ["derive"] }
-
-# Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# Time
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rand = "0.8"
+rand_chacha = "0.3"
 chrono = "0.4"
-
-[features]
-default = []

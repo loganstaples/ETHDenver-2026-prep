@@ -142,6 +142,12 @@ pub use provers::training_prover_v2::{
     create_zero_witness_pub, validate_witness,
 };
 
+// Re-export checkpoint prover types (lightweight state transition proofs)
+pub use provers::checkpoint_prover::{
+    CheckpointProver, CheckpointProverConfig, CheckpointProverError,
+    CheckpointProverResult, CheckpointProofResult,
+};
+
 // Re-export cache types
 pub use cache::{
     // Key cache

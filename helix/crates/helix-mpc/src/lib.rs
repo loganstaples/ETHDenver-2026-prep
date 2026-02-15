@@ -21,8 +21,11 @@
 #![allow(unexpected_cfgs)]
 
 pub mod beaver;
+pub mod e2e_integration;
 pub mod error;
+pub mod error_containment;
 pub mod field;
+pub mod graceful_shutdown;
 pub mod integration;
 pub mod mac_verification;
 pub mod mnist;
@@ -32,12 +35,15 @@ pub mod poseidon;
 pub mod profiling;
 pub mod proofs;
 pub mod protocols;
+pub mod recovery;
+pub mod resilience;
 pub mod security;
 pub mod session;
 pub mod share_distribution;
 pub mod sharing;
 pub mod types;
 pub mod verification;
+pub mod zk_integration;
 
 pub use error::MPCError;
 pub use field::{Fr, FieldElement, CtChoice, SecureBuffer, SecureVec};

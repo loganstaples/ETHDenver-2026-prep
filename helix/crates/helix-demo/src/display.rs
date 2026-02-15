@@ -1,115 +1,268 @@
-//! Terminal display utilities for the HELIX demo.
+//! Terminal display utilities for the HELIX MPC training demo.
+//!
+//! Provides colorful, structured output for each phase of the demo using
+//! ANSI escape codes via the `colored` crate and progress bars via `indicatif`.
 
+use std::io::Write;
 use std::time::Duration;
 
-// ANSI color codes
-const RED: &str = "\x1b[0;31m";
-const GREEN: &str = "\x1b[0;32m";
-const YELLOW: &str = "\x1b[1;33m";
-const BLUE: &str = "\x1b[0;34m";
-const CYAN: &str = "\x1b[0;36m";
-const WHITE: &str = "\x1b[1;37m";
-const BOLD: &str = "\x1b[1m";
-const DIM: &str = "\x1b[2m";
-const NC: &str = "\x1b[0m";
+use colored::Colorize;
+use indicatif::{ProgressBar, ProgressStyle};
 
+// ============================================================================
+// Banner
+// ============================================================================
+
+/// Prints the HELIX ASCII art banner.
 pub fn banner() {
+    let art = r#"
+    ██╗  ██╗███████╗██╗     ██╗██╗  ██╗
+    ██║  ██║██╔════╝██║     ██║╚██╗██╔╝
+    ███████║█████╗  ██║     ██║ ╚███╔╝
+    ██╔══██║██╔══╝  ██║     ██║ ██╔██╗
+    ██║  ██║███████╗███████╗██║██╔╝ ██╗
+    ╚═╝  ╚═╝╚══════╝╚══════╝╚═╝╚═╝  ╚═╝
+"#;
+    println!("{}", art.bright_cyan().bold());
     println!(
-        r#"
-                    {WHITE}HELIX{NC}
-         Trustless Distributed ML Training
-
-    Train on untrusted GPUs worldwide
-    Model weights stay private via MPC
-    Every computation verified with ZK proofs
-"#,
-        WHITE = WHITE,
-        NC = NC,
+        "    {}",
+        "Trustless Distributed ML Training".white().bold()
     );
-}
-
-pub fn phase(num: u32, title: &str, subtitle: &str) {
-    println!();
     println!(
-        "{BOLD}{BLUE}--- Phase {num}: {title} ---{NC}",
-        BOLD = BOLD,
-        BLUE = BLUE,
-        NC = NC,
+        "    {}",
+        "MPC-Primary Architecture | SPDZ MAC Verification".dimmed()
     );
-    println!("    {DIM}{subtitle}{NC}", DIM = DIM, NC = NC);
+    println!(
+        "    {}",
+        "ETHDenver 2026".dimmed()
+    );
     println!();
 }
 
+// ============================================================================
+// Phase Headings
+// ============================================================================
+
+/// Prints a major phase heading with a number and description.
+pub fn phase(title: &str) {
+    println!();
+    let separator = "=".repeat(60);
+    println!("  {}", separator.bright_blue().bold());
+    println!("  {}", title.bright_blue().bold());
+    println!("  {}", separator.bright_blue().bold());
+    println!();
+}
+
+/// Prints a sub-phase description.
+pub fn subphase(msg: &str) {
+    println!("  {} {}", ">>>".bright_blue(), msg.white());
+}
+
+// ============================================================================
+// Status Messages
+// ============================================================================
+
+/// Prints a success message with green checkmark.
 pub fn success(msg: &str) {
-    println!("  {GREEN}[ok]{NC} {msg}", GREEN = GREEN, NC = NC);
+    println!("  {} {}", "[OK]".bright_green().bold(), msg);
 }
 
+/// Prints an informational message.
 pub fn info(msg: &str) {
-    println!("  {CYAN}[..]{NC} {msg}", CYAN = CYAN, NC = NC);
+    println!("  {} {}", "[..]".bright_cyan(), msg);
 }
 
-pub fn metric(msg: &str) {
-    println!("  {YELLOW}[**]{NC} {msg}", YELLOW = YELLOW, NC = NC);
+/// Prints a metric/statistic.
+pub fn metric(label: &str, value: &str) {
+    println!(
+        "  {} {}: {}",
+        "[**]".bright_yellow(),
+        label,
+        value.bright_white().bold()
+    );
 }
 
+/// Prints a warning message.
 pub fn warn(msg: &str) {
-    println!("  {YELLOW}[!!]{NC} {msg}", YELLOW = YELLOW, NC = NC);
+    println!("  {} {}", "[!!]".bright_yellow().bold(), msg.yellow());
 }
 
+/// Prints an error/alert message.
 pub fn alert(msg: &str) {
-    println!("  {RED}[XX]{NC} {msg}", RED = RED, NC = NC);
+    println!("  {} {}", "[XX]".bright_red().bold(), msg.bright_red());
 }
 
-/// Truncates an address to 0xABCD...EF12 format.
-pub fn short_addr(addr: &ethers::types::Address) -> String {
-    let s = format!("{:?}", addr);
-    if s.len() > 14 {
-        format!("{}...{}", &s[..8], &s[s.len() - 6..])
+// ============================================================================
+// Training Step Display
+// ============================================================================
+
+/// Prints a single-line in-place training step update.
+///
+/// Uses carriage return to overwrite the previous line for a clean
+/// scrolling effect during training.
+pub fn step_update(step: usize, total_steps: usize, loss: f64, workers: usize, mac_ok: bool) {
+    let mac_status = if mac_ok {
+        "MAC OK".bright_green().to_string()
     } else {
-        s
-    }
+        "MAC FAIL".bright_red().bold().to_string()
+    };
+
+    let pct = (step as f64 / total_steps as f64 * 100.0) as usize;
+    let bar_width = 30;
+    let filled = (pct * bar_width / 100).min(bar_width);
+    let empty = bar_width - filled;
+    let bar = format!(
+        "[{}{}]",
+        "#".repeat(filled),
+        "-".repeat(empty)
+    );
+
+    print!(
+        "\r  {} Step {}/{} | Loss: {:.6} | Workers: {} | {} | {}%   ",
+        bar.bright_blue(),
+        format!("{:>4}", step).bright_white(),
+        total_steps,
+        loss,
+        workers,
+        mac_status,
+        pct,
+    );
+    let _ = std::io::stdout().flush();
 }
 
-/// Draws an ASCII loss curve from multiple workers' loss histories.
-pub fn loss_curve(all_losses: &[Vec<f64>]) {
-    if all_losses.is_empty() || all_losses.iter().all(|l| l.is_empty()) {
+/// Finishes the step update line (moves to next line).
+pub fn step_update_finish() {
+    println!();
+}
+
+// ============================================================================
+// Checkpoint Display
+// ============================================================================
+
+/// Prints a checkpoint announcement with commitment hash.
+pub fn checkpoint(step: u64, commitment_hex: &str) {
+    println!();
+    println!(
+        "  {} Checkpoint at step {}",
+        "[CP]".bright_magenta().bold(),
+        format!("{}", step).bright_white().bold(),
+    );
+    println!(
+        "       Pedersen commitment: {}",
+        if commitment_hex.len() > 20 {
+            format!("{}...{}", &commitment_hex[..10], &commitment_hex[commitment_hex.len() - 10..])
+        } else {
+            commitment_hex.to_string()
+        }
+        .dimmed()
+    );
+}
+
+/// Prints a MAC verification success message.
+pub fn mac_verified(step: u64) {
+    println!(
+        "  {} MAC verification passed at step {} (information-theoretic integrity confirmed)",
+        "[MAC]".bright_green().bold(),
+        step,
+    );
+}
+
+// ============================================================================
+// Cheater Detection Display
+// ============================================================================
+
+/// Prints a dramatic cheater detection announcement.
+pub fn cheater_detected(party: usize, step: u64) {
+    println!();
+    let separator = "!".repeat(60);
+    println!("  {}", separator.bright_red().bold());
+    println!(
+        "  {}  CHEATER DETECTED: Party {} at step {}",
+        "ALERT".bright_red().bold(),
+        format!("{}", party).bright_red().bold(),
+        step,
+    );
+    println!("  {}", separator.bright_red().bold());
+    println!(
+        "       {}",
+        "SPDZ MAC verification failed - pairwise identification complete".bright_red()
+    );
+    println!(
+        "       {}",
+        "Corrupted party excluded from further training".yellow()
+    );
+    println!();
+}
+
+/// Prints cheater simulation notice.
+pub fn cheater_simulated(party: usize, step: usize) {
+    println!();
+    println!(
+        "  {} Injecting corruption into Party {} at step {} (simulated attack)",
+        "[SIM]".bright_yellow().bold(),
+        party,
+        step,
+    );
+}
+
+// ============================================================================
+// Progress Bars
+// ============================================================================
+
+/// Creates a progress bar for Beaver triple generation.
+pub fn triple_progress_bar(total: u64) -> ProgressBar {
+    let pb = ProgressBar::new(total);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "  {spinner:.green} Generating Beaver triples [{bar:40.cyan/blue}] {pos}/{len} ({eta})"
+        )
+        .unwrap()
+        .progress_chars("##-"),
+    );
+    pb
+}
+
+/// Creates a progress bar for generic operations.
+pub fn generic_progress_bar(total: u64, msg: &str) -> ProgressBar {
+    let pb = ProgressBar::new(total);
+    pb.set_style(
+        ProgressStyle::with_template(
+            &format!("  {{spinner:.green}} {} [{{bar:40.cyan/blue}}] {{pos}}/{{len}} ({{eta}})", msg)
+        )
+        .unwrap()
+        .progress_chars("##-"),
+    );
+    pb
+}
+
+// ============================================================================
+// Loss Curve
+// ============================================================================
+
+/// Draws an ASCII loss curve from training loss history.
+pub fn loss_curve(losses: &[f64]) {
+    if losses.is_empty() {
         println!("  (no loss data)");
         return;
     }
 
-    // Compute average loss per step across workers
-    let max_steps = all_losses.iter().map(|l| l.len()).max().unwrap_or(0);
-    if max_steps == 0 {
+    let height = 14;
+    let width = 60.min(losses.len());
+    if width == 0 {
         return;
     }
 
-    let mut avg_losses = Vec::with_capacity(max_steps);
-    for step in 0..max_steps {
-        let mut sum = 0.0;
-        let mut count = 0;
-        for worker_losses in all_losses {
-            if step < worker_losses.len() {
-                sum += worker_losses[step];
-                count += 1;
-            }
-        }
-        if count > 0 {
-            avg_losses.push(sum / count as f64);
-        }
-    }
-
-    let max_loss = avg_losses.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let min_loss = avg_losses.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max_loss = losses.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let min_loss = losses.iter().cloned().fold(f64::INFINITY, f64::min);
     let range = (max_loss - min_loss).max(0.001);
 
-    let height = 12;
-    let width = 60.min(avg_losses.len());
-
-    // Downsample if needed
-    let step_size = (avg_losses.len() as f64 / width as f64).ceil() as usize;
+    let step_size = (losses.len() as f64 / width as f64).ceil() as usize;
 
     println!();
-    println!("  {BOLD}Loss Curve (avg across workers){NC}", BOLD = BOLD, NC = NC);
+    println!(
+        "  {}",
+        "Loss Convergence Curve".white().bold()
+    );
     println!("  {:.4} |", max_loss);
 
     for row in 0..height {
@@ -117,8 +270,8 @@ pub fn loss_curve(all_losses: &[Vec<f64>]) {
         let mut line = String::new();
         for col in 0..width {
             let idx = col * step_size;
-            if idx < avg_losses.len() {
-                let val = avg_losses[idx];
+            if idx < losses.len() {
+                let val = losses[idx];
                 if val >= threshold {
                     line.push('#');
                 } else {
@@ -131,100 +284,142 @@ pub fn loss_curve(all_losses: &[Vec<f64>]) {
 
         if row == height / 2 {
             println!(
-                "  {:.4} |{line}|",
+                "  {:.4} |{}|",
                 min_loss + range / 2.0,
+                line.bright_cyan(),
             );
         } else {
-            println!("         |{line}|");
+            println!("         |{}|", line.bright_cyan());
         }
     }
 
-    println!("  {:.4} |{}|", min_loss, "-".repeat(width));
-    if width > 6 {
+    println!(
+        "  {:.4} |{}|",
+        min_loss,
+        "-".repeat(width).dimmed(),
+    );
+    if width > 10 {
         println!(
-            "         {DIM}step 0{:>width$}{NC}",
-            format!("step {}", avg_losses.len()),
-            width = width - 6,
-            DIM = DIM,
-            NC = NC,
-        );
-    } else {
-        println!(
-            "         {DIM}step 0 .. step {}{NC}",
-            avg_losses.len(),
-            DIM = DIM,
-            NC = NC,
+            "         {}{}",
+            "step 0".dimmed(),
+            format!("{:>width$}", format!("step {}", losses.len()), width = width - 4).dimmed(),
         );
     }
     println!();
 }
 
-pub fn summary(
-    total_time: Duration,
-    total_proofs: usize,
-    num_workers: usize,
-    loss_start: f64,
-    loss_end: f64,
-    on_chain: bool,
-) {
+// ============================================================================
+// Summary
+// ============================================================================
+
+/// Holds all the stats for the final summary.
+pub struct DemoSummary {
+    pub total_time: Duration,
+    pub num_workers: usize,
+    pub num_steps: usize,
+    pub loss_start: f64,
+    pub loss_end: f64,
+    pub final_accuracy: f64,
+    pub triples_generated: usize,
+    pub mac_checks_passed: usize,
+    pub cheater_detected: bool,
+    pub cheater_party: Option<usize>,
+}
+
+/// Prints the final demo summary with all metrics.
+pub fn summary(stats: &DemoSummary) {
     println!();
+    let separator = "=".repeat(60);
+    println!("  {}", separator.bright_green());
     println!(
-        "  {GREEN}==============================================={NC}",
-        GREEN = GREEN,
-        NC = NC,
+        "  {}",
+        "HELIX Demo Complete".bright_green().bold()
     );
-    println!(
-        "  {GREEN}          HELIX Demo Complete{NC}",
-        GREEN = GREEN,
-        NC = NC,
-    );
-    println!(
-        "  {GREEN}==============================================={NC}",
-        GREEN = GREEN,
-        NC = NC,
-    );
+    println!("  {}", separator.bright_green());
     println!();
-    println!("  {BOLD}What was demonstrated:{NC}", BOLD = BOLD, NC = NC);
-    println!("    {GREEN}[ok]{NC} Real ZK proof generation (Halo2 KZG)", GREEN = GREEN, NC = NC);
-    println!("    {GREEN}[ok]{NC} Multi-worker distributed training", GREEN = GREEN, NC = NC);
+
+    println!("  {}", "What was demonstrated:".white().bold());
     println!(
-        "    {GREEN}[ok]{NC} Loss convergence: {:.4} -> {:.4}",
-        loss_start,
-        loss_end,
-        GREEN = GREEN,
-        NC = NC,
+        "    {} MPC training: {} workers, weights never reconstructed",
+        "[OK]".bright_green(),
+        stats.num_workers,
+    );
+    println!(
+        "    {} SPDZ MAC verification: {} checks passed (information-theoretic security)",
+        "[OK]".bright_green(),
+        stats.mac_checks_passed,
+    );
+    println!(
+        "    {} Beaver triple multiplication: {} triples consumed",
+        "[OK]".bright_green(),
+        stats.triples_generated,
+    );
+    println!(
+        "    {} Loss convergence: {:.4} -> {:.4} ({:.1}% reduction)",
+        "[OK]".bright_green(),
+        stats.loss_start,
+        stats.loss_end,
+        if stats.loss_start > 1e-10 {
+            (1.0 - stats.loss_end / stats.loss_start) * 100.0
+        } else {
+            0.0
+        },
+    );
+    println!(
+        "    {} MNIST accuracy: {:.1}% on test set",
+        "[OK]".bright_green(),
+        stats.final_accuracy * 100.0,
     );
 
-    if on_chain {
-        println!("    {GREEN}[ok]{NC} On-chain proof submission via HelixCoordinatorV2", GREEN = GREEN, NC = NC);
-        println!("    {GREEN}[ok]{NC} Adversarial detection and slashing", GREEN = GREEN, NC = NC);
+    if stats.cheater_detected {
+        println!(
+            "    {} Cheater detection: Party {} identified and excluded via pairwise MAC check",
+            "[OK]".bright_green(),
+            stats.cheater_party.unwrap_or(0),
+        );
     }
 
     println!();
-    println!("  {BOLD}Key metrics:{NC}", BOLD = BOLD, NC = NC);
+    println!("  {}", "Key metrics:".white().bold());
     println!(
-        "    Total proofs:  {CYAN}{}{NC} across {} workers",
-        total_proofs,
-        num_workers,
-        CYAN = CYAN,
-        NC = NC,
+        "    Training steps:   {}",
+        format!("{}", stats.num_steps).bright_cyan(),
     );
     println!(
-        "    Total time:    {CYAN}{:.1}s{NC}",
-        total_time.as_secs_f64(),
-        CYAN = CYAN,
-        NC = NC,
+        "    MPC workers:      {}",
+        format!("{}", stats.num_workers).bright_cyan(),
     );
-    let reduction = if loss_start > 1e-10 {
-        (1.0 - loss_end / loss_start) * 100.0
-    } else {
-        0.0
-    };
     println!(
-        "    Loss reduction: {CYAN}{:.1}%{NC}",
-        reduction,
-        CYAN = CYAN,
-        NC = NC,
+        "    Total time:       {}",
+        format!("{:.1}s", stats.total_time.as_secs_f64()).bright_cyan(),
+    );
+    let steps_per_sec = stats.num_steps as f64 / stats.total_time.as_secs_f64();
+    println!(
+        "    Throughput:       {}",
+        format!("{:.1} steps/sec", steps_per_sec).bright_cyan(),
+    );
+    println!(
+        "    Final accuracy:   {}",
+        format!("{:.1}%", stats.final_accuracy * 100.0).bright_cyan(),
+    );
+
+    println!();
+    println!("  {}", "Security properties:".white().bold());
+    println!(
+        "    {} Information-theoretic: SPDZ MACs cannot be broken with unlimited compute",
+        "*".bright_yellow(),
+    );
+    println!(
+        "    {} Individual cheater identification via pairwise MAC verification",
+        "*".bright_yellow(),
+    );
+    println!(
+        "    {} Zero weight leakage: additive secret sharing throughout training",
+        "*".bright_yellow(),
+    );
+    println!(
+        "    {} Self-healing: remove cheater, continue training with remaining parties",
+        "*".bright_yellow(),
     );
     println!();
 }

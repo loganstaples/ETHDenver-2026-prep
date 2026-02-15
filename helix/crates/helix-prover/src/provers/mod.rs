@@ -1,4 +1,5 @@
 pub mod batch_prover;
+pub mod checkpoint_prover;
 pub mod gpu_prover;
 pub mod gradient_prover;
 pub mod ivc_circuit;

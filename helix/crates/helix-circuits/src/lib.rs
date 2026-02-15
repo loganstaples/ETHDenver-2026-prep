@@ -58,6 +58,11 @@ pub use verifier::{
     create_test_proof, create_test_public_inputs,
 };
 pub use ml::softmax::{SoftmaxChip, SoftmaxCircuit, SoftmaxWitness, compute_softmax};
+pub use ml::state_transition::{
+    StateTransitionCircuit, StateTransitionWitness, StateTransitionConfig,
+    compute_field_hash, split_hash,
+    NUM_PUBLIC_INPUTS as STATE_TRANSITION_NUM_PUBLIC_INPUTS,
+};
 
 // Re-export params module types
 pub use params::{
