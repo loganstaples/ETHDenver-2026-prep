@@ -58,6 +58,7 @@ async fn test_e2e_mpc_training_full() {
         ],
         seed: 42,
         use_node_transport: false,
+        use_tcp_transport: false,
     };
 
     eprintln!("[E2E-MPC-INTEGRATION] Config: {} workers, {} steps, d_in={}, d_hid={}, d_out={}",
@@ -203,6 +204,7 @@ async fn test_e2e_mpc_training_no_mac() {
         ],
         seed: 123,
         use_node_transport: false,
+        use_tcp_transport: false,
     };
 
     let result = run_mpc_training(config).await
@@ -247,6 +249,7 @@ async fn test_e2e_mpc_training_node_transport() {
         ],
         seed: 42,
         use_node_transport: true,
+        use_tcp_transport: false,
     };
 
     let result = run_mpc_training(config).await
@@ -289,6 +292,7 @@ async fn test_e2e_weight_reconstruction_matches() {
         ],
         seed: 42,
         use_node_transport: false,
+        use_tcp_transport: false,
     };
 
     let result = run_mpc_training(config).await

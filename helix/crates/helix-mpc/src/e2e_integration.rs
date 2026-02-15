@@ -63,6 +63,10 @@ pub struct MPCIntegrationConfig {
     pub seed: u64,
     /// Whether to use NodeTransport (true) or LocalTransport (false).
     pub use_node_transport: bool,
+    /// Whether to use TcpTransport (true) or LocalTransport (false).
+    /// Takes precedence over `use_node_transport` when true.
+    /// Requires the `network-mpc` feature.
+    pub use_tcp_transport: bool,
 }
 
 /// Serializable initial weights for the integration config.
@@ -95,6 +99,7 @@ impl Default for MPCIntegrationConfig {
             ],
             seed: 42,
             use_node_transport: false,
+            use_tcp_transport: false,
         }
     }
 }
@@ -222,7 +227,21 @@ pub async fn run_mpc_training(
     // Create transport mesh.
     let parties: Vec<PartyId> = (0..num_workers).map(PartyId::from_index).collect();
 
-    if config.use_node_transport {
+    if config.use_tcp_transport {
+        #[cfg(feature = "network-mpc")]
+        {
+            run_with_tcp_transport(
+                parties, trainer_config, initial_weights, training_data,
+                num_steps, checkpoint_interval, config.seed, start,
+            ).await
+        }
+        #[cfg(not(feature = "network-mpc"))]
+        {
+            Err(anyhow::anyhow!(
+                "use_tcp_transport requires the 'network-mpc' feature"
+            ))
+        }
+    } else if config.use_node_transport {
         run_with_node_transport(
             parties, trainer_config, initial_weights, training_data,
             num_steps, checkpoint_interval, config.seed, start,
@@ -292,11 +311,28 @@ pub async fn run_mpc_training_with_cheater(
     let training_data = config.training_data.clone();
     let parties: Vec<PartyId> = (0..num_workers).map(PartyId::from_index).collect();
 
-    run_with_cheater(
-        parties, trainer_config, initial_weights, training_data,
-        num_steps, checkpoint_interval, config.seed, start,
-        cheater_party, corrupt_at_step,
-    ).await
+    if config.use_tcp_transport {
+        #[cfg(feature = "network-mpc")]
+        {
+            run_with_tcp_cheater(
+                parties, trainer_config, initial_weights, training_data,
+                num_steps, checkpoint_interval, config.seed, start,
+                cheater_party, corrupt_at_step,
+            ).await
+        }
+        #[cfg(not(feature = "network-mpc"))]
+        {
+            Err(anyhow::anyhow!(
+                "use_tcp_transport requires the 'network-mpc' feature"
+            ))
+        }
+    } else {
+        run_with_cheater(
+            parties, trainer_config, initial_weights, training_data,
+            num_steps, checkpoint_interval, config.seed, start,
+            cheater_party, corrupt_at_step,
+        ).await
+    }
 }
 
 // ============================================================================
@@ -359,6 +395,199 @@ async fn run_with_node_transport(
                 cfg, transport, i, weights, data,
                 num_steps, checkpoint_interval, seed,
                 None, 0,
+            ).await
+        });
+        handles.push(handle);
+    }
+
+    collect_results(handles, num_workers, num_steps, start).await
+}
+
+// ============================================================================
+// Internal: TcpTransport-based execution
+// ============================================================================
+
+#[cfg(feature = "network-mpc")]
+async fn run_with_tcp_transport(
+    parties: Vec<PartyId>,
+    trainer_config: MPCTrainerConfig,
+    initial_weights: Option<ModelWeights>,
+    training_data: Vec<(Vec<f64>, Vec<f64>)>,
+    num_steps: usize,
+    checkpoint_interval: usize,
+    seed: u64,
+    start: Instant,
+) -> Result<MPCIntegrationResult, anyhow::Error> {
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+    use crate::session::transport::TcpTransport;
+
+    let num_workers = parties.len();
+
+    // Phase 1: Bind temporary TCP listeners to reserve OS-assigned ports.
+    // Using port 0 lets the OS pick free ephemeral ports.
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+    let mut addrs: Vec<SocketAddr> = Vec::with_capacity(num_workers);
+    let mut listeners = Vec::with_capacity(num_workers);
+    for _ in 0..num_workers {
+        let listener = tokio::net::TcpListener::bind(bind_addr).await
+            .map_err(|e| anyhow::anyhow!("TCP bind failed: {}", e))?;
+        let addr = listener.local_addr()
+            .map_err(|e| anyhow::anyhow!("local_addr failed: {}", e))?;
+        addrs.push(addr);
+        listeners.push(listener);
+    }
+
+    // Drop listeners so TcpTransport can rebind to the same ports.
+    // On localhost this is safe: we just released them and will immediately
+    // rebind, so port reuse races are extremely unlikely.
+    drop(listeners);
+
+    info!(
+        num_workers = num_workers,
+        addrs = ?addrs,
+        "Reserved TCP ports for MPC transport mesh"
+    );
+
+    // Phase 2: Create TcpTransport instances concurrently.
+    // Each party needs the addresses of all other parties to establish
+    // the full mesh. TcpTransport::bind handles the deterministic
+    // connect/accept strategy internally.
+    let mut transport_handles = Vec::with_capacity(num_workers);
+    for i in 0..num_workers {
+        let party = parties[i].clone();
+        let party_addr = addrs[i];
+        let mut peer_addrs: HashMap<PartyId, SocketAddr> = HashMap::new();
+        for j in 0..num_workers {
+            if i != j {
+                peer_addrs.insert(parties[j].clone(), addrs[j]);
+            }
+        }
+
+        transport_handles.push(tokio::spawn(async move {
+            TcpTransport::bind(party_addr, party, &peer_addrs).await
+        }));
+    }
+
+    // Collect all transports — all must succeed for the mesh to be valid.
+    let mut transports = Vec::with_capacity(num_workers);
+    for handle in transport_handles {
+        let transport = handle.await
+            .map_err(|e| anyhow::anyhow!("TCP transport task panicked: {}", e))?
+            .map_err(|e| anyhow::anyhow!("TcpTransport::bind failed: {}", e))?;
+        transports.push(transport);
+    }
+
+    info!("TCP transport mesh established for {} parties", num_workers);
+
+    // Phase 3: Run training on each transport (same pattern as LocalTransport).
+    let mut handles = Vec::new();
+    for (i, transport) in transports.into_iter().enumerate() {
+        let cfg = trainer_config.clone();
+        let weights = if i == 0 { initial_weights.clone() } else { None };
+        let data = training_data.clone();
+
+        let handle = tokio::spawn(async move {
+            run_party_training(
+                cfg, transport, i, weights, data,
+                num_steps, checkpoint_interval, seed,
+                None, 0, // no cheater
+            ).await
+        });
+        handles.push(handle);
+    }
+
+    collect_results(handles, num_workers, num_steps, start).await
+}
+
+#[cfg(feature = "network-mpc")]
+async fn run_with_tcp_cheater(
+    parties: Vec<PartyId>,
+    trainer_config: MPCTrainerConfig,
+    initial_weights: Option<ModelWeights>,
+    training_data: Vec<(Vec<f64>, Vec<f64>)>,
+    num_steps: usize,
+    checkpoint_interval: usize,
+    seed: u64,
+    start: Instant,
+    cheater_party: usize,
+    corrupt_at_step: u64,
+) -> Result<MPCIntegrationResult, anyhow::Error> {
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+    use crate::session::transport::TcpTransport;
+
+    let num_workers = parties.len();
+
+    // Phase 1: Reserve ports (same strategy as run_with_tcp_transport).
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+    let mut addrs: Vec<SocketAddr> = Vec::with_capacity(num_workers);
+    let mut listeners = Vec::with_capacity(num_workers);
+    for _ in 0..num_workers {
+        let listener = tokio::net::TcpListener::bind(bind_addr).await
+            .map_err(|e| anyhow::anyhow!("TCP bind failed: {}", e))?;
+        let addr = listener.local_addr()
+            .map_err(|e| anyhow::anyhow!("local_addr failed: {}", e))?;
+        addrs.push(addr);
+        listeners.push(listener);
+    }
+
+    drop(listeners);
+
+    info!(
+        num_workers = num_workers,
+        cheater_party = cheater_party,
+        corrupt_at_step = corrupt_at_step,
+        "Reserved TCP ports for MPC transport mesh (with cheater)"
+    );
+
+    // Phase 2: Create TcpTransport instances concurrently.
+    let mut transport_handles = Vec::with_capacity(num_workers);
+    for i in 0..num_workers {
+        let party = parties[i].clone();
+        let party_addr = addrs[i];
+        let mut peer_addrs: HashMap<PartyId, SocketAddr> = HashMap::new();
+        for j in 0..num_workers {
+            if i != j {
+                peer_addrs.insert(parties[j].clone(), addrs[j]);
+            }
+        }
+
+        transport_handles.push(tokio::spawn(async move {
+            TcpTransport::bind(party_addr, party, &peer_addrs).await
+        }));
+    }
+
+    let mut transports = Vec::with_capacity(num_workers);
+    for handle in transport_handles {
+        let transport = handle.await
+            .map_err(|e| anyhow::anyhow!("TCP transport task panicked: {}", e))?
+            .map_err(|e| anyhow::anyhow!("TcpTransport::bind failed: {}", e))?;
+        transports.push(transport);
+    }
+
+    info!("TCP transport mesh established for {} parties (cheater mode)", num_workers);
+
+    // Phase 3: Run training with cheater injection.
+    let mut handles = Vec::new();
+    for (i, transport) in transports.into_iter().enumerate() {
+        let cfg = trainer_config.clone();
+        let weights = if i == 0 { initial_weights.clone() } else { None };
+        let data = training_data.clone();
+
+        let cheater_info = if i == cheater_party {
+            Some(cheater_party)
+        } else {
+            None
+        };
+
+        let handle = tokio::spawn(async move {
+            run_party_training(
+                cfg, transport, i, weights, data,
+                num_steps, checkpoint_interval, seed,
+                cheater_info, corrupt_at_step,
             ).await
         });
         handles.push(handle);
@@ -760,6 +989,7 @@ mod tests {
             ],
             seed: 42,
             use_node_transport: false,
+            use_tcp_transport: false,
         };
 
         let result = run_mpc_training(config).await.expect("training should succeed");
@@ -794,6 +1024,7 @@ mod tests {
             ],
             seed: 42,
             use_node_transport: false,
+            use_tcp_transport: false,
         };
 
         let result = run_mpc_training(config).await.expect("training should succeed");
@@ -831,6 +1062,7 @@ mod tests {
             ],
             seed: 42,
             use_node_transport: true,
+            use_tcp_transport: false,
         };
 
         let result = run_mpc_training(config).await.expect("training should succeed");
@@ -858,6 +1090,7 @@ mod tests {
             ],
             seed: 123,
             use_node_transport: false,
+            use_tcp_transport: false,
         };
 
         let result = run_mpc_training(config).await.expect("training should succeed");

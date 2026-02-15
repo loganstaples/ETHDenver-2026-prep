@@ -60,6 +60,10 @@ pub struct MPCOrchestrationConfig {
     pub model_id: Option<String>,
     /// Whether to use NodeTransport (true) or LocalTransport (false).
     pub use_node_transport: bool,
+    /// Whether to use TcpTransport for real TCP connections.
+    /// Takes precedence over `use_node_transport` when true.
+    /// Requires the `network-mpc` feature in helix-mpc.
+    pub use_tcp_transport: bool,
 }
 
 impl Default for MPCOrchestrationConfig {
@@ -84,6 +88,7 @@ impl Default for MPCOrchestrationConfig {
             seed: 42,
             model_id: None,
             use_node_transport: false,
+            use_tcp_transport: false,
         }
     }
 }
@@ -114,6 +119,7 @@ impl MPCOrchestrationConfig {
             seed: 42,
             model_id: None,
             use_node_transport: false,
+            use_tcp_transport: false,
         }
     }
 
@@ -134,6 +140,7 @@ impl MPCOrchestrationConfig {
             seed: 42,
             model_id: None,
             use_node_transport: false,
+            use_tcp_transport: false,
         }
     }
 }
@@ -323,6 +330,7 @@ impl MPCTrainingOrchestrator {
             training_data: self.config.training_data.clone(),
             seed: self.config.seed,
             use_node_transport: self.config.use_node_transport,
+            use_tcp_transport: self.config.use_tcp_transport,
         }
     }
 
