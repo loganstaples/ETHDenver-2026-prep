@@ -30,6 +30,7 @@ pub mod integration;
 pub mod mac_verification;
 pub mod mnist;
 pub mod mpc_trainer;
+pub mod network_distribution;
 pub mod nn;
 pub mod poseidon;
 pub mod profiling;
@@ -52,4 +53,10 @@ pub use share_distribution::{
     ShareDistributor, ShareReceiver, CheckpointCommitment, WeightReconstructor,
     EncryptedShare, WeightShare, DistributionResult, VectorCommitment, CommitmentShare,
     encrypt_share_for_owner, generate_x25519_keypair,
+};
+pub use network_distribution::{
+    distribute_shares, reconstruct_shares,
+    worker_receive_distribution, worker_send_final_share,
+    NetworkDistributionResult, ReconstructionResult, WorkerShareState,
+    ProtocolMessage, send_message, recv_message,
 };

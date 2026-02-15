@@ -97,7 +97,7 @@ pub struct DistributionResult {
 /// Contains per-element commitments and their aggregate (point sum).
 /// The aggregate is suitable for on-chain storage; per-element commitments
 /// enable fine-grained verification off-chain.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorCommitment {
     /// Per-element Pedersen commitments: C_j = g^{v_j} * h^{r_j}.
     pub element_commitments: Vec<PedersenCommitment>,
@@ -143,7 +143,7 @@ impl VectorCommitment {
 }
 
 /// A single worker's Pedersen commitment share for a checkpoint.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitmentShare {
     /// The worker's party identifier.
     pub party: PartyId,
@@ -306,7 +306,7 @@ impl ShareDistributor {
     ///
     /// Shares 0..N-2 are uniformly random Fr elements.
     /// Share N-1 = value - sum(shares 0..N-2).
-    fn generate_additive_shares(&mut self, values: &[Fr], n: usize) -> Vec<Vec<Fr>> {
+    pub(crate) fn generate_additive_shares(&mut self, values: &[Fr], n: usize) -> Vec<Vec<Fr>> {
         let dim = values.len();
         let mut shares: Vec<Vec<Fr>> = Vec::with_capacity(n);
 
@@ -329,7 +329,7 @@ impl ShareDistributor {
     }
 
     /// Encrypts a share vector to a worker's x25519 public key.
-    fn encrypt_share(
+    pub(crate) fn encrypt_share(
         &mut self,
         share: &[Fr],
         recipient_pk: &X25519PublicKey,
@@ -819,7 +819,7 @@ pub fn generate_x25519_keypair(rng: &mut impl RngCore) -> (StaticSecret, X25519P
 // Internal: vector commitment helper
 // ============================================================================
 
-fn compute_vector_commitment(
+pub(crate) fn compute_vector_commitment(
     values: &[Fr],
     blindings: &[Fr],
     generators: &PedersenGenerators,
@@ -858,7 +858,7 @@ fn aggregate_commitments(
 
 /// Derives an AES-256 key from the DH shared secret for share encryption.
 /// Uses domain-separated SHA-256 to ensure independence from other key derivations.
-fn derive_share_key(shared_secret: &[u8; 32], ephemeral_pk: &[u8; 32]) -> [u8; 32] {
+pub(crate) fn derive_share_key(shared_secret: &[u8; 32], ephemeral_pk: &[u8; 32]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"HELIX-SHARE-KEY-v1");
     hasher.update(shared_secret);
@@ -867,7 +867,7 @@ fn derive_share_key(shared_secret: &[u8; 32], ephemeral_pk: &[u8; 32]) -> [u8; 3
 }
 
 /// Derives a 96-bit nonce for AES-GCM from the DH shared secret.
-fn derive_share_nonce(shared_secret: &[u8; 32], ephemeral_pk: &[u8; 32]) -> [u8; 12] {
+pub(crate) fn derive_share_nonce(shared_secret: &[u8; 32], ephemeral_pk: &[u8; 32]) -> [u8; 12] {
     let mut hasher = Sha256::new();
     hasher.update(b"HELIX-SHARE-NONCE-v1");
     hasher.update(shared_secret);
@@ -879,7 +879,7 @@ fn derive_share_nonce(shared_secret: &[u8; 32], ephemeral_pk: &[u8; 32]) -> [u8;
 }
 
 /// Encrypts plaintext using AES-256-GCM.
-fn encrypt_with_key(key: &[u8; 32], plaintext: &[u8], nonce: &[u8; 12]) -> MPCResult<Vec<u8>> {
+pub(crate) fn encrypt_with_key(key: &[u8; 32], plaintext: &[u8], nonce: &[u8; 12]) -> MPCResult<Vec<u8>> {
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| MPCError::ProtocolError(format!("cipher init failed: {}", e)))?;
     let nonce = Nonce::from_slice(nonce);
@@ -889,7 +889,7 @@ fn encrypt_with_key(key: &[u8; 32], plaintext: &[u8], nonce: &[u8; 12]) -> MPCRe
 }
 
 /// Decrypts ciphertext using AES-256-GCM.
-fn decrypt_with_key(key: &[u8; 32], ciphertext: &[u8], nonce: &[u8; 12]) -> MPCResult<Vec<u8>> {
+pub(crate) fn decrypt_with_key(key: &[u8; 32], ciphertext: &[u8], nonce: &[u8; 12]) -> MPCResult<Vec<u8>> {
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| MPCError::ProtocolError(format!("cipher init failed: {}", e)))?;
     let nonce = Nonce::from_slice(nonce);
@@ -899,7 +899,7 @@ fn decrypt_with_key(key: &[u8; 32], ciphertext: &[u8], nonce: &[u8; 12]) -> MPCR
 }
 
 /// Serializes a vector of Fr elements to bytes (32 bytes per element, little-endian).
-fn serialize_fr_vec(values: &[Fr]) -> Vec<u8> {
+pub(crate) fn serialize_fr_vec(values: &[Fr]) -> Vec<u8> {
     let mut data = Vec::with_capacity(values.len() * 32);
     for v in values {
         data.extend_from_slice(&v.to_bytes_le());
@@ -908,7 +908,7 @@ fn serialize_fr_vec(values: &[Fr]) -> Vec<u8> {
 }
 
 /// Deserializes a byte vector into Fr elements.
-fn deserialize_fr_vec(data: &[u8], expected_count: usize) -> MPCResult<Vec<Fr>> {
+pub(crate) fn deserialize_fr_vec(data: &[u8], expected_count: usize) -> MPCResult<Vec<Fr>> {
     let expected_bytes = expected_count * 32;
     if data.len() != expected_bytes {
         return Err(MPCError::ProtocolError(format!(

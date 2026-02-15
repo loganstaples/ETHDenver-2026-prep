@@ -16,6 +16,12 @@ pub use helix_mpc::share_distribution::{
     X25519PublicKey, X25519StaticSecret,
     encrypt_share_for_owner, generate_x25519_keypair,
 };
+pub use helix_mpc::network_distribution::{
+    distribute_shares, reconstruct_shares,
+    worker_receive_distribution, worker_send_final_share,
+    NetworkDistributionResult, ReconstructionResult, WorkerShareState,
+    ProtocolMessage, send_message, recv_message,
+};
 pub use helix_mpc::security::commitment::{PedersenCommitment, PedersenGenerators};
 pub use helix_mpc::{Fr, PartyId};
 

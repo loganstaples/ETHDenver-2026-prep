@@ -21,7 +21,7 @@ export default function App() {
     // Wait for orb animation to finish before showing dashboard
     setTimeout(() => {
       completeStart();
-    }, 1000);
+    }, 500);
   }, [beginStart, completeStart, start]);
 
   const handleStop = useCallback(async () => {

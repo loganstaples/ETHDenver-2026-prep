@@ -3,7 +3,7 @@ import { Header } from "./Header";
 import { CardGrid } from "./CardGrid";
 import { useNodeStatus } from "../../hooks/useNodeStatus";
 import { useSessionTimer } from "../../hooks/useSessionTimer";
-import { useExpandedCard } from "../../hooks/useExpandedCard";
+import { useWindowManager } from "../../hooks/useWindowManager";
 
 interface ActiveViewProps {
   onStop: () => void;
@@ -13,7 +13,7 @@ interface ActiveViewProps {
 export function ActiveView({ onStop, onOpenSettings }: ActiveViewProps) {
   const { status } = useNodeStatus();
   const sessionSeconds = useSessionTimer(status.running, status.uptime_secs);
-  const { expandedCard, expand } = useExpandedCard();
+  const { windows, focusedCard, focus, unfocus, minimize, restore } = useWindowManager();
 
   return (
     <motion.div
@@ -28,7 +28,14 @@ export function ActiveView({ onStop, onOpenSettings }: ActiveViewProps) {
         onStop={onStop}
         onOpenSettings={onOpenSettings}
       />
-      <CardGrid expandedCard={expandedCard} onExpand={expand} />
+      <CardGrid
+        windows={windows}
+        focusedCard={focusedCard}
+        onFocus={focus}
+        onUnfocus={unfocus}
+        onMinimize={minimize}
+        onRestore={restore}
+      />
     </motion.div>
   );
 }
