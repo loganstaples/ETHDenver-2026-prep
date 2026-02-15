@@ -58,12 +58,9 @@ function TextInput({ value, onChange }: { value: string; onChange: (v: string) =
 export function SettingsOverlay({ open, onClose }: SettingsOverlayProps) {
   const { config, updateConfig } = useConfig();
   const [local, setLocal] = useState<NodeConfig | null>(null);
-
-  // Initialize local state from config
   const current = local ?? config;
 
   const update = (patch: Partial<NodeConfig>) => {
-    if (!current) return;
     const next = { ...current, ...patch };
     setLocal(next);
     updateConfig(next);
@@ -102,8 +99,7 @@ export function SettingsOverlay({ open, onClose }: SettingsOverlayProps) {
               </button>
             </div>
 
-            {current && (
-              <div className="px-6 py-4 space-y-6">
+            <div className="px-6 py-4 space-y-6">
                 {/* Resources */}
                 <section>
                   <h3 className="text-label text-text-tertiary mb-3">Resources</h3>
@@ -160,7 +156,6 @@ export function SettingsOverlay({ open, onClose }: SettingsOverlayProps) {
                   <p className="text-label-sm text-text-tertiary">HELIX v0.1.0</p>
                 </section>
               </div>
-            )}
           </motion.div>
         </motion.div>
       )}

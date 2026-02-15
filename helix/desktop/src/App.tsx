@@ -13,7 +13,11 @@ export default function App() {
 
   const handleActivate = useCallback(async () => {
     beginStart();
-    await start();
+    try {
+      await start();
+    } catch {
+      // Backend may not be available (dev mode without Tauri)
+    }
     // Wait for orb animation to finish before showing dashboard
     setTimeout(() => {
       completeStart();
@@ -22,7 +26,11 @@ export default function App() {
 
   const handleStop = useCallback(async () => {
     beginStop();
-    await stop();
+    try {
+      await stop();
+    } catch {
+      // Backend may not be available (dev mode without Tauri)
+    }
     setTimeout(() => {
       completeStop();
     }, 600);
