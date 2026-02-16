@@ -33,6 +33,8 @@ pub use dealer::TrustedDealer;
 pub use distributed::{
     DistributedTripleGen, NetworkDistributedDealer,
     DistributedTriplePool, DistributedPoolConfig,
+    BeaverTriplePool as DistributedBeaverTriplePool,
+    ProgressCallback,
     generate_and_fill_pool,
 };
 pub use ot::{OTTripleGenerator, OTSender, OTReceiver, OTReceiverKeys, OTExtension, CorrelatedOT};

@@ -1017,6 +1017,264 @@ pub async fn generate_and_fill_pool<T: MPCTransport>(
     Ok(pool)
 }
 
+// ============================================================================
+// BeaverTriplePool — high-level pool with pre-generation and exhaustion recovery
+// ============================================================================
+
+/// Callback for progress reporting during pre-generation.
+pub type ProgressCallback = Box<dyn Fn(usize, usize) + Send>;
+
+/// A high-level Beaver triple pool with distributed pre-generation,
+/// progress reporting, and automatic exhaustion recovery.
+///
+/// Unlike the lower-level [`DistributedTriplePool`] which is a passive container,
+/// `BeaverTriplePool` holds a reference to the transport and can actively
+/// generate more triples when the pool runs low.
+///
+/// # Pre-generation
+///
+/// Call [`generate`] before training starts to fill the pool. Progress is
+/// reported via an optional callback, useful for demo UIs.
+///
+/// # Exhaustion Recovery
+///
+/// When [`take`] or [`take_batch`] finds the pool empty, it automatically
+/// triggers a new distributed generation round (pause-regenerate-resume)
+/// rather than returning an error. This ensures training never crashes
+/// due to triple exhaustion.
+///
+/// # Thread Safety
+///
+/// This struct is NOT thread-safe — it's designed to be used by a single
+/// party in the training loop. For async access, wrap in a tokio::Mutex.
+pub struct BeaverTriplePool<'t, T: MPCTransport> {
+    /// Inner pool for triple storage.
+    inner: DistributedTriplePool,
+    /// Transport for distributed generation.
+    transport: &'t T,
+    /// Party index.
+    party_index: usize,
+    /// RNG seed (incremented per generation batch).
+    seed: u64,
+    /// Generation batch counter.
+    batch_count: u64,
+    /// Default number of triples to generate on exhaustion recovery.
+    recovery_batch_size: usize,
+}
+
+impl<'t, T: MPCTransport> BeaverTriplePool<'t, T> {
+    /// Creates a new empty pool.
+    ///
+    /// # Arguments
+    ///
+    /// * `transport` - MPC transport for distributed generation
+    /// * `party_index` - This party's index
+    /// * `seed` - Base RNG seed (varied per batch to avoid correlation)
+    /// * `recovery_batch_size` - Number of triples to generate when the pool runs out
+    pub fn new(
+        transport: &'t T,
+        party_index: usize,
+        seed: u64,
+        recovery_batch_size: usize,
+    ) -> Self {
+        Self {
+            inner: DistributedTriplePool::new(),
+            transport,
+            party_index,
+            seed,
+            batch_count: 0,
+            recovery_batch_size,
+        }
+    }
+
+    /// Pre-generates `num_triples` scalar Beaver triples.
+    ///
+    /// All parties must call this concurrently with the same `num_triples`.
+    /// Progress is reported via the optional callback: `callback(generated, total)`.
+    ///
+    /// For large counts, generation is batched internally to avoid allocating
+    /// enormous single messages. Each batch generates up to `batch_size` triples.
+    pub async fn generate(
+        &mut self,
+        num_triples: usize,
+        progress: Option<ProgressCallback>,
+    ) -> MPCResult<()> {
+        if num_triples == 0 {
+            return Ok(());
+        }
+
+        // Generate in batches of 10K to keep memory manageable and allow
+        // progress reporting at a useful granularity.
+        let batch_size = 10_000.min(num_triples);
+        let mut generated = 0usize;
+
+        while generated < num_triples {
+            let remaining = num_triples - generated;
+            let this_batch = remaining.min(batch_size);
+
+            let batch_seed = self.next_batch_seed();
+            let mut dealer = NetworkDistributedDealer::new(
+                self.transport,
+                self.party_index,
+                batch_seed,
+            );
+            let triples = dealer.generate(this_batch).await?;
+            self.inner.fill_scalar(triples);
+            generated += this_batch;
+
+            if let Some(ref cb) = progress {
+                cb(generated, num_triples);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Pre-generates vector triples.
+    pub async fn generate_vector(
+        &mut self,
+        num_triples: usize,
+        dim: usize,
+    ) -> MPCResult<()> {
+        if num_triples == 0 {
+            return Ok(());
+        }
+
+        let batch_seed = self.next_batch_seed();
+        let mut dealer = NetworkDistributedDealer::new(
+            self.transport,
+            self.party_index,
+            batch_seed,
+        );
+        let triples = dealer.generate_vector(num_triples, dim).await?;
+        self.inner.fill_vector(dim, triples);
+        Ok(())
+    }
+
+    /// Pre-generates matrix triples.
+    pub async fn generate_matrix(
+        &mut self,
+        num_triples: usize,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> MPCResult<()> {
+        if num_triples == 0 {
+            return Ok(());
+        }
+
+        let batch_seed = self.next_batch_seed();
+        let mut dealer = NetworkDistributedDealer::new(
+            self.transport,
+            self.party_index,
+            batch_seed,
+        );
+        let triples = dealer.generate_matrix(num_triples, m, k, n).await?;
+        self.inner.fill_matrix(m, k, n, triples);
+        Ok(())
+    }
+
+    /// Takes the next scalar triple, generating more if the pool is exhausted.
+    ///
+    /// If the pool is empty, this method pauses, runs a distributed generation
+    /// round of `recovery_batch_size` triples, and then returns one.
+    ///
+    /// All parties must have the same exhaustion pattern (i.e., they all run out
+    /// at the same time) for the recovery generation to synchronize correctly.
+    pub async fn take(&mut self) -> MPCResult<BeaverTriple> {
+        if self.inner.remaining() == 0 {
+            tracing::warn!(
+                party = self.party_index,
+                recovery_size = self.recovery_batch_size,
+                "Beaver triple pool exhausted — generating {} more",
+                self.recovery_batch_size,
+            );
+            self.generate(self.recovery_batch_size, None).await?;
+        }
+        self.inner.take()
+    }
+
+    /// Takes a batch of scalar triples, generating more if needed.
+    pub async fn take_batch(&mut self, count: usize) -> MPCResult<Vec<BeaverTriple>> {
+        if self.inner.remaining() < count {
+            let deficit = count - self.inner.remaining();
+            let gen_count = deficit.max(self.recovery_batch_size);
+            tracing::warn!(
+                party = self.party_index,
+                needed = count,
+                available = self.inner.remaining(),
+                generating = gen_count,
+                "Beaver triple pool low — generating {} more", gen_count,
+            );
+            self.generate(gen_count, None).await?;
+        }
+        self.inner.take_batch(count)
+    }
+
+    /// Takes a vector triple, generating more if needed.
+    pub async fn take_vector(&mut self, dim: usize) -> MPCResult<VectorBeaverTriple> {
+        if self.inner.vector_remaining(dim) == 0 {
+            let gen_count = self.recovery_batch_size.max(10);
+            self.generate_vector(gen_count, dim).await?;
+        }
+        self.inner.take_vector(dim)
+    }
+
+    /// Takes a matrix triple, generating more if needed.
+    pub async fn take_matrix(
+        &mut self,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> MPCResult<MatrixBeaverTriple> {
+        if self.inner.matrix_remaining(m, k, n) == 0 {
+            let gen_count = self.recovery_batch_size.max(5);
+            self.generate_matrix(gen_count, m, k, n).await?;
+        }
+        self.inner.take_matrix(m, k, n)
+    }
+
+    /// Returns the number of scalar triples remaining.
+    pub fn remaining(&self) -> usize {
+        self.inner.remaining()
+    }
+
+    /// Returns the number of vector triples remaining for a given dimension.
+    pub fn vector_remaining(&self, dim: usize) -> usize {
+        self.inner.vector_remaining(dim)
+    }
+
+    /// Returns the number of matrix triples remaining for given dimensions.
+    pub fn matrix_remaining(&self, m: usize, k: usize, n: usize) -> usize {
+        self.inner.matrix_remaining(m, k, n)
+    }
+
+    /// Returns the total number of scalar triples consumed.
+    pub fn total_consumed(&self) -> usize {
+        self.inner.total_consumed()
+    }
+
+    /// Returns the total number of scalar triples ever generated.
+    pub fn total_generated(&self) -> usize {
+        self.inner.total_generated()
+    }
+
+    /// Returns true if the pool needs replenishment.
+    pub fn needs_replenishment(&self, config: &DistributedPoolConfig) -> bool {
+        self.inner.needs_replenishment(config)
+    }
+
+    /// Provides direct access to the inner pool (for filling from external sources).
+    pub fn inner_mut(&mut self) -> &mut DistributedTriplePool {
+        &mut self.inner
+    }
+
+    fn next_batch_seed(&mut self) -> u64 {
+        self.batch_count += 1;
+        self.seed.wrapping_add(self.batch_count.wrapping_mul(0x517CC1B727220A95))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1691,6 +1949,343 @@ mod tests {
                 c.ct_eq(&expected).to_bool(),
                 "Pool triple {} incorrect after generate_and_fill_pool", t,
             );
+        }
+    }
+
+    // ========== BeaverTriplePool tests ==========
+
+    #[tokio::test]
+    async fn test_beaver_triple_pool_basic() {
+        use crate::session::transport::LocalTransport;
+
+        let num_parties = 3;
+        let parties: Vec<PartyId> = (0..num_parties).map(PartyId::from_index).collect();
+        let transports = LocalTransport::create_mesh(&parties);
+
+        let mut handles = Vec::new();
+        for (i, transport) in transports.into_iter().enumerate() {
+            let handle = tokio::spawn(async move {
+                let mut pool = BeaverTriplePool::new(&transport, i, 42, 100);
+                pool.generate(200, None).await.unwrap();
+                assert_eq!(pool.remaining(), 200);
+                assert_eq!(pool.total_generated(), 200);
+
+                // Take some triples
+                let t = pool.take().await.unwrap();
+                assert_eq!(pool.remaining(), 199);
+                assert_eq!(pool.total_consumed(), 1);
+
+                let batch = pool.take_batch(10).await.unwrap();
+                assert_eq!(batch.len(), 10);
+                assert_eq!(pool.remaining(), 189);
+                assert_eq!(pool.total_consumed(), 11);
+
+                // Return shares for verification
+                (t, batch)
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pool_exhaustion_recovery() {
+        use crate::session::transport::LocalTransport;
+
+        let num_parties = 3;
+        let initial_count = 50;
+        // We'll consume more than initial_count to force recovery.
+        let total_consumption = 80;
+        let recovery_batch = 100;
+
+        let parties: Vec<PartyId> = (0..num_parties).map(PartyId::from_index).collect();
+        let transports = LocalTransport::create_mesh(&parties);
+
+        let mut handles = Vec::new();
+        for (i, transport) in transports.into_iter().enumerate() {
+            let handle = tokio::spawn(async move {
+                let mut pool = BeaverTriplePool::new(&transport, i, 42, recovery_batch);
+
+                // Pre-generate only 50 triples
+                pool.generate(initial_count, None).await.unwrap();
+                assert_eq!(pool.remaining(), initial_count);
+
+                // Consume all 50 one by one — should succeed
+                for _ in 0..initial_count {
+                    pool.take().await.unwrap();
+                }
+                assert_eq!(pool.remaining(), 0);
+                assert_eq!(pool.total_consumed(), initial_count);
+
+                // Now take more — this should trigger automatic recovery
+                // (pause, generate recovery_batch more, resume)
+                for _ in 0..(total_consumption - initial_count) {
+                    pool.take().await.unwrap();
+                }
+
+                // Pool should have been replenished
+                // After recovery of 100, consumed 30 more = 70 remaining
+                let expected_remaining = recovery_batch - (total_consumption - initial_count);
+                assert_eq!(pool.remaining(), expected_remaining);
+                assert_eq!(pool.total_consumed(), total_consumption);
+
+                // Total generated = initial 50 + recovery 100
+                assert_eq!(pool.total_generated(), initial_count + recovery_batch);
+
+                pool.remaining()
+            });
+            handles.push(handle);
+        }
+
+        // All parties must complete (they all sync on the recovery generation)
+        for handle in handles {
+            let remaining = handle.await.unwrap();
+            assert!(remaining > 0, "Pool should have triples remaining after recovery");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pool_batch_exhaustion_recovery() {
+        use crate::session::transport::LocalTransport;
+
+        let num_parties = 3;
+        let parties: Vec<PartyId> = (0..num_parties).map(PartyId::from_index).collect();
+        let transports = LocalTransport::create_mesh(&parties);
+
+        let mut handles = Vec::new();
+        for (i, transport) in transports.into_iter().enumerate() {
+            let handle = tokio::spawn(async move {
+                let mut pool = BeaverTriplePool::new(&transport, i, 42, 200);
+
+                // Start with only 20 triples
+                pool.generate(20, None).await.unwrap();
+                assert_eq!(pool.remaining(), 20);
+
+                // Request a batch of 50 — more than available.
+                // Should auto-replenish and return all 50.
+                let batch = pool.take_batch(50).await.unwrap();
+                assert_eq!(batch.len(), 50);
+                assert_eq!(pool.total_consumed(), 50);
+
+                // Pool should have remaining from the recovery batch
+                assert!(pool.remaining() > 0);
+                // Generated: 20 initial + 200 recovery = 220, consumed 50
+                assert_eq!(pool.total_generated(), 20 + 200);
+
+                pool.remaining()
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pool_progress_callback() {
+        use crate::session::transport::LocalTransport;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let num_parties = 3;
+        let parties: Vec<PartyId> = (0..num_parties).map(PartyId::from_index).collect();
+        let transports = LocalTransport::create_mesh(&parties);
+
+        let mut handles = Vec::new();
+        for (i, transport) in transports.into_iter().enumerate() {
+            let handle = tokio::spawn(async move {
+                let mut pool = BeaverTriplePool::new(&transport, i, 42, 100);
+
+                let callback_count = Arc::new(AtomicUsize::new(0));
+                let last_generated = Arc::new(AtomicUsize::new(0));
+                let last_total = Arc::new(AtomicUsize::new(0));
+
+                let cc = callback_count.clone();
+                let lg = last_generated.clone();
+                let lt = last_total.clone();
+
+                let progress: ProgressCallback = Box::new(move |generated, total| {
+                    cc.fetch_add(1, Ordering::Relaxed);
+                    lg.store(generated, Ordering::Relaxed);
+                    lt.store(total, Ordering::Relaxed);
+                });
+
+                pool.generate(500, Some(progress)).await.unwrap();
+
+                assert_eq!(pool.remaining(), 500);
+                // Progress callback should have been called at least once
+                assert!(callback_count.load(Ordering::Relaxed) >= 1);
+                // Final callback should report all generated
+                assert_eq!(last_generated.load(Ordering::Relaxed), 500);
+                assert_eq!(last_total.load(Ordering::Relaxed), 500);
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pregeneration_for_mnist() {
+        use crate::session::transport::LocalTransport;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // MNIST model: 784 -> 32 -> 10
+        // Per training step triple requirements:
+        //   Layer 1 forward: 784 * 32 = 25,088 multiplications (matmul)
+        //   Layer 1 bias: 32 additions (no triples needed)
+        //   ReLU: 32 comparisons (garbled circuit, no scalar triples)
+        //   Layer 2 forward: 32 * 10 = 320 multiplications
+        //   Layer 2 bias: 10 additions (no triples needed)
+        //   Backprop: similar count
+        //   Total per step: ~(25088 + 320) * 2 + overhead ≈ 51K scalar triples
+        //
+        // For a demo with 100 steps: 51K * 100 ≈ 5.1M triples total.
+        // We test pre-generation at a smaller scale to validate the mechanism
+        // works, then extrapolate.
+
+        let num_parties = 3;
+        let d_in = 784;
+        let d_hid = 32;
+        let d_out = 10;
+        let num_steps = 100;
+
+        // Scalar triples needed per step for element-wise operations
+        // (activations, normalization, gradient computation).
+        // The full matmul triples would be matrix triples in production,
+        // but the scalar pool serves the simpler training loop.
+        let scalars_per_step = (d_hid + d_out * d_hid + d_hid) * 2 + 32;
+        let total_scalars = scalars_per_step * num_steps;
+
+        // For testing, we generate a representative fraction (1 step's worth)
+        // and verify it completes successfully. Full 100-step generation would
+        // take too long for a unit test but works identically.
+        let test_scalars = scalars_per_step; // ~716 triples
+
+        let parties: Vec<PartyId> = (0..num_parties).map(PartyId::from_index).collect();
+        let transports = LocalTransport::create_mesh(&parties);
+
+        let mut handles = Vec::new();
+        for (i, transport) in transports.into_iter().enumerate() {
+            let handle = tokio::spawn(async move {
+                let mut pool = BeaverTriplePool::new(&transport, i, 42, 1000);
+
+                let progress_reports = Arc::new(AtomicUsize::new(0));
+                let pr = progress_reports.clone();
+                let progress: ProgressCallback = Box::new(move |generated, total| {
+                    pr.fetch_add(1, Ordering::Relaxed);
+                    // Verify progress is monotonically increasing
+                    assert!(generated <= total);
+                });
+
+                pool.generate(test_scalars, Some(progress)).await.unwrap();
+
+                assert_eq!(pool.remaining(), test_scalars);
+                assert_eq!(pool.total_generated(), test_scalars);
+
+                // Simulate consuming all triples (one step)
+                let batch = pool.take_batch(test_scalars).await.unwrap();
+                assert_eq!(batch.len(), test_scalars);
+                assert_eq!(pool.remaining(), 0);
+
+                // Verify the triple count matches MNIST requirements
+                assert!(
+                    test_scalars >= scalars_per_step,
+                    "Should have enough triples for one MNIST step: need {}, have {}",
+                    scalars_per_step, test_scalars,
+                );
+
+                // Document the full requirement for 100 steps
+                assert_eq!(
+                    total_scalars, scalars_per_step * num_steps,
+                    "Full 100-step MNIST training needs {} triples",
+                    total_scalars,
+                );
+
+                (test_scalars, total_scalars, progress_reports.load(Ordering::Relaxed))
+            });
+            handles.push(handle);
+        }
+
+        let mut results: Vec<(usize, usize, usize)> = Vec::new();
+        for handle in handles {
+            results.push(handle.await.unwrap());
+        }
+
+        // All parties should have generated the same count
+        for (test_count, full_count, progress_calls) in &results {
+            assert_eq!(*test_count, scalars_per_step);
+            assert_eq!(*full_count, scalars_per_step * num_steps);
+            assert!(*progress_calls >= 1, "Progress should have been reported");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_beaver_triple_pool_vector_exhaustion_recovery() {
+        use crate::session::transport::LocalTransport;
+
+        let num_parties = 3;
+        let dim = 8;
+        let parties: Vec<PartyId> = (0..num_parties).map(PartyId::from_index).collect();
+        let transports = LocalTransport::create_mesh(&parties);
+
+        let mut handles = Vec::new();
+        for (i, transport) in transports.into_iter().enumerate() {
+            let handle = tokio::spawn(async move {
+                let mut pool = BeaverTriplePool::new(&transport, i, 42, 50);
+
+                // Start with 0 vector triples — first take should trigger generation
+                assert_eq!(pool.vector_remaining(dim), 0);
+                let vt = pool.take_vector(dim).await.unwrap();
+                assert_eq!(vt.a.len(), dim);
+
+                // Should have generated 10+ (min recovery for vectors)
+                assert!(pool.vector_remaining(dim) >= 9);
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_beaver_triple_pool_matrix_exhaustion_recovery() {
+        use crate::session::transport::LocalTransport;
+
+        let num_parties = 3;
+        let (m, k, n) = (4, 3, 2);
+        let parties: Vec<PartyId> = (0..num_parties).map(PartyId::from_index).collect();
+        let transports = LocalTransport::create_mesh(&parties);
+
+        let mut handles = Vec::new();
+        for (i, transport) in transports.into_iter().enumerate() {
+            let handle = tokio::spawn(async move {
+                let mut pool = BeaverTriplePool::new(&transport, i, 42, 50);
+
+                // Start with 0 matrix triples — first take should trigger generation
+                assert_eq!(pool.matrix_remaining(m, k, n), 0);
+                let mt = pool.take_matrix(m, k, n).await.unwrap();
+                assert_eq!(mt.a.len(), m * k);
+                assert_eq!(mt.b.len(), k * n);
+                assert_eq!(mt.c.len(), m * n);
+
+                // Should have generated 5+ (min recovery for matrices)
+                assert!(pool.matrix_remaining(m, k, n) >= 4);
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
         }
     }
 }

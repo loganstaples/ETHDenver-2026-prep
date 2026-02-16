@@ -20,6 +20,7 @@ use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn, instrument};
 
+use crate::beaver::distributed::NetworkDistributedDealer;
 use crate::beaver::triple::BeaverTriple;
 use crate::error::{MPCError, MPCResult};
 use crate::field::Fr;
@@ -618,61 +619,19 @@ impl<T: MPCTransport> MPCTrainer<T> {
         info!(
             party = self.party_index,
             count = count,
-            "Generating {} Beaver triples distributedly", count
+            "Generating {} Beaver triples distributedly (batched)", count
         );
 
-        let mut new_triples = Vec::with_capacity(count);
-
-        for t in 0..count {
-            // Step 1: Each party samples random a_i, b_i.
-            let a_i = Fr::random(&mut self.rng);
-            let b_i = Fr::random(&mut self.rng);
-
-            // Start with the diagonal term: c_i = a_i * b_i.
-            // Use mpc_scale for fixed-point multiplication, consistent with
-            // multiply_shares() which also uses mpc_scale for Beaver protocol.
-            let mut c_i = a_i.mpc_scale(&b_i);
-
-            let peers = self.transport.peers();
-
-            // Step 2: For each peer j, pick random r_ij and send (a_i, r_ij).
-            let mut my_randoms: HashMap<String, Fr> = HashMap::new();
-            for peer in &peers {
-                let r_ij = Fr::random(&mut self.rng);
-                my_randoms.insert(peer.0.clone(), r_ij.clone());
-
-                let msg = TrainingMessage::BeaverShares {
-                    a: SecureArithmetic::serialize_share_batch(&[a_i.clone()]),
-                    b: SecureArithmetic::serialize_share_batch(&[r_ij]),
-                    c: SecureArithmetic::serialize_share_batch(&[Fr::from_u64(t as u64)]),
-                };
-                self.transport.send(peer, &msg.encode()).await?;
-            }
-
-            // Step 3: Add our random r_ij to c_i (our share of cross-term a_i*b_j).
-            for r_ij in my_randoms.values() {
-                c_i = Fr::add(&c_i, r_ij);
-            }
-
-            // Step 4: Receive (a_j, r_ji) from each peer and add the cross-term.
-            for peer in &peers {
-                let data = self.transport.recv(peer).await?;
-                let msg = TrainingMessage::decode(&data)?;
-
-                if let TrainingMessage::BeaverShares { a, b, c: _ } = msg {
-                    let peer_a = SecureArithmetic::deserialize_share_batch(&a)?;
-                    let peer_r = SecureArithmetic::deserialize_share_batch(&b)?;
-
-                    // Cross-term: a_j * b_i - r_ji
-                    // peer_a[0] = a_j, peer_r[0] = r_ji (their random for us)
-                    // Use mpc_scale for fixed-point multiplication consistency.
-                    let cross = Fr::sub(&peer_a[0].mpc_scale(&b_i), &peer_r[0]);
-                    c_i = Fr::add(&c_i, &cross);
-                }
-            }
-
-            new_triples.push(BeaverTriple::new(a_i, b_i, c_i));
-        }
+        // Use NetworkDistributedDealer for batched generation: O(peers) messages
+        // instead of O(count * peers). Each party sends one message per peer
+        // containing all a_i and r_ij values for the entire batch.
+        let seed = self.rng.gen::<u64>();
+        let mut dealer = NetworkDistributedDealer::new(
+            &self.transport,
+            self.party_index,
+            seed,
+        );
+        let new_triples = dealer.generate(count).await?;
 
         // Authenticate triples with MAC shares if MAC verification is enabled.
         if self.mac_state.is_some() {
