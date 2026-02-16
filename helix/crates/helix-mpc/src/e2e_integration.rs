@@ -132,7 +132,7 @@ pub struct MPCIntegrationResult {
 }
 
 /// Reconstructed weights at the end of training.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FinalWeights {
     pub w1: Vec<f64>,
     pub b1: Vec<f64>,

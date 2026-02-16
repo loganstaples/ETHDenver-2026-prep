@@ -114,6 +114,12 @@ enum Commands {
     /// Submit a pre-generated proof to the coordinator contract
     #[cfg(feature = "chain")]
     SubmitProof(SubmitProofArgs),
+
+    /// Run full MPC-primary training as model owner (end-to-end)
+    MpcTrain(MpcTrainArgs),
+
+    /// Join an MPC training session as a worker
+    MpcWorker(MpcWorkerArgs),
 }
 
 // ============================================================================
@@ -362,6 +368,133 @@ struct SubmitProofArgs {
     /// Chain ID (auto-detected if omitted)
     #[arg(long)]
     chain_id: Option<u64>,
+}
+
+/// Arguments for the mpc-train subcommand (model owner end-to-end orchestration).
+#[derive(Args)]
+struct MpcTrainArgs {
+    /// Model architecture as "d_in,d_hid,d_out" (e.g. "784,32,10" for MNIST)
+    #[arg(long, default_value = "784,32,10")]
+    architecture: String,
+
+    /// Number of training steps
+    #[arg(long, default_value = "100")]
+    steps: usize,
+
+    /// SGD learning rate
+    #[arg(long, default_value = "0.001")]
+    learning_rate: f64,
+
+    /// Checkpoint frequency (every N steps)
+    #[arg(long, default_value = "10")]
+    checkpoint_freq: usize,
+
+    /// MAC verification interval (every N steps, 0 to disable)
+    #[arg(long, default_value = "10")]
+    mac_interval: u64,
+
+    /// Pre-generated Beaver triples per batch
+    #[arg(long, default_value = "2048")]
+    beaver_batch_size: usize,
+
+    /// Random seed for deterministic execution
+    #[arg(long, default_value = "42")]
+    seed: u64,
+
+    /// Worker TCP endpoints (comma-separated, e.g. "127.0.0.1:9001,127.0.0.1:9002,127.0.0.1:9003")
+    #[arg(long, value_delimiter = ',')]
+    workers: Vec<String>,
+
+    /// Path to JSON file with initial weights (omit for Xavier initialization)
+    #[arg(long)]
+    weights: Option<String>,
+
+    /// Use real MNIST data (requires helix-mpc real-mnist feature)
+    #[arg(long)]
+    real_mnist: bool,
+
+    /// Number of training samples
+    #[arg(long, default_value = "1000")]
+    train_size: usize,
+
+    /// Number of test samples for accuracy evaluation
+    #[arg(long, default_value = "200")]
+    test_size: usize,
+
+    /// Ethereum RPC URL (omit to start local Anvil)
+    #[cfg(feature = "chain")]
+    #[arg(long, env = "RPC_URL")]
+    rpc_url: Option<String>,
+
+    /// Owner's Ethereum private key (hex)
+    #[cfg(feature = "chain")]
+    #[arg(long, env = "HELIX_PRIVATE_KEY", default_value = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")]
+    private_key: String,
+
+    /// Worker private keys (comma-separated hex, must match --workers count)
+    #[cfg(feature = "chain")]
+    #[arg(long, value_delimiter = ',')]
+    worker_keys: Vec<String>,
+
+    /// Payment amount in ETH for job registration
+    #[cfg(feature = "chain")]
+    #[arg(long, default_value = "1.0")]
+    payment_eth: f64,
+
+    /// Stake amount in ETH per worker
+    #[cfg(feature = "chain")]
+    #[arg(long, default_value = "0.1")]
+    stake_eth: f64,
+
+    /// Existing V4 coordinator contract address (omit to deploy new)
+    #[cfg(feature = "chain")]
+    #[arg(long)]
+    coordinator: Option<String>,
+
+    /// Save final trained weights to this JSON file
+    #[arg(long)]
+    output: Option<PathBuf>,
+}
+
+/// Arguments for the mpc-worker subcommand (worker participation).
+#[derive(Args)]
+struct MpcWorkerArgs {
+    /// TCP address to listen on for data channel (e.g. "0.0.0.0:9001")
+    #[arg(long, default_value = "0.0.0.0:9001")]
+    listen: String,
+
+    /// Worker party index (0-based)
+    #[arg(long, default_value = "0")]
+    party_index: usize,
+
+    /// Deterministic seed for key generation
+    #[arg(long, default_value = "42")]
+    seed: u64,
+
+    /// Ethereum RPC URL for on-chain staking (omit for off-chain mode)
+    #[cfg(feature = "chain")]
+    #[arg(long, env = "RPC_URL")]
+    rpc_url: Option<String>,
+
+    /// Worker's Ethereum private key (hex)
+    #[cfg(feature = "chain")]
+    #[arg(long, env = "HELIX_PRIVATE_KEY")]
+    private_key: Option<String>,
+
+    /// On-chain job ID to join (omit to skip staking)
+    #[cfg(feature = "chain")]
+    #[arg(long)]
+    job_id: Option<u64>,
+
+    /// V4 coordinator contract address
+    #[cfg(feature = "chain")]
+    #[arg(long)]
+    coordinator: Option<String>,
+
+    /// Stake amount in ETH
+    #[cfg(feature = "chain")]
+    #[arg(long, default_value = "0.1")]
+    stake_eth: f64,
 }
 
 #[derive(Args)]
@@ -670,6 +803,8 @@ async fn main() -> Result<()> {
         Commands::Guide(args) => cmd_help(args, &cli).await,
         #[cfg(feature = "chain")]
         Commands::SubmitProof(args) => cmd_submit_proof(args).await,
+        Commands::MpcTrain(args) => cmd_mpc_train(args, &cli).await,
+        Commands::MpcWorker(args) => cmd_mpc_worker(args, &cli).await,
     };
 
     if let Err(e) = result {
@@ -2414,6 +2549,175 @@ async fn cmd_submit_proof(args: &SubmitProofArgs) -> Result<()> {
 
     println!();
     println!("{}", "Proof submitted successfully!".green().bold());
+    println!();
+
+    Ok(())
+}
+
+// ============================================================================
+// MPC Training (Model Owner)
+// ============================================================================
+
+async fn cmd_mpc_train(args: &MpcTrainArgs, _cli: &Cli) -> Result<()> {
+    use helix_client::full_orchestration::{FullOrchestrationConfig, FullOrchestrator};
+
+    println!();
+    println!("{}", "═".repeat(64).cyan());
+    println!("{}", " HELIX MPC-Primary Training (Model Owner)".cyan().bold());
+    println!("{}", "═".repeat(64).cyan());
+    println!();
+
+    // Parse architecture dimensions.
+    let dims: Vec<usize> = args
+        .architecture
+        .split(',')
+        .map(|s| s.trim().parse::<usize>())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|_| anyhow::anyhow!("Invalid --architecture format. Expected d_in,d_hid,d_out (e.g. 784,32,10)"))?;
+    if dims.len() != 3 {
+        return Err(anyhow::anyhow!("--architecture requires exactly 3 dimensions (d_in,d_hid,d_out)"));
+    }
+
+    // Use default 3 workers if none specified.
+    let worker_endpoints = if args.workers.is_empty() {
+        vec![
+            "127.0.0.1:9001".to_string(),
+            "127.0.0.1:9002".to_string(),
+            "127.0.0.1:9003".to_string(),
+        ]
+    } else {
+        args.workers.clone()
+    };
+
+    println!("{}", "Configuration:".yellow().bold());
+    println!("  Architecture:    {}x{}x{}", dims[0], dims[1], dims[2]);
+    println!("  Parameters:      {}", dims[1] * dims[0] + dims[1] + dims[2] * dims[1] + dims[2]);
+    println!("  Steps:           {}", args.steps);
+    println!("  Learning Rate:   {}", args.learning_rate);
+    println!("  Checkpoint Freq: every {} steps", args.checkpoint_freq);
+    println!("  MAC Interval:    every {} steps", args.mac_interval);
+    println!("  Workers:         {}", worker_endpoints.len());
+    for (i, ep) in worker_endpoints.iter().enumerate() {
+        println!("    Worker {}: {}", i, ep);
+    }
+    println!("  Seed:            {}", args.seed);
+    println!();
+
+    let config = FullOrchestrationConfig {
+        architecture: dims,
+        num_steps: args.steps,
+        learning_rate: args.learning_rate,
+        checkpoint_frequency: args.checkpoint_freq,
+        mac_check_interval: args.mac_interval,
+        beaver_batch_size: args.beaver_batch_size,
+        seed: args.seed,
+        worker_endpoints,
+        initial_weights_path: args.weights.clone(),
+        use_real_mnist: args.real_mnist,
+        mnist_cache_dir: None,
+        train_size: args.train_size,
+        test_size: args.test_size,
+        #[cfg(feature = "chain")]
+        eth_rpc_url: args.rpc_url.clone(),
+        #[cfg(feature = "chain")]
+        private_key: args.private_key.clone(),
+        #[cfg(feature = "chain")]
+        worker_private_keys: args.worker_keys.clone(),
+        #[cfg(feature = "chain")]
+        payment_amount_eth: args.payment_eth,
+        #[cfg(feature = "chain")]
+        stake_amount_eth: args.stake_eth,
+        #[cfg(feature = "chain")]
+        coordinator_address: args.coordinator.clone(),
+    };
+
+    let mut orchestrator = FullOrchestrator::new(config);
+
+    println!("{}", "Starting full orchestration pipeline...".green().bold());
+    println!();
+
+    let result = orchestrator.run().await?;
+
+    // Save weights if requested.
+    if let Some(ref output_path) = args.output {
+        if let Some(ref weights) = result.final_weights {
+            let json = serde_json::to_string_pretty(weights)
+                .map_err(|e| anyhow::anyhow!("Failed to serialize final weights: {}", e))?;
+            std::fs::write(output_path, &json)
+                .map_err(|e| anyhow::anyhow!("Failed to write weights to {}: {}", output_path.display(), e))?;
+            println!(
+                "\n{}",
+                format!("Final weights saved to {}", output_path.display())
+                    .green()
+                    .bold()
+            );
+        }
+    }
+
+    println!();
+    println!("{}", "═".repeat(64).cyan());
+    println!(
+        "  Result: {} accuracy, {} steps in {:.1}s",
+        format!("{:.1}%", result.test_accuracy * 100.0).green().bold(),
+        result.steps_completed,
+        result.training_time_secs,
+    );
+    println!("{}", "═".repeat(64).cyan());
+    println!();
+
+    Ok(())
+}
+
+// ============================================================================
+// MPC Worker
+// ============================================================================
+
+async fn cmd_mpc_worker(args: &MpcWorkerArgs, _cli: &Cli) -> Result<()> {
+    use helix_client::worker_entry::{WorkerConfig, launch_worker};
+
+    println!();
+    println!("{}", "═".repeat(64).cyan());
+    println!("{}", " HELIX MPC Worker".cyan().bold());
+    println!("{}", "═".repeat(64).cyan());
+    println!();
+
+    println!("{}", "Configuration:".yellow().bold());
+    println!("  Listen:        {}", args.listen);
+    println!("  Party Index:   {}", args.party_index);
+    println!("  Seed:          {}", args.seed);
+    println!();
+
+    let config = WorkerConfig {
+        listen_addr: args.listen.clone(),
+        party_index: args.party_index,
+        seed: args.seed,
+        #[cfg(feature = "chain")]
+        eth_rpc_url: args.rpc_url.clone(),
+        #[cfg(feature = "chain")]
+        private_key: args.private_key.clone().unwrap_or_default(),
+        #[cfg(feature = "chain")]
+        job_id: args.job_id,
+        #[cfg(feature = "chain")]
+        coordinator_address: args.coordinator.clone(),
+        #[cfg(feature = "chain")]
+        stake_amount_eth: args.stake_eth,
+    };
+
+    println!("{}", "Worker starting...".green().bold());
+    println!("  Waiting for owner connection on data channel");
+    println!("  Control channel on port +1");
+    println!();
+
+    let result = launch_worker(config).await?;
+
+    println!();
+    println!("{}", "═".repeat(64).cyan());
+    println!("{}", " Worker Session Complete".green().bold());
+    println!("{}", "═".repeat(64).cyan());
+    println!("  Steps Completed:       {}", result.steps_completed);
+    println!("  Checkpoints Signed:    {}", result.checkpoint_signatures);
+    println!("  Slashing Reports:      {}", result.slashing_reports_signed);
+    println!("  Final Share Sent:      {}", result.final_share_sent);
     println!();
 
     Ok(())

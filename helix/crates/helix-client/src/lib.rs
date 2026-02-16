@@ -7,6 +7,7 @@ pub mod config;
 pub mod dashboard;
 pub mod demo;
 pub mod error;
+pub mod full_orchestration;
 pub mod health;
 pub mod help;
 pub mod model;
@@ -19,6 +20,7 @@ pub mod session;
 pub mod share_distributor;
 pub mod visualization;
 pub mod wallet;
+pub mod worker_entry;
 
 // Re-export key types for external consumers
 pub use client::HelixClient;
@@ -33,3 +35,6 @@ pub use rpc::client::{
     ModelWeightsResponse, RoundSummary, TrainingHistory, TrainingReport,
 };
 pub use session::{SessionResult, TrainingEvent, TrainingProgress, TrainingSession};
+pub use full_orchestration::{
+    FullOrchestrationConfig, FullOrchestrationResult, FullOrchestrator, CheaterInfo,
+};
