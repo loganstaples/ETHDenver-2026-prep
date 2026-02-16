@@ -42,6 +42,10 @@ pub mod proof_aggregation;
 /// ZK checkpoint proof pipeline tests (optional ZK proofs)
 pub mod zk_checkpoint_proof;
 
+/// Comprehensive end-to-end integration tests (definition of done)
+#[cfg(feature = "integration")]
+pub mod comprehensive_e2e;
+
 /// On-chain verification tests (Anvil + real contracts)
 #[cfg(feature = "on-chain")]
 pub mod on_chain_verification;

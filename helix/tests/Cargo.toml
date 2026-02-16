@@ -234,6 +234,15 @@ path = "integration/e2e_onchain_checkpoint.rs"
 required-features = ["integration"]
 
 # ============================================================================
+# Comprehensive E2E Integration Tests (Definition of Done)
+# ============================================================================
+
+[[test]]
+name = "comprehensive_e2e"
+path = "integration/comprehensive_e2e.rs"
+required-features = ["integration"]
+
+# ============================================================================
 # E2E Resilience Tests (Stage 8)
 # ============================================================================
 
