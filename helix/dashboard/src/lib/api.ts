@@ -203,6 +203,50 @@ export interface NetworkStats {
 }
 
 // ============================================================================
+// MPC Training Types
+// ============================================================================
+
+export interface MpcTrainingJobConfig {
+    architecture: number[];
+    num_workers: number;
+    num_steps: number;
+    learning_rate: number;
+    checkpoint_freq: number;
+    mac_interval: number;
+    zk_mode: 'off' | 'always' | 'risk';
+    zk_checkpoint_freq: number;
+    min_workers_for_mpc: number;
+    train_size: number;
+    test_size: number;
+    use_real_mnist: boolean;
+    payment_eth: number;
+    stake_per_worker_eth: number;
+    simulate_cheater: boolean;
+    seed: number;
+}
+
+export interface MpcTrainingSessionState {
+    session_id: string;
+    status: 'starting' | 'running' | 'complete' | 'failed';
+    current_step: number;
+    total_steps: number;
+    current_loss: number;
+    losses: number[];
+    accuracy: number | null;
+    checkpoints_submitted: number;
+    mac_checks_passed: number;
+    cheater_detected: { party_index: number; step: number } | null;
+    zk_proofs_generated: number;
+    zk_activated_by_risk: boolean;
+    phase: number;
+    phase_description: string;
+    coordinator_address: string;
+    job_id: number;
+    elapsed_secs: number;
+    started_at: number;
+}
+
+// ============================================================================
 // API Client
 // ============================================================================
 
@@ -458,6 +502,30 @@ export class HelixApiClient {
         smoothed: Array<{ epoch: number; loss: number }>;
     }> {
         return this.fetch(`/training/${sessionId}/loss-curve`);
+    }
+
+    // ========================================================================
+    // MPC Training Endpoints (backend at /api/training/*)
+    // ========================================================================
+
+    async startMpcTraining(config: MpcTrainingJobConfig): Promise<{ session_id: string; status: string }> {
+        return this.fetch<{ session_id: string; status: string }>('/training/start', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(config),
+        });
+    }
+
+    async getMpcTrainingSession(sessionId: string): Promise<MpcTrainingSessionState> {
+        return this.fetch<MpcTrainingSessionState>(`/training/sessions/${sessionId}`);
+    }
+
+    async getMpcSessionLosses(sessionId: string): Promise<{ losses: number[]; current_step: number; total_steps: number }> {
+        return this.fetch<{ losses: number[]; current_step: number; total_steps: number }>(`/training/sessions/${sessionId}/losses`);
+    }
+
+    async listMpcTrainingSessions(): Promise<MpcTrainingSessionState[]> {
+        return this.fetch<MpcTrainingSessionState[]>('/training/sessions');
     }
 
     // ========================================================================

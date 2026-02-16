@@ -30,7 +30,7 @@ use crate::mac_verification::{MACFailureReport, MACVerificationConfig};
 use crate::mpc_trainer::{MPCTrainer, MPCTrainerConfig, ModelWeights};
 use crate::security::commitment::PedersenGenerators;
 use crate::session::node_transport::NodeTransport;
-use crate::session::transport::LocalTransport;
+use crate::session::transport::{LocalTransport, TransportConfig};
 use crate::share_distribution::{
     EncryptedShare, ShareDistributor, ShareReceiver, VectorCommitment, WeightReconstructor,
     WeightShare, X25519PublicKey, encrypt_share_for_owner, generate_x25519_keypair,
@@ -846,9 +846,13 @@ async fn run_party_training<T: crate::session::transport::MPCTransport + 'static
     }
 
     // Phase 2: Generate Beaver triples distributedly.
-    // Estimate triples needed: for training_step_with_mac, each step uses
-    // approximately (d_hid + d_out * d_hid + d_hid) * 2 auth triples.
-    let triples_per_step = (config.d_hid + config.d_out * config.d_hid + config.d_hid) * 2 + 32;
+    // The MAC path uses d_hid vector Beaver triples per step (for h = h_pre * relu).
+    // The unproved path uses none. Add margin for resharing overhead.
+    let triples_per_step = if config.mac_config.is_some() {
+        config.d_hid * 2 + 32 // h multiply + margin
+    } else {
+        32 // small margin for resharing
+    };
     let total_triples_needed = triples_per_step * num_steps;
     let batch_size = config.beaver_batch_size.max(total_triples_needed);
     trainer.generate_beaver_triples(batch_size).await?;
@@ -1338,5 +1342,65 @@ mod tests {
             "Loss should generally decrease: early_avg={}, late_avg={}",
             early_avg, late_avg
         );
+    }
+
+    #[tokio::test]
+    async fn test_mnist_scale_loss_diagnostic() {
+        use rand::{Rng, SeedableRng};
+        use rand_chacha::ChaCha20Rng;
+
+        let d_in = 784;
+        let d_hid = 32;
+        let d_out = 10;
+
+        let mut rng = ChaCha20Rng::seed_from_u64(42);
+        let w1_scale = (2.0 / d_in as f64).sqrt();
+        let w2_scale = (2.0 / d_hid as f64).sqrt();
+
+        let w1: Vec<f64> = (0..d_hid * d_in).map(|_| rng.gen_range(-w1_scale..w1_scale)).collect();
+        let b1 = vec![0.0; d_hid];
+        let w2: Vec<f64> = (0..d_out * d_hid).map(|_| rng.gen_range(-w2_scale..w2_scale)).collect();
+        let b2 = vec![0.0; d_out];
+
+        let input: Vec<f64> = (0..d_in).map(|_| rng.gen_range(0.0..1.0)).collect();
+        let mut target = vec![0.0; d_out];
+        target[3] = 1.0;
+
+        // Test BOTH paths: no-MAC (unproved) and MAC
+        for (label, mac_interval) in [("no-MAC", 0u64), ("MAC", 1u64)] {
+            let config = MPCIntegrationConfig {
+                d_in, d_hid, d_out,
+                num_workers: 3,
+                num_steps: 3,
+                learning_rate: 0.001,
+                checkpoint_interval: 3,
+                mac_check_interval: mac_interval,
+                beaver_batch_size: 8192,
+                initial_weights: Some(InitialWeights {
+                    w1: w1.clone(), b1: b1.clone(),
+                    w2: w2.clone(), b2: b2.clone(),
+                }),
+                training_data: vec![(input.clone(), target.clone())],
+                seed: 42,
+                use_node_transport: false,
+                use_tcp_transport: false,
+            };
+
+            let result = run_mpc_training(config).await.expect("should succeed");
+
+            for (i, &loss) in result.losses.iter().enumerate() {
+                eprintln!("[{}] MNIST-scale step {}: loss = {:.6e}", label, i, loss);
+            }
+
+            // Also check reconstructed weights
+            eprintln!("[{}] final_weights w1[0..3] = {:?}", label,
+                &result.final_weights.w1[..3]);
+
+            assert!(
+                result.final_loss < 100.0,
+                "[{}] Loss should be reasonable, got: {:.6e}",
+                label, result.final_loss,
+            );
+        }
     }
 }

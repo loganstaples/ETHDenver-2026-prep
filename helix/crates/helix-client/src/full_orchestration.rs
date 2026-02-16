@@ -55,6 +55,40 @@ use helix_mpc::e2e_integration::{
 };
 use helix_mpc::mnist::{MnistDataset, MnistSample};
 
+use crate::zk_proof_layer::{ZkCheckpointProofResult, ZkProofConfig, ZkProofLayer};
+
+// ============================================================================
+// ZK Mode
+// ============================================================================
+
+/// Controls when ZK proofs are required for checkpoint submissions.
+///
+/// - `Off`: Pure MPC+MAC attestation, no ZK proofs.
+/// - `Always`: ZK proofs are always required for every checkpoint (or per the configured frequency).
+/// - `Risk { min_workers }`: Start with MPC-only, but auto-activate ZK proofs on-chain when
+///   the active worker count drops below `min_workers` (e.g. due to cheater slashing).
+///   This provides a safety net: if too many workers are removed, the remaining MPC quorum
+///   may be too small for information-theoretic security, so ZK proofs fill the gap.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ZkMode {
+    /// No ZK proofs — pure MPC+MAC attestation.
+    Off,
+    /// Always require ZK proofs for checkpoints.
+    Always,
+    /// Auto-activate ZK when active workers drop below the threshold.
+    Risk {
+        /// Minimum number of active workers for MPC-only mode.
+        /// When active workers fall below this, ZK proofs are required.
+        min_workers: usize,
+    },
+}
+
+impl Default for ZkMode {
+    fn default() -> Self {
+        ZkMode::Off
+    }
+}
+
 #[cfg(feature = "chain")]
 use crate::rpc::chain_v4::{
     sign_checkpoint, sign_completion, sign_mac_failure, ChainClientV4,
@@ -87,6 +121,16 @@ pub enum ProgressEvent {
     TrainingComplete { accuracy: f64, steps: usize, time_secs: f64, checkpoints: usize },
     /// An error occurred but was recovered from.
     RecoverableError { phase: u32, message: String, retry_count: u32 },
+    /// ZK proof generation started for a checkpoint.
+    ZkProofStarted { checkpoint_index: usize, step: u64 },
+    /// ZK proof generation succeeded.
+    ZkProofGenerated { checkpoint_index: usize, step: u64, proof_size: usize, time_ms: u64, verified: bool },
+    /// ZK proof generation failed (non-fatal).
+    ZkProofFailed { checkpoint_index: usize, step: u64, error: String },
+    /// ZK proof submitted on-chain.
+    ZkProofSubmitted { checkpoint_index: usize, step: u64, tx_hash: String },
+    /// ZK risk threshold was crossed — ZK proofs are now required.
+    ZkRiskActivated { active_workers: u64, min_workers: usize },
 }
 
 /// A callback for receiving progress events.
@@ -145,6 +189,25 @@ pub struct FullOrchestrationConfig {
     /// Number of test samples to use (for accuracy evaluation).
     pub test_size: usize,
 
+    // -- Optional ZK Proof Configuration --
+    /// Configuration for optional ZK proof generation at checkpoints.
+    /// When enabled, generates `StateTransitionCircuit` proofs at checkpoint
+    /// boundaries for external verifiability. Default: disabled.
+    pub zk_proof: ZkProofConfig,
+
+    /// Controls when ZK proofs are activated for on-chain checkpoint submission.
+    ///
+    /// - `ZkMode::Off` (default): Pure MPC+MAC attestation, no ZK.
+    /// - `ZkMode::Always`: ZK proofs required for every checkpoint.
+    /// - `ZkMode::Risk { min_workers }`: Auto-activate ZK when active workers
+    ///   drop below `min_workers` (e.g. due to cheater slashing).
+    ///
+    /// When `ZkMode::Risk` is active and the threshold is crossed mid-training,
+    /// the orchestrator dynamically creates a `ZkProofLayer` for remaining
+    /// checkpoint submissions.
+    #[serde(default)]
+    pub zk_mode: ZkMode,
+
     // -- Chain Configuration (all behind #[cfg(feature = "chain")]) --
     /// Ethereum JSON-RPC URL. None = start a local Anvil instance.
     #[cfg(feature = "chain")]
@@ -187,6 +250,8 @@ impl Default for FullOrchestrationConfig {
                 "127.0.0.1:9003".to_string(),
             ],
             initial_weights_path: None,
+            zk_proof: ZkProofConfig::default(),
+            zk_mode: ZkMode::Off,
             use_real_mnist: false,
             mnist_cache_dir: None,
             train_size: 1000,
@@ -241,6 +306,10 @@ pub struct FullOrchestrationResult {
     pub coordinator_address: String,
     /// Total gas used across all on-chain transactions.
     pub total_gas_used: u64,
+    /// Number of ZK proofs generated (0 if ZK disabled).
+    pub zk_proofs_generated: usize,
+    /// Number of ZK proofs submitted on-chain (0 if ZK disabled or no chain).
+    pub zk_proofs_on_chain: usize,
 }
 
 /// Information about a detected cheater.
@@ -274,6 +343,10 @@ pub struct FullOrchestrator {
     config: FullOrchestrationConfig,
     /// Optional progress callback for user-facing display.
     progress: Option<ProgressCallback>,
+    /// Optional ZK proof layer.
+    /// Initialized at startup when `zk_proof.enabled == true` or `zk_mode == ZkMode::Always`.
+    /// For `ZkMode::Risk`, created dynamically in Phase 10.5 if the risk threshold is crossed.
+    zk_layer: Option<ZkProofLayer>,
     /// Anvil child process, if we started one.
     #[cfg(feature = "chain")]
     anvil_process: Option<Child>,
@@ -285,9 +358,31 @@ pub struct FullOrchestrator {
 impl FullOrchestrator {
     /// Creates a new orchestrator with the given configuration.
     pub fn new(config: FullOrchestrationConfig) -> Self {
+        // Create the ZK layer if explicitly enabled or if zk_mode is Always.
+        // For ZkMode::Risk, the layer is created dynamically in Phase 10.5
+        // only if the risk threshold is actually crossed.
+        let should_init_zk = config.zk_proof.enabled
+            || matches!(config.zk_mode, ZkMode::Always);
+
+        let zk_layer = if should_init_zk && config.architecture.len() == 3 {
+            let d_in = config.architecture[0];
+            let d_hid = config.architecture[1];
+            let d_out = config.architecture[2];
+
+            let mut zk_config = config.zk_proof.clone();
+            if matches!(config.zk_mode, ZkMode::Always) {
+                zk_config.enabled = true; // Ensure enabled flag is set for Always mode.
+            }
+
+            Some(ZkProofLayer::new(zk_config, d_in, d_hid, d_out))
+        } else {
+            None
+        };
+
         Self {
             config,
             progress: None,
+            zk_layer,
             #[cfg(feature = "chain")]
             anvil_process: None,
             #[cfg(feature = "chain")]
@@ -386,6 +481,16 @@ impl FullOrchestrator {
         );
         self.emit(ProgressEvent::PhaseCompleted { phase: 2, elapsed_ms: phase2_elapsed });
 
+        // Set ZK baseline weights from initial model state (before MPC training).
+        if let Some(ref mut zk_layer) = self.zk_layer {
+            zk_layer.set_baseline_weights(
+                &initial_weights.w1,
+                &initial_weights.b1,
+                &initial_weights.w2,
+                &initial_weights.b2,
+            ).context("Failed to set ZK baseline weights")?;
+        }
+
         // ================================================================
         // Phases 3-7: On-chain setup (feature-gated)
         // ================================================================
@@ -422,7 +527,9 @@ impl FullOrchestrator {
             training_data: training_pairs,
             seed: self.config.seed,
             use_node_transport: false,
-            use_tcp_transport: !self.config.worker_endpoints.is_empty(),
+            // In-process mode: workers run as tokio tasks with local transport.
+            // TCP transport requires the network-mpc feature and external worker processes.
+            use_tcp_transport: false,
         };
 
         let mpc_result = helix_mpc::e2e_integration::run_mpc_training(mpc_config)
@@ -463,7 +570,7 @@ impl FullOrchestrator {
         // Phases 9-11: On-chain settlement (feature-gated)
         // ================================================================
         #[cfg(feature = "chain")]
-        let (checkpoints_on_chain, cheater_info, settlement_gas) = {
+        let (checkpoints_on_chain, cheater_info, settlement_gas, zk_proofs_on_chain) = {
             self.run_chain_settlement_phases(
                 job_id,
                 &mpc_result,
@@ -474,14 +581,14 @@ impl FullOrchestrator {
         };
 
         #[cfg(not(feature = "chain"))]
-        let (checkpoints_on_chain, cheater_info, settlement_gas): (usize, Option<CheaterInfo>, u64) = {
+        let (checkpoints_on_chain, cheater_info, settlement_gas, zk_proofs_on_chain): (usize, Option<CheaterInfo>, u64, usize) = {
             let ci = mpc_result.cheater_detected.as_ref().map(|c| CheaterInfo {
                 party_index: c.party_index,
                 detected_at_step: c.detected_at_step,
                 slashed: false,
                 slash_tx_hash: None,
             });
-            (0, ci, 0)
+            (0, ci, 0, 0)
         };
 
         // ================================================================
@@ -538,6 +645,12 @@ impl FullOrchestrator {
         #[cfg(not(feature = "chain"))]
         let total_gas = chain_gas + settlement_gas + withdrawal_gas;
 
+        let zk_proofs_generated = self
+            .zk_layer
+            .as_ref()
+            .map(|zk| zk.proofs_generated())
+            .unwrap_or(0);
+
         let result = FullOrchestrationResult {
             job_id,
             steps_completed: mpc_result.steps_completed,
@@ -551,6 +664,8 @@ impl FullOrchestrator {
             training_time_secs: total_elapsed,
             coordinator_address: coordinator_address.clone(),
             total_gas_used: total_gas,
+            zk_proofs_generated,
+            zk_proofs_on_chain,
         };
 
         self.emit(ProgressEvent::PhaseStarted {
@@ -824,7 +939,44 @@ impl FullOrchestrator {
             let owner_wallet = LocalWallet::from_str(owner_pk)
                 .map_err(|e| anyhow!("Invalid owner private key: {}", e))?;
             let treasury = owner_wallet.address();
-            let verifier = Address::zero(); // No ZK verifier for MPC-primary mode.
+
+            // Deploy the real Halo2Verifier when ZK proofs may be needed
+            // (enabled explicitly, Always mode, or Risk mode which might activate later).
+            // Otherwise use Address::zero() to disable on-chain ZK verification.
+            let needs_verifier = self.config.zk_proof.enabled
+                || matches!(self.config.zk_mode, ZkMode::Always | ZkMode::Risk { .. });
+            let verifier = if needs_verifier {
+                info!("Phase 4: Deploying real Halo2Verifier for ZK proof verification");
+
+                // Create a temporary client for deploying the verifier
+                let temp_provider = Provider::<Http>::try_from(rpc_url.as_str())
+                    .map_err(|e| anyhow!("Invalid RPC URL for verifier deploy: {}", e))?;
+                let temp_wallet = LocalWallet::from_str(owner_pk)
+                    .map_err(|e| anyhow!("Invalid owner key for verifier deploy: {}", e))?
+                    .with_chain_id(
+                        temp_provider.get_chainid().await
+                            .map_err(|e| anyhow!("Failed to get chain ID: {}", e))?
+                            .as_u64()
+                    );
+                let temp_client = Arc::new(SignerMiddleware::new(temp_provider, temp_wallet));
+
+                let verifier_contract = crate::rpc::chain_v4::Halo2VerifierContract::deploy(
+                    temp_client, ()
+                )
+                .map_err(|e| anyhow!("Halo2Verifier deploy prepare: {}", e))?
+                .send()
+                .await
+                .map_err(|e| anyhow!("Halo2Verifier deploy send: {}", e))?;
+
+                let verifier_addr = verifier_contract.address();
+                info!(
+                    verifier_address = %format!("{:?}", verifier_addr),
+                    "Halo2Verifier deployed"
+                );
+                verifier_addr
+            } else {
+                Address::zero() // No ZK verifier for MPC-primary mode
+            };
 
             let (client, deploy_result) = retry_chain_op(
                 "contract deployment",
@@ -885,15 +1037,37 @@ impl FullOrchestrator {
             }
         }
 
+        // Derive ZK parameters from zk_mode for the on-chain registration.
+        let zk_enabled = matches!(self.config.zk_mode, ZkMode::Always);
+        let risk_zk_enabled = matches!(self.config.zk_mode, ZkMode::Risk { .. });
+        let min_workers_for_mpc = match self.config.zk_mode {
+            ZkMode::Risk { min_workers } => min_workers as u64,
+            _ => 0,
+        };
+        let zk_checkpoint_freq = self.config.zk_proof.checkpoint_frequency as u64;
+
+        info!(
+            zk_mode = ?self.config.zk_mode,
+            zk_enabled = zk_enabled,
+            risk_zk_enabled = risk_zk_enabled,
+            min_workers_for_mpc = min_workers_for_mpc,
+            zk_checkpoint_freq = zk_checkpoint_freq,
+            "Phase 5: Registering job with ZK configuration"
+        );
+
         let (reg_receipt, job_id) = retry_chain_op(
             "job registration",
             || async {
                 chain_client
-                    .register_training_job(
+                    .register_training_job_with_zk(
                         arch_hash,
                         self.config.checkpoint_frequency as u64,
                         num_checkpoints.max(1) as u64,
                         payment_wei,
+                        zk_enabled,
+                        zk_checkpoint_freq,
+                        risk_zk_enabled,
+                        min_workers_for_mpc,
                     )
                     .await
             },
@@ -1027,25 +1201,32 @@ impl FullOrchestrator {
     /// Runs phases 9 through 11: checkpoint attestation, cheater slashing,
     /// and training completion.
     ///
-    /// Returns (checkpoints_on_chain, cheater_info, gas_used).
+    /// Returns (checkpoints_on_chain, cheater_info, gas_used, zk_proofs_on_chain).
     #[cfg(feature = "chain")]
     async fn run_chain_settlement_phases(
-        &self,
+        &mut self,
         job_id: u64,
         mpc_result: &MPCIntegrationResult,
         chain_client: &ChainClientV4,
         worker_wallets: &[LocalWallet],
-    ) -> Result<(usize, Option<CheaterInfo>, u64)> {
+    ) -> Result<(usize, Option<CheaterInfo>, u64, usize)> {
         let mut total_gas: u64 = 0;
         let mut checkpoints_on_chain: usize = 0;
+        let mut zk_proofs_on_chain: usize = 0;
 
-        // -- Phase 9: Submit checkpoints --
+        // -- Phase 9: Submit checkpoints (with optional ZK proofs) --
+        let zk_enabled = self.zk_layer.is_some();
         self.emit(ProgressEvent::PhaseStarted {
             phase: 9, total: 13,
-            description: "Submitting checkpoint attestations".to_string(),
+            description: if zk_enabled {
+                "Submitting checkpoint attestations + ZK proofs".to_string()
+            } else {
+                "Submitting checkpoint attestations".to_string()
+            },
         });
         info!(
             checkpoint_count = mpc_result.checkpoints.len(),
+            zk_enabled = zk_enabled,
             "Phase 9: Submitting checkpoint attestations"
         );
         let phase9_start = Instant::now();
@@ -1077,27 +1258,136 @@ impl FullOrchestrator {
                 signatures.push(sig);
             }
 
-            let receipt = retry_chain_op(
-                &format!("checkpoint {} submission", idx),
-                || async {
-                    chain_client
-                        .submit_checkpoint(
-                            job_id,
-                            checkpoint.step as u64,
-                            checkpoint.commitment_bytes32,
-                            loss_u256,
-                            signatures.clone(),
-                        )
-                        .await
-                },
-                &self.progress,
-                9,
-            ).await
-            .with_context(|| format!("Phase 9: Failed to submit checkpoint {} after retries", idx))?;
+            // Optionally generate a ZK proof for the LAST checkpoint.
+            // In MPC training, intermediate checkpoint weights aren't reconstructed
+            // (only commitments are recorded). We have initial weights (baseline,
+            // set in Phase 2) and final weights (reconstructed after MPC completes).
+            // The ZK proof covers the transition: initial_weights → final_weights.
+            let is_last_checkpoint = idx == total_checkpoints - 1;
+            let zk_proof_result: Option<ZkCheckpointProofResult> = if is_last_checkpoint {
+                if let Some(ref mut zk_layer) = self.zk_layer {
+                    self.progress.as_ref().map(|cb| cb(ProgressEvent::ZkProofStarted {
+                        checkpoint_index: idx,
+                        step: checkpoint.step as u64,
+                    }));
+
+                    match zk_layer.process_checkpoint(
+                        idx,
+                        checkpoint.step,
+                        &mpc_result.final_weights,
+                        checkpoint.loss,
+                    ) {
+                        Ok(Some(result)) => {
+                            if let Some(ref cb) = self.progress {
+                                cb(ProgressEvent::ZkProofGenerated {
+                                    checkpoint_index: idx,
+                                    step: checkpoint.step as u64,
+                                    proof_size: result.proof.proof_size(),
+                                    time_ms: result.proof.generation_time.as_millis() as u64,
+                                    verified: result.proof.verified,
+                                });
+                            }
+                            Some(result)
+                        }
+                        Ok(None) => None,
+                        Err(e) => {
+                            // ZK proof failure is non-fatal; MAC attestation is primary
+                            warn!(
+                                checkpoint_index = idx,
+                                error = %e,
+                                "Phase 9: ZK proof generation failed (non-fatal), falling back to attestation-only"
+                            );
+                            if let Some(ref cb) = self.progress {
+                                cb(ProgressEvent::ZkProofFailed {
+                                    checkpoint_index: idx,
+                                    step: checkpoint.step as u64,
+                                    error: e.to_string(),
+                                });
+                            }
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            // Submit checkpoint: use ZK path if we have a proof, otherwise attestation path.
+            let receipt = if let Some(ref zk_result) = zk_proof_result {
+                let evm_proof = zk_result.proof.to_evm_proof();
+                let evm_public_inputs: Vec<U256> = zk_result
+                    .proof
+                    .to_evm_public_inputs()
+                    .iter()
+                    .map(|bytes| U256::from_big_endian(bytes))
+                    .collect();
+
+                info!(
+                    checkpoint_index = idx,
+                    proof_size = evm_proof.len(),
+                    public_inputs = evm_public_inputs.len(),
+                    "Submitting checkpoint with ZK proof"
+                );
+
+                retry_chain_op(
+                    &format!("checkpoint {} ZK submission", idx),
+                    || {
+                        let proof_clone = evm_proof.clone();
+                        let pi_clone = evm_public_inputs.clone();
+                        async move {
+                            chain_client
+                                .submit_checkpoint_with_proof(
+                                    job_id,
+                                    checkpoint.step as u64,
+                                    checkpoint.commitment_bytes32,
+                                    loss_u256,
+                                    proof_clone,
+                                    pi_clone,
+                                )
+                                .await
+                        }
+                    },
+                    &self.progress,
+                    9,
+                ).await
+                .with_context(|| format!("Phase 9: Failed to submit ZK checkpoint {} after retries", idx))?
+            } else {
+                retry_chain_op(
+                    &format!("checkpoint {} submission", idx),
+                    || async {
+                        chain_client
+                            .submit_checkpoint(
+                                job_id,
+                                checkpoint.step as u64,
+                                checkpoint.commitment_bytes32,
+                                loss_u256,
+                                signatures.clone(),
+                            )
+                            .await
+                    },
+                    &self.progress,
+                    9,
+                ).await
+                .with_context(|| format!("Phase 9: Failed to submit checkpoint {} after retries", idx))?
+            };
 
             let gas = receipt.gas_used.map(|g| g.as_u64()).unwrap_or(0);
             total_gas += gas;
             checkpoints_on_chain += 1;
+
+            if zk_proof_result.is_some() {
+                zk_proofs_on_chain += 1;
+                let tx_hash = format!("{:?}", receipt.transaction_hash);
+                if let Some(ref cb) = self.progress {
+                    cb(ProgressEvent::ZkProofSubmitted {
+                        checkpoint_index: idx,
+                        step: checkpoint.step as u64,
+                        tx_hash: tx_hash.clone(),
+                    });
+                }
+            }
 
             let tx_hash = format!("{:?}", receipt.transaction_hash);
             self.emit(ProgressEvent::CheckpointSubmitted {
@@ -1112,15 +1402,29 @@ impl FullOrchestrator {
                 step = checkpoint.step,
                 loss = checkpoint.loss,
                 gas_used = gas,
+                zk_proof = zk_proof_result.is_some(),
                 tx_hash = %tx_hash,
                 "Checkpoint submitted on-chain"
             );
         }
 
+        let zk_stats_msg = if let Some(ref zk_layer) = self.zk_layer {
+            let stats = zk_layer.stats();
+            format!(
+                ", zk_proofs={}, zk_on_chain={}, zk_proving_time_ms={}",
+                stats.proofs_generated,
+                zk_proofs_on_chain,
+                stats.total_proving_time.as_millis()
+            )
+        } else {
+            String::new()
+        };
+
         info!(
             checkpoints_submitted = checkpoints_on_chain,
             elapsed_ms = phase9_start.elapsed().as_millis(),
-            "Phase 9 complete: all checkpoints attested"
+            "Phase 9 complete: all checkpoints attested{}",
+            zk_stats_msg
         );
         self.emit(ProgressEvent::PhaseCompleted { phase: 9, elapsed_ms: phase9_start.elapsed().as_millis() });
 
@@ -1226,6 +1530,83 @@ impl FullOrchestrator {
         };
         self.emit(ProgressEvent::PhaseCompleted { phase: 10, elapsed_ms: 0 });
 
+        // -- Phase 10.5: Risk-based ZK activation check --
+        // If zk_mode is Risk and a cheater was just slashed, the active worker
+        // count may have dropped below the threshold. Query the contract to see
+        // if ZK is now required, and dynamically create a ZkProofLayer if so.
+        if matches!(self.config.zk_mode, ZkMode::Risk { .. }) && self.zk_layer.is_none() {
+            match chain_client.is_zk_required(job_id).await {
+                Ok(true) => {
+                    let active_workers = chain_client
+                        .get_active_worker_count(job_id)
+                        .await
+                        .unwrap_or(0);
+                    let min_w = match self.config.zk_mode {
+                        ZkMode::Risk { min_workers } => min_workers,
+                        _ => 0,
+                    };
+
+                    warn!(
+                        active_workers = active_workers,
+                        min_workers = min_w,
+                        "Phase 10.5: Risk threshold crossed! Active workers ({}) < min_workers ({}). \
+                         Activating ZK proof layer for remaining operations.",
+                        active_workers,
+                        min_w,
+                    );
+
+                    self.emit(ProgressEvent::ZkRiskActivated {
+                        active_workers,
+                        min_workers: min_w,
+                    });
+
+                    // Dynamically create the ZK proof layer.
+                    let arch = &self.config.architecture;
+                    if arch.len() == 3 {
+                        let d_in = arch[0];
+                        let d_hid = arch[1];
+                        let d_out = arch[2];
+
+                        let mut zk_config = self.config.zk_proof.clone();
+                        zk_config.enabled = true; // Force-enable for risk activation.
+
+                        let mut zk_layer = ZkProofLayer::new(zk_config, d_in, d_hid, d_out);
+
+                        // Set baseline weights from the final MPC result so the proof
+                        // covers the full training transition.
+                        if let Err(e) = zk_layer.set_baseline_weights(
+                            &mpc_result.final_weights.w1,
+                            &mpc_result.final_weights.b1,
+                            &mpc_result.final_weights.w2,
+                            &mpc_result.final_weights.b2,
+                        ) {
+                            warn!(
+                                error = %e,
+                                "Phase 10.5: Failed to set baseline weights for risk-activated ZK layer"
+                            );
+                        } else {
+                            info!("Phase 10.5: ZK proof layer activated dynamically for risk mode");
+                            self.zk_layer = Some(zk_layer);
+                        }
+                    } else {
+                        warn!(
+                            "Phase 10.5: Cannot activate ZK layer — architecture must have 3 layers, got {}",
+                            arch.len()
+                        );
+                    }
+                }
+                Ok(false) => {
+                    debug!("Phase 10.5: ZK not required (worker count still above threshold)");
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "Phase 10.5: Failed to query is_zk_required, continuing without ZK activation"
+                    );
+                }
+            }
+        }
+
         // -- Phase 11: Complete training on-chain --
         self.emit(ProgressEvent::PhaseStarted {
             phase: 11, total: 13,
@@ -1291,7 +1672,7 @@ impl FullOrchestrator {
         );
         self.emit(ProgressEvent::PhaseCompleted { phase: 11, elapsed_ms: phase11_start.elapsed().as_millis() });
 
-        Ok((checkpoints_on_chain, cheater_info, total_gas))
+        Ok((checkpoints_on_chain, cheater_info, total_gas, zk_proofs_on_chain))
     }
 
     // ========================================================================
@@ -1517,6 +1898,22 @@ impl FullOrchestrator {
             info!("    Total Gas:        {}", result.total_gas_used);
         } else {
             info!("    (chain features not enabled)");
+        }
+
+        if result.zk_proofs_generated > 0 {
+            info!("");
+            info!("  ZK Proof Layer");
+            info!("  {thin_divider}");
+            info!("    Proofs Generated: {}", result.zk_proofs_generated);
+            info!("    Proofs On-Chain:  {}", result.zk_proofs_on_chain);
+            if let Some(ref zk_layer) = self.zk_layer {
+                let stats = zk_layer.stats();
+                info!("    Proofs Verified:  {}", stats.proofs_verified);
+                info!("    Proving Time:     {:.2}s", stats.total_proving_time.as_secs_f64());
+                if let Some(init_time) = stats.init_time {
+                    info!("    Init Time:        {:.2}s", init_time.as_secs_f64());
+                }
+            }
         }
 
         if let Some(ref cheater) = result.cheater_detected {
@@ -1912,6 +2309,8 @@ mod tests {
             coordinator_address: None,
             #[cfg(feature = "chain")]
             enable_withdrawal: false,
+            zk_proof: ZkProofConfig::default(),
+            zk_mode: ZkMode::Off,
         };
         let orchestrator = FullOrchestrator::new(config);
         assert!(orchestrator.validate_config().is_ok());
@@ -2122,6 +2521,8 @@ mod tests {
             training_time_secs: 12.5,
             coordinator_address: "0x1234".to_string(),
             total_gas_used: 500_000,
+            zk_proofs_generated: 0,
+            zk_proofs_on_chain: 0,
         };
         let json = serde_json::to_string(&result).unwrap();
         let parsed: FullOrchestrationResult = serde_json::from_str(&json).unwrap();

@@ -134,7 +134,7 @@ async fn test_tcp_e2e_with_checkpoints() {
         result.checkpoints.len()
     );
     for cp in &result.checkpoints {
-        assert!(!cp.commitment_bytes.is_empty(), "Checkpoint should have non-empty commitment");
+        assert!(cp.commitment_bytes32 != [0u8; 32], "Checkpoint should have non-zero commitment");
         assert!(cp.loss.is_finite(), "Checkpoint loss should be finite");
     }
 }

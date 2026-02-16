@@ -780,4 +780,123 @@ mod tests {
             );
         }
     }
+
+    /// Non-MPC forward pass at MNIST scale: pure field arithmetic.
+    /// This isolates whether the bug is in MPC or field ops.
+    #[test]
+    fn test_mnist_scale_forward_pass_no_mpc() {
+        use rand::{Rng, SeedableRng};
+        use rand_chacha::ChaCha20Rng;
+
+        let d_in = 784;
+        let d_hid = 32;
+        let d_out = 10;
+
+        let mut rng = ChaCha20Rng::seed_from_u64(42);
+        let w1_scale = (2.0 / d_in as f64).sqrt();
+        let w2_scale = (2.0 / d_hid as f64).sqrt();
+
+        // Create weights as f64 and Fr
+        let w1_f64: Vec<f64> = (0..d_hid * d_in).map(|_| rng.gen_range(-w1_scale..w1_scale)).collect();
+        let w2_f64: Vec<f64> = (0..d_out * d_hid).map(|_| rng.gen_range(-w2_scale..w2_scale)).collect();
+        let w1_fr: Vec<Fr> = w1_f64.iter().map(|&v| Fr::from_f64(v)).collect();
+        let w2_fr: Vec<Fr> = w2_f64.iter().map(|&v| Fr::from_f64(v)).collect();
+
+        // Input
+        let input_f64: Vec<f64> = (0..d_in).map(|_| rng.gen_range(0.0..1.0)).collect();
+        let input_fr: Vec<Fr> = input_f64.iter().map(|&v| Fr::from_f64(v)).collect();
+
+        // f64 forward pass
+        let mut h_pre_f64 = vec![0.0f64; d_hid];
+        for i in 0..d_hid {
+            for j in 0..d_in {
+                h_pre_f64[i] += w1_f64[i * d_in + j] * input_f64[j];
+            }
+        }
+        eprintln!("f64 h_pre[0..3] = {:?}", &h_pre_f64[..3]);
+
+        // Fr forward pass (using mpc_scale = exact mod-inverse path)
+        let mut h_pre_fr = vec![Fr::ZERO; d_hid];
+        for i in 0..d_hid {
+            let mut sum = Fr::ZERO;
+            for j in 0..d_in {
+                let contrib = w1_fr[i * d_in + j].mpc_scale(&input_fr[j]);
+                sum = Fr::add(&sum, &contrib);
+            }
+            h_pre_fr[i] = sum;
+        }
+
+        // Convert Fr back to f64 and compare
+        for i in 0..3 {
+            let fr_val = h_pre_fr[i].to_f64();
+            eprintln!("h_pre[{}]: f64={:.6}, Fr.to_f64()={:.6e}, diff={:.6e}",
+                i, h_pre_f64[i], fr_val, (fr_val - h_pre_f64[i]).abs());
+        }
+
+        // Check: Fr values should match f64 values within reasonable tolerance
+        for i in 0..d_hid {
+            let fr_val = h_pre_fr[i].to_f64();
+            let f64_val = h_pre_f64[i];
+            assert!(
+                (fr_val - f64_val).abs() < 1.0,
+                "h_pre[{}]: f64={}, Fr={} — massive divergence!",
+                i, f64_val, fr_val,
+            );
+        }
+
+        // ReLU
+        let mut h_f64 = vec![0.0f64; d_hid];
+        let mut h_fr = vec![Fr::ZERO; d_hid];
+        for i in 0..d_hid {
+            if h_pre_f64[i] > 0.0 {
+                h_f64[i] = h_pre_f64[i];
+            }
+            let fr_val = h_pre_fr[i].to_f64();
+            if fr_val > 0.0 {
+                h_fr[i] = Fr::from_f64(fr_val);
+            }
+        }
+
+        // Layer 2: y = W2 @ h + b2
+        let mut y_f64 = vec![0.0f64; d_out];
+        let mut y_fr = vec![Fr::ZERO; d_out];
+        for i in 0..d_out {
+            for j in 0..d_hid {
+                y_f64[i] += w2_f64[i * d_hid + j] * h_f64[j];
+                let contrib = w2_fr[i * d_hid + j].mpc_scale(&h_fr[j]);
+                y_fr[i] = Fr::add(&y_fr[i], &contrib);
+            }
+        }
+
+        eprintln!("f64 y[0..3] = {:?}", &y_f64[..3]);
+        for i in 0..3 {
+            let fr_val = y_fr[i].to_f64();
+            eprintln!("y[{}]: f64={:.6}, Fr.to_f64()={:.6e}", i, y_f64[i], fr_val);
+        }
+
+        // Loss = 0.5 * sum((y - target)^2)
+        let mut target = vec![0.0f64; d_out];
+        target[3] = 1.0;
+        let target_fr: Vec<Fr> = target.iter().map(|&v| Fr::from_f64(v)).collect();
+
+        let mut loss_f64 = 0.0f64;
+        let mut loss_fr = 0.0f64;
+        for i in 0..d_out {
+            let diff_f64 = y_f64[i] - target[i];
+            loss_f64 += 0.5 * diff_f64 * diff_f64;
+
+            let diff_fr = Fr::sub(&y_fr[i], &target_fr[i]);
+            let diff_val = diff_fr.to_f64();
+            loss_fr += 0.5 * diff_val * diff_val;
+        }
+
+        eprintln!("Loss (f64): {:.6}", loss_f64);
+        eprintln!("Loss (Fr):  {:.6e}", loss_fr);
+
+        assert!(
+            loss_fr < 100.0,
+            "Fr-based loss too high: {:.6e} (f64 loss: {:.6})",
+            loss_fr, loss_f64,
+        );
+    }
 }

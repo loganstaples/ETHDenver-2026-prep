@@ -58,7 +58,9 @@ pub use party_selection::{
     HeartbeatMessage, PartyMetricsSummary, PartySelector, RoundRobinSelector,
     SelectionConfig,
 };
-pub use transport::{HandshakeMessage, LocalTransport, MPCTransport};
+pub use transport::{
+    HandshakeMessage, LocalTransport, MPCTransport, TcpTransportConfig, TransportConfig,
+};
 #[cfg(feature = "network-mpc")]
 pub use transport::TcpTransport;
 pub use checkpoint::{SessionCheckpoint, SessionPersistence};

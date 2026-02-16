@@ -1,8 +1,11 @@
-//! HELIX Dashboard HTTP Server
+//! HELIX Dashboard HTTP + WebSocket Server
 //!
-//! Provides a REST API for the status dashboard to consume.
-//! Includes bearer-token authentication, per-IP rate limiting,
-//! configurable CORS, and dynamic state wiring.
+//! REST API for status dashboard + training job submission + WebSocket progress streaming.
+//! - POST /api/training/start — submit a training job from the web app
+//! - GET  /api/training/:id   — get training session state
+//! - GET  /api/training/:id/losses — get loss history
+//! - WS   /ws                 — WebSocket for real-time progress events
+//! - GET  /api/status, /api/network, etc. — existing dashboard endpoints
 
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
@@ -11,15 +14,26 @@ use std::time::Instant;
 
 use axum::{
     Router,
-    routing::get,
-    extract::{ConnectInfo, State},
+    routing::{get, post},
+    extract::{
+        ConnectInfo, Path, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
     response::{IntoResponse, Json},
     http::{header, Method, Request, StatusCode},
     middleware::{self, Next},
 };
+use futures::stream::StreamExt;
+use futures::SinkExt;
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
 use tower_http::cors::{CorsLayer, Any};
+use tracing::{debug, error, info, warn};
+
+use crate::full_orchestration::{
+    FullOrchestrationConfig, FullOrchestrator, ProgressCallback, ProgressEvent, ZkMode,
+};
+use crate::zk_proof_layer::ZkProofConfig;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -44,6 +58,108 @@ impl Default for DashboardConfig {
             rate_limit_per_second: 30,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Training Job Request/Response Types
+// ---------------------------------------------------------------------------
+
+/// Training job submission from the web app.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrainingJobRequest {
+    /// Layer dimensions, e.g. [784, 32, 10]
+    #[serde(default = "default_architecture")]
+    pub architecture: Vec<usize>,
+    /// Number of MPC workers
+    #[serde(default = "default_num_workers")]
+    pub num_workers: usize,
+    /// Total training steps
+    #[serde(default = "default_num_steps")]
+    pub num_steps: usize,
+    /// Learning rate
+    #[serde(default = "default_learning_rate")]
+    pub learning_rate: f64,
+    /// Checkpoint every N steps
+    #[serde(default = "default_checkpoint_freq")]
+    pub checkpoint_freq: usize,
+    /// MAC verification interval (every N steps)
+    #[serde(default = "default_mac_interval")]
+    pub mac_interval: u64,
+    /// ZK mode: "off", "always", or "risk"
+    #[serde(default = "default_zk_mode")]
+    pub zk_mode: String,
+    /// ZK proof every N checkpoints (when zk_mode != "off")
+    #[serde(default = "default_zk_checkpoint_freq")]
+    pub zk_checkpoint_freq: u64,
+    /// Min workers for MPC before risk-ZK activates
+    #[serde(default = "default_min_workers")]
+    pub min_workers_for_mpc: usize,
+    /// Number of training samples
+    #[serde(default = "default_train_size")]
+    pub train_size: usize,
+    /// Number of test samples
+    #[serde(default = "default_test_size")]
+    pub test_size: usize,
+    /// Use real MNIST data (requires network)
+    #[serde(default)]
+    pub use_real_mnist: bool,
+    /// ETH payment for training job
+    #[serde(default = "default_payment")]
+    pub payment_eth: f64,
+    /// ETH stake per worker
+    #[serde(default = "default_stake")]
+    pub stake_per_worker_eth: f64,
+    /// Demo feature: simulate a cheater
+    #[serde(default)]
+    pub simulate_cheater: bool,
+    /// Random seed
+    #[serde(default = "default_seed")]
+    pub seed: u64,
+}
+
+fn default_architecture() -> Vec<usize> { vec![784, 32, 10] }
+fn default_num_workers() -> usize { 3 }
+fn default_num_steps() -> usize { 500 }
+fn default_learning_rate() -> f64 { 0.001 }
+fn default_checkpoint_freq() -> usize { 50 }
+fn default_mac_interval() -> u64 { 1 }
+fn default_zk_mode() -> String { "off".to_string() }
+fn default_zk_checkpoint_freq() -> u64 { 5 }
+fn default_min_workers() -> usize { 2 }
+fn default_train_size() -> usize { 1000 }
+fn default_test_size() -> usize { 200 }
+fn default_payment() -> f64 { 1.0 }
+fn default_stake() -> f64 { 0.1 }
+fn default_seed() -> u64 { 42 }
+
+/// Response after submitting a training job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrainingJobResponse {
+    pub session_id: String,
+    pub status: String,
+}
+
+/// Live training session state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrainingSessionState {
+    pub session_id: String,
+    pub status: String,
+    pub current_step: usize,
+    pub total_steps: usize,
+    pub current_loss: f64,
+    pub losses: Vec<f64>,
+    pub accuracy: Option<f64>,
+    pub checkpoints_submitted: usize,
+    pub mac_checks_passed: usize,
+    pub cheater_detected: Option<serde_json::Value>,
+    pub zk_proofs_generated: usize,
+    pub zk_activated_by_risk: bool,
+    pub phase: u32,
+    pub phase_description: String,
+    pub coordinator_address: String,
+    pub job_id: u64,
+    pub elapsed_secs: f64,
+    pub started_at: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -173,11 +289,16 @@ pub struct DashboardState {
     pub config: DashboardConfig,
     /// Per-IP request timestamps for rate limiting
     rate_limiter: RwLock<HashMap<IpAddr, VecDeque<Instant>>>,
+    /// Active training sessions
+    pub sessions: RwLock<HashMap<String, TrainingSessionState>>,
+    /// WebSocket broadcast channel for progress events
+    pub ws_broadcast: broadcast::Sender<(String, serde_json::Value)>,
 }
 
 impl DashboardState {
     /// Create new dashboard state with the given config
     pub fn new(config: DashboardConfig) -> Self {
+        let (ws_broadcast, _) = broadcast::channel(1024);
         Self {
             start_time: Instant::now(),
             network_status: RwLock::new(NetworkStatus::default()),
@@ -187,6 +308,8 @@ impl DashboardState {
             events: RwLock::new(Vec::new()),
             config,
             rate_limiter: RwLock::new(HashMap::new()),
+            sessions: RwLock::new(HashMap::new()),
+            ws_broadcast,
         }
     }
 
@@ -318,8 +441,9 @@ async fn auth_middleware(
         return next.run(req).await.into_response();
     };
 
-    // Skip auth for /health endpoint
-    if req.uri().path() == "/health" {
+    // Skip auth for /health and /ws endpoints
+    let path = req.uri().path();
+    if path == "/health" || path == "/ws" {
         return next.run(req).await.into_response();
     }
 
@@ -411,6 +535,13 @@ pub fn create_dashboard_router_with_state(state: Arc<DashboardState>) -> Router 
         .route("/api/nodes", get(nodes_handler))
         .route("/api/metrics", get(metrics_handler))
         .route("/api/events", get(events_handler))
+        // New training job endpoints
+        .route("/api/training/start", post(start_training_handler))
+        .route("/api/training/sessions", get(list_sessions_handler))
+        .route("/api/training/sessions/{id}", get(get_session_handler))
+        .route("/api/training/sessions/{id}/losses", get(get_losses_handler))
+        // WebSocket endpoint
+        .route("/ws", get(websocket_handler))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .layer(middleware::from_fn_with_state(state.clone(), rate_limit_middleware))
         .layer(cors_layer)
@@ -419,7 +550,7 @@ pub fn create_dashboard_router_with_state(state: Arc<DashboardState>) -> Router 
 
 fn build_cors_layer(config: &DashboardConfig) -> CorsLayer {
     let base = CorsLayer::new()
-        .allow_methods([Method::GET, Method::POST])
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers(Any);
 
     if config.allowed_origins.is_empty() {
@@ -435,7 +566,120 @@ fn build_cors_layer(config: &DashboardConfig) -> CorsLayer {
 }
 
 // ---------------------------------------------------------------------------
-// Handlers
+// Progress Event → JSON conversion
+// ---------------------------------------------------------------------------
+
+fn progress_event_to_json(event: &ProgressEvent) -> serde_json::Value {
+    match event {
+        ProgressEvent::PhaseStarted { phase, total, description } => {
+            serde_json::json!({
+                "type": "phase_started",
+                "phase": phase,
+                "total": total,
+                "description": description,
+            })
+        }
+        ProgressEvent::PhaseCompleted { phase, elapsed_ms } => {
+            serde_json::json!({
+                "type": "phase_completed",
+                "phase": phase,
+                "elapsed_ms": elapsed_ms,
+            })
+        }
+        ProgressEvent::TrainingStep { step, total, loss, mac_ok } => {
+            serde_json::json!({
+                "type": "training_step",
+                "step": step,
+                "total": total,
+                "loss": loss,
+                "mac_ok": mac_ok,
+            })
+        }
+        ProgressEvent::CheckpointSubmitted { index, total, step, tx_hash } => {
+            serde_json::json!({
+                "type": "checkpoint_submitted",
+                "index": index,
+                "total": total,
+                "step": step,
+                "tx_hash": tx_hash,
+            })
+        }
+        ProgressEvent::CheaterDetected { party_index, step } => {
+            serde_json::json!({
+                "type": "cheater_detected",
+                "party_index": party_index,
+                "step": step,
+            })
+        }
+        ProgressEvent::CheaterSlashed { party_index, tx_hash } => {
+            serde_json::json!({
+                "type": "cheater_slashed",
+                "party_index": party_index,
+                "tx_hash": tx_hash,
+            })
+        }
+        ProgressEvent::TrainingComplete { accuracy, steps, time_secs, checkpoints } => {
+            serde_json::json!({
+                "type": "training_complete",
+                "accuracy": accuracy,
+                "steps": steps,
+                "time_secs": time_secs,
+                "checkpoints": checkpoints,
+            })
+        }
+        ProgressEvent::RecoverableError { phase, message, retry_count } => {
+            serde_json::json!({
+                "type": "recoverable_error",
+                "phase": phase,
+                "message": message,
+                "retry_count": retry_count,
+            })
+        }
+        ProgressEvent::ZkProofStarted { checkpoint_index, step } => {
+            serde_json::json!({
+                "type": "zk_proof_started",
+                "checkpoint_index": checkpoint_index,
+                "step": step,
+            })
+        }
+        ProgressEvent::ZkProofGenerated { checkpoint_index, step, proof_size, time_ms, verified } => {
+            serde_json::json!({
+                "type": "zk_proof_generated",
+                "checkpoint_index": checkpoint_index,
+                "step": step,
+                "proof_size": proof_size,
+                "time_ms": time_ms,
+                "verified": verified,
+            })
+        }
+        ProgressEvent::ZkProofFailed { checkpoint_index, step, error } => {
+            serde_json::json!({
+                "type": "zk_proof_failed",
+                "checkpoint_index": checkpoint_index,
+                "step": step,
+                "error": error,
+            })
+        }
+        ProgressEvent::ZkProofSubmitted { checkpoint_index, step, tx_hash } => {
+            serde_json::json!({
+                "type": "zk_proof_submitted",
+                "checkpoint_index": checkpoint_index,
+                "step": step,
+                "tx_hash": tx_hash,
+            })
+        }
+        ProgressEvent::ZkRiskActivated { active_workers, min_workers } => {
+            serde_json::json!({
+                "type": "zk_risk_activated",
+                "active_workers": active_workers,
+                "min_workers": min_workers,
+            })
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Handlers: Existing
 // ---------------------------------------------------------------------------
 
 /// Root handler - returns API info
@@ -450,7 +694,12 @@ async fn root_handler() -> Json<serde_json::Value> {
             "/api/training",
             "/api/nodes",
             "/api/metrics",
-            "/api/events"
+            "/api/events",
+            "/api/training/start",
+            "/api/training/sessions",
+            "/api/training/sessions/:id",
+            "/api/training/sessions/:id/losses",
+            "/ws"
         ]
     }))
 }
@@ -574,4 +823,413 @@ async fn events_handler(
     } else {
         Json(events.clone())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Handlers: Training Job Submission
+// ---------------------------------------------------------------------------
+
+/// POST /api/training/start — submit a new training job
+async fn start_training_handler(
+    State(state): State<Arc<DashboardState>>,
+    Json(req): Json<TrainingJobRequest>,
+) -> impl IntoResponse {
+    let session_id = uuid::Uuid::new_v4().to_string();
+    info!(session_id = %session_id, "Starting new training session");
+
+    // Validate request
+    if req.architecture.len() != 3 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "architecture must have exactly 3 elements [input, hidden, output]" })),
+        ).into_response();
+    }
+    if req.num_workers < 2 || req.num_workers > 10 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "num_workers must be between 2 and 10" })),
+        ).into_response();
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+
+    // Create initial session state
+    let session = TrainingSessionState {
+        session_id: session_id.clone(),
+        status: "starting".to_string(),
+        current_step: 0,
+        total_steps: req.num_steps,
+        current_loss: 0.0,
+        losses: Vec::new(),
+        accuracy: None,
+        checkpoints_submitted: 0,
+        mac_checks_passed: 0,
+        cheater_detected: None,
+        zk_proofs_generated: 0,
+        zk_activated_by_risk: false,
+        phase: 0,
+        phase_description: "Initializing".to_string(),
+        coordinator_address: String::new(),
+        job_id: 0,
+        elapsed_secs: 0.0,
+        started_at: now,
+    };
+
+    // Store session
+    state.sessions.write().await.insert(session_id.clone(), session);
+
+    // Build orchestration config
+    let zk_enabled = req.zk_mode == "always";
+    let zk_config = ZkProofConfig {
+        enabled: req.zk_mode != "off",
+        checkpoint_frequency: req.zk_checkpoint_freq as usize,
+        ..ZkProofConfig::default()
+    };
+
+    // Generate worker endpoints (in-process workers on localhost)
+    let worker_endpoints: Vec<String> = (0..req.num_workers)
+        .map(|i| format!("127.0.0.1:{}", 9001 + i))
+        .collect();
+
+    let mut config = FullOrchestrationConfig {
+        architecture: req.architecture.clone(),
+        num_steps: req.num_steps,
+        learning_rate: req.learning_rate,
+        checkpoint_frequency: req.checkpoint_freq,
+        mac_check_interval: req.mac_interval,
+        beaver_batch_size: 2048,
+        seed: req.seed,
+        worker_endpoints,
+        initial_weights_path: None,
+        zk_proof: zk_config,
+        zk_mode: match req.zk_mode.as_str() {
+            "always" => ZkMode::Always,
+            "risk" => ZkMode::Risk { min_workers: req.min_workers_for_mpc },
+            _ => ZkMode::Off,
+        },
+        use_real_mnist: req.use_real_mnist,
+        mnist_cache_dir: None,
+        train_size: req.train_size,
+        test_size: req.test_size,
+        #[cfg(feature = "chain")]
+        eth_rpc_url: None, // Will start Anvil
+        #[cfg(feature = "chain")]
+        private_key: String::new(), // Will be set from Anvil default accounts
+        #[cfg(feature = "chain")]
+        worker_private_keys: Vec::new(),
+        #[cfg(feature = "chain")]
+        payment_amount_eth: req.payment_eth,
+        #[cfg(feature = "chain")]
+        stake_amount_eth: req.stake_per_worker_eth,
+        #[cfg(feature = "chain")]
+        coordinator_address: None,
+        #[cfg(feature = "chain")]
+        enable_withdrawal: false,
+    };
+
+    // Set Anvil default private keys for demo mode
+    #[cfg(feature = "chain")]
+    {
+        // Anvil default account 0 (owner)
+        config.private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".to_string();
+        // Anvil default accounts 1..N (workers)
+        let anvil_keys = vec![
+            "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
+            "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a",
+            "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6",
+            "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a",
+            "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba",
+            "0x92db14e403b83dfe3df233f83dfa3a0d7096f21ca9b0d6d6b8d88b2b4ec1564e",
+            "0x4bbbf85ce3377467afe5d46f804f221813b2bb87f24d81f60f1fcdbf7cbf4356",
+            "0xdbda1821b80551c9d65939329250298aa3472ba22feea921c0cf5d620ea67b97",
+            "0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6",
+        ];
+        config.worker_private_keys = anvil_keys[..req.num_workers]
+            .iter()
+            .map(|k| k.to_string())
+            .collect();
+    }
+
+    // Spawn background training task
+    let state_clone = state.clone();
+    let sid = session_id.clone();
+    let simulate_cheater = req.simulate_cheater;
+    let _zk_mode = req.zk_mode.clone();
+
+    tokio::spawn(async move {
+        run_training_session(state_clone, sid, config, simulate_cheater).await;
+    });
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "session_id": session_id,
+            "status": "starting",
+        })),
+    ).into_response()
+}
+
+/// Background task that runs the full orchestration pipeline.
+async fn run_training_session(
+    state: Arc<DashboardState>,
+    session_id: String,
+    config: FullOrchestrationConfig,
+    _simulate_cheater: bool,
+) {
+    let sid = session_id.clone();
+    let state_for_cb = state.clone();
+    let sid_for_cb = sid.clone();
+
+    let mut orchestrator = FullOrchestrator::new(config);
+
+    // Set up progress callback that updates session state and broadcasts to WebSocket.
+    // The callback must be Fn + Send + Sync (non-async), so we use try_write for state
+    // updates and the broadcast channel (which is sync-safe) for WebSocket fanout.
+    let progress_cb: ProgressCallback = Arc::new(move |event: ProgressEvent| {
+        let event_json = progress_event_to_json(&event);
+
+        // Broadcast to WebSocket subscribers (send is sync-safe on broadcast::Sender)
+        let _ = state_for_cb.ws_broadcast.send((sid_for_cb.clone(), event_json));
+
+        // Update session state synchronously using try_write.
+        // Scoped block ensures the write guard is dropped before the closure returns.
+        let sessions_guard = state_for_cb.sessions.try_write();
+        if let Ok(mut sessions) = sessions_guard {
+            if let Some(session) = sessions.get_mut(&sid_for_cb) {
+                match &event {
+                    ProgressEvent::PhaseStarted { phase, description, .. } => {
+                        session.phase = *phase;
+                        session.phase_description = description.clone();
+                        session.status = "running".to_string();
+                    }
+                    ProgressEvent::TrainingStep { step, loss, .. } => {
+                        session.current_step = *step;
+                        session.current_loss = *loss;
+                        session.losses.push(*loss);
+                        session.mac_checks_passed += 1;
+                    }
+                    ProgressEvent::CheckpointSubmitted { .. } => {
+                        session.checkpoints_submitted += 1;
+                    }
+                    ProgressEvent::CheaterDetected { party_index, step } => {
+                        session.cheater_detected = Some(serde_json::json!({
+                            "party_index": party_index,
+                            "step": step,
+                        }));
+                    }
+                    ProgressEvent::TrainingComplete { accuracy, .. } => {
+                        session.accuracy = Some(*accuracy);
+                        session.status = "complete".to_string();
+                    }
+                    ProgressEvent::ZkProofGenerated { .. } => {
+                        session.zk_proofs_generated += 1;
+                    }
+                    _ => {}
+                }
+
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs_f64();
+                session.elapsed_secs = now - session.started_at;
+            }
+        }
+    });
+
+    orchestrator.set_progress_callback(progress_cb);
+
+    // Run the orchestration pipeline
+    info!(session_id = %session_id, "Running training orchestration");
+    match orchestrator.run().await {
+        Ok(result) => {
+            info!(
+                session_id = %session_id,
+                accuracy = result.test_accuracy,
+                steps = result.steps_completed,
+                "Training completed successfully"
+            );
+
+            // Update final session state
+            if let Ok(mut sessions) = state.sessions.try_write() {
+                if let Some(session) = sessions.get_mut(&session_id) {
+                    session.status = "complete".to_string();
+                    session.accuracy = Some(result.test_accuracy);
+                    session.job_id = result.job_id;
+                    session.coordinator_address = result.coordinator_address.clone();
+                    session.zk_proofs_generated = result.zk_proofs_generated;
+                }
+            }
+
+            // Broadcast completion
+            let _ = state.ws_broadcast.send((session_id.clone(), serde_json::json!({
+                "type": "session_complete",
+                "session_id": session_id,
+                "accuracy": result.test_accuracy,
+                "steps": result.steps_completed,
+                "time_secs": result.training_time_secs,
+                "checkpoints": result.checkpoints_on_chain,
+                "gas_used": result.total_gas_used,
+                "zk_proofs": result.zk_proofs_generated,
+            })));
+        }
+        Err(e) => {
+            error!(session_id = %session_id, error = %e, "Training failed");
+
+            if let Ok(mut sessions) = state.sessions.try_write() {
+                if let Some(session) = sessions.get_mut(&session_id) {
+                    session.status = "failed".to_string();
+                    session.phase_description = format!("Error: {}", e);
+                }
+            }
+
+            let _ = state.ws_broadcast.send((session_id.clone(), serde_json::json!({
+                "type": "session_failed",
+                "session_id": session_id,
+                "error": e.to_string(),
+            })));
+        }
+    }
+
+    // Clean up orchestrator
+    orchestrator.shutdown();
+}
+
+/// GET /api/training/sessions — list all training sessions
+async fn list_sessions_handler(
+    State(state): State<Arc<DashboardState>>,
+) -> Json<Vec<TrainingSessionState>> {
+    let sessions = state.sessions.read().await;
+    let mut list: Vec<TrainingSessionState> = sessions.values().cloned().collect();
+    // Sort by started_at descending (newest first)
+    list.sort_by(|a, b| b.started_at.partial_cmp(&a.started_at).unwrap_or(std::cmp::Ordering::Equal));
+    Json(list)
+}
+
+/// GET /api/training/sessions/:id — get a specific training session
+async fn get_session_handler(
+    State(state): State<Arc<DashboardState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let sessions = state.sessions.read().await;
+    match sessions.get(&id) {
+        Some(session) => Json(serde_json::json!(session)).into_response(),
+        None => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "Session not found" }))).into_response(),
+    }
+}
+
+/// GET /api/training/sessions/:id/losses — get loss history for a session
+async fn get_losses_handler(
+    State(state): State<Arc<DashboardState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let sessions = state.sessions.read().await;
+    match sessions.get(&id) {
+        Some(session) => Json(serde_json::json!({
+            "session_id": id,
+            "losses": session.losses,
+            "current_step": session.current_step,
+            "total_steps": session.total_steps,
+        })).into_response(),
+        None => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "Session not found" }))).into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Handler: WebSocket
+// ---------------------------------------------------------------------------
+
+/// GET /ws — WebSocket upgrade for real-time training progress
+async fn websocket_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<DashboardState>>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_websocket(socket, state))
+}
+
+async fn handle_websocket(socket: WebSocket, state: Arc<DashboardState>) {
+    let (mut sender, mut receiver) = socket.split();
+    let mut subscriptions: Vec<String> = Vec::new();
+    let mut rx = state.ws_broadcast.subscribe();
+
+    info!("WebSocket client connected");
+
+    // Spawn a task to forward broadcast messages to this client
+    let (tx, mut forward_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(256);
+
+    let forward_task = tokio::spawn(async move {
+        while let Ok((session_id, event)) = rx.recv().await {
+            // Send to the mpsc channel; the main loop will check subscriptions
+            let msg = serde_json::json!({
+                "session_id": session_id,
+                "event": event,
+            });
+            if tx.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    loop {
+        tokio::select! {
+            // Handle incoming messages from the client
+            msg = receiver.next() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        // Parse subscription messages
+                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) {
+                            if let Some(sub) = parsed.get("subscribe").and_then(|v| v.as_str()) {
+                                info!(subscription = %sub, "WebSocket client subscribed");
+                                subscriptions.push(sub.to_string());
+
+                                // Send current state for this session if it exists
+                                if let Some(session_id) = sub.strip_prefix("training:") {
+                                    let sessions = state.sessions.read().await;
+                                    if let Some(session) = sessions.get(session_id) {
+                                        let state_msg = serde_json::json!({
+                                            "type": "session_state",
+                                            "session_id": session_id,
+                                            "state": session,
+                                        });
+                                        if sender.send(Message::Text(state_msg.to_string().into())).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(unsub) = parsed.get("unsubscribe").and_then(|v| v.as_str()) {
+                                subscriptions.retain(|s| s != unsub);
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Ping(data))) => {
+                        if sender.send(Message::Pong(data)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => {
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            // Forward broadcast messages to this WebSocket client
+            Some(msg) = forward_rx.recv() => {
+                if let Some(session_id) = msg.get("session_id").and_then(|v| v.as_str()) {
+                    let channel = format!("training:{}", session_id);
+                    // Send if subscribed to this session or to "training:*" (all)
+                    if subscriptions.contains(&channel) || subscriptions.contains(&"training:*".to_string()) {
+                        if sender.send(Message::Text(msg.to_string().into())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    forward_task.abort();
+    info!("WebSocket client disconnected");
 }

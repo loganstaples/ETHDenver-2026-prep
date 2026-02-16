@@ -4,11 +4,12 @@ import { useState } from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { motion } from 'framer-motion';
-import { Boxes, Globe, Settings } from 'lucide-react';
+import { Boxes, Globe, Settings, Cpu } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 const navItems = [
   { name: 'Models', href: '/', icon: Boxes },
+  { name: 'Train', href: '/train', icon: Cpu },
   { name: 'Network', href: '/network', icon: Globe },
   { name: 'Settings', href: '/settings', icon: Settings },
 ] as const;

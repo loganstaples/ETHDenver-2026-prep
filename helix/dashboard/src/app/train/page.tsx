@@ -1,0 +1,761 @@
+'use client';
+
+import { useState, useMemo } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
+import {
+  Play,
+  Loader2,
+  CheckCircle,
+  XCircle,
+  AlertTriangle,
+  Shield,
+  Zap,
+  Activity,
+  Clock,
+  Wifi,
+  WifiOff,
+} from 'lucide-react';
+import {
+  ResponsiveContainer,
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip as RechartsTooltip,
+} from 'recharts';
+import { Card } from '@/components/ui/Card';
+import { ProgressBar } from '@/components/ui/ProgressBar';
+import { Badge } from '@/components/ui/Badge';
+import { cn } from '@/lib/utils';
+import { useMpcTraining, type TrainingJobConfig } from '@/hooks/useMpcTraining';
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const PHASE_DESCRIPTIONS: Record<number, string> = {
+  1: 'Deploying contracts',
+  2: 'Registering model',
+  3: 'Staking tokens',
+  4: 'Starting training round',
+  5: 'Spawning MPC workers',
+  6: 'Distributing data',
+  7: 'Generating Beaver triples',
+  8: 'Running MPC training',
+  9: 'Submitting checkpoint',
+  10: 'Verifying MACs',
+  11: 'Generating ZK proof',
+  12: 'On-chain settlement',
+  13: 'Complete',
+};
+
+const TOTAL_PHASES = 13;
+
+// ============================================================================
+// Chart tooltip
+// ============================================================================
+
+function ChartTooltip({ active, payload, label }: any) {
+  if (!active || !payload?.length) return null;
+  return (
+    <div className="bg-helix-surface2 border border-helix-border rounded-lg p-2 text-xs shadow-lg">
+      <p className="text-helix-muted font-mono mb-1">Step {label}</p>
+      {payload.map((entry: any, i: number) => (
+        <p key={i} className="text-helix-text">
+          <span className="text-helix-text2">{entry.name}: </span>
+          {typeof entry.value === 'number' ? entry.value.toFixed(4) : entry.value}
+        </p>
+      ))}
+    </div>
+  );
+}
+
+// ============================================================================
+// Config Form Component
+// ============================================================================
+
+interface ConfigFormProps {
+  onStart: (config: TrainingJobConfig) => void;
+  isStarting: boolean;
+}
+
+function ConfigForm({ onStart, isStarting }: ConfigFormProps) {
+  const [numWorkers, setNumWorkers] = useState(3);
+  const [numSteps, setNumSteps] = useState(500);
+  const [learningRate, setLearningRate] = useState(0.001);
+  const [checkpointFreq, setCheckpointFreq] = useState(50);
+  const [zkMode, setZkMode] = useState<'off' | 'always' | 'risk'>('off');
+  const [zkCheckpointFreq, setZkCheckpointFreq] = useState(5);
+  const [minWorkersForMpc, setMinWorkersForMpc] = useState(2);
+  const [paymentEth, setPaymentEth] = useState(1.0);
+  const [stakePerWorkerEth, setStakePerWorkerEth] = useState(0.1);
+  const [simulateCheater, setSimulateCheater] = useState(false);
+
+  const handleSubmit = () => {
+    onStart({
+      architecture: [784, 32, 10],
+      num_workers: numWorkers,
+      num_steps: numSteps,
+      learning_rate: learningRate,
+      checkpoint_freq: checkpointFreq,
+      mac_interval: 1,
+      zk_mode: zkMode,
+      zk_checkpoint_freq: zkCheckpointFreq,
+      min_workers_for_mpc: minWorkersForMpc,
+      train_size: 1000,
+      test_size: 200,
+      use_real_mnist: false,
+      payment_eth: paymentEth,
+      stake_per_worker_eth: stakePerWorkerEth,
+      simulate_cheater: simulateCheater,
+      seed: 42,
+    });
+  };
+
+  return (
+    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      {/* Model Architecture */}
+      <Card variant="default">
+        <h3 className="text-sm font-medium text-white mb-4">Model Architecture</h3>
+        <div className="space-y-4">
+          <div>
+            <label className="label-text block mb-1.5">Architecture</label>
+            <div className="flex items-center gap-2 px-3 py-2 bg-helix-bg border border-helix-border rounded-md">
+              <span className="text-sm text-helix-text font-mono">MNIST 784 → 32 → 10</span>
+              <Badge variant="default" className="ml-auto">25K params</Badge>
+            </div>
+          </div>
+
+          <div>
+            <label className="label-text block mb-1.5">
+              Workers: <span className="text-helix-text">{numWorkers}</span>
+            </label>
+            <input
+              type="range"
+              min={2}
+              max={7}
+              value={numWorkers}
+              onChange={(e) => setNumWorkers(Number(e.target.value))}
+              className="w-full accent-white h-1 bg-helix-border rounded-full appearance-none cursor-pointer"
+            />
+            <div className="flex justify-between text-2xs text-helix-dim mt-1">
+              <span>2</span>
+              <span>7</span>
+            </div>
+          </div>
+
+          <div>
+            <label className="label-text block mb-1.5">Training Steps</label>
+            <input
+              type="number"
+              value={numSteps}
+              onChange={(e) => setNumSteps(Number(e.target.value))}
+              min={10}
+              max={10000}
+              className="w-full px-3 py-2 bg-helix-bg border border-helix-border rounded-md text-sm text-helix-text font-mono focus:outline-none focus:border-helix-border2 transition-colors"
+            />
+          </div>
+
+          <div>
+            <label className="label-text block mb-1.5">Learning Rate</label>
+            <input
+              type="number"
+              value={learningRate}
+              onChange={(e) => setLearningRate(Number(e.target.value))}
+              step={0.0001}
+              min={0.00001}
+              max={1}
+              className="w-full px-3 py-2 bg-helix-bg border border-helix-border rounded-md text-sm text-helix-text font-mono focus:outline-none focus:border-helix-border2 transition-colors"
+            />
+          </div>
+
+          <div>
+            <label className="label-text block mb-1.5">Checkpoint Frequency</label>
+            <input
+              type="number"
+              value={checkpointFreq}
+              onChange={(e) => setCheckpointFreq(Number(e.target.value))}
+              min={1}
+              max={1000}
+              className="w-full px-3 py-2 bg-helix-bg border border-helix-border rounded-md text-sm text-helix-text font-mono focus:outline-none focus:border-helix-border2 transition-colors"
+            />
+          </div>
+        </div>
+      </Card>
+
+      {/* Security & Economics */}
+      <Card variant="default">
+        <h3 className="text-sm font-medium text-white mb-4">Security & Economics</h3>
+        <div className="space-y-4">
+          {/* ZK Mode */}
+          <div>
+            <label className="label-text block mb-2">ZK Proofs</label>
+            <div className="flex gap-2">
+              {(['off', 'always', 'risk'] as const).map((mode) => (
+                <button
+                  key={mode}
+                  type="button"
+                  onClick={() => setZkMode(mode)}
+                  className={cn(
+                    'flex-1 px-3 py-2 rounded-md text-xs font-mono uppercase tracking-wider transition-all',
+                    zkMode === mode
+                      ? 'bg-white text-black'
+                      : 'bg-helix-bg border border-helix-border text-helix-muted hover:border-helix-border2',
+                  )}
+                >
+                  {mode === 'off' ? 'Off' : mode === 'always' ? 'Always' : 'Risk-Based'}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Conditional ZK fields */}
+          <AnimatePresence>
+            {zkMode === 'always' && (
+              <motion.div
+                initial={{ opacity: 0, height: 0 }}
+                animate={{ opacity: 1, height: 'auto' }}
+                exit={{ opacity: 0, height: 0 }}
+                transition={{ duration: 0.2 }}
+              >
+                <label className="label-text block mb-1.5">ZK Checkpoint Frequency</label>
+                <input
+                  type="number"
+                  value={zkCheckpointFreq}
+                  onChange={(e) => setZkCheckpointFreq(Number(e.target.value))}
+                  min={1}
+                  max={100}
+                  className="w-full px-3 py-2 bg-helix-bg border border-helix-border rounded-md text-sm text-helix-text font-mono focus:outline-none focus:border-helix-border2 transition-colors"
+                />
+              </motion.div>
+            )}
+            {zkMode === 'risk' && (
+              <motion.div
+                initial={{ opacity: 0, height: 0 }}
+                animate={{ opacity: 1, height: 'auto' }}
+                exit={{ opacity: 0, height: 0 }}
+                transition={{ duration: 0.2 }}
+              >
+                <label className="label-text block mb-1.5">Min Workers for MPC</label>
+                <input
+                  type="number"
+                  value={minWorkersForMpc}
+                  onChange={(e) => setMinWorkersForMpc(Number(e.target.value))}
+                  min={2}
+                  max={numWorkers}
+                  className="w-full px-3 py-2 bg-helix-bg border border-helix-border rounded-md text-sm text-helix-text font-mono focus:outline-none focus:border-helix-border2 transition-colors"
+                />
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          {/* Payment fields */}
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="label-text block mb-1.5">Payment (ETH)</label>
+              <input
+                type="number"
+                value={paymentEth}
+                onChange={(e) => setPaymentEth(Number(e.target.value))}
+                step={0.1}
+                min={0}
+                className="w-full px-3 py-2 bg-helix-bg border border-helix-border rounded-md text-sm text-helix-text font-mono focus:outline-none focus:border-helix-border2 transition-colors"
+              />
+            </div>
+            <div>
+              <label className="label-text block mb-1.5">Stake / Worker (ETH)</label>
+              <input
+                type="number"
+                value={stakePerWorkerEth}
+                onChange={(e) => setStakePerWorkerEth(Number(e.target.value))}
+                step={0.01}
+                min={0}
+                className="w-full px-3 py-2 bg-helix-bg border border-helix-border rounded-md text-sm text-helix-text font-mono focus:outline-none focus:border-helix-border2 transition-colors"
+              />
+            </div>
+          </div>
+
+          {/* Simulate Cheater */}
+          <div className="flex items-center gap-3 py-2">
+            <button
+              type="button"
+              onClick={() => setSimulateCheater(!simulateCheater)}
+              className={cn(
+                'relative w-9 h-5 rounded-full transition-colors',
+                simulateCheater ? 'bg-white' : 'bg-helix-border',
+              )}
+            >
+              <motion.div
+                className={cn(
+                  'absolute top-0.5 w-4 h-4 rounded-full',
+                  simulateCheater ? 'bg-black' : 'bg-helix-muted',
+                )}
+                animate={{ left: simulateCheater ? 18 : 2 }}
+                transition={{ type: 'spring', stiffness: 500, damping: 35 }}
+              />
+            </button>
+            <div>
+              <span className="text-sm text-helix-text">Simulate Cheater</span>
+              <p className="text-2xs text-helix-muted">Demo: inject a malicious worker</p>
+            </div>
+          </div>
+        </div>
+      </Card>
+
+      {/* Start Button */}
+      <div className="lg:col-span-2">
+        <button
+          type="button"
+          onClick={handleSubmit}
+          disabled={isStarting}
+          className={cn(
+            'w-full flex items-center justify-center gap-2 py-3 rounded-lg font-medium text-sm transition-all',
+            isStarting
+              ? 'bg-helix-border text-helix-muted cursor-not-allowed'
+              : 'bg-white text-black hover:bg-white/90',
+          )}
+        >
+          {isStarting ? (
+            <>
+              <Loader2 size={16} className="animate-spin" />
+              Starting Training...
+            </>
+          ) : (
+            <>
+              <Play size={16} />
+              Start Training
+            </>
+          )}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// Phase Indicator Component
+// ============================================================================
+
+interface PhaseIndicatorProps {
+  currentPhase: number;
+  description: string;
+}
+
+function PhaseIndicator({ currentPhase, description }: PhaseIndicatorProps) {
+  return (
+    <Card variant="glass">
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="text-sm font-medium text-white">Phase Progress</h3>
+        <Badge variant="pulse">
+          Phase {currentPhase} / {TOTAL_PHASES}
+        </Badge>
+      </div>
+      <div className="flex gap-1 mb-3">
+        {Array.from({ length: TOTAL_PHASES }, (_, i) => {
+          const phase = i + 1;
+          const isComplete = phase < currentPhase;
+          const isCurrent = phase === currentPhase;
+          return (
+            <div
+              key={phase}
+              className={cn(
+                'flex-1 h-1.5 rounded-full transition-all duration-300',
+                isComplete ? 'bg-white' : isCurrent ? 'bg-white/60' : 'bg-helix-border',
+              )}
+            />
+          );
+        })}
+      </div>
+      <p className="text-sm text-helix-text2">
+        {description || PHASE_DESCRIPTIONS[currentPhase] || 'Processing...'}
+      </p>
+    </Card>
+  );
+}
+
+// ============================================================================
+// Stat Tiles
+// ============================================================================
+
+interface StatTileProps {
+  label: string;
+  value: string | number;
+  icon: React.ReactNode;
+  highlight?: boolean;
+}
+
+function StatTile({ label, value, icon, highlight }: StatTileProps) {
+  return (
+    <div
+      className={cn(
+        'bg-helix-surface border border-helix-border rounded-lg p-4',
+        highlight && 'border-white/20',
+      )}
+    >
+      <div className="flex items-center gap-2 mb-1.5">
+        <span className="text-helix-dim">{icon}</span>
+        <span className="label-text">{label}</span>
+      </div>
+      <p className="text-xl font-light tracking-tight text-helix-text font-mono">{value}</p>
+    </div>
+  );
+}
+
+// ============================================================================
+// Loss Curve Chart
+// ============================================================================
+
+interface LossCurveProps {
+  data: { step: number; loss: number }[];
+}
+
+function LossCurve({ data }: LossCurveProps) {
+  // Downsample for performance if needed
+  const chartData = useMemo(() => {
+    if (data.length <= 200) return data;
+    const step = Math.ceil(data.length / 200);
+    return data.filter((_, i) => i % step === 0 || i === data.length - 1);
+  }, [data]);
+
+  if (chartData.length === 0) {
+    return (
+      <div className="flex items-center justify-center h-[300px] text-helix-muted text-sm">
+        Waiting for training data...
+      </div>
+    );
+  }
+
+  return (
+    <ResponsiveContainer width="100%" height={300}>
+      <LineChart data={chartData}>
+        <defs>
+          <linearGradient id="lossGradient" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="rgba(255,255,255,0.08)" />
+            <stop offset="100%" stopColor="rgba(255,255,255,0)" />
+          </linearGradient>
+        </defs>
+        <CartesianGrid
+          strokeDasharray="3 3"
+          stroke="#1e1e22"
+          vertical={false}
+        />
+        <XAxis
+          dataKey="step"
+          stroke="#3e3e44"
+          tick={{ fill: '#63636e', fontSize: 11, fontFamily: 'var(--font-geist-mono)' }}
+          tickLine={false}
+          axisLine={{ stroke: '#1e1e22' }}
+        />
+        <YAxis
+          stroke="#3e3e44"
+          tick={{ fill: '#63636e', fontSize: 11, fontFamily: 'var(--font-geist-mono)' }}
+          tickLine={false}
+          axisLine={false}
+          width={52}
+          tickFormatter={(v: number) => v.toFixed(2)}
+        />
+        <RechartsTooltip
+          content={<ChartTooltip />}
+          cursor={{ stroke: '#2a2a2e', strokeWidth: 1 }}
+        />
+        <Line
+          type="monotone"
+          dataKey="loss"
+          name="Loss"
+          stroke="#ffffff"
+          strokeWidth={1.5}
+          dot={false}
+          activeDot={{ r: 3, fill: '#ffffff', stroke: '#111113', strokeWidth: 2 }}
+          isAnimationActive={false}
+        />
+      </LineChart>
+    </ResponsiveContainer>
+  );
+}
+
+// ============================================================================
+// Cheater Alert
+// ============================================================================
+
+interface CheaterAlertProps {
+  cheater: { party_index: number; step: number };
+}
+
+function CheaterAlert({ cheater }: CheaterAlertProps) {
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: -8 }}
+      animate={{ opacity: 1, y: 0 }}
+      className="bg-red-500/10 border border-red-500/30 rounded-lg p-4"
+    >
+      <div className="flex items-center gap-3">
+        <AlertTriangle size={20} className="text-red-400 shrink-0" />
+        <div>
+          <p className="text-sm font-medium text-red-300">Cheater Detected</p>
+          <p className="text-2xs text-red-300/70 mt-0.5">
+            Worker {cheater.party_index} submitted invalid MAC at step {cheater.step}.
+            Stake slashed, training continues with remaining workers.
+          </p>
+        </div>
+      </div>
+    </motion.div>
+  );
+}
+
+// ============================================================================
+// Final Results
+// ============================================================================
+
+interface FinalResultsProps {
+  session: {
+    accuracy: number | null;
+    elapsed_secs: number;
+    checkpoints_submitted: number;
+    mac_checks_passed: number;
+    zk_proofs_generated: number;
+    cheater_detected: { party_index: number; step: number } | null;
+    total_steps: number;
+    current_step: number;
+    status: string;
+  };
+}
+
+function FinalResults({ session }: FinalResultsProps) {
+  const isSuccess = session.status === 'complete';
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 8 }}
+      animate={{ opacity: 1, y: 0 }}
+    >
+      <Card variant="glass" className="overflow-visible">
+        <div className="flex items-center gap-3 mb-4">
+          {isSuccess ? (
+            <CheckCircle size={24} className="text-green-400" />
+          ) : (
+            <XCircle size={24} className="text-red-400" />
+          )}
+          <h3 className="text-lg font-semibold text-white">
+            {isSuccess ? 'Training Complete' : 'Training Failed'}
+          </h3>
+        </div>
+
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+          {session.accuracy !== null && (
+            <div>
+              <p className="label-text mb-1">Final Accuracy</p>
+              <p className="text-2xl font-mono font-light text-white">
+                {(session.accuracy * 100).toFixed(1)}%
+              </p>
+            </div>
+          )}
+          <div>
+            <p className="label-text mb-1">Time</p>
+            <p className="text-2xl font-mono font-light text-white">
+              {session.elapsed_secs > 0
+                ? `${session.elapsed_secs.toFixed(1)}s`
+                : `${((Date.now() / 1000) - session.elapsed_secs).toFixed(1)}s`}
+            </p>
+          </div>
+          <div>
+            <p className="label-text mb-1">Steps Completed</p>
+            <p className="text-2xl font-mono font-light text-white">
+              {session.current_step} / {session.total_steps}
+            </p>
+          </div>
+          <div>
+            <p className="label-text mb-1">Checkpoints</p>
+            <p className="text-2xl font-mono font-light text-white">
+              {session.checkpoints_submitted}
+            </p>
+          </div>
+        </div>
+      </Card>
+    </motion.div>
+  );
+}
+
+// ============================================================================
+// Live Progress Component
+// ============================================================================
+
+interface LiveProgressProps {
+  session: NonNullable<ReturnType<typeof useMpcTraining>['session']>;
+  losses: { step: number; loss: number }[];
+  isConnected: boolean;
+  error: string | null;
+}
+
+function LiveProgress({ session, losses, isConnected, error }: LiveProgressProps) {
+  const stepProgress = session.total_steps > 0
+    ? (session.current_step / session.total_steps) * 100
+    : 0;
+
+  const isTerminal = session.status === 'complete' || session.status === 'failed';
+
+  return (
+    <div className="space-y-5">
+      {/* Connection Status */}
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          {isConnected ? (
+            <Wifi size={14} className="text-green-400" />
+          ) : (
+            <WifiOff size={14} className="text-helix-muted" />
+          )}
+          <span className="text-2xs text-helix-muted font-mono uppercase tracking-wider">
+            {isConnected ? 'Connected' : 'Reconnecting...'}
+          </span>
+        </div>
+        <Badge
+          variant={session.status === 'running' ? 'pulse' : 'default'}
+          className={cn(
+            session.status === 'complete' && 'text-green-400',
+            session.status === 'failed' && 'text-red-400',
+          )}
+        >
+          {session.status}
+        </Badge>
+      </div>
+
+      {/* Error Display */}
+      {error && (
+        <motion.div
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          className="bg-red-500/10 border border-red-500/30 rounded-lg px-4 py-3"
+        >
+          <p className="text-sm text-red-300">{error}</p>
+        </motion.div>
+      )}
+
+      {/* Phase Indicator */}
+      <PhaseIndicator
+        currentPhase={session.phase}
+        description={session.phase_description}
+      />
+
+      {/* Step Progress */}
+      <Card variant="default">
+        <div className="flex items-center justify-between mb-2">
+          <span className="label-text">Training Progress</span>
+          <span className="text-sm font-mono text-helix-text">
+            {session.current_step} / {session.total_steps}
+          </span>
+        </div>
+        <ProgressBar value={stepProgress} size="md" />
+        <p className="text-2xs text-helix-dim mt-2 text-right font-mono">
+          {stepProgress.toFixed(1)}%
+        </p>
+      </Card>
+
+      {/* Stats Grid */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <StatTile
+          label="Current Loss"
+          value={session.current_loss > 0 ? session.current_loss.toFixed(4) : '--'}
+          icon={<Activity size={14} />}
+        />
+        <StatTile
+          label="MAC Checks"
+          value={session.mac_checks_passed}
+          icon={<Shield size={14} />}
+        />
+        <StatTile
+          label="Checkpoints"
+          value={session.checkpoints_submitted}
+          icon={<Zap size={14} />}
+        />
+        <StatTile
+          label="Elapsed"
+          value={
+            session.elapsed_secs > 0
+              ? `${session.elapsed_secs.toFixed(0)}s`
+              : `${Math.floor((Date.now() / 1000) - session.started_at)}s`
+          }
+          icon={<Clock size={14} />}
+        />
+      </div>
+
+      {/* ZK Proofs indicator */}
+      {(session.zk_proofs_generated > 0 || session.zk_activated_by_risk) && (
+        <Card variant="default">
+          <div className="flex items-center gap-3">
+            <Shield size={16} className="text-helix-text2" />
+            <div>
+              <p className="text-sm text-helix-text">
+                ZK Proofs: {session.zk_proofs_generated} generated
+              </p>
+              {session.zk_activated_by_risk && (
+                <p className="text-2xs text-helix-muted mt-0.5">
+                  Activated by risk detection
+                </p>
+              )}
+            </div>
+          </div>
+        </Card>
+      )}
+
+      {/* Cheater Alert */}
+      {session.cheater_detected && (
+        <CheaterAlert cheater={session.cheater_detected} />
+      )}
+
+      {/* Loss Curve */}
+      <Card variant="default">
+        <h3 className="text-sm font-medium text-white mb-3">Loss Curve</h3>
+        <LossCurve data={losses} />
+      </Card>
+
+      {/* Final Results */}
+      {isTerminal && <FinalResults session={session} />}
+    </div>
+  );
+}
+
+// ============================================================================
+// Main Page
+// ============================================================================
+
+export default function TrainPage() {
+  const {
+    startTraining,
+    session,
+    losses,
+    isConnected,
+    isStarting,
+    error,
+  } = useMpcTraining();
+
+  const hasSession = session !== null;
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 6 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.3, ease: 'easeOut' }}
+      className="space-y-6"
+    >
+      <div className="flex items-center justify-between">
+        <h1 className="page-title">Train</h1>
+        {hasSession && (
+          <span className="text-2xs font-mono text-helix-muted">
+            Session: {session.session_id.slice(0, 8)}...
+          </span>
+        )}
+      </div>
+
+      {!hasSession ? (
+        <ConfigForm onStart={startTraining} isStarting={isStarting} />
+      ) : (
+        <LiveProgress
+          session={session}
+          losses={losses}
+          isConnected={isConnected}
+          error={error}
+        />
+      )}
+    </motion.div>
+  );
+}

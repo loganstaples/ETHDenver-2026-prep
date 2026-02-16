@@ -21,10 +21,11 @@ pub mod share_distributor;
 pub mod visualization;
 pub mod wallet;
 pub mod worker_entry;
+pub mod zk_proof_layer;
 
 // Re-export key types for external consumers
 pub use client::HelixClient;
-pub use dashboard::{DashboardConfig, DashboardState};
+pub use dashboard::{DashboardConfig, DashboardState, TrainingJobRequest, TrainingSessionState};
 pub use error::HelixError;
 pub use model::{ModelArchitecture, ModelHandle, SdkModelConfig, TrainingParams};
 pub use orchestration::{
@@ -37,6 +38,7 @@ pub use rpc::client::{
 pub use session::{SessionResult, TrainingEvent, TrainingProgress, TrainingSession};
 pub use full_orchestration::{
     FullOrchestrationConfig, FullOrchestrationResult, FullOrchestrator, CheaterInfo,
-    ProgressCallback, ProgressEvent,
+    ProgressCallback, ProgressEvent, ZkMode,
 };
 pub use worker_entry::{WorkerConfig, WorkerResult, launch_worker};
+pub use zk_proof_layer::{ZkCheckpointProofResult, ZkProofConfig, ZkProofLayer, ZkProofStats};

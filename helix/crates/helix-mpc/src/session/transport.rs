@@ -162,13 +162,95 @@ impl MPCTransport for LocalTransport {
 }
 
 // ---------------------------------------------------------------------------
-// TcpTransport — TCP transport for distributed MPC
+// TransportConfig — unified transport selection
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "network-mpc")]
 use std::net::SocketAddr;
-#[cfg(feature = "network-mpc")]
 use std::time::Duration;
+
+/// Configuration for selecting and configuring the transport layer.
+///
+/// This enum provides a single entry point for choosing between transport
+/// backends. The choice can be driven by a config file, CLI flag, or
+/// environment variable (`HELIX_TRANSPORT`).
+///
+/// # Environment Variable
+///
+/// Set `HELIX_TRANSPORT` to one of:
+/// - `local` — in-memory channels (default, single-process testing)
+/// - `tcp` — real TCP connections (standalone deployment)
+/// - `node` — route through helix-node P2P layer (full node deployment)
+#[derive(Debug, Clone)]
+pub enum TransportConfig {
+    /// In-memory channels for single-process testing.
+    Local,
+    /// TCP connections with configurable timeouts and reconnection.
+    Tcp(TcpTransportConfig),
+    /// Route through helix-node's P2P connections.
+    Node {
+        /// Session identifier for message multiplexing.
+        session_id: String,
+    },
+}
+
+impl Default for TransportConfig {
+    fn default() -> Self {
+        Self::Local
+    }
+}
+
+impl TransportConfig {
+    /// Creates a `TransportConfig` from the `HELIX_TRANSPORT` environment variable.
+    ///
+    /// Returns `Local` if the variable is unset or unrecognized.
+    pub fn from_env() -> Self {
+        match std::env::var("HELIX_TRANSPORT").as_deref() {
+            Ok("tcp") => Self::Tcp(TcpTransportConfig::default()),
+            Ok("node") => Self::Node {
+                session_id: std::env::var("HELIX_SESSION_ID")
+                    .unwrap_or_else(|_| "default".to_string()),
+            },
+            _ => Self::Local,
+        }
+    }
+}
+
+/// Configuration for TCP transport connections.
+#[derive(Debug, Clone)]
+pub struct TcpTransportConfig {
+    /// Per-party addresses: map from party ID string to socket address.
+    pub peer_addrs: HashMap<String, SocketAddr>,
+    /// Local bind address (use port 0 for OS-assigned).
+    pub bind_addr: SocketAddr,
+    /// Timeout for individual message recv operations (default 30s).
+    pub recv_timeout: Duration,
+    /// Maximum number of connection retry attempts (default 50).
+    pub max_connect_retries: u32,
+    /// Delay between connection retry attempts (default 50ms).
+    pub connect_retry_delay: Duration,
+    /// Timeout for establishing the full mesh (default 10s).
+    pub mesh_timeout: Duration,
+    /// Channel buffer capacity (default 4096).
+    pub channel_capacity: usize,
+}
+
+impl Default for TcpTransportConfig {
+    fn default() -> Self {
+        Self {
+            peer_addrs: HashMap::new(),
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            recv_timeout: Duration::from_secs(30),
+            max_connect_retries: 50,
+            connect_retry_delay: Duration::from_millis(50),
+            mesh_timeout: Duration::from_secs(10),
+            channel_capacity: 4096,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TcpTransport — TCP transport for distributed MPC
+// ---------------------------------------------------------------------------
 
 /// TCP-based transport for real distributed MPC.
 ///
@@ -186,6 +268,8 @@ pub struct TcpTransport {
     receivers: HashMap<String, TokioMutex<tokio::sync::mpsc::Receiver<Vec<u8>>>>,
     /// The address we actually bound to.
     pub local_addr: SocketAddr,
+    /// Configuration for timeouts and reconnection.
+    config: TcpTransportConfig,
 }
 
 #[cfg(feature = "network-mpc")]
@@ -203,9 +287,25 @@ impl TcpTransport {
         party: PartyId,
         peer_addrs: &HashMap<PartyId, SocketAddr>,
     ) -> MPCResult<Self> {
+        let config = TcpTransportConfig {
+            bind_addr,
+            ..TcpTransportConfig::default()
+        };
+        Self::bind_with_config(party, peer_addrs, config).await
+    }
+
+    /// Creates a new TCP transport with full configuration control.
+    ///
+    /// Use this when you need to customize timeouts, retry behavior, or
+    /// channel capacity.
+    pub async fn bind_with_config(
+        party: PartyId,
+        peer_addrs: &HashMap<PartyId, SocketAddr>,
+        config: TcpTransportConfig,
+    ) -> MPCResult<Self> {
         use tokio::net::{TcpListener, TcpStream};
 
-        let listener = TcpListener::bind(bind_addr)
+        let listener = TcpListener::bind(config.bind_addr)
             .await
             .map_err(|e| MPCError::CommunicationError(format!("bind failed: {}", e)))?;
         let local_addr = listener
@@ -217,6 +317,8 @@ impl TcpTransport {
         let mut peers_list: Vec<PartyId> = peer_addrs.keys().cloned().collect();
         peers_list.sort();
 
+        let channel_capacity = config.channel_capacity;
+
         // Create per-peer channel pairs
         let mut out_tx_map: HashMap<String, tokio::sync::mpsc::Sender<Vec<u8>>> = HashMap::new();
         let mut out_rx_map: HashMap<String, tokio::sync::mpsc::Receiver<Vec<u8>>> = HashMap::new();
@@ -224,11 +326,11 @@ impl TcpTransport {
         let mut in_rx_map: HashMap<String, tokio::sync::mpsc::Receiver<Vec<u8>>> = HashMap::new();
 
         for peer in &peers_list {
-            let (otx, orx) = tokio::sync::mpsc::channel(4096);
+            let (otx, orx) = tokio::sync::mpsc::channel(channel_capacity);
             out_tx_map.insert(peer.0.clone(), otx);
             out_rx_map.insert(peer.0.clone(), orx);
 
-            let (itx, irx) = tokio::sync::mpsc::channel(4096);
+            let (itx, irx) = tokio::sync::mpsc::channel(channel_capacity);
             in_tx_map.insert(peer.0.clone(), itx);
             in_rx_map.insert(peer.0.clone(), irx);
         }
@@ -315,6 +417,8 @@ impl TcpTransport {
         };
 
         // Spawn connect tasks
+        let max_retries = config.max_connect_retries;
+        let retry_delay = config.connect_retry_delay;
         let mut connect_handles = Vec::new();
         for (peer, addr) in connect_peers {
             let our_hs = HandshakeMessage {
@@ -328,18 +432,21 @@ impl TcpTransport {
             let orx = out_rx_map.remove(&peer.0);
 
             let handle = tokio::spawn(async move {
-                // Retry connection
+                // Retry connection with exponential backoff
                 let mut attempts = 0u32;
                 let mut stream = loop {
                     match TcpStream::connect(addr).await {
                         Ok(s) => break s,
                         Err(e) => {
                             attempts += 1;
-                            if attempts > 50 {
+                            if attempts > max_retries {
                                 tracing::error!("gave up connecting to {} at {}: {}", peer, addr, e);
                                 return;
                             }
-                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            // Exponential backoff: base_delay * min(2^attempts, 32)
+                            let backoff_mult = (1u64 << attempts.min(5)).min(32);
+                            let delay = retry_delay * backoff_mult as u32;
+                            tokio::time::sleep(delay).await;
                         }
                     }
                 };
@@ -365,11 +472,12 @@ impl TcpTransport {
         }
 
         // Wait for all connections
+        let mesh_timeout = config.mesh_timeout;
         if let Some(h) = accept_handle {
-            let _ = tokio::time::timeout(Duration::from_secs(10), h).await;
+            let _ = tokio::time::timeout(mesh_timeout, h).await;
         }
         for h in connect_handles {
-            let _ = tokio::time::timeout(Duration::from_secs(10), h).await;
+            let _ = tokio::time::timeout(mesh_timeout, h).await;
         }
 
         // Build receivers map
@@ -384,6 +492,7 @@ impl TcpTransport {
             senders: out_tx_map,
             receivers,
             local_addr,
+            config,
         })
     }
 }
@@ -513,6 +622,9 @@ async fn writer_loop(
 #[cfg(feature = "network-mpc")]
 impl TcpTransport {
     /// Receives a message with a timeout.
+    ///
+    /// If `timeout` is provided, uses that duration. Otherwise falls back to
+    /// the configured `recv_timeout` from [`TcpTransportConfig`].
     pub async fn recv_timeout(
         &self,
         party: &PartyId,
@@ -533,9 +645,22 @@ impl TcpTransport {
             })
     }
 
+    /// Receives a message using the configured default timeout.
+    pub async fn recv_with_default_timeout(
+        &self,
+        party: &PartyId,
+    ) -> MPCResult<Vec<u8>> {
+        self.recv_timeout(party, self.config.recv_timeout).await
+    }
+
     /// Returns the total number of parties (self + peers).
     pub fn num_parties(&self) -> usize {
         self.peers_list.len() + 1
+    }
+
+    /// Returns a reference to the transport configuration.
+    pub fn config(&self) -> &TcpTransportConfig {
+        &self.config
     }
 }
 
@@ -559,13 +684,21 @@ impl MPCTransport for TcpTransport {
     }
 
     async fn recv(&self, party: &PartyId) -> MPCResult<Vec<u8>> {
+        // Apply the configured recv timeout by default for TCP transport.
+        // This prevents indefinite hangs if a peer drops.
         let rx_mutex = self.receivers.get(&party.0).ok_or_else(|| {
             MPCError::CommunicationError(format!("no channel from party {}", party))
         })?;
         let mut rx = rx_mutex.lock().await;
-        rx.recv().await.ok_or_else(|| {
-            MPCError::CommunicationError(format!("channel from {} closed", party))
-        })
+        tokio::time::timeout(self.config.recv_timeout, rx.recv())
+            .await
+            .map_err(|_| MPCError::Timeout {
+                party: party.clone(),
+                phase: "recv".into(),
+            })?
+            .ok_or_else(|| {
+                MPCError::CommunicationError(format!("channel from {} closed", party))
+            })
     }
 
     async fn broadcast(&self, msg: &[u8]) -> MPCResult<()> {

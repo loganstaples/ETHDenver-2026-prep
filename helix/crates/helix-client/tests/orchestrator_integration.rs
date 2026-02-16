@@ -12,6 +12,7 @@ use helix_client::full_orchestration::{
     evaluate_accuracy, xavier_init, CheaterInfo, FullOrchestrationConfig, FullOrchestrationResult,
     FullOrchestrator, ProgressEvent,
 };
+use helix_client::zk_proof_layer::ZkProofConfig;
 use helix_client::worker_entry::WorkerConfig;
 use helix_mpc::e2e_integration::FinalWeights;
 use helix_mpc::mnist::MnistSample;
@@ -65,6 +66,8 @@ async fn test_full_owner_flow() {
         coordinator_address: None,
         #[cfg(feature = "chain")]
         enable_withdrawal: false,
+        zk_proof: ZkProofConfig::default(),
+        zk_mode: helix_client::ZkMode::Off,
     };
 
     let mut orchestrator = FullOrchestrator::new(config);
@@ -337,6 +340,8 @@ async fn test_progress_output() {
         coordinator_address: None,
         #[cfg(feature = "chain")]
         enable_withdrawal: false,
+        zk_proof: ZkProofConfig::default(),
+        zk_mode: helix_client::ZkMode::Off,
     };
 
     let mut orchestrator = FullOrchestrator::new(config);
@@ -502,6 +507,8 @@ async fn test_error_recovery() {
             coordinator_address: None,
             #[cfg(feature = "chain")]
             enable_withdrawal: false,
+            zk_proof: ZkProofConfig::default(),
+            zk_mode: helix_client::ZkMode::Off,
         }
     };
 
@@ -726,6 +733,8 @@ fn test_orchestration_result_roundtrip() {
         training_time_secs: 45.67,
         coordinator_address: "0x1234567890abcdef".to_string(),
         total_gas_used: 1_200_000,
+        zk_proofs_generated: 0,
+        zk_proofs_on_chain: 0,
     };
 
     let json = serde_json::to_string_pretty(&result).unwrap();

@@ -40,9 +40,10 @@ colored = "2.0"
 
 # HTTP client/server for health endpoints and dashboard
 reqwest = { version = "0.11", features = ["json"] }
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "trace"] }
+tokio-tungstenite = "0.21"
 
 # Logging
 tracing = "0.1"
@@ -122,3 +123,4 @@ tempfile = "3.0"
 tokio-test = "0.4"
 tower = { version = "0.4", features = ["util"] }
 hyper = "1.0"
+portpicker = "0.1"

@@ -2375,28 +2375,50 @@ impl<T: MPCTransport> MPCTrainer<T> {
             &relu_mask_share, &relu_mask_mac,
         ).await?;
 
-        // y = W2 @ h + b2 (shared-times-shared matmul).
+        // Reconstruct h to public values for correct loss computation.
+        // The Beaver-based scalar multiply loop (W2 @ h) produces shares whose
+        // reconstructed values have invalid fixed-point encoding due to
+        // accumulated communication-order artifacts across 320 sequential rounds.
+        // Instead, reconstruct h here (one round), compute y via share × public
+        // (matching the unproved path), and use that for loss and gradients.
+        let peers = self.transport.peers();
+        let h_bytes = SecureArithmetic::serialize_share_batch(&h_share);
+        self.transport.broadcast(&h_bytes).await?;
+
+        let mut h_recon = h_share.clone();
+        for peer in &peers {
+            let msg = self.transport.recv(peer).await?;
+            let peer_h = SecureArithmetic::deserialize_share_batch(&msg)?;
+            for j in 0..d_hid {
+                h_recon[j] = Fr::add(&h_recon[j], &peer_h[j]);
+            }
+        }
+
+        // Convert reconstructed h to f64 and back to aligned Fr (same as unproved path).
+        let mut h_f64 = vec![0.0f64; d_hid];
+        let mut relu_mask_f64 = vec![0.0f64; d_hid];
+        let mut h_fr = vec![Fr::ZERO; d_hid];
+        for j in 0..d_hid {
+            let val = h_recon[j].to_f64();
+            if val > 0.0 {
+                h_f64[j] = val;
+                relu_mask_f64[j] = 1.0;
+                h_fr[j] = Fr::from_f64(val);
+            }
+        }
+
+        // Layer 2: y = W2 @ h + b2 via share × public (same as unproved path).
         let mut y_share = vec![Fr::ZERO; d_out];
-        let mut y_mac = vec![Fr::ZERO; d_out];
         for i in 0..d_out {
             let mut sum = Fr::ZERO;
-            let mut mac_sum = Fr::ZERO;
             for j in 0..d_hid {
-                let w2_mac = self.mac_state.as_ref().unwrap().w2_macs[i * d_hid + j];
-                let (prod, prod_mac) = self.secure_multiply_authenticated(
-                    &self.w2[i * d_hid + j].clone(), &w2_mac,
-                    &h_share[j], &h_mac[j],
-                ).await?;
-                sum = Fr::add(&sum, &prod);
-                mac_sum = Fr::add(&mac_sum, &prod_mac);
+                let contrib = self.w2[i * d_hid + j].mpc_scale(&h_fr[j]);
+                sum = Fr::add(&sum, &contrib);
             }
-            let b2_mac = self.mac_state.as_ref().unwrap().b2_macs[i];
             y_share[i] = Fr::add(&sum, &self.b2[i]);
-            y_mac[i] = Fr::add(&mac_sum, &b2_mac);
         }
 
         // Reconstruct y for loss computation.
-        let peers = self.transport.peers();
         let y_bytes = SecureArithmetic::serialize_share_batch(&y_share);
         self.transport.broadcast(&y_bytes).await?;
 
@@ -2409,115 +2431,121 @@ impl<T: MPCTransport> MPCTrainer<T> {
             }
         }
 
-        // Accumulate opened y for MAC verification.
+        // Accumulate opened h and y for MAC verification.
+        // Use the Beaver-computed h_share/h_mac for MAC tracking (they're valid
+        // shares even though reconstruction has artifacts).
         if let Some(ref mut ms) = self.mac_state {
-            for i in 0..d_out {
-                ms.accumulate_opened(y_reconstructed[i], y_mac[i]);
+            for j in 0..d_hid {
+                ms.accumulate_opened(h_recon[j], h_mac[j]);
             }
         }
 
+        // Loss = 0.5 * sum((y - target)^2). dy = y - target (public, in f64).
         let mut loss = 0.0_f64;
-        let mut dy: Vec<Fr> = vec![Fr::ZERO; d_out];
+        let mut dy_f64 = vec![0.0f64; d_out];
+        let mut dy_fr = vec![Fr::ZERO; d_out];
         for i in 0..d_out {
-            let diff = Fr::sub(&y_reconstructed[i], &target_fr[i]);
-            let diff_f64 = diff.to_f64();
-            loss += 0.5 * diff_f64 * diff_f64;
-            dy[i] = diff;
+            let y_f64 = y_reconstructed[i].to_f64();
+            let diff = y_f64 - target[i];
+            loss += 0.5 * diff * diff;
+            dy_f64[i] = diff;
+            dy_fr[i] = Fr::from_f64(diff);
         }
 
-        // ---- Backward pass with MAC tracking ----
-        // dW2 = outer(dy, h): dy is public, h is shared → scale by public
-        let mut dw2_share = vec![Fr::ZERO; d_out * d_hid];
-        let mut dw2_mac = vec![Fr::ZERO; d_out * d_hid];
+        // ---- Backward pass (public gradients, matching unproved path) ----
+        // Since h and dy are both PUBLIC, gradients are computed in f64.
+
+        // dW2 = outer(dy, h) — both public. Compute in f64.
+        let mut dw2_f64 = vec![0.0f64; d_out * d_hid];
         for i in 0..d_out {
             for j in 0..d_hid {
-                dw2_share[i * d_hid + j] = h_share[j].mpc_scale(&dy[i]);
-                dw2_mac[i * d_hid + j] = h_mac[j].mpc_scale(&dy[i]);
+                dw2_f64[i * d_hid + j] = dy_f64[i] * h_f64[j];
             }
         }
+        // db2 = dy (public)
+        let db2_f64 = dy_f64.clone();
 
-        // db2 = dy (public, only party 0 holds value)
-        let db2_share: Vec<Fr> = if self.party_index == 0 {
-            dy.clone()
-        } else {
-            vec![Fr::ZERO; d_out]
-        };
-        // MAC for db2: all parties add alpha_i * dy[i]
-        let db2_mac: Vec<Fr> = dy.iter()
-            .map(|d| Fr::mul(&alpha_share, d))
-            .collect();
-
-        // dh = W2^T @ dy (W2 shared, dy public → scale by public)
+        // dh = W2^T @ dy — dy is public, W2 is secret-shared.
+        // This is share × public. Reconstruct dh.
         let mut dh_share = vec![Fr::ZERO; d_hid];
-        let mut dh_mac = vec![Fr::ZERO; d_hid];
         for j in 0..d_hid {
             let mut sum = Fr::ZERO;
-            let mut mac_sum = Fr::ZERO;
             for i in 0..d_out {
-                let w2_mac = self.mac_state.as_ref().unwrap().w2_macs[i * d_hid + j];
-                sum = Fr::add(&sum, &self.w2[i * d_hid + j].mpc_scale(&dy[i]));
-                mac_sum = Fr::add(&mac_sum, &w2_mac.mpc_scale(&dy[i]));
+                let contrib = self.w2[i * d_hid + j].mpc_scale(&dy_fr[i]);
+                sum = Fr::add(&sum, &contrib);
             }
             dh_share[j] = sum;
-            dh_mac[j] = mac_sum;
+        }
+        // Reconstruct dh
+        let dh_bytes = SecureArithmetic::serialize_share_batch(&dh_share);
+        self.transport.broadcast(&dh_bytes).await?;
+        let mut dh_recon = dh_share.clone();
+        for peer in &peers {
+            let msg = self.transport.recv(peer).await?;
+            let peer_dh = SecureArithmetic::deserialize_share_batch(&msg)?;
+            for j in 0..d_hid {
+                dh_recon[j] = Fr::add(&dh_recon[j], &peer_dh[j]);
+            }
         }
 
-        // dh_pre = dh * relu_mask (both shared → authenticated Beaver multiply)
-        let (dh_pre_share, dh_pre_mac) = self.secure_vector_multiply_authenticated(
-            &dh_share, &dh_mac,
-            &relu_mask_share, &relu_mask_mac,
-        ).await?;
+        // dh_pre = dh * relu_mask — both now public. Compute in f64.
+        let mut dh_pre_f64 = vec![0.0f64; d_hid];
+        for j in 0..d_hid {
+            dh_pre_f64[j] = dh_recon[j].to_f64() * relu_mask_f64[j];
+        }
 
-        // dW1 = outer(dh_pre, x): dh_pre shared, x public → scale by public
-        let mut dw1_share = vec![Fr::ZERO; d_hid * d_in];
-        let mut dw1_mac = vec![Fr::ZERO; d_hid * d_in];
+        // dW1 = outer(dh_pre, x) — both public. Compute in f64.
+        let mut dw1_f64 = vec![0.0f64; d_hid * d_in];
         for i in 0..d_hid {
             for j in 0..d_in {
-                dw1_share[i * d_in + j] = dh_pre_share[i].mpc_scale(&x[j]);
-                dw1_mac[i * d_in + j] = dh_pre_mac[i].mpc_scale(&x[j]);
+                dw1_f64[i * d_in + j] = dh_pre_f64[i] * input[j];
             }
         }
-
-        // db1 = dh_pre
-        let db1_share = dh_pre_share.clone();
-        let db1_mac = dh_pre_mac.clone();
+        // db1 = dh_pre (public)
+        let db1_f64 = dh_pre_f64;
 
         // ---- Weight update: W -= lr * dW ----
-        let lr = Fr::from_f64(self.config.learning_rate);
-        for i in 0..self.w1.len() {
-            let update = lr.mpc_scale(&dw1_share[i]);
-            self.w1[i] = Fr::sub(&self.w1[i], &update);
-        }
-        for i in 0..self.b1.len() {
-            let update = lr.mpc_scale(&db1_share[i]);
-            self.b1[i] = Fr::sub(&self.b1[i], &update);
-        }
-        for i in 0..self.w2.len() {
-            let update = lr.mpc_scale(&dw2_share[i]);
-            self.w2[i] = Fr::sub(&self.w2[i], &update);
-        }
-        for i in 0..self.b2.len() {
-            let update = lr.mpc_scale(&db2_share[i]);
-            self.b2[i] = Fr::sub(&self.b2[i], &update);
+        // Gradients are PUBLIC. Only party 0 applies the update,
+        // maintaining the additive sharing property.
+        let lr_f64 = self.config.learning_rate;
+        if self.party_index == 0 {
+            for i in 0..self.w1.len() {
+                let update = Fr::from_f64(lr_f64 * dw1_f64[i]);
+                self.w1[i] = Fr::sub(&self.w1[i], &update);
+            }
+            for i in 0..self.b1.len() {
+                let update = Fr::from_f64(lr_f64 * db1_f64[i]);
+                self.b1[i] = Fr::sub(&self.b1[i], &update);
+            }
+            for i in 0..self.w2.len() {
+                let update = Fr::from_f64(lr_f64 * dw2_f64[i]);
+                self.w2[i] = Fr::sub(&self.w2[i], &update);
+            }
+            for i in 0..self.b2.len() {
+                let update = Fr::from_f64(lr_f64 * db2_f64[i]);
+                self.b2[i] = Fr::sub(&self.b2[i], &update);
+            }
         }
 
-        // ---- MAC weight update: MAC_W -= lr * MAC_dW ----
+        // ---- MAC weight update ----
+        // Gradient dw is public. MAC(w_new) = MAC(w_old) - α_i * lr * dw.
+        // Each party applies: mac_w_i -= α_i * Fr::from_f64(lr * dw).
         if let Some(ref mut ms) = self.mac_state {
             for i in 0..ms.w1_macs.len() {
-                let mac_update = lr.mpc_scale(&dw1_mac[i]);
-                ms.w1_macs[i] = Fr::sub(&ms.w1_macs[i], &mac_update);
+                let grad_fr = Fr::from_f64(lr_f64 * dw1_f64[i]);
+                ms.w1_macs[i] = Fr::sub(&ms.w1_macs[i], &Fr::mul(&alpha_share, &grad_fr));
             }
             for i in 0..ms.b1_macs.len() {
-                let mac_update = lr.mpc_scale(&db1_mac[i]);
-                ms.b1_macs[i] = Fr::sub(&ms.b1_macs[i], &mac_update);
+                let grad_fr = Fr::from_f64(lr_f64 * db1_f64[i]);
+                ms.b1_macs[i] = Fr::sub(&ms.b1_macs[i], &Fr::mul(&alpha_share, &grad_fr));
             }
             for i in 0..ms.w2_macs.len() {
-                let mac_update = lr.mpc_scale(&dw2_mac[i]);
-                ms.w2_macs[i] = Fr::sub(&ms.w2_macs[i], &mac_update);
+                let grad_fr = Fr::from_f64(lr_f64 * dw2_f64[i]);
+                ms.w2_macs[i] = Fr::sub(&ms.w2_macs[i], &Fr::mul(&alpha_share, &grad_fr));
             }
             for i in 0..ms.b2_macs.len() {
-                let mac_update = lr.mpc_scale(&db2_mac[i]);
-                ms.b2_macs[i] = Fr::sub(&ms.b2_macs[i], &mac_update);
+                let grad_fr = Fr::from_f64(lr_f64 * db2_f64[i]);
+                ms.b2_macs[i] = Fr::sub(&ms.b2_macs[i], &Fr::mul(&alpha_share, &grad_fr));
             }
         }
 

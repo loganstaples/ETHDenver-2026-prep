@@ -29,6 +29,12 @@ abigen!(
     "../../contracts/out/HelixCoordinatorV4.sol/HelixCoordinatorV4.json"
 );
 
+// Halo2Verifier binding for deploying the real on-chain verifier.
+abigen!(
+    Halo2VerifierContract,
+    "../../contracts/out/Halo2Verifier.sol/Halo2Verifier.json"
+);
+
 // ============ Data Types ============
 
 /// V4 deployment result.
@@ -48,6 +54,8 @@ pub struct V4JobSummary {
     pub active_worker_count: u64,
     pub active: bool,
     pub completed: bool,
+    pub zk_enabled: bool,
+    pub zk_activated_by_risk: bool,
 }
 
 /// Worker info from getWorkerInfo().
@@ -362,6 +370,13 @@ impl ChainClientV4 {
     // ============ Job Registration ============
 
     /// Register a new MPC training job with ETH payment deposit.
+    ///
+    /// New parameters for risk-based ZK activation:
+    /// - `zk_enabled`: If true, always require ZK proofs for checkpoints.
+    /// - `zk_checkpoint_freq`: ZK proof every N checkpoints (0 = end only).
+    /// - `risk_zk_enabled`: If true, auto-activate ZK when workers drop below threshold.
+    /// - `min_workers_for_mpc`: Minimum worker count for MPC-only mode (0 defaults to 2).
+    ///
     /// Returns `(receipt, job_id)`.
     pub async fn register_training_job(
         &self,
@@ -369,6 +384,33 @@ impl ChainClientV4 {
         checkpoint_freq: u64,
         num_rounds: u64,
         payment_amount: U256,
+    ) -> Result<(TransactionReceipt, u64)> {
+        self.register_training_job_with_zk(
+            architecture_hash,
+            checkpoint_freq,
+            num_rounds,
+            payment_amount,
+            false,
+            0,
+            false,
+            0,
+        )
+        .await
+    }
+
+    /// Register a new MPC training job with full ZK/risk configuration.
+    ///
+    /// Returns `(receipt, job_id)`.
+    pub async fn register_training_job_with_zk(
+        &self,
+        architecture_hash: [u8; 32],
+        checkpoint_freq: u64,
+        num_rounds: u64,
+        payment_amount: U256,
+        zk_enabled: bool,
+        zk_checkpoint_freq: u64,
+        risk_zk_enabled: bool,
+        min_workers_for_mpc: u64,
     ) -> Result<(TransactionReceipt, u64)> {
         self.check_cb().await?;
         let result: Result<(TransactionReceipt, u64)> = async {
@@ -379,6 +421,10 @@ impl ChainClientV4 {
                     U256::from(checkpoint_freq),
                     U256::from(num_rounds),
                     payment_amount,
+                    zk_enabled,
+                    U256::from(zk_checkpoint_freq),
+                    risk_zk_enabled,
+                    U256::from(min_workers_for_mpc),
                 )
                 .value(payment_amount);
             let pending = call
@@ -629,6 +675,25 @@ impl ChainClientV4 {
         result
     }
 
+    // ============ Halo2Verifier Deployment ============
+
+    /// Deploy the real Halo2Verifier contract for on-chain ZK proof verification.
+    ///
+    /// The Halo2Verifier deploys its own `Halo2VerifierCore` and `Halo2VerifyingKey`
+    /// contracts in its constructor (no-args). Returns the deployed verifier address.
+    ///
+    /// After deployment, call `set_verifier(verifier_address)` on the coordinator
+    /// to enable ZK proof verification for `submitCheckpointWithProof()`.
+    pub async fn deploy_halo2_verifier(&self) -> Result<Address> {
+        let contract = Halo2VerifierContract::deploy(self.client.clone(), ())
+            .map_err(|e| anyhow!("Halo2Verifier deploy prepare: {}", e))?
+            .send()
+            .await
+            .map_err(|e| anyhow!("Halo2Verifier deploy send: {}", e))?;
+
+        Ok(contract.address())
+    }
+
     // ============ Admin ============
 
     /// Update the treasury address (owner only).
@@ -697,6 +762,8 @@ impl ChainClientV4 {
                 active_worker_count: resp.4.as_u64(),
                 active: resp.5,
                 completed: resp.6,
+                zk_enabled: resp.7,
+                zk_activated_by_risk: resp.8,
             })
         }
         .await;
@@ -860,6 +927,23 @@ impl ChainClientV4 {
             })
         }
         .await;
+        if result.is_ok() {
+            self.ok().await;
+        } else {
+            self.fail().await;
+        }
+        result
+    }
+
+    /// Check if ZK proofs are required for a job (either user-enabled or risk-activated).
+    pub async fn is_zk_required(&self, job_id: u64) -> Result<bool> {
+        self.check_cb().await?;
+        let result = self
+            .coordinator
+            .is_zk_required(U256::from(job_id))
+            .call()
+            .await
+            .map_err(|e| anyhow!("is_zk_required: {}", e));
         if result.is_ok() {
             self.ok().await;
         } else {

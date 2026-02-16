@@ -37,6 +37,12 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
         uint256 latestLoss;
         bool active;
         bool completed;
+        // Risk-based ZK activation fields
+        bool zkEnabled;               // User toggle: always require ZK
+        uint256 zkCheckpointFreq;     // ZK proof every N checkpoints (0 = end only)
+        bool riskZkEnabled;           // User toggle: enable auto-ZK on risk
+        uint256 minWorkersForMpc;     // Threshold (default 2)
+        bool zkActivatedByRisk;       // Set true when workers drop below threshold
     }
 
     /// @notice Per-job worker state
@@ -122,6 +128,15 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
     /// @notice Whether a worker has withdrawn stake for a job: jobId => worker => withdrawn
     mapping(uint256 => mapping(address => bool)) public stakeWithdrawn;
 
+    /// @notice Total staked ETH by each worker address across all jobs
+    mapping(address => uint256) public workerTotalStaked;
+
+    /// @notice Number of active jobs a worker is currently participating in
+    mapping(address => uint256) public workerActiveJobs;
+
+    /// @notice Stake required per active job slot (rate limiting)
+    uint256 public stakePerJobSlot = 0.1 ether;
+
     // ============ Events ============
 
     event JobRegistered(
@@ -185,6 +200,7 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
 
     event TreasuryUpdated(address indexed oldTreasury, address indexed newTreasury);
     event VerifierUpdated(address indexed oldVerifier, address indexed newVerifier);
+    event ZkActivatedByRisk(uint256 indexed jobId, uint256 activeWorkerCount);
 
     // ============ Errors ============
 
@@ -215,6 +231,8 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
     error InvalidProof();
     error NoWorkersJoined();
     error WorkerAlreadySlashed();
+    error RateLimited();
+    error ZkRequired();
 
     // ============ Modifiers ============
 
@@ -254,18 +272,29 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
     /// @param checkpointFreq How often checkpoints are submitted (every N steps)
     /// @param numRounds Total number of training steps/rounds
     /// @param paymentAmount Total payment for workers (sent as msg.value)
+    /// @param zkEnabled If true, always require ZK proofs for checkpoints
+    /// @param zkCheckpointFreq ZK proof every N checkpoints (0 = end only, ignored if !zkEnabled)
+    /// @param riskZkEnabled If true, auto-activate ZK when workers drop below minWorkersForMpc
+    /// @param minWorkersForMpc Minimum worker threshold for MPC-only mode (default 2)
     /// @return jobId The unique job identifier
     function registerTrainingJob(
         bytes32 architectureHash,
         uint256 checkpointFreq,
         uint256 numRounds,
-        uint256 paymentAmount
+        uint256 paymentAmount,
+        bool zkEnabled,
+        uint256 zkCheckpointFreq,
+        bool riskZkEnabled,
+        uint256 minWorkersForMpc
     ) external payable nonReentrant returns (uint256 jobId) {
         if (msg.value != paymentAmount || paymentAmount == 0) revert InvalidPayment();
         if (checkpointFreq == 0) revert InvalidCheckpointFreq();
         if (numRounds == 0) revert InvalidNumRounds();
 
         jobId = nextJobId++;
+
+        // Default minWorkersForMpc to 2 if not specified
+        uint256 effectiveMinWorkers = minWorkersForMpc > 0 ? minWorkersForMpc : 2;
 
         jobs[jobId] = Job({
             owner: msg.sender,
@@ -278,7 +307,12 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
             latestWeightCommitment: bytes32(0),
             latestLoss: 0,
             active: true,
-            completed: false
+            completed: false,
+            zkEnabled: zkEnabled,
+            zkCheckpointFreq: zkCheckpointFreq,
+            riskZkEnabled: riskZkEnabled,
+            minWorkersForMpc: effectiveMinWorkers,
+            zkActivatedByRisk: false
         });
 
         emit JobRegistered(jobId, msg.sender, architectureHash, checkpointFreq, numRounds, paymentAmount);
@@ -292,6 +326,11 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
         if (workers[jobId][msg.sender].registered) revert AlreadyRegistered();
         if (msg.value < jobs[jobId].minStake) revert InsufficientStake();
 
+        // Rate limiting: worker must have enough total stake to support another active job
+        if (workerActiveJobs[msg.sender] >= (workerTotalStaked[msg.sender] + msg.value) / stakePerJobSlot) {
+            revert RateLimited();
+        }
+
         workers[jobId][msg.sender] = WorkerInfo({
             stakeAmount: msg.value,
             joinedAtStep: jobs[jobId].currentStep,
@@ -302,6 +341,10 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
 
         _activeWorkers[jobId].push(msg.sender);
         _workerIndex[jobId][msg.sender] = _activeWorkers[jobId].length; // 1-indexed
+
+        // Update rate limiting state
+        workerTotalStaked[msg.sender] += msg.value;
+        workerActiveJobs[msg.sender]++;
 
         emit WorkerJoined(jobId, msg.sender, msg.value);
     }
@@ -321,6 +364,9 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
         uint256 loss,
         bytes[] calldata signatures
     ) external nonReentrant jobExists(jobId) jobActive(jobId) {
+        // Enforce ZK when required (either user-enabled or risk-activated)
+        if (jobs[jobId].zkEnabled || jobs[jobId].zkActivatedByRisk) revert ZkRequired();
+
         uint256 activeCount = _activeWorkers[jobId].length;
         if (activeCount == 0) revert NoWorkersJoined();
         if (signatures.length != activeCount) revert InvalidSignatureCount();
@@ -420,6 +466,24 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
             if (!success) revert TransferFailed();
         }
 
+        // Decrement slashed worker's active job count and total staked
+        if (workerActiveJobs[cheater] > 0) {
+            workerActiveJobs[cheater]--;
+        }
+        // workerTotalStaked was already set when they joined; stakeAmount was their contribution
+        if (workerTotalStaked[cheater] >= stakeAmount) {
+            workerTotalStaked[cheater] -= stakeAmount;
+        } else {
+            workerTotalStaked[cheater] = 0;
+        }
+
+        // Check risk threshold: activate ZK if workers drop below minimum
+        uint256 activeWorkerCount = _activeWorkers[jobId].length;
+        if (jobs[jobId].riskZkEnabled && !jobs[jobId].zkActivatedByRisk && activeWorkerCount < jobs[jobId].minWorkersForMpc) {
+            jobs[jobId].zkActivatedByRisk = true;
+            emit ZkActivatedByRisk(jobId, activeWorkerCount);
+        }
+
         // Store report
         macFailureReports[jobId].push(MACFailureReport({
             stepNumber: stepNumber,
@@ -460,10 +524,15 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
         job.latestWeightCommitment = finalCommitment;
         jobCompletionTime[jobId] = block.timestamp;
 
-        // Update all workers' lastActiveStep to final
+        // Update all workers' lastActiveStep to final and decrement active job counts
         uint256 finalStep = job.currentStep;
         for (uint256 i = 0; i < activeCount; i++) {
-            workers[jobId][_activeWorkers[jobId][i]].lastActiveStep = finalStep;
+            address w = _activeWorkers[jobId][i];
+            workers[jobId][w].lastActiveStep = finalStep;
+            // Decrement active job count for rate limiting
+            if (workerActiveJobs[w] > 0) {
+                workerActiveJobs[w]--;
+            }
         }
 
         // Distribute payment proportionally to participation
@@ -763,7 +832,9 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
         uint256 paymentAmount,
         uint256 activeWorkerCount,
         bool active,
-        bool completed
+        bool completed,
+        bool zkEnabled,
+        bool zkActivatedByRisk
     ) {
         Job storage job = jobs[jobId];
         return (
@@ -773,13 +844,20 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
             job.paymentAmount,
             _activeWorkers[jobId].length,
             job.active,
-            job.completed
+            job.completed,
+            job.zkEnabled,
+            job.zkActivatedByRisk
         );
     }
 
     /// @notice Check if an address is an active worker for a job
     function isActiveWorker(uint256 jobId, address worker) external view returns (bool) {
         return _workerIndex[jobId][worker] > 0 && !workers[jobId][worker].slashed;
+    }
+
+    /// @notice Check if ZK proofs are required for a job (either user-enabled or risk-activated)
+    function isZkRequired(uint256 jobId) external view returns (bool) {
+        return jobs[jobId].zkEnabled || jobs[jobId].zkActivatedByRisk;
     }
 
     // ============ Admin Functions ============

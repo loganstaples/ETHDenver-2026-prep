@@ -14,7 +14,6 @@ use tokio::sync::broadcast;
 
 mod commands;
 mod config;
-mod dashboard;
 mod demo;
 mod help;
 mod orchestrator;
@@ -24,6 +23,9 @@ mod benchmark;
 mod rpc;
 mod visualization;
 mod wallet;
+
+// Use dashboard from the lib crate (it needs access to full_orchestration/zk_proof_layer)
+use helix_client::dashboard;
 
 use commands::{
     init::InitCommand,
@@ -455,6 +457,17 @@ struct MpcTrainArgs {
     #[cfg(feature = "chain")]
     #[arg(long)]
     enable_withdrawal: bool,
+
+    /// Enable optional ZK proof generation at checkpoints.
+    /// When enabled, generates StateTransitionCircuit proofs for external verifiability.
+    /// Default: disabled (MPC+MAC is the primary correctness mechanism).
+    #[arg(long)]
+    zk_proofs: bool,
+
+    /// ZK proof checkpoint frequency: generate a proof every N checkpoints.
+    /// Only used when --zk-proofs is enabled. Default: only at the final checkpoint.
+    #[arg(long, default_value = "0")]
+    zk_checkpoint_freq: usize,
 
     /// Save final trained weights to this JSON file
     #[arg(long)]
@@ -2677,6 +2690,20 @@ async fn cmd_mpc_train(args: &MpcTrainArgs, _cli: &Cli) -> Result<()> {
         seed: args.seed,
         worker_endpoints: worker_endpoints.clone(),
         initial_weights_path: args.weights.clone(),
+        zk_proof: helix_client::ZkProofConfig {
+            enabled: args.zk_proofs,
+            // If zk_checkpoint_freq is 0 (default), only prove at the very end:
+            // set frequency to total checkpoints so only the last one gets a proof.
+            checkpoint_frequency: if args.zk_checkpoint_freq > 0 {
+                args.zk_checkpoint_freq
+            } else if args.checkpoint_freq > 0 {
+                // Default: prove only at final checkpoint
+                (args.steps / args.checkpoint_freq).max(1)
+            } else {
+                1
+            },
+            self_verify: true,
+        },
         use_real_mnist: args.real_mnist,
         mnist_cache_dir: None,
         train_size: args.train_size,
@@ -2695,6 +2722,7 @@ async fn cmd_mpc_train(args: &MpcTrainArgs, _cli: &Cli) -> Result<()> {
         coordinator_address: args.coordinator.clone(),
         #[cfg(feature = "chain")]
         enable_withdrawal: args.enable_withdrawal,
+        zk_mode: helix_client::ZkMode::Off,
     };
 
     let mut orchestrator = FullOrchestrator::new(config);
@@ -2817,6 +2845,55 @@ async fn cmd_mpc_train(args: &MpcTrainArgs, _cli: &Cli) -> Result<()> {
                     retry_count,
                     message.dimmed(),
                 );
+            }
+            ProgressEvent::ZkProofStarted { checkpoint_index, step } => {
+                println!(
+                    "  {} ZK proof: generating for checkpoint {} (step {})...",
+                    "🔐".dimmed(),
+                    checkpoint_index,
+                    step,
+                );
+            }
+            ProgressEvent::ZkProofGenerated { checkpoint_index: _, step, proof_size, time_ms, verified } => {
+                println!(
+                    "  {} ZK proof: step {} | {} bytes | {}ms | verified={}",
+                    "✓".green(),
+                    step,
+                    proof_size,
+                    time_ms,
+                    verified,
+                );
+            }
+            ProgressEvent::ZkProofFailed { checkpoint_index: _, step, error } => {
+                println!(
+                    "  {} ZK proof failed at step {} (non-fatal): {}",
+                    "⚠".yellow(),
+                    step,
+                    error.dimmed(),
+                );
+            }
+            ProgressEvent::ZkProofSubmitted { checkpoint_index: _, step, tx_hash } => {
+                println!(
+                    "  {} ZK proof submitted on-chain: step {} tx={}",
+                    "⛓".dimmed(),
+                    step,
+                    &tx_hash[..10.min(tx_hash.len())],
+                );
+            }
+            ProgressEvent::ZkRiskActivated { active_workers, min_workers } => {
+                println!();
+                println!(
+                    "  {} {} -- active workers ({}) dropped below threshold ({})",
+                    "⚠".yellow(),
+                    "ZK RISK ACTIVATED".red().bold(),
+                    active_workers,
+                    min_workers,
+                );
+                println!(
+                    "  {} Switching to ZK proof mode for remaining checkpoints",
+                    "🔐".dimmed(),
+                );
+                println!();
             }
         }
     });
