@@ -157,7 +157,7 @@ pub async fn redistribute_shares_after_removal<T: MPCTransport>(
         ).await
     } else {
         redistribute_as_worker(
-            checkpoint, transport, party_index, cheater_index,
+            checkpoint, transport, party_index, cheater_index, new_num_parties,
         ).await
     }
 }
@@ -352,6 +352,7 @@ async fn redistribute_as_worker<T: MPCTransport>(
     transport: &T,
     party_index: usize,
     cheater_index: usize,
+    new_num_parties: usize,
 ) -> MPCResult<RedistributionResult> {
     let dealer = PartyId::from_index(0);
 
@@ -404,7 +405,7 @@ async fn redistribute_as_worker<T: MPCTransport>(
             b2: new_b2,
             mac_state,
             checkpoint_step: checkpoint.step,
-            new_num_parties: 0, // Will be set by caller
+            new_num_parties,
         })
     } else {
         Err(MPCError::ProtocolError(

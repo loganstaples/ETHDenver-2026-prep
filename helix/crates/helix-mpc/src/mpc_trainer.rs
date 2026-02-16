@@ -2727,6 +2727,59 @@ impl<T: MPCTransport> MPCTrainer<T> {
     pub fn weight_shares(&self) -> (&[Fr], &[Fr], &[Fr], &[Fr]) {
         (&self.w1, &self.b1, &self.w2, &self.b2)
     }
+
+    /// Returns the trainer's configuration.
+    pub fn config(&self) -> &MPCTrainerConfig {
+        &self.config
+    }
+
+    /// Applies recovery state after share redistribution.
+    ///
+    /// Called after `redistribute_shares_after_removal` to load the new shares,
+    /// MAC state, and step counter into this trainer. Also sets the party count
+    /// to the new (reduced) value.
+    ///
+    /// After calling this, the caller must generate fresh Beaver triples before
+    /// resuming training (the old triples are invalidated by the party change).
+    pub fn apply_recovery_state(
+        &mut self,
+        result: &crate::share_redistribution::RedistributionResult,
+        new_num_parties: usize,
+    ) {
+        self.w1 = result.w1.clone();
+        self.b1 = result.b1.clone();
+        self.w2 = result.w2.clone();
+        self.b2 = result.b2.clone();
+        self.current_step = result.checkpoint_step;
+        self.config.num_parties = new_num_parties;
+
+        // Install the new MAC state from redistribution.
+        let mut ms = MACState::new(result.mac_state.alpha_share);
+        ms.w1_macs = result.mac_state.w1_macs.clone();
+        ms.b1_macs = result.mac_state.b1_macs.clone();
+        ms.w2_macs = result.mac_state.w2_macs.clone();
+        ms.b2_macs = result.mac_state.b2_macs.clone();
+        // Save an initial checkpoint at the recovery point.
+        ms.save_checkpoint(
+            result.checkpoint_step,
+            &self.w1, &self.b1, &self.w2, &self.b2,
+            0, 0,
+        );
+        self.mac_state = Some(ms);
+
+        // Clear old Beaver triples (must regenerate for new party set).
+        self.beaver_triples.clear();
+        self.beaver_cursor = 0;
+        self.auth_beaver_triples.clear();
+        self.auth_beaver_cursor = 0;
+
+        info!(
+            party = self.party_index,
+            step = result.checkpoint_step,
+            new_parties = new_num_parties,
+            "Recovery state applied — trainer ready for fresh Beaver generation"
+        );
+    }
 }
 
 // ============================================================================

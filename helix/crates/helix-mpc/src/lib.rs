@@ -40,6 +40,7 @@ pub mod profiling;
 pub mod proofs;
 pub mod protocols;
 pub mod recovery;
+pub mod recovery_integration;
 pub mod message_validation;
 pub mod resilience;
 pub mod resilient_training;

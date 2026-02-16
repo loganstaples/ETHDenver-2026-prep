@@ -150,7 +150,7 @@ pub struct MACState {
     /// Step of the last successful MAC verification.
     pub last_verified_step: u64,
     /// Checkpoint of the last known-good state.
-    checkpoint: Option<TrainingCheckpoint>,
+    pub checkpoint: Option<TrainingCheckpoint>,
 }
 
 impl MACState {
