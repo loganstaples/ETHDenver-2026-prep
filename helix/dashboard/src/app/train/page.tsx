@@ -14,6 +14,8 @@ import {
   Clock,
   Wifi,
   WifiOff,
+  Upload,
+  Download,
 } from 'lucide-react';
 import {
   ResponsiveContainer,
@@ -28,7 +30,12 @@ import { Card } from '@/components/ui/Card';
 import { ProgressBar } from '@/components/ui/ProgressBar';
 import { Badge } from '@/components/ui/Badge';
 import { cn } from '@/lib/utils';
-import { useMpcTraining, type TrainingJobConfig } from '@/hooks/useMpcTraining';
+import {
+  useMpcTraining,
+  type TrainingJobConfig,
+  type UploadedData,
+  type UploadedWeights,
+} from '@/hooks/useMpcTraining';
 
 // ============================================================================
 // Constants
@@ -78,9 +85,13 @@ function ChartTooltip({ active, payload, label }: any) {
 interface ConfigFormProps {
   onStart: (config: TrainingJobConfig) => void;
   isStarting: boolean;
+  onUploadData: (file: File) => Promise<void>;
+  onUploadWeights: (file: File) => Promise<void>;
+  uploadedData: UploadedData | null;
+  uploadedWeights: UploadedWeights | null;
 }
 
-function ConfigForm({ onStart, isStarting }: ConfigFormProps) {
+function ConfigForm({ onStart, isStarting, onUploadData, onUploadWeights, uploadedData, uploadedWeights }: ConfigFormProps) {
   const [numWorkers, setNumWorkers] = useState(3);
   const [numSteps, setNumSteps] = useState(500);
   const [learningRate, setLearningRate] = useState(0.001);
@@ -180,6 +191,76 @@ function ConfigForm({ onStart, isStarting }: ConfigFormProps) {
               max={1000}
               className="w-full px-3 py-2 bg-helix-bg border border-helix-border rounded-md text-sm text-helix-text font-mono focus:outline-none focus:border-helix-border2 transition-colors"
             />
+          </div>
+        </div>
+      </Card>
+
+      {/* Data & Weights */}
+      <Card variant="default">
+        <h3 className="text-sm font-medium text-white mb-4">Data & Weights</h3>
+        <div className="space-y-4">
+          <div>
+            <label className="label-text block mb-1.5">Training Data (JSON)</label>
+            <div className="flex items-center gap-3">
+              <label
+                className={cn(
+                  'flex items-center gap-2 px-3 py-2 rounded-md text-sm cursor-pointer transition-colors',
+                  'bg-helix-bg border border-helix-border hover:border-helix-border2 text-helix-text',
+                )}
+              >
+                <Upload size={14} />
+                <span>Upload</span>
+                <input
+                  type="file"
+                  accept=".json"
+                  className="hidden"
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    if (file) onUploadData(file);
+                  }}
+                />
+              </label>
+              {uploadedData && (
+                <div className="flex items-center gap-2">
+                  <CheckCircle size={14} className="text-green-400" />
+                  <span className="text-sm text-helix-text font-mono">
+                    {uploadedData.samples} samples ({uploadedData.inputDim}D)
+                  </span>
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div>
+            <label className="label-text block mb-1.5">Initial Weights (JSON, optional)</label>
+            <div className="flex items-center gap-3">
+              <label
+                className={cn(
+                  'flex items-center gap-2 px-3 py-2 rounded-md text-sm cursor-pointer transition-colors',
+                  'bg-helix-bg border border-helix-border hover:border-helix-border2 text-helix-text',
+                )}
+              >
+                <Upload size={14} />
+                <span>Upload</span>
+                <input
+                  type="file"
+                  accept=".json"
+                  className="hidden"
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    if (file) onUploadWeights(file);
+                  }}
+                />
+              </label>
+              {uploadedWeights && (
+                <div className="flex items-center gap-2">
+                  <CheckCircle size={14} className="text-green-400" />
+                  <span className="text-sm text-helix-text font-mono">
+                    {uploadedWeights.totalParams.toLocaleString()} params
+                  </span>
+                </div>
+              )}
+            </div>
           </div>
         </div>
       </Card>
@@ -509,6 +590,7 @@ function CheaterAlert({ cheater }: CheaterAlertProps) {
 
 interface FinalResultsProps {
   session: {
+    session_id: string;
     accuracy: number | null;
     elapsed_secs: number;
     checkpoints_submitted: number;
@@ -519,9 +601,10 @@ interface FinalResultsProps {
     current_step: number;
     status: string;
   };
+  onDownloadModel?: (sessionId: string) => Promise<void>;
 }
 
-function FinalResults({ session }: FinalResultsProps) {
+function FinalResults({ session, onDownloadModel }: FinalResultsProps) {
   const isSuccess = session.status === 'complete';
 
   return (
@@ -530,15 +613,27 @@ function FinalResults({ session }: FinalResultsProps) {
       animate={{ opacity: 1, y: 0 }}
     >
       <Card variant="glass" className="overflow-visible">
-        <div className="flex items-center gap-3 mb-4">
-          {isSuccess ? (
-            <CheckCircle size={24} className="text-green-400" />
-          ) : (
-            <XCircle size={24} className="text-red-400" />
+        <div className="flex items-center justify-between mb-4">
+          <div className="flex items-center gap-3">
+            {isSuccess ? (
+              <CheckCircle size={24} className="text-green-400" />
+            ) : (
+              <XCircle size={24} className="text-red-400" />
+            )}
+            <h3 className="text-lg font-semibold text-white">
+              {isSuccess ? 'Training Complete' : 'Training Failed'}
+            </h3>
+          </div>
+          {isSuccess && onDownloadModel && (
+            <button
+              type="button"
+              onClick={() => onDownloadModel(session.session_id)}
+              className="flex items-center gap-2 px-4 py-2 rounded-lg bg-white text-black text-sm font-medium hover:bg-white/90 transition-colors"
+            >
+              <Download size={14} />
+              Download Model
+            </button>
           )}
-          <h3 className="text-lg font-semibold text-white">
-            {isSuccess ? 'Training Complete' : 'Training Failed'}
-          </h3>
         </div>
 
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
@@ -585,9 +680,10 @@ interface LiveProgressProps {
   losses: { step: number; loss: number }[];
   isConnected: boolean;
   error: string | null;
+  onDownloadModel: (sessionId: string) => Promise<void>;
 }
 
-function LiveProgress({ session, losses, isConnected, error }: LiveProgressProps) {
+function LiveProgress({ session, losses, isConnected, error, onDownloadModel }: LiveProgressProps) {
   const stepProgress = session.total_steps > 0
     ? (session.current_step / session.total_steps) * 100
     : 0;
@@ -709,7 +805,7 @@ function LiveProgress({ session, losses, isConnected, error }: LiveProgressProps
       </Card>
 
       {/* Final Results */}
-      {isTerminal && <FinalResults session={session} />}
+      {isTerminal && <FinalResults session={session} onDownloadModel={onDownloadModel} />}
     </div>
   );
 }
@@ -721,11 +817,16 @@ function LiveProgress({ session, losses, isConnected, error }: LiveProgressProps
 export default function TrainPage() {
   const {
     startTraining,
+    uploadData,
+    uploadWeights,
+    downloadModel,
     session,
     losses,
     isConnected,
     isStarting,
     error,
+    uploadedData,
+    uploadedWeights,
   } = useMpcTraining();
 
   const hasSession = session !== null;
@@ -747,13 +848,21 @@ export default function TrainPage() {
       </div>
 
       {!hasSession ? (
-        <ConfigForm onStart={startTraining} isStarting={isStarting} />
+        <ConfigForm
+          onStart={startTraining}
+          isStarting={isStarting}
+          onUploadData={uploadData}
+          onUploadWeights={uploadWeights}
+          uploadedData={uploadedData}
+          uploadedWeights={uploadedWeights}
+        />
       ) : (
         <LiveProgress
           session={session}
           losses={losses}
           isConnected={isConnected}
           error={error}
+          onDownloadModel={downloadModel}
         />
       )}
     </motion.div>

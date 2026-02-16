@@ -1853,4 +1853,110 @@ mod tests {
             eprintln!("  Written to: {}", vk_path.display());
         }
     }
+
+    /// Generate Solidity verifier files for the StateTransitionCircuit (6 public inputs).
+    /// This replaces the old MLTrainingStepV2 verifier (8 public inputs) to match the
+    /// MPC-primary architecture where ZK is optional at checkpoints.
+    ///
+    /// Run explicitly with: cargo test -p helix-prover test_generate_state_transition_verifier -- --ignored
+    #[test]
+    #[ignore]
+    fn test_generate_state_transition_verifier() {
+        let _lock = crate::PROOF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use helix_circuits::ml::state_transition::{StateTransitionCircuit, StateTransitionWitness, NUM_PUBLIC_INPUTS};
+        use helix_circuits::halo2_proofs::{
+            plonk::{keygen_vk, keygen_pk, create_proof, verify_proof_multi},
+            poly::kzg::{
+                commitment::{KZGCommitmentScheme, ParamsKZG},
+                multiopen::{ProverSHPLONK, VerifierSHPLONK},
+                strategy::SingleStrategy,
+            },
+        };
+        use helix_circuits::halo2curves::bn256::{Bn256, Fr};
+        use helix_circuits::halo2curves::ff::Field;
+        use halo2_solidity_verifier::{SolidityGenerator, BatchOpenScheme::Bdfg21, encode_calldata, Keccak256Transcript};
+        use rand_core::OsRng;
+
+        // Create a test witness with 8 weights (matching test patterns)
+        let old_weights: Vec<Fr> = (0..8).map(|i| Fr::from(i + 1)).collect();
+        let new_weights: Vec<Fr> = (0..8).map(|i| Fr::from(i + 2)).collect();
+        let error_bound = Fr::from(100u64);
+
+        let witness = StateTransitionWitness::new(old_weights, new_weights, error_bound);
+        let circuit = StateTransitionCircuit::new(witness).expect("circuit creation");
+        let pi = circuit.public_inputs();
+        assert_eq!(pi.len(), NUM_PUBLIC_INPUTS, "StateTransitionCircuit must have 6 public inputs");
+
+        let k = circuit.minimum_k().max(12); // Ensure at least k=12 for SRS compatibility
+
+        // Use HELIX_SRS_SEED for deterministic SRS — same seed as generate_keys_for_circuit()
+        use crate::keys::HELIX_SRS_SEED;
+        use rand::SeedableRng;
+        let srs_rng = rand::rngs::StdRng::from_seed(HELIX_SRS_SEED);
+        let params = ParamsKZG::<Bn256>::setup(k, srs_rng);
+        let vk = keygen_vk(&params, &circuit).expect("keygen_vk failed");
+        let pk = keygen_pk(&params, vk.clone(), &circuit).expect("keygen_pk failed");
+
+        // Generate proof with PSE's Keccak256Transcript (EVM-compatible)
+        let instances = vec![pi.clone()];
+        let mut transcript = Keccak256Transcript::new(vec![]);
+        create_proof::<
+            KZGCommitmentScheme<Bn256>,
+            ProverSHPLONK<'_, Bn256>,
+            _,_,_,_,
+        >(&params, &pk, &[circuit], &[instances.clone()], OsRng, &mut transcript)
+        .expect("create_proof failed");
+        let proof = transcript.finalize();
+
+        // Verify proof using PSE transcript
+        let mut verifier_transcript = Keccak256Transcript::new(proof.as_slice());
+        let verifier_params = params.verifier_params();
+        let verified = verify_proof_multi::<
+            KZGCommitmentScheme<Bn256>,
+            VerifierSHPLONK<Bn256>,
+            _,_,
+            SingleStrategy<Bn256>,
+        >(&verifier_params, &vk, &[instances.clone()], &mut verifier_transcript);
+        assert!(verified, "PSE Keccak256Transcript proof verification must succeed");
+
+        // Generate Solidity verifier using PSE generator
+        let num_instances = pi.len();
+        let generator = SolidityGenerator::new(&params, &vk, Bdfg21, num_instances);
+        let verifier_sol = generator.render().expect("render failed");
+
+        assert!(verifier_sol.contains("Halo2Verifier"), "generated verifier must contain Halo2Verifier");
+        assert!(verifier_sol.contains("ecPairing") || verifier_sol.contains("pairing") || verifier_sol.contains("staticcall"),
+            "generated verifier must contain pairing logic");
+
+        // Also generate separate VK
+        let (verifier_sol_sep, vk_sol) = generator.render_separately().expect("render_separately failed");
+        assert!(vk_sol.contains("Halo2VerifyingKey"), "VK contract must exist");
+
+        // Encode calldata for testing
+        let calldata = encode_calldata(None, &proof, &pi);
+        assert!(!calldata.is_empty(), "calldata must not be empty");
+        eprintln!("=== StateTransitionCircuit Solidity verifier generated ===");
+        eprintln!("  Verifier size: {} bytes", verifier_sol.len());
+        eprintln!("  VK size: {} bytes", vk_sol.len());
+        eprintln!("  Proof size: {} bytes", proof.len());
+        eprintln!("  Calldata size: {} bytes", calldata.len());
+        eprintln!("  Public inputs: {} (6 = StateTransitionCircuit)", num_instances);
+
+        // Write the core verifier to contracts directory
+        let contracts_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap().parent().unwrap()
+            .join("contracts").join("src").join("verification");
+        if contracts_dir.exists() {
+            // Rename contract from Halo2Verifier to Halo2VerifierCore
+            // and add memory-safe annotation for via_ir compatibility
+            let core_sol = verifier_sol_sep.replace("contract Halo2Verifier", "contract Halo2VerifierCore");
+            let core_sol = core_sol.replace("assembly {", "assembly (\"memory-safe\") {");
+            let verifier_path = contracts_dir.join("Halo2VerifierCore.sol");
+            let vk_path = contracts_dir.join("Halo2VerifyingKey.sol");
+            std::fs::write(&verifier_path, &core_sol).expect("write verifier core");
+            std::fs::write(&vk_path, &vk_sol).expect("write VK");
+            eprintln!("  Written to: {}", verifier_path.display());
+            eprintln!("  Written to: {}", vk_path.display());
+        }
+    }
 }

@@ -68,6 +68,8 @@ async fn test_full_owner_flow() {
         enable_withdrawal: false,
         zk_proof: ZkProofConfig::default(),
         zk_mode: helix_client::ZkMode::Off,
+        custom_training_data: None,
+        simulate_cheater: false,
     };
 
     let mut orchestrator = FullOrchestrator::new(config);
@@ -342,6 +344,8 @@ async fn test_progress_output() {
         enable_withdrawal: false,
         zk_proof: ZkProofConfig::default(),
         zk_mode: helix_client::ZkMode::Off,
+        custom_training_data: None,
+        simulate_cheater: false,
     };
 
     let mut orchestrator = FullOrchestrator::new(config);
@@ -509,6 +513,8 @@ async fn test_error_recovery() {
             enable_withdrawal: false,
             zk_proof: ZkProofConfig::default(),
             zk_mode: helix_client::ZkMode::Off,
+            custom_training_data: None,
+            simulate_cheater: false,
         }
     };
 

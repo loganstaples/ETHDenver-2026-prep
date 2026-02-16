@@ -122,6 +122,9 @@ enum Commands {
 
     /// Join an MPC training session as a worker
     MpcWorker(MpcWorkerArgs),
+
+    /// Spawn multiple MPC worker processes locally
+    SpawnWorkers(SpawnWorkersArgs),
 }
 
 // ============================================================================
@@ -411,6 +414,10 @@ struct MpcTrainArgs {
     #[arg(long)]
     weights: Option<String>,
 
+    /// Path to JSON training data file (array of {input: [...], target: [...]})
+    #[arg(long)]
+    data: Option<PathBuf>,
+
     /// Use real MNIST data (requires helix-mpc real-mnist feature)
     #[arg(long)]
     real_mnist: bool,
@@ -469,6 +476,17 @@ struct MpcTrainArgs {
     #[arg(long, default_value = "0")]
     zk_checkpoint_freq: usize,
 
+    /// ZK proof mode: "off" (default), "always", or "risk:N" where N is the
+    /// minimum worker count before ZK activates (e.g. "risk:2").
+    #[arg(long, default_value = "off")]
+    zk_mode: String,
+
+    /// Simulate a cheater worker during training (demo feature).
+    /// One worker will inject corrupt shares mid-training to demonstrate
+    /// cheater detection and slashing.
+    #[arg(long)]
+    simulate_cheater: bool,
+
     /// Save final trained weights to this JSON file
     #[arg(long)]
     output: Option<PathBuf>,
@@ -513,6 +531,26 @@ struct MpcWorkerArgs {
     #[cfg(feature = "chain")]
     #[arg(long, default_value = "0.1")]
     stake_eth: f64,
+}
+
+/// Arguments for spawning multiple local MPC workers.
+#[derive(Args)]
+struct SpawnWorkersArgs {
+    /// Number of workers to spawn
+    #[arg(long, default_value = "3")]
+    count: usize,
+
+    /// Base TCP port (worker i listens on base_port + i*2)
+    #[arg(long, default_value = "9001")]
+    base_port: u16,
+
+    /// Bind address for all workers
+    #[arg(long, default_value = "0.0.0.0")]
+    bind: String,
+
+    /// Base random seed (worker i uses seed + i)
+    #[arg(long, default_value = "42")]
+    seed: u64,
 }
 
 #[derive(Args)]
@@ -652,7 +690,7 @@ enum HealthTarget {
 #[derive(Args)]
 struct DashboardArgs {
     /// Port to serve dashboard on
-    #[arg(short, long, default_value = "8080")]
+    #[arg(short, long, default_value = "3001")]
     port: u16,
 
     /// Host to bind to
@@ -823,6 +861,7 @@ async fn main() -> Result<()> {
         Commands::SubmitProof(args) => cmd_submit_proof(args).await,
         Commands::MpcTrain(args) => cmd_mpc_train(args, &cli).await,
         Commands::MpcWorker(args) => cmd_mpc_worker(args, &cli).await,
+        Commands::SpawnWorkers(args) => cmd_spawn_workers(args, &cli).await,
     };
 
     if let Err(e) = result {
@@ -2573,6 +2612,32 @@ async fn cmd_submit_proof(args: &SubmitProofArgs) -> Result<()> {
 }
 
 // ============================================================================
+// ZK Mode Parsing
+// ============================================================================
+
+/// Parse the --zk-mode CLI flag into a ZkMode enum.
+///
+/// Accepted values: "off", "always", "risk:N" (e.g. "risk:2").
+fn parse_zk_mode(s: &str) -> Result<helix_client::ZkMode> {
+    match s.to_lowercase().as_str() {
+        "off" => Ok(helix_client::ZkMode::Off),
+        "always" => Ok(helix_client::ZkMode::Always),
+        other if other.starts_with("risk:") => {
+            let n: usize = other[5..].parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "Invalid --zk-mode format. Expected 'risk:N' where N is a number (e.g. 'risk:2')"
+                )
+            })?;
+            Ok(helix_client::ZkMode::Risk { min_workers: n })
+        }
+        _ => Err(anyhow::anyhow!(
+            "Unknown --zk-mode '{}'. Options: off, always, risk:N",
+            s
+        )),
+    }
+}
+
+// ============================================================================
 // MPC Training (Model Owner)
 // ============================================================================
 
@@ -2678,9 +2743,13 @@ async fn cmd_mpc_train(args: &MpcTrainArgs, _cli: &Cli) -> Result<()> {
         println!("  Payment:         {} ETH", args.payment_eth);
         println!("  Stake/worker:    {} ETH", args.stake_eth);
     }
+    println!("  ZK Mode:         {}", args.zk_mode);
+    if args.simulate_cheater {
+        println!("  {} CHEATER SIMULATION ENABLED", "⚠".yellow());
+    }
     println!();
 
-    let config = FullOrchestrationConfig {
+    let mut config = FullOrchestrationConfig {
         architecture: dims.clone(),
         num_steps: args.steps,
         learning_rate: args.learning_rate,
@@ -2722,8 +2791,26 @@ async fn cmd_mpc_train(args: &MpcTrainArgs, _cli: &Cli) -> Result<()> {
         coordinator_address: args.coordinator.clone(),
         #[cfg(feature = "chain")]
         enable_withdrawal: args.enable_withdrawal,
-        zk_mode: helix_client::ZkMode::Off,
+        zk_mode: parse_zk_mode(&args.zk_mode)?,
+        custom_training_data: None,
+        simulate_cheater: args.simulate_cheater,
     };
+
+    // Load custom training data from --data flag if provided
+    if let Some(ref data_path) = args.data {
+        let data_str = std::fs::read_to_string(data_path)
+            .map_err(|e| anyhow::anyhow!("Failed to read --data file '{}': {}", data_path.display(), e))?;
+        let samples: Vec<helix_client::dashboard::TrainingSample> = serde_json::from_str(&data_str)
+            .map_err(|e| anyhow::anyhow!(
+                "Failed to parse --data file. Expected JSON array of {{input: [...], target: [...]}}: {}", e
+            ))?;
+        let pairs: Vec<(Vec<f64>, Vec<f64>)> = samples
+            .into_iter()
+            .map(|s| (s.input, s.target))
+            .collect();
+        println!("  Loaded {} custom training samples from {}", pairs.len(), data_path.display());
+        config.custom_training_data = Some(pairs);
+    }
 
     let mut orchestrator = FullOrchestrator::new(config);
 
@@ -3019,5 +3106,112 @@ async fn cmd_mpc_worker(args: &MpcWorkerArgs, _cli: &Cli) -> Result<()> {
     println!("  Final Share Sent:      {}", share_status);
     println!();
 
+    Ok(())
+}
+
+// ============================================================================
+// spawn-workers: Launch multiple MPC workers in-process
+// ============================================================================
+
+async fn cmd_spawn_workers(args: &SpawnWorkersArgs, _cli: &Cli) -> Result<()> {
+    use helix_client::worker_entry::{WorkerConfig, launch_worker};
+    use tokio::signal;
+
+    println!();
+    println!("{}", "═".repeat(64).cyan());
+    println!("{}", " HELIX MPC Worker Spawner".cyan().bold());
+    println!("{}", "═".repeat(64).cyan());
+    println!();
+
+    if args.count < 2 {
+        anyhow::bail!("Need at least 2 workers (got {})", args.count);
+    }
+
+    let colors = ["red", "green", "yellow", "blue", "magenta", "cyan", "white", "bright_red", "bright_green", "bright_blue"];
+
+    // Print summary of worker addresses
+    println!("{}", "Workers:".yellow().bold());
+    let mut worker_addrs = Vec::new();
+    for i in 0..args.count {
+        let port = args.base_port + (i as u16) * 2;
+        let addr = format!("{}:{}", args.bind, port);
+        let color = colors[i % colors.len()];
+        println!("  [worker-{}] {} (color: {})", i, addr, color);
+        worker_addrs.push(addr);
+    }
+    println!();
+
+    // Print copy-paste command for --workers flag
+    let workers_flag: Vec<String> = worker_addrs.iter()
+        .map(|a| a.replace("0.0.0.0", "127.0.0.1"))
+        .collect();
+    println!("{}", "Copy-paste for mpc-train:".yellow().bold());
+    println!("  --workers {}", workers_flag.join(","));
+    println!();
+
+    // Spawn all workers as tokio tasks
+    let mut handles = Vec::new();
+
+    for i in 0..args.count {
+        let port = args.base_port + (i as u16) * 2;
+        let listen_addr = format!("{}:{}", args.bind, port);
+        let seed = args.seed + i as u64;
+
+        let config = WorkerConfig {
+            listen_addr: listen_addr.clone(),
+            party_index: i,
+            seed,
+            #[cfg(feature = "chain")]
+            eth_rpc_url: None,
+            #[cfg(feature = "chain")]
+            private_key: String::new(),
+            #[cfg(feature = "chain")]
+            job_id: None,
+            #[cfg(feature = "chain")]
+            coordinator_address: None,
+            #[cfg(feature = "chain")]
+            stake_amount_eth: 0.0,
+        };
+
+        let handle = tokio::spawn(async move {
+            println!("[worker-{}] Starting on {}", i, listen_addr);
+            match launch_worker(config).await {
+                Ok(result) => {
+                    println!(
+                        "[worker-{}] Done: {} steps, {} checkpoints signed",
+                        i, result.steps_completed, result.checkpoint_signatures
+                    );
+                }
+                Err(e) => {
+                    eprintln!("[worker-{}] Error: {}", i, e);
+                }
+            }
+        });
+        handles.push(handle);
+    }
+
+    println!("{}", "All workers started. Press Ctrl+C to shut down.".green().bold());
+    println!();
+
+    // Wait for SIGINT
+    signal::ctrl_c().await?;
+    println!();
+    println!("{}", "Shutting down workers...".yellow());
+
+    // Abort all worker tasks
+    for handle in &handles {
+        handle.abort();
+    }
+
+    // Wait for tasks to finish
+    for (i, handle) in handles.into_iter().enumerate() {
+        match handle.await {
+            Ok(()) => println!("[worker-{}] Stopped cleanly", i),
+            Err(e) if e.is_cancelled() => println!("[worker-{}] Stopped", i),
+            Err(e) => eprintln!("[worker-{}] Error during shutdown: {}", i, e),
+        }
+    }
+
+    println!("{}", "All workers stopped.".green());
     Ok(())
 }

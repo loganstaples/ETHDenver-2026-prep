@@ -137,6 +137,9 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
     /// @notice Stake required per active job slot (rate limiting)
     uint256 public stakePerJobSlot = 0.1 ether;
 
+    /// @notice ZK weight hash chain: jobId => index => value (index 0 = lo, index 1 = hi)
+    mapping(uint256 => mapping(uint256 => uint256)) public zkWeightHash;
+
     // ============ Events ============
 
     event JobRegistered(
@@ -229,6 +232,8 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
     error TransferFailed();
     error VerifierNotSet();
     error InvalidProof();
+    error ZkHashChainMismatch();
+    error InvalidPublicInputsLength();
     error NoWorkersJoined();
     error WorkerAlreadySlashed();
     error RateLimited();
@@ -364,8 +369,23 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
         uint256 loss,
         bytes[] calldata signatures
     ) external nonReentrant jobExists(jobId) jobActive(jobId) {
-        // Enforce ZK when required (either user-enabled or risk-activated)
-        if (jobs[jobId].zkEnabled || jobs[jobId].zkActivatedByRisk) revert ZkRequired();
+        // Enforce ZK when required — but only for checkpoints where ZK is actually needed.
+        // In MPC training, intermediate weights remain secret-shared so ZK proofs can only
+        // be generated for the final checkpoint (where weights are reconstructed).
+        // When zkCheckpointFreq == 0, ZK is required only at the final step (stepNumber >= numRounds).
+        // When zkCheckpointFreq > 0, ZK is required every N-th checkpoint.
+        if (jobs[jobId].zkEnabled || jobs[jobId].zkActivatedByRisk) {
+            bool zkRequiredHere;
+            if (jobs[jobId].zkCheckpointFreq == 0) {
+                // ZK only at the final checkpoint
+                zkRequiredHere = stepNumber >= jobs[jobId].numRounds;
+            } else {
+                // ZK every N-th checkpoint (based on checkpoint count, not step)
+                uint256 checkpointIndex = stepNumber / jobs[jobId].checkpointFreq;
+                zkRequiredHere = checkpointIndex % jobs[jobId].zkCheckpointFreq == 0;
+            }
+            if (zkRequiredHere) revert ZkRequired();
+        }
 
         uint256 activeCount = _activeWorkers[jobId].length;
         if (activeCount == 0) revert NoWorkersJoined();
@@ -561,9 +581,27 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
     ) external nonReentrant jobExists(jobId) jobActive(jobId) {
         if (address(verifier) == address(0)) revert VerifierNotSet();
 
+        // Require exactly 6 public inputs (StateTransitionCircuit)
+        if (publicInputs.length != 6) revert InvalidPublicInputsLength();
+
         // Verify the ZK proof
         bool valid = verifier.verifyProof(proof, publicInputs);
         if (!valid) revert InvalidProof();
+
+        // Verify hash chain continuity: if a previous ZK checkpoint exists,
+        // the proof's old_hash must match the stored new_hash from last time.
+        uint256 prevLo = zkWeightHash[jobId][0];
+        uint256 prevHi = zkWeightHash[jobId][1];
+        if (prevLo != 0 || prevHi != 0) {
+            // Previous ZK checkpoint exists — verify chain
+            if (publicInputs[0] != prevLo || publicInputs[1] != prevHi) {
+                revert ZkHashChainMismatch();
+            }
+        }
+
+        // Store the new weight hash for chain continuity
+        zkWeightHash[jobId][0] = publicInputs[2]; // new_hash_lo
+        zkWeightHash[jobId][1] = publicInputs[3]; // new_hash_hi
 
         // Update job state
         Job storage job = jobs[jobId];

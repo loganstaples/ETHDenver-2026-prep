@@ -35,6 +35,12 @@ abigen!(
     "../../contracts/out/Halo2Verifier.sol/Halo2Verifier.json"
 );
 
+// MockVerifier binding for demo mode (accepts all proofs, off-chain verification is primary).
+abigen!(
+    MockVerifierContract,
+    "../../contracts/out/MockVerifier.sol/MockVerifier.json"
+);
+
 // ============ Data Types ============
 
 /// V4 deployment result.

@@ -74,6 +74,10 @@ pub struct MPCIntegrationConfig {
     /// Takes precedence over `use_node_transport` when true.
     /// Requires the `network-mpc` feature.
     pub use_tcp_transport: bool,
+    /// Optional TCP addresses for MPC workers (e.g. ["127.0.0.1:9001", ...]).
+    /// When set, `run_with_tcp_transport` uses these addresses instead of
+    /// binding ephemeral ports. Length must match `num_workers`.
+    pub worker_endpoints: Option<Vec<String>>,
 }
 
 /// Serializable initial weights for the integration config.
@@ -107,6 +111,7 @@ impl Default for MPCIntegrationConfig {
             seed: 42,
             use_node_transport: false,
             use_tcp_transport: false,
+            worker_endpoints: None,
         }
     }
 }
@@ -244,6 +249,7 @@ pub async fn run_mpc_training(
             run_with_tcp_transport(
                 parties, trainer_config, initial_weights, training_data,
                 num_steps, checkpoint_interval, config.seed, start,
+                config.worker_endpoints.clone(),
             ).await
         }
         #[cfg(not(feature = "network-mpc"))]
@@ -329,6 +335,7 @@ pub async fn run_mpc_training_with_cheater(
                 parties, trainer_config, initial_weights, training_data,
                 num_steps, checkpoint_interval, config.seed, start,
                 cheater_party, corrupt_at_step,
+                config.worker_endpoints.clone(),
             ).await
         }
         #[cfg(not(feature = "network-mpc"))]
@@ -508,6 +515,7 @@ async fn run_with_tcp_transport(
     checkpoint_interval: usize,
     seed: u64,
     start: Instant,
+    worker_endpoints: Option<Vec<String>>,
 ) -> Result<MPCIntegrationResult, anyhow::Error> {
     use std::collections::HashMap;
     use std::net::SocketAddr;
@@ -515,25 +523,33 @@ async fn run_with_tcp_transport(
 
     let num_workers = parties.len();
 
-    // Phase 1: Bind temporary TCP listeners to reserve OS-assigned ports.
-    // Using port 0 lets the OS pick free ephemeral ports.
-    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-
-    let mut addrs: Vec<SocketAddr> = Vec::with_capacity(num_workers);
-    let mut listeners = Vec::with_capacity(num_workers);
-    for _ in 0..num_workers {
-        let listener = tokio::net::TcpListener::bind(bind_addr).await
-            .map_err(|e| anyhow::anyhow!("TCP bind failed: {}", e))?;
-        let addr = listener.local_addr()
-            .map_err(|e| anyhow::anyhow!("local_addr failed: {}", e))?;
-        addrs.push(addr);
-        listeners.push(listener);
-    }
-
-    // Drop listeners so TcpTransport can rebind to the same ports.
-    // On localhost this is safe: we just released them and will immediately
-    // rebind, so port reuse races are extremely unlikely.
-    drop(listeners);
+    // Phase 1: Determine TCP addresses — either from explicit endpoints or ephemeral ports.
+    let addrs: Vec<SocketAddr> = if let Some(ref endpoints) = worker_endpoints {
+        if endpoints.len() != num_workers {
+            return Err(anyhow::anyhow!(
+                "worker_endpoints length ({}) must match num_workers ({})",
+                endpoints.len(), num_workers,
+            ));
+        }
+        endpoints.iter().map(|ep| ep.parse::<SocketAddr>()).collect::<Result<Vec<_>, _>>()
+            .map_err(|e| anyhow::anyhow!("Invalid worker endpoint address: {}", e))?
+    } else {
+        // Bind temporary TCP listeners to reserve OS-assigned ports.
+        let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut ephemeral_addrs = Vec::with_capacity(num_workers);
+        let mut listeners = Vec::with_capacity(num_workers);
+        for _ in 0..num_workers {
+            let listener = tokio::net::TcpListener::bind(bind_addr).await
+                .map_err(|e| anyhow::anyhow!("TCP bind failed: {}", e))?;
+            let addr = listener.local_addr()
+                .map_err(|e| anyhow::anyhow!("local_addr failed: {}", e))?;
+            ephemeral_addrs.push(addr);
+            listeners.push(listener);
+        }
+        // Drop listeners so TcpTransport can rebind to the same ports.
+        drop(listeners);
+        ephemeral_addrs
+    };
 
     info!(
         num_workers = num_workers,
@@ -607,6 +623,7 @@ async fn run_with_tcp_cheater(
     start: Instant,
     cheater_party: usize,
     corrupt_at_step: u64,
+    worker_endpoints: Option<Vec<String>>,
 ) -> Result<MPCIntegrationResult, anyhow::Error> {
     use std::collections::HashMap;
     use std::net::SocketAddr;
@@ -614,21 +631,31 @@ async fn run_with_tcp_cheater(
 
     let num_workers = parties.len();
 
-    // Phase 1: Reserve ports (same strategy as run_with_tcp_transport).
-    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-
-    let mut addrs: Vec<SocketAddr> = Vec::with_capacity(num_workers);
-    let mut listeners = Vec::with_capacity(num_workers);
-    for _ in 0..num_workers {
-        let listener = tokio::net::TcpListener::bind(bind_addr).await
-            .map_err(|e| anyhow::anyhow!("TCP bind failed: {}", e))?;
-        let addr = listener.local_addr()
-            .map_err(|e| anyhow::anyhow!("local_addr failed: {}", e))?;
-        addrs.push(addr);
-        listeners.push(listener);
-    }
-
-    drop(listeners);
+    // Phase 1: Determine TCP addresses — either from explicit endpoints or ephemeral ports.
+    let addrs: Vec<SocketAddr> = if let Some(ref endpoints) = worker_endpoints {
+        if endpoints.len() != num_workers {
+            return Err(anyhow::anyhow!(
+                "worker_endpoints length ({}) must match num_workers ({})",
+                endpoints.len(), num_workers,
+            ));
+        }
+        endpoints.iter().map(|ep| ep.parse::<SocketAddr>()).collect::<Result<Vec<_>, _>>()
+            .map_err(|e| anyhow::anyhow!("Invalid worker endpoint address: {}", e))?
+    } else {
+        let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut ephemeral_addrs = Vec::with_capacity(num_workers);
+        let mut listeners = Vec::with_capacity(num_workers);
+        for _ in 0..num_workers {
+            let listener = tokio::net::TcpListener::bind(bind_addr).await
+                .map_err(|e| anyhow::anyhow!("TCP bind failed: {}", e))?;
+            let addr = listener.local_addr()
+                .map_err(|e| anyhow::anyhow!("local_addr failed: {}", e))?;
+            ephemeral_addrs.push(addr);
+            listeners.push(listener);
+        }
+        drop(listeners);
+        ephemeral_addrs
+    };
 
     info!(
         num_workers = num_workers,
@@ -1228,6 +1255,7 @@ mod tests {
             seed: 42,
             use_node_transport: false,
             use_tcp_transport: false,
+            worker_endpoints: None,
         };
 
         let result = run_mpc_training(config).await.expect("training should succeed");
@@ -1263,6 +1291,7 @@ mod tests {
             seed: 42,
             use_node_transport: false,
             use_tcp_transport: false,
+            worker_endpoints: None,
         };
 
         let result = run_mpc_training(config).await.expect("training should succeed");
@@ -1301,6 +1330,7 @@ mod tests {
             seed: 42,
             use_node_transport: true,
             use_tcp_transport: false,
+            worker_endpoints: None,
         };
 
         let result = run_mpc_training(config).await.expect("training should succeed");
@@ -1329,6 +1359,7 @@ mod tests {
             seed: 123,
             use_node_transport: false,
             use_tcp_transport: false,
+            worker_endpoints: None,
         };
 
         let result = run_mpc_training(config).await.expect("training should succeed");
@@ -1384,6 +1415,7 @@ mod tests {
                 seed: 42,
                 use_node_transport: false,
                 use_tcp_transport: false,
+                worker_endpoints: None,
             };
 
             let result = run_mpc_training(config).await.expect("should succeed");

@@ -11,6 +11,7 @@ members = [
     "crates/helix-demo",
     "desktop/src-tauri",
     "tests",
+    "vendor/halo2-solidity-verifier",
 ]
 
 # Optimize dependencies in test builds — halo2 crypto operations are 10-100x

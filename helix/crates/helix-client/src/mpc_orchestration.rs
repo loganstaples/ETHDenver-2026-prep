@@ -331,6 +331,7 @@ impl MPCTrainingOrchestrator {
             seed: self.config.seed,
             use_node_transport: self.config.use_node_transport,
             use_tcp_transport: self.config.use_tcp_transport,
+            worker_endpoints: None,
         }
     }
 

@@ -160,6 +160,31 @@ pub struct TrainingSessionState {
     pub job_id: u64,
     pub elapsed_secs: f64,
     pub started_at: f64,
+    /// Final trained weights (populated when training completes)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_weights: Option<serde_json::Value>,
+}
+
+/// Request body for uploading training data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrainingDataUpload {
+    pub samples: Vec<TrainingSample>,
+}
+
+/// A single training sample (input, target).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrainingSample {
+    pub input: Vec<f64>,
+    pub target: Vec<f64>,
+}
+
+/// Request body for uploading initial weights.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WeightsUpload {
+    pub w1: Vec<f64>,
+    pub b1: Vec<f64>,
+    pub w2: Vec<f64>,
+    pub b2: Vec<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -293,6 +318,10 @@ pub struct DashboardState {
     pub sessions: RwLock<HashMap<String, TrainingSessionState>>,
     /// WebSocket broadcast channel for progress events
     pub ws_broadcast: broadcast::Sender<(String, serde_json::Value)>,
+    /// Uploaded training data (used instead of synthetic MNIST when set)
+    pub uploaded_data: RwLock<Option<Vec<(Vec<f64>, Vec<f64>)>>>,
+    /// Uploaded initial weights (for continue-training)
+    pub uploaded_weights: RwLock<Option<serde_json::Value>>,
 }
 
 impl DashboardState {
@@ -310,6 +339,8 @@ impl DashboardState {
             rate_limiter: RwLock::new(HashMap::new()),
             sessions: RwLock::new(HashMap::new()),
             ws_broadcast,
+            uploaded_data: RwLock::new(None),
+            uploaded_weights: RwLock::new(None),
         }
     }
 
@@ -367,6 +398,32 @@ impl DashboardState {
 impl Default for DashboardState {
     fn default() -> Self {
         Self::new(DashboardConfig::default())
+    }
+}
+
+impl Default for TrainingSessionState {
+    fn default() -> Self {
+        Self {
+            session_id: String::new(),
+            status: "pending".to_string(),
+            current_step: 0,
+            total_steps: 0,
+            current_loss: 0.0,
+            losses: Vec::new(),
+            accuracy: None,
+            checkpoints_submitted: 0,
+            mac_checks_passed: 0,
+            cheater_detected: None,
+            zk_proofs_generated: 0,
+            zk_activated_by_risk: false,
+            phase: 0,
+            phase_description: String::new(),
+            coordinator_address: String::new(),
+            job_id: 0,
+            elapsed_secs: 0.0,
+            started_at: 0.0,
+            final_weights: None,
+        }
     }
 }
 
@@ -535,11 +592,15 @@ pub fn create_dashboard_router_with_state(state: Arc<DashboardState>) -> Router 
         .route("/api/nodes", get(nodes_handler))
         .route("/api/metrics", get(metrics_handler))
         .route("/api/events", get(events_handler))
-        // New training job endpoints
+        // Training job endpoints
         .route("/api/training/start", post(start_training_handler))
         .route("/api/training/sessions", get(list_sessions_handler))
         .route("/api/training/sessions/{id}", get(get_session_handler))
         .route("/api/training/sessions/{id}/losses", get(get_losses_handler))
+        .route("/api/training/sessions/{id}/model", get(get_model_handler))
+        // Data/weights upload endpoints
+        .route("/api/training/data", post(upload_data_handler))
+        .route("/api/training/weights", post(upload_weights_handler))
         // WebSocket endpoint
         .route("/ws", get(websocket_handler))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
@@ -876,6 +937,7 @@ async fn start_training_handler(
         job_id: 0,
         elapsed_secs: 0.0,
         started_at: now,
+        final_weights: None,
     };
 
     // Store session
@@ -928,6 +990,8 @@ async fn start_training_handler(
         coordinator_address: None,
         #[cfg(feature = "chain")]
         enable_withdrawal: false,
+        custom_training_data: None,
+        simulate_cheater: req.simulate_cheater,
     };
 
     // Set Anvil default private keys for demo mode
@@ -953,14 +1017,31 @@ async fn start_training_handler(
             .collect();
     }
 
+    // If custom training data was uploaded, pass it to the orchestrator
+    if let Some(custom_data) = state.uploaded_data.read().await.clone() {
+        info!(samples = custom_data.len(), "Using uploaded training data for session");
+        config.custom_training_data = Some(custom_data);
+    }
+
+    // If initial weights were uploaded, write them to a temp file for the orchestrator
+    if let Some(weights_json) = state.uploaded_weights.read().await.clone() {
+        if let Ok(tmp_dir) = std::env::temp_dir().canonicalize() {
+            let weights_path = tmp_dir.join(format!("helix_weights_{}.json", session_id));
+            if let Ok(json_str) = serde_json::to_string_pretty(&weights_json) {
+                if std::fs::write(&weights_path, &json_str).is_ok() {
+                    config.initial_weights_path = Some(weights_path.to_string_lossy().to_string());
+                    info!(path = %weights_path.display(), "Using uploaded initial weights");
+                }
+            }
+        }
+    }
+
     // Spawn background training task
     let state_clone = state.clone();
     let sid = session_id.clone();
-    let simulate_cheater = req.simulate_cheater;
-    let _zk_mode = req.zk_mode.clone();
 
     tokio::spawn(async move {
-        run_training_session(state_clone, sid, config, simulate_cheater).await;
+        run_training_session(state_clone, sid, config).await;
     });
 
     (
@@ -977,7 +1058,6 @@ async fn run_training_session(
     state: Arc<DashboardState>,
     session_id: String,
     config: FullOrchestrationConfig,
-    _simulate_cheater: bool,
 ) {
     let sid = session_id.clone();
     let state_for_cb = state.clone();
@@ -1052,6 +1132,16 @@ async fn run_training_session(
                 "Training completed successfully"
             );
 
+            // Serialize final weights if available
+            let weights_json = result.final_weights.as_ref().map(|fw| {
+                serde_json::json!({
+                    "w1": fw.w1,
+                    "b1": fw.b1,
+                    "w2": fw.w2,
+                    "b2": fw.b2,
+                })
+            });
+
             // Update final session state
             if let Ok(mut sessions) = state.sessions.try_write() {
                 if let Some(session) = sessions.get_mut(&session_id) {
@@ -1060,6 +1150,7 @@ async fn run_training_session(
                     session.job_id = result.job_id;
                     session.coordinator_address = result.coordinator_address.clone();
                     session.zk_proofs_generated = result.zk_proofs_generated;
+                    session.final_weights = weights_json;
                 }
             }
 
@@ -1232,4 +1323,146 @@ async fn handle_websocket(socket: WebSocket, state: Arc<DashboardState>) {
 
     forward_task.abort();
     info!("WebSocket client disconnected");
+}
+
+// ---------------------------------------------------------------------------
+// Handler: Training Data Upload
+// ---------------------------------------------------------------------------
+
+/// POST /api/training/data — upload custom training data
+async fn upload_data_handler(
+    State(state): State<Arc<DashboardState>>,
+    Json(req): Json<TrainingDataUpload>,
+) -> impl IntoResponse {
+    if req.samples.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "samples array must not be empty" })),
+        ).into_response();
+    }
+
+    let input_dim = req.samples[0].input.len();
+    let output_dim = req.samples[0].target.len();
+
+    // Validate all samples have consistent dimensions
+    for (i, sample) in req.samples.iter().enumerate() {
+        if sample.input.len() != input_dim {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("sample {} has input dim {} but expected {}", i, sample.input.len(), input_dim)
+                })),
+            ).into_response();
+        }
+        if sample.target.len() != output_dim {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("sample {} has target dim {} but expected {}", i, sample.target.len(), output_dim)
+                })),
+            ).into_response();
+        }
+    }
+
+    let pairs: Vec<(Vec<f64>, Vec<f64>)> = req.samples
+        .into_iter()
+        .map(|s| (s.input, s.target))
+        .collect();
+    let count = pairs.len();
+
+    *state.uploaded_data.write().await = Some(pairs);
+
+    info!(samples = count, input_dim, output_dim, "Training data uploaded");
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "samples": count,
+            "input_dim": input_dim,
+            "output_dim": output_dim,
+        })),
+    ).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Handler: Initial Weights Upload
+// ---------------------------------------------------------------------------
+
+/// POST /api/training/weights — upload initial model weights (for continue-training)
+async fn upload_weights_handler(
+    State(state): State<Arc<DashboardState>>,
+    Json(req): Json<WeightsUpload>,
+) -> impl IntoResponse {
+    let w1_len = req.w1.len();
+    let b1_len = req.b1.len();
+    let w2_len = req.w2.len();
+    let b2_len = req.b2.len();
+
+    if w1_len == 0 || b1_len == 0 || w2_len == 0 || b2_len == 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "all weight arrays must be non-empty" })),
+        ).into_response();
+    }
+
+    let weights_json = serde_json::json!({
+        "w1": req.w1,
+        "b1": req.b1,
+        "w2": req.w2,
+        "b2": req.b2,
+    });
+
+    *state.uploaded_weights.write().await = Some(weights_json);
+
+    info!(w1 = w1_len, b1 = b1_len, w2 = w2_len, b2 = b2_len, "Initial weights uploaded");
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "w1_size": w1_len,
+            "b1_size": b1_len,
+            "w2_size": w2_len,
+            "b2_size": b2_len,
+        })),
+    ).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Handler: Model Download
+// ---------------------------------------------------------------------------
+
+/// GET /api/training/sessions/:id/model — download trained model weights
+async fn get_model_handler(
+    State(state): State<Arc<DashboardState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let sessions = state.sessions.read().await;
+    match sessions.get(&id) {
+        Some(session) => {
+            if session.status != "complete" {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "Training not yet complete" })),
+                ).into_response();
+            }
+            match &session.final_weights {
+                Some(weights) => Json(serde_json::json!({
+                    "session_id": id,
+                    "status": "complete",
+                    "accuracy": session.accuracy,
+                    "weights": weights,
+                })).into_response(),
+                None => (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": "Weights not available for this session" })),
+                ).into_response(),
+            }
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Session not found" })),
+        ).into_response(),
+    }
 }

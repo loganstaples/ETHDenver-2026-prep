@@ -319,6 +319,7 @@ async fn test_chain_recovery_full_e2e() -> anyhow::Result<()> {
         seed: 42,
         use_node_transport: false,
         use_tcp_transport: false,
+        worker_endpoints: None,
     };
 
     let result = run_mpc_training_with_cheater(mpc_config, cheater_party, corrupt_at_step).await?;
@@ -498,6 +499,7 @@ async fn test_chain_recovery_full_e2e() -> anyhow::Result<()> {
         seed: 99,
         use_node_transport: false,
         use_tcp_transport: false,
+        worker_endpoints: None,
     };
 
     let recovery_result = run_mpc_training(recovery_config).await?;

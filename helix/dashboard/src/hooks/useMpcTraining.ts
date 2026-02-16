@@ -64,14 +64,29 @@ export type LossDataPoint = {
   loss: number;
 };
 
+export interface UploadedData {
+  samples: number;
+  inputDim: number;
+  outputDim: number;
+}
+
+export interface UploadedWeights {
+  totalParams: number;
+}
+
 export interface UseMpcTrainingReturn {
   startTraining: (config: TrainingJobConfig) => Promise<void>;
+  uploadData: (file: File) => Promise<void>;
+  uploadWeights: (file: File) => Promise<void>;
+  downloadModel: (sessionId: string) => Promise<void>;
   session: TrainingSessionState | null;
   losses: LossDataPoint[];
   events: TrainingEvent[];
   isConnected: boolean;
   isStarting: boolean;
   error: string | null;
+  uploadedData: UploadedData | null;
+  uploadedWeights: UploadedWeights | null;
 }
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
@@ -88,6 +103,8 @@ export function useMpcTraining(): UseMpcTrainingReturn {
   const [isConnected, setIsConnected] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [uploadedData, setUploadedData] = useState<UploadedData | null>(null);
+  const [uploadedWeights, setUploadedWeights] = useState<UploadedWeights | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
   const sessionIdRef = useRef<string | null>(null);
@@ -370,6 +387,99 @@ export function useMpcTraining(): UseMpcTrainingReturn {
   }, [connectWebSocket, startPolling]);
 
   // ========================================================================
+  // Data Upload
+  // ========================================================================
+
+  const uploadData = useCallback(async (file: File) => {
+    try {
+      setError(null);
+      const text = await file.text();
+      const data = JSON.parse(text);
+
+      const res = await fetch(`${API_BASE}/api/training/data`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      });
+
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => ({}));
+        throw new Error(errBody.message || errBody.error || `HTTP ${res.status}`);
+      }
+
+      const result = await res.json();
+      setUploadedData({
+        samples: result.samples ?? (Array.isArray(data) ? data.length : 0),
+        inputDim: result.input_dim ?? 0,
+        outputDim: result.output_dim ?? 0,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to upload data';
+      setError(message);
+    }
+  }, []);
+
+  // ========================================================================
+  // Weights Upload
+  // ========================================================================
+
+  const uploadWeights = useCallback(async (file: File) => {
+    try {
+      setError(null);
+      const text = await file.text();
+      const data = JSON.parse(text);
+
+      const res = await fetch(`${API_BASE}/api/training/weights`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      });
+
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => ({}));
+        throw new Error(errBody.message || errBody.error || `HTTP ${res.status}`);
+      }
+
+      const result = await res.json();
+      setUploadedWeights({
+        totalParams: result.total_params ?? 0,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to upload weights';
+      setError(message);
+    }
+  }, []);
+
+  // ========================================================================
+  // Model Download
+  // ========================================================================
+
+  const downloadModel = useCallback(async (sessionId: string) => {
+    try {
+      setError(null);
+      const res = await fetch(`${API_BASE}/api/training/sessions/${sessionId}/model`);
+
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => ({}));
+        throw new Error(errBody.message || errBody.error || `HTTP ${res.status}`);
+      }
+
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `helix-model-${sessionId.slice(0, 8)}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to download model';
+      setError(message);
+    }
+  }, []);
+
+  // ========================================================================
   // Cleanup
   // ========================================================================
 
@@ -393,12 +503,17 @@ export function useMpcTraining(): UseMpcTrainingReturn {
 
   return {
     startTraining,
+    uploadData,
+    uploadWeights,
+    downloadModel,
     session,
     losses,
     events,
     isConnected,
     isStarting,
     error,
+    uploadedData,
+    uploadedWeights,
   };
 }
 

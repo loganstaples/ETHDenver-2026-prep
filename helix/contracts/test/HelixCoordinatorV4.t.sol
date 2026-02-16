@@ -570,8 +570,13 @@ contract HelixCoordinatorV4Test is Test {
         uint256 jobId = _setupJobWith3Workers();
 
         bytes memory proof = hex"deadbeef";
-        uint256[] memory publicInputs = new uint256[](8);
-        publicInputs[0] = 1;
+        uint256[] memory publicInputs = new uint256[](6);
+        publicInputs[0] = 0; // old_hash_lo
+        publicInputs[1] = 0; // old_hash_hi
+        publicInputs[2] = 1; // new_hash_lo
+        publicInputs[3] = 2; // new_hash_hi
+        publicInputs[4] = 3; // delta_hash
+        publicInputs[5] = 4; // error_bound
 
         bytes32 commitment = keccak256("zk_weights");
         coordinator.submitCheckpointWithProof(jobId, 100, commitment, 500, proof, publicInputs);
@@ -591,7 +596,8 @@ contract HelixCoordinatorV4Test is Test {
         mockVerifier.setAccept(false);
 
         bytes memory proof = hex"deadbeef";
-        uint256[] memory publicInputs = new uint256[](8);
+        uint256[] memory publicInputs = new uint256[](6);
+        for (uint i = 0; i < 6; i++) publicInputs[i] = i;
 
         vm.expectRevert(HelixCoordinatorV4.InvalidProof.selector);
         coordinator.submitCheckpointWithProof(jobId, 100, keccak256("x"), 500, proof, publicInputs);
@@ -605,7 +611,8 @@ contract HelixCoordinatorV4Test is Test {
         uint256 jobId = noVerifier.registerTrainingJob{value: 1 ether}(ARCH_HASH, 10, 100, 1 ether, false, 0, false, 0);
 
         bytes memory proof = hex"deadbeef";
-        uint256[] memory publicInputs = new uint256[](8);
+        uint256[] memory publicInputs = new uint256[](6);
+        for (uint i = 0; i < 6; i++) publicInputs[i] = i;
 
         vm.expectRevert(HelixCoordinatorV4.VerifierNotSet.selector);
         noVerifier.submitCheckpointWithProof(jobId, 100, keccak256("x"), 500, proof, publicInputs);
@@ -917,6 +924,99 @@ contract HelixCoordinatorV4Test is Test {
         // Contract should be able to receive ETH
         (bool success, ) = address(coordinator).call{value: 1 ether}("");
         assertTrue(success);
+    }
+
+    // ============ ZK Proof Hash Chain Tests ============
+
+    function test_zkProof_firstProofNoChainCheck() public {
+        uint256 jobId = _setupJobWith3Workers();
+
+        uint256[] memory pi = new uint256[](6);
+        pi[0] = 0; // old_hash_lo (no predecessor)
+        pi[1] = 0; // old_hash_hi
+        pi[2] = 123; // new_hash_lo
+        pi[3] = 456; // new_hash_hi
+        pi[4] = 789; // delta_hash
+        pi[5] = 100; // error_bound
+
+        vm.prank(jobOwner);
+        coordinator.submitCheckpointWithProof(
+            jobId, 100, keccak256("weights1"), 500, hex"aabb", pi
+        );
+
+        // Verify hash was stored
+        assertEq(coordinator.zkWeightHash(jobId, 0), 123);
+        assertEq(coordinator.zkWeightHash(jobId, 1), 456);
+    }
+
+    function test_zkProof_validHashChain() public {
+        uint256 jobId = _setupJobWith3Workers();
+
+        // First proof
+        uint256[] memory pi1 = new uint256[](6);
+        pi1[0] = 0; pi1[1] = 0;
+        pi1[2] = 100; pi1[3] = 200;
+        pi1[4] = 300; pi1[5] = 50;
+
+        vm.prank(jobOwner);
+        coordinator.submitCheckpointWithProof(
+            jobId, 100, keccak256("w1"), 500, hex"aabb", pi1
+        );
+
+        // Second proof — old_hash matches first proof's new_hash
+        uint256[] memory pi2 = new uint256[](6);
+        pi2[0] = 100; pi2[1] = 200; // Must match pi1[2], pi1[3]
+        pi2[2] = 400; pi2[3] = 500;
+        pi2[4] = 600; pi2[5] = 75;
+
+        vm.prank(jobOwner);
+        coordinator.submitCheckpointWithProof(
+            jobId, 200, keccak256("w2"), 300, hex"ccdd", pi2
+        );
+
+        // Verify updated hash
+        assertEq(coordinator.zkWeightHash(jobId, 0), 400);
+        assertEq(coordinator.zkWeightHash(jobId, 1), 500);
+    }
+
+    function test_zkProof_revert_hashChainMismatch() public {
+        uint256 jobId = _setupJobWith3Workers();
+
+        // First proof
+        uint256[] memory pi1 = new uint256[](6);
+        pi1[0] = 0; pi1[1] = 0;
+        pi1[2] = 100; pi1[3] = 200;
+        pi1[4] = 300; pi1[5] = 50;
+
+        vm.prank(jobOwner);
+        coordinator.submitCheckpointWithProof(
+            jobId, 100, keccak256("w1"), 500, hex"aabb", pi1
+        );
+
+        // Second proof with WRONG old_hash (doesn't match stored new_hash)
+        uint256[] memory pi2 = new uint256[](6);
+        pi2[0] = 999; pi2[1] = 888; // Wrong! Should be 100, 200
+        pi2[2] = 400; pi2[3] = 500;
+        pi2[4] = 600; pi2[5] = 75;
+
+        vm.prank(jobOwner);
+        vm.expectRevert(HelixCoordinatorV4.ZkHashChainMismatch.selector);
+        coordinator.submitCheckpointWithProof(
+            jobId, 200, keccak256("w2"), 300, hex"ccdd", pi2
+        );
+    }
+
+    function test_zkProof_revert_wrongPublicInputsLength() public {
+        uint256 jobId = _setupJobWith3Workers();
+
+        uint256[] memory pi = new uint256[](8); // Wrong! Should be 6
+        for (uint i = 0; i < 8; i++) pi[i] = i;
+
+        vm.prank(jobOwner);
+        vm.expectRevert(HelixCoordinatorV4.InvalidPublicInputsLength.selector);
+        coordinator.submitCheckpointWithProof(
+            jobId, 100, keccak256("w1"), 500, hex"aabb", pi
+        );
     }
 }
 

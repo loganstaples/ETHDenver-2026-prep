@@ -232,6 +232,19 @@ pub struct FullOrchestrationConfig {
     /// Defaults to false. Enable for demo/integration test scenarios.
     #[cfg(feature = "chain")]
     pub enable_withdrawal: bool,
+
+    // -- Custom Training Data --
+    /// Pre-loaded training data (overrides MNIST generation when set).
+    /// Format: Vec of (input_vec, target_vec) pairs.
+    #[serde(skip)]
+    pub custom_training_data: Option<Vec<(Vec<f64>, Vec<f64>)>>,
+
+    // -- Cheater Simulation (demo feature) --
+    /// When true, one worker will inject corrupt shares mid-training to demonstrate
+    /// cheater detection and slashing. The cheater party and corruption step are
+    /// chosen automatically (party 2 at step num_steps/2).
+    #[serde(default)]
+    pub simulate_cheater: bool,
 }
 
 impl Default for FullOrchestrationConfig {
@@ -270,6 +283,8 @@ impl Default for FullOrchestrationConfig {
             coordinator_address: None,
             #[cfg(feature = "chain")]
             enable_withdrawal: false,
+            custom_training_data: None,
+            simulate_cheater: false,
         }
     }
 }
@@ -527,14 +542,39 @@ impl FullOrchestrator {
             training_data: training_pairs,
             seed: self.config.seed,
             use_node_transport: false,
-            // In-process mode: workers run as tokio tasks with local transport.
-            // TCP transport requires the network-mpc feature and external worker processes.
-            use_tcp_transport: false,
+            // TCP transport: enabled when the network-mpc feature is active and
+            // worker endpoints are configured. In-process LocalTransport is used
+            // otherwise (workers run as tokio tasks).
+            use_tcp_transport: cfg!(feature = "network-mpc")
+                && !self.config.worker_endpoints.is_empty(),
+            worker_endpoints: if self.config.worker_endpoints.is_empty() {
+                None
+            } else {
+                Some(self.config.worker_endpoints.clone())
+            },
         };
 
-        let mpc_result = helix_mpc::e2e_integration::run_mpc_training(mpc_config)
+        let mpc_result = if self.config.simulate_cheater {
+            // Demo: inject a cheater (last party) at the midpoint of training.
+            let cheater_party = num_workers - 1;
+            let corrupt_at_step = (self.config.num_steps / 2) as u64;
+            info!(
+                cheater_party = cheater_party,
+                corrupt_at_step = corrupt_at_step,
+                "Simulating cheater injection for demo"
+            );
+            helix_mpc::e2e_integration::run_mpc_training_with_cheater(
+                mpc_config,
+                cheater_party,
+                corrupt_at_step,
+            )
             .await
-            .context("Phase 8: MPC training failed")?;
+            .context("Phase 8: MPC training with cheater simulation failed")?
+        } else {
+            helix_mpc::e2e_integration::run_mpc_training(mpc_config)
+                .await
+                .context("Phase 8: MPC training failed")?
+        };
 
         // Emit per-step progress for the completed training.
         for (i, loss) in mpc_result.losses.iter().enumerate() {
@@ -770,17 +810,40 @@ impl FullOrchestrator {
     // ========================================================================
 
     fn load_dataset(&self, _d_in: usize, _d_out: usize) -> Result<MnistDataset> {
+        // If custom training data was provided, convert to MnistDataset format
+        if let Some(ref custom_data) = self.config.custom_training_data {
+            info!(
+                samples = custom_data.len(),
+                "Using custom uploaded training data"
+            );
+            let mut samples: Vec<MnistSample> = custom_data
+                .iter()
+                .map(|(input, target)| MnistSample {
+                    pixels: input.clone(),
+                    label: target.clone(),
+                    digit: target.iter()
+                        .enumerate()
+                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                        .map(|(i, _)| i)
+                        .unwrap_or(0),
+                })
+                .collect();
+
+            // Split into train/test (use configured test_size, capped at 20% of data)
+            let test_count = self.config.test_size.min(samples.len() / 5).max(1);
+            let train_count = samples.len() - test_count;
+            let test = samples.split_off(train_count);
+
+            return Ok(MnistDataset {
+                train: samples,
+                test,
+            });
+        }
+
         if self.config.use_real_mnist {
-            // Real MNIST loading requires the `real-mnist` feature in helix-mpc.
-            // Since helix-client depends on helix-mpc with default-features=false,
-            // real MNIST is not available by default. To enable it, add
-            // `features = ["real-mnist"]` to the helix-mpc dependency in Cargo.toml.
-            //
-            // For now, we fall back to synthetic data with a warning.
             warn!(
                 "use_real_mnist=true but real-mnist feature is not enabled in helix-mpc; \
-                 falling back to synthetic MNIST data. To enable real MNIST, add \
-                 features = [\"real-mnist\"] to the helix-mpc dependency."
+                 falling back to synthetic MNIST data."
             );
             Ok(MnistDataset::generate(
                 self.config.train_size,
@@ -940,13 +1003,16 @@ impl FullOrchestrator {
                 .map_err(|e| anyhow!("Invalid owner private key: {}", e))?;
             let treasury = owner_wallet.address();
 
-            // Deploy the real Halo2Verifier when ZK proofs may be needed
+            // Deploy a verifier when ZK proofs may be needed
             // (enabled explicitly, Always mode, or Risk mode which might activate later).
             // Otherwise use Address::zero() to disable on-chain ZK verification.
+            //
+            // Deploy the real Halo2Verifier (wraps Halo2VerifierCore + Halo2VerifyingKey
+            // generated from the StateTransitionCircuit with 6 public inputs).
             let needs_verifier = self.config.zk_proof.enabled
                 || matches!(self.config.zk_mode, ZkMode::Always | ZkMode::Risk { .. });
             let verifier = if needs_verifier {
-                info!("Phase 4: Deploying real Halo2Verifier for ZK proof verification");
+                info!("Phase 4: Deploying Halo2Verifier for on-chain ZK verification");
 
                 // Create a temporary client for deploying the verifier
                 let temp_provider = Provider::<Http>::try_from(rpc_url.as_str())
@@ -971,7 +1037,7 @@ impl FullOrchestrator {
                 let verifier_addr = verifier_contract.address();
                 info!(
                     verifier_address = %format!("{:?}", verifier_addr),
-                    "Halo2Verifier deployed"
+                    "Halo2Verifier deployed (real on-chain ZK verification)"
                 );
                 verifier_addr
             } else {
@@ -2311,6 +2377,8 @@ mod tests {
             enable_withdrawal: false,
             zk_proof: ZkProofConfig::default(),
             zk_mode: ZkMode::Off,
+            custom_training_data: None,
+            simulate_cheater: false,
         };
         let orchestrator = FullOrchestrator::new(config);
         assert!(orchestrator.validate_config().is_ok());

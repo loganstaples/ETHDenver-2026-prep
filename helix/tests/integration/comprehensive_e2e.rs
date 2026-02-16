@@ -497,6 +497,7 @@ async fn run_training(
         seed,
         use_node_transport: false,
         use_tcp_transport: false,
+        worker_endpoints: None,
     };
 
     helix_mpc::e2e_integration::run_mpc_training(config)
@@ -530,6 +531,7 @@ async fn run_training_with_cheater(
         seed,
         use_node_transport: false,
         use_tcp_transport: false,
+        worker_endpoints: None,
     };
 
     helix_mpc::e2e_integration::run_mpc_training_with_cheater(config, cheater_party, corrupt_at_step)
@@ -561,6 +563,7 @@ async fn run_training_2_workers(
         seed: seed.wrapping_add(1000),
         use_node_transport: false,
         use_tcp_transport: false,
+        worker_endpoints: None,
     };
 
     helix_mpc::e2e_integration::run_mpc_training(config)
@@ -1357,6 +1360,7 @@ async fn test_e2e_full_mnist_scale() -> Result<()> {
         seed: 42,
         use_node_transport: false,
         use_tcp_transport: false,
+        worker_endpoints: None,
     };
 
     let mpc_result = helix_mpc::e2e_integration::run_mpc_training(config)

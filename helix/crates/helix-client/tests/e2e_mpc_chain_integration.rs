@@ -220,6 +220,7 @@ fn test_mpc_config(num_steps: usize, checkpoint_interval: usize) -> MPCIntegrati
         seed: 12345,
         use_node_transport: false,
         use_tcp_transport: false,
+        worker_endpoints: None,
     }
 }
 

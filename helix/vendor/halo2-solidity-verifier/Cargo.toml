@@ -1,0 +1,17 @@
+[package]
+name = "halo2_solidity_verifier"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2", rev = "198e9ae30d322cd0ad003b6955f91ec095b1490d" }
+halo2_backend = { git = "https://github.com/privacy-scaling-explorations/halo2", rev = "198e9ae30d322cd0ad003b6955f91ec095b1490d" }
+halo2_middleware = { git = "https://github.com/privacy-scaling-explorations/halo2", rev = "198e9ae30d322cd0ad003b6955f91ec095b1490d" }
+askama = { version = "0.12.0", features = ["config"], default-features = false }
+hex = "0.4.3"
+ruint = "1"
+sha3 = "0.10"
+itertools = "0.11.0"
+
+[features]
+default = []

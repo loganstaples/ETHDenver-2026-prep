@@ -116,6 +116,7 @@ windows = { version = "0.52", features = ["Win32_Security_Cryptography"] }
 default = ["chain"]
 hardware-wallet = ["hidapi"]
 chain = ["ethers", "dotenv"]
+network-mpc = ["helix-mpc/network-mpc"]
 mock-fallback = []  # Allow silent mock fallback on connection failure (dev only)
 
 [dev-dependencies]

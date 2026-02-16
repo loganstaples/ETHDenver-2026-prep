@@ -18,7 +18,7 @@ helix-avm = { path = "../helix-avm", features = ["circuit-bridge"] }
 helix-circuits = { path = "../helix-circuits" }
 halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2", rev = "198e9ae30d322cd0ad003b6955f91ec095b1490d" }
 halo2_backend = { git = "https://github.com/privacy-scaling-explorations/halo2", rev = "198e9ae30d322cd0ad003b6955f91ec095b1490d" }
-halo2_solidity_verifier = { path = "/tmp/halo2-solidity-verifier" }
+halo2_solidity_verifier = { path = "../../vendor/halo2-solidity-verifier" }
 halo2curves = "0.7.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

@@ -25,7 +25,7 @@ pub mod zk_proof_layer;
 
 // Re-export key types for external consumers
 pub use client::HelixClient;
-pub use dashboard::{DashboardConfig, DashboardState, TrainingJobRequest, TrainingSessionState};
+pub use dashboard::{DashboardConfig, DashboardState, TrainingJobRequest, TrainingSessionState, TrainingSample};
 pub use error::HelixError;
 pub use model::{ModelArchitecture, ModelHandle, SdkModelConfig, TrainingParams};
 pub use orchestration::{
