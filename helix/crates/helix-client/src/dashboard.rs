@@ -1168,6 +1168,7 @@ async fn run_training_session(
         }
         Err(e) => {
             error!(session_id = %session_id, error = %e, "Training failed");
+            error!(session_id = %session_id, "Full error chain: {:?}", e);
 
             if let Ok(mut sessions) = state.sessions.try_write() {
                 if let Some(session) = sessions.get_mut(&session_id) {
