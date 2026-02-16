@@ -44,6 +44,7 @@ pub mod multi_round;
 pub mod job_manager;
 pub mod distribution;
 pub mod checkpoint_manager;
+pub mod resilient_session;
 
 // Re-export key types
 pub use round::{
@@ -218,6 +219,11 @@ pub use distribution::{
     verify_model_package, verify_weight_integrity, verify_checkpoint_integrity,
     compute_data_hash, split_into_chunks, reassemble_chunks,
     MAX_CHUNK_SIZE, CHUNKED_TRANSFER_THRESHOLD,
+};
+
+pub use resilient_session::{
+    ResilientSessionConfig, ResilientSession, SessionEvent as ResilientSessionEvent, SessionSnapshot,
+    WorkerSessionState, WorkerInfo as ResilientWorkerInfo,
 };
 
 /// Convenience type alias for training results.

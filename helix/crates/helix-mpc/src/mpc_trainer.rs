@@ -351,6 +351,16 @@ impl<T: MPCTransport> MPCTrainer<T> {
         self.party_index
     }
 
+    /// Returns the current Beaver triple cursor position.
+    pub fn beaver_cursor(&self) -> usize {
+        self.beaver_cursor
+    }
+
+    /// Returns the current authenticated Beaver triple cursor position.
+    pub fn auth_beaver_cursor(&self) -> usize {
+        self.auth_beaver_cursor
+    }
+
     // ========================================================================
     // Phase 1: Weight sharing
     // ========================================================================
