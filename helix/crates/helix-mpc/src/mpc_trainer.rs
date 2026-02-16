@@ -405,6 +405,47 @@ impl<T: MPCTransport> MPCTrainer<T> {
     // Phase 1: Weight sharing
     // ========================================================================
 
+    /// Initializes the trainer with pre-distributed weight shares.
+    ///
+    /// Call this instead of [`share_weights`] when shares have been distributed
+    /// via encrypted channels (e.g., [`ShareDistributor`] → [`ShareReceiver`]).
+    /// Sets the weight shares directly, then initializes MAC state if configured.
+    ///
+    /// The shares must be additive shares of the original weight matrices:
+    /// - `w1`: d_in × d_hid weight matrix share
+    /// - `b1`: d_hid bias vector share
+    /// - `w2`: d_hid × d_out weight matrix share
+    /// - `b2`: d_out bias vector share
+    #[instrument(skip(self, w1, b1, w2, b2), level = "info", fields(party = self.party_index))]
+    pub async fn init_with_shares(
+        &mut self,
+        w1: Vec<Fr>,
+        b1: Vec<Fr>,
+        w2: Vec<Fr>,
+        b2: Vec<Fr>,
+    ) -> MPCResult<()> {
+        self.w1 = w1;
+        self.b1 = b1;
+        self.w2 = w2;
+        self.b2 = b2;
+
+        info!(
+            party = self.party_index,
+            w1_len = self.w1.len(),
+            b1_len = self.b1.len(),
+            w2_len = self.w2.len(),
+            b2_len = self.b2.len(),
+            "Weight shares initialized from encrypted distribution"
+        );
+
+        // Initialize MAC state if enabled.
+        if self.config.mac_config.is_some() {
+            self.initialize_mac_shares().await?;
+        }
+
+        Ok(())
+    }
+
     /// Initializes weight shares.
     ///
     /// Party 0 (dealer) generates random initial weights, creates additive

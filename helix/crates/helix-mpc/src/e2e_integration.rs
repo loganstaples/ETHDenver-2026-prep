@@ -15,10 +15,11 @@
 
 use std::time::Instant;
 
-use rand::SeedableRng;
+use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
+use x25519_dalek::StaticSecret;
 
 use crate::checkpoint_attestation::{
     CheckpointAttestationConfig, CheckpointAttestationManager, OnChainCheckpoint,
@@ -30,6 +31,10 @@ use crate::mpc_trainer::{MPCTrainer, MPCTrainerConfig, ModelWeights};
 use crate::security::commitment::PedersenGenerators;
 use crate::session::node_transport::NodeTransport;
 use crate::session::transport::LocalTransport;
+use crate::share_distribution::{
+    EncryptedShare, ShareDistributor, ShareReceiver, VectorCommitment, WeightReconstructor,
+    WeightShare, X25519PublicKey, encrypt_share_for_owner, generate_x25519_keypair,
+};
 use crate::types::PartyId;
 
 // ============================================================================
@@ -129,6 +134,10 @@ pub struct MPCIntegrationResult {
     pub training_time_ms: u128,
     /// Final reconstructed weights (f64, from summing all party shares).
     pub final_weights: FinalWeights,
+    /// Initial Pedersen commitment to the full weights (from encrypted distribution).
+    pub initial_commitment: Option<VectorCommitment>,
+    /// Whether encrypted share distribution was used.
+    pub encrypted_distribution: bool,
 }
 
 /// Reconstructed weights at the end of training.
@@ -341,6 +350,78 @@ pub async fn run_mpc_training_with_cheater(
 // Internal: LocalTransport-based execution
 // ============================================================================
 
+/// Prepares encrypted share bundles for all parties.
+///
+/// Returns (owner_secret, initial_commitment, per-party bundles).
+fn prepare_encrypted_shares(
+    trainer_config: &MPCTrainerConfig,
+    initial_weights: &Option<ModelWeights>,
+    parties: &[PartyId],
+    seed: u64,
+) -> Result<(StaticSecret, VectorCommitment, Vec<EncryptedShareBundle>), anyhow::Error> {
+    let num_workers = parties.len();
+    let mut key_rng = ChaCha20Rng::seed_from_u64(seed.wrapping_mul(0xDEAD_BEEF));
+
+    // Generate owner keypair.
+    let (owner_secret, owner_public) = generate_x25519_keypair(&mut key_rng);
+
+    // Generate worker keypairs.
+    let mut worker_secrets = Vec::with_capacity(num_workers);
+    let mut worker_publics = Vec::with_capacity(num_workers);
+    for _ in 0..num_workers {
+        let (secret, public) = generate_x25519_keypair(&mut key_rng);
+        worker_secrets.push(secret);
+        worker_publics.push(public);
+    }
+
+    // Build initial weights as Fr field elements.
+    let d_in = trainer_config.d_in;
+    let d_hid = trainer_config.d_hid;
+    let d_out = trainer_config.d_out;
+    let layout = WeightLayout::new(d_in, d_hid, d_out);
+
+    let weight_frs: Vec<Fr> = if let Some(mw) = initial_weights {
+        mw.w1.iter().chain(mw.b1.iter()).chain(mw.w2.iter()).chain(mw.b2.iter())
+            .cloned()
+            .collect()
+    } else {
+        let mut weight_rng = ChaCha20Rng::seed_from_u64(seed);
+        let mw = ModelWeights::random(d_in, d_hid, d_out, &mut weight_rng);
+        mw.w1.iter().chain(mw.b1.iter()).chain(mw.w2.iter()).chain(mw.b2.iter())
+            .cloned()
+            .collect()
+    };
+
+    // Use ShareDistributor to split, encrypt, and commit.
+    let mut distributor = ShareDistributor::with_seed(seed.wrapping_mul(0xCAFE));
+    let shape = vec![layout.total()];
+    let dist_result = distributor.distribute_fr(
+        &weight_frs,
+        &shape,
+        &worker_publics,
+        parties,
+    ).map_err(|e| anyhow::anyhow!("ShareDistributor::distribute_fr failed: {}", e))?;
+
+    info!(
+        num_workers = num_workers,
+        total_elements = layout.total(),
+        "Encrypted shares distributed via ShareDistributor"
+    );
+
+    // Build per-party bundles.
+    let mut bundles = Vec::with_capacity(num_workers);
+    for enc_share in dist_result.encrypted_shares.into_iter() {
+        bundles.push(EncryptedShareBundle {
+            encrypted_share: enc_share,
+            worker_secret: worker_secrets.remove(0),
+            owner_public_key: owner_public,
+            weight_layout: layout.clone(),
+        });
+    }
+
+    Ok((owner_secret, dist_result.initial_commitment, bundles))
+}
+
 async fn run_with_local_transport(
     parties: Vec<PartyId>,
     trainer_config: MPCTrainerConfig,
@@ -354,23 +435,27 @@ async fn run_with_local_transport(
     let num_workers = parties.len();
     let transports = LocalTransport::create_mesh(&parties);
 
+    // Prepare encrypted share distribution.
+    let (owner_secret, initial_commitment, bundles) =
+        prepare_encrypted_shares(&trainer_config, &initial_weights, &parties, seed)?;
+
     let mut handles = Vec::new();
-    for (i, transport) in transports.into_iter().enumerate() {
+    for (i, (transport, bundle)) in transports.into_iter().zip(bundles.into_iter()).enumerate() {
         let cfg = trainer_config.clone();
-        let weights = if i == 0 { initial_weights.clone() } else { None };
         let data = training_data.clone();
 
         let handle = tokio::spawn(async move {
             run_party_training(
-                cfg, transport, i, weights, data,
+                cfg, transport, i, None, data,
                 num_steps, checkpoint_interval, seed,
                 None, 0, // no cheater
+                Some(bundle),
             ).await
         });
         handles.push(handle);
     }
 
-    collect_results(handles, num_workers, num_steps, start).await
+    collect_results(handles, num_workers, num_steps, start, Some(owner_secret), Some(initial_commitment)).await
 }
 
 async fn run_with_node_transport(
@@ -386,23 +471,27 @@ async fn run_with_node_transport(
     let num_workers = parties.len();
     let transports = NodeTransport::create_mesh(&parties, "e2e-integration");
 
+    // Prepare encrypted share distribution.
+    let (owner_secret, initial_commitment, bundles) =
+        prepare_encrypted_shares(&trainer_config, &initial_weights, &parties, seed)?;
+
     let mut handles = Vec::new();
-    for (i, transport) in transports.into_iter().enumerate() {
+    for (i, (transport, bundle)) in transports.into_iter().zip(bundles.into_iter()).enumerate() {
         let cfg = trainer_config.clone();
-        let weights = if i == 0 { initial_weights.clone() } else { None };
         let data = training_data.clone();
 
         let handle = tokio::spawn(async move {
             run_party_training(
-                cfg, transport, i, weights, data,
+                cfg, transport, i, None, data,
                 num_steps, checkpoint_interval, seed,
                 None, 0,
+                Some(bundle),
             ).await
         });
         handles.push(handle);
     }
 
-    collect_results(handles, num_workers, num_steps, start).await
+    collect_results(handles, num_workers, num_steps, start, Some(owner_secret), Some(initial_commitment)).await
 }
 
 // ============================================================================
@@ -483,24 +572,27 @@ async fn run_with_tcp_transport(
 
     info!("TCP transport mesh established for {} parties", num_workers);
 
-    // Phase 3: Run training on each transport (same pattern as LocalTransport).
+    // Phase 3: Prepare encrypted shares and run training.
+    let (owner_secret, initial_commitment, bundles) =
+        prepare_encrypted_shares(&trainer_config, &initial_weights, &parties, seed)?;
+
     let mut handles = Vec::new();
-    for (i, transport) in transports.into_iter().enumerate() {
+    for (i, (transport, bundle)) in transports.into_iter().zip(bundles.into_iter()).enumerate() {
         let cfg = trainer_config.clone();
-        let weights = if i == 0 { initial_weights.clone() } else { None };
         let data = training_data.clone();
 
         let handle = tokio::spawn(async move {
             run_party_training(
-                cfg, transport, i, weights, data,
+                cfg, transport, i, None, data,
                 num_steps, checkpoint_interval, seed,
                 None, 0, // no cheater
+                Some(bundle),
             ).await
         });
         handles.push(handle);
     }
 
-    collect_results(handles, num_workers, num_steps, start).await
+    collect_results(handles, num_workers, num_steps, start, Some(owner_secret), Some(initial_commitment)).await
 }
 
 #[cfg(feature = "network-mpc")]
@@ -572,11 +664,13 @@ async fn run_with_tcp_cheater(
 
     info!("TCP transport mesh established for {} parties (cheater mode)", num_workers);
 
-    // Phase 3: Run training with cheater injection.
+    // Phase 3: Prepare encrypted shares and run training with cheater injection.
+    let (owner_secret, initial_commitment, bundles) =
+        prepare_encrypted_shares(&trainer_config, &initial_weights, &parties, seed)?;
+
     let mut handles = Vec::new();
-    for (i, transport) in transports.into_iter().enumerate() {
+    for (i, (transport, bundle)) in transports.into_iter().zip(bundles.into_iter()).enumerate() {
         let cfg = trainer_config.clone();
-        let weights = if i == 0 { initial_weights.clone() } else { None };
         let data = training_data.clone();
 
         let cheater_info = if i == cheater_party {
@@ -587,15 +681,16 @@ async fn run_with_tcp_cheater(
 
         let handle = tokio::spawn(async move {
             run_party_training(
-                cfg, transport, i, weights, data,
+                cfg, transport, i, None, data,
                 num_steps, checkpoint_interval, seed,
                 cheater_info, corrupt_at_step,
+                Some(bundle),
             ).await
         });
         handles.push(handle);
     }
 
-    collect_results(handles, num_workers, num_steps, start).await
+    collect_results(handles, num_workers, num_steps, start, Some(owner_secret), Some(initial_commitment)).await
 }
 
 async fn run_with_cheater(
@@ -613,10 +708,13 @@ async fn run_with_cheater(
     let num_workers = parties.len();
     let transports = LocalTransport::create_mesh(&parties);
 
+    // Prepare encrypted share distribution.
+    let (owner_secret, initial_commitment, bundles) =
+        prepare_encrypted_shares(&trainer_config, &initial_weights, &parties, seed)?;
+
     let mut handles = Vec::new();
-    for (i, transport) in transports.into_iter().enumerate() {
+    for (i, (transport, bundle)) in transports.into_iter().zip(bundles.into_iter()).enumerate() {
         let cfg = trainer_config.clone();
-        let weights = if i == 0 { initial_weights.clone() } else { None };
         let data = training_data.clone();
 
         let cheater_info = if i == cheater_party {
@@ -627,15 +725,16 @@ async fn run_with_cheater(
 
         let handle = tokio::spawn(async move {
             run_party_training(
-                cfg, transport, i, weights, data,
+                cfg, transport, i, None, data,
                 num_steps, checkpoint_interval, seed,
                 cheater_info, corrupt_at_step,
+                Some(bundle),
             ).await
         });
         handles.push(handle);
     }
 
-    collect_results(handles, num_workers, num_steps, start).await
+    collect_results(handles, num_workers, num_steps, start, Some(owner_secret), Some(initial_commitment)).await
 }
 
 // ============================================================================
@@ -656,6 +755,57 @@ struct PartyResult {
     final_b2: Vec<Fr>,
     /// Combined on-chain checkpoints (exchanged and combined during training).
     checkpoints: Vec<OnChainCheckpoint>,
+    /// Encrypted final share for the owner (present when encrypted distribution is used).
+    encrypted_final_share: Option<EncryptedShare>,
+}
+
+/// Encrypted share material for a party, distributed before training.
+struct EncryptedShareBundle {
+    /// The encrypted share from the owner.
+    encrypted_share: EncryptedShare,
+    /// This worker's x25519 secret key (for decrypting the share).
+    worker_secret: StaticSecret,
+    /// The owner's x25519 public key (for encrypting the final share back).
+    owner_public_key: X25519PublicKey,
+    /// Model weight shape: [d_in*d_hid, d_hid, d_hid*d_out, d_out].
+    weight_layout: WeightLayout,
+}
+
+/// Layout of the flattened weight vector: [w1_len, b1_len, w2_len, b2_len].
+#[derive(Debug, Clone)]
+struct WeightLayout {
+    w1_len: usize,
+    b1_len: usize,
+    w2_len: usize,
+    b2_len: usize,
+}
+
+impl WeightLayout {
+    fn new(d_in: usize, d_hid: usize, d_out: usize) -> Self {
+        Self {
+            w1_len: d_in * d_hid,
+            b1_len: d_hid,
+            w2_len: d_hid * d_out,
+            b2_len: d_out,
+        }
+    }
+
+    fn total(&self) -> usize {
+        self.w1_len + self.b1_len + self.w2_len + self.b2_len
+    }
+
+    /// Splits a flat Fr vector into (w1, b1, w2, b2).
+    fn split(&self, flat: &[Fr]) -> (Vec<Fr>, Vec<Fr>, Vec<Fr>, Vec<Fr>) {
+        let mut offset = 0;
+        let w1 = flat[offset..offset + self.w1_len].to_vec();
+        offset += self.w1_len;
+        let b1 = flat[offset..offset + self.b1_len].to_vec();
+        offset += self.b1_len;
+        let w2 = flat[offset..offset + self.w2_len].to_vec();
+        offset += self.w2_len;
+        let b2 = flat[offset..offset + self.b2_len].to_vec();
+        (w1, b1, w2, b2)
+    }
 }
 
 /// Runs training for a single party.
@@ -672,12 +822,28 @@ async fn run_party_training<T: crate::session::transport::MPCTransport + 'static
     seed: u64,
     cheater_info: Option<usize>,
     corrupt_at_step: u64,
+    encrypted_bundle: Option<EncryptedShareBundle>,
 ) -> Result<PartyResult, anyhow::Error> {
-    // Phase 1: Create trainer and share weights (includes MAC init if configured).
+    // Phase 1: Initialize weight shares.
     let mut trainer = MPCTrainer::new(config.clone(), transport, party_index, seed);
-    trainer.share_weights(initial_weights).await?;
 
-    info!(party = party_index, "Weight shares initialized");
+    if let Some(bundle) = &encrypted_bundle {
+        // Encrypted path: decrypt the share from the owner, then init.
+        let receiver = ShareReceiver::new(
+            bundle.worker_secret.clone(),
+            PartyId::from_index(party_index),
+        );
+        let weight_share = receiver.receive(&bundle.encrypted_share)
+            .map_err(|e| anyhow::anyhow!("ShareReceiver::receive failed: {}", e))?;
+
+        let (w1, b1, w2, b2) = bundle.weight_layout.split(&weight_share.data);
+        trainer.init_with_shares(w1, b1, w2, b2).await?;
+        info!(party = party_index, "Weight shares initialized via encrypted distribution");
+    } else {
+        // Plaintext path: dealer distributes over transport (backward compat).
+        trainer.share_weights(initial_weights).await?;
+        info!(party = party_index, "Weight shares initialized via transport");
+    }
 
     // Phase 2: Generate Beaver triples distributedly.
     // Estimate triples needed: for training_step_with_mac, each step uses
@@ -816,8 +982,33 @@ async fn run_party_training<T: crate::session::transport::MPCTransport + 'static
         }
     }
 
-    // Phase 4: Collect final weight shares.
+    // Phase 4: Collect final weight shares and encrypt for owner if applicable.
     let (final_w1, final_b1, final_w2, final_b2) = trainer.weight_shares();
+
+    let encrypted_final_share = if let Some(bundle) = &encrypted_bundle {
+        // Encrypt final shares back to the owner.
+        let all_shares: Vec<Fr> = final_w1.iter()
+            .chain(final_b1.iter())
+            .chain(final_w2.iter())
+            .chain(final_b2.iter())
+            .cloned()
+            .collect();
+        let weight_share = WeightShare {
+            party: PartyId::from_index(party_index),
+            index: party_index,
+            data: all_shares,
+            shape: vec![bundle.weight_layout.total()],
+        };
+        let mut enc_rng = ChaCha20Rng::seed_from_u64(
+            seed.wrapping_add(party_index as u64 * 7777).wrapping_add(0xF1A1_54A8),
+        );
+        let enc = encrypt_share_for_owner(&weight_share, &bundle.owner_public_key, &mut enc_rng)
+            .map_err(|e| anyhow::anyhow!("encrypt_share_for_owner failed: {}", e))?;
+        info!(party = party_index, "Final shares encrypted for owner");
+        Some(enc)
+    } else {
+        None
+    };
 
     info!(
         party = party_index,
@@ -838,6 +1029,7 @@ async fn run_party_training<T: crate::session::transport::MPCTransport + 'static
         final_w2: final_w2.to_vec(),
         final_b2: final_b2.to_vec(),
         checkpoints,
+        encrypted_final_share,
     })
 }
 
@@ -850,6 +1042,8 @@ async fn collect_results(
     num_workers: usize,
     _num_steps: usize,
     start: Instant,
+    owner_secret: Option<StaticSecret>,
+    initial_commitment: Option<VectorCommitment>,
 ) -> Result<MPCIntegrationResult, anyhow::Error> {
     let mut party_results: Vec<PartyResult> = Vec::with_capacity(num_workers);
     for handle in handles {
@@ -861,39 +1055,6 @@ async fn collect_results(
 
     // Sort by party index.
     party_results.sort_by_key(|r| r.party_index);
-
-    // Reconstruct final weights by summing all party shares.
-    let w1_len = party_results[0].final_w1.len();
-    let b1_len = party_results[0].final_b1.len();
-    let w2_len = party_results[0].final_w2.len();
-    let b2_len = party_results[0].final_b2.len();
-
-    let mut w1_sum = vec![Fr::ZERO; w1_len];
-    let mut b1_sum = vec![Fr::ZERO; b1_len];
-    let mut w2_sum = vec![Fr::ZERO; w2_len];
-    let mut b2_sum = vec![Fr::ZERO; b2_len];
-
-    for pr in &party_results {
-        for i in 0..w1_len {
-            w1_sum[i] = Fr::add(&w1_sum[i], &pr.final_w1[i]);
-        }
-        for i in 0..b1_len {
-            b1_sum[i] = Fr::add(&b1_sum[i], &pr.final_b1[i]);
-        }
-        for i in 0..w2_len {
-            w2_sum[i] = Fr::add(&w2_sum[i], &pr.final_w2[i]);
-        }
-        for i in 0..b2_len {
-            b2_sum[i] = Fr::add(&b2_sum[i], &pr.final_b2[i]);
-        }
-    }
-
-    let final_weights = FinalWeights {
-        w1: w1_sum.iter().map(|fr| fr.to_f64()).collect(),
-        b1: b1_sum.iter().map(|fr| fr.to_f64()).collect(),
-        w2: w2_sum.iter().map(|fr| fr.to_f64()).collect(),
-        b2: b2_sum.iter().map(|fr| fr.to_f64()).collect(),
-    };
 
     // Checkpoints were already exchanged and combined during training.
     // All parties should agree on the same commitments — take party 0's records.
@@ -920,6 +1081,81 @@ async fn collect_results(
         }
     }
 
+    // Reconstruct final weights.
+    let encrypted_distribution = party_results[0].encrypted_final_share.is_some();
+
+    let final_weights = if encrypted_distribution {
+        // Encrypted path: use WeightReconstructor to decrypt and verify.
+        let owner_secret = owner_secret
+            .ok_or_else(|| anyhow::anyhow!("owner secret key required for encrypted reconstruction"))?;
+        let reconstructor = WeightReconstructor::new(owner_secret);
+
+        let encrypted_shares: Vec<EncryptedShare> = party_results.iter()
+            .map(|pr| pr.encrypted_final_share.clone()
+                .expect("all parties should have encrypted final shares"))
+            .collect();
+
+        // Reconstruct (no checkpoint verification — checkpoint blindings aren't
+        // available at this layer since each party generated their own).
+        let flat_weights = reconstructor.reconstruct(&encrypted_shares, None, None)
+            .map_err(|e| anyhow::anyhow!("WeightReconstructor failed: {}", e))?;
+
+        // Split flat vector back into w1, b1, w2, b2 based on sizes from party shares.
+        let w1_len = party_results[0].final_w1.len();
+        let b1_len = party_results[0].final_b1.len();
+        let w2_len = party_results[0].final_w2.len();
+        let b2_len = party_results[0].final_b2.len();
+
+        let mut offset = 0;
+        let w1 = flat_weights[offset..offset + w1_len].to_vec();
+        offset += w1_len;
+        let b1 = flat_weights[offset..offset + b1_len].to_vec();
+        offset += b1_len;
+        let w2 = flat_weights[offset..offset + w2_len].to_vec();
+        offset += w2_len;
+        let b2 = flat_weights[offset..offset + b2_len].to_vec();
+
+        info!(
+            "Final weights reconstructed via encrypted shares ({} elements decrypted)",
+            flat_weights.len()
+        );
+
+        FinalWeights { w1, b1, w2, b2 }
+    } else {
+        // Plaintext path: sum Fr shares directly (backward compat).
+        let w1_len = party_results[0].final_w1.len();
+        let b1_len = party_results[0].final_b1.len();
+        let w2_len = party_results[0].final_w2.len();
+        let b2_len = party_results[0].final_b2.len();
+
+        let mut w1_sum = vec![Fr::ZERO; w1_len];
+        let mut b1_sum = vec![Fr::ZERO; b1_len];
+        let mut w2_sum = vec![Fr::ZERO; w2_len];
+        let mut b2_sum = vec![Fr::ZERO; b2_len];
+
+        for pr in &party_results {
+            for i in 0..w1_len {
+                w1_sum[i] = Fr::add(&w1_sum[i], &pr.final_w1[i]);
+            }
+            for i in 0..b1_len {
+                b1_sum[i] = Fr::add(&b1_sum[i], &pr.final_b1[i]);
+            }
+            for i in 0..w2_len {
+                w2_sum[i] = Fr::add(&w2_sum[i], &pr.final_w2[i]);
+            }
+            for i in 0..b2_len {
+                b2_sum[i] = Fr::add(&b2_sum[i], &pr.final_b2[i]);
+            }
+        }
+
+        FinalWeights {
+            w1: w1_sum.iter().map(|fr| fr.to_f64()).collect(),
+            b1: b1_sum.iter().map(|fr| fr.to_f64()).collect(),
+            w2: w2_sum.iter().map(|fr| fr.to_f64()).collect(),
+            b2: b2_sum.iter().map(|fr| fr.to_f64()).collect(),
+        }
+    };
+
     // Aggregate results.
     let steps_completed = party_results[0].steps_completed;
     let losses = party_results[0].losses.clone();
@@ -936,6 +1172,7 @@ async fn collect_results(
         mac_checks = mac_checks_passed,
         checkpoints = checkpoints.len(),
         cheater = ?cheater_detected.as_ref().map(|c| c.party_index),
+        encrypted = encrypted_distribution,
         time_ms = training_time_ms,
         "MPC integration training complete"
     );
@@ -949,6 +1186,8 @@ async fn collect_results(
         cheater_detected,
         training_time_ms,
         final_weights,
+        initial_commitment,
+        encrypted_distribution,
     })
 }
 

@@ -356,6 +356,7 @@ impl FullOrchestrator {
             checkpoints = mpc_result.checkpoints.len(),
             mac_checks_passed = mpc_result.mac_checks_passed,
             cheater_detected = mpc_result.cheater_detected.is_some(),
+            encrypted_distribution = mpc_result.encrypted_distribution,
             elapsed_ms = phase8_start.elapsed().as_millis(),
             "Phase 8 complete: MPC training finished"
         );
