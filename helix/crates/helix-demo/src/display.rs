@@ -167,6 +167,57 @@ pub fn mac_verified(step: u64) {
     );
 }
 
+/// Prints ZK proof generation start notice.
+pub fn zk_proof_start(step: u64) {
+    println!(
+        "  {} Generating StateTransitionCircuit proof at step {}...",
+        "[ZK]".bright_magenta().bold(),
+        step,
+    );
+}
+
+/// Prints ZK proof generation success.
+pub fn zk_proof_success(step: u64, proof_size: usize, gen_time_ms: u64, verified: bool) {
+    let verify_status = if verified { ", self-verified" } else { "" };
+    println!(
+        "  {} ZK proof generated at step {} ({} bytes, {:.1}s{})",
+        "[ZK]".bright_green().bold(),
+        step,
+        proof_size,
+        gen_time_ms as f64 / 1000.0,
+        verify_status,
+    );
+}
+
+/// Prints ZK proof generation failure.
+pub fn zk_proof_failed(step: u64, error: &str) {
+    println!(
+        "  {} ZK proof generation failed at step {}: {}",
+        "[ZK]".bright_red().bold(),
+        step,
+        error,
+    );
+}
+
+/// Prints ZK prover initialization notice.
+pub fn zk_prover_init(num_weights: usize, k: u32) {
+    println!(
+        "  {} Initializing ZK prover (num_weights={}, k={}, SRS setup + keygen)...",
+        "[ZK]".bright_magenta().bold(),
+        num_weights,
+        k,
+    );
+}
+
+/// Prints ZK prover initialization success.
+pub fn zk_prover_init_done(elapsed_ms: u64) {
+    println!(
+        "  {} ZK prover initialized ({:.1}s)",
+        "[ZK]".bright_green().bold(),
+        elapsed_ms as f64 / 1000.0,
+    );
+}
+
 // ============================================================================
 // Cheater Detection Display
 // ============================================================================
@@ -324,6 +375,9 @@ pub struct DemoSummary {
     pub mac_checks_passed: usize,
     pub cheater_detected: bool,
     pub cheater_party: Option<usize>,
+    pub zk_proofs_generated: usize,
+    pub zk_proofs_verified: usize,
+    pub zk_total_proving_time_ms: u64,
 }
 
 /// Prints the final demo summary with all metrics.
@@ -379,6 +433,16 @@ pub fn summary(stats: &DemoSummary) {
         );
     }
 
+    if stats.zk_proofs_generated > 0 {
+        println!(
+            "    {} ZK proofs: {} generated, {} verified ({:.1}s total proving time)",
+            "[OK]".bright_green(),
+            stats.zk_proofs_generated,
+            stats.zk_proofs_verified,
+            stats.zk_total_proving_time_ms as f64 / 1000.0,
+        );
+    }
+
     println!();
     println!("  {}", "Key metrics:".white().bold());
     println!(
@@ -402,6 +466,20 @@ pub fn summary(stats: &DemoSummary) {
         "    Final accuracy:   {}",
         format!("{:.1}%", stats.final_accuracy * 100.0).bright_cyan(),
     );
+    if stats.zk_proofs_generated > 0 {
+        println!(
+            "    ZK proofs:        {}",
+            format!(
+                "{} generated ({:.1}s avg)",
+                stats.zk_proofs_generated,
+                if stats.zk_proofs_generated > 0 {
+                    stats.zk_total_proving_time_ms as f64 / stats.zk_proofs_generated as f64 / 1000.0
+                } else {
+                    0.0
+                },
+            ).bright_cyan(),
+        );
+    }
 
     println!();
     println!("  {}", "Security properties:".white().bold());

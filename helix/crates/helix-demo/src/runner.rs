@@ -26,6 +26,7 @@ use rand_chacha::ChaCha20Rng;
 
 use crate::display;
 use crate::evaluator;
+use crate::zk_prover::LazyZkProver;
 use crate::Args;
 
 /// MNIST network dimensions.
@@ -268,6 +269,14 @@ impl DemoRunner {
         // ================================================================
         display::phase("Phase 5: MPC Training with SPDZ MAC Verification");
 
+        // Optional ZK prover: only created when --zk-proofs is set.
+        // All expensive operations (SRS, keygen) are deferred until first use.
+        let mut zk_prover = if self.args.zk_proofs {
+            Some(LazyZkProver::new(D_IN, D_HID, D_OUT))
+        } else {
+            None
+        };
+
         let phase5_start = Instant::now();
         let mut all_losses: Vec<f64> = Vec::with_capacity(self.args.steps);
         let mut mac_checks_passed = 0u64;
@@ -383,6 +392,36 @@ impl DemoRunner {
                     .collect();
                 let commitment_hex = hex_encode(&commitment_bytes);
                 display::checkpoint((step + 1) as u64, &commitment_hex);
+
+                // Optional ZK proof generation at this checkpoint.
+                // The ZK proof proves the weight transition from the previous
+                // checkpoint to this one is valid via StateTransitionCircuit.
+                if let Some(ref mut prover) = zk_prover {
+                    let is_zk_checkpoint = mac_checks_passed % self.args.zk_checkpoint_freq == 0;
+                    if is_zk_checkpoint {
+                        let current_loss = all_losses.last().copied().unwrap_or(0.0);
+                        match prover.generate_proof(
+                            (step + 1) as u64,
+                            &trainers,
+                            current_loss,
+                        ) {
+                            Ok(Some(_result)) => {
+                                // Proof generated and displayed by zk_prover
+                            }
+                            Ok(None) => {
+                                // First checkpoint: baseline weights recorded, no proof yet
+                                display::info("ZK baseline weights recorded (proof starts at next ZK checkpoint)");
+                            }
+                            Err(e) => {
+                                // ZK proof failure is non-fatal: MPC+MAC is the primary mechanism
+                                display::warn(&format!(
+                                    "ZK proof generation failed (non-fatal): {}",
+                                    e,
+                                ));
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -496,6 +535,12 @@ impl DemoRunner {
         let loss_start = all_losses.first().copied().unwrap_or(0.0);
         let loss_end = all_losses.last().copied().unwrap_or(0.0);
 
+        // Collect ZK proof stats
+        let (zk_generated, zk_verified, zk_time_ms) = match &zk_prover {
+            Some(p) => (p.proofs_generated(), p.proofs_verified(), p.total_proving_time_ms()),
+            None => (0, 0, 0),
+        };
+
         display::summary(&display::DemoSummary {
             total_time: demo_start.elapsed(),
             num_workers: self.args.workers,
@@ -507,6 +552,9 @@ impl DemoRunner {
             mac_checks_passed: mac_checks_passed as usize,
             cheater_detected,
             cheater_party,
+            zk_proofs_generated: zk_generated,
+            zk_proofs_verified: zk_verified,
+            zk_total_proving_time_ms: zk_time_ms,
         });
 
         Ok(())

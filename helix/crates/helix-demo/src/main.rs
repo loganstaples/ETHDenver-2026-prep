@@ -15,6 +15,7 @@
 mod display;
 mod evaluator;
 mod runner;
+mod zk_prover;
 
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
@@ -48,9 +49,16 @@ pub struct Args {
     #[arg(long)]
     pub simulate_cheater: bool,
 
-    /// Enable ZK proof generation at checkpoints (not yet implemented for Stage 10)
+    /// Enable optional ZK proof generation at checkpoints.
+    /// When enabled, the model owner generates a StateTransitionCircuit proof
+    /// at each ZK checkpoint, proving the weight transition is valid.
     #[arg(long)]
     pub zk_proofs: bool,
+
+    /// ZK proof checkpoint frequency (generate a proof every N checkpoints).
+    /// Defaults to 1 (every checkpoint). Only used when --zk-proofs is enabled.
+    #[arg(long, default_value = "1")]
+    pub zk_checkpoint_freq: u64,
 
     /// Verbose logging output
     #[arg(short, long)]
@@ -97,8 +105,10 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     if args.zk_proofs {
-        display::warn("--zk-proofs flag noted but ZK proof generation is not yet wired for Stage 10.");
-        display::info("MPC training will proceed with MAC verification only.");
+        display::info(&format!(
+            "ZK proofs ENABLED: StateTransitionCircuit proof every {} checkpoint(s)",
+            args.zk_checkpoint_freq,
+        ));
         println!();
     }
 

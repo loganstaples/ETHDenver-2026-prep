@@ -241,6 +241,14 @@ required-features = ["integration"]
 name = "e2e_resilience"
 path = "integration/e2e_resilience.rs"
 
+# ============================================================================
+# ZK Checkpoint Proof Pipeline Tests (Stage 8 - Optional ZK)
+# ============================================================================
+
+[[test]]
+name = "zk_checkpoint_proof"
+path = "integration/zk_checkpoint_proof.rs"
+
 [features]
 default = []
 parallel = ["rayon"]

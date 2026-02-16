@@ -13,6 +13,8 @@ helix-core = { path = "../helix-core" }
 helix-avm = { path = "../helix-avm" }
 helix-mpc = { path = "../helix-mpc" }
 helix-client = { path = "../helix-client", default-features = false }
+helix-prover = { path = "../helix-prover", default-features = false }
+helix-circuits = { path = "../helix-circuits" }
 
 tokio = { version = "1", features = ["full", "signal"] }
 clap = { version = "4.0", features = ["derive"] }
@@ -26,3 +28,4 @@ serde_json = "1.0"
 rand = "0.8"
 rand_chacha = "0.3"
 chrono = "0.4"
+sha2 = "0.10"

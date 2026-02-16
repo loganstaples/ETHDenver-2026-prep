@@ -39,6 +39,9 @@ pub mod proof_chain;
 /// Proof aggregation pipeline tests
 pub mod proof_aggregation;
 
+/// ZK checkpoint proof pipeline tests (optional ZK proofs)
+pub mod zk_checkpoint_proof;
+
 /// On-chain verification tests (Anvil + real contracts)
 #[cfg(feature = "on-chain")]
 pub mod on_chain_verification;
