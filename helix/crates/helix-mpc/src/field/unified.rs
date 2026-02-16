@@ -313,47 +313,32 @@ impl Fr {
         }
     }
 
-    /// Fixed-point multiplication that works for both small values and MPC shares.
+    /// Fixed-point multiplication for MPC secret shares.
     ///
-    /// Computes `floor(self * other / 2^64)` in the fixed-point sense:
-    /// - When both operands are small (< 2^96 in absolute value), uses exact
-    ///   byte-shift truncation (same as `fixed_mul`). This handles the common
-    ///   case of two fixed-point encoded values correctly.
-    /// - When at least one operand is large (e.g., a random MPC share), uses
-    ///   modular inverse `self * other * (2^64)^{-1} mod r`. This is algebraically
-    ///   exact for share-by-public multiplication because the 2^64 factors cancel.
+    /// Computes `self * other * (2^64)^{-1} mod r`, which is the algebraically
+    /// exact fixed-point scaling operation in the BN254 scalar field.
+    ///
+    /// This ALWAYS uses the modular-inverse path (`* inv_2_64`) rather than
+    /// byte-shift truncation, ensuring algebraic consistency across all parties
+    /// regardless of operand magnitudes. This is critical for SPDZ MAC
+    /// verification: the MAC invariant `sum(mac_i) = α * sum(value_i)` requires
+    /// that value updates and MAC updates use identical arithmetic. Byte-shift
+    /// truncation (`fixed_mul`) introduces rounding errors that differ between
+    /// value shares (which may be small) and MAC shares (which are always large),
+    /// breaking the invariant and causing false-positive cheater detection.
+    ///
+    /// Individual shares may become large field elements, but the reconstructed
+    /// sum (the actual value) remains correct and small.
     ///
     /// **Linear**: `sum(share_i.mpc_scale(x)) == sum(share_i).mpc_scale(x)`,
     /// which is required for additive secret sharing.
+    ///
+    /// For non-MPC fixed-point arithmetic on small values, use [`fixed_mul`]
+    /// instead, which provides deterministic truncation behavior.
     #[inline]
     pub fn mpc_scale(&self, other: &Self) -> Self {
-        // Check if both operands are "small" after sign normalization.
-        // Small = fits in 96 bits (absolute value). Their product < 2^192 < r,
-        // so field multiplication equals integer multiplication (no mod reduction),
-        // and byte-shift truncation gives the exact floor(a*b / 2^64).
-        let self_neg = self.is_negative().to_bool();
-        let other_neg = other.is_negative().to_bool();
-
-        let abs_self = if self_neg { self.neg() } else { *self };
-        let abs_other = if other_neg { other.neg() } else { *other };
-
-        let a_bytes = abs_self.to_bytes_le();
-        let b_bytes = abs_other.to_bytes_le();
-
-        let a_small = a_bytes[12..32].iter().all(|&x| x == 0);
-        let b_small = b_bytes[12..32].iter().all(|&x| x == 0);
-
-        if a_small && b_small {
-            // Both small: delegate to fixed_mul (byte-shift truncation with sign handling).
-            self.fixed_mul(other)
-        } else {
-            // At least one large (MPC share): use modular inverse.
-            // This is correct when one operand is a random share and the other is
-            // a fixed-point public value, because the (2^64) and (2^64)^{-1} cancel
-            // exactly in the field.
-            let product = Fr(self.0 * other.0);
-            Fr(product.0 * Self::inv_2_64().0)
-        }
+        let product = Fr(self.0 * other.0);
+        Fr(product.0 * Self::inv_2_64().0)
     }
 
     /// Returns (2^64)^{-1} mod r, cached after first computation.
