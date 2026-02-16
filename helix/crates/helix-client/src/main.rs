@@ -2629,6 +2629,8 @@ async fn cmd_mpc_train(args: &MpcTrainArgs, _cli: &Cli) -> Result<()> {
         stake_amount_eth: args.stake_eth,
         #[cfg(feature = "chain")]
         coordinator_address: args.coordinator.clone(),
+        #[cfg(feature = "chain")]
+        enable_withdrawal: false,
     };
 
     let mut orchestrator = FullOrchestrator::new(config);

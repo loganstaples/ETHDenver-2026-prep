@@ -126,6 +126,11 @@ pub struct FullOrchestrationConfig {
     /// Existing coordinator contract address. None = deploy a new V4.
     #[cfg(feature = "chain")]
     pub coordinator_address: Option<String>,
+    /// Whether to execute the stake withdrawal phase after training completion.
+    /// Requires local Anvil (uses `evm_increaseTime` to advance past the 7-day cooldown).
+    /// Defaults to false. Enable for demo/integration test scenarios.
+    #[cfg(feature = "chain")]
+    pub enable_withdrawal: bool,
 }
 
 impl Default for FullOrchestrationConfig {
@@ -160,6 +165,8 @@ impl Default for FullOrchestrationConfig {
             stake_amount_eth: 0.1,
             #[cfg(feature = "chain")]
             coordinator_address: None,
+            #[cfg(feature = "chain")]
+            enable_withdrawal: false,
         }
     }
 }
@@ -387,6 +394,29 @@ impl FullOrchestrator {
         };
 
         // ================================================================
+        // Phase 11.5: Stake withdrawal (feature-gated, opt-in)
+        // ================================================================
+        #[cfg(feature = "chain")]
+        let withdrawal_gas = if self.config.enable_withdrawal {
+            self.run_withdrawal_phase(
+                job_id,
+                &coordinator_address,
+                &worker_wallets,
+                &cheater_info,
+            )
+            .await
+            .unwrap_or_else(|e| {
+                warn!("Phase 11.5: Stake withdrawal failed: {}. Continuing.", e);
+                0
+            })
+        } else {
+            info!("Phase 11.5: Stake withdrawal skipped (enable_withdrawal=false)");
+            0
+        };
+        #[cfg(not(feature = "chain"))]
+        let withdrawal_gas: u64 = 0;
+
+        // ================================================================
         // Phase 12: Evaluate accuracy on test set
         // ================================================================
         info!("Phase 12: Evaluating test accuracy");
@@ -407,9 +437,9 @@ impl FullOrchestrator {
         let total_elapsed = overall_start.elapsed().as_secs_f64();
 
         #[cfg(feature = "chain")]
-        let total_gas = chain_gas + settlement_gas;
+        let total_gas = chain_gas + settlement_gas + withdrawal_gas;
         #[cfg(not(feature = "chain"))]
-        let total_gas = chain_gas + settlement_gas;
+        let total_gas = chain_gas + settlement_gas + withdrawal_gas;
 
         let result = FullOrchestrationResult {
             job_id,
@@ -1034,6 +1064,94 @@ impl FullOrchestrator {
     }
 
     // ========================================================================
+    // Phase 11.5: Stake Withdrawal (feature-gated)
+    // ========================================================================
+
+    /// Runs the stake withdrawal phase: advances time past the 7-day cooldown
+    /// (local Anvil only) and has each honest worker withdraw their stake.
+    ///
+    /// Returns gas used across all withdrawals.
+    #[cfg(feature = "chain")]
+    async fn run_withdrawal_phase(
+        &self,
+        job_id: u64,
+        coordinator_address: &str,
+        worker_wallets: &[LocalWallet],
+        cheater_info: &Option<CheaterInfo>,
+    ) -> Result<u64> {
+        info!("Phase 11.5: Withdrawing stakes after cooldown");
+        let phase_start = Instant::now();
+
+        let rpc_url = self
+            .rpc_url
+            .as_ref()
+            .ok_or_else(|| anyhow!("Phase 11.5: No RPC URL available"))?;
+
+        // Advance time past the 7-day cooldown (only works on local Anvil).
+        let provider = Provider::<Http>::try_from(rpc_url.as_str())
+            .map_err(|e| anyhow!("Invalid RPC URL: {}", e))?;
+
+        let seven_days_plus: u64 = 7 * 24 * 3600 + 1;
+        let _: serde_json::Value = provider
+            .request("evm_increaseTime", [seven_days_plus])
+            .await
+            .map_err(|e| anyhow!("Phase 11.5: evm_increaseTime failed (not on Anvil?): {}", e))?;
+        let _: serde_json::Value = provider
+            .request("evm_mine", Vec::<()>::new())
+            .await
+            .map_err(|e| anyhow!("Phase 11.5: evm_mine failed: {}", e))?;
+
+        info!("Advanced time by 7 days + 1 second past cooldown");
+
+        // Withdraw for each honest worker.
+        let mut total_gas: u64 = 0;
+        let mut withdrawals: usize = 0;
+
+        for (i, wallet) in worker_wallets.iter().enumerate() {
+            // Skip the cheater — their stake was already slashed.
+            if let Some(ref ci) = cheater_info {
+                if i == ci.party_index {
+                    debug!(worker = i, "Skipping slashed worker for withdrawal");
+                    continue;
+                }
+            }
+
+            let worker_client = ChainClientV4::with_wallet(
+                rpc_url,
+                wallet.clone(),
+                coordinator_address,
+            )
+            .await
+            .with_context(|| format!("Phase 11.5: Failed to create worker {} client", i))?;
+
+            let receipt = worker_client
+                .withdraw_stake(job_id)
+                .await
+                .with_context(|| format!("Phase 11.5: Worker {} withdraw_stake failed", i))?;
+
+            let gas = receipt.gas_used.map(|g| g.as_u64()).unwrap_or(0);
+            total_gas += gas;
+            withdrawals += 1;
+
+            debug!(
+                worker = i,
+                address = %wallet.address(),
+                gas_used = gas,
+                "Worker stake withdrawn"
+            );
+        }
+
+        info!(
+            withdrawals = withdrawals,
+            total_gas = total_gas,
+            elapsed_ms = phase_start.elapsed().as_millis(),
+            "Phase 11.5 complete: stakes withdrawn"
+        );
+
+        Ok(total_gas)
+    }
+
+    // ========================================================================
     // Anvil Management
     // ========================================================================
 
@@ -1515,6 +1633,8 @@ mod tests {
             stake_amount_eth: 0.1,
             #[cfg(feature = "chain")]
             coordinator_address: None,
+            #[cfg(feature = "chain")]
+            enable_withdrawal: false,
         };
         let orchestrator = FullOrchestrator::new(config);
         assert!(orchestrator.validate_config().is_ok());
