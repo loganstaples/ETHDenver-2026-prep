@@ -451,6 +451,11 @@ struct MpcTrainArgs {
     #[arg(long)]
     coordinator: Option<String>,
 
+    /// Enable stake withdrawal after training (requires local Anvil)
+    #[cfg(feature = "chain")]
+    #[arg(long)]
+    enable_withdrawal: bool,
+
     /// Save final trained weights to this JSON file
     #[arg(long)]
     output: Option<PathBuf>,
@@ -2559,7 +2564,9 @@ async fn cmd_submit_proof(args: &SubmitProofArgs) -> Result<()> {
 // ============================================================================
 
 async fn cmd_mpc_train(args: &MpcTrainArgs, _cli: &Cli) -> Result<()> {
-    use helix_client::full_orchestration::{FullOrchestrationConfig, FullOrchestrator};
+    use helix_client::full_orchestration::{
+        FullOrchestrationConfig, FullOrchestrator, ProgressCallback, ProgressEvent,
+    };
 
     println!();
     println!("{}", "═".repeat(64).cyan());
@@ -2589,9 +2596,61 @@ async fn cmd_mpc_train(args: &MpcTrainArgs, _cli: &Cli) -> Result<()> {
         args.workers.clone()
     };
 
+    // Anvil default private keys for demo mode (accounts 1-10).
+    // These match `anvil --accounts 20` default derivation.
+    #[cfg(feature = "chain")]
+    let worker_keys = if args.worker_keys.is_empty() {
+        // Safety: only auto-populate Anvil keys when targeting localhost/local Anvil.
+        // Using these well-known keys against a real network would be insecure.
+        let is_local = args.rpc_url.as_ref().map_or(true, |url| {
+            let u = url.to_lowercase();
+            u.contains("127.0.0.1") || u.contains("localhost") || u.contains("[::1]")
+        });
+        if !is_local {
+            return Err(anyhow::anyhow!(
+                "Cannot auto-populate worker keys when --rpc-url points to a remote network. \
+                 Provide explicit --worker-keys to avoid using well-known Anvil keys on mainnet/testnet."
+            ));
+        }
+        // Auto-populate with Anvil default keys when no explicit keys provided.
+        let anvil_default_keys = vec![
+            "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d".to_string(),
+            "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a".to_string(),
+            "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6".to_string(),
+            "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a".to_string(),
+            "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba".to_string(),
+            "0x92db14e403b83dfe3df233f83dfa3a0d7096f21ca9b0d6d6b8d88b2b4ec1564e".to_string(),
+            "0x4bbbf85ce3377467afe5d46f804f221813b2bb87f24d81f60f1fcdbf7cbf4356".to_string(),
+            "0xdbda1821b80551c9d65939329250298aa3472ba22feea921c0cf5d620ea67b97".to_string(),
+            "0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6".to_string(),
+            "0xf214f2b2cd398c806f84e317254e0f0b801d0643303237d97a22a48e01628897".to_string(),
+        ];
+        // Take only as many as we have workers.
+        let needed = worker_endpoints.len();
+        if needed > anvil_default_keys.len() {
+            return Err(anyhow::anyhow!(
+                "Cannot auto-assign keys for {} workers (max {} Anvil defaults). \
+                 Provide explicit --worker-keys for more workers.",
+                needed,
+                anvil_default_keys.len()
+            ));
+        }
+        eprintln!(
+            "{}",
+            format!(
+                "  Note: Using Anvil default keys for {} workers (demo mode)",
+                needed
+            ).dimmed()
+        );
+        anvil_default_keys[..needed].to_vec()
+    } else {
+        args.worker_keys.clone()
+    };
+
+    let total_params = dims[1] * dims[0] + dims[1] + dims[2] * dims[1] + dims[2];
     println!("{}", "Configuration:".yellow().bold());
     println!("  Architecture:    {}x{}x{}", dims[0], dims[1], dims[2]);
-    println!("  Parameters:      {}", dims[1] * dims[0] + dims[1] + dims[2] * dims[1] + dims[2]);
+    println!("  Parameters:      {}", total_params);
     println!("  Steps:           {}", args.steps);
     println!("  Learning Rate:   {}", args.learning_rate);
     println!("  Checkpoint Freq: every {} steps", args.checkpoint_freq);
@@ -2601,17 +2660,22 @@ async fn cmd_mpc_train(args: &MpcTrainArgs, _cli: &Cli) -> Result<()> {
         println!("    Worker {}: {}", i, ep);
     }
     println!("  Seed:            {}", args.seed);
+    #[cfg(feature = "chain")]
+    {
+        println!("  Payment:         {} ETH", args.payment_eth);
+        println!("  Stake/worker:    {} ETH", args.stake_eth);
+    }
     println!();
 
     let config = FullOrchestrationConfig {
-        architecture: dims,
+        architecture: dims.clone(),
         num_steps: args.steps,
         learning_rate: args.learning_rate,
         checkpoint_frequency: args.checkpoint_freq,
         mac_check_interval: args.mac_interval,
         beaver_batch_size: args.beaver_batch_size,
         seed: args.seed,
-        worker_endpoints,
+        worker_endpoints: worker_endpoints.clone(),
         initial_weights_path: args.weights.clone(),
         use_real_mnist: args.real_mnist,
         mnist_cache_dir: None,
@@ -2622,7 +2686,7 @@ async fn cmd_mpc_train(args: &MpcTrainArgs, _cli: &Cli) -> Result<()> {
         #[cfg(feature = "chain")]
         private_key: args.private_key.clone(),
         #[cfg(feature = "chain")]
-        worker_private_keys: args.worker_keys.clone(),
+        worker_private_keys: worker_keys,
         #[cfg(feature = "chain")]
         payment_amount_eth: args.payment_eth,
         #[cfg(feature = "chain")]
@@ -2630,10 +2694,133 @@ async fn cmd_mpc_train(args: &MpcTrainArgs, _cli: &Cli) -> Result<()> {
         #[cfg(feature = "chain")]
         coordinator_address: args.coordinator.clone(),
         #[cfg(feature = "chain")]
-        enable_withdrawal: false,
+        enable_withdrawal: args.enable_withdrawal,
     };
 
     let mut orchestrator = FullOrchestrator::new(config);
+
+    // Set up the progress display callback for user-facing output.
+    let num_steps = args.steps;
+    let num_workers = worker_endpoints.len();
+    let progress_cb: ProgressCallback = std::sync::Arc::new(move |event: ProgressEvent| {
+        match event {
+            ProgressEvent::PhaseStarted { phase, total, description } => {
+                println!(
+                    "{}",
+                    format!("Phase {}/{}: {}...", phase, total, description)
+                        .cyan()
+                        .bold()
+                );
+            }
+            ProgressEvent::PhaseCompleted { phase, elapsed_ms } => {
+                if elapsed_ms > 0 {
+                    println!(
+                        "  {} Phase {} complete ({:.1}s)",
+                        "✓".green(),
+                        phase,
+                        elapsed_ms as f64 / 1000.0
+                    );
+                }
+            }
+            ProgressEvent::TrainingStep { step, total, loss, mac_ok } => {
+                // Show progress at regular intervals to avoid flooding.
+                let show = step == 1
+                    || step == total
+                    || (total <= 50)
+                    || (total <= 200 && step % 10 == 0)
+                    || (total <= 1000 && step % 50 == 0)
+                    || (step % 100 == 0);
+                if show {
+                    let mac_indicator = if mac_ok {
+                        "MACs: ✓".green().to_string()
+                    } else {
+                        "MACs: ✗".red().to_string()
+                    };
+                    let pct = (step as f64 / total as f64 * 100.0) as u32;
+                    let bar_width = 30;
+                    let filled = (pct as usize * bar_width / 100).min(bar_width);
+                    let bar = format!(
+                        "[{}{}]",
+                        "#".repeat(filled),
+                        "-".repeat(bar_width - filled)
+                    );
+                    println!(
+                        "  Step {}/{} {} Loss: {:.4} -- {}",
+                        step, total,
+                        bar.dimmed(),
+                        loss,
+                        mac_indicator,
+                    );
+                }
+            }
+            ProgressEvent::CheckpointSubmitted { index, total, step, tx_hash } => {
+                let short_hash = if tx_hash.len() > 12 {
+                    format!("{}...{}", &tx_hash[..8], &tx_hash[tx_hash.len()-4..])
+                } else {
+                    tx_hash
+                };
+                println!(
+                    "  {} Checkpoint {}/{} submitted on-chain at step {} (tx: {})",
+                    "✓".green(),
+                    index,
+                    total,
+                    step,
+                    short_hash.dimmed(),
+                );
+            }
+            ProgressEvent::CheaterDetected { party_index, step } => {
+                println!();
+                println!(
+                    "  {} {} at step {} -- Worker {} identified",
+                    "⚠".yellow(),
+                    "MAC FAILURE DETECTED".red().bold(),
+                    step,
+                    party_index,
+                );
+            }
+            ProgressEvent::CheaterSlashed { party_index, tx_hash } => {
+                let short_hash = if tx_hash.len() > 12 {
+                    format!("{}...{}", &tx_hash[..8], &tx_hash[tx_hash.len()-4..])
+                } else {
+                    tx_hash
+                };
+                println!(
+                    "  {} Worker {} slashed on-chain (tx: {})",
+                    "⚡".red(),
+                    party_index,
+                    short_hash.dimmed(),
+                );
+                println!();
+            }
+            ProgressEvent::TrainingComplete { accuracy, steps, time_secs, checkpoints } => {
+                println!();
+                println!("{}", "═".repeat(64).green());
+                println!(
+                    "  {} -- {:.1}% accuracy -- {} steps -- {:.1}s -- {} checkpoints verified",
+                    "Training complete".green().bold(),
+                    accuracy * 100.0,
+                    steps,
+                    time_secs,
+                    checkpoints,
+                );
+                println!(
+                    "  {} workers participated, all MAC checks passed",
+                    num_workers,
+                );
+                println!("{}", "═".repeat(64).green());
+            }
+            ProgressEvent::RecoverableError { phase, message, retry_count } => {
+                println!(
+                    "  {} Phase {} retry {}: {}",
+                    "⚠".yellow(),
+                    phase,
+                    retry_count,
+                    message.dimmed(),
+                );
+            }
+        }
+    });
+    orchestrator.set_progress_callback(progress_cb);
 
     println!("{}", "Starting full orchestration pipeline...".green().bold());
     println!();
@@ -2648,23 +2835,13 @@ async fn cmd_mpc_train(args: &MpcTrainArgs, _cli: &Cli) -> Result<()> {
             std::fs::write(output_path, &json)
                 .map_err(|e| anyhow::anyhow!("Failed to write weights to {}: {}", output_path.display(), e))?;
             println!(
-                "\n{}",
-                format!("Final weights saved to {}", output_path.display())
-                    .green()
-                    .bold()
+                "\n  {} Final weights saved to {}",
+                "✓".green(),
+                output_path.display(),
             );
         }
     }
 
-    println!();
-    println!("{}", "═".repeat(64).cyan());
-    println!(
-        "  Result: {} accuracy, {} steps in {:.1}s",
-        format!("{:.1}%", result.test_accuracy * 100.0).green().bold(),
-        result.steps_completed,
-        result.training_time_secs,
-    );
-    println!("{}", "═".repeat(64).cyan());
     println!();
 
     Ok(())
@@ -2683,14 +2860,35 @@ async fn cmd_mpc_worker(args: &MpcWorkerArgs, _cli: &Cli) -> Result<()> {
     println!("{}", "═".repeat(64).cyan());
     println!();
 
+    // Parse the listen address and compute the control channel port.
+    let data_addr: std::net::SocketAddr = args.listen.parse()
+        .map_err(|e| anyhow::anyhow!(
+            "Invalid --listen address '{}'. Expected format: IP:PORT (e.g. 0.0.0.0:9001). Error: {}", args.listen, e
+        ))?;
+    let control_port = data_addr.port() + 1;
+
     println!("{}", "Configuration:".yellow().bold());
-    println!("  Listen:        {}", args.listen);
-    println!("  Party Index:   {}", args.party_index);
-    println!("  Seed:          {}", args.seed);
+    println!("  Data Channel:    {}", args.listen);
+    println!("  Control Channel: {}:{}", data_addr.ip(), control_port);
+    println!("  Party Index:     {}", args.party_index);
+    println!("  Seed:            {}", args.seed);
+    #[cfg(feature = "chain")]
+    {
+        if let Some(ref rpc) = args.rpc_url {
+            println!("  RPC URL:         {}", rpc);
+        }
+        if let Some(job_id) = args.job_id {
+            println!("  Job ID:          {}", job_id);
+            println!("  Stake:           {} ETH", args.stake_eth);
+        }
+        if let Some(ref coord) = args.coordinator {
+            println!("  Coordinator:     {}", coord);
+        }
+    }
     println!();
 
     let config = WorkerConfig {
-        listen_addr: args.listen.clone(),
+        listen_addr: data_addr.to_string(),
         party_index: args.party_index,
         seed: args.seed,
         #[cfg(feature = "chain")]
@@ -2706,8 +2904,25 @@ async fn cmd_mpc_worker(args: &MpcWorkerArgs, _cli: &Cli) -> Result<()> {
     };
 
     println!("{}", "Worker starting...".green().bold());
-    println!("  Waiting for owner connection on data channel");
-    println!("  Control channel on port +1");
+    println!(
+        "  {} Listening for owner connection on data channel ({})",
+        "⏳".dimmed(),
+        args.listen,
+    );
+    println!(
+        "  {} Control channel ready on port {}",
+        "⏳".dimmed(),
+        control_port,
+    );
+    #[cfg(feature = "chain")]
+    if args.job_id.is_some() {
+        println!(
+            "  {} Staking {} ETH on-chain for job {}",
+            "💰".dimmed(),
+            args.stake_eth,
+            args.job_id.unwrap(),
+        );
+    }
     println!();
 
     let result = launch_worker(config).await?;
@@ -2719,7 +2934,12 @@ async fn cmd_mpc_worker(args: &MpcWorkerArgs, _cli: &Cli) -> Result<()> {
     println!("  Steps Completed:       {}", result.steps_completed);
     println!("  Checkpoints Signed:    {}", result.checkpoint_signatures);
     println!("  Slashing Reports:      {}", result.slashing_reports_signed);
-    println!("  Final Share Sent:      {}", result.final_share_sent);
+    let share_status = if result.final_share_sent {
+        "Yes".green().to_string()
+    } else {
+        "No".red().to_string()
+    };
+    println!("  Final Share Sent:      {}", share_status);
     println!();
 
     Ok(())

@@ -37,4 +37,6 @@ pub use rpc::client::{
 pub use session::{SessionResult, TrainingEvent, TrainingProgress, TrainingSession};
 pub use full_orchestration::{
     FullOrchestrationConfig, FullOrchestrationResult, FullOrchestrator, CheaterInfo,
+    ProgressCallback, ProgressEvent,
 };
+pub use worker_entry::{WorkerConfig, WorkerResult, launch_worker};

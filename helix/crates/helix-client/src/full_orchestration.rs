@@ -26,6 +26,7 @@
 //! All on-chain interactions require the `chain` feature. The MPC training
 //! pipeline works without it, but phases 3-7, 9-11 are skipped.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -58,6 +59,43 @@ use helix_mpc::mnist::{MnistDataset, MnistSample};
 use crate::rpc::chain_v4::{
     sign_checkpoint, sign_completion, sign_mac_failure, ChainClientV4,
 };
+
+// ============================================================================
+// Progress Reporting
+// ============================================================================
+
+/// Events emitted by the orchestrator for user-facing progress display.
+///
+/// The orchestrator calls the progress callback at key moments so the CLI
+/// can render formatted output (colored text, progress bars, etc.) without
+/// coupling the orchestrator to any particular display mechanism.
+#[derive(Debug, Clone)]
+pub enum ProgressEvent {
+    /// A phase is starting. Fields: (phase_number, total_phases, description).
+    PhaseStarted { phase: u32, total: u32, description: String },
+    /// A phase completed successfully. Fields: (phase_number, elapsed_ms).
+    PhaseCompleted { phase: u32, elapsed_ms: u128 },
+    /// Training step progress. Fields: (step, total_steps, loss, accuracy_estimate, mac_ok).
+    TrainingStep { step: usize, total: usize, loss: f64, mac_ok: bool },
+    /// A checkpoint was submitted on-chain.
+    CheckpointSubmitted { index: usize, total: usize, step: u64, tx_hash: String },
+    /// A cheater was detected.
+    CheaterDetected { party_index: usize, step: u64 },
+    /// Cheater was slashed on-chain.
+    CheaterSlashed { party_index: usize, tx_hash: String },
+    /// Training completed with summary stats.
+    TrainingComplete { accuracy: f64, steps: usize, time_secs: f64, checkpoints: usize },
+    /// An error occurred but was recovered from.
+    RecoverableError { phase: u32, message: String, retry_count: u32 },
+}
+
+/// A callback for receiving progress events.
+pub type ProgressCallback = Arc<dyn Fn(ProgressEvent) + Send + Sync>;
+
+/// Maximum number of retries for chain operations.
+const CHAIN_RETRY_MAX: u32 = 3;
+/// Delay between retries for chain operations.
+const CHAIN_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 // ============================================================================
 // Configuration
@@ -234,6 +272,8 @@ pub struct CheaterInfo {
 /// the orchestrator still runs MPC training and evaluates accuracy.
 pub struct FullOrchestrator {
     config: FullOrchestrationConfig,
+    /// Optional progress callback for user-facing display.
+    progress: Option<ProgressCallback>,
     /// Anvil child process, if we started one.
     #[cfg(feature = "chain")]
     anvil_process: Option<Child>,
@@ -247,10 +287,26 @@ impl FullOrchestrator {
     pub fn new(config: FullOrchestrationConfig) -> Self {
         Self {
             config,
+            progress: None,
             #[cfg(feature = "chain")]
             anvil_process: None,
             #[cfg(feature = "chain")]
             rpc_url: None,
+        }
+    }
+
+    /// Sets a progress callback for user-facing status updates.
+    ///
+    /// The callback is invoked at key moments during orchestration so the CLI
+    /// can render formatted output without coupling to the display mechanism.
+    pub fn set_progress_callback(&mut self, cb: ProgressCallback) {
+        self.progress = Some(cb);
+    }
+
+    /// Emits a progress event to the registered callback (if any).
+    fn emit(&self, event: ProgressEvent) {
+        if let Some(ref cb) = self.progress {
+            cb(event);
         }
     }
 
@@ -283,6 +339,10 @@ impl FullOrchestrator {
         // ================================================================
         // Phase 1: Load or generate training data
         // ================================================================
+        self.emit(ProgressEvent::PhaseStarted {
+            phase: 1, total: 13,
+            description: "Loading training data".to_string(),
+        });
         info!("Phase 1: Loading training data");
         let phase1_start = Instant::now();
 
@@ -293,16 +353,22 @@ impl FullOrchestrator {
         let training_pairs = MnistDataset::as_training_pairs(&dataset.train);
         let test_samples = dataset.test.clone();
 
+        let phase1_elapsed = phase1_start.elapsed().as_millis();
         info!(
             train_samples = training_pairs.len(),
             test_samples = test_samples.len(),
-            elapsed_ms = phase1_start.elapsed().as_millis(),
+            elapsed_ms = phase1_elapsed,
             "Phase 1 complete: training data loaded"
         );
+        self.emit(ProgressEvent::PhaseCompleted { phase: 1, elapsed_ms: phase1_elapsed });
 
         // ================================================================
         // Phase 2: Generate or load initial weights
         // ================================================================
+        self.emit(ProgressEvent::PhaseStarted {
+            phase: 2, total: 13,
+            description: "Initializing model weights".to_string(),
+        });
         info!("Phase 2: Initializing model weights");
         let phase2_start = Instant::now();
 
@@ -311,12 +377,14 @@ impl FullOrchestrator {
             .context("Phase 2: Failed to initialize weights")?;
 
         let total_params = d_hid * d_in + d_hid + d_out * d_hid + d_out;
+        let phase2_elapsed = phase2_start.elapsed().as_millis();
         info!(
             total_params = total_params,
             source = if self.config.initial_weights_path.is_some() { "file" } else { "xavier" },
-            elapsed_ms = phase2_start.elapsed().as_millis(),
+            elapsed_ms = phase2_elapsed,
             "Phase 2 complete: weights initialized"
         );
+        self.emit(ProgressEvent::PhaseCompleted { phase: 2, elapsed_ms: phase2_elapsed });
 
         // ================================================================
         // Phases 3-7: On-chain setup (feature-gated)
@@ -333,6 +401,10 @@ impl FullOrchestrator {
         // ================================================================
         // Phase 8: Run MPC training
         // ================================================================
+        self.emit(ProgressEvent::PhaseStarted {
+            phase: 8, total: 13,
+            description: "Running MPC training".to_string(),
+        });
         info!("Phase 8: Running MPC training");
         let phase8_start = Instant::now();
 
@@ -357,6 +429,24 @@ impl FullOrchestrator {
             .await
             .context("Phase 8: MPC training failed")?;
 
+        // Emit per-step progress for the completed training.
+        for (i, loss) in mpc_result.losses.iter().enumerate() {
+            self.emit(ProgressEvent::TrainingStep {
+                step: i + 1,
+                total: self.config.num_steps,
+                loss: *loss,
+                mac_ok: true,
+            });
+        }
+
+        if let Some(ref cheater) = mpc_result.cheater_detected {
+            self.emit(ProgressEvent::CheaterDetected {
+                party_index: cheater.party_index,
+                step: cheater.detected_at_step,
+            });
+        }
+
+        let phase8_elapsed = phase8_start.elapsed().as_millis();
         info!(
             steps_completed = mpc_result.steps_completed,
             final_loss = mpc_result.final_loss,
@@ -364,9 +454,10 @@ impl FullOrchestrator {
             mac_checks_passed = mpc_result.mac_checks_passed,
             cheater_detected = mpc_result.cheater_detected.is_some(),
             encrypted_distribution = mpc_result.encrypted_distribution,
-            elapsed_ms = phase8_start.elapsed().as_millis(),
+            elapsed_ms = phase8_elapsed,
             "Phase 8 complete: MPC training finished"
         );
+        self.emit(ProgressEvent::PhaseCompleted { phase: 8, elapsed_ms: phase8_elapsed });
 
         // ================================================================
         // Phases 9-11: On-chain settlement (feature-gated)
@@ -419,17 +510,23 @@ impl FullOrchestrator {
         // ================================================================
         // Phase 12: Evaluate accuracy on test set
         // ================================================================
+        self.emit(ProgressEvent::PhaseStarted {
+            phase: 12, total: 13,
+            description: "Evaluating test accuracy".to_string(),
+        });
         info!("Phase 12: Evaluating test accuracy");
         let phase12_start = Instant::now();
 
         let test_accuracy = evaluate_accuracy(&mpc_result.final_weights, &test_samples, d_in, d_hid, d_out);
 
+        let phase12_elapsed = phase12_start.elapsed().as_millis();
         info!(
             test_accuracy = format!("{:.2}%", test_accuracy * 100.0),
             test_samples = test_samples.len(),
-            elapsed_ms = phase12_start.elapsed().as_millis(),
+            elapsed_ms = phase12_elapsed,
             "Phase 12 complete: accuracy evaluated"
         );
+        self.emit(ProgressEvent::PhaseCompleted { phase: 12, elapsed_ms: phase12_elapsed });
 
         // ================================================================
         // Phase 13: Print comprehensive summary
@@ -456,7 +553,18 @@ impl FullOrchestrator {
             total_gas_used: total_gas,
         };
 
+        self.emit(ProgressEvent::PhaseStarted {
+            phase: 13, total: 13,
+            description: "Printing summary".to_string(),
+        });
         self.print_summary(&result);
+        self.emit(ProgressEvent::TrainingComplete {
+            accuracy: result.test_accuracy,
+            steps: result.steps_completed,
+            time_secs: result.training_time_secs,
+            checkpoints: result.checkpoints_on_chain,
+        });
+        self.emit(ProgressEvent::PhaseCompleted { phase: 13, elapsed_ms: 0 });
 
         Ok(result)
     }
@@ -658,13 +766,35 @@ impl FullOrchestrator {
         let mut total_gas: u64 = 0;
 
         // -- Phase 3: Start Anvil if needed --
+        self.emit(ProgressEvent::PhaseStarted {
+            phase: 3, total: 13,
+            description: "Bootstrapping chain connection".to_string(),
+        });
+        let phase3_start = Instant::now();
         let rpc_url = if let Some(ref url) = self.config.eth_rpc_url {
-            info!(rpc_url = %url, "Phase 3: Using provided RPC URL");
+            // Verify RPC is reachable before proceeding.
+            info!(rpc_url = %url, "Phase 3: Verifying provided RPC URL");
+            let provider_check = Provider::<Http>::try_from(url.as_str())
+                .map_err(|e| anyhow!("Phase 3: Invalid RPC URL '{}': {}", url, e))?;
+            match provider_check.get_chainid().await {
+                Ok(chain_id) => {
+                    info!(chain_id = chain_id.as_u64(), "RPC connection verified");
+                }
+                Err(e) => {
+                    return Err(anyhow!(
+                        "Phase 3: Cannot connect to RPC at '{}'. \
+                         Check the URL and ensure the node is running. Error: {}",
+                        url, e
+                    ));
+                }
+            }
             url.clone()
         } else {
             info!("Phase 3: Starting local Anvil instance");
-            let phase3_start = Instant::now();
-            let url = self.start_anvil().context("Phase 3: Failed to start Anvil")?;
+            let url = self.start_anvil().context(
+                "Phase 3: Failed to start Anvil. Is Foundry installed? \
+                 Install with: curl -L https://foundry.paradigm.xyz | bash && foundryup"
+            )?;
             info!(
                 rpc_url = %url,
                 elapsed_ms = phase3_start.elapsed().as_millis(),
@@ -673,8 +803,13 @@ impl FullOrchestrator {
             url
         };
         self.rpc_url = Some(rpc_url.clone());
+        self.emit(ProgressEvent::PhaseCompleted { phase: 3, elapsed_ms: phase3_start.elapsed().as_millis() });
 
         // -- Phase 4: Deploy V4 contract if needed --
+        self.emit(ProgressEvent::PhaseStarted {
+            phase: 4, total: 13,
+            description: "Deploying contracts".to_string(),
+        });
         let phase4_start = Instant::now();
         let (chain_client, coordinator_addr_str) = if let Some(ref addr) = self.config.coordinator_address {
             info!(address = %addr, "Phase 4: Using existing V4 coordinator");
@@ -691,15 +826,21 @@ impl FullOrchestrator {
             let treasury = owner_wallet.address();
             let verifier = Address::zero(); // No ZK verifier for MPC-primary mode.
 
-            let (client, deploy_result) = ChainClientV4::deploy(
-                &rpc_url,
-                &self.config.private_key,
-                treasury,
-                verifier,
-                None,
-            )
-            .await
-            .context("Phase 4: V4 contract deployment failed")?;
+            let (client, deploy_result) = retry_chain_op(
+                "contract deployment",
+                || async {
+                    ChainClientV4::deploy(
+                        &rpc_url,
+                        &self.config.private_key,
+                        treasury,
+                        verifier,
+                        None,
+                    ).await
+                },
+                &self.progress,
+                4,
+            ).await
+            .context("Phase 4: V4 contract deployment failed after retries")?;
 
             info!(
                 coordinator = %deploy_result.coordinator,
@@ -710,8 +851,13 @@ impl FullOrchestrator {
 
             (client, deploy_result.coordinator)
         };
+        self.emit(ProgressEvent::PhaseCompleted { phase: 4, elapsed_ms: phase4_start.elapsed().as_millis() });
 
         // -- Phase 5: Register training job --
+        self.emit(ProgressEvent::PhaseStarted {
+            phase: 5, total: 13,
+            description: "Registering training job on-chain".to_string(),
+        });
         info!("Phase 5: Registering training job");
         let phase5_start = Instant::now();
 
@@ -720,15 +866,41 @@ impl FullOrchestrator {
             .context("Phase 5: Invalid payment amount")?;
         let num_checkpoints = self.config.num_steps / self.config.checkpoint_frequency;
 
-        let (reg_receipt, job_id) = chain_client
-            .register_training_job(
-                arch_hash,
-                self.config.checkpoint_frequency as u64,
-                num_checkpoints.max(1) as u64,
-                payment_wei,
-            )
-            .await
-            .context("Phase 5: Job registration failed")?;
+        // Check owner balance before attempting registration.
+        {
+            let provider = Provider::<Http>::try_from(rpc_url.as_str())
+                .map_err(|e| anyhow!("Invalid RPC URL: {}", e))?;
+            let owner_pk = self.config.private_key.strip_prefix("0x")
+                .unwrap_or(&self.config.private_key);
+            let owner_wallet = LocalWallet::from_str(owner_pk)
+                .map_err(|e| anyhow!("Invalid owner private key: {}", e))?;
+            let balance = provider.get_balance(owner_wallet.address(), None).await
+                .context("Phase 5: Failed to check owner balance")?;
+            if balance < payment_wei {
+                return Err(anyhow!(
+                    "Phase 5: Insufficient funds. Owner balance is {} wei but payment requires {} wei. \
+                     Fund the owner address {:?} before starting.",
+                    balance, payment_wei, owner_wallet.address()
+                ));
+            }
+        }
+
+        let (reg_receipt, job_id) = retry_chain_op(
+            "job registration",
+            || async {
+                chain_client
+                    .register_training_job(
+                        arch_hash,
+                        self.config.checkpoint_frequency as u64,
+                        num_checkpoints.max(1) as u64,
+                        payment_wei,
+                    )
+                    .await
+            },
+            &self.progress,
+            5,
+        ).await
+        .context("Phase 5: Job registration failed after retries")?;
 
         let reg_gas = reg_receipt.gas_used.map(|g| g.as_u64()).unwrap_or(0);
         total_gas += reg_gas;
@@ -739,8 +911,13 @@ impl FullOrchestrator {
             elapsed_ms = phase5_start.elapsed().as_millis(),
             "Phase 5 complete: training job registered"
         );
+        self.emit(ProgressEvent::PhaseCompleted { phase: 5, elapsed_ms: phase5_start.elapsed().as_millis() });
 
         // -- Phase 6: Workers stake and join --
+        self.emit(ProgressEvent::PhaseStarted {
+            phase: 6, total: 13,
+            description: "Workers staking and joining".to_string(),
+        });
         info!("Phase 6: Workers staking and joining");
         let phase6_start = Instant::now();
 
@@ -794,12 +971,17 @@ impl FullOrchestrator {
             elapsed_ms = phase6_start.elapsed().as_millis(),
             "Phase 6 complete: all workers staked"
         );
+        self.emit(ProgressEvent::PhaseCompleted { phase: 6, elapsed_ms: phase6_start.elapsed().as_millis() });
 
         // -- Phase 7: Poll for worker readiness --
+        self.emit(ProgressEvent::PhaseStarted {
+            phase: 7, total: 13,
+            description: "Waiting for worker readiness".to_string(),
+        });
         info!("Phase 7: Waiting for all workers to be registered on-chain");
         let phase7_start = Instant::now();
         let expected_workers = num_workers as u64;
-        let poll_timeout = Duration::from_secs(30);
+        let poll_timeout = Duration::from_secs(60);
         let poll_interval = Duration::from_millis(500);
         let deadline = Instant::now() + poll_timeout;
 
@@ -822,14 +1004,18 @@ impl FullOrchestrator {
 
             if Instant::now() > deadline {
                 return Err(anyhow!(
-                    "Phase 7: Timed out waiting for workers. Expected {}, got {}",
+                    "Phase 7: Timed out waiting for {} workers after {}s. Only {} registered. \
+                     Ensure all workers are running and can reach the coordinator at {}.",
                     expected_workers,
-                    count
+                    poll_timeout.as_secs(),
+                    count,
+                    coordinator_addr_str
                 ));
             }
 
             tokio::time::sleep(poll_interval).await;
         }
+        self.emit(ProgressEvent::PhaseCompleted { phase: 7, elapsed_ms: phase7_start.elapsed().as_millis() });
 
         Ok((job_id, coordinator_addr_str, chain_client, worker_wallets, total_gas))
     }
@@ -854,11 +1040,16 @@ impl FullOrchestrator {
         let mut checkpoints_on_chain: usize = 0;
 
         // -- Phase 9: Submit checkpoints --
+        self.emit(ProgressEvent::PhaseStarted {
+            phase: 9, total: 13,
+            description: "Submitting checkpoint attestations".to_string(),
+        });
         info!(
             checkpoint_count = mpc_result.checkpoints.len(),
             "Phase 9: Submitting checkpoint attestations"
         );
         let phase9_start = Instant::now();
+        let total_checkpoints = mpc_result.checkpoints.len();
 
         for (idx, checkpoint) in mpc_result.checkpoints.iter().enumerate() {
             let step_u256 = U256::from(checkpoint.step);
@@ -886,26 +1077,42 @@ impl FullOrchestrator {
                 signatures.push(sig);
             }
 
-            let receipt = chain_client
-                .submit_checkpoint(
-                    job_id,
-                    checkpoint.step as u64,
-                    checkpoint.commitment_bytes32,
-                    loss_u256,
-                    signatures,
-                )
-                .await
-                .with_context(|| format!("Phase 9: Failed to submit checkpoint {}", idx))?;
+            let receipt = retry_chain_op(
+                &format!("checkpoint {} submission", idx),
+                || async {
+                    chain_client
+                        .submit_checkpoint(
+                            job_id,
+                            checkpoint.step as u64,
+                            checkpoint.commitment_bytes32,
+                            loss_u256,
+                            signatures.clone(),
+                        )
+                        .await
+                },
+                &self.progress,
+                9,
+            ).await
+            .with_context(|| format!("Phase 9: Failed to submit checkpoint {} after retries", idx))?;
 
             let gas = receipt.gas_used.map(|g| g.as_u64()).unwrap_or(0);
             total_gas += gas;
             checkpoints_on_chain += 1;
+
+            let tx_hash = format!("{:?}", receipt.transaction_hash);
+            self.emit(ProgressEvent::CheckpointSubmitted {
+                index: idx + 1,
+                total: total_checkpoints,
+                step: checkpoint.step as u64,
+                tx_hash: tx_hash.clone(),
+            });
 
             debug!(
                 checkpoint_index = idx,
                 step = checkpoint.step,
                 loss = checkpoint.loss,
                 gas_used = gas,
+                tx_hash = %tx_hash,
                 "Checkpoint submitted on-chain"
             );
         }
@@ -915,8 +1122,17 @@ impl FullOrchestrator {
             elapsed_ms = phase9_start.elapsed().as_millis(),
             "Phase 9 complete: all checkpoints attested"
         );
+        self.emit(ProgressEvent::PhaseCompleted { phase: 9, elapsed_ms: phase9_start.elapsed().as_millis() });
 
         // -- Phase 10: Report cheater if detected --
+        self.emit(ProgressEvent::PhaseStarted {
+            phase: 10, total: 13,
+            description: if mpc_result.cheater_detected.is_some() {
+                "Reporting MAC failure on-chain".to_string()
+            } else {
+                "Checking for cheaters (none detected)".to_string()
+            },
+        });
         let cheater_info = if let Some(ref cheater) = mpc_result.cheater_detected {
             info!(
                 party_index = cheater.party_index,
@@ -981,10 +1197,19 @@ impl FullOrchestrator {
                         elapsed_ms = phase10_start.elapsed().as_millis(),
                         "Phase 10 complete: cheater slashed"
                     );
+                    self.emit(ProgressEvent::CheaterSlashed {
+                        party_index: cheater.party_index,
+                        tx_hash: tx_hash.clone(),
+                    });
                     (true, Some(tx_hash))
                 }
                 Err(e) => {
                     error!("Phase 10: MAC failure report failed: {}", e);
+                    self.emit(ProgressEvent::RecoverableError {
+                        phase: 10,
+                        message: format!("MAC failure report failed: {}", e),
+                        retry_count: 0,
+                    });
                     (false, None)
                 }
             };
@@ -999,8 +1224,13 @@ impl FullOrchestrator {
             info!("Phase 10: No cheater detected, skipping");
             None
         };
+        self.emit(ProgressEvent::PhaseCompleted { phase: 10, elapsed_ms: 0 });
 
         // -- Phase 11: Complete training on-chain --
+        self.emit(ProgressEvent::PhaseStarted {
+            phase: 11, total: 13,
+            description: "Completing training on-chain".to_string(),
+        });
         info!("Phase 11: Completing training on-chain");
         let phase11_start = Instant::now();
 
@@ -1059,6 +1289,7 @@ impl FullOrchestrator {
             active_workers = job_summary.active_worker_count,
             "On-chain job final state"
         );
+        self.emit(ProgressEvent::PhaseCompleted { phase: 11, elapsed_ms: phase11_start.elapsed().as_millis() });
 
         Ok((checkpoints_on_chain, cheater_info, total_gas))
     }
@@ -1317,6 +1548,52 @@ impl Drop for FullOrchestrator {
 // ============================================================================
 // Helper Functions
 // ============================================================================
+
+/// Retries a chain operation up to `CHAIN_RETRY_MAX` times with exponential backoff.
+///
+/// On each retry, emits a `RecoverableError` progress event so the CLI can
+/// inform the user. Returns the result of the last attempt on final failure.
+#[cfg(feature = "chain")]
+async fn retry_chain_op<F, Fut, T>(
+    operation_name: &str,
+    mut op: F,
+    progress: &Option<ProgressCallback>,
+    phase: u32,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut last_err = None;
+    for attempt in 0..CHAIN_RETRY_MAX {
+        match op().await {
+            Ok(val) => return Ok(val),
+            Err(e) => {
+                let msg = format!(
+                    "{} failed (attempt {}/{}): {}",
+                    operation_name,
+                    attempt + 1,
+                    CHAIN_RETRY_MAX,
+                    e
+                );
+                warn!("{}", msg);
+                if let Some(ref cb) = progress {
+                    cb(ProgressEvent::RecoverableError {
+                        phase,
+                        message: msg,
+                        retry_count: attempt + 1,
+                    });
+                }
+                last_err = Some(e);
+                if attempt + 1 < CHAIN_RETRY_MAX {
+                    let delay = CHAIN_RETRY_DELAY * 2u32.pow(attempt);
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("{} failed after {} retries", operation_name, CHAIN_RETRY_MAX)))
+}
 
 /// Xavier (Glorot) initialization for a 2-layer MLP.
 ///

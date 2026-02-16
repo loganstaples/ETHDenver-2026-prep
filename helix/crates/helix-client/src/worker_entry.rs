@@ -174,7 +174,7 @@ pub enum ControlMessage {
 const MAX_CONTROL_MSG_SIZE: usize = 1024 * 1024;
 
 /// Sends a control message over a TCP stream with 4-byte big-endian length prefix.
-async fn send_control_message(
+pub async fn send_control_message(
     stream: &mut tokio::net::TcpStream,
     msg: &ControlMessage,
 ) -> Result<()> {
@@ -202,7 +202,7 @@ async fn send_control_message(
 }
 
 /// Receives a control message from a TCP stream with 4-byte big-endian length prefix.
-async fn recv_control_message(
+pub async fn recv_control_message(
     stream: &mut tokio::net::TcpStream,
 ) -> Result<ControlMessage> {
     use tokio::io::AsyncReadExt;
@@ -652,9 +652,14 @@ impl WorkerRunner {
         let receiver = ShareReceiver::new(secret_key.clone(), party_id.clone());
 
         // Accept data channel connection and receive share distribution.
-        // The control channel is accepted concurrently.
+        // The control channel is accepted concurrently with a timeout to prevent
+        // indefinite hangs if the owner never connects.
         let control_accept = tokio::spawn(async move {
-            let (stream, addr) = control_listener.accept().await?;
+            let accept_fut = control_listener.accept();
+            let (stream, addr) = tokio::time::timeout(Duration::from_secs(120), accept_fut)
+                .await
+                .map_err(|_| anyhow!("Control channel accept timed out after 120s — owner never connected"))?
+                .map_err(|e| anyhow!("Control channel accept failed: {}", e))?;
             info!(addr = %addr, "Control channel connection accepted");
             Ok::<_, anyhow::Error>(stream)
         });
@@ -997,9 +1002,13 @@ async fn run_worker_with_listeners(
 
     let receiver = ShareReceiver::new(secret_key.clone(), party_id.clone());
 
-    // Accept connections concurrently.
+    // Accept connections concurrently with timeout.
     let control_accept = tokio::spawn(async move {
-        let (stream, addr) = control_listener.accept().await?;
+        let accept_fut = control_listener.accept();
+        let (stream, addr) = tokio::time::timeout(Duration::from_secs(120), accept_fut)
+            .await
+            .map_err(|_| anyhow!("Ephemeral control accept timed out after 120s"))?
+            .map_err(|e| anyhow!("Ephemeral control accept failed: {}", e))?;
         info!(addr = %addr, "Ephemeral control channel accepted");
         Ok::<_, anyhow::Error>(stream)
     });
