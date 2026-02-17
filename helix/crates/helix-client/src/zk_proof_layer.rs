@@ -174,6 +174,29 @@ impl ZkProofLayer {
         weights: &FinalWeights,
         loss: f64,
     ) -> Result<Option<ZkCheckpointProofResult>> {
+        self.process_checkpoint_inner(checkpoint_index, step, weights, loss, false)
+    }
+
+    /// Like `process_checkpoint` but forces proof generation regardless of frequency.
+    /// Used for the final checkpoint to ensure at least one ZK proof is generated.
+    pub fn process_final_checkpoint(
+        &mut self,
+        checkpoint_index: usize,
+        step: usize,
+        weights: &FinalWeights,
+        loss: f64,
+    ) -> Result<Option<ZkCheckpointProofResult>> {
+        self.process_checkpoint_inner(checkpoint_index, step, weights, loss, true)
+    }
+
+    fn process_checkpoint_inner(
+        &mut self,
+        checkpoint_index: usize,
+        step: usize,
+        weights: &FinalWeights,
+        loss: f64,
+        force: bool,
+    ) -> Result<Option<ZkCheckpointProofResult>> {
         if !self.config.enabled {
             return Ok(None);
         }
@@ -194,8 +217,8 @@ impl ZkProofLayer {
             return Ok(None);
         }
 
-        // Check if this checkpoint should produce a ZK proof
-        if !self.should_prove_checkpoint(checkpoint_index) {
+        // Check if this checkpoint should produce a ZK proof (skip check if forced)
+        if !force && !self.should_prove_checkpoint(checkpoint_index) {
             return Ok(None);
         }
 

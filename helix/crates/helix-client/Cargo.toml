@@ -13,7 +13,7 @@ helix-core = { path = "../helix-core" }
 helix-avm = { path = "../helix-avm" }
 helix-prover = { path = "../helix-prover" }
 helix-circuits = { path = "../helix-circuits" }
-helix-mpc = { path = "../helix-mpc", default-features = false }
+helix-mpc = { path = "../helix-mpc", default-features = false, features = ["real-mnist"] }
 
 # Field arithmetic (for ZK proof integration)
 ff = "0.13"
@@ -113,7 +113,7 @@ zbus = "3.14"
 windows = { version = "0.52", features = ["Win32_Security_Cryptography"] }
 
 [features]
-default = ["chain"]
+default = ["chain", "network-mpc"]
 hardware-wallet = ["hidapi"]
 chain = ["ethers", "dotenv"]
 network-mpc = ["helix-mpc/network-mpc"]

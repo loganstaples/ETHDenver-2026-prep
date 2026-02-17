@@ -595,9 +595,9 @@ pub fn create_dashboard_router_with_state(state: Arc<DashboardState>) -> Router 
         // Training job endpoints
         .route("/api/training/start", post(start_training_handler))
         .route("/api/training/sessions", get(list_sessions_handler))
-        .route("/api/training/sessions/{id}", get(get_session_handler))
-        .route("/api/training/sessions/{id}/losses", get(get_losses_handler))
-        .route("/api/training/sessions/{id}/model", get(get_model_handler))
+        .route("/api/training/sessions/:id", get(get_session_handler))
+        .route("/api/training/sessions/:id/losses", get(get_losses_handler))
+        .route("/api/training/sessions/:id/model", get(get_model_handler))
         // Data/weights upload endpoints
         .route("/api/training/data", post(upload_data_handler))
         .route("/api/training/weights", post(upload_weights_handler))
@@ -951,9 +951,9 @@ async fn start_training_handler(
         ..ZkProofConfig::default()
     };
 
-    // Generate worker endpoints (in-process workers on localhost)
+    // Generate worker endpoints with stride-2 ports (data channel on base, control on +1)
     let worker_endpoints: Vec<String> = (0..req.num_workers)
-        .map(|i| format!("127.0.0.1:{}", 9001 + i))
+        .map(|i| format!("127.0.0.1:{}", 9001 + (i as u16) * 2))
         .collect();
 
     let mut config = FullOrchestrationConfig {
@@ -985,7 +985,7 @@ async fn start_training_handler(
         #[cfg(feature = "chain")]
         payment_amount_eth: req.payment_eth,
         #[cfg(feature = "chain")]
-        stake_amount_eth: req.stake_per_worker_eth,
+        stake_amount_eth: req.stake_per_worker_eth.max(0.1), // Contract minStake is 0.1 ETH
         #[cfg(feature = "chain")]
         coordinator_address: None,
         #[cfg(feature = "chain")]
