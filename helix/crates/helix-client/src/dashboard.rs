@@ -1862,12 +1862,18 @@ async fn inference_handler(
         ).into_response(),
     };
 
+    // Extract job_id from session for on-chain attestation
+    let session_job_id = {
+        let sessions = state.sessions.read().await;
+        sessions.get(&req.session_id).map(|s| s.job_id)
+    };
+
     // Run distributed MPC inference (each worker only sees its share)
     let pixels = req.pixels;
     let num_parties = req.num_parties;
     let config = crate::inference_orchestration::InferenceConfig {
         num_parties,
-        job_id: None, // TODO: extract from session for on-chain attestation
+        job_id: session_job_id,
     };
 
     let result = crate::inference_orchestration::run_inference_orchestration(
@@ -1887,6 +1893,50 @@ async fn inference_handler(
                 .map(|s| hex::encode(s))
                 .collect();
 
+            // Attempt on-chain inference attestation (best-effort, non-blocking)
+            let mut chain_tx_hash = None::<String>;
+            let mut inference_id = None::<u64>;
+            #[cfg(feature = "chain")]
+            {
+                if let Some(job_id) = session_job_id {
+                    if job_id > 0 {
+                        let coord_addr = state.coordinator_address.read().await.clone();
+                        let rpc_url = state.eth_rpc_url.read().await.clone();
+                        if let (Some(coord), Some(rpc)) = (coord_addr, rpc_url) {
+                            use crate::rpc::chain_v4::ChainClientV4;
+                            // Use owner's default key for submission
+                            let owner_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+                            if let Ok(client) = ChainClientV4::new(&rpc, owner_key, &coord, None).await {
+                                let sigs: Vec<ethers::types::Bytes> = inference.worker_signatures
+                                    .iter()
+                                    .map(|s| ethers::types::Bytes::from(s.clone()))
+                                    .collect();
+                                match client.submit_inference_result(
+                                    job_id,
+                                    inference.prediction as u64,
+                                    inference.input_hash,
+                                    inference.output_hash,
+                                    sigs,
+                                ).await {
+                                    Ok((receipt, iid)) => {
+                                        chain_tx_hash = Some(format!("{:?}", receipt.transaction_hash));
+                                        inference_id = Some(iid);
+                                        info!(
+                                            inference_id = iid,
+                                            tx_hash = ?receipt.transaction_hash,
+                                            "Inference result submitted on-chain"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!("On-chain inference submission failed (non-fatal): {}", e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             Json(serde_json::json!({
                 "prediction": inference.prediction,
                 "confidence": inference.confidence,
@@ -1897,6 +1947,8 @@ async fn inference_handler(
                     "input_hash": input_hash_hex,
                     "output_hash": output_hash_hex,
                     "worker_signatures": sig_hexes,
+                    "chain_tx_hash": chain_tx_hash,
+                    "inference_id": inference_id,
                 },
                 "timing": {
                     "share_generation_ms": inference.timing.share_generation_ms,

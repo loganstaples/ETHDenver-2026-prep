@@ -571,6 +571,12 @@ struct SpawnWorkersArgs {
     #[arg(long, default_value = "42")]
     seed: u64,
 
+    /// Public IP/hostname for cross-machine registration (e.g. "192.168.1.100").
+    /// Workers bind on --bind but register with this address so remote machines can reach them.
+    /// Defaults to --bind value (or 127.0.0.1 if bind is 0.0.0.0).
+    #[arg(long)]
+    public_addr: Option<String>,
+
     /// Dashboard API URL to register workers with (e.g. http://localhost:3001)
     #[arg(long)]
     api_url: Option<String>,
@@ -3192,15 +3198,27 @@ async fn cmd_spawn_workers(args: &SpawnWorkersArgs, _cli: &Cli) -> Result<()> {
 
     let colors = ["red", "green", "yellow", "blue", "magenta", "cyan", "white", "bright_red", "bright_green", "bright_blue"];
 
+    // Resolve the public address for registration (so remote machines can reach these workers).
+    let public_host = args.public_addr.clone().unwrap_or_else(|| {
+        if args.bind == "0.0.0.0" {
+            "127.0.0.1".to_string()
+        } else {
+            args.bind.clone()
+        }
+    });
+
     // Print summary of worker addresses
     println!("{}", "Workers:".yellow().bold());
     let mut worker_addrs = Vec::new();
+    let mut worker_public_addrs = Vec::new();
     for i in 0..args.count {
         let port = args.base_port + (i as u16) * 2;
         let addr = format!("{}:{}", args.bind, port);
+        let pub_addr = format!("{}:{}", public_host, port);
         let color = colors[i % colors.len()];
-        println!("  [worker-{}] {} (color: {})", i, addr, color);
+        println!("  [worker-{}] bind={} public={} (color: {})", i, addr, pub_addr, color);
         worker_addrs.push(addr);
+        worker_public_addrs.push(pub_addr);
     }
     println!();
 
@@ -3254,8 +3272,8 @@ async fn cmd_spawn_workers(args: &SpawnWorkersArgs, _cli: &Cli) -> Result<()> {
 
                 match ChainClientV4::with_wallet(rpc_url, wallet, coordinator).await {
                     Ok(client) => {
-                        let endpoint = worker_addrs[i].replace("0.0.0.0", "127.0.0.1");
-                        match client.register_in_pool(&endpoint, stake_wei).await {
+                        let endpoint = &worker_public_addrs[i];
+                        match client.register_in_pool(endpoint, stake_wei).await {
                             Ok(receipt) => {
                                 let gas = receipt.gas_used.map(|g| g.as_u64()).unwrap_or(0);
                                 println!(
@@ -3289,12 +3307,11 @@ async fn cmd_spawn_workers(args: &SpawnWorkersArgs, _cli: &Cli) -> Result<()> {
     if !chain_registered {
         if let Some(ref api_url) = args.api_url {
             println!("{}", "Registering workers with dashboard API...".yellow().bold());
-            for (i, addr) in worker_addrs.iter().enumerate() {
-                let endpoint = addr.replace("0.0.0.0", "127.0.0.1");
+            for (i, pub_addr) in worker_public_addrs.iter().enumerate() {
                 let resp = http_client
                     .post(format!("{}/api/workers/register", api_url))
                     .json(&serde_json::json!({
-                        "endpoint": endpoint,
+                        "endpoint": pub_addr,
                         "party_index": i,
                     }))
                     .send()
@@ -3320,11 +3337,8 @@ async fn cmd_spawn_workers(args: &SpawnWorkersArgs, _cli: &Cli) -> Result<()> {
             println!();
         } else {
             // Print copy-paste command for --workers flag (legacy mode)
-            let workers_flag: Vec<String> = worker_addrs.iter()
-                .map(|a| a.replace("0.0.0.0", "127.0.0.1"))
-                .collect();
             println!("{}", "Copy-paste for mpc-train:".yellow().bold());
-            println!("  --workers {}", workers_flag.join(","));
+            println!("  --workers {}", worker_public_addrs.join(","));
             println!();
         }
     }
@@ -3362,33 +3376,37 @@ async fn cmd_spawn_workers(args: &SpawnWorkersArgs, _cli: &Cli) -> Result<()> {
         let listen_addr = format!("{}:{}", args.bind, port);
         let seed = args.seed + i as u64;
 
-        let config = WorkerConfig {
-            listen_addr: listen_addr.clone(),
-            party_index: i,
-            seed,
-            #[cfg(feature = "chain")]
-            eth_rpc_url: None,
-            #[cfg(feature = "chain")]
-            private_key: String::new(),
-            #[cfg(feature = "chain")]
-            job_id: None,
-            #[cfg(feature = "chain")]
-            coordinator_address: None,
-            #[cfg(feature = "chain")]
-            stake_amount_eth: 0.0,
-        };
-
         let handle = tokio::spawn(async move {
-            println!("[worker-{}] Starting on {}", i, listen_addr);
-            match launch_worker(config).await {
-                Ok(result) => {
-                    println!(
-                        "[worker-{}] Done: {} steps, {} checkpoints signed",
-                        i, result.steps_completed, result.checkpoint_signatures
-                    );
-                }
-                Err(e) => {
-                    eprintln!("[worker-{}] Error: {}", i, e);
+            // Workers loop: restart after each job so they can handle multiple
+            // training sessions without manual restart.
+            loop {
+                println!("[worker-{}] Starting on {} (waiting for job...)", i, listen_addr);
+                let job_config = WorkerConfig {
+                    listen_addr: listen_addr.clone(),
+                    party_index: i,
+                    seed,
+                    #[cfg(feature = "chain")]
+                    eth_rpc_url: None,
+                    #[cfg(feature = "chain")]
+                    private_key: String::new(),
+                    #[cfg(feature = "chain")]
+                    job_id: None,
+                    #[cfg(feature = "chain")]
+                    coordinator_address: None,
+                    #[cfg(feature = "chain")]
+                    stake_amount_eth: 0.0,
+                };
+                match launch_worker(job_config).await {
+                    Ok(result) => {
+                        println!(
+                            "[worker-{}] Job done: {} steps, {} checkpoints signed. Restarting...",
+                            i, result.steps_completed, result.checkpoint_signatures
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("[worker-{}] Error: {}. Restarting in 2s...", i, e);
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
                 }
             }
         });

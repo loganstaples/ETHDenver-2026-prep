@@ -50,6 +50,8 @@ interface MPCInferenceResult {
     input_hash: string;
     output_hash: string;
     worker_signatures: string[];
+    chain_tx_hash?: string;
+    inference_id?: number;
   };
   timing: {
     share_generation_ms: number;
@@ -610,6 +612,17 @@ function MPCResultCard({ result }: { result: MPCInferenceResult }) {
                 </span>
               </div>
             </div>
+            {result.attestation.chain_tx_hash && (
+              <div className="flex items-center gap-2 mt-1">
+                <span className="text-2xs text-helix-muted w-20">On-chain TX</span>
+                <span className="text-2xs text-green-400 font-mono truncate">
+                  {result.attestation.chain_tx_hash.slice(0, 18)}...
+                </span>
+                {result.attestation.inference_id && (
+                  <span className="text-2xs text-helix-muted">(ID: {result.attestation.inference_id})</span>
+                )}
+              </div>
+            )}
           </div>
         </div>
       )}

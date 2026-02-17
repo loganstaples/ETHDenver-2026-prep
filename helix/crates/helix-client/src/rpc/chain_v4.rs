@@ -728,6 +728,94 @@ impl ChainClientV4 {
         result
     }
 
+    // ============ Inference Attestation ============
+
+    /// Submit a multi-party inference result attestation on-chain.
+    ///
+    /// `signatures` must contain ECDSA signatures from active workers,
+    /// each signing the inference message (see `sign_inference`).
+    /// Returns `(receipt, inference_id)`.
+    pub async fn submit_inference_result(
+        &self,
+        job_id: u64,
+        prediction: u64,
+        input_hash: [u8; 32],
+        output_hash: [u8; 32],
+        signatures: Vec<Bytes>,
+    ) -> Result<(TransactionReceipt, u64)> {
+        self.check_cb().await?;
+        let result: Result<(TransactionReceipt, u64)> = async {
+            let call = self.coordinator.submit_inference_result(
+                U256::from(job_id),
+                U256::from(prediction),
+                input_hash,
+                output_hash,
+                signatures,
+            );
+            let pending = call
+                .send()
+                .await
+                .map_err(|e| anyhow!("submit_inference_result send: {}", e))?;
+            let receipt = pending
+                .await
+                .map_err(|e| anyhow!("submit_inference_result receipt: {}", e))?
+                .ok_or_else(|| anyhow!("submit_inference_result: tx dropped"))?;
+
+            // Parse inference ID from InferenceResultCommitted event
+            let coord_addr = self.coordinator_address;
+            let inference_id = receipt
+                .logs
+                .iter()
+                .find_map(|log| {
+                    if log.address == coord_addr && log.topics.len() >= 2 {
+                        Some(U256::from(log.topics[1].as_bytes()).as_u64())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+
+            Ok((receipt, inference_id))
+        }
+        .await;
+        if result.is_ok() {
+            self.ok().await;
+        } else {
+            self.fail().await;
+        }
+        result
+    }
+
+    /// Get an inference result by ID.
+    pub async fn get_inference_result(
+        &self,
+        inference_id: u64,
+    ) -> Result<(u64, u64, [u8; 32], [u8; 32], u64, u64)> {
+        self.check_cb().await?;
+        let result = self
+            .coordinator
+            .get_inference_result(U256::from(inference_id))
+            .call()
+            .await
+            .map(|resp| {
+                (
+                    resp.0.as_u64(), // jobId
+                    resp.1.as_u64(), // prediction
+                    resp.2,          // inputHash
+                    resp.3,          // outputHash
+                    resp.4.as_u64(), // timestamp
+                    resp.5.as_u64(), // signerCount
+                )
+            })
+            .map_err(|e| anyhow!("get_inference_result: {}", e));
+        if result.is_ok() {
+            self.ok().await;
+        } else {
+            self.fail().await;
+        }
+        result
+    }
+
     // ============ Halo2Verifier Deployment ============
 
     /// Deploy the real Halo2Verifier contract for on-chain ZK proof verification.
