@@ -373,34 +373,105 @@ export const HELIX_TOKEN_ABI = [
     },
 ] as const;
 
-// HelixModelStore ABI — user-owned on-chain model registry
+// HelixModelStore ABI — ERC-721 on-chain model registry
 export const HELIX_MODEL_STORE_ABI = [
+    // ── Write functions ──────────────────────────────────────────────
     {
         type: 'function',
-        name: 'registerModel',
+        name: 'createModel',
         inputs: [
-            { name: 'version', type: 'string' },
-            { name: 'rootHash', type: 'string' },
-            { name: 'accuracy', type: 'uint96' },
-            { name: 'sessionId', type: 'string' },
+            { name: 'slug', type: 'string' },
+            { name: 'name', type: 'string' },
+            { name: 'description', type: 'string' },
         ],
-        outputs: [{ name: 'index', type: 'uint256' }],
+        outputs: [{ name: 'tokenId', type: 'uint256' }],
         stateMutability: 'nonpayable',
     },
     {
         type: 'function',
-        name: 'getModels',
-        inputs: [{ name: 'user', type: 'address' }],
+        name: 'addVersion',
+        inputs: [
+            { name: 'tokenId', type: 'uint256' },
+            { name: 'semver', type: 'string' },
+            { name: 'rootHash', type: 'string' },
+            { name: 'accuracy', type: 'uint96' },
+            { name: 'sessionId', type: 'string' },
+            { name: 'weightsStored', type: 'bool' },
+        ],
+        outputs: [{ name: 'versionIndex', type: 'uint256' }],
+        stateMutability: 'nonpayable',
+    },
+    {
+        type: 'function',
+        name: 'setPublic',
+        inputs: [
+            { name: 'tokenId', type: 'uint256' },
+            { name: 'isPublic', type: 'bool' },
+        ],
+        outputs: [],
+        stateMutability: 'nonpayable',
+    },
+    {
+        type: 'function',
+        name: 'setInferenceFee',
+        inputs: [
+            { name: 'tokenId', type: 'uint256' },
+            { name: 'feeBps', type: 'uint16' },
+        ],
+        outputs: [],
+        stateMutability: 'nonpayable',
+    },
+    {
+        type: 'function',
+        name: 'grantAccess',
+        inputs: [
+            { name: 'tokenId', type: 'uint256' },
+            { name: 'account', type: 'address' },
+        ],
+        outputs: [],
+        stateMutability: 'nonpayable',
+    },
+    {
+        type: 'function',
+        name: 'revokeAccess',
+        inputs: [
+            { name: 'tokenId', type: 'uint256' },
+            { name: 'account', type: 'address' },
+        ],
+        outputs: [],
+        stateMutability: 'nonpayable',
+    },
+    // ── Read functions ───────────────────────────────────────────────
+    {
+        type: 'function',
+        name: 'models',
+        inputs: [{ name: 'tokenId', type: 'uint256' }],
+        outputs: [
+            { name: 'slug', type: 'string' },
+            { name: 'name', type: 'string' },
+            { name: 'description', type: 'string' },
+            { name: 'creator', type: 'address' },
+            { name: 'createdAt', type: 'uint40' },
+            { name: 'isPublic', type: 'bool' },
+            { name: 'inferenceFee', type: 'uint16' },
+        ],
+        stateMutability: 'view',
+    },
+    {
+        type: 'function',
+        name: 'getVersions',
+        inputs: [{ name: 'tokenId', type: 'uint256' }],
         outputs: [
             {
                 name: '',
                 type: 'tuple[]',
                 components: [
-                    { name: 'version', type: 'string' },
+                    { name: 'semver', type: 'string' },
                     { name: 'rootHash', type: 'string' },
                     { name: 'accuracy', type: 'uint96' },
                     { name: 'timestamp', type: 'uint40' },
                     { name: 'sessionId', type: 'string' },
+                    { name: 'weightsStored', type: 'bool' },
                 ],
             },
         ],
@@ -408,20 +479,169 @@ export const HELIX_MODEL_STORE_ABI = [
     },
     {
         type: 'function',
-        name: 'getModelCount',
-        inputs: [{ name: 'user', type: 'address' }],
+        name: 'getVersionCount',
+        inputs: [{ name: 'tokenId', type: 'uint256' }],
         outputs: [{ name: '', type: 'uint256' }],
         stateMutability: 'view',
     },
     {
+        type: 'function',
+        name: 'getVersion',
+        inputs: [
+            { name: 'tokenId', type: 'uint256' },
+            { name: 'versionIndex', type: 'uint256' },
+        ],
+        outputs: [
+            {
+                name: '',
+                type: 'tuple',
+                components: [
+                    { name: 'semver', type: 'string' },
+                    { name: 'rootHash', type: 'string' },
+                    { name: 'accuracy', type: 'uint96' },
+                    { name: 'timestamp', type: 'uint40' },
+                    { name: 'sessionId', type: 'string' },
+                    { name: 'weightsStored', type: 'bool' },
+                ],
+            },
+        ],
+        stateMutability: 'view',
+    },
+    {
+        type: 'function',
+        name: 'getModelBySlug',
+        inputs: [{ name: 'slug', type: 'string' }],
+        outputs: [{ name: 'tokenId', type: 'uint256' }],
+        stateMutability: 'view',
+    },
+    {
+        type: 'function',
+        name: 'hasModelAccess',
+        inputs: [
+            { name: 'tokenId', type: 'uint256' },
+            { name: 'account', type: 'address' },
+        ],
+        outputs: [{ name: '', type: 'bool' }],
+        stateMutability: 'view',
+    },
+    {
+        type: 'function',
+        name: 'accessGranted',
+        inputs: [
+            { name: 'tokenId', type: 'uint256' },
+            { name: 'account', type: 'address' },
+        ],
+        outputs: [{ name: '', type: 'bool' }],
+        stateMutability: 'view',
+    },
+    // ── ERC721Enumerable ─────────────────────────────────────────────
+    {
+        type: 'function',
+        name: 'balanceOf',
+        inputs: [{ name: 'owner', type: 'address' }],
+        outputs: [{ name: '', type: 'uint256' }],
+        stateMutability: 'view',
+    },
+    {
+        type: 'function',
+        name: 'tokenOfOwnerByIndex',
+        inputs: [
+            { name: 'owner', type: 'address' },
+            { name: 'index', type: 'uint256' },
+        ],
+        outputs: [{ name: 'tokenId', type: 'uint256' }],
+        stateMutability: 'view',
+    },
+    {
+        type: 'function',
+        name: 'ownerOf',
+        inputs: [{ name: 'tokenId', type: 'uint256' }],
+        outputs: [{ name: '', type: 'address' }],
+        stateMutability: 'view',
+    },
+    {
+        type: 'function',
+        name: 'totalSupply',
+        inputs: [],
+        outputs: [{ name: '', type: 'uint256' }],
+        stateMutability: 'view',
+    },
+    {
+        type: 'function',
+        name: 'name',
+        inputs: [],
+        outputs: [{ name: '', type: 'string' }],
+        stateMutability: 'view',
+    },
+    {
+        type: 'function',
+        name: 'symbol',
+        inputs: [],
+        outputs: [{ name: '', type: 'string' }],
+        stateMutability: 'view',
+    },
+    // ── Events ───────────────────────────────────────────────────────
+    {
         type: 'event',
-        name: 'ModelRegistered',
+        name: 'ModelCreated',
+        inputs: [
+            { name: 'tokenId', type: 'uint256', indexed: true },
+            { name: 'creator', type: 'address', indexed: true },
+            { name: 'slug', type: 'string', indexed: false },
+            { name: 'name', type: 'string', indexed: false },
+        ],
+    },
+    {
+        type: 'event',
+        name: 'VersionAdded',
+        inputs: [
+            { name: 'tokenId', type: 'uint256', indexed: true },
+            { name: 'versionIndex', type: 'uint256', indexed: true },
+            { name: 'semver', type: 'string', indexed: false },
+            { name: 'rootHash', type: 'string', indexed: false },
+        ],
+    },
+    {
+        type: 'event',
+        name: 'ModelPublicityChanged',
+        inputs: [
+            { name: 'tokenId', type: 'uint256', indexed: true },
+            { name: 'isPublic', type: 'bool', indexed: false },
+        ],
+    },
+    {
+        type: 'event',
+        name: 'InferenceFeeChanged',
+        inputs: [
+            { name: 'tokenId', type: 'uint256', indexed: true },
+            { name: 'feeBps', type: 'uint16', indexed: false },
+        ],
+    },
+    {
+        type: 'event',
+        name: 'AccessChanged',
+        inputs: [
+            { name: 'tokenId', type: 'uint256', indexed: true },
+            { name: 'account', type: 'address', indexed: true },
+            { name: 'granted', type: 'bool', indexed: false },
+        ],
+    },
+    {
+        type: 'event',
+        name: 'Transfer',
+        inputs: [
+            { name: 'from', type: 'address', indexed: true },
+            { name: 'to', type: 'address', indexed: true },
+            { name: 'tokenId', type: 'uint256', indexed: true },
+        ],
+    },
+    {
+        type: 'event',
+        name: 'Approval',
         inputs: [
             { name: 'owner', type: 'address', indexed: true },
-            { name: 'index', type: 'uint256', indexed: true },
-            { name: 'version', type: 'string', indexed: false },
-            { name: 'rootHash', type: 'string', indexed: false },
-            { name: 'accuracy', type: 'uint96', indexed: false },
+            { name: 'approved', type: 'address', indexed: true },
+            { name: 'tokenId', type: 'uint256', indexed: true },
         ],
     },
 ] as const;
@@ -512,12 +732,24 @@ export interface SlashedEvent {
     timestamp: number;
 }
 
-export interface OnChainModelEntry {
-    version: string;
+export interface OnChainModel {
+    tokenId: number;
+    slug: string;
+    name: string;
+    description: string;
+    creator: string;
+    createdAt: number;
+    isPublic: boolean;
+    inferenceFee: number; // basis points
+}
+
+export interface OnChainVersion {
+    semver: string;
     rootHash: string;
-    accuracy: number;   // already divided by 1e4
-    timestamp: number;  // unix seconds
+    accuracy: number;     // already divided by 1e4
+    timestamp: number;
     sessionId: string;
+    weightsStored: boolean;
 }
 
 // Helper to get contract address for current chain.
