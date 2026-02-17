@@ -7,6 +7,7 @@ import {
   useReadContracts,
 } from 'wagmi';
 import { getContractAddress, HELIX_MODEL_STORE_ABI, type OnChainVersion } from '@/lib/contracts';
+import { USE_MOCK_DATA, MOCK_MODELS, MOCK_CURRENT_USER } from '@/lib/mock-models';
 
 const ZERO_ADDR = '0x0000000000000000000000000000000000000000';
 
@@ -29,6 +30,7 @@ export type ModelFilter = 'all' | 'others' | 'mine';
 
 export function usePublicModels() {
   const { address, isConnected, chainId } = useAccount();
+  const live = !USE_MOCK_DATA;
 
   const contractAddress = useMemo(() => {
     if (!chainId) return ZERO_ADDR;
@@ -47,21 +49,21 @@ export function usePublicModels() {
     address: addr,
     abi: HELIX_MODEL_STORE_ABI,
     functionName: 'totalSupply',
-    query: { enabled: isContractDeployed },
+    query: { enabled: live && isContractDeployed },
   });
 
   const totalSupply = rawTotalSupply ? Number(rawTotalSupply) : 0;
 
   // Phase 2: Get all token IDs via tokenByIndex
   const tokenIdCalls = useMemo(() => {
-    if (totalSupply === 0) return [];
+    if (!live || totalSupply === 0) return [];
     return Array.from({ length: totalSupply }, (_, i) => ({
       address: addr,
       abi: HELIX_MODEL_STORE_ABI,
       functionName: 'tokenByIndex' as const,
       args: [BigInt(i)],
     }));
-  }, [totalSupply, addr]);
+  }, [live, totalSupply, addr]);
 
   const {
     data: tokenIdResults,
@@ -80,7 +82,7 @@ export function usePublicModels() {
 
   // Phase 3: Fetch model data + ownerOf + getVersions for each token
   const modelDataCalls = useMemo(() => {
-    if (tokenIds.length === 0) return [];
+    if (!live || tokenIds.length === 0) return [];
     const calls: {
       address: `0x${string}`;
       abi: typeof HELIX_MODEL_STORE_ABI;
@@ -108,7 +110,7 @@ export function usePublicModels() {
       });
     }
     return calls;
-  }, [tokenIds, addr]);
+  }, [live, tokenIds, addr]);
 
   const {
     data: modelDataResults,
@@ -119,9 +121,9 @@ export function usePublicModels() {
     query: { enabled: modelDataCalls.length > 0 },
   });
 
-  // Parse results into PublicModel[]
-  const allModels: PublicModel[] = useMemo(() => {
-    if (!modelDataResults || tokenIds.length === 0) return [];
+  // Parse on-chain results into PublicModel[]
+  const chainModels: PublicModel[] = useMemo(() => {
+    if (USE_MOCK_DATA || !modelDataResults || tokenIds.length === 0) return [];
     const result: PublicModel[] = [];
 
     for (let i = 0; i < tokenIds.length; i++) {
@@ -188,17 +190,31 @@ export function usePublicModels() {
     return result;
   }, [modelDataResults, tokenIds]);
 
-  const isLoading = isLoadingSupply || isLoadingTokenIds || isLoadingModelData;
+  // ── Mock path: build PublicModel[] from static data ────────────────
+  const mockModels: PublicModel[] = useMemo(() => {
+    if (!USE_MOCK_DATA) return [];
+    return MOCK_MODELS.map((m) => ({
+      ...m,
+      versionCount: m.versions.length,
+      latestVersion: m.versions.length > 0 ? m.versions[m.versions.length - 1] : null,
+      bestAccuracy: m.versions.reduce((best, v) => (v.accuracy > best ? v.accuracy : best), 0),
+    }));
+  }, []);
+
+  const allModels = USE_MOCK_DATA ? mockModels : chainModels;
+  const isLoading = USE_MOCK_DATA ? false : (isLoadingSupply || isLoadingTokenIds || isLoadingModelData);
 
   const refetch = () => {
-    refetchSupply();
-    refetchModelData();
+    if (!USE_MOCK_DATA) {
+      refetchSupply();
+      refetchModelData();
+    }
   };
 
   return {
-    address,
-    isConnected,
-    isContractDeployed,
+    address: USE_MOCK_DATA ? (address || MOCK_CURRENT_USER) : address,
+    isConnected: USE_MOCK_DATA ? true : isConnected,
+    isContractDeployed: USE_MOCK_DATA ? true : isContractDeployed,
     allModels,
     isLoading,
     refetch,
