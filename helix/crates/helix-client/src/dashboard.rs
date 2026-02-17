@@ -1133,11 +1133,13 @@ async fn start_training_handler(
                 .collect();
         }
 
-        // Use pre-deployed coordinator if dashboard was started with --coordinator
+        // Use pre-deployed coordinator if dashboard was started with --coordinator.
+        // use_pool_workers stays false — the orchestrator auto-generates + funds worker
+        // wallets and stakes them per-job (Phase 5.5 + Phase 6 legacy path). This avoids
+        // requiring workers to call registerInPool() on-chain before training.
         if let Some(ref coord_addr) = *state.coordinator_address.read().await {
             config.coordinator_address = Some(coord_addr.clone());
-            config.use_pool_workers = true;
-            info!(coordinator = %coord_addr, "Using pre-deployed V4 coordinator with on-chain worker pool");
+            info!(coordinator = %coord_addr, "Using pre-deployed V4 coordinator (per-job worker staking)");
         }
         if let Some(ref rpc_url) = *state.eth_rpc_url.read().await {
             config.eth_rpc_url = Some(rpc_url.clone());
