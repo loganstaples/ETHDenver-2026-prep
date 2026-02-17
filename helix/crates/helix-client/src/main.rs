@@ -403,8 +403,12 @@ struct MpcTrainArgs {
     beaver_batch_size: usize,
 
     /// Mini-batch size (samples per step). Higher values use more CPU cores.
-    #[arg(long, default_value = "1")]
+    #[arg(long, default_value = "128")]
     batch_size: usize,
+
+    /// Number of MPC workers (ignored when --workers is provided)
+    #[arg(long, default_value = "6")]
+    num_workers: usize,
 
     /// Random seed for deterministic execution
     #[arg(long, default_value = "42")]
@@ -2671,13 +2675,11 @@ async fn cmd_mpc_train(args: &MpcTrainArgs, _cli: &Cli) -> Result<()> {
         return Err(anyhow::anyhow!("--architecture requires exactly 3 dimensions (d_in,d_hid,d_out)"));
     }
 
-    // Use default 3 workers if none specified.
+    // Use --num-workers localhost endpoints if --workers not explicitly provided.
     let worker_endpoints = if args.workers.is_empty() {
-        vec![
-            "127.0.0.1:9001".to_string(),
-            "127.0.0.1:9002".to_string(),
-            "127.0.0.1:9003".to_string(),
-        ]
+        (0..args.num_workers)
+            .map(|i| format!("127.0.0.1:{}", 9001 + i))
+            .collect()
     } else {
         args.workers.clone()
     };

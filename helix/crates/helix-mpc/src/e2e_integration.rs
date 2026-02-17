@@ -458,13 +458,19 @@ async fn run_with_local_transport(
         let cfg = trainer_config.clone();
         let data = training_data.clone();
 
-        let handle = tokio::spawn(async move {
-            run_party_training(
+        // Spawn each worker on a dedicated OS thread so rayon parallelism
+        // from multiple workers runs truly concurrently across all CPU cores.
+        let handle = tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build per-worker tokio runtime");
+            rt.block_on(run_party_training(
                 cfg, transport, i, None, data,
                 num_steps, checkpoint_interval, seed,
                 None, 0, // no cheater
                 Some(bundle),
-            ).await
+            ))
         });
         handles.push(handle);
     }
@@ -494,13 +500,17 @@ async fn run_with_node_transport(
         let cfg = trainer_config.clone();
         let data = training_data.clone();
 
-        let handle = tokio::spawn(async move {
-            run_party_training(
+        let handle = tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build per-worker tokio runtime");
+            rt.block_on(run_party_training(
                 cfg, transport, i, None, data,
                 num_steps, checkpoint_interval, seed,
                 None, 0,
                 Some(bundle),
-            ).await
+            ))
         });
         handles.push(handle);
     }
@@ -604,13 +614,17 @@ async fn run_with_tcp_transport(
         let cfg = trainer_config.clone();
         let data = training_data.clone();
 
-        let handle = tokio::spawn(async move {
-            run_party_training(
+        let handle = tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build per-worker tokio runtime");
+            rt.block_on(run_party_training(
                 cfg, transport, i, None, data,
                 num_steps, checkpoint_interval, seed,
                 None, 0, // no cheater
                 Some(bundle),
-            ).await
+            ))
         });
         handles.push(handle);
     }
@@ -713,13 +727,17 @@ async fn run_with_tcp_cheater(
             None
         };
 
-        let handle = tokio::spawn(async move {
-            run_party_training(
+        let handle = tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build per-worker tokio runtime");
+            rt.block_on(run_party_training(
                 cfg, transport, i, None, data,
                 num_steps, checkpoint_interval, seed,
                 cheater_info, corrupt_at_step,
                 Some(bundle),
-            ).await
+            ))
         });
         handles.push(handle);
     }
@@ -757,13 +775,17 @@ async fn run_with_cheater(
             None
         };
 
-        let handle = tokio::spawn(async move {
-            run_party_training(
+        let handle = tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build per-worker tokio runtime");
+            rt.block_on(run_party_training(
                 cfg, transport, i, None, data,
                 num_steps, checkpoint_interval, seed,
                 cheater_info, corrupt_at_step,
                 Some(bundle),
-            ).await
+            ))
         });
         handles.push(handle);
     }
