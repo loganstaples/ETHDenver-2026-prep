@@ -20,7 +20,7 @@ export async function POST(req: NextRequest) {
     }
 
     const body = await req.json();
-    const { session_id, weights, accuracy } = body;
+    const { session_id, weights, accuracy, version } = body;
 
     if (!session_id || !weights) {
       return NextResponse.json(
@@ -31,7 +31,7 @@ export async function POST(req: NextRequest) {
 
     // Build the model artifact JSON
     const modelArtifact = {
-      version: '1.0',
+      version: version || '1.0.0',
       framework: 'helix-mpc',
       session_id,
       accuracy,

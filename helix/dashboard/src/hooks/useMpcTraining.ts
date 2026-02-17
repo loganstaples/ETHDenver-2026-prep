@@ -85,7 +85,7 @@ export interface UseMpcTrainingReturn {
   uploadData: (file: File) => Promise<void>;
   uploadWeights: (file: File) => Promise<void>;
   downloadModel: (sessionId: string) => Promise<void>;
-  storeOnZeroG: (sessionId: string) => Promise<void>;
+  storeOnZeroG: (sessionId: string, version?: string) => Promise<void>;
   session: TrainingSessionState | null;
   losses: LossDataPoint[];
   events: TrainingEvent[];
@@ -502,7 +502,8 @@ export function useMpcTraining(): UseMpcTrainingReturn {
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `helix-model-${sessionId.slice(0, 8)}.json`;
+      const sessionSlice = sessionId.slice(0, 8);
+      a.download = `helix-model-${sessionSlice}.json`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
@@ -517,7 +518,7 @@ export function useMpcTraining(): UseMpcTrainingReturn {
   // Store on 0G Storage
   // ========================================================================
 
-  const storeOnZeroG = useCallback(async (sessionId: string) => {
+  const storeOnZeroG = useCallback(async (sessionId: string, version?: string) => {
     try {
       setIsStoringOnZeroG(true);
       setError(null);
@@ -538,6 +539,7 @@ export function useMpcTraining(): UseMpcTrainingReturn {
           session_id: sessionId,
           weights: modelData.weights,
           accuracy: modelData.accuracy,
+          version,
         }),
       });
 

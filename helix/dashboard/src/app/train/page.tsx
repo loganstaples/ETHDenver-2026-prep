@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect, useCallback, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   Play,
@@ -19,6 +19,8 @@ import {
   HardDrive,
   ExternalLink,
   Copy,
+  History,
+  Tag,
 } from 'lucide-react';
 import {
   ResponsiveContainer,
@@ -64,6 +66,58 @@ const PHASE_DESCRIPTIONS: Record<number, string> = {
 const TOTAL_PHASES = 13;
 
 // ============================================================================
+// Version & Training History
+// ============================================================================
+
+const VERSION_REGEX = /^\d+(\.\d+){0,2}$/;
+
+function isValidVersion(v: string): boolean {
+  return VERSION_REGEX.test(v.trim());
+}
+
+interface TrainingHistoryEntry {
+  sessionId: string;
+  version: string;
+  accuracy: number | null;
+  steps: number;
+  totalSteps: number;
+  date: string;
+  storedOn0G: boolean;
+  rootHash?: string;
+  status: 'complete' | 'failed';
+}
+
+const HISTORY_KEY = 'helix-training-history';
+
+function getTrainingHistory(): TrainingHistoryEntry[] {
+  if (typeof window === 'undefined') return [];
+  try {
+    const raw = localStorage.getItem(HISTORY_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveTrainingHistory(entries: TrainingHistoryEntry[]): void {
+  try {
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(entries));
+  } catch {
+    // localStorage full or unavailable
+  }
+}
+
+function getNextVersion(history: TrainingHistoryEntry[]): string {
+  if (history.length === 0) return '1.0.0';
+  let maxMajor = 0;
+  for (const entry of history) {
+    const major = parseInt(entry.version.split('.')[0], 10);
+    if (!isNaN(major) && major > maxMajor) maxMajor = major;
+  }
+  return `${maxMajor + 1}.0.0`;
+}
+
+// ============================================================================
 // Chart tooltip
 // ============================================================================
 
@@ -87,16 +141,17 @@ function ChartTooltip({ active, payload, label }: any) {
 // ============================================================================
 
 interface ConfigFormProps {
-  onStart: (config: TrainingJobConfig, opts: { storeOn0G: boolean }) => void;
+  onStart: (config: TrainingJobConfig, opts: { storeOn0G: boolean; version: string }) => void;
   isStarting: boolean;
   onUploadData: (file: File) => Promise<void>;
   onUploadWeights: (file: File) => Promise<void>;
   uploadedData: UploadedData | null;
   uploadedWeights: UploadedWeights | null;
   workersOnline: number;
+  defaultVersion: string;
 }
 
-function ConfigForm({ onStart, isStarting, onUploadData, onUploadWeights, uploadedData, uploadedWeights, workersOnline }: ConfigFormProps) {
+function ConfigForm({ onStart, isStarting, onUploadData, onUploadWeights, uploadedData, uploadedWeights, workersOnline, defaultVersion }: ConfigFormProps) {
   const [numSteps, setNumSteps] = useState(500);
   const [learningRate, setLearningRate] = useState(0.001);
   const [checkpointFreq, setCheckpointFreq] = useState(50);
@@ -107,8 +162,21 @@ function ConfigForm({ onStart, isStarting, onUploadData, onUploadWeights, upload
   const [stakePerWorkerEth, setStakePerWorkerEth] = useState(0.1);
   const [simulateCheater, setSimulateCheater] = useState(false);
   const [storeOn0G, setStoreOn0G] = useState(false);
+  const [version, setVersion] = useState(defaultVersion);
+  const [versionError, setVersionError] = useState<string | null>(null);
+
+  const handleVersionChange = (v: string) => {
+    setVersion(v);
+    if (v.trim() && !isValidVersion(v)) {
+      setVersionError('Version must be x, x.y, or x.y.z (e.g. 1, 1.0, 1.0.0)');
+    } else {
+      setVersionError(null);
+    }
+  };
 
   const handleSubmit = () => {
+    const v = version.trim() || defaultVersion;
+    if (!isValidVersion(v)) return;
     onStart({
       architecture: [784, 128, 10],
       num_workers: workersOnline > 0 ? workersOnline : 3,
@@ -126,7 +194,7 @@ function ConfigForm({ onStart, isStarting, onUploadData, onUploadWeights, upload
       stake_per_worker_eth: stakePerWorkerEth,
       simulate_cheater: simulateCheater,
       seed: 42,
-    }, { storeOn0G });
+    }, { storeOn0G, version: v });
   };
 
   return (
@@ -141,6 +209,28 @@ function ConfigForm({ onStart, isStarting, onUploadData, onUploadWeights, upload
               <span className="text-sm text-helix-text font-mono">MNIST 784 → 128 → 10</span>
               <Badge variant="default" className="ml-auto">~102K params</Badge>
             </div>
+          </div>
+
+          <div>
+            <label className="label-text block mb-1.5">
+              <span className="flex items-center gap-1.5">
+                <Tag size={12} />
+                Model Version
+              </span>
+            </label>
+            <input
+              type="text"
+              value={version}
+              onChange={(e) => handleVersionChange(e.target.value)}
+              placeholder={defaultVersion}
+              className={cn(
+                'w-full px-3 py-2 bg-helix-bg border rounded-md text-sm text-helix-text font-mono focus:outline-none transition-colors',
+                versionError ? 'border-red-500/50 focus:border-red-500' : 'border-helix-border focus:border-helix-border2',
+              )}
+            />
+            {versionError && (
+              <p className="text-2xs text-red-400 mt-1">{versionError}</p>
+            )}
           </div>
 
           <div>
@@ -417,10 +507,10 @@ function ConfigForm({ onStart, isStarting, onUploadData, onUploadWeights, upload
         <button
           type="button"
           onClick={handleSubmit}
-          disabled={isStarting || workersOnline < 2}
+          disabled={isStarting || workersOnline < 2 || !!versionError}
           className={cn(
             'w-full flex items-center justify-center gap-2 py-3 rounded-lg font-medium text-sm transition-all',
-            (isStarting || workersOnline < 2)
+            (isStarting || workersOnline < 2 || !!versionError)
               ? 'bg-helix-border text-helix-muted cursor-not-allowed'
               : 'bg-white text-black hover:bg-white/90',
           )}
@@ -635,14 +725,15 @@ interface FinalResultsProps {
     current_step: number;
     status: string;
   };
+  version: string;
   onDownloadModel?: (sessionId: string) => Promise<void>;
-  onStoreOnZeroG?: (sessionId: string) => Promise<void>;
+  onStoreOnZeroG?: (sessionId: string, version?: string) => Promise<void>;
   isStoringOnZeroG?: boolean;
   zeroGResult?: ZeroGStorageResult | null;
   showStoreOn0G?: boolean;
 }
 
-function FinalResults({ session, onDownloadModel, onStoreOnZeroG, isStoringOnZeroG, zeroGResult, showStoreOn0G }: FinalResultsProps) {
+function FinalResults({ session, version, onDownloadModel, onStoreOnZeroG, isStoringOnZeroG, zeroGResult, showStoreOn0G }: FinalResultsProps) {
   const isSuccess = session.status === 'complete';
   const [copied, setCopied] = useState(false);
 
@@ -669,6 +760,7 @@ function FinalResults({ session, onDownloadModel, onStoreOnZeroG, isStoringOnZer
             <h3 className="text-lg font-semibold text-white">
               {isSuccess ? 'Training Complete' : 'Training Failed'}
             </h3>
+            <Badge variant="default" className="font-mono">v{version}</Badge>
           </div>
           {isSuccess && onDownloadModel && (
             <button
@@ -769,7 +861,7 @@ function FinalResults({ session, onDownloadModel, onStoreOnZeroG, isStoringOnZer
               ) : (
                 <button
                   type="button"
-                  onClick={() => onStoreOnZeroG?.(session.session_id)}
+                  onClick={() => onStoreOnZeroG?.(session.session_id, version)}
                   className="flex items-center gap-2 px-4 py-2 rounded-lg bg-helix-surface border border-helix-border text-sm text-helix-text hover:border-helix-border2 hover:text-white transition-colors"
                 >
                   <HardDrive size={14} />
@@ -793,14 +885,15 @@ interface LiveProgressProps {
   losses: { step: number; loss: number }[];
   isConnected: boolean;
   error: string | null;
+  version: string;
   onDownloadModel: (sessionId: string) => Promise<void>;
-  onStoreOnZeroG: (sessionId: string) => Promise<void>;
+  onStoreOnZeroG: (sessionId: string, version?: string) => Promise<void>;
   isStoringOnZeroG: boolean;
   zeroGResult: ZeroGStorageResult | null;
   showStoreOn0G: boolean;
 }
 
-function LiveProgress({ session, losses, isConnected, error, onDownloadModel, onStoreOnZeroG, isStoringOnZeroG, zeroGResult, showStoreOn0G }: LiveProgressProps) {
+function LiveProgress({ session, losses, isConnected, error, version, onDownloadModel, onStoreOnZeroG, isStoringOnZeroG, zeroGResult, showStoreOn0G }: LiveProgressProps) {
   const stepProgress = session.total_steps > 0
     ? (session.current_step / session.total_steps) * 100
     : 0;
@@ -925,6 +1018,7 @@ function LiveProgress({ session, losses, isConnected, error, onDownloadModel, on
       {isTerminal && (
         <FinalResults
           session={session}
+          version={version}
           onDownloadModel={onDownloadModel}
           onStoreOnZeroG={onStoreOnZeroG}
           isStoringOnZeroG={isStoringOnZeroG}
@@ -933,6 +1027,84 @@ function LiveProgress({ session, losses, isConnected, error, onDownloadModel, on
         />
       )}
     </div>
+  );
+}
+
+// ============================================================================
+// Training History Component
+// ============================================================================
+
+interface TrainingHistoryListProps {
+  history: TrainingHistoryEntry[];
+  onClearHistory: () => void;
+}
+
+function TrainingHistoryList({ history, onClearHistory }: TrainingHistoryListProps) {
+  if (history.length === 0) return null;
+
+  return (
+    <Card variant="default">
+      <div className="flex items-center justify-between mb-4">
+        <div className="flex items-center gap-2">
+          <History size={14} className="text-helix-text2" />
+          <h3 className="text-sm font-medium text-white">Training History</h3>
+          <Badge variant="default">{history.length}</Badge>
+        </div>
+        <button
+          type="button"
+          onClick={onClearHistory}
+          className="text-2xs text-helix-muted hover:text-red-400 transition-colors"
+        >
+          Clear
+        </button>
+      </div>
+
+      <div className="space-y-2">
+        {history.slice().reverse().map((entry) => (
+          <div
+            key={entry.sessionId}
+            className="flex items-center gap-3 px-3 py-2.5 bg-helix-bg border border-helix-border rounded-lg"
+          >
+            {entry.status === 'complete' ? (
+              <CheckCircle size={14} className="text-green-400 shrink-0" />
+            ) : (
+              <XCircle size={14} className="text-red-400 shrink-0" />
+            )}
+
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-2">
+                <Badge variant="default" className="font-mono text-2xs">v{entry.version}</Badge>
+                <span className="text-xs font-mono text-helix-muted truncate">
+                  {entry.sessionId.slice(0, 8)}
+                </span>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-4 shrink-0">
+              {entry.accuracy !== null && (
+                <span className="text-xs font-mono text-helix-text">
+                  {(entry.accuracy * 100).toFixed(1)}%
+                </span>
+              )}
+              <span className="text-xs font-mono text-helix-muted">
+                {entry.steps}/{entry.totalSteps}
+              </span>
+              {entry.storedOn0G ? (
+                <span className="flex items-center gap-1 text-2xs text-green-400">
+                  <HardDrive size={10} />
+                  0G
+                </span>
+              ) : (
+                <span className="text-2xs text-helix-dim">Local only</span>
+              )}
+              <span className="text-2xs text-helix-dim">
+                {new Date(entry.date).toLocaleDateString()}
+              </span>
+            </div>
+          </div>
+        ))}
+      </div>
+    </Card>
   );
 }
 
@@ -961,11 +1133,73 @@ export default function TrainPage() {
 
   const hasSession = session !== null;
   const [wantsStoreOn0G, setWantsStoreOn0G] = useState(false);
+  const [currentVersion, setCurrentVersion] = useState('1.0.0');
+  const [history, setHistory] = useState<TrainingHistoryEntry[]>([]);
+  const historyRecordedRef = useRef(false);
 
-  const handleStart = (config: TrainingJobConfig, opts: { storeOn0G: boolean }) => {
+  // Load history from localStorage on mount
+  useEffect(() => {
+    const h = getTrainingHistory();
+    setHistory(h);
+    setCurrentVersion(getNextVersion(h));
+  }, []);
+
+  // Record to history when session reaches terminal state
+  useEffect(() => {
+    if (!session) {
+      historyRecordedRef.current = false;
+      return;
+    }
+    if (historyRecordedRef.current) return;
+    if (session.status !== 'complete' && session.status !== 'failed') return;
+
+    historyRecordedRef.current = true;
+    const entry: TrainingHistoryEntry = {
+      sessionId: session.session_id,
+      version: currentVersion,
+      accuracy: session.accuracy,
+      steps: session.current_step,
+      totalSteps: session.total_steps,
+      date: new Date().toISOString(),
+      storedOn0G: false,
+      status: session.status as 'complete' | 'failed',
+    };
+
+    setHistory((prev) => {
+      const updated = [...prev, entry];
+      saveTrainingHistory(updated);
+      return updated;
+    });
+  }, [session, currentVersion]);
+
+  // Update history entry when 0G storage completes
+  useEffect(() => {
+    if (!zeroGResult || !session) return;
+
+    setHistory((prev) => {
+      const updated = prev.map((e) =>
+        e.sessionId === session.session_id
+          ? { ...e, storedOn0G: true, rootHash: zeroGResult.rootHash }
+          : e,
+      );
+      saveTrainingHistory(updated);
+      return updated;
+    });
+  }, [zeroGResult, session]);
+
+  const handleStart = (config: TrainingJobConfig, opts: { storeOn0G: boolean; version: string }) => {
     setWantsStoreOn0G(opts.storeOn0G);
+    setCurrentVersion(opts.version);
     startTraining(config);
   };
+
+  const handleClearHistory = useCallback(() => {
+    setHistory([]);
+    saveTrainingHistory([]);
+    setCurrentVersion('1.0.0');
+  }, []);
+
+  const defaultVersion = useMemo(() => getNextVersion(history), [history]);
 
   return (
     <motion.div
@@ -977,9 +1211,12 @@ export default function TrainPage() {
       <div className="flex items-center justify-between">
         <h1 className="page-title">Train</h1>
         {hasSession && (
-          <span className="text-2xs font-mono text-helix-muted">
-            Session: {session.session_id.slice(0, 8)}...
-          </span>
+          <div className="flex items-center gap-3">
+            <Badge variant="default" className="font-mono">v{currentVersion}</Badge>
+            <span className="text-2xs font-mono text-helix-muted">
+              Session: {session.session_id.slice(0, 8)}...
+            </span>
+          </div>
         )}
       </div>
 
@@ -992,6 +1229,7 @@ export default function TrainPage() {
           uploadedData={uploadedData}
           uploadedWeights={uploadedWeights}
           workersOnline={workersOnline}
+          defaultVersion={defaultVersion}
         />
       ) : (
         <LiveProgress
@@ -999,6 +1237,7 @@ export default function TrainPage() {
           losses={losses}
           isConnected={isConnected}
           error={error}
+          version={currentVersion}
           onDownloadModel={downloadModel}
           onStoreOnZeroG={storeOnZeroG}
           isStoringOnZeroG={isStoringOnZeroG}
@@ -1006,6 +1245,8 @@ export default function TrainPage() {
           showStoreOn0G={wantsStoreOn0G}
         />
       )}
+
+      <TrainingHistoryList history={history} onClearHistory={handleClearHistory} />
     </motion.div>
   );
 }
