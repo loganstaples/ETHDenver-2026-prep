@@ -23,6 +23,8 @@ import {
   Plus,
   AlertTriangle,
   Shield,
+  Globe,
+  Lock,
 } from 'lucide-react';
 import { Card } from '@/components/ui/Card';
 import { Badge } from '@/components/ui/Badge';
@@ -605,9 +607,11 @@ function VersionRow({ version }: { version: OnChainVersion }) {
 interface ModelCardProps {
   model: ModelWithVersions;
   onAddVersion: (model: ModelWithVersions) => void;
+  onTogglePublic: (model: ModelWithVersions) => void;
+  isToggling: boolean;
 }
 
-function ModelCard({ model, onAddVersion }: ModelCardProps) {
+function ModelCard({ model, onAddVersion, onTogglePublic, isToggling }: ModelCardProps) {
   const [expanded, setExpanded] = useState(false);
 
   const versionCount = model.versions.length;
@@ -631,6 +635,17 @@ function ModelCard({ model, onAddVersion }: ModelCardProps) {
           </div>
         </div>
         <div className="flex items-center gap-2">
+          {model.isPublic ? (
+            <Badge variant="default" className="text-green-400 text-2xs flex items-center gap-1">
+              <Globe size={10} />
+              Public
+            </Badge>
+          ) : (
+            <Badge variant="default" className="text-helix-muted text-2xs flex items-center gap-1">
+              <Lock size={10} />
+              Private
+            </Badge>
+          )}
           {model.versions.length > 0 && (
             <Badge variant="default" className="font-mono">
               v{model.versions[model.versions.length - 1]?.semver}
@@ -713,6 +728,28 @@ function ModelCard({ model, onAddVersion }: ModelCardProps) {
           Add Version
         </button>
 
+        <button
+          type="button"
+          onClick={() => onTogglePublic(model)}
+          disabled={isToggling}
+          className={cn(
+            'flex items-center gap-2 px-4 py-2 rounded-lg border text-sm transition-colors',
+            model.isPublic
+              ? 'bg-helix-surface border-helix-border text-helix-text hover:border-helix-border2 hover:text-white'
+              : 'bg-green-500/10 border-green-500/30 text-green-400 hover:bg-green-500/20',
+            isToggling && 'opacity-50 cursor-not-allowed',
+          )}
+        >
+          {isToggling ? (
+            <Loader2 size={14} className="animate-spin" />
+          ) : model.isPublic ? (
+            <Lock size={14} />
+          ) : (
+            <Globe size={14} />
+          )}
+          {model.isPublic ? 'Make Private' : 'Make Public'}
+        </button>
+
         {/* Quick inference link for best version with weights */}
         {(() => {
           const best = model.versions
@@ -751,6 +788,7 @@ export default function MyModelsPage() {
     isLoading,
     createModel,
     addVersion,
+    setPublic,
     isWritePending,
     isConfirming,
     writeError,
@@ -955,6 +993,8 @@ export default function MyModelsPage() {
                 key={model.tokenId}
                 model={model}
                 onAddVersion={(m) => setVersionTarget(m)}
+                onTogglePublic={(m) => setPublic({ tokenId: m.tokenId, isPublic: !m.isPublic })}
+                isToggling={isWritePending || isConfirming}
               />
             ))}
           </div>

@@ -568,6 +568,13 @@ export const HELIX_MODEL_STORE_ABI = [
     },
     {
         type: 'function',
+        name: 'tokenByIndex',
+        inputs: [{ name: 'index', type: 'uint256' }],
+        outputs: [{ name: 'tokenId', type: 'uint256' }],
+        stateMutability: 'view',
+    },
+    {
+        type: 'function',
         name: 'name',
         inputs: [],
         outputs: [{ name: '', type: 'string' }],

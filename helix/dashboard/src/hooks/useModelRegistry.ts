@@ -39,6 +39,7 @@ export interface UseModelRegistryReturn {
     sessionId: string;
     weightsStored: boolean;
   }) => void;
+  setPublic: (params: { tokenId: number; isPublic: boolean }) => void;
   isWritePending: boolean;
   isConfirming: boolean;
   writeError: Error | null;
@@ -239,6 +240,19 @@ export function useModelRegistry(): UseModelRegistryReturn {
     [isConnected, isContractDeployed, addr, writeContract],
   );
 
+  const setPublic = useCallback(
+    (params: { tokenId: number; isPublic: boolean }) => {
+      if (!isConnected || !isContractDeployed) return;
+      writeContract({
+        address: addr,
+        abi: HELIX_MODEL_STORE_ABI,
+        functionName: 'setPublic',
+        args: [BigInt(params.tokenId), params.isPublic],
+      });
+    },
+    [isConnected, isContractDeployed, addr, writeContract],
+  );
+
   const refetch = useCallback(() => {
     refetchBalance();
     refetchModelData();
@@ -252,6 +266,7 @@ export function useModelRegistry(): UseModelRegistryReturn {
     isLoading,
     createModel,
     addVersion,
+    setPublic,
     isWritePending,
     isConfirming,
     writeError: writeError ?? null,
