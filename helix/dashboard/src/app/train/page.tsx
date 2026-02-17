@@ -16,6 +16,9 @@ import {
   WifiOff,
   Upload,
   Download,
+  HardDrive,
+  ExternalLink,
+  Copy,
 } from 'lucide-react';
 import {
   ResponsiveContainer,
@@ -35,6 +38,7 @@ import {
   type TrainingJobConfig,
   type UploadedData,
   type UploadedWeights,
+  type ZeroGStorageResult,
 } from '@/hooks/useMpcTraining';
 
 // ============================================================================
@@ -83,7 +87,7 @@ function ChartTooltip({ active, payload, label }: any) {
 // ============================================================================
 
 interface ConfigFormProps {
-  onStart: (config: TrainingJobConfig) => void;
+  onStart: (config: TrainingJobConfig, opts: { storeOn0G: boolean }) => void;
   isStarting: boolean;
   onUploadData: (file: File) => Promise<void>;
   onUploadWeights: (file: File) => Promise<void>;
@@ -102,6 +106,7 @@ function ConfigForm({ onStart, isStarting, onUploadData, onUploadWeights, upload
   const [paymentEth, setPaymentEth] = useState(1.0);
   const [stakePerWorkerEth, setStakePerWorkerEth] = useState(0.1);
   const [simulateCheater, setSimulateCheater] = useState(false);
+  const [storeOn0G, setStoreOn0G] = useState(false);
 
   const handleSubmit = () => {
     onStart({
@@ -121,7 +126,7 @@ function ConfigForm({ onStart, isStarting, onUploadData, onUploadWeights, upload
       stake_per_worker_eth: stakePerWorkerEth,
       simulate_cheater: simulateCheater,
       seed: 42,
-    });
+    }, { storeOn0G });
   };
 
   return (
@@ -379,6 +384,31 @@ function ConfigForm({ onStart, isStarting, onUploadData, onUploadWeights, upload
               <p className="text-2xs text-helix-muted">Demo: inject a malicious worker</p>
             </div>
           </div>
+
+          {/* Store on 0G */}
+          <div className="flex items-center gap-3 py-2">
+            <button
+              type="button"
+              onClick={() => setStoreOn0G(!storeOn0G)}
+              className={cn(
+                'relative w-9 h-5 rounded-full transition-colors',
+                storeOn0G ? 'bg-white' : 'bg-helix-border',
+              )}
+            >
+              <motion.div
+                className={cn(
+                  'absolute top-0.5 w-4 h-4 rounded-full',
+                  storeOn0G ? 'bg-black' : 'bg-helix-muted',
+                )}
+                animate={{ left: storeOn0G ? 18 : 2 }}
+                transition={{ type: 'spring', stiffness: 500, damping: 35 }}
+              />
+            </button>
+            <div>
+              <span className="text-sm text-helix-text">Store on 0G</span>
+              <p className="text-2xs text-helix-muted">Save trained model to 0G decentralized storage</p>
+            </div>
+          </div>
         </div>
       </Card>
 
@@ -606,15 +636,27 @@ interface FinalResultsProps {
     status: string;
   };
   onDownloadModel?: (sessionId: string) => Promise<void>;
+  onStoreOnZeroG?: (sessionId: string) => Promise<void>;
+  isStoringOnZeroG?: boolean;
+  zeroGResult?: ZeroGStorageResult | null;
+  showStoreOn0G?: boolean;
 }
 
-function FinalResults({ session, onDownloadModel }: FinalResultsProps) {
+function FinalResults({ session, onDownloadModel, onStoreOnZeroG, isStoringOnZeroG, zeroGResult, showStoreOn0G }: FinalResultsProps) {
   const isSuccess = session.status === 'complete';
+  const [copied, setCopied] = useState(false);
+
+  const copyHash = (hash: string) => {
+    navigator.clipboard.writeText(hash);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
 
   return (
     <motion.div
       initial={{ opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
+      className="space-y-4"
     >
       <Card variant="glass" className="overflow-visible">
         <div className="flex items-center justify-between mb-4">
@@ -673,6 +715,71 @@ function FinalResults({ session, onDownloadModel }: FinalResultsProps) {
           </div>
         </div>
       </Card>
+
+      {/* 0G Storage */}
+      {isSuccess && showStoreOn0G && (
+        <Card variant="default">
+          <div className="flex items-center gap-2 mb-3">
+            <HardDrive size={14} className="text-helix-text2" />
+            <h4 className="text-sm font-medium text-white">0G Decentralized Storage</h4>
+          </div>
+
+          {zeroGResult ? (
+            <div className="space-y-3">
+              <div className="flex items-center gap-2">
+                <CheckCircle size={14} className="text-green-400 shrink-0" />
+                <span className="text-sm text-green-300">Model stored on 0G Storage</span>
+              </div>
+
+              <div className="space-y-2">
+                <div>
+                  <p className="label-text mb-1">Root Hash</p>
+                  <div className="flex items-center gap-2">
+                    <code className="flex-1 text-xs font-mono text-helix-text bg-helix-bg px-3 py-2 rounded-md border border-helix-border truncate">
+                      {zeroGResult.rootHash}
+                    </code>
+                    <button
+                      type="button"
+                      onClick={() => copyHash(zeroGResult.rootHash)}
+                      className="shrink-0 p-2 rounded-md bg-helix-bg border border-helix-border text-helix-muted hover:text-white transition-colors"
+                    >
+                      {copied ? <CheckCircle size={14} /> : <Copy size={14} />}
+                    </button>
+                  </div>
+                </div>
+
+                <a
+                  href={zeroGResult.explorerUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1.5 text-xs text-helix-text2 hover:text-white transition-colors"
+                >
+                  View on 0G Explorer
+                  <ExternalLink size={12} />
+                </a>
+              </div>
+            </div>
+          ) : (
+            <div>
+              {isStoringOnZeroG ? (
+                <div className="flex items-center gap-3 py-2">
+                  <Loader2 size={16} className="animate-spin text-helix-text2" />
+                  <span className="text-sm text-helix-text2">Uploading model to 0G Storage...</span>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => onStoreOnZeroG?.(session.session_id)}
+                  className="flex items-center gap-2 px-4 py-2 rounded-lg bg-helix-surface border border-helix-border text-sm text-helix-text hover:border-helix-border2 hover:text-white transition-colors"
+                >
+                  <HardDrive size={14} />
+                  Store Model on 0G
+                </button>
+              )}
+            </div>
+          )}
+        </Card>
+      )}
     </motion.div>
   );
 }
@@ -687,9 +794,13 @@ interface LiveProgressProps {
   isConnected: boolean;
   error: string | null;
   onDownloadModel: (sessionId: string) => Promise<void>;
+  onStoreOnZeroG: (sessionId: string) => Promise<void>;
+  isStoringOnZeroG: boolean;
+  zeroGResult: ZeroGStorageResult | null;
+  showStoreOn0G: boolean;
 }
 
-function LiveProgress({ session, losses, isConnected, error, onDownloadModel }: LiveProgressProps) {
+function LiveProgress({ session, losses, isConnected, error, onDownloadModel, onStoreOnZeroG, isStoringOnZeroG, zeroGResult, showStoreOn0G }: LiveProgressProps) {
   const stepProgress = session.total_steps > 0
     ? (session.current_step / session.total_steps) * 100
     : 0;
@@ -811,7 +922,16 @@ function LiveProgress({ session, losses, isConnected, error, onDownloadModel }: 
       </Card>
 
       {/* Final Results */}
-      {isTerminal && <FinalResults session={session} onDownloadModel={onDownloadModel} />}
+      {isTerminal && (
+        <FinalResults
+          session={session}
+          onDownloadModel={onDownloadModel}
+          onStoreOnZeroG={onStoreOnZeroG}
+          isStoringOnZeroG={isStoringOnZeroG}
+          zeroGResult={zeroGResult}
+          showStoreOn0G={showStoreOn0G}
+        />
+      )}
     </div>
   );
 }
@@ -826,6 +946,7 @@ export default function TrainPage() {
     uploadData,
     uploadWeights,
     downloadModel,
+    storeOnZeroG,
     session,
     losses,
     isConnected,
@@ -834,9 +955,17 @@ export default function TrainPage() {
     uploadedData,
     uploadedWeights,
     workersOnline,
+    zeroGResult,
+    isStoringOnZeroG,
   } = useMpcTraining();
 
   const hasSession = session !== null;
+  const [wantsStoreOn0G, setWantsStoreOn0G] = useState(false);
+
+  const handleStart = (config: TrainingJobConfig, opts: { storeOn0G: boolean }) => {
+    setWantsStoreOn0G(opts.storeOn0G);
+    startTraining(config);
+  };
 
   return (
     <motion.div
@@ -856,7 +985,7 @@ export default function TrainPage() {
 
       {!hasSession ? (
         <ConfigForm
-          onStart={startTraining}
+          onStart={handleStart}
           isStarting={isStarting}
           onUploadData={uploadData}
           onUploadWeights={uploadWeights}
@@ -871,6 +1000,10 @@ export default function TrainPage() {
           isConnected={isConnected}
           error={error}
           onDownloadModel={downloadModel}
+          onStoreOnZeroG={storeOnZeroG}
+          isStoringOnZeroG={isStoringOnZeroG}
+          zeroGResult={zeroGResult}
+          showStoreOn0G={wantsStoreOn0G}
         />
       )}
     </motion.div>

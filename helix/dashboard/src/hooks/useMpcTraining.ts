@@ -74,11 +74,18 @@ export interface UploadedWeights {
   totalParams: number;
 }
 
+export interface ZeroGStorageResult {
+  rootHash: string;
+  txHash: string;
+  explorerUrl: string;
+}
+
 export interface UseMpcTrainingReturn {
   startTraining: (config: TrainingJobConfig) => Promise<void>;
   uploadData: (file: File) => Promise<void>;
   uploadWeights: (file: File) => Promise<void>;
   downloadModel: (sessionId: string) => Promise<void>;
+  storeOnZeroG: (sessionId: string) => Promise<void>;
   session: TrainingSessionState | null;
   losses: LossDataPoint[];
   events: TrainingEvent[];
@@ -88,6 +95,8 @@ export interface UseMpcTrainingReturn {
   uploadedData: UploadedData | null;
   uploadedWeights: UploadedWeights | null;
   workersOnline: number;
+  zeroGResult: ZeroGStorageResult | null;
+  isStoringOnZeroG: boolean;
 }
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
@@ -107,6 +116,8 @@ export function useMpcTraining(): UseMpcTrainingReturn {
   const [uploadedData, setUploadedData] = useState<UploadedData | null>(null);
   const [uploadedWeights, setUploadedWeights] = useState<UploadedWeights | null>(null);
   const [workersOnline, setWorkersOnline] = useState(0);
+  const [zeroGResult, setZeroGResult] = useState<ZeroGStorageResult | null>(null);
+  const [isStoringOnZeroG, setIsStoringOnZeroG] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const sessionIdRef = useRef<string | null>(null);
@@ -503,6 +514,53 @@ export function useMpcTraining(): UseMpcTrainingReturn {
   }, []);
 
   // ========================================================================
+  // Store on 0G Storage
+  // ========================================================================
+
+  const storeOnZeroG = useCallback(async (sessionId: string) => {
+    try {
+      setIsStoringOnZeroG(true);
+      setError(null);
+
+      // Fetch model weights from the Helix backend
+      const modelRes = await fetch(`${API_BASE}/api/training/sessions/${sessionId}/model`);
+      if (!modelRes.ok) {
+        const errBody = await modelRes.json().catch(() => ({}));
+        throw new Error(errBody.message || errBody.error || `HTTP ${modelRes.status}`);
+      }
+      const modelData = await modelRes.json();
+
+      // Upload to 0G Storage via our Next.js API route
+      const res = await fetch('/api/store-on-0g', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: sessionId,
+          weights: modelData.weights,
+          accuracy: modelData.accuracy,
+        }),
+      });
+
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => ({}));
+        throw new Error(errBody.error || `HTTP ${res.status}`);
+      }
+
+      const result = await res.json();
+      setZeroGResult({
+        rootHash: result.root_hash,
+        txHash: result.tx_hash,
+        explorerUrl: result.explorer_url,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to store on 0G';
+      setError(message);
+    } finally {
+      setIsStoringOnZeroG(false);
+    }
+  }, []);
+
+  // ========================================================================
   // Worker count polling
   // ========================================================================
 
@@ -551,6 +609,7 @@ export function useMpcTraining(): UseMpcTrainingReturn {
     uploadData,
     uploadWeights,
     downloadModel,
+    storeOnZeroG,
     session,
     losses,
     events,
@@ -560,6 +619,8 @@ export function useMpcTraining(): UseMpcTrainingReturn {
     uploadedData,
     uploadedWeights,
     workersOnline,
+    zeroGResult,
+    isStoringOnZeroG,
   };
 }
 
