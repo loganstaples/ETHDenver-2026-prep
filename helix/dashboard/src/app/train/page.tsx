@@ -507,10 +507,10 @@ function ConfigForm({ onStart, isStarting, onUploadData, onUploadWeights, upload
         <button
           type="button"
           onClick={handleSubmit}
-          disabled={isStarting || workersOnline < 2 || !!versionError}
+          disabled={isStarting || !!versionError}
           className={cn(
             'w-full flex items-center justify-center gap-2 py-3 rounded-lg font-medium text-sm transition-all',
-            (isStarting || workersOnline < 2 || !!versionError)
+            (isStarting || !!versionError)
               ? 'bg-helix-border text-helix-muted cursor-not-allowed'
               : 'bg-white text-black hover:bg-white/90',
           )}
@@ -520,15 +520,15 @@ function ConfigForm({ onStart, isStarting, onUploadData, onUploadWeights, upload
               <Loader2 size={16} className="animate-spin" />
               Starting Training...
             </>
-          ) : workersOnline < 2 ? (
+          ) : workersOnline >= 2 ? (
             <>
-              <AlertTriangle size={16} />
-              Waiting for Workers ({workersOnline}/2)
+              <Play size={16} />
+              Start Distributed Training ({workersOnline} workers)
             </>
           ) : (
             <>
               <Play size={16} />
-              Start Training ({workersOnline} workers)
+              Start Training (Local MPC)
             </>
           )}
         </button>

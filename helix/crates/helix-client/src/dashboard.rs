@@ -1269,8 +1269,11 @@ async fn run_training_session(
                 })
             });
 
-            // Update final session state
-            if let Ok(mut sessions) = state.sessions.try_write() {
+            // Update final session state (use .write().await, not try_write(),
+            // to guarantee weights are stored — try_write can fail under read contention
+            // from polling handlers, causing inference to fail with "Weights not available").
+            {
+                let mut sessions = state.sessions.write().await;
                 if let Some(session) = sessions.get_mut(&session_id) {
                     session.status = "complete".to_string();
                     session.accuracy = Some(result.test_accuracy);
