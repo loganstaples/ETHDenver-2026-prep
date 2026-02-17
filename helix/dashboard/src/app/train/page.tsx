@@ -282,21 +282,29 @@ function PaymentNumber({
     colorClass,
   );
 
+  const displayText = editable ? editText : display.toFixed(4);
+
   return (
     <div className="flex items-baseline justify-center gap-4">
-      {editable ? (
-        <input
-          type="text"
-          inputMode="decimal"
-          value={editText}
-          onChange={handleChange}
-          className={cn(numberClass, 'bg-transparent text-center outline-none p-0 border-0 w-56')}
-        />
-      ) : (
-        <span className={numberClass}>
-          {display.toFixed(4)}
+      <div className="relative">
+        {/* Always-visible span sets the size — never swapped out */}
+        <span className={cn(numberClass, 'invisible')} aria-hidden>
+          {displayText}
         </span>
-      )}
+        {editable ? (
+          <input
+            type="text"
+            inputMode="decimal"
+            value={editText}
+            onChange={handleChange}
+            className={cn(numberClass, 'absolute inset-0 bg-transparent text-center outline-none p-0 border-0 w-full h-full')}
+          />
+        ) : (
+          <span className={cn(numberClass, 'absolute inset-0')}>
+            {displayText}
+          </span>
+        )}
+      </div>
       <span className={cn('text-2xl font-semibold transition-colors duration-500', colorClass)}>
         ETH
       </span>
