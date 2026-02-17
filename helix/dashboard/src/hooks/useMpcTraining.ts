@@ -87,6 +87,7 @@ export interface UseMpcTrainingReturn {
   error: string | null;
   uploadedData: UploadedData | null;
   uploadedWeights: UploadedWeights | null;
+  workersOnline: number;
 }
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
@@ -105,6 +106,7 @@ export function useMpcTraining(): UseMpcTrainingReturn {
   const [error, setError] = useState<string | null>(null);
   const [uploadedData, setUploadedData] = useState<UploadedData | null>(null);
   const [uploadedWeights, setUploadedWeights] = useState<UploadedWeights | null>(null);
+  const [workersOnline, setWorkersOnline] = useState(0);
 
   const wsRef = useRef<WebSocket | null>(null);
   const sessionIdRef = useRef<string | null>(null);
@@ -268,9 +270,17 @@ export function useMpcTraining(): UseMpcTrainingReturn {
             });
           }
 
+          // Handle worker count updates
+          if (evt.type === 'workers_updated') {
+            const count = evt.count as number | undefined;
+            if (count !== undefined) {
+              setWorkersOnline(count);
+            }
+          }
+
           // Handle session failure
           if (evt.type === 'session_failed') {
-            const reason = evt.reason as string | undefined;
+            const reason = (evt.error ?? evt.reason) as string | undefined;
             setSession((prev) => {
               if (!prev) return prev;
               return { ...prev, status: 'failed' };
@@ -441,8 +451,10 @@ export function useMpcTraining(): UseMpcTrainingReturn {
       }
 
       const result = await res.json();
+      const totalParams = result.total_params
+        ?? ((result.w1_size ?? 0) + (result.b1_size ?? 0) + (result.w2_size ?? 0) + (result.b2_size ?? 0));
       setUploadedWeights({
-        totalParams: result.total_params ?? 0,
+        totalParams,
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to upload weights';
@@ -480,6 +492,28 @@ export function useMpcTraining(): UseMpcTrainingReturn {
   }, []);
 
   // ========================================================================
+  // Worker count polling
+  // ========================================================================
+
+  useEffect(() => {
+    const fetchWorkers = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/workers`);
+        if (res.ok) {
+          const data = await res.json();
+          setWorkersOnline(data.online ?? 0);
+        }
+      } catch {
+        // Non-fatal
+      }
+    };
+
+    fetchWorkers();
+    const interval = setInterval(fetchWorkers, 5000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // ========================================================================
   // Cleanup
   // ========================================================================
 
@@ -514,6 +548,7 @@ export function useMpcTraining(): UseMpcTrainingReturn {
     error,
     uploadedData,
     uploadedWeights,
+    workersOnline,
   };
 }
 

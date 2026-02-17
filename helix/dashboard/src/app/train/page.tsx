@@ -89,10 +89,10 @@ interface ConfigFormProps {
   onUploadWeights: (file: File) => Promise<void>;
   uploadedData: UploadedData | null;
   uploadedWeights: UploadedWeights | null;
+  workersOnline: number;
 }
 
-function ConfigForm({ onStart, isStarting, onUploadData, onUploadWeights, uploadedData, uploadedWeights }: ConfigFormProps) {
-  const [numWorkers, setNumWorkers] = useState(3);
+function ConfigForm({ onStart, isStarting, onUploadData, onUploadWeights, uploadedData, uploadedWeights, workersOnline }: ConfigFormProps) {
   const [numSteps, setNumSteps] = useState(500);
   const [learningRate, setLearningRate] = useState(0.001);
   const [checkpointFreq, setCheckpointFreq] = useState(50);
@@ -105,8 +105,8 @@ function ConfigForm({ onStart, isStarting, onUploadData, onUploadWeights, upload
 
   const handleSubmit = () => {
     onStart({
-      architecture: [784, 32, 10],
-      num_workers: numWorkers,
+      architecture: [784, 128, 10],
+      num_workers: workersOnline > 0 ? workersOnline : 3,
       num_steps: numSteps,
       learning_rate: learningRate,
       checkpoint_freq: checkpointFreq,
@@ -116,7 +116,7 @@ function ConfigForm({ onStart, isStarting, onUploadData, onUploadWeights, upload
       min_workers_for_mpc: minWorkersForMpc,
       train_size: 1000,
       test_size: 200,
-      use_real_mnist: false,
+      use_real_mnist: true,
       payment_eth: paymentEth,
       stake_per_worker_eth: stakePerWorkerEth,
       simulate_cheater: simulateCheater,
@@ -133,26 +133,24 @@ function ConfigForm({ onStart, isStarting, onUploadData, onUploadWeights, upload
           <div>
             <label className="label-text block mb-1.5">Architecture</label>
             <div className="flex items-center gap-2 px-3 py-2 bg-helix-bg border border-helix-border rounded-md">
-              <span className="text-sm text-helix-text font-mono">MNIST 784 → 32 → 10</span>
-              <Badge variant="default" className="ml-auto">25K params</Badge>
+              <span className="text-sm text-helix-text font-mono">MNIST 784 → 128 → 10</span>
+              <Badge variant="default" className="ml-auto">~102K params</Badge>
             </div>
           </div>
 
           <div>
-            <label className="label-text block mb-1.5">
-              Workers: <span className="text-helix-text">{numWorkers}</span>
-            </label>
-            <input
-              type="range"
-              min={2}
-              max={7}
-              value={numWorkers}
-              onChange={(e) => setNumWorkers(Number(e.target.value))}
-              className="w-full accent-white h-1 bg-helix-border rounded-full appearance-none cursor-pointer"
-            />
-            <div className="flex justify-between text-2xs text-helix-dim mt-1">
-              <span>2</span>
-              <span>7</span>
+            <label className="label-text block mb-1.5">MPC Workers</label>
+            <div className="flex items-center gap-2 px-3 py-2 bg-helix-bg border border-helix-border rounded-md">
+              <span className={cn(
+                'inline-block w-2 h-2 rounded-full',
+                workersOnline >= 2 ? 'bg-green-400 animate-pulse' : 'bg-red-400',
+              )} />
+              <span className="text-sm text-helix-text font-mono">
+                {workersOnline} worker{workersOnline !== 1 ? 's' : ''} online
+              </span>
+              {workersOnline < 2 && (
+                <span className="text-2xs text-red-400 ml-auto">Need 2+</span>
+              )}
             </div>
           </div>
 
@@ -324,7 +322,7 @@ function ConfigForm({ onStart, isStarting, onUploadData, onUploadWeights, upload
                   value={minWorkersForMpc}
                   onChange={(e) => setMinWorkersForMpc(Number(e.target.value))}
                   min={2}
-                  max={numWorkers}
+                  max={workersOnline > 2 ? workersOnline : 7}
                   className="w-full px-3 py-2 bg-helix-bg border border-helix-border rounded-md text-sm text-helix-text font-mono focus:outline-none focus:border-helix-border2 transition-colors"
                 />
               </motion.div>
@@ -389,10 +387,10 @@ function ConfigForm({ onStart, isStarting, onUploadData, onUploadWeights, upload
         <button
           type="button"
           onClick={handleSubmit}
-          disabled={isStarting}
+          disabled={isStarting || workersOnline < 2}
           className={cn(
             'w-full flex items-center justify-center gap-2 py-3 rounded-lg font-medium text-sm transition-all',
-            isStarting
+            (isStarting || workersOnline < 2)
               ? 'bg-helix-border text-helix-muted cursor-not-allowed'
               : 'bg-white text-black hover:bg-white/90',
           )}
@@ -402,10 +400,15 @@ function ConfigForm({ onStart, isStarting, onUploadData, onUploadWeights, upload
               <Loader2 size={16} className="animate-spin" />
               Starting Training...
             </>
+          ) : workersOnline < 2 ? (
+            <>
+              <AlertTriangle size={16} />
+              Waiting for Workers ({workersOnline}/2)
+            </>
           ) : (
             <>
               <Play size={16} />
-              Start Training
+              Start Training ({workersOnline} workers)
             </>
           )}
         </button>
@@ -827,6 +830,7 @@ export default function TrainPage() {
     error,
     uploadedData,
     uploadedWeights,
+    workersOnline,
   } = useMpcTraining();
 
   const hasSession = session !== null;
@@ -855,6 +859,7 @@ export default function TrainPage() {
           onUploadWeights={uploadWeights}
           uploadedData={uploadedData}
           uploadedWeights={uploadedWeights}
+          workersOnline={workersOnline}
         />
       ) : (
         <LiveProgress

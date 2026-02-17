@@ -7,14 +7,16 @@
 # Starts:
 #   1. Anvil (local chain on port 8545)
 #   2. Backend API (Axum on port 3001)
-#   3. Next.js Dashboard (port 3000)
+#   3. MPC Workers (auto-register with API)
+#   4. Next.js Dashboard (port 3000)
 #
 # Then open http://localhost:3000/train and click "Start Training".
 #
 # Usage:
-#   ./scripts/mpc-demo.sh              # Full demo (dashboard + API)
-#   ./scripts/mpc-demo.sh --cli-only   # CLI training only (no web UI)
-#   ./scripts/mpc-demo.sh --skip-build # Skip Rust/JS build (fast restart)
+#   ./scripts/mpc-demo.sh                    # Full demo (dashboard + API + 6 workers)
+#   ./scripts/mpc-demo.sh --workers 10       # Use 10 workers
+#   ./scripts/mpc-demo.sh --cli-only         # CLI training only (no web UI)
+#   ./scripts/mpc-demo.sh --skip-build       # Skip Rust/JS build (fast restart)
 #   ./scripts/mpc-demo.sh --help
 # ==============================================================================
 
@@ -41,14 +43,16 @@ warn()    { echo -e "  ${YELLOW}!${NC} $1"; }
 # PIDs to clean up
 ANVIL_PID=""
 API_PID=""
+WORKERS_PID=""
 DASH_PID=""
 
 cleanup() {
     echo ""
     log "Shutting down..."
-    [ -n "$DASH_PID" ]  && kill "$DASH_PID"  2>/dev/null && echo "  Dashboard stopped"
-    [ -n "$API_PID" ]   && kill "$API_PID"   2>/dev/null && echo "  API stopped"
-    [ -n "$ANVIL_PID" ] && kill "$ANVIL_PID" 2>/dev/null && echo "  Anvil stopped"
+    [ -n "$DASH_PID" ]    && kill "$DASH_PID"    2>/dev/null && echo "  Dashboard stopped"
+    [ -n "$WORKERS_PID" ] && kill "$WORKERS_PID" 2>/dev/null && echo "  Workers stopped"
+    [ -n "$API_PID" ]     && kill "$API_PID"     2>/dev/null && echo "  API stopped"
+    [ -n "$ANVIL_PID" ]   && kill "$ANVIL_PID"   2>/dev/null && echo "  Anvil stopped"
     log "Done."
 }
 trap cleanup EXIT INT TERM
@@ -58,11 +62,13 @@ trap cleanup EXIT INT TERM
 # ============================================================================
 CLI_ONLY=false
 SKIP_BUILD=false
+NUM_WORKERS=6
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --cli-only)   CLI_ONLY=true;   shift ;;
         --skip-build) SKIP_BUILD=true; shift ;;
+        --workers)    NUM_WORKERS="$2"; shift 2 ;;
         --help|-h)
             cat <<'EOF'
 HELIX MPC Demo
@@ -70,6 +76,7 @@ HELIX MPC Demo
 Usage: ./scripts/mpc-demo.sh [OPTIONS]
 
 Options:
+    --workers N     Number of MPC workers to launch (default: 6)
     --cli-only      Run CLI training only (no web dashboard)
     --skip-build    Skip Rust and JS builds (fast restart)
     --help, -h      Show this help
@@ -78,9 +85,12 @@ Full Demo (open browser):
     ./scripts/mpc-demo.sh
     # Then open http://localhost:3000/train
 
+Full Demo with more workers:
+    ./scripts/mpc-demo.sh --workers 10
+
 CLI-Only Demo (no browser):
     ./scripts/mpc-demo.sh --cli-only
-    # Runs MNIST 784→32→10 with 3 MPC workers, 500 steps
+    # Runs MNIST 784→128→10 with 6 MPC workers, 500 steps
 EOF
             exit 0
             ;;
@@ -210,7 +220,25 @@ if ! $CLI_ONLY; then
     fi
 
     # ========================================================================
-    # 3. Start Dashboard (port 3000)
+    # 3. Spawn MPC Workers (register with API)
+    # ========================================================================
+    log "Launching $NUM_WORKERS MPC workers..."
+    "$HELIX_ROOT/target/release/helix" spawn-workers \
+        --count "$NUM_WORKERS" \
+        --api-url http://localhost:3001 \
+        > "$HELIX_ROOT/.helix/workers.log" 2>&1 &
+    WORKERS_PID=$!
+    sleep 2
+
+    if kill -0 "$WORKERS_PID" 2>/dev/null; then
+        ok "$NUM_WORKERS workers launched and registered (PID: $WORKERS_PID)"
+    else
+        err "Workers failed to start. Check .helix/workers.log"
+        exit 1
+    fi
+
+    # ========================================================================
+    # 4. Start Dashboard (port 3000)
     # ========================================================================
     log "Starting Next.js dashboard on port 3000..."
     cd "$HELIX_ROOT/dashboard"
@@ -238,9 +266,10 @@ if ! $CLI_ONLY; then
     echo -e "  ${BOLD}Dashboard:${NC}  http://localhost:3000/train"
     echo -e "  ${BOLD}API:${NC}        http://localhost:3001"
     echo -e "  ${BOLD}Chain:${NC}      http://localhost:8545"
+    echo -e "  ${BOLD}Workers:${NC}    $NUM_WORKERS MPC workers registered"
     echo ""
     echo -e "  Open the dashboard and click ${BOLD}Start Training${NC}"
-    echo -e "  Default: MNIST 784→32→10, 3 workers, 500 steps"
+    echo -e "  Workers will be auto-assigned when training starts."
     echo ""
     echo -e "  ${DIM}Press Ctrl+C to stop everything${NC}"
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -259,11 +288,12 @@ else
     echo ""
 
     exec "$HELIX_ROOT/target/release/helix" mpc-train \
-        --architecture 784,32,10 \
+        --architecture 784,128,10 \
         --steps 500 \
         --checkpoint-freq 50 \
         --mac-interval 1 \
         --train-size 1000 \
         --test-size 200 \
+        --num-workers "$NUM_WORKERS" \
         --seed 42
 fi

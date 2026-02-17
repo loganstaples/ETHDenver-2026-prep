@@ -296,6 +296,43 @@ pub fn populate_demo_network(status: &mut NetworkStatus) {
 }
 
 // ---------------------------------------------------------------------------
+// Worker Registry
+// ---------------------------------------------------------------------------
+
+/// A registered MPC worker that is available for training jobs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisteredWorker {
+    /// Unique worker ID (assigned on registration)
+    pub id: String,
+    /// TCP endpoint the worker is listening on (e.g. "192.168.1.5:9001")
+    pub endpoint: String,
+    /// Party index hint (from the worker)
+    pub party_index: usize,
+    /// Unix timestamp when the worker registered
+    pub registered_at: f64,
+    /// Unix timestamp of the last heartbeat
+    pub last_heartbeat: f64,
+    /// Worker status: "idle", "busy", "offline"
+    pub status: String,
+}
+
+/// Request body for worker registration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerRegisterRequest {
+    /// TCP endpoint the worker is listening on
+    pub endpoint: String,
+    /// Party index hint
+    #[serde(default)]
+    pub party_index: usize,
+}
+
+/// Request body for worker heartbeat.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerHeartbeatRequest {
+    pub worker_id: String,
+}
+
+// ---------------------------------------------------------------------------
 // Dashboard State
 // ---------------------------------------------------------------------------
 
@@ -325,6 +362,8 @@ pub struct DashboardState {
     pub uploaded_data: RwLock<Option<Vec<(Vec<f64>, Vec<f64>)>>>,
     /// Uploaded initial weights (for continue-training)
     pub uploaded_weights: RwLock<Option<serde_json::Value>>,
+    /// Registered MPC workers available for training jobs
+    pub registered_workers: RwLock<Vec<RegisteredWorker>>,
 }
 
 impl DashboardState {
@@ -344,6 +383,7 @@ impl DashboardState {
             ws_broadcast,
             uploaded_data: RwLock::new(None),
             uploaded_weights: RwLock::new(None),
+            registered_workers: RwLock::new(Vec::new()),
         }
     }
 
@@ -604,6 +644,10 @@ pub fn create_dashboard_router_with_state(state: Arc<DashboardState>) -> Router 
         // Data/weights upload endpoints
         .route("/api/training/data", post(upload_data_handler))
         .route("/api/training/weights", post(upload_weights_handler))
+        // Worker registry endpoints
+        .route("/api/workers", get(list_workers_handler))
+        .route("/api/workers/register", post(register_worker_handler))
+        .route("/api/workers/heartbeat", post(heartbeat_worker_handler))
         // WebSocket endpoint
         .route("/ws", get(websocket_handler))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
@@ -763,6 +807,9 @@ async fn root_handler() -> Json<serde_json::Value> {
             "/api/training/sessions",
             "/api/training/sessions/:id",
             "/api/training/sessions/:id/losses",
+            "/api/workers",
+            "/api/workers/register",
+            "/api/workers/heartbeat",
             "/ws"
         ]
     }))
@@ -908,12 +955,56 @@ async fn start_training_handler(
             Json(serde_json::json!({ "error": "architecture must have exactly 3 elements [input, hidden, output]" })),
         ).into_response();
     }
-    if req.num_workers < 2 || req.num_workers > 10 {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "num_workers must be between 2 and 10" })),
-        ).into_response();
-    }
+
+    // Use registered workers if available, otherwise fall back to num_workers
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    let registered: Vec<RegisteredWorker> = {
+        let workers = state.registered_workers.read().await;
+        workers.iter()
+            .filter(|w| w.status == "idle" && (now_ts - w.last_heartbeat) <= 30.0)
+            .cloned()
+            .collect()
+    };
+
+    let (num_workers, worker_endpoints) = if !registered.is_empty() {
+        let count = registered.len().min(10); // cap at 10 (Anvil key limit)
+        if count < 2 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "Need at least 2 online workers to start training" })),
+            ).into_response();
+        }
+        let endpoints: Vec<String> = registered[..count].iter().map(|w| w.endpoint.clone()).collect();
+        info!(count, "Using {} registered workers", count);
+
+        // Mark workers as busy
+        {
+            let mut workers = state.registered_workers.write().await;
+            for w in workers.iter_mut() {
+                if registered[..count].iter().any(|r| r.id == w.id) {
+                    w.status = "busy".to_string();
+                }
+            }
+        }
+
+        (count, endpoints)
+    } else {
+        // Fallback: generate endpoints from num_workers (legacy/CLI mode)
+        let nw = req.num_workers;
+        if nw < 2 || nw > 10 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "num_workers must be between 2 and 10" })),
+            ).into_response();
+        }
+        let endpoints: Vec<String> = (0..nw)
+            .map(|i| format!("127.0.0.1:{}", 9001 + (i as u16) * 2))
+            .collect();
+        (nw, endpoints)
+    };
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -953,11 +1044,6 @@ async fn start_training_handler(
         checkpoint_frequency: req.zk_checkpoint_freq as usize,
         ..ZkProofConfig::default()
     };
-
-    // Generate worker endpoints with stride-2 ports (data channel on base, control on +1)
-    let worker_endpoints: Vec<String> = (0..req.num_workers)
-        .map(|i| format!("127.0.0.1:{}", 9001 + (i as u16) * 2))
-        .collect();
 
     let mut config = FullOrchestrationConfig {
         architecture: req.architecture.clone(),
@@ -1015,7 +1101,7 @@ async fn start_training_handler(
             "0xdbda1821b80551c9d65939329250298aa3472ba22feea921c0cf5d620ea67b97",
             "0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6",
         ];
-        config.worker_private_keys = anvil_keys[..req.num_workers]
+        config.worker_private_keys = anvil_keys[..num_workers.min(anvil_keys.len())]
             .iter()
             .map(|k| k.to_string())
             .collect();
@@ -1191,6 +1277,24 @@ async fn run_training_session(
 
     // Clean up orchestrator
     orchestrator.shutdown();
+
+    // Mark all busy workers as idle again
+    if let Ok(mut workers) = state.registered_workers.try_write() {
+        for w in workers.iter_mut() {
+            if w.status == "busy" {
+                w.status = "idle".to_string();
+            }
+        }
+    }
+
+    // Broadcast worker status update
+    let idle_count = state.registered_workers.try_read()
+        .map(|w| w.iter().filter(|w| w.status == "idle").count())
+        .unwrap_or(0);
+    let _ = state.ws_broadcast.send(("__system__".to_string(), serde_json::json!({
+        "type": "workers_updated",
+        "count": idle_count,
+    })));
 }
 
 /// GET /api/training/sessions — list all training sessions
@@ -1314,11 +1418,18 @@ async fn handle_websocket(socket: WebSocket, state: Arc<DashboardState>) {
             // Forward broadcast messages to this WebSocket client
             Some(msg) = forward_rx.recv() => {
                 if let Some(session_id) = msg.get("session_id").and_then(|v| v.as_str()) {
-                    let channel = format!("training:{}", session_id);
-                    // Send if subscribed to this session or to "training:*" (all)
-                    if subscriptions.contains(&channel) || subscriptions.contains(&"training:*".to_string()) {
+                    // System messages (worker updates) go to all clients
+                    if session_id == "__system__" {
                         if sender.send(Message::Text(msg.to_string().into())).await.is_err() {
                             break;
+                        }
+                    } else {
+                        let channel = format!("training:{}", session_id);
+                        // Send if subscribed to this session or to "training:*" (all)
+                        if subscriptions.contains(&channel) || subscriptions.contains(&"training:*".to_string()) {
+                            if sender.send(Message::Text(msg.to_string().into())).await.is_err() {
+                                break;
+                            }
                         }
                     }
                 }
@@ -1422,6 +1533,8 @@ async fn upload_weights_handler(
 
     info!(w1 = w1_len, b1 = b1_len, w2 = w2_len, b2 = b2_len, "Initial weights uploaded");
 
+    let total_params = w1_len + b1_len + w2_len + b2_len;
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -1430,8 +1543,120 @@ async fn upload_weights_handler(
             "b1_size": b1_len,
             "w2_size": w2_len,
             "b2_size": b2_len,
+            "total_params": total_params,
         })),
     ).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Handlers: Worker Registry
+// ---------------------------------------------------------------------------
+
+/// POST /api/workers/register — register a new MPC worker
+async fn register_worker_handler(
+    State(state): State<Arc<DashboardState>>,
+    Json(req): Json<WorkerRegisterRequest>,
+) -> impl IntoResponse {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+
+    let worker_id = uuid::Uuid::new_v4().to_string();
+
+    let worker = RegisteredWorker {
+        id: worker_id.clone(),
+        endpoint: req.endpoint.clone(),
+        party_index: req.party_index,
+        registered_at: now,
+        last_heartbeat: now,
+        status: "idle".to_string(),
+    };
+
+    let mut workers = state.registered_workers.write().await;
+    // Remove any existing worker with the same endpoint (re-registration)
+    workers.retain(|w| w.endpoint != req.endpoint);
+    workers.push(worker);
+
+    let count = workers.len();
+    drop(workers);
+
+    info!(worker_id = %worker_id, endpoint = %req.endpoint, total = count, "Worker registered");
+
+    // Broadcast worker count update to WebSocket clients
+    let _ = state.ws_broadcast.send(("__system__".to_string(), serde_json::json!({
+        "type": "workers_updated",
+        "count": count,
+    })));
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "worker_id": worker_id,
+            "status": "registered",
+            "total_workers": count,
+        })),
+    ).into_response()
+}
+
+/// POST /api/workers/heartbeat — worker heartbeat to stay alive
+async fn heartbeat_worker_handler(
+    State(state): State<Arc<DashboardState>>,
+    Json(req): Json<WorkerHeartbeatRequest>,
+) -> impl IntoResponse {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+
+    let mut workers = state.registered_workers.write().await;
+    if let Some(worker) = workers.iter_mut().find(|w| w.id == req.worker_id) {
+        worker.last_heartbeat = now;
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": "ok" })),
+        ).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Worker not found" })),
+        ).into_response()
+    }
+}
+
+/// GET /api/workers — list all registered workers
+async fn list_workers_handler(
+    State(state): State<Arc<DashboardState>>,
+) -> Json<serde_json::Value> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+
+    let workers = state.registered_workers.read().await;
+    let worker_list: Vec<serde_json::Value> = workers.iter().map(|w| {
+        let effective_status = if now - w.last_heartbeat > 30.0 && w.status == "idle" {
+            "offline"
+        } else {
+            &w.status
+        };
+        serde_json::json!({
+            "id": w.id,
+            "endpoint": w.endpoint,
+            "party_index": w.party_index,
+            "status": effective_status,
+            "registered_at": w.registered_at,
+            "last_heartbeat": w.last_heartbeat,
+        })
+    }).collect();
+
+    let online_count = workers.iter().filter(|w| now - w.last_heartbeat <= 30.0).count();
+
+    Json(serde_json::json!({
+        "workers": worker_list,
+        "total": workers.len(),
+        "online": online_count,
+    }))
 }
 
 // ---------------------------------------------------------------------------

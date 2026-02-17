@@ -563,6 +563,10 @@ struct SpawnWorkersArgs {
     /// Base random seed (worker i uses seed + i)
     #[arg(long, default_value = "42")]
     seed: u64,
+
+    /// Dashboard API URL to register workers with (e.g. http://localhost:3001)
+    #[arg(long)]
+    api_url: Option<String>,
 }
 
 #[derive(Args)]
@@ -3152,13 +3156,71 @@ async fn cmd_spawn_workers(args: &SpawnWorkersArgs, _cli: &Cli) -> Result<()> {
     }
     println!();
 
-    // Print copy-paste command for --workers flag
-    let workers_flag: Vec<String> = worker_addrs.iter()
-        .map(|a| a.replace("0.0.0.0", "127.0.0.1"))
-        .collect();
-    println!("{}", "Copy-paste for mpc-train:".yellow().bold());
-    println!("  --workers {}", workers_flag.join(","));
-    println!();
+    // Register with dashboard API if --api-url is provided
+    let http_client = reqwest::Client::new();
+    let mut worker_ids: Vec<String> = Vec::new();
+
+    if let Some(ref api_url) = args.api_url {
+        println!("{}", "Registering workers with dashboard API...".yellow().bold());
+        for (i, addr) in worker_addrs.iter().enumerate() {
+            let endpoint = addr.replace("0.0.0.0", "127.0.0.1");
+            let resp = http_client
+                .post(format!("{}/api/workers/register", api_url))
+                .json(&serde_json::json!({
+                    "endpoint": endpoint,
+                    "party_index": i,
+                }))
+                .send()
+                .await;
+
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    let body: serde_json::Value = r.json().await.unwrap_or_default();
+                    let wid = body["worker_id"].as_str().unwrap_or("unknown").to_string();
+                    println!("  {} [worker-{}] registered (id: {})", "✓".green(), i, &wid[..8]);
+                    worker_ids.push(wid);
+                }
+                Ok(r) => {
+                    eprintln!("  {} [worker-{}] registration failed: HTTP {}", "✗".red(), i, r.status());
+                    worker_ids.push(String::new());
+                }
+                Err(e) => {
+                    eprintln!("  {} [worker-{}] registration failed: {}", "✗".red(), i, e);
+                    worker_ids.push(String::new());
+                }
+            }
+        }
+        println!();
+    } else {
+        // Print copy-paste command for --workers flag (legacy mode)
+        let workers_flag: Vec<String> = worker_addrs.iter()
+            .map(|a| a.replace("0.0.0.0", "127.0.0.1"))
+            .collect();
+        println!("{}", "Copy-paste for mpc-train:".yellow().bold());
+        println!("  --workers {}", workers_flag.join(","));
+        println!();
+    }
+
+    // Spawn heartbeat task if registered
+    let heartbeat_handle = if let Some(ref api_url) = args.api_url {
+        let url = api_url.clone();
+        let ids: Vec<String> = worker_ids.iter().filter(|id| !id.is_empty()).cloned().collect();
+        let client = http_client.clone();
+        Some(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                for wid in &ids {
+                    let _ = client
+                        .post(format!("{}/api/workers/heartbeat", url))
+                        .json(&serde_json::json!({ "worker_id": wid }))
+                        .send()
+                        .await;
+                }
+            }
+        }))
+    } else {
+        None
+    };
 
     // Spawn all workers as tokio tasks
     let mut handles = Vec::new();
@@ -3201,13 +3263,22 @@ async fn cmd_spawn_workers(args: &SpawnWorkersArgs, _cli: &Cli) -> Result<()> {
         handles.push(handle);
     }
 
-    println!("{}", "All workers started. Press Ctrl+C to shut down.".green().bold());
+    println!("{}", "All workers started. Waiting for training jobs...".green().bold());
+    if args.api_url.is_some() {
+        println!("{}", "Workers registered with dashboard — they will be auto-assigned when training starts.".cyan());
+    }
+    println!("{}", "Press Ctrl+C to shut down.".dimmed());
     println!();
 
     // Wait for SIGINT
     signal::ctrl_c().await?;
     println!();
     println!("{}", "Shutting down workers...".yellow());
+
+    // Abort heartbeat task
+    if let Some(hb) = heartbeat_handle {
+        hb.abort();
+    }
 
     // Abort all worker tasks
     for handle in &handles {
