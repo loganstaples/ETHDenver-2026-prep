@@ -423,6 +423,35 @@ export const HELIX_MODEL_STORE_ABI = [
     },
     {
         type: 'function',
+        name: 'setForSale',
+        inputs: [
+            { name: 'tokenId', type: 'uint256' },
+            { name: 'forSale', type: 'bool' },
+        ],
+        outputs: [],
+        stateMutability: 'nonpayable',
+    },
+    {
+        type: 'function',
+        name: 'setSalePrice',
+        inputs: [
+            { name: 'tokenId', type: 'uint256' },
+            { name: 'price', type: 'uint256' },
+        ],
+        outputs: [],
+        stateMutability: 'nonpayable',
+    },
+    {
+        type: 'function',
+        name: 'buyModel',
+        inputs: [
+            { name: 'tokenId', type: 'uint256' },
+        ],
+        outputs: [],
+        stateMutability: 'payable',
+    },
+    {
+        type: 'function',
         name: 'grantAccess',
         inputs: [
             { name: 'tokenId', type: 'uint256' },
@@ -534,6 +563,21 @@ export const HELIX_MODEL_STORE_ABI = [
         outputs: [{ name: '', type: 'bool' }],
         stateMutability: 'view',
     },
+    // ── Sale / marketplace reads ───────────────────────────────────────
+    {
+        type: 'function',
+        name: 'isForSale',
+        inputs: [{ name: 'tokenId', type: 'uint256' }],
+        outputs: [{ name: '', type: 'bool' }],
+        stateMutability: 'view',
+    },
+    {
+        type: 'function',
+        name: 'salePrice',
+        inputs: [{ name: 'tokenId', type: 'uint256' }],
+        outputs: [{ name: '', type: 'uint256' }],
+        stateMutability: 'view',
+    },
     // ── ERC721Enumerable ─────────────────────────────────────────────
     {
         type: 'function',
@@ -631,6 +675,32 @@ export const HELIX_MODEL_STORE_ABI = [
             { name: 'tokenId', type: 'uint256', indexed: true },
             { name: 'account', type: 'address', indexed: true },
             { name: 'granted', type: 'bool', indexed: false },
+        ],
+    },
+    {
+        type: 'event',
+        name: 'ModelForSaleChanged',
+        inputs: [
+            { name: 'tokenId', type: 'uint256', indexed: true },
+            { name: 'forSale', type: 'bool', indexed: false },
+        ],
+    },
+    {
+        type: 'event',
+        name: 'SalePriceChanged',
+        inputs: [
+            { name: 'tokenId', type: 'uint256', indexed: true },
+            { name: 'price', type: 'uint256', indexed: false },
+        ],
+    },
+    {
+        type: 'event',
+        name: 'ModelSold',
+        inputs: [
+            { name: 'tokenId', type: 'uint256', indexed: true },
+            { name: 'seller', type: 'address', indexed: true },
+            { name: 'buyer', type: 'address', indexed: true },
+            { name: 'price', type: 'uint256', indexed: false },
         ],
     },
     {

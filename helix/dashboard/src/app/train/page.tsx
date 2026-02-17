@@ -1,7 +1,8 @@
 'use client';
 
-import { useState, useMemo, useEffect, useCallback, useRef } from 'react';
+import { useState, useMemo, useEffect, useCallback, useRef, Suspense } from 'react';
 import Link from 'next/link';
+import { useSearchParams } from 'next/navigation';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   Play,
@@ -23,6 +24,8 @@ import {
   History,
   Tag,
   Link2,
+  RefreshCw,
+  ChevronDown,
 } from 'lucide-react';
 import {
   ResponsiveContainer,
@@ -33,6 +36,7 @@ import {
   CartesianGrid,
   Tooltip as RechartsTooltip,
 } from 'recharts';
+import { useSignMessage } from 'wagmi';
 import { Card } from '@/components/ui/Card';
 import { ProgressBar } from '@/components/ui/ProgressBar';
 import { Badge } from '@/components/ui/Badge';
@@ -44,6 +48,8 @@ import {
   type UploadedWeights,
   type ZeroGStorageResult,
 } from '@/hooks/useMpcTraining';
+import { useModelRegistry, type ModelWithVersions } from '@/hooks/useModelRegistry';
+import { deriveModelKey, decryptWeights } from '@/lib/model-encryption';
 
 // ============================================================================
 // Constants
@@ -66,6 +72,14 @@ const PHASE_DESCRIPTIONS: Record<number, string> = {
 };
 
 const TOTAL_PHASES = 13;
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
+
+// ============================================================================
+// Weight Fetch State
+// ============================================================================
+
+type WeightFetchStatus = 'idle' | 'fetching' | 'decrypting' | 'uploading' | 'done' | 'error';
 
 // ============================================================================
 // Version & Training History
@@ -151,9 +165,28 @@ interface ConfigFormProps {
   uploadedWeights: UploadedWeights | null;
   workersOnline: number;
   defaultVersion: string;
+  models: ModelWithVersions[];
+  selectedModelId: number | null;
+  onSelectModel: (tokenId: number | null) => void;
+  isFetchingWeights: boolean;
+  fetchedModelName: string | null;
 }
 
-function ConfigForm({ onStart, isStarting, onUploadData, onUploadWeights, uploadedData, uploadedWeights, workersOnline, defaultVersion }: ConfigFormProps) {
+function ConfigForm({
+  onStart,
+  isStarting,
+  onUploadData,
+  onUploadWeights,
+  uploadedData,
+  uploadedWeights,
+  workersOnline,
+  defaultVersion,
+  models,
+  selectedModelId,
+  onSelectModel,
+  isFetchingWeights,
+  fetchedModelName,
+}: ConfigFormProps) {
   const [numSteps, setNumSteps] = useState(500);
   const [learningRate, setLearningRate] = useState(0.001);
   const [checkpointFreq, setCheckpointFreq] = useState(50);
@@ -199,8 +232,124 @@ function ConfigForm({ onStart, isStarting, onUploadData, onUploadWeights, upload
     }, { storeOn0G, version: v });
   };
 
+  // Find selected model for display
+  const selectedModel = models.find((m) => m.tokenId === selectedModelId) ?? null;
+  const latestVersion = selectedModel?.versions?.length
+    ? selectedModel.versions[selectedModel.versions.length - 1]
+    : null;
+
   return (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      {/* Continue Training */}
+      {models.length > 0 && (
+        <Card variant="default" className="lg:col-span-2">
+          <div className="flex items-center gap-2 mb-4">
+            <RefreshCw size={14} className="text-helix-text2" />
+            <h3 className="text-sm font-medium text-white">Continue Training</h3>
+            <span className="text-2xs text-helix-muted">Load weights from an existing model</span>
+          </div>
+
+          <div className="space-y-3">
+            <div>
+              <label className="label-text block mb-1.5">Select Model</label>
+              <div className="relative">
+                <select
+                  value={selectedModelId ?? ''}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    onSelectModel(val ? Number(val) : null);
+                  }}
+                  className={cn(
+                    'w-full appearance-none px-3 py-2 pr-8 bg-helix-bg border border-helix-border rounded-md text-sm text-helix-text font-mono',
+                    'focus:outline-none focus:border-helix-border2 transition-colors cursor-pointer',
+                  )}
+                >
+                  <option value="">-- Start from scratch --</option>
+                  {models.map((m) => {
+                    const latest = m.versions.length
+                      ? m.versions[m.versions.length - 1]
+                      : null;
+                    return (
+                      <option key={m.tokenId} value={m.tokenId}>
+                        {m.name} {latest ? `(v${latest.semver})` : '(no versions)'}
+                      </option>
+                    );
+                  })}
+                </select>
+                <ChevronDown
+                  size={14}
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-helix-muted pointer-events-none"
+                />
+              </div>
+            </div>
+
+            {/* Status row */}
+            <AnimatePresence mode="wait">
+              {isFetchingWeights && (
+                <motion.div
+                  key="fetching"
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: 'auto' }}
+                  exit={{ opacity: 0, height: 0 }}
+                  className="flex items-center gap-2 px-3 py-2 bg-helix-bg border border-helix-border rounded-md"
+                >
+                  <Loader2 size={14} className="animate-spin text-helix-text2" />
+                  <span className="text-sm text-helix-text2">
+                    Fetching weights from 0G Storage...
+                  </span>
+                </motion.div>
+              )}
+
+              {!isFetchingWeights && fetchedModelName && uploadedWeights && (
+                <motion.div
+                  key="done"
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: 'auto' }}
+                  exit={{ opacity: 0, height: 0 }}
+                  className="flex items-center gap-2 px-3 py-2 bg-green-500/5 border border-green-500/20 rounded-md"
+                >
+                  <CheckCircle size={14} className="text-green-400 shrink-0" />
+                  <span className="text-sm text-green-300">
+                    Loaded weights from <span className="font-mono font-medium">{fetchedModelName}</span>
+                    {' '}({uploadedWeights.totalParams.toLocaleString()} params)
+                  </span>
+                </motion.div>
+              )}
+
+              {selectedModel && latestVersion && !latestVersion.weightsStored && !isFetchingWeights && (
+                <motion.div
+                  key="no-weights"
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: 'auto' }}
+                  exit={{ opacity: 0, height: 0 }}
+                  className="flex items-center gap-2 px-3 py-2 bg-yellow-500/5 border border-yellow-500/20 rounded-md"
+                >
+                  <AlertTriangle size={14} className="text-yellow-400 shrink-0" />
+                  <span className="text-sm text-yellow-300">
+                    Latest version has no stored weights. Upload weights manually or start from scratch.
+                  </span>
+                </motion.div>
+              )}
+
+              {selectedModel && (!latestVersion) && !isFetchingWeights && (
+                <motion.div
+                  key="no-versions"
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: 'auto' }}
+                  exit={{ opacity: 0, height: 0 }}
+                  className="flex items-center gap-2 px-3 py-2 bg-yellow-500/5 border border-yellow-500/20 rounded-md"
+                >
+                  <AlertTriangle size={14} className="text-yellow-400 shrink-0" />
+                  <span className="text-sm text-yellow-300">
+                    This model has no versions yet. Upload weights manually or start from scratch.
+                  </span>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </div>
+        </Card>
+      )}
+
       {/* Model Architecture */}
       <Card variant="default">
         <h3 className="text-sm font-medium text-white mb-4">Model Architecture</h3>
@@ -327,7 +476,14 @@ function ConfigForm({ onStart, isStarting, onUploadData, onUploadWeights, upload
           </div>
 
           <div>
-            <label className="label-text block mb-1.5">Initial Weights (JSON, optional)</label>
+            <label className="label-text block mb-1.5">
+              Initial Weights (JSON, optional)
+              {fetchedModelName && (
+                <span className="text-2xs text-green-400 ml-2">
+                  Auto-loaded from {fetchedModelName}
+                </span>
+              )}
+            </label>
             <div className="flex items-center gap-3">
               <label
                 className={cn(
@@ -509,10 +665,10 @@ function ConfigForm({ onStart, isStarting, onUploadData, onUploadWeights, upload
         <button
           type="button"
           onClick={handleSubmit}
-          disabled={isStarting || !!versionError}
+          disabled={isStarting || !!versionError || isFetchingWeights}
           className={cn(
             'w-full flex items-center justify-center gap-2 py-3 rounded-lg font-medium text-sm transition-all',
-            (isStarting || !!versionError)
+            (isStarting || !!versionError || isFetchingWeights)
               ? 'bg-helix-border text-helix-muted cursor-not-allowed'
               : 'bg-white text-black hover:bg-white/90',
           )}
@@ -521,6 +677,11 @@ function ConfigForm({ onStart, isStarting, onUploadData, onUploadWeights, upload
             <>
               <Loader2 size={16} className="animate-spin" />
               Starting Training...
+            </>
+          ) : isFetchingWeights ? (
+            <>
+              <Loader2 size={16} className="animate-spin" />
+              Loading Weights...
             </>
           ) : workersOnline >= 2 ? (
             <>
@@ -1119,10 +1280,13 @@ function TrainingHistoryList({ history, onClearHistory }: TrainingHistoryListPro
 }
 
 // ============================================================================
-// Main Page
+// Inner page (needs useSearchParams, so must be inside Suspense)
 // ============================================================================
 
-export default function TrainPage() {
+function TrainPageInner() {
+  const searchParams = useSearchParams();
+  const queryModelId = searchParams.get('model');
+
   const {
     startTraining,
     uploadData,
@@ -1133,7 +1297,7 @@ export default function TrainPage() {
     losses,
     isConnected,
     isStarting,
-    error,
+    error: trainingError,
     uploadedData,
     uploadedWeights,
     workersOnline,
@@ -1141,11 +1305,159 @@ export default function TrainPage() {
     isStoringOnZeroG,
   } = useMpcTraining();
 
+  const { models, isLoading: isLoadingModels } = useModelRegistry();
+  const { signMessageAsync } = useSignMessage();
+
   const hasSession = session !== null;
   const [wantsStoreOn0G, setWantsStoreOn0G] = useState(false);
   const [currentVersion, setCurrentVersion] = useState('1.0.0');
   const [history, setHistory] = useState<TrainingHistoryEntry[]>([]);
   const historyRecordedRef = useRef(false);
+
+  // ── Continue Training state ────────────────────────────────────────
+  const [selectedModelId, setSelectedModelId] = useState<number | null>(null);
+  const [weightFetchStatus, setWeightFetchStatus] = useState<WeightFetchStatus>('idle');
+  const [weightFetchError, setWeightFetchError] = useState<string | null>(null);
+  const [fetchedModelName, setFetchedModelName] = useState<string | null>(null);
+  const fetchingForRef = useRef<number | null>(null);
+
+  // ── Auto-select from query param ───────────────────────────────────
+  const autoSelectAppliedRef = useRef(false);
+
+  useEffect(() => {
+    if (autoSelectAppliedRef.current) return;
+    if (!queryModelId) return;
+    if (isLoadingModels) return;
+
+    const tokenId = Number(queryModelId);
+    if (isNaN(tokenId)) return;
+
+    // Check the model exists in the user's list
+    const found = models.find((m) => m.tokenId === tokenId);
+    if (found) {
+      autoSelectAppliedRef.current = true;
+      setSelectedModelId(tokenId);
+    }
+  }, [queryModelId, models, isLoadingModels]);
+
+  // ── Fetch weights when selectedModelId changes ─────────────────────
+  useEffect(() => {
+    if (selectedModelId === null) {
+      // Reset state when deselected
+      if (fetchingForRef.current !== null) {
+        fetchingForRef.current = null;
+      }
+      setWeightFetchStatus('idle');
+      setWeightFetchError(null);
+      setFetchedModelName(null);
+      return;
+    }
+
+    const model = models.find((m) => m.tokenId === selectedModelId);
+    if (!model) return;
+
+    const latestVersion = model.versions.length
+      ? model.versions[model.versions.length - 1]
+      : null;
+
+    if (!latestVersion || !latestVersion.weightsStored || !latestVersion.rootHash) {
+      // No weights to fetch
+      setWeightFetchStatus('idle');
+      setWeightFetchError(null);
+      setFetchedModelName(null);
+      return;
+    }
+
+    // Avoid re-fetching if already fetching for the same model
+    if (fetchingForRef.current === selectedModelId) return;
+    fetchingForRef.current = selectedModelId;
+
+    const fetchWeights = async () => {
+      setWeightFetchStatus('fetching');
+      setWeightFetchError(null);
+      setFetchedModelName(null);
+
+      try {
+        // Fetch from 0G
+        const res = await fetch('/api/fetch-from-0g', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ rootHash: latestVersion.rootHash }),
+        });
+
+        if (!res.ok) {
+          const errBody = await res.json().catch(() => ({}));
+          throw new Error(errBody.error || `Failed to fetch from 0G (HTTP ${res.status})`);
+        }
+
+        const result = await res.json();
+        let weightsData: unknown;
+
+        if (result.encoding === 'base64') {
+          // Encrypted weights -- need wallet decryption
+          setWeightFetchStatus('decrypting');
+
+          const rawBytes = Uint8Array.from(atob(result.data), (c) => c.charCodeAt(0));
+
+          const signMsg = async (message: string): Promise<string> => {
+            return signMessageAsync({ message });
+          };
+
+          const key = await deriveModelKey(signMsg, selectedModelId);
+          const decryptedJson = await decryptWeights(key, rawBytes);
+          weightsData = JSON.parse(decryptedJson);
+        } else {
+          // JSON encoding -- already decrypted
+          weightsData = result.data;
+        }
+
+        // Upload the weights to the training backend
+        setWeightFetchStatus('uploading');
+
+        const uploadRes = await fetch(`${API_BASE}/api/training/weights`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(weightsData),
+        });
+
+        if (!uploadRes.ok) {
+          const errBody = await uploadRes.json().catch(() => ({}));
+          throw new Error(errBody.message || errBody.error || `Failed to upload weights (HTTP ${uploadRes.status})`);
+        }
+
+        // NOTE: useMpcTraining's uploadedWeights state is internal to the hook.
+        // We call uploadWeights with a synthetic File to go through the hook's pathway.
+        // Instead, we'll create a File from the JSON and call the hook's uploadWeights.
+        // But since we already uploaded directly, we need to replicate what the hook does
+        // to set uploadedWeights state. The hook's uploadWeights calls the same endpoint,
+        // so we re-use its logic by creating a synthetic file and calling it.
+
+        // Actually, let's just call uploadWeights from the hook with a synthetic File
+        // to keep state consistent. But we already uploaded... let's just call the hook
+        // method with a Blob-based File to set the state properly.
+        const weightsJson = JSON.stringify(weightsData);
+        const blob = new Blob([weightsJson], { type: 'application/json' });
+        const syntheticFile = new File([blob], `weights-from-${model.slug}.json`, { type: 'application/json' });
+        await uploadWeights(syntheticFile);
+
+        setFetchedModelName(model.name);
+        setWeightFetchStatus('done');
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Failed to fetch weights';
+        setWeightFetchError(message);
+        setWeightFetchStatus('error');
+        fetchingForRef.current = null;
+      }
+    };
+
+    fetchWeights();
+  }, [selectedModelId, models, signMessageAsync, uploadWeights]);
+
+  const handleSelectModel = useCallback((tokenId: number | null) => {
+    // Reset fetch tracking so a new fetch can happen
+    fetchingForRef.current = null;
+    setSelectedModelId(tokenId);
+  }, []);
 
   // Load history from localStorage on mount
   useEffect(() => {
@@ -1211,6 +1523,8 @@ export default function TrainPage() {
 
   const defaultVersion = useMemo(() => getNextVersion(history), [history]);
 
+  const isFetchingWeights = weightFetchStatus === 'fetching' || weightFetchStatus === 'decrypting' || weightFetchStatus === 'uploading';
+
   return (
     <motion.div
       initial={{ opacity: 0, y: 6 }}
@@ -1230,6 +1544,20 @@ export default function TrainPage() {
         )}
       </div>
 
+      {/* Weight fetch error banner */}
+      {weightFetchStatus === 'error' && weightFetchError && (
+        <motion.div
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          className="bg-red-500/10 border border-red-500/30 rounded-lg px-4 py-3"
+        >
+          <div className="flex items-center gap-2">
+            <XCircle size={14} className="text-red-400 shrink-0" />
+            <p className="text-sm text-red-300">{weightFetchError}</p>
+          </div>
+        </motion.div>
+      )}
+
       {!hasSession ? (
         <ConfigForm
           onStart={handleStart}
@@ -1240,13 +1568,18 @@ export default function TrainPage() {
           uploadedWeights={uploadedWeights}
           workersOnline={workersOnline}
           defaultVersion={defaultVersion}
+          models={models}
+          selectedModelId={selectedModelId}
+          onSelectModel={handleSelectModel}
+          isFetchingWeights={isFetchingWeights}
+          fetchedModelName={fetchedModelName}
         />
       ) : (
         <LiveProgress
           session={session}
           losses={losses}
           isConnected={isConnected}
-          error={error}
+          error={trainingError}
           version={currentVersion}
           onDownloadModel={downloadModel}
           onStoreOnZeroG={storeOnZeroG}
@@ -1258,5 +1591,23 @@ export default function TrainPage() {
 
       <TrainingHistoryList history={history} onClearHistory={handleClearHistory} />
     </motion.div>
+  );
+}
+
+// ============================================================================
+// Main Page (wrapped in Suspense for useSearchParams)
+// ============================================================================
+
+export default function TrainPage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="flex items-center justify-center py-20">
+          <Loader2 size={24} className="animate-spin text-helix-muted" />
+        </div>
+      }
+    >
+      <TrainPageInner />
+    </Suspense>
   );
 }

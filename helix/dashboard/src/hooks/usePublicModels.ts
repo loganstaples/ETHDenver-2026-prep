@@ -21,6 +21,8 @@ export interface PublicModel {
   createdAt: number;
   isPublic: boolean;
   inferenceFee: number;
+  forSale: boolean;
+  salePrice: number; // in ETH
   versionCount: number;
   latestVersion: OnChainVersion | null;
   bestAccuracy: number;
@@ -80,7 +82,8 @@ export function usePublicModels() {
       .map((r) => Number(r.result));
   }, [tokenIdResults]);
 
-  // Phase 3: Fetch model data + ownerOf + getVersions for each token
+  // Phase 3: Fetch model data + ownerOf + getVersions + isForSale + salePrice for each token
+  const CALLS_PER_TOKEN = 5;
   const modelDataCalls = useMemo(() => {
     if (!live || tokenIds.length === 0) return [];
     const calls: {
@@ -108,6 +111,18 @@ export function usePublicModels() {
         functionName: 'getVersions',
         args: [BigInt(tokenId)],
       });
+      calls.push({
+        address: addr,
+        abi: HELIX_MODEL_STORE_ABI,
+        functionName: 'isForSale',
+        args: [BigInt(tokenId)],
+      });
+      calls.push({
+        address: addr,
+        abi: HELIX_MODEL_STORE_ABI,
+        functionName: 'salePrice',
+        args: [BigInt(tokenId)],
+      });
     }
     return calls;
   }, [live, tokenIds, addr]);
@@ -127,15 +142,21 @@ export function usePublicModels() {
     const result: PublicModel[] = [];
 
     for (let i = 0; i < tokenIds.length; i++) {
-      const modelResult = modelDataResults[i * 3];
-      const ownerResult = modelDataResults[i * 3 + 1];
-      const versionsResult = modelDataResults[i * 3 + 2];
+      const base = i * CALLS_PER_TOKEN;
+      const modelResult = modelDataResults[base];
+      const ownerResult = modelDataResults[base + 1];
+      const versionsResult = modelDataResults[base + 2];
+      const forSaleResult = modelDataResults[base + 3];
+      const salePriceResult = modelDataResults[base + 4];
 
       if (modelResult?.status !== 'success' || !modelResult.result) continue;
       if (ownerResult?.status !== 'success' || !ownerResult.result) continue;
 
       const m = modelResult.result as unknown as readonly [string, string, string, string, bigint, boolean, number];
       const owner = ownerResult.result as unknown as string;
+      const forSale = forSaleResult?.status === 'success' ? (forSaleResult.result as unknown as boolean) : false;
+      const salePriceWei = salePriceResult?.status === 'success' ? (salePriceResult.result as unknown as bigint) : BigInt(0);
+      const salePrice = Number(salePriceWei) / 1e18;
 
       let versionCount = 0;
       let latestVersion: OnChainVersion | null = null;
@@ -181,6 +202,8 @@ export function usePublicModels() {
         createdAt: Number(m[4]),
         isPublic: m[5],
         inferenceFee: Number(m[6]),
+        forSale,
+        salePrice,
         versionCount,
         latestVersion,
         bestAccuracy,
@@ -195,6 +218,8 @@ export function usePublicModels() {
     if (!USE_MOCK_DATA) return [];
     return MOCK_MODELS.map((m) => ({
       ...m,
+      forSale: m.forSale ?? false,
+      salePrice: m.salePrice ?? 0,
       versionCount: m.versions.length,
       latestVersion: m.versions.length > 0 ? m.versions[m.versions.length - 1] : null,
       bestAccuracy: m.versions.reduce((best, v) => (v.accuracy > best ? v.accuracy : best), 0),

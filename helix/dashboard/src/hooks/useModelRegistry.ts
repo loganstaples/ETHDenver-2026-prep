@@ -22,6 +22,8 @@ export interface ModelWithVersions {
   createdAt: number;
   isPublic: boolean;
   inferenceFee: number;
+  forSale: boolean;
+  salePrice: number; // in ETH
   versions: OnChainVersion[];
 }
 
@@ -41,6 +43,10 @@ export interface UseModelRegistryReturn {
     weightsStored: boolean;
   }) => void;
   setPublic: (params: { tokenId: number; isPublic: boolean }) => void;
+  setInferenceFee: (params: { tokenId: number; feeBps: number }) => void;
+  setForSale: (params: { tokenId: number; forSale: boolean }) => void;
+  setSalePrice: (params: { tokenId: number; priceEth: number }) => void;
+  buyModel: (params: { tokenId: number; priceEth: number }) => void;
   isWritePending: boolean;
   isConfirming: boolean;
   writeError: Error | null;
@@ -101,7 +107,8 @@ export function useModelRegistry(): UseModelRegistryReturn {
       .map((r) => Number(r.result));
   }, [tokenIdResults]);
 
-  // ── Phase 3: Get model data + versions ────────────────────────────
+  // ── Phase 3: Get model data + versions + sale info ────────────────
+  const CALLS_PER_TOKEN = 4;
   const modelDataCalls = useMemo(() => {
     if (!live || tokenIds.length === 0) return [];
     const calls: {
@@ -123,6 +130,18 @@ export function useModelRegistry(): UseModelRegistryReturn {
         functionName: 'getVersions',
         args: [BigInt(tokenId)],
       });
+      calls.push({
+        address: addr,
+        abi: HELIX_MODEL_STORE_ABI,
+        functionName: 'isForSale',
+        args: [BigInt(tokenId)],
+      });
+      calls.push({
+        address: addr,
+        abi: HELIX_MODEL_STORE_ABI,
+        functionName: 'salePrice',
+        args: [BigInt(tokenId)],
+      });
     }
     return calls;
   }, [live, tokenIds, addr]);
@@ -142,12 +161,18 @@ export function useModelRegistry(): UseModelRegistryReturn {
     const result: ModelWithVersions[] = [];
 
     for (let i = 0; i < tokenIds.length; i++) {
-      const modelResult = modelDataResults[i * 2];
-      const versionsResult = modelDataResults[i * 2 + 1];
+      const base = i * CALLS_PER_TOKEN;
+      const modelResult = modelDataResults[base];
+      const versionsResult = modelDataResults[base + 1];
+      const forSaleResult = modelDataResults[base + 2];
+      const salePriceResult = modelDataResults[base + 3];
 
       if (modelResult?.status !== 'success' || !modelResult.result) continue;
 
       const m = modelResult.result as unknown as readonly [string, string, string, string, bigint, boolean, number];
+      const forSale = forSaleResult?.status === 'success' ? (forSaleResult.result as unknown as boolean) : false;
+      const salePriceWei = salePriceResult?.status === 'success' ? (salePriceResult.result as unknown as bigint) : BigInt(0);
+      const salePrice = Number(salePriceWei) / 1e18;
 
       const versions: OnChainVersion[] = [];
       if (versionsResult?.status === 'success' && versionsResult.result) {
@@ -180,6 +205,8 @@ export function useModelRegistry(): UseModelRegistryReturn {
         createdAt: Number(m[4]),
         isPublic: m[5],
         inferenceFee: Number(m[6]),
+        forSale,
+        salePrice,
         versions,
       });
     }
@@ -201,6 +228,8 @@ export function useModelRegistry(): UseModelRegistryReturn {
         createdAt: m.createdAt,
         isPublic: m.isPublic,
         inferenceFee: m.inferenceFee,
+        forSale: m.forSale ?? false,
+        salePrice: m.salePrice ?? 0,
         versions: m.versions,
       }));
   }, []);
@@ -274,6 +303,62 @@ export function useModelRegistry(): UseModelRegistryReturn {
     [isConnected, isContractDeployed, addr, writeContract],
   );
 
+  const setInferenceFee = useCallback(
+    (params: { tokenId: number; feeBps: number }) => {
+      if (USE_MOCK_DATA || !isConnected || !isContractDeployed) return;
+      writeContract({
+        address: addr,
+        abi: HELIX_MODEL_STORE_ABI,
+        functionName: 'setInferenceFee',
+        args: [BigInt(params.tokenId), params.feeBps],
+      });
+    },
+    [isConnected, isContractDeployed, addr, writeContract],
+  );
+
+  const setForSale = useCallback(
+    (params: { tokenId: number; forSale: boolean }) => {
+      if (USE_MOCK_DATA || !isConnected || !isContractDeployed) return;
+      writeContract({
+        address: addr,
+        abi: HELIX_MODEL_STORE_ABI,
+        functionName: 'setForSale',
+        args: [BigInt(params.tokenId), params.forSale],
+      });
+    },
+    [isConnected, isContractDeployed, addr, writeContract],
+  );
+
+  const setSalePrice = useCallback(
+    (params: { tokenId: number; priceEth: number }) => {
+      if (USE_MOCK_DATA || !isConnected || !isContractDeployed) return;
+      // Convert ETH to wei (BigInt)
+      const priceWei = BigInt(Math.round(params.priceEth * 1e18));
+      writeContract({
+        address: addr,
+        abi: HELIX_MODEL_STORE_ABI,
+        functionName: 'setSalePrice',
+        args: [BigInt(params.tokenId), priceWei],
+      });
+    },
+    [isConnected, isContractDeployed, addr, writeContract],
+  );
+
+  const buyModel = useCallback(
+    (params: { tokenId: number; priceEth: number }) => {
+      if (USE_MOCK_DATA || !isConnected || !isContractDeployed) return;
+      const priceWei = BigInt(Math.round(params.priceEth * 1e18));
+      writeContract({
+        address: addr,
+        abi: HELIX_MODEL_STORE_ABI,
+        functionName: 'buyModel',
+        args: [BigInt(params.tokenId)],
+        value: priceWei,
+      });
+    },
+    [isConnected, isContractDeployed, addr, writeContract],
+  );
+
   const refetch = useCallback(() => {
     if (!USE_MOCK_DATA) {
       refetchBalance();
@@ -290,6 +375,10 @@ export function useModelRegistry(): UseModelRegistryReturn {
     createModel,
     addVersion,
     setPublic,
+    setInferenceFee,
+    setForSale,
+    setSalePrice,
+    buyModel,
     isWritePending,
     isConfirming,
     writeError: writeError ?? null,

@@ -28,6 +28,8 @@ export const MOCK_MODELS = [
     createdAt: now - 14 * day,
     isPublic: true,
     inferenceFee: 250, // 2.5%
+    forSale: true,
+    salePrice: 0.5, // ETH
     versions: [
       {
         semver: '1.0.0',
@@ -65,6 +67,8 @@ export const MOCK_MODELS = [
     createdAt: now - 10 * day,
     isPublic: true,
     inferenceFee: 500, // 5%
+    forSale: true,
+    salePrice: 1.2, // ETH
     versions: [
       {
         semver: '0.1.0',
@@ -94,6 +98,8 @@ export const MOCK_MODELS = [
     createdAt: now - 21 * day,
     isPublic: true,
     inferenceFee: 0, // free
+    forSale: false,
+    salePrice: 0,
     versions: [
       {
         semver: '1.0.0',
@@ -123,6 +129,8 @@ export const MOCK_MODELS = [
     createdAt: now - 5 * day,
     isPublic: true,
     inferenceFee: 1000, // 10%
+    forSale: true,
+    salePrice: 2.5, // ETH
     versions: [
       {
         semver: '1.0.0',
@@ -144,6 +152,8 @@ export const MOCK_MODELS = [
     createdAt: now - 3 * day,
     isPublic: true,
     inferenceFee: 150, // 1.5%
+    forSale: false,
+    salePrice: 0,
     versions: [
       {
         semver: '1.0.0',
@@ -165,6 +175,8 @@ export const MOCK_MODELS = [
     createdAt: now - 8 * day,
     isPublic: false,
     inferenceFee: 2000, // 20%
+    forSale: false,
+    salePrice: 0,
     versions: [
       {
         semver: '1.0.0',
@@ -186,6 +198,8 @@ export const MOCK_MODELS = [
     createdAt: now - 1 * day,
     isPublic: false,
     inferenceFee: 0,
+    forSale: false,
+    salePrice: 0,
     versions: [],
   },
 ];

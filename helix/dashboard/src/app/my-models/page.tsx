@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useMemo, useEffect, useRef, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import Link from 'next/link';
 import {
@@ -9,7 +9,6 @@ import {
   CheckCircle,
   XCircle,
   HardDrive,
-  Sparkles,
   Copy,
   ExternalLink,
   ChevronDown,
@@ -17,6 +16,7 @@ import {
   Clock,
   Trophy,
   Upload,
+  Download,
   Loader2,
   Wallet,
   Link2,
@@ -25,6 +25,11 @@ import {
   Shield,
   Globe,
   Lock,
+  Settings,
+  Play,
+  ArrowUpDown,
+  Search,
+  X,
 } from 'lucide-react';
 import { Card } from '@/components/ui/Card';
 import { Badge } from '@/components/ui/Badge';
@@ -34,7 +39,7 @@ import { Modal } from '@/components/ui/Modal';
 import { cn } from '@/lib/utils';
 import { useModelRegistry, type ModelWithVersions } from '@/hooks/useModelRegistry';
 import { useSignMessage } from 'wagmi';
-import { deriveModelKey, encryptWeights } from '@/lib/model-encryption';
+import { deriveModelKey, encryptWeights, decryptWeights } from '@/lib/model-encryption';
 import type { OnChainVersion } from '@/lib/contracts';
 
 // ============================================================================
@@ -44,6 +49,54 @@ import type { OnChainVersion } from '@/lib/contracts';
 const SEMVER_REGEX = /^\d+\.\d+\.\d+$/;
 const SLUG_REGEX = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 const LEGACY_HISTORY_KEY = 'helix-training-history';
+
+// ============================================================================
+// Sort & Category
+// ============================================================================
+
+type SortOption = 'newest' | 'oldest' | 'accuracy' | 'versions' | 'name';
+
+const SORT_OPTIONS: { id: SortOption; label: string }[] = [
+  { id: 'newest', label: 'Newest' },
+  { id: 'oldest', label: 'Oldest' },
+  { id: 'accuracy', label: 'Best Accuracy' },
+  { id: 'versions', label: 'Most Versions' },
+  { id: 'name', label: 'Name A-Z' },
+];
+
+function sortMyModels(models: ModelWithVersions[], sort: SortOption): ModelWithVersions[] {
+  const sorted = [...models];
+  switch (sort) {
+    case 'newest': return sorted.sort((a, b) => b.createdAt - a.createdAt);
+    case 'oldest': return sorted.sort((a, b) => a.createdAt - b.createdAt);
+    case 'accuracy': return sorted.sort((a, b) => {
+      const aBest = a.versions.reduce((best, v) => (v.accuracy > best ? v.accuracy : best), 0);
+      const bBest = b.versions.reduce((best, v) => (v.accuracy > best ? v.accuracy : best), 0);
+      return bBest - aBest;
+    });
+    case 'versions': return sorted.sort((a, b) => b.versions.length - a.versions.length);
+    case 'name': return sorted.sort((a, b) => a.name.localeCompare(b.name));
+    default: return sorted;
+  }
+}
+
+const CATEGORY_RULES: { tag: string; patterns: RegExp }[] = [
+  { tag: 'Classifier', patterns: /classif|detector|detection/i },
+  { tag: 'Image', patterns: /image|mnist|cifar|resnet|vision|x-ray|imaging/i },
+  { tag: 'NLP', patterns: /sentiment|bert|text|language|nlp|embedding/i },
+  { tag: 'Autoencoder', patterns: /autoencoder|denoising|vae/i },
+  { tag: 'Generative', patterns: /generative|gan|diffusion/i },
+  { tag: 'Finance', patterns: /fraud|finance|transaction|trading/i },
+];
+
+function getModelTags(model: { name: string; description: string; slug: string }): string[] {
+  const text = `${model.name} ${model.description} ${model.slug}`;
+  const tags: string[] = [];
+  for (const rule of CATEGORY_RULES) {
+    if (rule.patterns.test(text)) tags.push(rule.tag);
+  }
+  return tags;
+}
 
 // ============================================================================
 // Helpers
@@ -608,11 +661,14 @@ interface ModelCardProps {
   model: ModelWithVersions;
   onAddVersion: (model: ModelWithVersions) => void;
   onTogglePublic: (model: ModelWithVersions) => void;
+  onDownloadWeights: (model: ModelWithVersions) => void;
   isToggling: boolean;
+  isDownloading: number | null; // tokenId being downloaded
 }
 
-function ModelCard({ model, onAddVersion, onTogglePublic, isToggling }: ModelCardProps) {
+function ModelCard({ model, onAddVersion, onTogglePublic, onDownloadWeights, isToggling, isDownloading }: ModelCardProps) {
   const [expanded, setExpanded] = useState(false);
+  const tags = useMemo(() => getModelTags(model), [model]);
 
   const versionCount = model.versions.length;
   const bestAccuracy = model.versions.reduce(
@@ -620,13 +676,15 @@ function ModelCard({ model, onAddVersion, onTogglePublic, isToggling }: ModelCar
     0,
   );
   const weightsCount = model.versions.filter((v) => v.weightsStored).length;
+  const latestWithWeights = [...model.versions].reverse().find((v) => v.weightsStored && v.rootHash);
+  const isThisDownloading = isDownloading === model.tokenId;
 
   return (
-    <Card variant="glass" hover>
+    <Card variant="glass" hover className="flex flex-col h-full">
       {/* Header */}
       <div className="flex items-start justify-between mb-4">
         <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-lg bg-white/[0.06] flex items-center justify-center">
+          <div className="w-10 h-10 rounded-lg bg-white/[0.06] flex items-center justify-center shrink-0">
             <Layers size={20} className="text-white" />
           </div>
           <div>
@@ -634,7 +692,7 @@ function ModelCard({ model, onAddVersion, onTogglePublic, isToggling }: ModelCar
             <p className="text-2xs font-mono text-helix-muted">{model.slug}</p>
           </div>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 shrink-0">
           {model.isPublic ? (
             <Badge variant="default" className="text-green-400 text-2xs flex items-center gap-1">
               <Globe size={10} />
@@ -655,9 +713,20 @@ function ModelCard({ model, onAddVersion, onTogglePublic, isToggling }: ModelCar
         </div>
       </div>
 
-      {/* Description */}
+      {/* Tags */}
+      {tags.length > 0 && (
+        <div className="flex items-center gap-1.5 mb-3">
+          {tags.map((tag) => (
+            <span key={tag} className="px-2 py-0.5 text-2xs rounded-full bg-white/[0.04] text-helix-text2 border border-white/[0.06]">
+              {tag}
+            </span>
+          ))}
+        </div>
+      )}
+
+      {/* Description - clamped for consistent height */}
       {model.description && (
-        <p className="text-2xs text-helix-muted mb-4">{model.description}</p>
+        <p className="text-2xs text-helix-muted mb-4 line-clamp-2">{model.description}</p>
       )}
 
       {/* Creator / Date */}
@@ -717,8 +786,39 @@ function ModelCard({ model, onAddVersion, onTogglePublic, isToggling }: ModelCar
         </div>
       )}
 
-      {/* Actions */}
-      <div className="flex items-center gap-3 pt-2 border-t border-helix-border/50">
+      {/* Actions - pinned to bottom */}
+      <div className="flex items-center gap-2 flex-wrap pt-3 border-t border-helix-border/50 mt-auto">
+        <Link
+          href={`/my-models/${model.tokenId}`}
+          className="flex items-center gap-2 px-4 py-2 rounded-lg bg-white text-black text-sm font-medium hover:bg-white/90 transition-colors"
+        >
+          <Settings size={14} />
+          Manage
+        </Link>
+
+        <Link
+          href={`/train?model=${model.tokenId}`}
+          className="flex items-center gap-2 px-4 py-2 rounded-lg bg-helix-surface border border-helix-border text-sm text-helix-text hover:border-helix-border2 hover:text-white transition-colors"
+        >
+          <Play size={14} />
+          Train
+        </Link>
+
+        {latestWithWeights && (
+          <button
+            type="button"
+            onClick={() => onDownloadWeights(model)}
+            disabled={isThisDownloading}
+            className={cn(
+              'flex items-center gap-2 px-4 py-2 rounded-lg bg-helix-surface border border-helix-border text-sm text-helix-text hover:border-helix-border2 hover:text-white transition-colors',
+              isThisDownloading && 'opacity-50 cursor-not-allowed',
+            )}
+          >
+            {isThisDownloading ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
+            Download
+          </button>
+        )}
+
         <button
           type="button"
           onClick={() => onAddVersion(model)}
@@ -749,23 +849,6 @@ function ModelCard({ model, onAddVersion, onTogglePublic, isToggling }: ModelCar
           )}
           {model.isPublic ? 'Make Private' : 'Make Public'}
         </button>
-
-        {/* Quick inference link for best version with weights */}
-        {(() => {
-          const best = model.versions
-            .filter((v) => v.weightsStored && v.accuracy > 0)
-            .sort((a, b) => b.accuracy - a.accuracy)[0];
-          if (!best) return null;
-          return (
-            <Link
-              href={`/inference?hash=${best.rootHash}&version=${best.semver}`}
-              className="flex items-center gap-2 px-4 py-2 rounded-lg bg-white text-black text-sm font-medium hover:bg-white/90 transition-colors"
-            >
-              <Sparkles size={14} />
-              Inference
-            </Link>
-          );
-        })()}
       </div>
     </Card>
   );
@@ -779,9 +862,14 @@ export default function MyModelsPage() {
   const [createOpen, setCreateOpen] = useState(false);
   const [versionTarget, setVersionTarget] = useState<ModelWithVersions | null>(null);
   const [showLegacyNotice, setShowLegacyNotice] = useState(false);
+  const [search, setSearch] = useState('');
+  const [sort, setSort] = useState<SortOption>('newest');
+  const [categoryFilter, setCategoryFilter] = useState<string | null>(null);
+  const [downloadingTokenId, setDownloadingTokenId] = useState<number | null>(null);
+
+  const { signMessageAsync } = useSignMessage();
 
   const {
-    address,
     isConnected,
     isContractDeployed,
     models,
@@ -795,6 +883,55 @@ export default function MyModelsPage() {
     isSuccess,
     refetch,
   } = useModelRegistry();
+
+  // Download weights from 0G with decryption
+  const handleDownloadWeights = useCallback(async (model: ModelWithVersions) => {
+    const latest = [...model.versions].reverse().find((v) => v.weightsStored && v.rootHash);
+    if (!latest) return;
+
+    setDownloadingTokenId(model.tokenId);
+    try {
+      const res = await fetch('/api/fetch-from-0g', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rootHash: latest.rootHash }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || `Fetch failed: HTTP ${res.status}`);
+      }
+      const result = await res.json();
+
+      let weightsJson: string;
+      if (result.encoding === 'base64') {
+        // Encrypted — decrypt with wallet key
+        const key = await deriveModelKey(
+          (message: string) => signMessageAsync({ message }),
+          model.tokenId,
+        );
+        const binary = Uint8Array.from(atob(result.data), (c) => c.charCodeAt(0));
+        weightsJson = await decryptWeights(key, binary);
+      } else {
+        weightsJson = JSON.stringify(result.data?.weights || result.data, null, 2);
+      }
+
+      // Trigger browser download
+      const blob = new Blob([weightsJson], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${model.slug}-v${latest.semver}-weights.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error('Download failed:', err);
+      alert(`Download failed: ${err instanceof Error ? err.message : 'Unknown error'}`);
+    } finally {
+      setDownloadingTokenId(null);
+    }
+  }, [signMessageAsync]);
 
   // Check for legacy localStorage data
   useEffect(() => {
@@ -810,6 +947,40 @@ export default function MyModelsPage() {
       setVersionTarget(null);
     }
   }, [isSuccess, refetch]);
+
+  // Derive categories from user's models
+  const availableCategories = useMemo(() => {
+    const tagCounts = new Map<string, number>();
+    for (const m of models) {
+      for (const tag of getModelTags(m)) {
+        tagCounts.set(tag, (tagCounts.get(tag) ?? 0) + 1);
+      }
+    }
+    return Array.from(tagCounts.entries())
+      .sort((a, b) => b[1] - a[1])
+      .map(([tag, count]) => ({ tag, count }));
+  }, [models]);
+
+  // Apply search + category + sort
+  const filteredModels = useMemo(() => {
+    let result = models;
+
+    if (categoryFilter) {
+      result = result.filter((m) => getModelTags(m).includes(categoryFilter));
+    }
+
+    if (search.trim()) {
+      const q = search.trim().toLowerCase();
+      result = result.filter(
+        (m) =>
+          m.name.toLowerCase().includes(q) ||
+          m.slug.toLowerCase().includes(q) ||
+          m.description.toLowerCase().includes(q),
+      );
+    }
+
+    return sortMyModels(result, sort);
+  }, [models, search, sort, categoryFilter]);
 
   // Aggregate stats
   const totalVersions = models.reduce((sum, m) => sum + m.versions.length, 0);
@@ -986,18 +1157,95 @@ export default function MyModelsPage() {
             />
           </div>
 
+          {/* Search + Sort + Category */}
+          {models.length > 1 && (
+            <div className="space-y-3">
+              <div className="flex flex-col sm:flex-row items-start sm:items-center gap-3">
+                <div className="relative flex-1 max-w-xs">
+                  <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-helix-muted" />
+                  <input
+                    type="text"
+                    value={search}
+                    onChange={(e) => setSearch(e.target.value)}
+                    placeholder="Search your models..."
+                    className="w-full pl-9 pr-3 py-2 bg-helix-bg border border-helix-border rounded-lg text-sm text-helix-text placeholder:text-helix-dim focus:outline-none focus:border-helix-border2 transition-colors"
+                  />
+                </div>
+                <div className="relative">
+                  <ArrowUpDown size={12} className="absolute left-3 top-1/2 -translate-y-1/2 text-helix-muted pointer-events-none" />
+                  <select
+                    value={sort}
+                    onChange={(e) => setSort(e.target.value as SortOption)}
+                    className="appearance-none pl-8 pr-8 py-2 bg-helix-bg border border-helix-border rounded-lg text-sm text-helix-text focus:outline-none focus:border-helix-border2 transition-colors cursor-pointer"
+                  >
+                    {SORT_OPTIONS.map((o) => (
+                      <option key={o.id} value={o.id}>{o.label}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              {availableCategories.length > 0 && (
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="text-2xs text-helix-dim">Type:</span>
+                  {availableCategories.map(({ tag, count }) => (
+                    <button
+                      key={tag}
+                      type="button"
+                      onClick={() => setCategoryFilter(categoryFilter === tag ? null : tag)}
+                      className={cn(
+                        'flex items-center gap-1.5 px-2.5 py-1 rounded-full text-2xs transition-colors',
+                        categoryFilter === tag
+                          ? 'bg-white text-black'
+                          : 'bg-white/[0.04] text-helix-text2 border border-white/[0.06] hover:border-white/[0.12]',
+                      )}
+                    >
+                      {tag}
+                      <span className={cn(
+                        'font-mono',
+                        categoryFilter === tag ? 'text-black/50' : 'text-helix-dim',
+                      )}>
+                        {count}
+                      </span>
+                      {categoryFilter === tag && <X size={10} />}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
           {/* Model Cards Grid */}
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-            {models.map((model) => (
-              <ModelCard
-                key={model.tokenId}
-                model={model}
-                onAddVersion={(m) => setVersionTarget(m)}
-                onTogglePublic={(m) => setPublic({ tokenId: m.tokenId, isPublic: !m.isPublic })}
-                isToggling={isWritePending || isConfirming}
-              />
-            ))}
-          </div>
+          {filteredModels.length === 0 ? (
+            <EmptyState
+              icon={<Search size={32} />}
+              title="No models match your filters"
+              description="Try a different search term or clear the filters."
+              action={
+                <button
+                  type="button"
+                  onClick={() => { setSearch(''); setCategoryFilter(null); }}
+                  className="px-4 py-2 rounded-lg bg-helix-surface border border-helix-border text-sm text-helix-text hover:text-white transition-colors"
+                >
+                  Clear Filters
+                </button>
+              }
+            />
+          ) : (
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              {filteredModels.map((model) => (
+                <ModelCard
+                  key={model.tokenId}
+                  model={model}
+                  onAddVersion={(m) => setVersionTarget(m)}
+                  onTogglePublic={(m) => setPublic({ tokenId: m.tokenId, isPublic: !m.isPublic })}
+                  onDownloadWeights={handleDownloadWeights}
+                  isToggling={isWritePending || isConfirming}
+                  isDownloading={downloadingTokenId}
+                />
+              ))}
+            </div>
+          )}
         </>
       )}
     </motion.div>

@@ -21,6 +21,8 @@ export interface ModelDetail {
   createdAt: number;
   isPublic: boolean;
   inferenceFee: number;
+  forSale: boolean;
+  salePrice: number; // in ETH
   versions: OnChainVersion[];
 }
 
@@ -36,7 +38,7 @@ export function useModelDetail(tokenId: number) {
   const isContractDeployed = contractAddress !== ZERO_ADDR;
   const addr = contractAddress as `0x${string}`;
 
-  // Batch: models(), ownerOf(), getVersions() in one multicall
+  // Batch: models(), ownerOf(), getVersions(), isForSale(), salePrice() in one multicall
   const calls = useMemo(() => {
     if (!live || !isContractDeployed) return [];
     return [
@@ -56,6 +58,18 @@ export function useModelDetail(tokenId: number) {
         address: addr,
         abi: HELIX_MODEL_STORE_ABI,
         functionName: 'getVersions' as const,
+        args: [BigInt(tokenId)],
+      },
+      {
+        address: addr,
+        abi: HELIX_MODEL_STORE_ABI,
+        functionName: 'isForSale' as const,
+        args: [BigInt(tokenId)],
+      },
+      {
+        address: addr,
+        abi: HELIX_MODEL_STORE_ABI,
+        functionName: 'salePrice' as const,
         args: [BigInt(tokenId)],
       },
     ];
@@ -89,12 +103,17 @@ export function useModelDetail(tokenId: number) {
     const modelResult = results[0];
     const ownerResult = results[1];
     const versionsResult = results[2];
+    const forSaleResult = results[3];
+    const salePriceResult = results[4];
 
     if (modelResult?.status !== 'success' || !modelResult.result) return null;
     if (ownerResult?.status !== 'success' || !ownerResult.result) return null;
 
     const m = modelResult.result as unknown as readonly [string, string, string, string, bigint, boolean, number];
     const owner = ownerResult.result as unknown as string;
+    const forSale = forSaleResult?.status === 'success' ? (forSaleResult.result as unknown as boolean) : false;
+    const salePriceWei = salePriceResult?.status === 'success' ? (salePriceResult.result as unknown as bigint) : BigInt(0);
+    const salePrice = Number(salePriceWei) / 1e18;
 
     const versions: OnChainVersion[] = [];
     if (versionsResult?.status === 'success' && versionsResult.result) {
@@ -128,6 +147,8 @@ export function useModelDetail(tokenId: number) {
       createdAt: Number(m[4]),
       isPublic: m[5],
       inferenceFee: Number(m[6]),
+      forSale,
+      salePrice,
       versions,
     };
   }, [results, tokenId]);
@@ -135,7 +156,13 @@ export function useModelDetail(tokenId: number) {
   // ── Mock path ──────────────────────────────────────────────────────
   const mockModel: ModelDetail | null = useMemo(() => {
     if (!USE_MOCK_DATA) return null;
-    return MOCK_MODELS.find((m) => m.tokenId === tokenId) ?? null;
+    const found = MOCK_MODELS.find((m) => m.tokenId === tokenId);
+    if (!found) return null;
+    return {
+      ...found,
+      forSale: found.forSale ?? false,
+      salePrice: found.salePrice ?? 0,
+    };
   }, [tokenId]);
 
   const model = USE_MOCK_DATA ? mockModel : chainModel;
