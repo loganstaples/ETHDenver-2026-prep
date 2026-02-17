@@ -17,6 +17,7 @@ const CHAIN_NAMES: Record<number, string> = {
   1: 'Ethereum Mainnet',
   11155111: 'Sepolia',
   31337: 'Localhost (Hardhat)',
+  99999: 'ADI Network Testnet',
 };
 
 function getChainName(chainId: number): string {
@@ -27,6 +28,7 @@ const RPC_ENDPOINTS: Record<number, string> = {
   1: 'https://eth-mainnet.g.alchemy.com/v2/***',
   11155111: 'https://eth-sepolia.g.alchemy.com/v2/***',
   31337: 'http://127.0.0.1:8545',
+  99999: 'https://rpc.ab.testnet.adifoundation.ai',
 };
 
 function getRpcEndpoint(chainId: number): string {

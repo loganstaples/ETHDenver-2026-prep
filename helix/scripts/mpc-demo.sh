@@ -65,6 +65,8 @@ SKIP_BUILD=false
 NUM_WORKERS=6
 TRANSPORT="local"
 ZK_MODE="always"
+TESTNET=false
+ADI_RPC="https://rpc.ab.testnet.adifoundation.ai"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -73,6 +75,7 @@ while [[ $# -gt 0 ]]; do
         --workers)    NUM_WORKERS="$2"; shift 2 ;;
         --transport)  TRANSPORT="$2";   shift 2 ;;
         --zk-mode)    ZK_MODE="$2";    shift 2 ;;
+        --testnet)    TESTNET=true;    shift ;;
         --help|-h)
             cat <<'EOF'
 HELIX MPC Demo
@@ -83,6 +86,7 @@ Options:
     --workers N        Number of MPC workers to launch (default: 6)
     --transport MODE   Transport: "local" (in-process) or "distributed" (TCP across machines)
     --zk-mode MODE     ZK mode: "always" (default), "off", or "risk:N"
+    --testnet          Deploy to ADI Network Testnet (requires TESTNET_PRIVATE_KEY env var)
     --cli-only         Run CLI training only (no web dashboard)
     --skip-build       Skip Rust and JS builds (fast restart)
     --help, -h         Show this help
@@ -91,8 +95,9 @@ Full Demo (open browser):
     ./scripts/mpc-demo.sh
     # Then open http://localhost:3000/train
 
-Full Demo with more workers:
-    ./scripts/mpc-demo.sh --workers 10
+ADI Testnet Demo:
+    export TESTNET_PRIVATE_KEY="0x..."
+    ./scripts/mpc-demo.sh --testnet --cli-only --workers 3
 
 CLI-Only Demo (no browser):
     ./scripts/mpc-demo.sh --cli-only
@@ -188,23 +193,47 @@ cd "$HELIX_ROOT"
 mkdir -p "$HELIX_ROOT/.helix"
 
 # ============================================================================
-# 1. Start Anvil
+# 1. Chain Setup (Anvil or ADI Testnet)
 # ============================================================================
-log "Starting Anvil (local chain)..."
-
-if curl -s http://localhost:8545 -X POST -H "Content-Type: application/json" \
-    --data '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}' &>/dev/null; then
-    warn "Anvil already running on port 8545"
-else
-    anvil --accounts 20 --balance 10000 --silent &>/dev/null &
-    ANVIL_PID=$!
-    sleep 2
-    if curl -s http://localhost:8545 -X POST -H "Content-Type: application/json" \
-        --data '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}' &>/dev/null; then
-        ok "Anvil running (PID: $ANVIL_PID)"
-    else
-        err "Anvil failed to start"
+if $TESTNET; then
+    # ------- ADI Network Testnet -------
+    if [ -z "${TESTNET_PRIVATE_KEY:-}" ]; then
+        err "TESTNET_PRIVATE_KEY environment variable required for --testnet mode"
+        echo "  Get ADI testnet tokens: http://faucet.ab.testnet.adifoundation.ai/"
+        echo "  Then: export TESTNET_PRIVATE_KEY=\"0x...\""
         exit 1
+    fi
+    RPC_URL="$ADI_RPC"
+    log "Using ADI Network Testnet: $RPC_URL"
+
+    # Verify connectivity
+    CHAIN_RESP=$(curl -s "$RPC_URL" -X POST -H "Content-Type: application/json" \
+        --data '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}' 2>/dev/null || true)
+    if echo "$CHAIN_RESP" | grep -q "result"; then
+        ok "Connected to ADI Testnet (chain 99999)"
+    else
+        err "Cannot connect to ADI Testnet RPC at $RPC_URL"
+        exit 1
+    fi
+else
+    # ------- Local Anvil -------
+    RPC_URL="http://localhost:8545"
+    log "Starting Anvil (local chain)..."
+
+    if curl -s "$RPC_URL" -X POST -H "Content-Type: application/json" \
+        --data '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}' &>/dev/null; then
+        warn "Anvil already running on port 8545"
+    else
+        anvil --accounts 20 --balance 10000 --silent &>/dev/null &
+        ANVIL_PID=$!
+        sleep 2
+        if curl -s "$RPC_URL" -X POST -H "Content-Type: application/json" \
+            --data '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}' &>/dev/null; then
+            ok "Anvil running (PID: $ANVIL_PID)"
+        else
+            err "Anvil failed to start"
+            exit 1
+        fi
     fi
 fi
 
@@ -218,8 +247,11 @@ if ! $CLI_ONLY; then
     V4_ADDR=""
     log "Deploying V4 coordinator on-chain..."
     cd "$HELIX_ROOT/contracts"
-    DEPLOY_OUT=$(forge script script/DeployV4.s.sol \
-        --rpc-url http://localhost:8545 --broadcast -q 2>&1 || true)
+    DEPLOY_ARGS=(script/DeployV4.s.sol --rpc-url "$RPC_URL" --broadcast -q)
+    if $TESTNET; then
+        DEPLOY_ARGS+=(--private-key "$TESTNET_PRIVATE_KEY")
+    fi
+    DEPLOY_OUT=$(forge script "${DEPLOY_ARGS[@]}" 2>&1 || true)
     # Extract the deployed address (last 0x... on any line)
     V4_ADDR=$(echo "$DEPLOY_OUT" | grep -oE '0x[0-9a-fA-F]{40}' | tail -1)
     cd "$HELIX_ROOT"
@@ -237,7 +269,7 @@ if ! $CLI_ONLY; then
     log "Starting backend API on port 3001..."
     API_CMD=("$HELIX_ROOT/target/release/helix" dashboard --port 3001 --host 0.0.0.0 --cors)
     if [ -n "$V4_ADDR" ]; then
-        API_CMD+=(--rpc-url http://localhost:8545 --coordinator "$V4_ADDR")
+        API_CMD+=(--rpc-url "$RPC_URL" --coordinator "$V4_ADDR")
     fi
     "${API_CMD[@]}" > "$HELIX_ROOT/.helix/api.log" 2>&1 &
     API_PID=$!
@@ -257,7 +289,7 @@ if ! $CLI_ONLY; then
     WORKER_CMD=("$HELIX_ROOT/target/release/helix" spawn-workers --count "$NUM_WORKERS")
     WORKER_CMD+=(--api-url http://localhost:3001)
     if [ -n "$V4_ADDR" ]; then
-        WORKER_CMD+=(--rpc-url http://localhost:8545 --coordinator "$V4_ADDR")
+        WORKER_CMD+=(--rpc-url "$RPC_URL" --coordinator "$V4_ADDR")
     fi
 
     "${WORKER_CMD[@]}" > "$HELIX_ROOT/.helix/workers.log" 2>&1 &
@@ -299,7 +331,7 @@ if ! $CLI_ONLY; then
     echo ""
     echo -e "  ${BOLD}Dashboard:${NC}    http://localhost:3000/train"
     echo -e "  ${BOLD}API:${NC}          http://localhost:3001"
-    echo -e "  ${BOLD}Chain:${NC}        http://localhost:8545"
+    echo -e "  ${BOLD}Chain:${NC}        $RPC_URL"
     echo -e "  ${BOLD}Coordinator:${NC}  ${V4_ADDR:-not deployed}"
     echo -e "  ${BOLD}Workers:${NC}      $NUM_WORKERS MPC workers registered on-chain"
     echo ""
@@ -322,15 +354,24 @@ else
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
 
-    exec "$HELIX_ROOT/target/release/helix" mpc-train \
-        --architecture 784,128,10 \
-        --steps 500 \
-        --checkpoint-freq 50 \
-        --mac-interval 1 \
-        --train-size 1000 \
-        --test-size 200 \
-        --num-workers "$NUM_WORKERS" \
-        --transport "$TRANSPORT" \
-        --zk-mode "$ZK_MODE" \
+    MPC_ARGS=(
+        --architecture 784,128,10
+        --steps 500
+        --checkpoint-freq 50
+        --mac-interval 1
+        --train-size 1000
+        --test-size 200
+        --num-workers "$NUM_WORKERS"
+        --transport "$TRANSPORT"
+        --zk-mode "$ZK_MODE"
         --seed 42
+    )
+    if $TESTNET; then
+        MPC_ARGS+=(--rpc-url "$ADI_RPC")
+        echo -e "  ${BOLD}Chain:${NC} ADI Network Testnet ($ADI_RPC)"
+        echo -e "  ${BOLD}Explorer:${NC} https://explorer.ab.testnet.adifoundation.ai/"
+        echo ""
+    fi
+
+    exec "$HELIX_ROOT/target/release/helix" mpc-train "${MPC_ARGS[@]}"
 fi

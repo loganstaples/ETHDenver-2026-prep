@@ -447,10 +447,11 @@ struct MpcTrainArgs {
     #[arg(long, env = "RPC_URL")]
     rpc_url: Option<String>,
 
-    /// Owner's Ethereum private key (hex)
+    /// Owner's Ethereum private key (hex). Reads from TESTNET_PRIVATE_KEY or
+    /// HELIX_PRIVATE_KEY env vars, falls back to Anvil default key for local dev.
     #[cfg(feature = "chain")]
-    #[arg(long, env = "HELIX_PRIVATE_KEY", default_value = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")]
-    private_key: String,
+    #[arg(long, env = "TESTNET_PRIVATE_KEY")]
+    private_key: Option<String>,
 
     /// Worker private keys (comma-separated hex, must match --workers count)
     #[cfg(feature = "chain")]
@@ -2736,55 +2737,46 @@ async fn cmd_mpc_train(args: &MpcTrainArgs, _cli: &Cli) -> Result<()> {
         args.workers.clone()
     };
 
-    // Anvil default private keys for demo mode (accounts 1-10).
-    // These match `anvil --accounts 20` default derivation.
+    // Worker private keys: explicit > Anvil defaults (local) > empty (auto-generate on testnet).
     #[cfg(feature = "chain")]
-    let worker_keys = if args.worker_keys.is_empty() {
-        // Safety: only auto-populate Anvil keys when targeting localhost/local Anvil.
-        // Using these well-known keys against a real network would be insecure.
+    let worker_keys = if !args.worker_keys.is_empty() {
+        args.worker_keys.clone()
+    } else {
         let is_local = args.rpc_url.as_ref().map_or(true, |url| {
             let u = url.to_lowercase();
             u.contains("127.0.0.1") || u.contains("localhost") || u.contains("[::1]")
         });
-        if !is_local {
-            return Err(anyhow::anyhow!(
-                "Cannot auto-populate worker keys when --rpc-url points to a remote network. \
-                 Provide explicit --worker-keys to avoid using well-known Anvil keys on mainnet/testnet."
-            ));
+        if is_local {
+            // Auto-populate with Anvil default keys (accounts 1-10).
+            let anvil_default_keys = vec![
+                "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d".to_string(),
+                "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a".to_string(),
+                "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6".to_string(),
+                "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a".to_string(),
+                "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba".to_string(),
+                "0x92db14e403b83dfe3df233f83dfa3a0d7096f21ca9b0d6d6b8d88b2b4ec1564e".to_string(),
+                "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6".to_string(),
+                "0xdbda1821b80551c9d65939329250298aa3472ba22feea921c0cf5d620ea67b97".to_string(),
+                "0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6".to_string(),
+                "0xf214f2b2cd398c806f84e317254e0f0b801d0643303237d97a22a48e01628897".to_string(),
+            ];
+            let needed = worker_endpoints.len().min(anvil_default_keys.len());
+            eprintln!(
+                "{}",
+                format!(
+                    "  Note: Using Anvil default keys for {} workers (demo mode)",
+                    needed
+                ).dimmed()
+            );
+            anvil_default_keys[..needed].to_vec()
+        } else {
+            // Remote chain: leave empty — orchestrator will generate and fund workers.
+            eprintln!(
+                "{}",
+                "  Note: Workers will be auto-generated and funded from owner account".dimmed()
+            );
+            Vec::new()
         }
-        // Auto-populate with Anvil default keys when no explicit keys provided.
-        let anvil_default_keys = vec![
-            "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d".to_string(),
-            "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a".to_string(),
-            "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6".to_string(),
-            "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a".to_string(),
-            "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba".to_string(),
-            "0x92db14e403b83dfe3df233f83dfa3a0d7096f21ca9b0d6d6b8d88b2b4ec1564e".to_string(),
-            "0x4bbbf85ce3377467afe5d46f804f221813b2bb87f24d81f60f1fcdbf7cbf4356".to_string(),
-            "0xdbda1821b80551c9d65939329250298aa3472ba22feea921c0cf5d620ea67b97".to_string(),
-            "0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6".to_string(),
-            "0xf214f2b2cd398c806f84e317254e0f0b801d0643303237d97a22a48e01628897".to_string(),
-        ];
-        // Take only as many as we have workers.
-        let needed = worker_endpoints.len();
-        if needed > anvil_default_keys.len() {
-            return Err(anyhow::anyhow!(
-                "Cannot auto-assign keys for {} workers (max {} Anvil defaults). \
-                 Provide explicit --worker-keys for more workers.",
-                needed,
-                anvil_default_keys.len()
-            ));
-        }
-        eprintln!(
-            "{}",
-            format!(
-                "  Note: Using Anvil default keys for {} workers (demo mode)",
-                needed
-            ).dimmed()
-        );
-        anvil_default_keys[..needed].to_vec()
-    } else {
-        args.worker_keys.clone()
     };
 
     let total_params = dims[1] * dims[0] + dims[1] + dims[2] * dims[1] + dims[2];
@@ -2843,7 +2835,12 @@ async fn cmd_mpc_train(args: &MpcTrainArgs, _cli: &Cli) -> Result<()> {
         #[cfg(feature = "chain")]
         eth_rpc_url: args.rpc_url.clone(),
         #[cfg(feature = "chain")]
-        private_key: args.private_key.clone(),
+        private_key: args.private_key.clone()
+            .or_else(|| std::env::var("HELIX_PRIVATE_KEY").ok())
+            .unwrap_or_else(|| {
+                // Anvil default account 0 for local dev
+                "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".to_string()
+            }),
         #[cfg(feature = "chain")]
         worker_private_keys: worker_keys,
         #[cfg(feature = "chain")]

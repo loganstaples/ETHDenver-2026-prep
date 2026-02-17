@@ -1479,6 +1479,55 @@ impl FullOrchestrator {
         );
         self.emit(ProgressEvent::PhaseCompleted { phase: 5, elapsed_ms: phase5_start.elapsed().as_millis() });
 
+        // -- Phase 5.5: Generate and fund worker wallets if needed --
+        // On remote testnets (not Anvil), workers don't come pre-funded.
+        // Generate random wallets and transfer funds from the owner.
+        if self.config.worker_private_keys.is_empty() && num_workers > 0 {
+            info!(
+                "Phase 5.5: No worker keys provided — generating {} random wallets",
+                num_workers
+            );
+            let provider = ethers::providers::Provider::<ethers::providers::Http>::try_from(&rpc_url)
+                .map_err(|e| anyhow!("Invalid RPC URL: {}", e))?;
+            let chain_id = provider.get_chainid().await
+                .map_err(|e| anyhow!("Failed to get chain ID: {}", e))?.as_u64();
+
+            let owner_pk = self.config.private_key.strip_prefix("0x")
+                .unwrap_or(&self.config.private_key);
+            let owner_wallet = LocalWallet::from_str(owner_pk)
+                .map_err(|e| anyhow!("Invalid owner private key: {}", e))?
+                .with_chain_id(chain_id);
+            let owner_signer = ethers::middleware::SignerMiddleware::new(
+                provider.clone(),
+                owner_wallet.clone(),
+            );
+
+            // Each worker needs stake + gas. Fund with 2x stake to cover gas.
+            let stake_wei = ethers::utils::parse_ether(self.config.stake_amount_eth)
+                .context("Invalid stake amount")?;
+            let fund_amount = stake_wei * 3; // stake + generous gas buffer
+
+            for i in 0..num_workers {
+                let worker_wallet = LocalWallet::new(&mut rand::thread_rng());
+                let worker_key = format!("0x{}", hex::encode(worker_wallet.signer().to_bytes()));
+
+                let tx = ethers::types::TransactionRequest::new()
+                    .to(worker_wallet.address())
+                    .value(fund_amount);
+                let pending = owner_signer.send_transaction(tx, None).await
+                    .with_context(|| format!("Phase 5.5: Failed to fund worker {}", i))?;
+                let _receipt = pending.await
+                    .with_context(|| format!("Phase 5.5: Worker {} funding tx not confirmed", i))?;
+
+                info!(
+                    worker = i,
+                    address = %worker_wallet.address(),
+                    "Funded worker wallet"
+                );
+                self.config.worker_private_keys.push(worker_key);
+            }
+        }
+
         // -- Phase 6: Workers stake and join --
         self.emit(ProgressEvent::PhaseStarted {
             phase: 6, total: 13,

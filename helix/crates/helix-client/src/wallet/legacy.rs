@@ -471,8 +471,8 @@ impl Wallet {
                 "mainnet" => 1,
                 "goerli" => 5,
                 "sepolia" => 11155111,
-                "local" | "localhost" | "hardhat" => 31337,
-                "anvil" => 31337,
+                "local" | "localhost" | "hardhat" | "anvil" => 31337,
+                "adi" | "adi-testnet" | "adichain" => 99999,
                 _ => 31337,
             },
         }
@@ -498,8 +498,8 @@ impl Wallet {
                 "mainnet" => 1,
                 "goerli" => 5,
                 "sepolia" => 11155111,
-                "local" | "localhost" | "hardhat" => 31337,
-                "anvil" => 31337,
+                "local" | "localhost" | "hardhat" | "anvil" => 31337,
+                "adi" | "adi-testnet" | "adichain" => 99999,
                 _ => 31337,
             },
         }

@@ -214,6 +214,7 @@ impl TransactionConfirmation {
             42161 => "Arbitrum One".to_string(),
             10 => "Optimism".to_string(),
             31337 => "Local/Hardhat".to_string(),
+            99999 => "ADI Network Testnet".to_string(),
             _ => format!("Chain {}", chain_id),
         };
 
