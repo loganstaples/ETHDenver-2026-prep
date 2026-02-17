@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useMemo, useEffect, useCallback, useRef } from 'react';
+import Link from 'next/link';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   Play,
@@ -21,6 +22,7 @@ import {
   Copy,
   History,
   Tag,
+  Link2,
 } from 'lucide-react';
 import {
   ResponsiveContainer,
@@ -849,6 +851,14 @@ function FinalResults({ session, version, onDownloadModel, onStoreOnZeroG, isSto
                   View on 0G Explorer
                   <ExternalLink size={12} />
                 </a>
+
+                <Link
+                  href={`/my-models?action=add-version&session=${session.session_id}&hash=${zeroGResult.rootHash}&version=${version}&accuracy=${session.accuracy !== null ? session.accuracy * 100 : ''}`}
+                  className="flex items-center gap-2 px-4 py-2 rounded-lg bg-helix-surface border border-helix-border text-sm text-blue-400 hover:border-blue-500/30 transition-colors"
+                >
+                  <Link2 size={14} />
+                  Save to Model Registry
+                </Link>
               </div>
             </div>
           ) : (
