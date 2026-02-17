@@ -3,6 +3,7 @@ pragma solidity ^0.8.19;
 
 import "forge-std/Script.sol";
 import "../src/core/HelixCoordinatorV4.sol";
+import "../src/verification/Halo2Verifier.sol";
 
 /// @title DeployV4Script
 /// @notice Deploy the V4 coordinator for the MPC-primary demo.
@@ -21,10 +22,12 @@ contract DeployV4Script is Script {
         address treasury = vm.envOr("TREASURY", vm.addr(pk));
 
         vm.startBroadcast(pk);
-        HelixCoordinatorV4 coord = new HelixCoordinatorV4(treasury, address(0));
+        Halo2Verifier verifier = new Halo2Verifier();
+        HelixCoordinatorV4 coord = new HelixCoordinatorV4(treasury, address(verifier));
         vm.stopBroadcast();
 
-        // Print address so the caller can capture it
+        // Print addresses so the caller can capture them
         console.log(address(coord));
+        console.log(address(verifier));
     }
 }

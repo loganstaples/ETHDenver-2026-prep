@@ -64,6 +64,7 @@ CLI_ONLY=false
 SKIP_BUILD=false
 NUM_WORKERS=6
 TRANSPORT="local"
+ZK_MODE="always"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -71,6 +72,7 @@ while [[ $# -gt 0 ]]; do
         --skip-build) SKIP_BUILD=true; shift ;;
         --workers)    NUM_WORKERS="$2"; shift 2 ;;
         --transport)  TRANSPORT="$2";   shift 2 ;;
+        --zk-mode)    ZK_MODE="$2";    shift 2 ;;
         --help|-h)
             cat <<'EOF'
 HELIX MPC Demo
@@ -80,6 +82,7 @@ Usage: ./scripts/mpc-demo.sh [OPTIONS]
 Options:
     --workers N        Number of MPC workers to launch (default: 6)
     --transport MODE   Transport: "local" (in-process) or "distributed" (TCP across machines)
+    --zk-mode MODE     ZK mode: "always" (default), "off", or "risk:N"
     --cli-only         Run CLI training only (no web dashboard)
     --skip-build       Skip Rust and JS builds (fast restart)
     --help, -h         Show this help
@@ -328,5 +331,6 @@ else
         --test-size 200 \
         --num-workers "$NUM_WORKERS" \
         --transport "$TRANSPORT" \
+        --zk-mode "$ZK_MODE" \
         --seed 42
 fi
