@@ -7,7 +7,6 @@ import {
   Boxes,
   Search,
   Sparkles,
-  ShoppingCart,
   Layers,
   Trophy,
   User,
@@ -101,99 +100,83 @@ function FilterTabs({
 
 function PublicModelCard({ model, isOwner }: { model: PublicModel; isOwner: boolean }) {
   return (
-    <Card variant="glass" hover>
-      {/* Header */}
-      <div className="flex items-start justify-between mb-3">
-        <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-lg bg-white/[0.06] flex items-center justify-center">
-            <Layers size={20} className="text-white" />
+    <Link href={`/models/${model.tokenId}`} className="block">
+      <Card variant="glass" hover className="cursor-pointer">
+        {/* Header */}
+        <div className="flex items-start justify-between mb-3">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-lg bg-white/[0.06] flex items-center justify-center">
+              <Layers size={20} className="text-white" />
+            </div>
+            <div>
+              <h3 className="text-base font-medium text-white">{model.name}</h3>
+              <p className="text-2xs font-mono text-helix-muted">{model.slug}</p>
+            </div>
           </div>
-          <div>
-            <h3 className="text-base font-medium text-white">{model.name}</h3>
-            <p className="text-2xs font-mono text-helix-muted">{model.slug}</p>
+          <div className="flex items-center gap-2">
+            {model.inferenceFee > 0 && (
+              <Badge variant="default" className="text-2xs">
+                {formatFee(model.inferenceFee)} fee
+              </Badge>
+            )}
+            {isOwner && (
+              <Badge variant="outline" className="text-2xs text-green-400 border-green-500/30">
+                Yours
+              </Badge>
+            )}
           </div>
         </div>
-        <div className="flex items-center gap-2">
-          {model.inferenceFee > 0 && (
-            <Badge variant="default" className="text-2xs">
-              {formatFee(model.inferenceFee)} fee
-            </Badge>
-          )}
-          {isOwner && (
-            <Badge variant="outline" className="text-2xs text-green-400 border-green-500/30">
-              Yours
-            </Badge>
-          )}
-        </div>
-      </div>
 
-      {/* Description */}
-      {model.description && (
-        <p className="text-2xs text-helix-muted mb-3 line-clamp-2">{model.description}</p>
-      )}
-
-      {/* Meta row */}
-      <div className="flex items-center gap-4 text-2xs text-helix-dim mb-4">
-        <span className="flex items-center gap-1">
-          <User size={10} />
-          {truncateAddress(model.creator)}
-        </span>
-        <span>{formatDate(model.createdAt)}</span>
-        {model.latestVersion && (
-          <span className="font-mono">v{model.latestVersion.semver}</span>
+        {/* Description */}
+        {model.description && (
+          <p className="text-2xs text-helix-muted mb-3 line-clamp-2">{model.description}</p>
         )}
-      </div>
 
-      {/* Stats */}
-      <div className="grid grid-cols-3 gap-3 mb-4">
-        <div className="bg-helix-bg rounded-md px-3 py-2 text-center">
-          <p className="text-2xs text-helix-muted">Versions</p>
-          <p className="text-lg font-mono font-light text-white">{model.versionCount}</p>
+        {/* Meta row */}
+        <div className="flex items-center gap-4 text-2xs text-helix-dim mb-4">
+          <span className="flex items-center gap-1">
+            <User size={10} />
+            {truncateAddress(model.creator)}
+          </span>
+          <span>{formatDate(model.createdAt)}</span>
+          {model.latestVersion && (
+            <span className="font-mono">v{model.latestVersion.semver}</span>
+          )}
         </div>
-        <div className="bg-helix-bg rounded-md px-3 py-2 text-center">
-          <p className="text-2xs text-helix-muted">Best Accuracy</p>
-          <p className="text-lg font-mono font-light text-white">
-            {model.bestAccuracy > 0 ? `${(model.bestAccuracy * 100).toFixed(1)}%` : '--'}
-          </p>
-        </div>
-        <div className="bg-helix-bg rounded-md px-3 py-2 text-center">
-          <p className="text-2xs text-helix-muted">Inference Fee</p>
-          <p className="text-lg font-mono font-light text-white">{formatFee(model.inferenceFee)}</p>
-        </div>
-      </div>
 
-      {/* Actions */}
-      <div className="flex items-center gap-3 pt-3 border-t border-helix-border/50">
-        {model.latestVersion?.weightsStored && model.latestVersion.rootHash && (
-          <Link
-            href={`/inference?hash=${model.latestVersion.rootHash}&version=${model.latestVersion.semver}&model=${model.slug}`}
-            className="flex items-center gap-2 px-4 py-2 rounded-lg bg-white text-black text-sm font-medium hover:bg-white/90 transition-colors"
-          >
+        {/* Stats */}
+        <div className="grid grid-cols-3 gap-3 mb-4">
+          <div className="bg-helix-bg rounded-md px-3 py-2 text-center">
+            <p className="text-2xs text-helix-muted">Versions</p>
+            <p className="text-lg font-mono font-light text-white">{model.versionCount}</p>
+          </div>
+          <div className="bg-helix-bg rounded-md px-3 py-2 text-center">
+            <p className="text-2xs text-helix-muted">Best Accuracy</p>
+            <p className="text-lg font-mono font-light text-white">
+              {model.bestAccuracy > 0 ? `${(model.bestAccuracy * 100).toFixed(1)}%` : '--'}
+            </p>
+          </div>
+          <div className="bg-helix-bg rounded-md px-3 py-2 text-center">
+            <p className="text-2xs text-helix-muted">Inference Fee</p>
+            <p className="text-lg font-mono font-light text-white">{formatFee(model.inferenceFee)}</p>
+          </div>
+        </div>
+
+        {/* Actions */}
+        <div className="flex items-center gap-3 pt-3 border-t border-helix-border/50">
+          <span className="flex items-center gap-2 px-4 py-2 rounded-lg bg-white text-black text-sm font-medium">
             <Sparkles size={14} />
-            Run Inference
-          </Link>
-        )}
-        {!isOwner && (
-          <button
-            type="button"
-            className="flex items-center gap-2 px-4 py-2 rounded-lg bg-helix-surface border border-helix-border text-sm text-helix-text hover:border-helix-border2 hover:text-white transition-colors"
-            title="Coming soon"
-          >
-            <ShoppingCart size={14} />
-            Make Offer
-          </button>
-        )}
-        {isOwner && (
-          <Link
-            href="/my-models"
-            className="flex items-center gap-2 px-4 py-2 rounded-lg bg-helix-surface border border-helix-border text-sm text-helix-text hover:border-helix-border2 hover:text-white transition-colors"
-          >
-            <Layers size={14} />
-            Manage
-          </Link>
-        )}
-      </div>
-    </Card>
+            View Model
+          </span>
+          {isOwner && (
+            <span className="flex items-center gap-2 px-4 py-2 rounded-lg bg-helix-surface border border-helix-border text-sm text-helix-text">
+              <Layers size={14} />
+              Yours
+            </span>
+          )}
+        </div>
+      </Card>
+    </Link>
   );
 }
 
