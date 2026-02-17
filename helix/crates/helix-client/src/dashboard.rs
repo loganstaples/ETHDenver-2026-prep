@@ -1862,36 +1862,53 @@ async fn inference_handler(
         ).into_response(),
     };
 
-    // Run MPC inference on a blocking thread (it's CPU-intensive)
+    // Run distributed MPC inference (each worker only sees its share)
     let pixels = req.pixels;
     let num_parties = req.num_parties;
-    let result = tokio::task::spawn_blocking(move || {
-        mpc_inference::run_mpc_inference(&model_weights, &pixels, num_parties)
-    })
+    let config = crate::inference_orchestration::InferenceConfig {
+        num_parties,
+        job_id: None, // TODO: extract from session for on-chain attestation
+    };
+
+    let result = crate::inference_orchestration::run_inference_orchestration(
+        &model_weights,
+        &pixels,
+        &config,
+    )
     .await;
 
     match result {
-        Ok(Ok(inference)) => Json(serde_json::json!({
-            "prediction": inference.prediction,
-            "confidence": inference.confidence,
-            "probabilities": inference.probabilities,
-            "num_parties": inference.num_parties,
-            "timing": {
-                "share_generation_ms": inference.timing.share_generation_ms,
-                "layer1_ms": inference.timing.layer1_ms,
-                "relu_ms": inference.timing.relu_ms,
-                "layer2_ms": inference.timing.layer2_ms,
-                "reconstruction_ms": inference.timing.reconstruction_ms,
-                "total_ms": inference.timing.total_ms,
-            },
-        })).into_response(),
-        Ok(Err(e)) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": e })),
-        ).into_response(),
+        Ok(inference) => {
+            // Hex-encode hashes for JSON
+            let input_hash_hex = hex::encode(inference.input_hash);
+            let output_hash_hex = hex::encode(inference.output_hash);
+            let sig_hexes: Vec<String> = inference.worker_signatures
+                .iter()
+                .map(|s| hex::encode(s))
+                .collect();
+
+            Json(serde_json::json!({
+                "prediction": inference.prediction,
+                "confidence": inference.confidence,
+                "probabilities": inference.probabilities,
+                "num_parties": inference.num_parties,
+                "distributed": true,
+                "attestation": {
+                    "input_hash": input_hash_hex,
+                    "output_hash": output_hash_hex,
+                    "worker_signatures": sig_hexes,
+                },
+                "timing": {
+                    "share_generation_ms": inference.timing.share_generation_ms,
+                    "forward_pass_ms": inference.timing.forward_pass_ms,
+                    "signing_ms": inference.timing.signing_ms,
+                    "total_ms": inference.timing.total_ms,
+                },
+            })).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": format!("Inference task failed: {e}") })),
+            Json(serde_json::json!({ "error": format!("Distributed inference failed: {e}") })),
         ).into_response(),
     }
 }

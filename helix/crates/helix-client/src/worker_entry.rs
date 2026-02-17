@@ -48,7 +48,7 @@ use helix_mpc::share_distribution::{generate_x25519_keypair, ShareReceiver, X255
 use helix_mpc::types::PartyId;
 
 #[cfg(feature = "chain")]
-use crate::rpc::chain_v4::{sign_checkpoint, sign_completion, sign_mac_failure, ChainClientV4};
+use crate::rpc::chain_v4::{sign_checkpoint, sign_completion, sign_inference, sign_mac_failure, ChainClientV4};
 
 // ============================================================================
 // Configuration
@@ -157,6 +157,17 @@ pub enum ControlMessage {
     },
     /// Worker -> Owner: completion signature.
     SignCompletionResponse {
+        signature: Vec<u8>,
+    },
+    /// Owner -> Worker: request signature on an inference result attestation.
+    SignInferenceRequest {
+        job_id: u64,
+        prediction: u64,
+        input_hash: [u8; 32],
+        output_hash: [u8; 32],
+    },
+    /// Worker -> Owner: inference attestation signature.
+    SignInferenceResponse {
         signature: Vec<u8>,
     },
     /// Owner -> Worker: signal that training is complete and worker may shut down.
@@ -406,6 +417,33 @@ impl WorkerSigningService {
                     info!(job_id = job_id, "Completion signature sent");
                 }
 
+                ControlMessage::SignInferenceRequest {
+                    job_id,
+                    prediction,
+                    input_hash,
+                    output_hash,
+                } => {
+                    info!(job_id = job_id, prediction = prediction, "Inference signing request received");
+                    let sig_bytes = self
+                        .handle_inference_sign(
+                            job_id,
+                            prediction,
+                            input_hash,
+                            output_hash,
+                            #[cfg(feature = "chain")]
+                            wallet.as_ref(),
+                        )
+                        .await?;
+                    send_control_message(
+                        &mut stream,
+                        &ControlMessage::SignInferenceResponse {
+                            signature: sig_bytes,
+                        },
+                    )
+                    .await?;
+                    info!(job_id = job_id, "Inference attestation signature sent");
+                }
+
                 ControlMessage::TrainingComplete { steps_completed } => {
                     info!(steps = steps_completed, "Training complete signal received");
                     {
@@ -515,6 +553,40 @@ impl WorkerSigningService {
         data.extend_from_slice(b"completion");
         data.extend_from_slice(&job_id.to_le_bytes());
         data.extend_from_slice(&final_commitment);
+        Ok(sha2_hash(&data).to_vec())
+    }
+
+    /// Produces an ECDSA signature for an inference attestation.
+    async fn handle_inference_sign(
+        &self,
+        job_id: u64,
+        prediction: u64,
+        input_hash: [u8; 32],
+        output_hash: [u8; 32],
+        #[cfg(feature = "chain")] wallet: Option<&LocalWallet>,
+    ) -> Result<Vec<u8>> {
+        #[cfg(feature = "chain")]
+        {
+            if let Some(w) = wallet {
+                let sig = sign_inference(
+                    w,
+                    U256::from(job_id),
+                    U256::from(prediction),
+                    input_hash,
+                    output_hash,
+                )
+                .await
+                .context("sign_inference ECDSA")?;
+                return Ok(sig.to_vec());
+            }
+        }
+        // Off-chain fallback.
+        let mut data = Vec::with_capacity(80);
+        data.extend_from_slice(b"inference");
+        data.extend_from_slice(&job_id.to_le_bytes());
+        data.extend_from_slice(&prediction.to_le_bytes());
+        data.extend_from_slice(&input_hash);
+        data.extend_from_slice(&output_hash);
         Ok(sha2_hash(&data).to_vec())
     }
 }
@@ -788,6 +860,62 @@ impl WorkerRunner {
                 );
 
                 (true, Some(result))
+            }
+
+            ProtocolMessage::StartInference {
+                input,
+                peer_addrs,
+                mpc_bind_addr,
+                weight_layout,
+                seed: _seed,
+                num_parties,
+            } => {
+                info!(
+                    party = %party_id,
+                    input_len = input.len(),
+                    num_parties = num_parties,
+                    peers = peer_addrs.len(),
+                    mpc_addr = %mpc_bind_addr,
+                    "Starting distributed MPC inference"
+                );
+
+                // Split existing weight shares by layout.
+                let (w1, b1, w2, b2) = weight_layout.split(&share_state.weight_share.data);
+                let in_features = w1.len() / b1.len();
+                let hidden_features = b1.len();
+                let out_features = b2.len();
+
+                // Run distributed inference.
+                let result = run_distributed_inference(
+                    self.config.party_index,
+                    &mpc_bind_addr,
+                    &peer_addrs,
+                    w1, b1, w2, b2,
+                    &input,
+                    in_features,
+                    hidden_features,
+                    out_features,
+                ).await?;
+
+                // Send result back over data channel.
+                let response = ProtocolMessage::InferenceResult {
+                    prediction: result.prediction,
+                    confidence_scaled: (result.confidence * 10000.0) as u64,
+                    probabilities: result.probabilities.clone(),
+                    output_hash: result.output_hash,
+                    input_hash: result.input_hash,
+                };
+                send_message(&mut data_stream, &response).await
+                    .map_err(|e| anyhow!("Failed to send inference result: {}", e))?;
+
+                info!(
+                    party = %party_id,
+                    prediction = result.prediction,
+                    confidence = format!("{:.2}%", result.confidence * 100.0),
+                    "Distributed inference complete, result sent to owner"
+                );
+
+                (true, None)
             }
 
             ProtocolMessage::ReconstructionRequest { owner_public_key } => {
@@ -1311,6 +1439,96 @@ async fn run_distributed_training(
     _weight_layout: helix_mpc::e2e_integration::WeightLayout,
 ) -> Result<helix_mpc::e2e_integration::PartyResult> {
     Err(anyhow!("Distributed training requires the 'network-mpc' feature"))
+}
+
+// ============================================================================
+// Distributed inference
+// ============================================================================
+
+/// Runs the distributed MPC forward pass for inference.
+///
+/// Creates a TcpTransport mesh with peers, then executes the
+/// `distributed_forward_pass` from `helix_mpc::distributed_inference`.
+#[cfg(feature = "network-mpc")]
+async fn run_distributed_inference(
+    party_index: usize,
+    mpc_bind_addr: &str,
+    peer_addrs: &[(String, String)],
+    w1: Vec<helix_mpc::field::Fr>,
+    b1: Vec<helix_mpc::field::Fr>,
+    w2: Vec<helix_mpc::field::Fr>,
+    b2: Vec<helix_mpc::field::Fr>,
+    input: &[f64],
+    in_features: usize,
+    hidden_features: usize,
+    out_features: usize,
+) -> Result<helix_mpc::distributed_inference::DistributedInferenceResult> {
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+    use helix_mpc::session::transport::TcpTransport;
+    use helix_mpc::distributed_inference::{WorkerWeightShares, distributed_forward_pass};
+
+    let bind_addr: SocketAddr = mpc_bind_addr.parse()
+        .with_context(|| format!("Invalid MPC bind address: {}", mpc_bind_addr))?;
+
+    let party_id = PartyId::from_index(party_index);
+
+    // Build peer address map (excluding self).
+    let mut peers: HashMap<PartyId, SocketAddr> = HashMap::new();
+    for (pid_str, addr_str) in peer_addrs {
+        let pid = PartyId::new(pid_str);
+        if pid != party_id {
+            let addr: SocketAddr = addr_str.parse()
+                .with_context(|| format!("Invalid peer address: {}", addr_str))?;
+            peers.insert(pid, addr);
+        }
+    }
+
+    info!(
+        party = %party_id,
+        bind_addr = %bind_addr,
+        num_peers = peers.len(),
+        "Creating TcpTransport mesh for distributed inference"
+    );
+
+    // Create TcpTransport — deterministic connect/accept handshake.
+    let transport = TcpTransport::bind(bind_addr, party_id, &peers).await
+        .map_err(|e| anyhow!("TcpTransport::bind failed: {}", e))?;
+
+    info!(
+        party_index = party_index,
+        "TcpTransport mesh established, starting distributed inference"
+    );
+
+    let shares = WorkerWeightShares { w1, b1, w2, b2 };
+
+    distributed_forward_pass(
+        &transport,
+        &shares,
+        input,
+        in_features,
+        hidden_features,
+        out_features,
+    ).await
+    .map_err(|e| anyhow!("Distributed inference failed: {}", e))
+}
+
+/// Stub for when the `network-mpc` feature is not enabled.
+#[cfg(not(feature = "network-mpc"))]
+async fn run_distributed_inference(
+    _party_index: usize,
+    _mpc_bind_addr: &str,
+    _peer_addrs: &[(String, String)],
+    _w1: Vec<helix_mpc::field::Fr>,
+    _b1: Vec<helix_mpc::field::Fr>,
+    _w2: Vec<helix_mpc::field::Fr>,
+    _b2: Vec<helix_mpc::field::Fr>,
+    _input: &[f64],
+    _in_features: usize,
+    _hidden_features: usize,
+    _out_features: usize,
+) -> Result<helix_mpc::distributed_inference::DistributedInferenceResult> {
+    Err(anyhow!("Distributed inference requires the 'network-mpc' feature"))
 }
 
 // ============================================================================

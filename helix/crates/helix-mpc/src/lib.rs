@@ -23,6 +23,7 @@
 pub mod beaver;
 pub mod blame_report;
 pub mod checkpoint_attestation;
+pub mod distributed_inference;
 pub mod cheater_recovery;
 pub mod e2e_integration;
 pub mod error;

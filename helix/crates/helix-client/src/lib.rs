@@ -8,6 +8,7 @@ pub mod dashboard;
 pub mod demo;
 pub mod error;
 pub mod full_orchestration;
+pub mod inference_orchestration;
 pub mod health;
 pub mod help;
 pub mod model;

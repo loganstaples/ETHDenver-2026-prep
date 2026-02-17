@@ -72,6 +72,16 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
         uint256 reporterCount;
     }
 
+    /// @notice Inference result attestation record
+    struct InferenceResult {
+        uint256 jobId;
+        uint256 prediction;
+        bytes32 inputHash;
+        bytes32 outputHash;
+        uint256 timestamp;
+        uint256 signerCount;
+    }
+
     /// @notice Global worker pool entry — workers register once, available for any job
     struct PoolWorker {
         string endpoint;            // TCP endpoint (e.g. "192.168.1.5:9001")
@@ -148,6 +158,12 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
 
     /// @notice ZK weight hash chain: jobId => index => value (index 0 = lo, index 1 = hi)
     mapping(uint256 => mapping(uint256 => uint256)) public zkWeightHash;
+
+    /// @notice Counter for inference result IDs
+    uint256 public inferenceCount;
+
+    /// @notice Inference results: inferenceId => InferenceResult
+    mapping(uint256 => InferenceResult) public inferenceResults;
 
     // ============ Global Worker Pool State ============
 
@@ -227,6 +243,15 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
     event TreasuryUpdated(address indexed oldTreasury, address indexed newTreasury);
     event VerifierUpdated(address indexed oldVerifier, address indexed newVerifier);
     event ZkActivatedByRisk(uint256 indexed jobId, uint256 activeWorkerCount);
+
+    event InferenceResultCommitted(
+        uint256 indexed inferenceId,
+        uint256 indexed jobId,
+        uint256 prediction,
+        bytes32 inputHash,
+        bytes32 outputHash,
+        uint256 signerCount
+    );
 
     // Worker pool events
     event WorkerPoolRegistered(address indexed worker, string endpoint, uint256 stakeAmount);
@@ -1084,6 +1109,91 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
     ) {
         PoolWorker storage pw = poolWorkers[worker];
         return (pw.endpoint, pw.stakeAmount, pw.registeredAt, pw.available, pw.activeJobId);
+    }
+
+    // ============ Inference Attestation ============
+
+    /// @notice Submit a multi-party attested inference result
+    /// @param jobId The training job that produced the model
+    /// @param prediction The predicted class (e.g. 0-9 for MNIST)
+    /// @param inputHash Hash of the inference input data
+    /// @param outputHash Hash of the full output probabilities
+    /// @param signatures Worker ECDSA signatures attesting to the result
+    function submitInferenceResult(
+        uint256 jobId,
+        uint256 prediction,
+        bytes32 inputHash,
+        bytes32 outputHash,
+        bytes[] calldata signatures
+    ) external nonReentrant {
+        // Job must exist and be completed (model trained)
+        if (jobs[jobId].owner == address(0)) revert JobNotFound();
+        if (!jobs[jobId].completed) revert JobNotCompleted();
+
+        // Must have at least MIN_WORKERS signatures
+        if (signatures.length < MIN_WORKERS) revert InvalidSignatureCount();
+
+        // Verify each signature
+        bytes32 messageHash = keccak256(abi.encodePacked(
+            "HELIX_INFERENCE",
+            jobId,
+            prediction,
+            inputHash,
+            outputHash
+        ));
+        bytes32 ethHash = messageHash.toEthSignedMessageHash();
+
+        address[] memory seen = new address[](signatures.length);
+        uint256 validSigners = 0;
+
+        for (uint256 i = 0; i < signatures.length; i++) {
+            address signer = ethHash.recover(signatures[i]);
+
+            // Signer must be a registered, non-slashed worker for this job
+            if (!workers[jobId][signer].registered || workers[jobId][signer].slashed) {
+                revert InvalidSigner();
+            }
+
+            // No duplicate signers
+            for (uint256 j = 0; j < validSigners; j++) {
+                if (seen[j] == signer) revert DuplicateSigner();
+            }
+            seen[validSigners] = signer;
+            validSigners++;
+        }
+
+        // Store inference result
+        uint256 inferenceId = ++inferenceCount;
+        inferenceResults[inferenceId] = InferenceResult({
+            jobId: jobId,
+            prediction: prediction,
+            inputHash: inputHash,
+            outputHash: outputHash,
+            timestamp: block.timestamp,
+            signerCount: validSigners
+        });
+
+        emit InferenceResultCommitted(
+            inferenceId,
+            jobId,
+            prediction,
+            inputHash,
+            outputHash,
+            validSigners
+        );
+    }
+
+    /// @notice Get inference result details
+    function getInferenceResult(uint256 inferenceId) external view returns (
+        uint256 jobId,
+        uint256 prediction,
+        bytes32 inputHash,
+        bytes32 outputHash,
+        uint256 timestamp,
+        uint256 signerCount
+    ) {
+        InferenceResult storage r = inferenceResults[inferenceId];
+        return (r.jobId, r.prediction, r.inputHash, r.outputHash, r.timestamp, r.signerCount);
     }
 
     // ============ Admin Functions ============

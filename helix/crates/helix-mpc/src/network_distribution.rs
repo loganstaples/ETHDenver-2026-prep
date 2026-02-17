@@ -202,6 +202,40 @@ pub enum ProtocolMessage {
         /// Checkpoint records from training.
         checkpoints: Vec<OnChainCheckpoint>,
     },
+
+    /// Owner → Worker: run MPC inference on a single input.
+    ///
+    /// The worker already has weight shares (from share distribution).
+    /// It forms a TCP mesh with peers for inter-worker communication
+    /// during the forward pass (ReLU all-reduce, Layer 2 Beaver matmul).
+    StartInference {
+        /// Public input vector (e.g. 784 MNIST pixels in [0, 1]).
+        input: Vec<f64>,
+        /// Peer MPC addresses: (party_id string, socket_addr string).
+        peer_addrs: Vec<(String, String)>,
+        /// Socket address this worker should bind for MPC peer communication.
+        mpc_bind_addr: String,
+        /// Model weight layout for splitting flat shares into w1/b1/w2/b2.
+        weight_layout: WeightLayout,
+        /// Base seed for deterministic re-sharing after ReLU.
+        seed: u64,
+        /// Number of MPC parties.
+        num_parties: usize,
+    },
+
+    /// Worker → Owner: result of MPC inference.
+    InferenceResult {
+        /// Predicted class (e.g. 0-9 for MNIST).
+        prediction: usize,
+        /// Confidence (probability of predicted class), scaled by 10000.
+        confidence_scaled: u64,
+        /// Full output probabilities (after softmax).
+        probabilities: Vec<f64>,
+        /// SHA-256 hash of the output for on-chain attestation.
+        output_hash: [u8; 32],
+        /// SHA-256 hash of the input for on-chain attestation.
+        input_hash: [u8; 32],
+    },
 }
 
 // ============================================================================

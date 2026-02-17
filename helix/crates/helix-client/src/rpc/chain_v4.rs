@@ -162,6 +162,43 @@ pub fn build_completion_message(
     keccak256(&data)
 }
 
+/// Build the inference attestation message hash.
+/// Matches Solidity: `keccak256(abi.encodePacked("HELIX_INFERENCE", jobId, prediction, inputHash, outputHash))`
+pub fn build_inference_message(
+    job_id: U256,
+    prediction: U256,
+    input_hash: [u8; 32],
+    output_hash: [u8; 32],
+) -> [u8; 32] {
+    let mut data = Vec::with_capacity(15 + 32 + 32 + 32 + 32);
+    data.extend_from_slice(b"HELIX_INFERENCE");
+    let mut buf = [0u8; 32];
+    job_id.to_big_endian(&mut buf);
+    data.extend_from_slice(&buf);
+    prediction.to_big_endian(&mut buf);
+    data.extend_from_slice(&buf);
+    data.extend_from_slice(&input_hash);
+    data.extend_from_slice(&output_hash);
+    keccak256(&data)
+}
+
+/// Sign an inference attestation message with a wallet.
+pub async fn sign_inference(
+    wallet: &LocalWallet,
+    job_id: U256,
+    prediction: U256,
+    input_hash: [u8; 32],
+    output_hash: [u8; 32],
+) -> Result<Bytes> {
+    let message = build_inference_message(job_id, prediction, input_hash, output_hash);
+    let sig = wallet
+        .sign_message(&message)
+        .await
+        .map_err(|e| anyhow!("sign_inference: {}", e))?;
+    let sig_bytes: [u8; 65] = sig.into();
+    Ok(Bytes::from(sig_bytes.to_vec()))
+}
+
 // ============ Signing Helpers ============
 
 /// Sign a checkpoint attestation message with a wallet.

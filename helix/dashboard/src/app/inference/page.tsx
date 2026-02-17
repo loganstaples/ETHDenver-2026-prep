@@ -45,12 +45,16 @@ interface MPCInferenceResult {
   confidence: number;
   probabilities: number[];
   num_parties: number;
+  distributed: boolean;
+  attestation?: {
+    input_hash: string;
+    output_hash: string;
+    worker_signatures: string[];
+  };
   timing: {
     share_generation_ms: number;
-    layer1_ms: number;
-    relu_ms: number;
-    layer2_ms: number;
-    reconstruction_ms: number;
+    forward_pass_ms: number;
+    signing_ms: number;
     total_ms: number;
   };
 }
@@ -498,10 +502,8 @@ function ModelSelector({
 function TimingBreakdown({ timing }: { timing: MPCInferenceResult['timing'] }) {
   const phases = [
     { label: 'Secret sharing', ms: timing.share_generation_ms, color: 'bg-blue-400' },
-    { label: 'Layer 1 (public input)', ms: timing.layer1_ms, color: 'bg-cyan-400' },
-    { label: 'ReLU activation', ms: timing.relu_ms, color: 'bg-green-400' },
-    { label: 'Layer 2 (Beaver triples)', ms: timing.layer2_ms, color: 'bg-yellow-400' },
-    { label: 'Reconstruction', ms: timing.reconstruction_ms, color: 'bg-purple-400' },
+    { label: 'Distributed forward pass', ms: timing.forward_pass_ms, color: 'bg-cyan-400' },
+    { label: 'Worker attestation signing', ms: timing.signing_ms, color: 'bg-green-400' },
   ];
 
   return (
@@ -527,21 +529,27 @@ function TimingBreakdown({ timing }: { timing: MPCInferenceResult['timing'] }) {
 // ============================================================================
 
 function MPCResultCard({ result }: { result: MPCInferenceResult }) {
-  const [showTiming, setShowTiming] = useState(false);
+  const [showDetails, setShowDetails] = useState(false);
 
   return (
     <Card variant="glass">
       <div className="flex items-center justify-between mb-4">
         <div className="flex items-center gap-2">
           <Shield size={14} className="text-green-400" />
-          <h3 className="text-sm font-medium text-white">MPC Inference Result</h3>
+          <h3 className="text-sm font-medium text-white">Distributed MPC Result</h3>
         </div>
         <div className="flex items-center gap-2">
-          <Badge variant="default" className="text-green-400">
-            <Users size={10} />
-            {result.num_parties} parties
-          </Badge>
+          {result.distributed && (
+            <Badge variant="default" className="text-green-400">
+              <Shield size={10} />
+              Distributed
+            </Badge>
+          )}
           <Badge variant="default" className="text-blue-400">
+            <Users size={10} />
+            {result.num_parties} workers
+          </Badge>
+          <Badge variant="default" className="text-helix-text2">
             <Clock size={10} />
             {result.timing.total_ms}ms
           </Badge>
@@ -565,18 +573,60 @@ function MPCResultCard({ result }: { result: MPCInferenceResult }) {
 
       <ProbabilityBars probabilities={result.probabilities} prediction={result.prediction} />
 
+      {/* Attestation summary */}
+      {result.attestation && (
+        <div className="mt-4 pt-3 border-t border-helix-border">
+          <div className="flex items-center gap-2 mb-2">
+            <Shield size={12} className="text-green-400" />
+            <span className="text-2xs font-medium text-white">On-chain Attestation</span>
+          </div>
+          <div className="space-y-1.5">
+            <div className="flex items-center gap-2">
+              <span className="text-2xs text-helix-muted w-20">Input hash</span>
+              <span className="text-2xs text-helix-text font-mono truncate">
+                {result.attestation.input_hash.slice(0, 16)}...
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-2xs text-helix-muted w-20">Output hash</span>
+              <span className="text-2xs text-helix-text font-mono truncate">
+                {result.attestation.output_hash.slice(0, 16)}...
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-2xs text-helix-muted w-20">Signatures</span>
+              <div className="flex items-center gap-1">
+                {result.attestation.worker_signatures.map((sig, i) => (
+                  <div
+                    key={i}
+                    className="w-5 h-5 rounded-full bg-green-400/20 flex items-center justify-center"
+                    title={`Worker ${i}: ${sig.slice(0, 16)}...`}
+                  >
+                    <CheckCircle size={10} className="text-green-400" />
+                  </div>
+                ))}
+                <span className="text-2xs text-green-400 ml-1">
+                  {result.attestation.worker_signatures.length}/{result.num_parties} signed
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Expandable timing details */}
       <div className="mt-4 pt-3 border-t border-helix-border">
         <button
           type="button"
-          onClick={() => setShowTiming(!showTiming)}
+          onClick={() => setShowDetails(!showDetails)}
           className="text-2xs text-helix-muted hover:text-white transition-colors flex items-center gap-1"
         >
           <Clock size={10} />
-          {showTiming ? 'Hide' : 'Show'} MPC timing breakdown
+          {showDetails ? 'Hide' : 'Show'} timing breakdown
         </button>
 
         <AnimatePresence>
-          {showTiming && (
+          {showDetails && (
             <motion.div
               initial={{ height: 0, opacity: 0 }}
               animate={{ height: 'auto', opacity: 1 }}
@@ -850,19 +900,23 @@ export default function InferencePage() {
 
               {/* How it works */}
               <div className="mt-4 p-3 bg-helix-bg rounded-lg border border-helix-border">
-                <p className="text-2xs font-medium text-helix-text2 mb-2">How MPC inference works</p>
+                <p className="text-2xs font-medium text-helix-text2 mb-2">How distributed MPC inference works</p>
                 <div className="space-y-1.5 text-2xs text-helix-muted">
                   <div className="flex items-center gap-2">
                     <Shield size={10} className="text-green-400 shrink-0" />
-                    <span>Weights are <strong className="text-helix-text">secret-shared</strong> across MPC workers</span>
+                    <span>Weights are <strong className="text-helix-text">secret-shared</strong> across independent workers</span>
                   </div>
                   <div className="flex items-center gap-2">
                     <Users size={10} className="text-blue-400 shrink-0" />
-                    <span>Each worker computes on their <strong className="text-helix-text">share only</strong> &mdash; no party sees full weights</span>
+                    <span>Each worker computes on their <strong className="text-helix-text">share only</strong> via inter-party transport</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <CheckCircle size={10} className="text-cyan-400 shrink-0" />
+                    <span>Workers <strong className="text-helix-text">sign attestations</strong> for on-chain verification</span>
                   </div>
                   <div className="flex items-center gap-2">
                     <HardDrive size={10} className="text-purple-400 shrink-0" />
-                    <span>Beaver triple multiplication for <strong className="text-helix-text">secure layer 2</strong></span>
+                    <span>Multi-party attestation recorded on <strong className="text-helix-text">HelixCoordinatorV4</strong></span>
                   </div>
                 </div>
               </div>
@@ -876,9 +930,9 @@ export default function InferencePage() {
                   <div className="flex items-center gap-3 py-4">
                     <Loader2 size={16} className="animate-spin text-white" />
                     <div>
-                      <p className="text-sm text-white">Running secure MPC inference...</p>
+                      <p className="text-sm text-white">Running distributed MPC inference...</p>
                       <p className="text-2xs text-helix-muted mt-0.5">
-                        Secret-sharing weights across 3 workers, running forward pass
+                        Secret-sharing weights across 3 independent workers, running forward pass via transport
                       </p>
                     </div>
                   </div>
