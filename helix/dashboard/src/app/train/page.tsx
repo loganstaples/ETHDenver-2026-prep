@@ -23,7 +23,6 @@ import {
   History,
   ChevronDown,
   Link2,
-  RefreshCw,
   Layers,
 } from 'lucide-react';
 import {
@@ -144,7 +143,7 @@ function NumberInput({ value, onChange, ...rest }: { value: number; onChange: (v
       type="number"
       value={value}
       onChange={(e) => onChange(Number(e.target.value))}
-      className="w-full bg-transparent text-right text-sm text-white outline-none placeholder:text-helix-dim [-moz-appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+      className="w-full bg-transparent text-right text-base text-white outline-none placeholder:text-helix-dim [-moz-appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
       {...rest}
     />
   );
@@ -172,10 +171,10 @@ function ChartTooltip({ active, payload, label }: any) {
 
 function SettingRow({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
   return (
-    <div className="flex items-center justify-between px-5 py-3.5">
+    <div className="flex items-center justify-between px-5 py-4">
       <div>
-        <span className="text-sm text-helix-text2">{label}</span>
-        {hint && <p className="text-2xs text-red-400 mt-0.5">{hint}</p>}
+        <span className="text-base text-helix-text2">{label}</span>
+        {hint && <p className="text-xs text-red-400 mt-0.5">{hint}</p>}
       </div>
       <div className="w-32 flex justify-end">{children}</div>
     </div>
@@ -207,7 +206,7 @@ function UploadRow({ label, accept, onUpload, uploaded, optional }: {
           <Upload size={16} className="text-helix-muted shrink-0" />
         )}
         <div className="min-w-0">
-          <p className={cn('text-sm truncate', uploaded ? 'text-green-300' : 'text-helix-text2')}>
+          <p className={cn('text-base truncate', uploaded ? 'text-green-300' : 'text-helix-text2')}>
             {label}
             {optional && !uploaded && <span className="text-helix-dim ml-1.5">optional</span>}
           </p>
@@ -243,8 +242,10 @@ function PaymentNumber({
   onChange?: (v: number) => void;
 }) {
   const [display, setDisplay] = useState(value);
+  const [editText, setEditText] = useState(value.toFixed(4));
   const motionVal = useMotionValue(value);
   const spring = useSpring(motionVal, { stiffness: 80, damping: 20, mass: 0.5 });
+  const wasEditable = useRef(editable);
 
   useEffect(() => {
     if (!editable) motionVal.set(value);
@@ -255,31 +256,44 @@ function PaymentNumber({
     return spring.on('change', (v) => setDisplay(v));
   }, [spring, editable]);
 
+  // When entering edit mode, seed editText with the formatted value
+  useEffect(() => {
+    if (editable && !wasEditable.current) {
+      setEditText(value.toFixed(4));
+    }
+    wasEditable.current = editable;
+  }, [editable, value]);
+
+  const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const text = e.target.value;
+    setEditText(text);
+    const num = parseFloat(text);
+    if (!isNaN(num) && num >= 0) {
+      onChange?.(num);
+    }
+  };
+
   const colorClass = color === 'green' ? 'text-green-400'
     : color === 'yellow' ? 'text-yellow-400'
     : 'text-red-400';
+
+  const numberClass = cn(
+    'text-7xl font-bold tracking-tighter tabular-nums transition-colors duration-500',
+    colorClass,
+  );
 
   return (
     <div className="flex items-baseline justify-center gap-4">
       {editable ? (
         <input
-          type="number"
-          value={value}
-          onChange={(e) => onChange?.(Number(e.target.value))}
-          step={0.01}
-          min={0}
-          className={cn(
-            'bg-transparent text-center text-7xl font-bold tracking-tighter tabular-nums outline-none w-56',
-            'transition-colors duration-500',
-            '[-moz-appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none',
-            colorClass,
-          )}
+          type="text"
+          inputMode="decimal"
+          value={editText}
+          onChange={handleChange}
+          className={cn(numberClass, 'bg-transparent text-center outline-none p-0 border-0 w-56')}
         />
       ) : (
-        <span className={cn(
-          'text-7xl font-bold tracking-tighter tabular-nums transition-colors duration-500',
-          colorClass,
-        )}>
+        <span className={numberClass}>
           {display.toFixed(4)}
         </span>
       )}
@@ -317,7 +331,7 @@ function ConfigForm({
 }: ConfigFormProps) {
   const [numSteps, setNumSteps] = useState(500);
   const [learningRate, setLearningRate] = useState(0.001);
-  const [checkpointFreq, setCheckpointFreq] = useState(50);
+  const [checkpointFreq] = useState(50);
   const [zkMode, setZkMode] = useState<'off' | 'always' | 'risk'>('off');
   const [zkCheckpointFreq, setZkCheckpointFreq] = useState(5);
   const [minWorkersForMpc, setMinWorkersForMpc] = useState(2);
@@ -409,22 +423,17 @@ function ConfigForm({
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
 
         {/* ── LEFT COLUMN ──────────────────────────────────────── */}
-        <div className="space-y-5">
+        <div className="flex flex-col gap-5">
 
           {/* Continue from existing model */}
           {models.length > 0 && (
             <div className="space-y-3">
-              <div className="flex items-center gap-2">
-                <RefreshCw size={13} className="text-helix-muted" />
-                <span className="text-sm font-medium text-helix-text2">Continue Training</span>
-              </div>
-
               <div className="relative">
                 <Layers size={14} className="absolute left-4 top-1/2 -translate-y-1/2 text-helix-muted pointer-events-none" />
                 <select
                   value={selectedModelId ?? ''}
                   onChange={(e) => onSelectModel(e.target.value ? Number(e.target.value) : null)}
-                  className="w-full appearance-none pl-10 pr-10 py-3.5 bg-helix-surface border border-helix-border rounded-2xl text-sm text-white focus:outline-none focus:border-helix-border2 transition-colors cursor-pointer"
+                  className="w-full appearance-none pl-10 pr-10 py-3.5 bg-helix-surface border border-helix-border rounded-2xl text-base text-white focus:outline-none focus:border-helix-border2 transition-colors cursor-pointer"
                 >
                   <option value="">Start from scratch</option>
                   {models.map((m) => {
@@ -506,7 +515,7 @@ function ConfigForm({
                 onChange={(e) => handleVersionChange(e.target.value)}
                 placeholder={defaultVersion}
                 className={cn(
-                  'bg-transparent text-right text-sm outline-none placeholder:text-helix-dim w-24',
+                  'bg-transparent text-right text-base outline-none placeholder:text-helix-dim w-24',
                   versionError ? 'text-red-400' : 'text-white',
                 )}
               />
@@ -518,6 +527,13 @@ function ConfigForm({
 
             <SettingRow label="Learning Rate">
               <NumberInput value={learningRate} onChange={setLearningRate} step={0.0001} min={0.00001} max={1} />
+            </SettingRow>
+
+            <SettingRow label="Stake / Worker">
+              <div className="flex items-center gap-1.5">
+                <NumberInput value={stakePerWorkerEth} onChange={setStakePerWorkerEth} step={0.01} min={0} />
+                <span className="text-sm text-helix-dim shrink-0">ETH</span>
+              </div>
             </SettingRow>
           </div>
 
@@ -540,11 +556,83 @@ function ConfigForm({
         </div>
 
         {/* ── RIGHT COLUMN ─────────────────────────────────────── */}
-        <div className="space-y-5">
+        <div className="flex flex-col gap-5">
+
+          {/* Payment + Start — Cash App style, connected */}
+          <div className="rounded-2xl bg-helix-surface border border-helix-border overflow-hidden">
+            <div className="p-6">
+              {/* Header with auto toggle */}
+              <div className="flex items-center justify-between mb-5">
+                <span className="text-base font-medium text-helix-text2">Payment</span>
+                <div className="flex items-center gap-2.5">
+                  <span className="text-sm text-helix-dim">Auto</span>
+                  <Toggle on={autoPropose} onToggle={handleToggleAutoPropose} />
+                </div>
+              </div>
+
+              {/* Big number — same component for both modes */}
+              <div className="py-3">
+                <PaymentNumber
+                  value={autoPropose ? recommendedPayment : paymentEth}
+                  color={paymentColor}
+                  editable={!autoPropose}
+                  onChange={setPaymentEth}
+                />
+              </div>
+
+              {/* Footer — fixed height, breakdown slides horizontally, rec fades in */}
+              <div className="relative h-5 mt-4">
+                <motion.span
+                  className="absolute top-0 text-sm text-helix-dim whitespace-nowrap"
+                  animate={{ left: autoPropose ? '50%' : 0, x: autoPropose ? '-50%' : 0 }}
+                  transition={{ type: 'spring', stiffness: 400, damping: 30 }}
+                >
+                  {workersOnline > 0 ? workersOnline : 3} workers × {numSteps} steps
+                  {zkMode !== 'off' && ` × ${zkMode === 'always' ? '1.75' : '1.25'}× ZK`}
+                </motion.span>
+                <AnimatePresence>
+                  {!autoPropose && (
+                    <motion.span
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
+                      exit={{ opacity: 0 }}
+                      transition={{ duration: 0.2 }}
+                      className="absolute top-0 right-0 text-sm text-helix-dim whitespace-nowrap"
+                    >
+                      Rec: {recommendedPayment.toFixed(4)} ETH
+                    </motion.span>
+                  )}
+                </AnimatePresence>
+              </div>
+            </div>
+
+            {/* Start button — attached to payment card */}
+            <motion.button
+              type="button"
+              onClick={handleSubmit}
+              disabled={!canStart}
+              whileTap={canStart ? { scale: 0.98 } : {}}
+              className={cn(
+                'w-full py-5 text-xl font-bold tracking-tight transition-all',
+                'flex items-center justify-center gap-3 border-t',
+                canStart
+                  ? 'bg-zinc-200 text-black border-zinc-200 hover:bg-zinc-300 active:bg-zinc-400'
+                  : 'bg-helix-border text-helix-muted border-helix-border cursor-not-allowed',
+              )}
+            >
+              {isStarting ? (
+                <><Loader2 size={22} className="animate-spin" /> Starting...</>
+              ) : isFetchingWeights ? (
+                <><Loader2 size={22} className="animate-spin" /> Loading Weights...</>
+              ) : (
+                <><Play size={22} /> Start Training</>
+              )}
+            </motion.button>
+          </div>
 
           {/* ZK Mode */}
           <div className="space-y-3">
-            <span className="text-sm font-medium text-helix-text2">ZK Proofs</span>
+            <span className="text-base font-medium text-helix-text2">ZK Proofs</span>
             <div className="grid grid-cols-3 gap-2">
               {(['off', 'always', 'risk'] as const).map((mode) => (
                 <button
@@ -552,7 +640,7 @@ function ConfigForm({
                   type="button"
                   onClick={() => setZkMode(mode)}
                   className={cn(
-                    'py-2.5 rounded-xl text-sm font-medium transition-all',
+                    'py-2.5 rounded-xl text-base font-medium transition-all',
                     zkMode === mode
                       ? 'bg-white text-black shadow-lg shadow-white/5'
                       : 'bg-helix-surface border border-helix-border text-helix-muted hover:text-white hover:border-helix-border2',
@@ -571,8 +659,8 @@ function ConfigForm({
                   exit={{ opacity: 0, height: 0 }}
                   className="overflow-hidden"
                 >
-                  <div className="flex items-center justify-between py-3 px-4 bg-helix-surface border border-helix-border rounded-xl">
-                    <span className="text-sm text-helix-text2">ZK Checkpoint Freq</span>
+                  <div className="flex items-center justify-between py-3.5 px-4 bg-helix-surface border border-helix-border rounded-xl">
+                    <span className="text-base text-helix-text2">ZK Checkpoint Freq</span>
                     <NumberInput value={zkCheckpointFreq} onChange={setZkCheckpointFreq} min={1} max={100} />
                   </div>
                 </motion.div>
@@ -584,8 +672,8 @@ function ConfigForm({
                   exit={{ opacity: 0, height: 0 }}
                   className="overflow-hidden"
                 >
-                  <div className="flex items-center justify-between py-3 px-4 bg-helix-surface border border-helix-border rounded-xl">
-                    <span className="text-sm text-helix-text2">Min Workers for MPC</span>
+                  <div className="flex items-center justify-between py-3.5 px-4 bg-helix-surface border border-helix-border rounded-xl">
+                    <span className="text-base text-helix-text2">Min Workers for MPC</span>
                     <NumberInput value={minWorkersForMpc} onChange={setMinWorkersForMpc} min={2} max={workersOnline > 2 ? workersOnline : 7} />
                   </div>
                 </motion.div>
@@ -593,92 +681,18 @@ function ConfigForm({
             </AnimatePresence>
           </div>
 
-          {/* Toggles */}
+          {/* Store on 0G */}
           <div className="rounded-2xl bg-helix-surface border border-helix-border overflow-hidden">
             <div className="flex items-center justify-between px-5 py-4">
               <div>
-                <p className="text-sm text-white">Store on 0G</p>
+                <p className="text-base text-white">Store on 0G</p>
                 <p className="text-xs text-helix-dim mt-0.5">Save model to decentralized storage</p>
               </div>
               <Toggle on={storeOn0G} onToggle={() => setStoreOn0G(!storeOn0G)} />
             </div>
           </div>
-
-          {/* Payment — Cash App style */}
-          <div className="rounded-2xl bg-helix-surface border border-helix-border p-6">
-            {/* Header with auto toggle */}
-            <div className="flex items-center justify-between mb-5">
-              <span className="text-sm font-medium text-helix-text2">Payment</span>
-              <div className="flex items-center gap-2.5">
-                <span className="text-xs text-helix-dim">Auto</span>
-                <Toggle on={autoPropose} onToggle={handleToggleAutoPropose} />
-              </div>
-            </div>
-
-            {/* Big number — same component for both modes */}
-            <div className="py-3">
-              <PaymentNumber
-                value={autoPropose ? recommendedPayment : paymentEth}
-                color={paymentColor}
-                editable={!autoPropose}
-                onChange={setPaymentEth}
-              />
-            </div>
-
-            {/* Recommended hint when manual */}
-            <AnimatePresence>
-              {!autoPropose && (
-                <motion.p
-                  initial={{ opacity: 0, y: -4 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -4 }}
-                  className="text-xs text-center text-helix-dim mt-3"
-                >
-                  Recommended: {recommendedPayment.toFixed(4)} ETH
-                </motion.p>
-              )}
-            </AnimatePresence>
-
-            {/* Breakdown */}
-            <p className="text-xs text-center text-helix-dim mt-4">
-              {workersOnline > 0 ? workersOnline : 3} workers × {numSteps} steps
-              {zkMode !== 'off' && ` × ${zkMode === 'always' ? '1.75' : '1.25'}× ZK`}
-            </p>
-
-            {/* Stake per worker */}
-            <div className="flex items-center justify-between mt-5 pt-4 border-t border-helix-border">
-              <span className="text-sm text-helix-text2">Stake per Worker</span>
-              <div className="w-28 flex items-center justify-end gap-1.5">
-                <NumberInput value={stakePerWorkerEth} onChange={setStakePerWorkerEth} step={0.01} min={0} />
-                <span className="text-xs text-helix-dim shrink-0">ETH</span>
-              </div>
-            </div>
-          </div>
         </div>
       </div>
-
-      {/* ── Start button (full width, bottom) ─────────────────── */}
-      <motion.button
-        type="button"
-        onClick={handleSubmit}
-        disabled={!canStart}
-        whileTap={canStart ? { scale: 0.98 } : {}}
-        className={cn(
-          'w-full py-4 rounded-2xl text-lg font-semibold tracking-tight transition-all',
-          'flex items-center justify-center gap-3',
-          canStart
-            ? 'bg-white text-black hover:shadow-lg hover:shadow-white/10 active:bg-white/95'
-            : 'bg-helix-border text-helix-muted cursor-not-allowed',
-        )}
-      >
-        {isStarting ? (
-          <><Loader2 size={20} className="animate-spin" /> Starting...</>
-        ) : isFetchingWeights ? (
-          <><Loader2 size={20} className="animate-spin" /> Loading Weights...</>
-        ) : (
-          <><Play size={20} /> Start Training</>
-        )}
-      </motion.button>
     </div>
   );
 }
