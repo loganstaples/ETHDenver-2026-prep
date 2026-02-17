@@ -3,7 +3,7 @@
 import { useState, useMemo, useEffect, useCallback, useRef, Suspense } from 'react';
 import Link from 'next/link';
 import { useSearchParams } from 'next/navigation';
-import { motion, AnimatePresence } from 'framer-motion';
+import { motion, AnimatePresence, useMotionValue, useSpring } from 'framer-motion';
 import {
   Play,
   Loader2,
@@ -22,7 +22,6 @@ import {
   Copy,
   History,
   ChevronDown,
-  ChevronUp,
   Link2,
   RefreshCw,
   Layers,
@@ -145,7 +144,7 @@ function NumberInput({ value, onChange, ...rest }: { value: number; onChange: (v
       type="number"
       value={value}
       onChange={(e) => onChange(Number(e.target.value))}
-      className="w-full bg-transparent text-right text-sm font-mono text-white outline-none placeholder:text-helix-dim [-moz-appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+      className="w-full bg-transparent text-right text-sm text-white outline-none placeholder:text-helix-dim [-moz-appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
       {...rest}
     />
   );
@@ -156,10 +155,10 @@ function ChartTooltip({ active, payload, label }: any) {
   if (!active || !payload?.length) return null;
   return (
     <div className="bg-helix-surface2 border border-helix-border2 rounded-xl px-3 py-2 text-xs shadow-xl">
-      <p className="text-helix-dim font-mono mb-0.5">Step {label}</p>
+      <p className="text-helix-dim mb-0.5">Step {label}</p>
       {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
       {payload.map((entry: any, i: number) => (
-        <p key={i} className="text-white font-mono font-medium">
+        <p key={i} className="text-white font-medium">
           {typeof entry.value === 'number' ? entry.value.toFixed(4) : entry.value}
         </p>
       ))}
@@ -168,358 +167,7 @@ function ChartTooltip({ active, payload, label }: any) {
 }
 
 // ============================================================================
-// Config Form — single-column, Cash App flow
-// ============================================================================
-
-interface ConfigFormProps {
-  onStart: (config: TrainingJobConfig, opts: { storeOn0G: boolean; version: string }) => void;
-  isStarting: boolean;
-  onUploadData: (file: File) => Promise<void>;
-  onUploadWeights: (file: File) => Promise<void>;
-  uploadedData: UploadedData | null;
-  uploadedWeights: UploadedWeights | null;
-  workersOnline: number;
-  defaultVersion: string;
-  models: ModelWithVersions[];
-  selectedModelId: number | null;
-  onSelectModel: (tokenId: number | null) => void;
-  isFetchingWeights: boolean;
-  fetchedModelName: string | null;
-}
-
-function ConfigForm({
-  onStart, isStarting, onUploadData, onUploadWeights,
-  uploadedData, uploadedWeights, workersOnline, defaultVersion,
-  models, selectedModelId, onSelectModel, isFetchingWeights, fetchedModelName,
-}: ConfigFormProps) {
-  const [numSteps, setNumSteps] = useState(500);
-  const [learningRate, setLearningRate] = useState(0.001);
-  const [checkpointFreq, setCheckpointFreq] = useState(50);
-  const [zkMode, setZkMode] = useState<'off' | 'always' | 'risk'>('off');
-  const [zkCheckpointFreq, setZkCheckpointFreq] = useState(5);
-  const [minWorkersForMpc, setMinWorkersForMpc] = useState(2);
-  const [paymentEth, setPaymentEth] = useState(1.0);
-  const [stakePerWorkerEth, setStakePerWorkerEth] = useState(0.1);
-  const [simulateCheater, setSimulateCheater] = useState(false);
-  const [storeOn0G, setStoreOn0G] = useState(false);
-  const [version, setVersion] = useState(defaultVersion);
-  const [versionError, setVersionError] = useState<string | null>(null);
-  const [showAdvanced, setShowAdvanced] = useState(false);
-
-  const handleVersionChange = (v: string) => {
-    setVersion(v);
-    setVersionError(v.trim() && !isValidVersion(v) ? 'Must be x.y.z format' : null);
-  };
-
-  const handleSubmit = () => {
-    const v = version.trim() || defaultVersion;
-    if (!isValidVersion(v)) return;
-    onStart({
-      architecture: [784, 128, 10],
-      num_workers: workersOnline > 0 ? workersOnline : 3,
-      num_steps: numSteps,
-      learning_rate: learningRate,
-      checkpoint_freq: checkpointFreq,
-      mac_interval: 1,
-      zk_mode: zkMode,
-      zk_checkpoint_freq: zkCheckpointFreq,
-      min_workers_for_mpc: minWorkersForMpc,
-      train_size: 1000,
-      test_size: 200,
-      use_real_mnist: true,
-      payment_eth: paymentEth,
-      stake_per_worker_eth: stakePerWorkerEth,
-      simulate_cheater: simulateCheater,
-      seed: 42,
-    }, { storeOn0G, version: v });
-  };
-
-  const selectedModel = models.find((m) => m.tokenId === selectedModelId) ?? null;
-  const latestVersion = selectedModel?.versions?.length
-    ? selectedModel.versions[selectedModel.versions.length - 1]
-    : null;
-
-  const canStart = !isStarting && !versionError && !isFetchingWeights;
-
-  return (
-    <div className="max-w-xl mx-auto space-y-8">
-      {/* ── Hero section ─────────────────────────────────────── */}
-      <div className="text-center space-y-2 pt-4">
-        <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-white/[0.04] border border-white/[0.06]">
-          <span className={cn('w-2 h-2 rounded-full', workersOnline >= 2 ? 'bg-green-400 animate-pulse' : 'bg-helix-dim')} />
-          <span className="text-xs font-mono text-helix-text2">
-            {workersOnline} worker{workersOnline !== 1 ? 's' : ''} online
-          </span>
-        </div>
-        <h2 className="text-3xl font-semibold tracking-tight text-white">
-          New Training Run
-        </h2>
-        <p className="text-sm text-helix-muted max-w-sm mx-auto">
-          MNIST 784 → 128 → 10 · ~102K params · Verifiable MPC
-        </p>
-      </div>
-
-      {/* ── Continue from existing model ─────────────────────── */}
-      {models.length > 0 && (
-        <div className="space-y-3">
-          <div className="flex items-center gap-2">
-            <RefreshCw size={12} className="text-helix-muted" />
-            <span className="text-xs text-helix-muted uppercase tracking-wider">Continue Training</span>
-          </div>
-
-          <div className="relative">
-            <Layers size={14} className="absolute left-4 top-1/2 -translate-y-1/2 text-helix-muted pointer-events-none" />
-            <select
-              value={selectedModelId ?? ''}
-              onChange={(e) => onSelectModel(e.target.value ? Number(e.target.value) : null)}
-              className="w-full appearance-none pl-10 pr-10 py-3.5 bg-helix-surface border border-helix-border rounded-2xl text-sm text-white font-mono focus:outline-none focus:border-helix-border2 transition-colors cursor-pointer"
-            >
-              <option value="">Start from scratch</option>
-              {models.map((m) => {
-                const latest = m.versions.length ? m.versions[m.versions.length - 1] : null;
-                return (
-                  <option key={m.tokenId} value={m.tokenId}>
-                    {m.name} {latest ? `v${latest.semver}` : '(no versions)'}
-                  </option>
-                );
-              })}
-            </select>
-            <ChevronDown size={14} className="absolute right-4 top-1/2 -translate-y-1/2 text-helix-muted pointer-events-none" />
-          </div>
-
-          <AnimatePresence mode="wait">
-            {isFetchingWeights && (
-              <motion.div
-                key="fetching"
-                initial={{ opacity: 0, y: -4 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -4 }}
-                className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-white/[0.03] border border-white/[0.06]"
-              >
-                <Loader2 size={14} className="animate-spin text-white" />
-                <span className="text-sm text-helix-text2">Fetching weights from 0G...</span>
-              </motion.div>
-            )}
-            {!isFetchingWeights && fetchedModelName && uploadedWeights && (
-              <motion.div
-                key="loaded"
-                initial={{ opacity: 0, y: -4 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -4 }}
-                className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-green-500/[0.06] border border-green-500/20"
-              >
-                <CheckCircle size={14} className="text-green-400" />
-                <span className="text-sm text-green-300">
-                  <span className="font-medium">{fetchedModelName}</span>
-                  <span className="text-green-400/60 ml-1.5">
-                    {uploadedWeights.totalParams.toLocaleString()} params
-                  </span>
-                </span>
-              </motion.div>
-            )}
-            {selectedModel && latestVersion && !latestVersion.weightsStored && !isFetchingWeights && (
-              <motion.div
-                key="no-weights"
-                initial={{ opacity: 0, y: -4 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -4 }}
-                className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-yellow-500/[0.06] border border-yellow-500/20"
-              >
-                <AlertTriangle size={14} className="text-yellow-400" />
-                <span className="text-sm text-yellow-300/80">No stored weights — upload manually or start fresh</span>
-              </motion.div>
-            )}
-            {selectedModel && !latestVersion && !isFetchingWeights && (
-              <motion.div
-                key="no-versions"
-                initial={{ opacity: 0, y: -4 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -4 }}
-                className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-yellow-500/[0.06] border border-yellow-500/20"
-              >
-                <AlertTriangle size={14} className="text-yellow-400" />
-                <span className="text-sm text-yellow-300/80">No versions yet — upload weights or start fresh</span>
-              </motion.div>
-            )}
-          </AnimatePresence>
-        </div>
-      )}
-
-      {/* ── Core settings (row-style) ────────────────────────── */}
-      <div className="rounded-2xl bg-helix-surface border border-helix-border overflow-hidden divide-y divide-helix-border">
-        <SettingRow label="Version" hint={versionError ?? undefined}>
-          <input
-            type="text"
-            value={version}
-            onChange={(e) => handleVersionChange(e.target.value)}
-            placeholder={defaultVersion}
-            className={cn(
-              'bg-transparent text-right text-sm font-mono outline-none placeholder:text-helix-dim w-24',
-              versionError ? 'text-red-400' : 'text-white',
-            )}
-          />
-        </SettingRow>
-
-        <SettingRow label="Training Steps">
-          <NumberInput value={numSteps} onChange={setNumSteps} min={10} max={10000} />
-        </SettingRow>
-
-        <SettingRow label="Learning Rate">
-          <NumberInput value={learningRate} onChange={setLearningRate} step={0.0001} min={0.00001} max={1} />
-        </SettingRow>
-
-        <SettingRow label="Checkpoint Every">
-          <div className="flex items-center gap-1.5">
-            <NumberInput value={checkpointFreq} onChange={setCheckpointFreq} min={1} max={1000} />
-            <span className="text-xs text-helix-dim shrink-0">steps</span>
-          </div>
-        </SettingRow>
-      </div>
-
-      {/* ── Uploads ──────────────────────────────────────────── */}
-      <div className="space-y-3">
-        <UploadRow
-          label="Training Data"
-          accept=".json"
-          onUpload={onUploadData}
-          uploaded={uploadedData ? `${uploadedData.samples} samples · ${uploadedData.inputDim}D` : null}
-        />
-        <UploadRow
-          label={fetchedModelName ? `Weights · ${fetchedModelName}` : 'Initial Weights'}
-          accept=".json"
-          onUpload={onUploadWeights}
-          uploaded={uploadedWeights ? `${uploadedWeights.totalParams.toLocaleString()} params` : null}
-          optional
-        />
-      </div>
-
-      {/* ── ZK Mode selector ─────────────────────────────────── */}
-      <div className="space-y-3">
-        <span className="text-xs text-helix-muted uppercase tracking-wider">ZK Proofs</span>
-        <div className="grid grid-cols-3 gap-2">
-          {(['off', 'always', 'risk'] as const).map((mode) => (
-            <button
-              key={mode}
-              type="button"
-              onClick={() => setZkMode(mode)}
-              className={cn(
-                'py-2.5 rounded-xl text-sm font-medium transition-all',
-                zkMode === mode
-                  ? 'bg-white text-black shadow-lg shadow-white/5'
-                  : 'bg-helix-surface border border-helix-border text-helix-muted hover:text-white hover:border-helix-border2',
-              )}
-            >
-              {mode === 'off' ? 'Off' : mode === 'always' ? 'Always' : 'Risk-Based'}
-            </button>
-          ))}
-        </div>
-
-        <AnimatePresence>
-          {zkMode === 'always' && (
-            <motion.div
-              initial={{ opacity: 0, height: 0 }}
-              animate={{ opacity: 1, height: 'auto' }}
-              exit={{ opacity: 0, height: 0 }}
-              className="overflow-hidden"
-            >
-              <div className="flex items-center justify-between py-3 px-4 bg-helix-surface border border-helix-border rounded-xl">
-                <span className="text-sm text-helix-text2">ZK Checkpoint Freq</span>
-                <NumberInput value={zkCheckpointFreq} onChange={setZkCheckpointFreq} min={1} max={100} />
-              </div>
-            </motion.div>
-          )}
-          {zkMode === 'risk' && (
-            <motion.div
-              initial={{ opacity: 0, height: 0 }}
-              animate={{ opacity: 1, height: 'auto' }}
-              exit={{ opacity: 0, height: 0 }}
-              className="overflow-hidden"
-            >
-              <div className="flex items-center justify-between py-3 px-4 bg-helix-surface border border-helix-border rounded-xl">
-                <span className="text-sm text-helix-text2">Min Workers for MPC</span>
-                <NumberInput value={minWorkersForMpc} onChange={setMinWorkersForMpc} min={2} max={workersOnline > 2 ? workersOnline : 7} />
-              </div>
-            </motion.div>
-          )}
-        </AnimatePresence>
-      </div>
-
-      {/* ── Toggles ──────────────────────────────────────────── */}
-      <div className="rounded-2xl bg-helix-surface border border-helix-border overflow-hidden divide-y divide-helix-border">
-        <div className="flex items-center justify-between px-5 py-4">
-          <div>
-            <p className="text-sm text-white">Store on 0G</p>
-            <p className="text-xs text-helix-dim mt-0.5">Save model to decentralized storage</p>
-          </div>
-          <Toggle on={storeOn0G} onToggle={() => setStoreOn0G(!storeOn0G)} />
-        </div>
-        <div className="flex items-center justify-between px-5 py-4">
-          <div>
-            <p className="text-sm text-white">Simulate Cheater</p>
-            <p className="text-xs text-helix-dim mt-0.5">Inject a malicious worker for demo</p>
-          </div>
-          <Toggle on={simulateCheater} onToggle={() => setSimulateCheater(!simulateCheater)} />
-        </div>
-      </div>
-
-      {/* ── Advanced (collapsed) ──────────────────────────────── */}
-      <button
-        type="button"
-        onClick={() => setShowAdvanced(!showAdvanced)}
-        className="flex items-center gap-2 mx-auto text-xs text-helix-muted hover:text-helix-text2 transition-colors"
-      >
-        {showAdvanced ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
-        {showAdvanced ? 'Hide' : 'Show'} Economics
-      </button>
-
-      <AnimatePresence>
-        {showAdvanced && (
-          <motion.div
-            initial={{ opacity: 0, height: 0 }}
-            animate={{ opacity: 1, height: 'auto' }}
-            exit={{ opacity: 0, height: 0 }}
-            className="overflow-hidden"
-          >
-            <div className="rounded-2xl bg-helix-surface border border-helix-border overflow-hidden divide-y divide-helix-border">
-              <SettingRow label="Payment (ETH)">
-                <NumberInput value={paymentEth} onChange={setPaymentEth} step={0.1} min={0} />
-              </SettingRow>
-              <SettingRow label="Stake / Worker (ETH)">
-                <NumberInput value={stakePerWorkerEth} onChange={setStakePerWorkerEth} step={0.01} min={0} />
-              </SettingRow>
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      {/* ── Start button ─────────────────────────────────────── */}
-      <motion.button
-        type="button"
-        onClick={handleSubmit}
-        disabled={!canStart}
-        whileTap={canStart ? { scale: 0.97 } : {}}
-        className={cn(
-          'w-full py-4 rounded-2xl text-base font-semibold tracking-tight transition-all',
-          'flex items-center justify-center gap-2.5',
-          canStart
-            ? 'bg-white text-black hover:shadow-lg hover:shadow-white/10 active:bg-white/95'
-            : 'bg-helix-border text-helix-muted cursor-not-allowed',
-        )}
-      >
-        {isStarting ? (
-          <><Loader2 size={18} className="animate-spin" /> Starting...</>
-        ) : isFetchingWeights ? (
-          <><Loader2 size={18} className="animate-spin" /> Loading Weights...</>
-        ) : (
-          <><Play size={18} /> Start Training</>
-        )}
-      </motion.button>
-    </div>
-  );
-}
-
-// ============================================================================
-// SettingRow — iOS-style list row
+// SettingRow — clean list row
 // ============================================================================
 
 function SettingRow({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
@@ -564,7 +212,7 @@ function UploadRow({ label, accept, onUpload, uploaded, optional }: {
             {optional && !uploaded && <span className="text-helix-dim ml-1.5">optional</span>}
           </p>
           {uploaded && (
-            <p className="text-xs font-mono text-green-400/60 truncate">{uploaded}</p>
+            <p className="text-xs text-green-400/60 truncate">{uploaded}</p>
           )}
         </div>
       </div>
@@ -580,7 +228,463 @@ function UploadRow({ label, accept, onUpload, uploaded, optional }: {
 }
 
 // ============================================================================
-// Live Progress — Bloomberg-style data view
+// PaymentNumber — Cash App style animated payment display
+// ============================================================================
+
+function PaymentNumber({
+  value,
+  color,
+  editable,
+  onChange,
+}: {
+  value: number;
+  color: 'green' | 'yellow' | 'red';
+  editable: boolean;
+  onChange?: (v: number) => void;
+}) {
+  const [display, setDisplay] = useState(value);
+  const motionVal = useMotionValue(value);
+  const spring = useSpring(motionVal, { stiffness: 80, damping: 20, mass: 0.5 });
+
+  useEffect(() => {
+    if (!editable) motionVal.set(value);
+  }, [value, editable, motionVal]);
+
+  useEffect(() => {
+    if (editable) return;
+    return spring.on('change', (v) => setDisplay(v));
+  }, [spring, editable]);
+
+  const colorClass = color === 'green' ? 'text-green-400'
+    : color === 'yellow' ? 'text-yellow-400'
+    : 'text-red-400';
+
+  return (
+    <div className="flex items-baseline justify-center gap-4">
+      {editable ? (
+        <input
+          type="number"
+          value={value}
+          onChange={(e) => onChange?.(Number(e.target.value))}
+          step={0.01}
+          min={0}
+          className={cn(
+            'bg-transparent text-center text-7xl font-bold tracking-tighter tabular-nums outline-none w-56',
+            'transition-colors duration-500',
+            '[-moz-appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none',
+            colorClass,
+          )}
+        />
+      ) : (
+        <span className={cn(
+          'text-7xl font-bold tracking-tighter tabular-nums transition-colors duration-500',
+          colorClass,
+        )}>
+          {display.toFixed(4)}
+        </span>
+      )}
+      <span className={cn('text-2xl font-semibold transition-colors duration-500', colorClass)}>
+        ETH
+      </span>
+    </div>
+  );
+}
+
+// ============================================================================
+// Config Form — two-column full-width layout
+// ============================================================================
+
+interface ConfigFormProps {
+  onStart: (config: TrainingJobConfig, opts: { storeOn0G: boolean; version: string }) => void;
+  isStarting: boolean;
+  onUploadData: (file: File) => Promise<void>;
+  onUploadWeights: (file: File) => Promise<void>;
+  uploadedData: UploadedData | null;
+  uploadedWeights: UploadedWeights | null;
+  workersOnline: number;
+  defaultVersion: string;
+  models: ModelWithVersions[];
+  selectedModelId: number | null;
+  onSelectModel: (tokenId: number | null) => void;
+  isFetchingWeights: boolean;
+  fetchedModelName: string | null;
+}
+
+function ConfigForm({
+  onStart, isStarting, onUploadData, onUploadWeights,
+  uploadedData, uploadedWeights, workersOnline, defaultVersion,
+  models, selectedModelId, onSelectModel, isFetchingWeights, fetchedModelName,
+}: ConfigFormProps) {
+  const [numSteps, setNumSteps] = useState(500);
+  const [learningRate, setLearningRate] = useState(0.001);
+  const [checkpointFreq, setCheckpointFreq] = useState(50);
+  const [zkMode, setZkMode] = useState<'off' | 'always' | 'risk'>('off');
+  const [zkCheckpointFreq, setZkCheckpointFreq] = useState(5);
+  const [minWorkersForMpc, setMinWorkersForMpc] = useState(2);
+  const [paymentEth, setPaymentEth] = useState(1.0);
+  const [stakePerWorkerEth, setStakePerWorkerEth] = useState(0.1);
+  const [storeOn0G, setStoreOn0G] = useState(false);
+  const [version, setVersion] = useState(defaultVersion);
+  const [versionError, setVersionError] = useState<string | null>(null);
+  const [autoPropose, setAutoPropose] = useState(true);
+
+  // Auto-compute recommended payment: base rate × steps × workers × ZK overhead
+  const recommendedPayment = useMemo(() => {
+    const workers = workersOnline > 0 ? workersOnline : 3;
+    const zkMult = zkMode === 'always' ? 1.75 : zkMode === 'risk' ? 1.25 : 1.0;
+    return parseFloat((0.0002 * numSteps * workers * zkMult).toFixed(4));
+  }, [numSteps, workersOnline, zkMode]);
+
+  const effectivePayment = autoPropose ? recommendedPayment : paymentEth;
+
+  const paymentColor = (() => {
+    if (recommendedPayment <= 0) return 'green' as const;
+    const ratio = effectivePayment / recommendedPayment;
+    if (ratio >= 0.9) return 'green' as const;
+    if (ratio >= 0.6) return 'yellow' as const;
+    return 'red' as const;
+  })();
+
+  const handleToggleAutoPropose = () => {
+    if (autoPropose) setPaymentEth(recommendedPayment);
+    setAutoPropose(!autoPropose);
+  };
+
+  const handleVersionChange = (v: string) => {
+    setVersion(v);
+    setVersionError(v.trim() && !isValidVersion(v) ? 'Must be x.y.z format' : null);
+  };
+
+  const handleSubmit = () => {
+    const v = version.trim() || defaultVersion;
+    if (!isValidVersion(v)) return;
+    onStart({
+      architecture: [784, 128, 10],
+      num_workers: workersOnline > 0 ? workersOnline : 3,
+      num_steps: numSteps,
+      learning_rate: learningRate,
+      checkpoint_freq: checkpointFreq,
+      mac_interval: 1,
+      zk_mode: zkMode,
+      zk_checkpoint_freq: zkCheckpointFreq,
+      min_workers_for_mpc: minWorkersForMpc,
+      train_size: 1000,
+      test_size: 200,
+      use_real_mnist: true,
+      payment_eth: effectivePayment,
+      stake_per_worker_eth: stakePerWorkerEth,
+      simulate_cheater: false,
+      seed: 42,
+    }, { storeOn0G, version: v });
+  };
+
+  const selectedModel = models.find((m) => m.tokenId === selectedModelId) ?? null;
+  const latestVersion = selectedModel?.versions?.length
+    ? selectedModel.versions[selectedModel.versions.length - 1]
+    : null;
+
+  const canStart = !isStarting && !versionError && !isFetchingWeights;
+
+  return (
+    <div className="space-y-6">
+      {/* ── Header ────────────────────────────────────────────── */}
+      <div className="flex items-end justify-between">
+        <div>
+          <h1 className="text-4xl font-semibold tracking-tight text-white">
+            New Training Run
+          </h1>
+          <p className="text-base text-helix-muted mt-1">
+            MNIST 784 → 128 → 10 · ~102K params · Verifiable MPC
+          </p>
+        </div>
+        <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-white/[0.04] border border-white/[0.06]">
+          <span className={cn('w-2 h-2 rounded-full', workersOnline >= 2 ? 'bg-green-400 animate-pulse' : 'bg-helix-dim')} />
+          <span className="text-sm text-helix-text2">
+            {workersOnline} worker{workersOnline !== 1 ? 's' : ''}
+          </span>
+        </div>
+      </div>
+
+      {/* ── Two-column grid ──────────────────────────────────── */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+
+        {/* ── LEFT COLUMN ──────────────────────────────────────── */}
+        <div className="space-y-5">
+
+          {/* Continue from existing model */}
+          {models.length > 0 && (
+            <div className="space-y-3">
+              <div className="flex items-center gap-2">
+                <RefreshCw size={13} className="text-helix-muted" />
+                <span className="text-sm font-medium text-helix-text2">Continue Training</span>
+              </div>
+
+              <div className="relative">
+                <Layers size={14} className="absolute left-4 top-1/2 -translate-y-1/2 text-helix-muted pointer-events-none" />
+                <select
+                  value={selectedModelId ?? ''}
+                  onChange={(e) => onSelectModel(e.target.value ? Number(e.target.value) : null)}
+                  className="w-full appearance-none pl-10 pr-10 py-3.5 bg-helix-surface border border-helix-border rounded-2xl text-sm text-white focus:outline-none focus:border-helix-border2 transition-colors cursor-pointer"
+                >
+                  <option value="">Start from scratch</option>
+                  {models.map((m) => {
+                    const latest = m.versions.length ? m.versions[m.versions.length - 1] : null;
+                    return (
+                      <option key={m.tokenId} value={m.tokenId}>
+                        {m.name} {latest ? `v${latest.semver}` : '(no versions)'}
+                      </option>
+                    );
+                  })}
+                </select>
+                <ChevronDown size={14} className="absolute right-4 top-1/2 -translate-y-1/2 text-helix-muted pointer-events-none" />
+              </div>
+
+              <AnimatePresence mode="wait">
+                {isFetchingWeights && (
+                  <motion.div
+                    key="fetching"
+                    initial={{ opacity: 0, y: -4 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -4 }}
+                    className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-white/[0.03] border border-white/[0.06]"
+                  >
+                    <Loader2 size={14} className="animate-spin text-white" />
+                    <span className="text-sm text-helix-text2">Fetching weights from 0G...</span>
+                  </motion.div>
+                )}
+                {!isFetchingWeights && fetchedModelName && uploadedWeights && (
+                  <motion.div
+                    key="loaded"
+                    initial={{ opacity: 0, y: -4 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -4 }}
+                    className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-green-500/[0.06] border border-green-500/20"
+                  >
+                    <CheckCircle size={14} className="text-green-400" />
+                    <span className="text-sm text-green-300">
+                      <span className="font-medium">{fetchedModelName}</span>
+                      <span className="text-green-400/60 ml-1.5">
+                        {uploadedWeights.totalParams.toLocaleString()} params
+                      </span>
+                    </span>
+                  </motion.div>
+                )}
+                {selectedModel && latestVersion && !latestVersion.weightsStored && !isFetchingWeights && (
+                  <motion.div
+                    key="no-weights"
+                    initial={{ opacity: 0, y: -4 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -4 }}
+                    className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-yellow-500/[0.06] border border-yellow-500/20"
+                  >
+                    <AlertTriangle size={14} className="text-yellow-400" />
+                    <span className="text-sm text-yellow-300/80">No stored weights — upload manually or start fresh</span>
+                  </motion.div>
+                )}
+                {selectedModel && !latestVersion && !isFetchingWeights && (
+                  <motion.div
+                    key="no-versions"
+                    initial={{ opacity: 0, y: -4 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -4 }}
+                    className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-yellow-500/[0.06] border border-yellow-500/20"
+                  >
+                    <AlertTriangle size={14} className="text-yellow-400" />
+                    <span className="text-sm text-yellow-300/80">No versions yet — upload weights or start fresh</span>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
+          )}
+
+          {/* Core training settings */}
+          <div className="rounded-2xl bg-helix-surface border border-helix-border overflow-hidden divide-y divide-helix-border">
+            <SettingRow label="Version" hint={versionError ?? undefined}>
+              <input
+                type="text"
+                value={version}
+                onChange={(e) => handleVersionChange(e.target.value)}
+                placeholder={defaultVersion}
+                className={cn(
+                  'bg-transparent text-right text-sm outline-none placeholder:text-helix-dim w-24',
+                  versionError ? 'text-red-400' : 'text-white',
+                )}
+              />
+            </SettingRow>
+
+            <SettingRow label="Training Steps">
+              <NumberInput value={numSteps} onChange={setNumSteps} min={10} max={10000} />
+            </SettingRow>
+
+            <SettingRow label="Learning Rate">
+              <NumberInput value={learningRate} onChange={setLearningRate} step={0.0001} min={0.00001} max={1} />
+            </SettingRow>
+          </div>
+
+          {/* Uploads */}
+          <div className="space-y-3">
+            <UploadRow
+              label="Training Data"
+              accept=".json"
+              onUpload={onUploadData}
+              uploaded={uploadedData ? `${uploadedData.samples} samples · ${uploadedData.inputDim}D` : null}
+            />
+            <UploadRow
+              label={fetchedModelName ? `Weights · ${fetchedModelName}` : 'Initial Weights'}
+              accept=".json"
+              onUpload={onUploadWeights}
+              uploaded={uploadedWeights ? `${uploadedWeights.totalParams.toLocaleString()} params` : null}
+              optional
+            />
+          </div>
+        </div>
+
+        {/* ── RIGHT COLUMN ─────────────────────────────────────── */}
+        <div className="space-y-5">
+
+          {/* ZK Mode */}
+          <div className="space-y-3">
+            <span className="text-sm font-medium text-helix-text2">ZK Proofs</span>
+            <div className="grid grid-cols-3 gap-2">
+              {(['off', 'always', 'risk'] as const).map((mode) => (
+                <button
+                  key={mode}
+                  type="button"
+                  onClick={() => setZkMode(mode)}
+                  className={cn(
+                    'py-2.5 rounded-xl text-sm font-medium transition-all',
+                    zkMode === mode
+                      ? 'bg-white text-black shadow-lg shadow-white/5'
+                      : 'bg-helix-surface border border-helix-border text-helix-muted hover:text-white hover:border-helix-border2',
+                  )}
+                >
+                  {mode === 'off' ? 'Off' : mode === 'always' ? 'Always' : 'Risk-Based'}
+                </button>
+              ))}
+            </div>
+
+            <AnimatePresence>
+              {zkMode === 'always' && (
+                <motion.div
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: 'auto' }}
+                  exit={{ opacity: 0, height: 0 }}
+                  className="overflow-hidden"
+                >
+                  <div className="flex items-center justify-between py-3 px-4 bg-helix-surface border border-helix-border rounded-xl">
+                    <span className="text-sm text-helix-text2">ZK Checkpoint Freq</span>
+                    <NumberInput value={zkCheckpointFreq} onChange={setZkCheckpointFreq} min={1} max={100} />
+                  </div>
+                </motion.div>
+              )}
+              {zkMode === 'risk' && (
+                <motion.div
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: 'auto' }}
+                  exit={{ opacity: 0, height: 0 }}
+                  className="overflow-hidden"
+                >
+                  <div className="flex items-center justify-between py-3 px-4 bg-helix-surface border border-helix-border rounded-xl">
+                    <span className="text-sm text-helix-text2">Min Workers for MPC</span>
+                    <NumberInput value={minWorkersForMpc} onChange={setMinWorkersForMpc} min={2} max={workersOnline > 2 ? workersOnline : 7} />
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </div>
+
+          {/* Toggles */}
+          <div className="rounded-2xl bg-helix-surface border border-helix-border overflow-hidden">
+            <div className="flex items-center justify-between px-5 py-4">
+              <div>
+                <p className="text-sm text-white">Store on 0G</p>
+                <p className="text-xs text-helix-dim mt-0.5">Save model to decentralized storage</p>
+              </div>
+              <Toggle on={storeOn0G} onToggle={() => setStoreOn0G(!storeOn0G)} />
+            </div>
+          </div>
+
+          {/* Payment — Cash App style */}
+          <div className="rounded-2xl bg-helix-surface border border-helix-border p-6">
+            {/* Header with auto toggle */}
+            <div className="flex items-center justify-between mb-5">
+              <span className="text-sm font-medium text-helix-text2">Payment</span>
+              <div className="flex items-center gap-2.5">
+                <span className="text-xs text-helix-dim">Auto</span>
+                <Toggle on={autoPropose} onToggle={handleToggleAutoPropose} />
+              </div>
+            </div>
+
+            {/* Big number — same component for both modes */}
+            <div className="py-3">
+              <PaymentNumber
+                value={autoPropose ? recommendedPayment : paymentEth}
+                color={paymentColor}
+                editable={!autoPropose}
+                onChange={setPaymentEth}
+              />
+            </div>
+
+            {/* Recommended hint when manual */}
+            <AnimatePresence>
+              {!autoPropose && (
+                <motion.p
+                  initial={{ opacity: 0, y: -4 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -4 }}
+                  className="text-xs text-center text-helix-dim mt-3"
+                >
+                  Recommended: {recommendedPayment.toFixed(4)} ETH
+                </motion.p>
+              )}
+            </AnimatePresence>
+
+            {/* Breakdown */}
+            <p className="text-xs text-center text-helix-dim mt-4">
+              {workersOnline > 0 ? workersOnline : 3} workers × {numSteps} steps
+              {zkMode !== 'off' && ` × ${zkMode === 'always' ? '1.75' : '1.25'}× ZK`}
+            </p>
+
+            {/* Stake per worker */}
+            <div className="flex items-center justify-between mt-5 pt-4 border-t border-helix-border">
+              <span className="text-sm text-helix-text2">Stake per Worker</span>
+              <div className="w-28 flex items-center justify-end gap-1.5">
+                <NumberInput value={stakePerWorkerEth} onChange={setStakePerWorkerEth} step={0.01} min={0} />
+                <span className="text-xs text-helix-dim shrink-0">ETH</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* ── Start button (full width, bottom) ─────────────────── */}
+      <motion.button
+        type="button"
+        onClick={handleSubmit}
+        disabled={!canStart}
+        whileTap={canStart ? { scale: 0.98 } : {}}
+        className={cn(
+          'w-full py-4 rounded-2xl text-lg font-semibold tracking-tight transition-all',
+          'flex items-center justify-center gap-3',
+          canStart
+            ? 'bg-white text-black hover:shadow-lg hover:shadow-white/10 active:bg-white/95'
+            : 'bg-helix-border text-helix-muted cursor-not-allowed',
+        )}
+      >
+        {isStarting ? (
+          <><Loader2 size={20} className="animate-spin" /> Starting...</>
+        ) : isFetchingWeights ? (
+          <><Loader2 size={20} className="animate-spin" /> Loading Weights...</>
+        ) : (
+          <><Play size={20} /> Start Training</>
+        )}
+      </motion.button>
+    </div>
+  );
+}
+
+// ============================================================================
+// Live Progress — full-width two-column training view
 // ============================================================================
 
 interface LiveProgressProps {
@@ -604,22 +708,22 @@ function LiveProgress({ session, losses, isConnected, error, version, onDownload
   const isComplete = session.status === 'complete';
 
   return (
-    <div className="max-w-2xl mx-auto space-y-6">
+    <div className="space-y-6">
       {/* ── Status bar ──────────────────────────────────────── */}
       <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2.5">
+        <div className="flex items-center gap-3">
           {isConnected ? (
-            <Wifi size={12} className="text-green-400" />
+            <Wifi size={14} className="text-green-400" />
           ) : (
-            <WifiOff size={12} className="text-red-400" />
+            <WifiOff size={14} className="text-red-400" />
           )}
-          <span className="text-xs font-mono text-helix-dim">
+          <span className="text-sm text-helix-dim">
             {session.session_id.slice(0, 8)}
           </span>
-          <Badge variant="default" className="font-mono">v{version}</Badge>
+          <Badge variant="default">v{version}</Badge>
         </div>
         <div className={cn(
-          'flex items-center gap-2 px-3 py-1 rounded-full text-xs font-medium',
+          'flex items-center gap-2 px-3.5 py-1.5 rounded-full text-sm font-medium',
           isComplete ? 'bg-green-500/10 text-green-400'
             : session.status === 'failed' ? 'bg-red-500/10 text-red-400'
             : 'bg-white/[0.06] text-white',
@@ -640,143 +744,155 @@ function LiveProgress({ session, losses, isConnected, error, version, onDownload
         </motion.div>
       )}
 
-      {/* ── Hero metric ─────────────────────────────────────── */}
-      <div className="text-center py-6">
-        {isComplete && session.accuracy !== null ? (
-          <motion.div
-            initial={{ scale: 0.9, opacity: 0 }}
-            animate={{ scale: 1, opacity: 1 }}
-            transition={{ type: 'spring', stiffness: 200, damping: 20 }}
-          >
-            <p className="text-xs text-helix-muted uppercase tracking-wider mb-2">Final Accuracy</p>
-            <p className="text-6xl font-semibold tracking-tighter text-white font-mono">
-              {(session.accuracy * 100).toFixed(1)}
-              <span className="text-2xl text-helix-muted ml-0.5">%</span>
-            </p>
-          </motion.div>
-        ) : session.status === 'failed' ? (
-          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
-            <XCircle size={48} className="text-red-400 mx-auto mb-3" />
-            <p className="text-lg font-medium text-red-300">Training Failed</p>
-          </motion.div>
-        ) : (
-          <div>
-            <p className="text-xs text-helix-muted uppercase tracking-wider mb-2">Current Loss</p>
-            <p className="text-6xl font-semibold tracking-tighter text-white font-mono tabular-nums">
-              {session.current_loss > 0 ? session.current_loss.toFixed(4) : '—'}
-            </p>
-          </div>
-        )}
-      </div>
+      {/* ── Two-column layout ─────────────────────────────────── */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
 
-      {/* ── Progress bar (slim, full-width) ──────────────────── */}
-      {!isTerminal && (
-        <div className="space-y-2">
-          <div className="h-1 w-full rounded-full bg-helix-border overflow-hidden">
+        {/* LEFT: Hero metric + chart */}
+        <div className="space-y-6">
+          {/* Hero metric */}
+          <div className="flex items-center justify-center py-8 rounded-2xl bg-helix-surface border border-helix-border">
+            {isComplete && session.accuracy !== null ? (
+              <motion.div
+                initial={{ scale: 0.9, opacity: 0 }}
+                animate={{ scale: 1, opacity: 1 }}
+                transition={{ type: 'spring', stiffness: 200, damping: 20 }}
+                className="text-center"
+              >
+                <p className="text-sm text-helix-muted uppercase tracking-wider mb-2">Final Accuracy</p>
+                <p className="text-7xl font-semibold tracking-tighter text-white">
+                  {(session.accuracy * 100).toFixed(1)}
+                  <span className="text-3xl text-helix-muted ml-1">%</span>
+                </p>
+              </motion.div>
+            ) : session.status === 'failed' ? (
+              <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="text-center">
+                <XCircle size={48} className="text-red-400 mx-auto mb-3" />
+                <p className="text-xl font-medium text-red-300">Training Failed</p>
+              </motion.div>
+            ) : (
+              <div className="text-center">
+                <p className="text-sm text-helix-muted uppercase tracking-wider mb-2">Current Loss</p>
+                <p className="text-7xl font-semibold tracking-tighter text-white tabular-nums">
+                  {session.current_loss > 0 ? session.current_loss.toFixed(4) : '—'}
+                </p>
+              </div>
+            )}
+          </div>
+
+          {/* Loss curve chart */}
+          <LossCurve data={losses} />
+        </div>
+
+        {/* RIGHT: Progress, phases, stats */}
+        <div className="space-y-5">
+
+          {/* Progress bar */}
+          {!isTerminal && (
+            <div className="space-y-2">
+              <div className="h-2 w-full rounded-full bg-helix-border overflow-hidden">
+                <motion.div
+                  className="h-full rounded-full bg-white"
+                  animate={{ width: `${stepProgress}%` }}
+                  transition={{ duration: 0.4, ease: 'easeOut' }}
+                />
+              </div>
+              <div className="flex items-center justify-between text-sm text-helix-dim">
+                <span>Step {session.current_step}</span>
+                <span>{session.total_steps}</span>
+              </div>
+            </div>
+          )}
+
+          {/* Phase indicator */}
+          {!isTerminal && (
+            <div className="flex items-center gap-3 px-4 py-3.5 rounded-2xl bg-white/[0.02] border border-white/[0.05]">
+              <div className="flex gap-[3px]">
+                {Array.from({ length: TOTAL_PHASES }, (_, i) => (
+                  <div
+                    key={i}
+                    className={cn(
+                      'w-1.5 h-3 rounded-sm transition-all duration-300',
+                      i + 1 < session.phase ? 'bg-white'
+                        : i + 1 === session.phase ? 'bg-white/60'
+                        : 'bg-helix-border',
+                    )}
+                  />
+                ))}
+              </div>
+              <span className="text-sm text-helix-text2">
+                {session.phase_description || PHASE_DESCRIPTIONS[session.phase] || 'Processing...'}
+              </span>
+              <span className="ml-auto text-sm text-helix-dim">
+                {session.phase}/{TOTAL_PHASES}
+              </span>
+            </div>
+          )}
+
+          {/* Stats grid */}
+          <div className="grid grid-cols-2 gap-3">
+            <StatCard label="MAC Checks" value={session.mac_checks_passed} icon={<Shield size={14} />} />
+            <StatCard label="Checkpoints" value={session.checkpoints_submitted} icon={<Zap size={14} />} />
+            <StatCard label="ZK Proofs" value={session.zk_proofs_generated} icon={<Activity size={14} />} />
+            <StatCard label="Elapsed" value={
+              session.elapsed_secs > 0
+                ? `${session.elapsed_secs.toFixed(0)}s`
+                : `${Math.floor((Date.now() / 1000) - session.started_at)}s`
+            } icon={null} />
+          </div>
+
+          {/* Cheater alert */}
+          {session.cheater_detected && (
             <motion.div
-              className="h-full rounded-full bg-white"
-              animate={{ width: `${stepProgress}%` }}
-              transition={{ duration: 0.4, ease: 'easeOut' }}
+              initial={{ opacity: 0, x: -8 }}
+              animate={{ opacity: 1, x: 0 }}
+              className="flex items-center gap-3 px-4 py-3.5 rounded-2xl bg-red-500/[0.08] border border-red-500/25"
+            >
+              <AlertTriangle size={16} className="text-red-400 shrink-0" />
+              <div>
+                <p className="text-sm font-medium text-red-300">Cheater Detected</p>
+                <p className="text-xs text-red-300/60 mt-0.5">
+                  Worker {session.cheater_detected.party_index} · Step {session.cheater_detected.step} · Stake slashed
+                </p>
+              </div>
+            </motion.div>
+          )}
+
+          {/* Results actions */}
+          {isTerminal && (
+            <ResultsActions
+              session={session}
+              version={version}
+              onDownloadModel={onDownloadModel}
+              onStoreOnZeroG={onStoreOnZeroG}
+              isStoringOnZeroG={isStoringOnZeroG}
+              zeroGResult={zeroGResult}
+              showStoreOn0G={showStoreOn0G}
             />
-          </div>
-          <div className="flex items-center justify-between text-xs font-mono text-helix-dim">
-            <span>Step {session.current_step}</span>
-            <span>{session.total_steps}</span>
-          </div>
+          )}
         </div>
-      )}
-
-      {/* ── Phase indicator ──────────────────────────────────── */}
-      {!isTerminal && (
-        <div className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-white/[0.02] border border-white/[0.05]">
-          <div className="flex gap-[3px]">
-            {Array.from({ length: TOTAL_PHASES }, (_, i) => (
-              <div
-                key={i}
-                className={cn(
-                  'w-1.5 h-3 rounded-sm transition-all duration-300',
-                  i + 1 < session.phase ? 'bg-white'
-                    : i + 1 === session.phase ? 'bg-white/60'
-                    : 'bg-helix-border',
-                )}
-              />
-            ))}
-          </div>
-          <span className="text-sm text-helix-text2">
-            {session.phase_description || PHASE_DESCRIPTIONS[session.phase] || 'Processing...'}
-          </span>
-          <span className="ml-auto text-xs font-mono text-helix-dim">
-            {session.phase}/{TOTAL_PHASES}
-          </span>
-        </div>
-      )}
-
-      {/* ── Stats strip ─────────────────────────────────────── */}
-      <div className="grid grid-cols-4 gap-px rounded-2xl overflow-hidden bg-helix-border">
-        <Stat label="MAC Checks" value={session.mac_checks_passed} icon={<Shield size={12} />} />
-        <Stat label="Checkpoints" value={session.checkpoints_submitted} icon={<Zap size={12} />} />
-        <Stat label="ZK Proofs" value={session.zk_proofs_generated} icon={<Activity size={12} />} />
-        <Stat label="Elapsed" value={
-          session.elapsed_secs > 0
-            ? `${session.elapsed_secs.toFixed(0)}s`
-            : `${Math.floor((Date.now() / 1000) - session.started_at)}s`
-        } icon={null} />
       </div>
-
-      {/* ── Cheater alert ───────────────────────────────────── */}
-      {session.cheater_detected && (
-        <motion.div
-          initial={{ opacity: 0, x: -8 }}
-          animate={{ opacity: 1, x: 0 }}
-          className="flex items-center gap-3 px-4 py-3.5 rounded-2xl bg-red-500/[0.08] border border-red-500/25"
-        >
-          <AlertTriangle size={16} className="text-red-400 shrink-0" />
-          <div>
-            <p className="text-sm font-medium text-red-300">Cheater Detected</p>
-            <p className="text-xs text-red-300/60 mt-0.5">
-              Worker {session.cheater_detected.party_index} · Step {session.cheater_detected.step} · Stake slashed
-            </p>
-          </div>
-        </motion.div>
-      )}
-
-      {/* ── Loss curve ──────────────────────────────────────── */}
-      <LossCurve data={losses} />
-
-      {/* ── Results actions ──────────────────────────────────── */}
-      {isTerminal && (
-        <ResultsActions
-          session={session}
-          version={version}
-          onDownloadModel={onDownloadModel}
-          onStoreOnZeroG={onStoreOnZeroG}
-          isStoringOnZeroG={isStoringOnZeroG}
-          zeroGResult={zeroGResult}
-          showStoreOn0G={showStoreOn0G}
-        />
-      )}
     </div>
   );
 }
 
 // ============================================================================
-// Stat — tiny Bloomberg-style metric cell
+// StatCard — clean metric card
 // ============================================================================
 
-function Stat({ label, value, icon }: { label: string; value: string | number; icon: React.ReactNode | null }) {
+function StatCard({ label, value, icon }: { label: string; value: string | number; icon: React.ReactNode | null }) {
   return (
-    <div className="bg-helix-surface px-3 py-3 text-center">
-      <div className="flex items-center justify-center gap-1 mb-1">
+    <div className="bg-helix-surface border border-helix-border rounded-2xl px-4 py-3.5">
+      <div className="flex items-center gap-1.5 mb-1.5">
         {icon && <span className="text-helix-dim">{icon}</span>}
-        <span className="text-[10px] text-helix-dim uppercase tracking-wider">{label}</span>
+        <span className="text-xs text-helix-dim uppercase tracking-wider">{label}</span>
       </div>
-      <p className="text-lg font-mono font-light text-white tabular-nums">{value}</p>
+      <p className="text-2xl font-semibold text-white tabular-nums">{value}</p>
     </div>
   );
 }
 
 // ============================================================================
-// Loss Curve — area chart, Bloomberg ticker feel
+// Loss Curve — area chart
 // ============================================================================
 
 function LossCurve({ data }: { data: { step: number; loss: number }[] }) {
@@ -795,14 +911,14 @@ function LossCurve({ data }: { data: { step: number; loss: number }[] }) {
   }
 
   return (
-    <div className="rounded-2xl bg-helix-surface border border-helix-border p-4 pt-3">
-      <div className="flex items-center justify-between mb-2">
-        <span className="text-xs text-helix-muted uppercase tracking-wider">Loss</span>
-        <span className="text-xs font-mono text-helix-dim">
+    <div className="rounded-2xl bg-helix-surface border border-helix-border p-5 pt-4">
+      <div className="flex items-center justify-between mb-3">
+        <span className="text-sm text-helix-muted">Loss</span>
+        <span className="text-sm text-helix-dim tabular-nums">
           {chartData[chartData.length - 1].loss.toFixed(4)}
         </span>
       </div>
-      <ResponsiveContainer width="100%" height={180}>
+      <ResponsiveContainer width="100%" height={200}>
         <AreaChart data={chartData}>
           <defs>
             <linearGradient id="lossGrad" x1="0" y1="0" x2="0" y2="1">
@@ -813,13 +929,13 @@ function LossCurve({ data }: { data: { step: number; loss: number }[] }) {
           <XAxis
             dataKey="step"
             stroke="transparent"
-            tick={{ fill: '#3e3e44', fontSize: 10, fontFamily: 'var(--font-geist-mono)' }}
+            tick={{ fill: '#3e3e44', fontSize: 11 }}
             tickLine={false}
             axisLine={false}
           />
           <YAxis
             stroke="transparent"
-            tick={{ fill: '#3e3e44', fontSize: 10, fontFamily: 'var(--font-geist-mono)' }}
+            tick={{ fill: '#3e3e44', fontSize: 11 }}
             tickLine={false}
             axisLine={false}
             width={40}
@@ -873,8 +989,8 @@ function ResultsActions({ session, version, onDownloadModel, onStoreOnZeroG, isS
       animate={{ opacity: 1, y: 0 }}
       className="space-y-3"
     >
-      {/* Summary stats row */}
-      <div className="flex items-center justify-center gap-6 py-3 text-xs font-mono text-helix-muted">
+      {/* Summary stats */}
+      <div className="flex items-center gap-6 py-3 text-sm text-helix-muted">
         <span>{session.current_step}/{session.total_steps} steps</span>
         <span className="w-px h-3 bg-helix-border" />
         <span>
@@ -933,7 +1049,7 @@ function ResultsActions({ session, version, onDownloadModel, onStoreOnZeroG, isS
           </div>
 
           <div className="flex items-center gap-2">
-            <code className="flex-1 text-xs font-mono text-green-300/70 bg-green-500/[0.06] px-3 py-2 rounded-xl truncate">
+            <code className="flex-1 text-xs text-green-300/70 bg-green-500/[0.06] px-3 py-2 rounded-xl truncate">
               {zeroGResult.rootHash}
             </code>
             <button
@@ -976,12 +1092,12 @@ function TrainingHistoryList({ history, onClearHistory }: { history: TrainingHis
   if (history.length === 0) return null;
 
   return (
-    <div className="max-w-2xl mx-auto">
+    <div>
       <div className="flex items-center justify-between mb-3">
         <div className="flex items-center gap-2">
-          <History size={12} className="text-helix-muted" />
-          <span className="text-xs text-helix-muted uppercase tracking-wider">History</span>
-          <span className="text-xs font-mono text-helix-dim">{history.length}</span>
+          <History size={14} className="text-helix-muted" />
+          <span className="text-sm font-medium text-helix-text2">History</span>
+          <span className="text-sm text-helix-dim">{history.length}</span>
         </div>
         <button
           type="button"
@@ -1004,17 +1120,17 @@ function TrainingHistoryList({ history, onClearHistory }: { history: TrainingHis
               <XCircle size={12} className="text-red-400 shrink-0" />
             )}
 
-            <span className="text-xs font-mono text-helix-muted">v{entry.version}</span>
+            <span className="text-sm text-helix-muted">v{entry.version}</span>
 
             <div className="flex-1" />
 
             {entry.accuracy !== null && (
-              <span className="text-sm font-mono font-medium text-white">
+              <span className="text-base font-medium text-white tabular-nums">
                 {(entry.accuracy * 100).toFixed(1)}%
               </span>
             )}
 
-            <span className="text-xs font-mono text-helix-dim">
+            <span className="text-sm text-helix-dim tabular-nums">
               {entry.steps}/{entry.totalSteps}
             </span>
 
@@ -1022,7 +1138,7 @@ function TrainingHistoryList({ history, onClearHistory }: { history: TrainingHis
               <HardDrive size={10} className="text-green-400/60" />
             )}
 
-            <span className="text-xs text-helix-dim">
+            <span className="text-sm text-helix-dim">
               {new Date(entry.date).toLocaleDateString()}
             </span>
           </div>
@@ -1224,16 +1340,14 @@ function TrainPageInner() {
     >
       {/* Weight fetch error */}
       {weightFetchStatus === 'error' && weightFetchError && (
-        <div className="max-w-xl mx-auto">
-          <motion.div
-            initial={{ opacity: 0, y: -4 }}
-            animate={{ opacity: 1, y: 0 }}
-            className="flex items-center gap-2.5 px-4 py-3 rounded-2xl bg-red-500/[0.06] border border-red-500/20"
-          >
-            <XCircle size={14} className="text-red-400 shrink-0" />
-            <p className="text-sm text-red-300">{weightFetchError}</p>
-          </motion.div>
-        </div>
+        <motion.div
+          initial={{ opacity: 0, y: -4 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="flex items-center gap-2.5 px-4 py-3 rounded-2xl bg-red-500/[0.06] border border-red-500/20"
+        >
+          <XCircle size={14} className="text-red-400 shrink-0" />
+          <p className="text-sm text-red-300">{weightFetchError}</p>
+        </motion.div>
       )}
 
       {!hasSession ? (
