@@ -559,7 +559,7 @@ struct SpawnWorkersArgs {
     #[arg(long, default_value = "3")]
     count: usize,
 
-    /// Base TCP port (worker i listens on base_port + i*2)
+    /// Base TCP port (worker i listens on base_port + i*3; ports: data, control=+1, mpc=+2)
     #[arg(long, default_value = "9001")]
     base_port: u16,
 
@@ -743,8 +743,8 @@ struct DashboardArgs {
     #[arg(short, long, default_value = "3001")]
     port: u16,
 
-    /// Host to bind to
-    #[arg(long, default_value = "127.0.0.1")]
+    /// Host to bind to (0.0.0.0 allows connections from other machines)
+    #[arg(long, default_value = "0.0.0.0")]
     host: String,
 
     /// Enable CORS
@@ -3212,11 +3212,11 @@ async fn cmd_spawn_workers(args: &SpawnWorkersArgs, _cli: &Cli) -> Result<()> {
     let mut worker_addrs = Vec::new();
     let mut worker_public_addrs = Vec::new();
     for i in 0..args.count {
-        let port = args.base_port + (i as u16) * 2;
+        let port = args.base_port + (i as u16) * 3;
         let addr = format!("{}:{}", args.bind, port);
         let pub_addr = format!("{}:{}", public_host, port);
         let color = colors[i % colors.len()];
-        println!("  [worker-{}] bind={} public={} (color: {})", i, addr, pub_addr, color);
+        println!("  [worker-{}] bind={} public={} (data={}, ctrl={}, mpc={})", i, addr, pub_addr, port, port+1, port+2);
         worker_addrs.push(addr);
         worker_public_addrs.push(pub_addr);
     }
@@ -3372,7 +3372,7 @@ async fn cmd_spawn_workers(args: &SpawnWorkersArgs, _cli: &Cli) -> Result<()> {
     let mut handles = Vec::new();
 
     for i in 0..args.count {
-        let port = args.base_port + (i as u16) * 2;
+        let port = args.base_port + (i as u16) * 3;
         let listen_addr = format!("{}:{}", args.bind, port);
         let seed = args.seed + i as u64;
 

@@ -867,11 +867,15 @@ impl FullOrchestrator {
             .map(|(pid, addr)| (pid.to_string(), addr.to_string()))
             .collect();
 
-        // Generate worker x25519 keys (deterministic from seed for demo).
+        // Compute worker x25519 public keys using the same derivation as workers.
+        // spawn-workers gives worker i seed = base_seed + i, party_index = i.
+        // worker_public_key_from_seed(seed, party_index) uses seeded_rng(seed, party_index).
         let mut worker_publics = Vec::with_capacity(num_workers);
-        for _ in 0..num_workers {
-            let (_secret, public) = generate_x25519_keypair(&mut key_rng);
-            worker_publics.push(public);
+        for i in 0..num_workers {
+            let pk_bytes = crate::worker_entry::worker_public_key_from_seed(
+                self.config.seed + i as u64, i,
+            );
+            worker_publics.push(X25519PublicKey::from(pk_bytes));
         }
 
         // Distribute encrypted shares to workers via TCP.

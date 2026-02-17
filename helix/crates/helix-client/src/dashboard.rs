@@ -985,7 +985,8 @@ async fn start_training_handler(
     // Note: On-chain pool worker assignment happens inside the orchestrator
     // (via assignPoolWorkers on the V4 contract). The off-chain registry here
     // is just for endpoint discovery so the orchestrator knows where to connect.
-    let (num_workers, worker_endpoints) = if !registered.is_empty() {
+    let use_registered_workers = !registered.is_empty();
+    let (num_workers, worker_endpoints) = if use_registered_workers {
         let count = registered.len().min(10); // cap at 10 (Anvil key limit)
         if count < 2 {
             return (
@@ -1017,7 +1018,7 @@ async fn start_training_handler(
             ).into_response();
         }
         let endpoints: Vec<String> = (0..nw)
-            .map(|i| format!("127.0.0.1:{}", 9001 + (i as u16) * 2))
+            .map(|i| format!("127.0.0.1:{}", 9001 + (i as u16) * 3))
             .collect();
         (nw, endpoints)
     };
@@ -1098,7 +1099,8 @@ async fn start_training_handler(
         use_pool_workers: false, // Will be set to true below if coordinator is pre-deployed
         #[cfg(feature = "chain")]
         enable_withdrawal: false,
-        distributed: req.transport == "distributed",
+        // Auto-detect: registered remote workers → distributed, otherwise local (single-machine)
+        distributed: use_registered_workers || req.transport == "distributed",
         custom_training_data: None,
         simulate_cheater: req.simulate_cheater,
     };
