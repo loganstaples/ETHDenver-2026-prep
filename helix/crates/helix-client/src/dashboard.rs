@@ -33,6 +33,7 @@ use tracing::{debug, error, info, warn};
 use crate::full_orchestration::{
     FullOrchestrationConfig, FullOrchestrator, ProgressCallback, ProgressEvent, ZkMode,
 };
+use crate::mpc_inference::{self, ModelWeights};
 use crate::zk_proof_layer::ZkProofConfig;
 
 // ---------------------------------------------------------------------------
@@ -651,6 +652,8 @@ pub fn create_dashboard_router_with_state(state: Arc<DashboardState>) -> Router 
         .route("/api/training/sessions/:id", get(get_session_handler))
         .route("/api/training/sessions/:id/losses", get(get_losses_handler))
         .route("/api/training/sessions/:id/model", get(get_model_handler))
+        // MPC inference endpoint
+        .route("/api/inference", post(inference_handler))
         // Data/weights upload endpoints
         .route("/api/training/data", post(upload_data_handler))
         .route("/api/training/weights", post(upload_weights_handler))
@@ -1791,6 +1794,104 @@ async fn get_model_handler(
         None => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": "Session not found" })),
+        ).into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Handler: MPC Inference
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct InferenceRequest {
+    session_id: String,
+    pixels: Vec<f64>,
+    #[serde(default = "default_num_parties")]
+    num_parties: usize,
+}
+
+fn default_num_parties() -> usize {
+    3
+}
+
+/// POST /api/inference — run MPC inference using secret-shared weights
+async fn inference_handler(
+    State(state): State<Arc<DashboardState>>,
+    Json(req): Json<InferenceRequest>,
+) -> impl IntoResponse {
+    // Validate pixels
+    if req.pixels.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "pixels array is empty" })),
+        ).into_response();
+    }
+
+    // Load weights from session
+    let weights = {
+        let sessions = state.sessions.read().await;
+        match sessions.get(&req.session_id) {
+            Some(session) => {
+                if session.status != "complete" {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": "Training not yet complete" })),
+                    ).into_response();
+                }
+                match &session.final_weights {
+                    Some(w) => w.clone(),
+                    None => return (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({ "error": "Weights not available for this session" })),
+                    ).into_response(),
+                }
+            }
+            None => return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "Session not found" })),
+            ).into_response(),
+        }
+    };
+
+    // Parse weights from JSON value into ModelWeights
+    let model_weights: ModelWeights = match serde_json::from_value(weights) {
+        Ok(w) => w,
+        Err(e) => return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("Failed to parse weights: {e}") })),
+        ).into_response(),
+    };
+
+    // Run MPC inference on a blocking thread (it's CPU-intensive)
+    let pixels = req.pixels;
+    let num_parties = req.num_parties;
+    let result = tokio::task::spawn_blocking(move || {
+        mpc_inference::run_mpc_inference(&model_weights, &pixels, num_parties)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(inference)) => Json(serde_json::json!({
+            "prediction": inference.prediction,
+            "confidence": inference.confidence,
+            "probabilities": inference.probabilities,
+            "num_parties": inference.num_parties,
+            "timing": {
+                "share_generation_ms": inference.timing.share_generation_ms,
+                "layer1_ms": inference.timing.layer1_ms,
+                "relu_ms": inference.timing.relu_ms,
+                "layer2_ms": inference.timing.layer2_ms,
+                "reconstruction_ms": inference.timing.reconstruction_ms,
+                "total_ms": inference.timing.total_ms,
+            },
+        })).into_response(),
+        Ok(Err(e)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e })),
+        ).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("Inference task failed: {e}") })),
         ).into_response(),
     }
 }

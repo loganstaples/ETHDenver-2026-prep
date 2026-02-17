@@ -16,10 +16,9 @@ import {
   Upload,
   Image as ImageIcon,
   Pencil,
-  Zap,
-  Database,
-  Globe,
-  Cpu,
+  Shield,
+  Clock,
+  Users,
 } from 'lucide-react';
 import { Card } from '@/components/ui/Card';
 import { Badge } from '@/components/ui/Badge';
@@ -41,31 +40,22 @@ interface TrainingHistoryEntry {
   status: 'complete' | 'failed';
 }
 
-interface LocalInferenceResult {
+interface MPCInferenceResult {
   prediction: number;
   confidence: number;
   probabilities: number[];
-  model_source: string;
-  cached: boolean;
+  num_parties: number;
+  timing: {
+    share_generation_ms: number;
+    layer1_ms: number;
+    relu_ms: number;
+    layer2_ms: number;
+    reconstruction_ms: number;
+    total_ms: number;
+  };
 }
 
-interface ComputeInferenceResult {
-  prediction: number;
-  confidence: number;
-  raw_response: string;
-  model_used: string;
-  provider: string;
-  source: string;
-}
-
-type InferencePhase =
-  | 'idle'
-  | 'loading-model'
-  | 'running-local'
-  | 'calling-0g-compute'
-  | 'done'
-  | 'error';
-
+type InferencePhase = 'idle' | 'submitting' | 'done' | 'error';
 type InputMode = 'draw' | 'upload';
 
 const HISTORY_KEY = 'helix-training-history';
@@ -502,125 +492,59 @@ function ModelSelector({
 }
 
 // ============================================================================
-// Progress Steps
+// MPC Timing Breakdown
 // ============================================================================
 
-function InferenceProgress({
-  phase,
-  localResult,
-  computeResult,
-}: {
-  phase: InferencePhase;
-  localResult: LocalInferenceResult | null;
-  computeResult: ComputeInferenceResult | null;
-}) {
-  const steps = [
-    {
-      key: 'loading-model',
-      label: 'Loading model from 0G Storage',
-      icon: Database,
-      detail: 'Downloading weights from decentralized storage',
-    },
-    {
-      key: 'running-local',
-      label: 'Running trained model inference',
-      icon: Cpu,
-      detail: 'Forward pass through HELIX-trained neural network',
-    },
-    {
-      key: 'calling-0g-compute',
-      label: 'Running 0G Compute inference',
-      icon: Globe,
-      detail: 'Classifying via 0G Compute Network LLM',
-    },
-  ] as const;
-
-  const phaseOrder = ['loading-model', 'running-local', 'calling-0g-compute', 'done'];
+function TimingBreakdown({ timing }: { timing: MPCInferenceResult['timing'] }) {
+  const phases = [
+    { label: 'Secret sharing', ms: timing.share_generation_ms, color: 'bg-blue-400' },
+    { label: 'Layer 1 (public input)', ms: timing.layer1_ms, color: 'bg-cyan-400' },
+    { label: 'ReLU activation', ms: timing.relu_ms, color: 'bg-green-400' },
+    { label: 'Layer 2 (Beaver triples)', ms: timing.layer2_ms, color: 'bg-yellow-400' },
+    { label: 'Reconstruction', ms: timing.reconstruction_ms, color: 'bg-purple-400' },
+  ];
 
   return (
-    <div className="space-y-2">
-      {steps.map((step) => {
-        const stepIdx = phaseOrder.indexOf(step.key);
-        const currentIdx = phaseOrder.indexOf(phase);
-        const isActive = phase === step.key;
-        const isDone = currentIdx > stepIdx;
-        const Icon = step.icon;
-
-        return (
-          <div
-            key={step.key}
-            className={cn(
-              'flex items-center gap-3 px-3 py-2 rounded-lg transition-all',
-              isActive && 'bg-white/[0.04]',
-            )}
-          >
-            {isActive ? (
-              <Loader2 size={14} className="animate-spin text-white shrink-0" />
-            ) : isDone ? (
-              <CheckCircle size={14} className="text-green-400 shrink-0" />
-            ) : (
-              <Icon size={14} className="text-helix-dim shrink-0" />
-            )}
-            <div className="flex-1 min-w-0">
-              <span
-                className={cn(
-                  'text-sm',
-                  isActive ? 'text-white' : isDone ? 'text-helix-text' : 'text-helix-dim',
-                )}
-              >
-                {step.label}
-              </span>
-              {isActive && (
-                <p className="text-2xs text-helix-muted mt-0.5">{step.detail}</p>
-              )}
-            </div>
-            {step.key === 'running-local' && isDone && localResult && (
-              <Badge variant="default" className="text-2xs shrink-0">
-                Predicted: {localResult.prediction}
-              </Badge>
-            )}
-            {step.key === 'calling-0g-compute' && isDone && computeResult && (
-              <Badge variant="default" className="text-2xs shrink-0">
-                Predicted: {computeResult.prediction}
-              </Badge>
-            )}
-          </div>
-        );
-      })}
+    <div className="space-y-1.5">
+      {phases.map((p) => (
+        <div key={p.label} className="flex items-center gap-3">
+          <div className={cn('w-2 h-2 rounded-full shrink-0', p.color)} />
+          <span className="text-2xs text-helix-text flex-1">{p.label}</span>
+          <span className="text-2xs text-helix-muted font-mono">{p.ms}ms</span>
+        </div>
+      ))}
+      <div className="flex items-center gap-3 pt-1 border-t border-helix-border">
+        <Clock size={10} className="text-white shrink-0" />
+        <span className="text-2xs text-white font-medium flex-1">Total</span>
+        <span className="text-2xs text-white font-mono font-medium">{timing.total_ms}ms</span>
+      </div>
     </div>
   );
 }
 
 // ============================================================================
-// Result Cards
+// MPC Result Card
 // ============================================================================
 
-function LocalResultCard({ result }: { result: LocalInferenceResult }) {
+function MPCResultCard({ result }: { result: MPCInferenceResult }) {
+  const [showTiming, setShowTiming] = useState(false);
+
   return (
     <Card variant="glass">
       <div className="flex items-center justify-between mb-4">
         <div className="flex items-center gap-2">
-          <Cpu size={14} className="text-blue-400" />
-          <h3 className="text-sm font-medium text-white">HELIX Trained Model</h3>
+          <Shield size={14} className="text-green-400" />
+          <h3 className="text-sm font-medium text-white">MPC Inference Result</h3>
         </div>
         <div className="flex items-center gap-2">
-          {result.cached && (
-            <Badge variant="default" className="text-helix-muted text-2xs">
-              <Zap size={10} />
-              Cached
-            </Badge>
-          )}
-          {result.model_source.includes('0g') ? (
-            <Badge variant="default" className="text-green-400">
-              <HardDrive size={10} />
-              0G Storage
-            </Badge>
-          ) : (
-            <Badge variant="default">
-              <Server size={10} />
-              Backend
-            </Badge>
-          )}
+          <Badge variant="default" className="text-green-400">
+            <Users size={10} />
+            {result.num_parties} parties
+          </Badge>
+          <Badge variant="default" className="text-blue-400">
+            <Clock size={10} />
+            {result.timing.total_ms}ms
+          </Badge>
         </div>
       </div>
 
@@ -640,99 +564,33 @@ function LocalResultCard({ result }: { result: LocalInferenceResult }) {
       </div>
 
       <ProbabilityBars probabilities={result.probabilities} prediction={result.prediction} />
+
+      <div className="mt-4 pt-3 border-t border-helix-border">
+        <button
+          type="button"
+          onClick={() => setShowTiming(!showTiming)}
+          className="text-2xs text-helix-muted hover:text-white transition-colors flex items-center gap-1"
+        >
+          <Clock size={10} />
+          {showTiming ? 'Hide' : 'Show'} MPC timing breakdown
+        </button>
+
+        <AnimatePresence>
+          {showTiming && (
+            <motion.div
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: 'auto', opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              className="overflow-hidden"
+            >
+              <div className="mt-3">
+                <TimingBreakdown timing={result.timing} />
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
     </Card>
-  );
-}
-
-function ComputeResultCard({ result }: { result: ComputeInferenceResult }) {
-  const [showRaw, setShowRaw] = useState(false);
-
-  return (
-    <Card variant="glass">
-      <div className="flex items-center justify-between mb-4">
-        <div className="flex items-center gap-2">
-          <Globe size={14} className="text-purple-400" />
-          <h3 className="text-sm font-medium text-white">0G Compute Network</h3>
-        </div>
-        <Badge variant="default" className="text-purple-400">
-          <Globe size={10} />
-          {result.model_used?.split('/').pop() || '0G LLM'}
-        </Badge>
-      </div>
-
-      <div className="flex items-center gap-6 mb-4">
-        <div className="w-20 h-20 rounded-xl bg-purple-500/10 border border-purple-500/20 flex items-center justify-center">
-          <span className="text-4xl font-light text-white font-mono">{result.prediction}</span>
-        </div>
-        <div>
-          <p className="text-2xl font-mono font-light text-white">
-            {(result.confidence * 100).toFixed(0)}%
-          </p>
-          <p className="text-2xs text-helix-muted mt-0.5">LLM confidence</p>
-        </div>
-        <div className="ml-auto">
-          <CheckCircle size={24} className="text-purple-400" />
-        </div>
-      </div>
-
-      <div className="flex items-center gap-2 text-2xs text-helix-muted mb-2">
-        <span className="font-mono truncate">Provider: {result.provider?.slice(0, 10)}...</span>
-      </div>
-
-      <button
-        type="button"
-        onClick={() => setShowRaw(!showRaw)}
-        className="text-2xs text-helix-muted hover:text-white transition-colors"
-      >
-        {showRaw ? 'Hide' : 'Show'} raw LLM response
-      </button>
-
-      <AnimatePresence>
-        {showRaw && (
-          <motion.div
-            initial={{ height: 0, opacity: 0 }}
-            animate={{ height: 'auto', opacity: 1 }}
-            exit={{ height: 0, opacity: 0 }}
-          >
-            <pre className="text-2xs font-mono text-helix-text bg-helix-bg px-3 py-2 rounded-md border border-helix-border mt-2 whitespace-pre-wrap">
-              {result.raw_response}
-            </pre>
-          </motion.div>
-        )}
-      </AnimatePresence>
-    </Card>
-  );
-}
-
-function AgreementBadge({
-  localResult,
-  computeResult,
-}: {
-  localResult: LocalInferenceResult;
-  computeResult: ComputeInferenceResult;
-}) {
-  const agree = localResult.prediction === computeResult.prediction;
-
-  return (
-    <div
-      className={cn(
-        'flex items-center justify-center gap-3 px-4 py-3 rounded-lg border',
-        agree
-          ? 'bg-green-500/5 border-green-500/20'
-          : 'bg-yellow-500/5 border-yellow-500/20',
-      )}
-    >
-      {agree ? (
-        <CheckCircle size={16} className="text-green-400" />
-      ) : (
-        <AlertTriangle size={16} className="text-yellow-400" />
-      )}
-      <span className={cn('text-sm font-medium', agree ? 'text-green-300' : 'text-yellow-300')}>
-        {agree
-          ? `Both models agree: digit is ${localResult.prediction}`
-          : `Models disagree: trained model says ${localResult.prediction}, 0G Compute says ${computeResult.prediction}`}
-      </span>
-    </div>
   );
 }
 
@@ -747,11 +605,9 @@ export default function InferencePage() {
   const [models, setModels] = useState<TrainingHistoryEntry[]>([]);
   const [selected, setSelected] = useState<TrainingHistoryEntry | null>(null);
   const [pixels, setPixels] = useState<number[]>([]);
-  const [localResult, setLocalResult] = useState<LocalInferenceResult | null>(null);
-  const [computeResult, setComputeResult] = useState<ComputeInferenceResult | null>(null);
+  const [result, setResult] = useState<MPCInferenceResult | null>(null);
   const [phase, setPhase] = useState<InferencePhase>('idle');
   const [error, setError] = useState<string | null>(null);
-  const [computeError, setComputeError] = useState<string | null>(null);
   const [inputMode, setInputMode] = useState<InputMode>('draw');
 
   // Load models that have retrievable weights
@@ -786,64 +642,36 @@ export default function InferencePage() {
     ctx.fillStyle = '#000000';
     ctx.fillRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
     setPixels([]);
-    setLocalResult(null);
-    setComputeResult(null);
+    setResult(null);
     setPhase('idle');
     setError(null);
-    setComputeError(null);
   }, []);
 
   const runInference = useCallback(async () => {
     if (!selected || !pixels.length) return;
 
-    setPhase('loading-model');
+    setPhase('submitting');
     setError(null);
-    setComputeError(null);
-    setLocalResult(null);
-    setComputeResult(null);
+    setResult(null);
 
     try {
-      // Phase 1: Load model + run local inference
-      setPhase('loading-model');
-      const localRes = await fetch('/api/inference', {
+      const res = await fetch('/api/inference', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           session_id: selected.sessionId,
-          root_hash: selected.rootHash || undefined,
           pixels,
+          num_parties: 3,
         }),
       });
 
-      if (!localRes.ok) {
-        const errBody = await localRes.json().catch(() => ({}));
-        throw new Error(errBody.error || `Local inference HTTP ${localRes.status}`);
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => ({}));
+        throw new Error(errBody.error || `Inference HTTP ${res.status}`);
       }
 
-      setPhase('running-local');
-      const localData: LocalInferenceResult = await localRes.json();
-      setLocalResult(localData);
-
-      // Phase 2: Run 0G Compute inference in parallel
-      setPhase('calling-0g-compute');
-      try {
-        const computeRes = await fetch('/api/0g-compute', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ pixels }),
-        });
-
-        if (!computeRes.ok) {
-          const errBody = await computeRes.json().catch(() => ({}));
-          setComputeError(errBody.error || `0G Compute HTTP ${computeRes.status}`);
-        } else {
-          const computeData: ComputeInferenceResult = await computeRes.json();
-          setComputeResult(computeData);
-        }
-      } catch (err) {
-        setComputeError(err instanceof Error ? err.message : '0G Compute failed');
-      }
-
+      const data: MPCInferenceResult = await res.json();
+      setResult(data);
       setPhase('done');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Inference failed');
@@ -852,8 +680,7 @@ export default function InferencePage() {
   }, [selected, pixels]);
 
   const hasDrawing = pixels.length > 0 && pixels.some((p) => p > 0.01);
-  const isRunning =
-    phase === 'loading-model' || phase === 'running-local' || phase === 'calling-0g-compute';
+  const isRunning = phase === 'submitting';
 
   return (
     <motion.div
@@ -866,9 +693,9 @@ export default function InferencePage() {
       <div className="flex items-center gap-3">
         <h1 className="page-title">Inference</h1>
         <Badge variant="default">MNIST</Badge>
-        <Badge variant="default" className="text-purple-400">
-          <Globe size={10} />
-          0G Compute
+        <Badge variant="default" className="text-green-400">
+          <Shield size={10} />
+          MPC
         </Badge>
       </div>
 
@@ -895,17 +722,15 @@ export default function InferencePage() {
               selected={selected}
               onSelect={(entry) => {
                 setSelected(entry);
-                setLocalResult(null);
-                setComputeResult(null);
+                setResult(null);
                 setPhase('idle');
                 setError(null);
-                setComputeError(null);
               }}
             />
             {selected && (
               <div className="flex items-center gap-4 mt-3 text-2xs text-helix-muted">
-                <span className="font-mono">784 → 128 → 10</span>
-                <span>·</span>
+                <span className="font-mono">784 &rarr; 128 &rarr; 10</span>
+                <span>&middot;</span>
                 <span className="flex items-center gap-1">
                   {selected.storedOn0G ? (
                     <>
@@ -917,7 +742,7 @@ export default function InferencePage() {
                     </>
                   )}
                 </span>
-                <span>·</span>
+                <span>&middot;</span>
                 <span>Trained {new Date(selected.date).toLocaleDateString()}</span>
               </div>
             )}
@@ -1013,35 +838,31 @@ export default function InferencePage() {
                 {isRunning ? (
                   <>
                     <Loader2 size={16} className="animate-spin" />
-                    {phase === 'loading-model'
-                      ? 'Loading Model...'
-                      : phase === 'running-local'
-                        ? 'Running Local Inference...'
-                        : 'Querying 0G Compute...'}
+                    Running MPC Inference...
                   </>
                 ) : (
                   <>
-                    <Sparkles size={16} />
-                    Classify
+                    <Shield size={16} />
+                    Classify with MPC
                   </>
                 )}
               </button>
 
               {/* How it works */}
               <div className="mt-4 p-3 bg-helix-bg rounded-lg border border-helix-border">
-                <p className="text-2xs font-medium text-helix-text2 mb-2">How inference works</p>
+                <p className="text-2xs font-medium text-helix-text2 mb-2">How MPC inference works</p>
                 <div className="space-y-1.5 text-2xs text-helix-muted">
                   <div className="flex items-center gap-2">
-                    <HardDrive size={10} className="text-green-400 shrink-0" />
-                    <span>Model weights loaded from <strong className="text-helix-text">0G Storage</strong></span>
+                    <Shield size={10} className="text-green-400 shrink-0" />
+                    <span>Weights are <strong className="text-helix-text">secret-shared</strong> across MPC workers</span>
                   </div>
                   <div className="flex items-center gap-2">
-                    <Cpu size={10} className="text-blue-400 shrink-0" />
-                    <span>Forward pass through <strong className="text-helix-text">HELIX trained model</strong></span>
+                    <Users size={10} className="text-blue-400 shrink-0" />
+                    <span>Each worker computes on their <strong className="text-helix-text">share only</strong> &mdash; no party sees full weights</span>
                   </div>
                   <div className="flex items-center gap-2">
-                    <Globe size={10} className="text-purple-400 shrink-0" />
-                    <span>Verified via <strong className="text-helix-text">0G Compute Network</strong> LLM</span>
+                    <HardDrive size={10} className="text-purple-400 shrink-0" />
+                    <span>Beaver triple multiplication for <strong className="text-helix-text">secure layer 2</strong></span>
                   </div>
                 </div>
               </div>
@@ -1049,15 +870,18 @@ export default function InferencePage() {
 
             {/* Results Column */}
             <div className="space-y-4">
-              {/* Progress */}
+              {/* Submitting indicator */}
               {isRunning && (
                 <Card variant="default">
-                  <h3 className="text-sm font-medium text-white mb-3">Progress</h3>
-                  <InferenceProgress
-                    phase={phase}
-                    localResult={localResult}
-                    computeResult={computeResult}
-                  />
+                  <div className="flex items-center gap-3 py-4">
+                    <Loader2 size={16} className="animate-spin text-white" />
+                    <div>
+                      <p className="text-sm text-white">Running secure MPC inference...</p>
+                      <p className="text-2xs text-helix-muted mt-0.5">
+                        Secret-sharing weights across 3 workers, running forward pass
+                      </p>
+                    </div>
+                  </div>
                 </Card>
               )}
 
@@ -1087,43 +911,14 @@ export default function InferencePage() {
                 </motion.div>
               )}
 
-              {/* Results */}
-              {phase === 'done' && (
+              {/* Result */}
+              {phase === 'done' && result && (
                 <motion.div
                   initial={{ opacity: 0, y: 8 }}
                   animate={{ opacity: 1, y: 0 }}
                   transition={{ duration: 0.3 }}
-                  className="space-y-4"
                 >
-                  {/* Agreement indicator */}
-                  {localResult && computeResult && (
-                    <AgreementBadge localResult={localResult} computeResult={computeResult} />
-                  )}
-
-                  {/* Local model result */}
-                  {localResult && <LocalResultCard result={localResult} />}
-
-                  {/* 0G Compute result */}
-                  {computeResult && <ComputeResultCard result={computeResult} />}
-
-                  {/* 0G Compute error (non-fatal) */}
-                  {computeError && !computeResult && (
-                    <Card variant="default">
-                      <div className="flex items-center gap-2 mb-2">
-                        <Globe size={14} className="text-purple-400" />
-                        <h3 className="text-sm font-medium text-white">0G Compute Network</h3>
-                      </div>
-                      <div className="flex items-start gap-2 bg-yellow-500/5 border border-yellow-500/20 rounded-lg px-3 py-2">
-                        <AlertTriangle size={12} className="text-yellow-400 shrink-0 mt-0.5" />
-                        <div>
-                          <p className="text-2xs text-yellow-300">{computeError}</p>
-                          <p className="text-2xs text-helix-muted mt-1">
-                            0G Compute requires ZG_COMPUTE_PRIVATE_KEY in .env.local with funded 0G tokens.
-                          </p>
-                        </div>
-                      </div>
-                    </Card>
-                  )}
+                  <MPCResultCard result={result} />
                 </motion.div>
               )}
 
@@ -1131,10 +926,10 @@ export default function InferencePage() {
               {!isRunning && !error && phase === 'idle' && (
                 <Card variant="default">
                   <div className="flex flex-col items-center justify-center py-16">
-                    <Sparkles size={24} className="text-helix-dim mb-3" />
+                    <Shield size={24} className="text-helix-dim mb-3" />
                     <p className="text-sm text-helix-text2">Draw a digit and click Classify</p>
                     <p className="text-2xs text-helix-muted mt-1">
-                      Runs inference via HELIX model + 0G Compute Network
+                      Runs inference via secure multi-party computation
                     </p>
                   </div>
                 </Card>

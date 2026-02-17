@@ -11,6 +11,7 @@ pub mod full_orchestration;
 pub mod health;
 pub mod help;
 pub mod model;
+pub mod mpc_inference;
 pub mod mpc_orchestration;
 pub mod orchestration;
 pub mod orchestrator;
