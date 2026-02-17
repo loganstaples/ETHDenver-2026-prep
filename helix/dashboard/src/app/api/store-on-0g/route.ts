@@ -20,30 +20,42 @@ export async function POST(req: NextRequest) {
     }
 
     const body = await req.json();
-    const { session_id, weights, accuracy, version } = body;
+    const { session_id, weights, accuracy, version, encrypted, encryptedPayload } = body;
 
-    if (!session_id || !weights) {
+    if (!session_id) {
       return NextResponse.json(
-        { error: 'session_id and weights are required' },
+        { error: 'session_id is required' },
+        { status: 400 },
+      );
+    }
+    if (!encrypted && !weights) {
+      return NextResponse.json(
+        { error: 'weights are required for non-encrypted uploads' },
         { status: 400 },
       );
     }
 
-    // Build the model artifact JSON
-    const modelArtifact = {
-      version: version || '1.0.0',
-      framework: 'helix-mpc',
-      session_id,
-      accuracy,
-      timestamp: new Date().toISOString(),
-      architecture: [784, 128, 10],
-      weights,
-    };
-
     // Write to a temp file (0G SDK needs a file path)
     const tmpDir = await mkdtemp(join(tmpdir(), 'helix-0g-'));
     const tmpPath = join(tmpDir, `helix-model-${session_id.slice(0, 8)}.json`);
-    await writeFile(tmpPath, JSON.stringify(modelArtifact));
+
+    if (encrypted && encryptedPayload) {
+      // Write encrypted binary directly
+      const buffer = Buffer.from(encryptedPayload, 'base64');
+      await writeFile(tmpPath, buffer);
+    } else {
+      // Build the model artifact JSON
+      const modelArtifact = {
+        version: version || '1.0.0',
+        framework: 'helix-mpc',
+        session_id,
+        accuracy,
+        timestamp: new Date().toISOString(),
+        architecture: [784, 128, 10],
+        weights,
+      };
+      await writeFile(tmpPath, JSON.stringify(modelArtifact));
+    }
 
     // Initialize 0G Storage client
     const provider = new ethers.JsonRpcProvider(ZG_RPC);
