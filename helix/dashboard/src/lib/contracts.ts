@@ -5,24 +5,28 @@ export const CONTRACT_ADDRESSES = {
         helixCoordinator: '0x0000000000000000000000000000000000000000', // TODO: Deploy
         helixVerifier: '0x0000000000000000000000000000000000000000',
         helixToken: '0x0000000000000000000000000000000000000000',
+        helixModelStore: '0x0000000000000000000000000000000000000000',
     },
     // Sepolia
     11155111: {
         helixCoordinator: '0x0000000000000000000000000000000000000000', // TODO: Deploy
         helixVerifier: '0x0000000000000000000000000000000000000000',
         helixToken: '0x0000000000000000000000000000000000000000',
+        helixModelStore: '0x0000000000000000000000000000000000000000',
     },
     // Hardhat/Localhost
     31337: {
         helixCoordinator: '0x5FbDB2315678afecb367f032d93F642f64180aa3',
         helixVerifier: '0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512',
         helixToken: '0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0',
+        helixModelStore: '0x0000000000000000000000000000000000000000', // Set after deploy
     },
     // ADI Network Testnet
     99999: {
         helixCoordinator: '0x0000000000000000000000000000000000000000', // Set after deploy
         helixVerifier: '0x0000000000000000000000000000000000000000',
         helixToken: '0x0000000000000000000000000000000000000000',
+        helixModelStore: '0x0000000000000000000000000000000000000000', // Set after deploy
     },
 } as const;
 
@@ -369,9 +373,63 @@ export const HELIX_TOKEN_ABI = [
     },
 ] as const;
 
+// HelixModelStore ABI — user-owned on-chain model registry
+export const HELIX_MODEL_STORE_ABI = [
+    {
+        type: 'function',
+        name: 'registerModel',
+        inputs: [
+            { name: 'version', type: 'string' },
+            { name: 'rootHash', type: 'string' },
+            { name: 'accuracy', type: 'uint96' },
+            { name: 'sessionId', type: 'string' },
+        ],
+        outputs: [{ name: 'index', type: 'uint256' }],
+        stateMutability: 'nonpayable',
+    },
+    {
+        type: 'function',
+        name: 'getModels',
+        inputs: [{ name: 'user', type: 'address' }],
+        outputs: [
+            {
+                name: '',
+                type: 'tuple[]',
+                components: [
+                    { name: 'version', type: 'string' },
+                    { name: 'rootHash', type: 'string' },
+                    { name: 'accuracy', type: 'uint96' },
+                    { name: 'timestamp', type: 'uint40' },
+                    { name: 'sessionId', type: 'string' },
+                ],
+            },
+        ],
+        stateMutability: 'view',
+    },
+    {
+        type: 'function',
+        name: 'getModelCount',
+        inputs: [{ name: 'user', type: 'address' }],
+        outputs: [{ name: '', type: 'uint256' }],
+        stateMutability: 'view',
+    },
+    {
+        type: 'event',
+        name: 'ModelRegistered',
+        inputs: [
+            { name: 'owner', type: 'address', indexed: true },
+            { name: 'index', type: 'uint256', indexed: true },
+            { name: 'version', type: 'string', indexed: false },
+            { name: 'rootHash', type: 'string', indexed: false },
+            { name: 'accuracy', type: 'uint96', indexed: false },
+        ],
+    },
+] as const;
+
 export const ABIS = {
     helixCoordinator: HELIX_COORDINATOR_ABI,
     helixToken: HELIX_TOKEN_ABI,
+    helixModelStore: HELIX_MODEL_STORE_ABI,
 };
 
 // Type definitions
@@ -454,8 +512,26 @@ export interface SlashedEvent {
     timestamp: number;
 }
 
-// Helper to get contract address for current chain
+export interface OnChainModelEntry {
+    version: string;
+    rootHash: string;
+    accuracy: number;   // already divided by 1e4
+    timestamp: number;  // unix seconds
+    sessionId: string;
+}
+
+// Helper to get contract address for current chain.
+// Supports env-var override: NEXT_PUBLIC_MODEL_STORE_ADDRESS takes precedence.
 export function getContractAddress(chainId: number, contract: keyof typeof CONTRACT_ADDRESSES[31337]): string {
+    // Allow env-var override for HelixModelStore (set after deploy)
+    if (contract === 'helixModelStore') {
+        const envAddr = typeof window !== 'undefined'
+            ? process.env.NEXT_PUBLIC_MODEL_STORE_ADDRESS
+            : process.env.NEXT_PUBLIC_MODEL_STORE_ADDRESS;
+        if (envAddr && envAddr !== '0x0000000000000000000000000000000000000000') {
+            return envAddr;
+        }
+    }
     const addresses = CONTRACT_ADDRESSES[chainId as keyof typeof CONTRACT_ADDRESSES];
     if (!addresses) {
         console.warn(`No addresses configured for chain ${chainId}, falling back to localhost`);
