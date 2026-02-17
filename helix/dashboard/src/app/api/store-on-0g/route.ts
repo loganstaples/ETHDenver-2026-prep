@@ -80,7 +80,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({
       status: 'stored',
       root_hash: rootHash,
-      tx_hash: tx,
+      tx_hash: typeof tx === 'object' && tx !== null ? (tx as { txHash?: string }).txHash : tx,
       explorer_url: `https://storagescan-galileo.0g.ai/file/${rootHash}`,
       retrieval_url: `${ZG_INDEXER}/file/${rootHash}`,
       session_id,

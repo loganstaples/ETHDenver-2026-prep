@@ -1,11 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { Indexer } from '@0glabs/0g-ts-sdk';
-import { readFile, unlink, mkdtemp } from 'fs/promises';
+import { readFile, unlink, rmdir, mkdtemp } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
 const ZG_INDEXER = process.env.ZG_INDEXER_URL || 'https://indexer-storage-testnet-turbo.0g.ai';
+const BACKEND_TIMEOUT_MS = 15_000;
 
 // ============================================================================
 // Types
@@ -92,7 +93,7 @@ function extractWeights(raw: any): ModelWeights {
     };
   }
 
-  throw new Error('Unrecognized weight format');
+  throw new Error('Unrecognized weight format. Expected { w1, b1, w2, b2 } or { layers: [...] }');
 }
 
 // ============================================================================
@@ -104,15 +105,29 @@ async function loadModelFromBackend(sessionId: string): Promise<ModelWeights> {
     return modelCache.get(`backend:${sessionId}`)!;
   }
 
-  const res = await fetch(`${API_BASE}/api/training/sessions/${sessionId}/model`);
-  if (!res.ok) {
-    throw new Error(`Failed to load model from backend: HTTP ${res.status}`);
-  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), BACKEND_TIMEOUT_MS);
 
-  const data = await res.json();
-  const weights = extractWeights(data.weights || data);
-  modelCache.set(`backend:${sessionId}`, weights);
-  return weights;
+  try {
+    const res = await fetch(`${API_BASE}/api/training/sessions/${sessionId}/model`, {
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      throw new Error(`Backend returned HTTP ${res.status}`);
+    }
+
+    const data = await res.json();
+    const weights = extractWeights(data.weights || data);
+    modelCache.set(`backend:${sessionId}`, weights);
+    return weights;
+  } catch (err) {
+    if (err instanceof Error && err.name === 'AbortError') {
+      throw new Error('Backend model fetch timed out (15s)');
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function loadModelFrom0G(rootHash: string): Promise<ModelWeights> {
@@ -125,7 +140,12 @@ async function loadModelFrom0G(rootHash: string): Promise<ModelWeights> {
   const tmpPath = join(tmpDir, 'model.json');
 
   try {
-    await indexer.download(rootHash, tmpPath, true);
+    // 0G SDK returns Error objects instead of throwing — must check return value
+    const downloadResult = await indexer.download(rootHash, tmpPath, true);
+    if (downloadResult instanceof Error) {
+      throw new Error(`0G download failed: ${downloadResult.message}`);
+    }
+
     const content = await readFile(tmpPath, 'utf-8');
     const artifact = JSON.parse(content);
     const weights = extractWeights(artifact.weights || artifact);
@@ -133,6 +153,7 @@ async function loadModelFrom0G(rootHash: string): Promise<ModelWeights> {
     return weights;
   } finally {
     await unlink(tmpPath).catch(() => {});
+    await rmdir(tmpDir).catch(() => {});
   }
 }
 
@@ -161,15 +182,18 @@ export async function POST(req: NextRequest) {
 
     let weights: ModelWeights;
     let modelSource: string;
+    let cached = false;
 
     // Prefer 0G Storage if root_hash is provided
     if (root_hash) {
+      cached = modelCache.has(`0g:${root_hash}`);
       try {
         weights = await loadModelFrom0G(root_hash);
         modelSource = '0g-storage';
       } catch {
         // Fallback to backend if 0G fails and session_id available
         if (session_id) {
+          cached = modelCache.has(`backend:${session_id}`);
           weights = await loadModelFromBackend(session_id);
           modelSource = 'backend-fallback';
         } else {
@@ -177,6 +201,7 @@ export async function POST(req: NextRequest) {
         }
       }
     } else {
+      cached = modelCache.has(`backend:${session_id}`);
       weights = await loadModelFromBackend(session_id);
       modelSource = 'backend';
     }
@@ -190,6 +215,7 @@ export async function POST(req: NextRequest) {
       confidence,
       probabilities,
       model_source: modelSource,
+      cached,
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Unknown error';
