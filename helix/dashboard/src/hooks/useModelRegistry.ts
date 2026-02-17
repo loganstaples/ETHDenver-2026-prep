@@ -144,11 +144,11 @@ export function useModelRegistry(): UseModelRegistryReturn {
 
       if (modelResult?.status !== 'success' || !modelResult.result) continue;
 
-      const m = modelResult.result as readonly [string, string, string, string, bigint, boolean, number];
+      const m = modelResult.result as unknown as readonly [string, string, string, string, bigint, boolean, number];
 
       const versions: OnChainVersion[] = [];
       if (versionsResult?.status === 'success' && versionsResult.result) {
-        const rawVersions = versionsResult.result as readonly {
+        const rawVersions = versionsResult.result as unknown as readonly {
           semver: string;
           rootHash: string;
           accuracy: bigint;
