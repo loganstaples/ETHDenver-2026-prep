@@ -30,7 +30,7 @@ use crate::types::PartyId;
 // ============================================================================
 
 /// A completed checkpoint ready for on-chain submission.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OnChainCheckpoint {
     /// Training step at which this checkpoint was taken.
     pub step: usize,

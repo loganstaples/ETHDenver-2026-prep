@@ -63,12 +63,14 @@ trap cleanup EXIT INT TERM
 CLI_ONLY=false
 SKIP_BUILD=false
 NUM_WORKERS=6
+TRANSPORT="local"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --cli-only)   CLI_ONLY=true;   shift ;;
         --skip-build) SKIP_BUILD=true; shift ;;
         --workers)    NUM_WORKERS="$2"; shift 2 ;;
+        --transport)  TRANSPORT="$2";   shift 2 ;;
         --help|-h)
             cat <<'EOF'
 HELIX MPC Demo
@@ -76,10 +78,11 @@ HELIX MPC Demo
 Usage: ./scripts/mpc-demo.sh [OPTIONS]
 
 Options:
-    --workers N     Number of MPC workers to launch (default: 6)
-    --cli-only      Run CLI training only (no web dashboard)
-    --skip-build    Skip Rust and JS builds (fast restart)
-    --help, -h      Show this help
+    --workers N        Number of MPC workers to launch (default: 6)
+    --transport MODE   Transport: "local" (in-process) or "distributed" (TCP across machines)
+    --cli-only         Run CLI training only (no web dashboard)
+    --skip-build       Skip Rust and JS builds (fast restart)
+    --help, -h         Show this help
 
 Full Demo (open browser):
     ./scripts/mpc-demo.sh
@@ -324,5 +327,6 @@ else
         --train-size 1000 \
         --test-size 200 \
         --num-workers "$NUM_WORKERS" \
+        --transport "$TRANSPORT" \
         --seed 42
 fi

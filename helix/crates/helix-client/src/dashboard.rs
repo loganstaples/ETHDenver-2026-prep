@@ -118,6 +118,9 @@ pub struct TrainingJobRequest {
     /// Mini-batch size for training
     #[serde(default)]
     pub batch_size: Option<usize>,
+    /// Transport mode: "local" (default) or "distributed"
+    #[serde(default = "default_transport")]
+    pub transport: String,
 }
 
 fn default_architecture() -> Vec<usize> { vec![784, 32, 10] }
@@ -134,6 +137,7 @@ fn default_test_size() -> usize { 200 }
 fn default_payment() -> f64 { 1.0 }
 fn default_stake() -> f64 { 0.1 }
 fn default_seed() -> u64 { 42 }
+fn default_transport() -> String { "local".to_string() }
 
 /// Response after submitting a training job.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1091,6 +1095,7 @@ async fn start_training_handler(
         use_pool_workers: false, // Will be set to true below if coordinator is pre-deployed
         #[cfg(feature = "chain")]
         enable_withdrawal: false,
+        distributed: req.transport == "distributed",
         custom_training_data: None,
         simulate_cheater: req.simulate_cheater,
     };

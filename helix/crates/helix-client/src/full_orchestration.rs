@@ -244,6 +244,15 @@ pub struct FullOrchestrationConfig {
     #[cfg(feature = "chain")]
     pub enable_withdrawal: bool,
 
+    // -- Transport Mode --
+    /// When true, workers run the MPC training loop on their own machines
+    /// using TcpTransport (distributed/multi-machine mode). The orchestrator
+    /// sends `StartDistributedTraining` to each worker over the data channel.
+    /// When false (default), the orchestrator runs all MPC parties in-process
+    /// using LocalTransport (single-machine, faster).
+    #[serde(default)]
+    pub distributed: bool,
+
     // -- Custom Training Data --
     /// Pre-loaded training data (overrides MNIST generation when set).
     /// Format: Vec of (input_vec, target_vec) pairs.
@@ -297,6 +306,7 @@ impl Default for FullOrchestrationConfig {
             use_pool_workers: false,
             #[cfg(feature = "chain")]
             enable_withdrawal: false,
+            distributed: false,
             custom_training_data: None,
             simulate_cheater: false,
         }
@@ -543,50 +553,62 @@ impl FullOrchestrator {
         info!("Phase 8: Running MPC training");
         let phase8_start = Instant::now();
 
-        let mpc_config = MPCIntegrationConfig {
-            d_in,
-            d_hid,
-            d_out,
-            num_workers,
-            num_steps: self.config.num_steps,
-            learning_rate: self.config.learning_rate,
-            checkpoint_interval: self.config.checkpoint_frequency,
-            mac_check_interval: self.config.mac_check_interval,
-            beaver_batch_size: self.config.beaver_batch_size,
-            initial_weights: Some(initial_weights),
-            training_data: training_pairs,
-            seed: self.config.seed,
-            use_node_transport: false,
-            // LocalTransport for in-process MPC parties (fast, real MPC protocol).
-            // TCP transport available via network-mpc feature but adds ~10x latency
-            // per step on localhost due to TCP round-trips for Beaver triples.
-            // The MPC cryptographic protocol (secret sharing, SPDZ MACs, Beaver
-            // triples) is identical regardless of transport layer.
-            use_tcp_transport: false,
-            worker_endpoints: None,
-            batch_size: self.config.batch_size,
-        };
-
-        let mpc_result = if self.config.simulate_cheater {
-            // Demo: inject a cheater (last party) at the midpoint of training.
-            let cheater_party = num_workers - 1;
-            let corrupt_at_step = (self.config.num_steps / 2) as u64;
+        let mpc_result = if self.config.distributed {
+            // Distributed mode: workers run the MPC training loop themselves.
+            // The orchestrator distributes shares + training config to each worker
+            // over the data channel. Workers create TcpTransport meshes, run
+            // training, and send results back.
             info!(
-                cheater_party = cheater_party,
-                corrupt_at_step = corrupt_at_step,
-                "Simulating cheater injection for demo"
+                distributed = true,
+                num_workers = num_workers,
+                "Phase 8: Distributed MPC training (workers execute on their own machines)"
             );
-            helix_mpc::e2e_integration::run_mpc_training_with_cheater(
-                mpc_config,
-                cheater_party,
-                corrupt_at_step,
-            )
-            .await
-            .context("Phase 8: MPC training with cheater simulation failed")?
+            self.run_distributed_training(
+                d_in, d_hid, d_out, num_workers,
+                initial_weights, training_pairs,
+            ).await
+            .context("Phase 8: Distributed MPC training failed")?
         } else {
-            helix_mpc::e2e_integration::run_mpc_training(mpc_config)
+            // Local mode: all MPC parties run in this process using LocalTransport.
+            let mpc_config = MPCIntegrationConfig {
+                d_in,
+                d_hid,
+                d_out,
+                num_workers,
+                num_steps: self.config.num_steps,
+                learning_rate: self.config.learning_rate,
+                checkpoint_interval: self.config.checkpoint_frequency,
+                mac_check_interval: self.config.mac_check_interval,
+                beaver_batch_size: self.config.beaver_batch_size,
+                initial_weights: Some(initial_weights),
+                training_data: training_pairs,
+                seed: self.config.seed,
+                use_node_transport: false,
+                use_tcp_transport: false,
+                worker_endpoints: None,
+                batch_size: self.config.batch_size,
+            };
+
+            if self.config.simulate_cheater {
+                let cheater_party = num_workers - 1;
+                let corrupt_at_step = (self.config.num_steps / 2) as u64;
+                info!(
+                    cheater_party = cheater_party,
+                    corrupt_at_step = corrupt_at_step,
+                    "Simulating cheater injection for demo"
+                );
+                helix_mpc::e2e_integration::run_mpc_training_with_cheater(
+                    mpc_config,
+                    cheater_party,
+                    corrupt_at_step,
+                )
                 .await
-                .context("Phase 8: MPC training failed")?
+                .context("Phase 8: MPC training with cheater simulation failed")?
+            } else {
+                helix_mpc::e2e_integration::run_mpc_training(mpc_config)
+                    .await
+                    .context("Phase 8: MPC training failed")?
+            }
         };
 
         // Emit per-step progress for the completed training.
@@ -754,6 +776,269 @@ impl FullOrchestrator {
                 }
             }
         }
+    }
+
+    // ========================================================================
+    // Distributed Training
+    // ========================================================================
+
+    /// Runs MPC training in distributed mode where workers actively execute
+    /// the training loop on their own machines.
+    ///
+    /// Flow:
+    /// 1. Prepare encrypted shares for each worker
+    /// 2. Connect to each worker's data channel and distribute shares
+    /// 3. Send `StartDistributedTraining` to each worker with peer addresses,
+    ///    trainer config, and training data
+    /// 4. Collect `DistributedTrainingResult` from each worker
+    /// 5. Reconstruct weights from encrypted final shares
+    async fn run_distributed_training(
+        &self,
+        d_in: usize,
+        d_hid: usize,
+        d_out: usize,
+        num_workers: usize,
+        initial_weights: InitialWeights,
+        training_data: Vec<(Vec<f64>, Vec<f64>)>,
+    ) -> Result<MPCIntegrationResult> {
+        use helix_mpc::e2e_integration::{
+            prepare_encrypted_shares, WeightLayout, FinalWeights, CheckpointRecord,
+        };
+        use helix_mpc::mpc_trainer::MPCTrainerConfig;
+        use helix_mpc::mac_verification::MACVerificationConfig;
+        use helix_mpc::network_distribution::{
+            distribute_shares, recv_message, send_message, ProtocolMessage,
+        };
+        use helix_mpc::share_distribution::{
+            generate_x25519_keypair, WeightReconstructor, X25519PublicKey,
+        };
+        use helix_mpc::types::PartyId;
+        use std::net::SocketAddr;
+
+        let start = std::time::Instant::now();
+
+        // Build the trainer config that workers will use.
+        let trainer_config = MPCTrainerConfig {
+            d_in,
+            d_hid,
+            d_out,
+            learning_rate: self.config.learning_rate,
+            num_parties: num_workers,
+            reshare_interval: 0,
+            beaver_batch_size: self.config.beaver_batch_size,
+            generate_proofs: false,
+            base_error: 1e-6,
+            checkpoint_interval: 1,
+            mac_config: if self.config.mac_check_interval > 0 {
+                Some(MACVerificationConfig {
+                    check_interval: self.config.mac_check_interval,
+                    enable_cheater_identification: true,
+                    mac_seed: self.config.seed.wrapping_mul(0xCAFE_BABE),
+                })
+            } else {
+                None
+            },
+            batch_size: self.config.batch_size.max(1),
+        };
+
+        let weight_layout = WeightLayout::new(d_in, d_hid, d_out);
+
+        // Generate owner x25519 keypair for encrypting final shares.
+        let mut key_rng = rand::rngs::StdRng::seed_from_u64(
+            self.config.seed.wrapping_mul(0xDEAD_BEEF),
+        );
+        let (owner_secret, owner_public) = generate_x25519_keypair(&mut key_rng);
+
+        // Parse worker endpoints and compute MPC ports (data_port + 2).
+        let worker_addrs: Vec<SocketAddr> = self.config.worker_endpoints.iter()
+            .map(|ep| ep.parse::<SocketAddr>())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("Invalid worker endpoint address")?;
+
+        let mpc_addrs: Vec<SocketAddr> = worker_addrs.iter()
+            .map(|addr| SocketAddr::new(addr.ip(), addr.port() + 2))
+            .collect();
+
+        let parties: Vec<PartyId> = (0..num_workers).map(PartyId::from_index).collect();
+
+        // Build peer address list: (party_id_str, mpc_addr_str) for all parties.
+        let all_peer_addrs: Vec<(String, String)> = parties.iter()
+            .zip(mpc_addrs.iter())
+            .map(|(pid, addr)| (pid.to_string(), addr.to_string()))
+            .collect();
+
+        // Generate worker x25519 keys (deterministic from seed for demo).
+        let mut worker_publics = Vec::with_capacity(num_workers);
+        for _ in 0..num_workers {
+            let (_secret, public) = generate_x25519_keypair(&mut key_rng);
+            worker_publics.push(public);
+        }
+
+        // Distribute encrypted shares to workers via TCP.
+        info!(
+            num_workers = num_workers,
+            "Distributing encrypted shares to workers"
+        );
+
+        let worker_info: Vec<(PartyId, SocketAddr, X25519PublicKey)> = parties.iter()
+            .zip(worker_addrs.iter())
+            .zip(worker_publics.iter())
+            .map(|((pid, addr), pk)| (pid.clone(), *addr, *pk))
+            .collect();
+
+        // Convert initial weights to flat f64 for distribution.
+        let flat_weights: Vec<f64> = initial_weights.w1.iter()
+            .chain(initial_weights.b1.iter())
+            .chain(initial_weights.w2.iter())
+            .chain(initial_weights.b2.iter())
+            .copied()
+            .collect();
+
+        let shape = vec![flat_weights.len()];
+
+        let mut dist_result = distribute_shares(
+            &flat_weights,
+            &shape,
+            &worker_info,
+            Some(self.config.seed),
+        ).await.map_err(|e| anyhow!("Share distribution failed: {}", e))?;
+
+        if !dist_result.verified {
+            return Err(anyhow!("Commitment verification failed after share distribution"));
+        }
+        info!("Encrypted shares distributed and commitment verified");
+
+        // Send StartDistributedTraining to each worker over the open data channel.
+        for (i, (_party_id, stream)) in dist_result.worker_streams.iter_mut().enumerate() {
+            let msg = ProtocolMessage::StartDistributedTraining {
+                trainer_config: trainer_config.clone(),
+                peer_addrs: all_peer_addrs.clone(),
+                training_data: training_data.clone(),
+                weight_layout: weight_layout.clone(),
+                owner_public_key: *owner_public.as_bytes(),
+                num_steps: self.config.num_steps,
+                checkpoint_interval: self.config.checkpoint_frequency,
+                seed: self.config.seed,
+                mpc_bind_addr: mpc_addrs[i].to_string(),
+            };
+            send_message(stream, &msg).await
+                .map_err(|e| anyhow!("Failed to send training command to worker {}: {}", i, e))?;
+        }
+        info!("StartDistributedTraining sent to all {} workers", num_workers);
+
+        // Collect results from all workers.
+        let mut all_encrypted_shares = Vec::with_capacity(num_workers);
+        let mut all_losses = Vec::new();
+        let mut total_steps = 0;
+        let mut total_mac_checks = 0;
+        let mut cheater_detected: Option<CheaterRecord> = None;
+        let mut all_checkpoints = Vec::new();
+
+        for (i, (_party_id, stream)) in dist_result.worker_streams.iter_mut().enumerate() {
+            let result_msg = recv_message(stream).await
+                .map_err(|e| anyhow!("Failed to receive result from worker {}: {}", i, e))?;
+
+            match result_msg {
+                ProtocolMessage::DistributedTrainingResult {
+                    steps_completed,
+                    losses,
+                    mac_checks_passed,
+                    cheater_detected: has_cheater,
+                    cheater_party,
+                    encrypted_final_share,
+                    checkpoints,
+                } => {
+                    info!(
+                        worker = i,
+                        steps = steps_completed,
+                        final_loss = losses.last().copied().unwrap_or(0.0),
+                        mac_checks = mac_checks_passed,
+                        cheater = has_cheater,
+                        "Worker {} training result received",
+                        i
+                    );
+
+                    if i == 0 {
+                        all_losses = losses;
+                        total_steps = steps_completed;
+                        total_mac_checks = mac_checks_passed;
+                        all_checkpoints = checkpoints.iter().map(|cp| {
+                            CheckpointRecord {
+                                step: cp.step,
+                                commitment_bytes32: cp.commitment_bytes32,
+                                loss: cp.loss,
+                            }
+                        }).collect();
+                    }
+
+                    if has_cheater {
+                        cheater_detected = Some(CheaterRecord {
+                            party_index: cheater_party.unwrap_or(usize::MAX),
+                            detected_at_step: 0,
+                            failure_report: helix_mpc::mac_verification::MACFailureReport {
+                                session_id: "distributed".to_string(),
+                                step_number: 0,
+                                identified_cheater: cheater_party,
+                                sigma_values: Vec::new(),
+                                commitments: Vec::new(),
+                                evidence: helix_mpc::mac_verification::CheaterEvidence {
+                                    pairwise_results: Vec::new(),
+                                    round1_sigmas: Vec::new(),
+                                    round2_sigmas: Vec::new(),
+                                },
+                            },
+                        });
+                    }
+
+                    if let Some(enc_share) = encrypted_final_share {
+                        all_encrypted_shares.push(enc_share);
+                    }
+                }
+                other => {
+                    return Err(anyhow!(
+                        "Unexpected message from worker {}: expected DistributedTrainingResult, got {:?}",
+                        i, std::mem::discriminant(&other),
+                    ));
+                }
+            }
+        }
+
+        // Reconstruct final weights from encrypted shares.
+        let final_weights = if !all_encrypted_shares.is_empty() {
+            let reconstructor = WeightReconstructor::new(owner_secret);
+            let flat = reconstructor.reconstruct(&all_encrypted_shares, None, None)
+                .map_err(|e| anyhow!("Weight reconstruction failed: {}", e))?;
+
+            let mut offset = 0;
+            let w1 = flat[offset..offset + weight_layout.w1_len].to_vec();
+            offset += weight_layout.w1_len;
+            let b1 = flat[offset..offset + weight_layout.b1_len].to_vec();
+            offset += weight_layout.b1_len;
+            let w2 = flat[offset..offset + weight_layout.w2_len].to_vec();
+            offset += weight_layout.w2_len;
+            let b2 = flat[offset..offset + weight_layout.b2_len].to_vec();
+
+            info!("Final weights reconstructed from {} encrypted shares", all_encrypted_shares.len());
+            FinalWeights { w1, b1, w2, b2 }
+        } else {
+            return Err(anyhow!("No encrypted final shares received from workers"));
+        };
+
+        let training_time_ms = start.elapsed().as_millis();
+        let final_loss = all_losses.last().copied().unwrap_or(0.0);
+
+        Ok(MPCIntegrationResult {
+            steps_completed: total_steps,
+            final_loss,
+            losses: all_losses,
+            checkpoints: all_checkpoints,
+            mac_checks_passed: total_mac_checks,
+            cheater_detected,
+            training_time_ms,
+            final_weights,
+            initial_commitment: Some(dist_result.distribution.initial_commitment),
+            encrypted_distribution: true,
+        })
     }
 
     // ========================================================================
@@ -2459,6 +2744,9 @@ mod tests {
             coordinator_address: None,
             #[cfg(feature = "chain")]
             enable_withdrawal: false,
+            #[cfg(feature = "chain")]
+            use_pool_workers: false,
+            distributed: false,
             zk_proof: ZkProofConfig::default(),
             zk_mode: ZkMode::Off,
             custom_training_data: None,

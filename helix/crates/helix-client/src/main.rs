@@ -499,6 +499,12 @@ struct MpcTrainArgs {
     #[arg(long)]
     simulate_cheater: bool,
 
+    /// Transport mode: "local" (default) runs all MPC parties in this process,
+    /// "distributed" sends training commands to remote workers over TCP.
+    /// Use "distributed" when workers run on separate physical machines.
+    #[arg(long, default_value = "local")]
+    transport: String,
+
     /// Save final trained weights to this JSON file
     #[arg(long)]
     output: Option<PathBuf>,
@@ -2851,6 +2857,7 @@ async fn cmd_mpc_train(args: &MpcTrainArgs, _cli: &Cli) -> Result<()> {
         #[cfg(feature = "chain")]
         enable_withdrawal: args.enable_withdrawal,
         zk_mode: parse_zk_mode(&args.zk_mode)?,
+        distributed: args.transport == "distributed",
         custom_training_data: None,
         simulate_cheater: args.simulate_cheater,
     };

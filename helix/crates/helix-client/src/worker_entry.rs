@@ -41,9 +41,10 @@ use ethers::signers::LocalWallet;
 use ethers::types::{Address, U256};
 
 use helix_mpc::network_distribution::{
-    worker_receive_distribution, worker_send_final_share,
+    recv_message, send_message, worker_receive_distribution, worker_send_final_share,
+    ProtocolMessage,
 };
-use helix_mpc::share_distribution::{generate_x25519_keypair, ShareReceiver};
+use helix_mpc::share_distribution::{generate_x25519_keypair, ShareReceiver, X25519PublicKey};
 use helix_mpc::types::PartyId;
 
 #[cfg(feature = "chain")]
@@ -713,39 +714,132 @@ impl WorkerRunner {
         // ----------------------------------------------------------------
         // Phase 7: Participate in MPC training
         // ----------------------------------------------------------------
-        // In the HELIX architecture, the owner's FullOrchestrator creates the
-        // MPC transport mesh connecting to all workers and drives the training
-        // loop via e2e_integration::run_mpc_training(). The worker's role at
-        // this point is:
-        //   (a) Hold the decrypted weight shares in memory
-        //   (b) Be addressable at its listen_addr for the transport mesh
-        //   (c) Respond to signing requests on the control channel
+        // The owner sends the next message on the data channel:
+        //   - ReconstructionRequest → passive mode (owner runs training in-process)
+        //   - StartDistributedTraining → active mode (worker runs training)
         //
-        // The data channel remains open. The owner will eventually send a
-        // ReconstructionRequest when training is done. We wait for that.
+        // In passive mode, the worker just waits and returns its shares.
+        // In distributed mode, the worker creates a TcpTransport mesh with
+        // peers and runs the full MPC training loop locally.
         info!(
             party = %party_id,
-            "Worker is participating in MPC training -- awaiting reconstruction request"
+            "Worker waiting for training command on data channel"
         );
 
-        // ----------------------------------------------------------------
-        // Phase 8: Send final trained shares back to owner
-        // ----------------------------------------------------------------
-        let final_share_sent = match worker_send_final_share(
-            &mut data_stream,
-            &share_state.weight_share,
-            &share_state.generators,
-            Some(self.config.seed.wrapping_add(self.config.party_index as u64 + 1000)),
-        )
-        .await
-        {
-            Ok(()) => {
-                info!(party = %party_id, "Final weight shares sent to owner");
-                true
+        let next_msg = recv_message(&mut data_stream).await
+            .map_err(|e| anyhow!("Failed to receive training command: {}", e))?;
+
+        let (final_share_sent, distributed_result) = match next_msg {
+            ProtocolMessage::StartDistributedTraining {
+                trainer_config,
+                peer_addrs,
+                training_data,
+                weight_layout,
+                owner_public_key,
+                num_steps,
+                checkpoint_interval,
+                seed,
+                mpc_bind_addr,
+            } => {
+                info!(
+                    party = %party_id,
+                    num_steps = num_steps,
+                    peers = peer_addrs.len(),
+                    mpc_addr = %mpc_bind_addr,
+                    "Starting distributed MPC training"
+                );
+
+                // Split existing weight shares by layout.
+                let (w1, b1, w2, b2) = weight_layout.split(&share_state.weight_share.data);
+
+                // Run distributed training.
+                let result = run_distributed_training(
+                    self.config.party_index,
+                    &mpc_bind_addr,
+                    &peer_addrs,
+                    trainer_config,
+                    w1, b1, w2, b2,
+                    training_data,
+                    num_steps,
+                    checkpoint_interval,
+                    seed,
+                    owner_public_key,
+                    weight_layout,
+                ).await?;
+
+                // Send result back over data channel.
+                let response = ProtocolMessage::DistributedTrainingResult {
+                    steps_completed: result.steps_completed,
+                    losses: result.losses.clone(),
+                    mac_checks_passed: result.mac_checks_passed,
+                    cheater_detected: result.cheater_detected.is_some(),
+                    cheater_party: result.cheater_detected.as_ref().map(|c| c.party_index),
+                    encrypted_final_share: result.encrypted_final_share.clone(),
+                    checkpoints: result.checkpoints.clone(),
+                };
+                send_message(&mut data_stream, &response).await
+                    .map_err(|e| anyhow!("Failed to send training result: {}", e))?;
+
+                info!(
+                    party = %party_id,
+                    steps = result.steps_completed,
+                    final_loss = result.losses.last().copied().unwrap_or(0.0),
+                    "Distributed training complete, result sent to owner"
+                );
+
+                (true, Some(result))
             }
-            Err(e) => {
-                error!(party = %party_id, error = %e, "Failed to send final shares");
-                false
+
+            ProtocolMessage::ReconstructionRequest { owner_public_key } => {
+                // Passive mode: owner ran training in-process, just return shares.
+                info!(party = %party_id, "Passive mode: sending final shares to owner");
+
+                // Re-inject the ReconstructionRequest back through the protocol.
+                // worker_send_final_share expects to read ReconstructionRequest,
+                // but we already consumed it. Send the response directly instead.
+                let owner_pk = X25519PublicKey::from(owner_public_key);
+                let mut rng = seeded_rng(
+                    self.config.seed.wrapping_add(1000),
+                    self.config.party_index,
+                );
+
+                let encrypted_share = helix_mpc::share_distribution::encrypt_share_for_owner(
+                    &share_state.weight_share,
+                    &owner_pk,
+                    &mut rng,
+                ).map_err(|e| anyhow!("encrypt_share_for_owner failed: {}", e))?;
+
+                let blindings: Vec<helix_mpc::field::Fr> = (0..share_state.weight_share.data.len())
+                    .map(|_| helix_mpc::field::Fr::random(&mut rng))
+                    .collect();
+
+                let checkpoint_commit = helix_mpc::share_distribution::CheckpointCommitment::with_generators(
+                    share_state.generators.clone(),
+                );
+                let commitment_share = checkpoint_commit.compute_share(
+                    &share_state.weight_share,
+                    &blindings,
+                ).map_err(|e| anyhow!("compute_share failed: {}", e))?;
+
+                let response = ProtocolMessage::FinalShareResponse {
+                    encrypted_share,
+                    commitment_share,
+                    blindings: helix_mpc::network_distribution::FrVecPayload::from_fr_vec(&blindings),
+                };
+                send_message(&mut data_stream, &response).await
+                    .map_err(|e| anyhow!("Failed to send final share: {}", e))?;
+
+                info!(party = %party_id, "Final weight shares sent to owner (passive mode)");
+                (true, None)
+            }
+
+            other => {
+                error!(
+                    party = %party_id,
+                    msg_type = ?std::mem::discriminant(&other),
+                    "Unexpected message after share distribution"
+                );
+                (false, None)
             }
         };
 
@@ -779,7 +873,11 @@ impl WorkerRunner {
         // ----------------------------------------------------------------
         let checkpoint_signatures = *cp_counter.read().await;
         let slashing_reports_signed = *slash_counter.read().await;
-        let steps_completed = *steps_counter.read().await;
+        let steps_completed = if let Some(ref dr) = distributed_result {
+            dr.steps_completed
+        } else {
+            *steps_counter.read().await
+        };
 
         let elapsed = start.elapsed();
         let result = WorkerResult {
@@ -1114,6 +1212,105 @@ pub fn worker_public_key_from_seed(seed: u64, party_index: usize) -> [u8; 32] {
     let mut rng = seeded_rng(seed, party_index);
     let (_secret, public) = generate_x25519_keypair(&mut rng);
     *public.as_bytes()
+}
+
+// ============================================================================
+// Distributed training helper
+// ============================================================================
+
+/// Runs distributed MPC training on a worker that already has decrypted shares.
+///
+/// Creates a TcpTransport mesh with peer workers and executes the full MPC
+/// training loop (Beaver triple generation, MAC-verified training, checkpoints).
+#[cfg(feature = "network-mpc")]
+async fn run_distributed_training(
+    party_index: usize,
+    mpc_bind_addr: &str,
+    peer_addrs: &[(String, String)],
+    trainer_config: helix_mpc::mpc_trainer::MPCTrainerConfig,
+    w1: Vec<helix_mpc::field::Fr>,
+    b1: Vec<helix_mpc::field::Fr>,
+    w2: Vec<helix_mpc::field::Fr>,
+    b2: Vec<helix_mpc::field::Fr>,
+    training_data: Vec<(Vec<f64>, Vec<f64>)>,
+    num_steps: usize,
+    checkpoint_interval: usize,
+    seed: u64,
+    owner_public_key: [u8; 32],
+    weight_layout: helix_mpc::e2e_integration::WeightLayout,
+) -> Result<helix_mpc::e2e_integration::PartyResult> {
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+    use helix_mpc::session::transport::TcpTransport;
+
+    let bind_addr: SocketAddr = mpc_bind_addr.parse()
+        .with_context(|| format!("Invalid MPC bind address: {}", mpc_bind_addr))?;
+
+    let party_id = PartyId::from_index(party_index);
+
+    // Build peer address map (excluding self).
+    let mut peers: HashMap<PartyId, SocketAddr> = HashMap::new();
+    for (pid_str, addr_str) in peer_addrs {
+        let pid = PartyId::new(pid_str);
+        if pid != party_id {
+            let addr: SocketAddr = addr_str.parse()
+                .with_context(|| format!("Invalid peer address: {}", addr_str))?;
+            peers.insert(pid, addr);
+        }
+    }
+
+    info!(
+        party = %party_id,
+        bind_addr = %bind_addr,
+        num_peers = peers.len(),
+        "Creating TcpTransport mesh for distributed training"
+    );
+
+    // Create TcpTransport — this does the deterministic connect/accept handshake.
+    let transport = TcpTransport::bind(bind_addr, party_id, &peers).await
+        .map_err(|e| anyhow!("TcpTransport::bind failed: {}", e))?;
+
+    info!(
+        party_index = party_index,
+        "TcpTransport mesh established, starting distributed training"
+    );
+
+    let owner_pk = helix_mpc::share_distribution::X25519PublicKey::from(owner_public_key);
+
+    // Run the training loop with pre-decrypted shares.
+    helix_mpc::e2e_integration::run_distributed_party(
+        trainer_config,
+        transport,
+        party_index,
+        w1, b1, w2, b2,
+        training_data,
+        num_steps,
+        checkpoint_interval,
+        seed,
+        Some(owner_pk),
+        Some(weight_layout),
+    ).await
+}
+
+/// Stub for when the `network-mpc` feature is not enabled.
+#[cfg(not(feature = "network-mpc"))]
+async fn run_distributed_training(
+    _party_index: usize,
+    _mpc_bind_addr: &str,
+    _peer_addrs: &[(String, String)],
+    _trainer_config: helix_mpc::mpc_trainer::MPCTrainerConfig,
+    _w1: Vec<helix_mpc::field::Fr>,
+    _b1: Vec<helix_mpc::field::Fr>,
+    _w2: Vec<helix_mpc::field::Fr>,
+    _b2: Vec<helix_mpc::field::Fr>,
+    _training_data: Vec<(Vec<f64>, Vec<f64>)>,
+    _num_steps: usize,
+    _checkpoint_interval: usize,
+    _seed: u64,
+    _owner_public_key: [u8; 32],
+    _weight_layout: helix_mpc::e2e_integration::WeightLayout,
+) -> Result<helix_mpc::e2e_integration::PartyResult> {
+    Err(anyhow!("Distributed training requires the 'network-mpc' feature"))
 }
 
 // ============================================================================

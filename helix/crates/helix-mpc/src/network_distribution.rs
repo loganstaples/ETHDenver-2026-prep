@@ -38,8 +38,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use x25519_dalek::StaticSecret;
 
+use crate::checkpoint_attestation::OnChainCheckpoint;
+use crate::e2e_integration::WeightLayout;
 use crate::error::{MPCError, MPCResult};
 use crate::field::Fr;
+use crate::mpc_trainer::MPCTrainerConfig;
 use crate::security::commitment::PedersenGenerators;
 use crate::share_distribution::{
     CheckpointCommitment, CommitmentShare, DistributionResult, EncryptedShare,
@@ -152,6 +155,52 @@ pub enum ProtocolMessage {
         commitment_share: CommitmentShare,
         /// The worker's blinding factors (for the owner to sum and verify).
         blindings: FrVecPayload,
+    },
+
+    /// Owner → Worker: start active distributed MPC training.
+    ///
+    /// Sent after share distribution when using distributed (multi-machine) mode.
+    /// The worker creates a TcpTransport mesh with peers and runs the full
+    /// training loop locally instead of passively waiting.
+    StartDistributedTraining {
+        /// MPC trainer configuration (dimensions, learning rate, MAC config, etc.).
+        trainer_config: MPCTrainerConfig,
+        /// Peer MPC addresses: (party_id string, socket_addr string) for each party.
+        peer_addrs: Vec<(String, String)>,
+        /// Training data samples: (input, target) pairs.
+        training_data: Vec<(Vec<f64>, Vec<f64>)>,
+        /// Model weight layout for splitting flat shares into w1/b1/w2/b2.
+        weight_layout: WeightLayout,
+        /// Owner's x25519 public key (for encrypting final shares back).
+        owner_public_key: [u8; 32],
+        /// Number of training steps.
+        num_steps: usize,
+        /// Pedersen checkpoint interval.
+        checkpoint_interval: usize,
+        /// Base seed for deterministic execution.
+        seed: u64,
+        /// Socket address this worker should bind for MPC peer communication.
+        mpc_bind_addr: String,
+    },
+
+    /// Worker → Owner: result of distributed training.
+    ///
+    /// Sent after the worker completes active MPC training. Contains the
+    /// training results including the encrypted final share.
+    DistributedTrainingResult {
+        /// Number of training steps completed.
+        steps_completed: usize,
+        /// Per-step loss values.
+        losses: Vec<f64>,
+        /// Number of MAC verification checks passed.
+        mac_checks_passed: usize,
+        /// Whether a cheater was detected (and which party).
+        cheater_detected: bool,
+        cheater_party: Option<usize>,
+        /// Encrypted final weight share for the owner.
+        encrypted_final_share: Option<EncryptedShare>,
+        /// Checkpoint records from training.
+        checkpoints: Vec<OnChainCheckpoint>,
     },
 }
 
