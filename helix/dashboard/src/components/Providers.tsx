@@ -18,9 +18,24 @@ import {
     hardhat,
     localhost,
 } from 'wagmi/chains';
+import { defineChain } from 'viem';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { WagmiProvider } from 'wagmi';
 import '@rainbow-me/rainbowkit/styles.css';
+
+// ADI Network Testnet (chain 99999)
+const adiTestnet = defineChain({
+    id: 99999,
+    name: 'ADI Network Testnet',
+    nativeCurrency: { name: 'ADI', symbol: 'ADI', decimals: 18 },
+    rpcUrls: {
+        default: { http: ['https://rpc.ab.testnet.adifoundation.ai'] },
+    },
+    blockExplorers: {
+        default: { name: 'ADI Explorer', url: 'https://explorer.ab.testnet.adifoundation.ai' },
+    },
+    testnet: true,
+});
 
 const { wallets } = getDefaultWallets();
 
@@ -51,7 +66,7 @@ const config = getDefaultConfig({
     chains: [
         mainnet,
         sepolia,
-        ...(process.env.NEXT_PUBLIC_ENABLE_TESTNETS === 'true' ? [hardhat, localhost] : []),
+        ...(process.env.NEXT_PUBLIC_ENABLE_TESTNETS === 'true' ? [hardhat, localhost, adiTestnet] : []),
     ],
     ssr: true,
 });

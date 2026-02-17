@@ -152,10 +152,21 @@ export function useMpcTraining(): UseMpcTrainingReturn {
 
       ws.onmessage = (event) => {
         try {
-          const data: TrainingEvent = JSON.parse(event.data);
+          const data = JSON.parse(event.data);
+
+          // Handle full session state snapshot (sent on subscribe/reconnect)
+          if (data.type === 'session_state' && data.state) {
+            const s = data.state as TrainingSessionState;
+            setSession(s);
+            if (s.losses && s.losses.length > 0) {
+              setLosses(s.losses.map((loss: number, i: number) => ({ step: i + 1, loss })));
+            }
+            return;
+          }
+
           if (!data.event) return;
 
-          setEvents((prev) => [...prev, data].slice(-200));
+          setEvents((prev) => [...prev, data as TrainingEvent].slice(-200));
 
           const evt = data.event;
 

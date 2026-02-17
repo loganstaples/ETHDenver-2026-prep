@@ -596,6 +596,7 @@ interface FinalResultsProps {
     session_id: string;
     accuracy: number | null;
     elapsed_secs: number;
+    started_at: number;
     checkpoints_submitted: number;
     mac_checks_passed: number;
     zk_proofs_generated: number;
@@ -653,7 +654,9 @@ function FinalResults({ session, onDownloadModel }: FinalResultsProps) {
             <p className="text-2xl font-mono font-light text-white">
               {session.elapsed_secs > 0
                 ? `${session.elapsed_secs.toFixed(1)}s`
-                : `${((Date.now() / 1000) - session.elapsed_secs).toFixed(1)}s`}
+                : session.started_at > 0
+                  ? `${((Date.now() / 1000) - session.started_at).toFixed(1)}s`
+                  : '--'}
             </p>
           </div>
           <div>
