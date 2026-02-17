@@ -167,6 +167,10 @@ pub struct FullOrchestrationConfig {
     pub mac_check_interval: u64,
     /// Number of Beaver triples to pre-generate per batch.
     pub beaver_batch_size: usize,
+    /// Mini-batch size for training. Default 1 (standard SGD).
+    /// Higher values (e.g. 32) improve CPU utilization by processing
+    /// multiple samples per communication round.
+    pub batch_size: usize,
     /// Base random seed for deterministic execution.
     pub seed: u64,
 
@@ -256,6 +260,7 @@ impl Default for FullOrchestrationConfig {
             checkpoint_frequency: 10,
             mac_check_interval: 10,
             beaver_batch_size: 2048,
+            batch_size: 1,
             seed: 42,
             worker_endpoints: vec![
                 "127.0.0.1:9001".to_string(),
@@ -550,6 +555,7 @@ impl FullOrchestrator {
             // triples) is identical regardless of transport layer.
             use_tcp_transport: false,
             worker_endpoints: None,
+            batch_size: self.config.batch_size,
         };
 
         let mpc_result = if self.config.simulate_cheater {
@@ -839,15 +845,26 @@ impl FullOrchestrator {
         }
 
         if self.config.use_real_mnist {
-            warn!(
-                "use_real_mnist=true but real-mnist feature is not enabled in helix-mpc; \
-                 falling back to synthetic MNIST data."
+            let cache_dir = self.config.mnist_cache_dir.as_ref().map(std::path::Path::new);
+            info!(
+                train_size = self.config.train_size,
+                test_size = self.config.test_size,
+                seed = self.config.seed,
+                cache_dir = ?cache_dir,
+                "Loading real MNIST dataset"
             );
-            Ok(MnistDataset::generate(
+            let dataset = MnistDataset::load_real_shuffled(
                 self.config.train_size,
                 self.config.test_size,
                 self.config.seed,
-            ))
+                cache_dir,
+            ).map_err(|e| anyhow::anyhow!("Failed to load real MNIST: {}", e))?;
+            info!(
+                train = dataset.train.len(),
+                test = dataset.test.len(),
+                "Real MNIST loaded successfully"
+            );
+            Ok(dataset)
         } else {
             info!(
                 train_size = self.config.train_size,
@@ -2356,6 +2373,7 @@ mod tests {
             checkpoint_frequency: 5,
             mac_check_interval: 5,
             beaver_batch_size: 512,
+            batch_size: 1,
             seed: 42,
             worker_endpoints: vec![
                 "127.0.0.1:9001".to_string(),

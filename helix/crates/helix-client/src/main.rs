@@ -402,6 +402,10 @@ struct MpcTrainArgs {
     #[arg(long, default_value = "2048")]
     beaver_batch_size: usize,
 
+    /// Mini-batch size (samples per step). Higher values use more CPU cores.
+    #[arg(long, default_value = "1")]
+    batch_size: usize,
+
     /// Random seed for deterministic execution
     #[arg(long, default_value = "42")]
     seed: u64,
@@ -421,6 +425,10 @@ struct MpcTrainArgs {
     /// Use real MNIST data (requires helix-mpc real-mnist feature)
     #[arg(long)]
     real_mnist: bool,
+
+    /// Directory containing MNIST IDX files (default: ~/.helix/data/mnist/)
+    #[arg(long)]
+    mnist_dir: Option<String>,
 
     /// Number of training samples
     #[arg(long, default_value = "1000")]
@@ -2756,6 +2764,7 @@ async fn cmd_mpc_train(args: &MpcTrainArgs, _cli: &Cli) -> Result<()> {
         checkpoint_frequency: args.checkpoint_freq,
         mac_check_interval: args.mac_interval,
         beaver_batch_size: args.beaver_batch_size,
+        batch_size: args.batch_size,
         seed: args.seed,
         worker_endpoints: worker_endpoints.clone(),
         initial_weights_path: args.weights.clone(),
@@ -2774,7 +2783,7 @@ async fn cmd_mpc_train(args: &MpcTrainArgs, _cli: &Cli) -> Result<()> {
             self_verify: true,
         },
         use_real_mnist: args.real_mnist,
-        mnist_cache_dir: None,
+        mnist_cache_dir: args.mnist_dir.clone(),
         train_size: args.train_size,
         test_size: args.test_size,
         #[cfg(feature = "chain")]

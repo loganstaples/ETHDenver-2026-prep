@@ -207,6 +207,7 @@ async fn main() -> anyhow::Result<()> {
         } else {
             None
         },
+        batch_size: 1,
     };
 
     let initial_weights = if args.party == 0 {

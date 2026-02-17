@@ -13,7 +13,7 @@ helix-core = { path = "../helix-core" }
 helix-avm = { path = "../helix-avm" }
 helix-prover = { path = "../helix-prover" }
 helix-circuits = { path = "../helix-circuits" }
-helix-mpc = { path = "../helix-mpc", default-features = false, features = ["real-mnist"] }
+helix-mpc = { path = "../helix-mpc", default-features = false, features = ["real-mnist", "parallel"] }
 
 # Field arithmetic (for ZK proof integration)
 ff = "0.13"

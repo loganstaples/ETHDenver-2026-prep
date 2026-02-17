@@ -79,6 +79,10 @@ pub struct MPCTrainerConfig {
     pub checkpoint_interval: u64,
     /// SPDZ MAC verification configuration. None = disabled.
     pub mac_config: Option<MACVerificationConfig>,
+    /// Mini-batch size: process multiple samples per communication round.
+    /// Default 1 (standard SGD). Higher values improve CPU utilization by
+    /// amortizing async communication overhead across more parallel compute.
+    pub batch_size: usize,
 }
 
 impl Default for MPCTrainerConfig {
@@ -95,6 +99,7 @@ impl Default for MPCTrainerConfig {
             base_error: 1e-6,
             checkpoint_interval: 1,
             mac_config: None,
+            batch_size: 1,
         }
     }
 }
@@ -1242,15 +1247,35 @@ impl<T: MPCTransport> MPCTrainer<T> {
         // ---- Forward pass ----
         // Layer 1: h_pre = W1 @ x + b1
         // x is public. Each party computes share of h_pre via mpc_scale (share * public).
-        let mut h_pre_share = vec![Fr::ZERO; d_hid];
-        for i in 0..d_hid {
-            let mut sum = Fr::ZERO;
-            for j in 0..d_in {
-                let contrib = self.w1[i * d_in + j].mpc_scale(&x[j]);
-                sum = Fr::add(&sum, &contrib);
+        let h_pre_share = {
+            let w1 = &self.w1;
+            let b1 = &self.b1;
+            #[cfg(feature = "parallel")]
+            {
+                use rayon::prelude::*;
+                (0..d_hid).into_par_iter().map(|i| {
+                    let mut sum = Fr::ZERO;
+                    for j in 0..d_in {
+                        let contrib = w1[i * d_in + j].mpc_scale(&x[j]);
+                        sum = Fr::add(&sum, &contrib);
+                    }
+                    Fr::add(&sum, &b1[i])
+                }).collect::<Vec<_>>()
             }
-            h_pre_share[i] = Fr::add(&sum, &self.b1[i]);
-        }
+            #[cfg(not(feature = "parallel"))]
+            {
+                let mut h = vec![Fr::ZERO; d_hid];
+                for i in 0..d_hid {
+                    let mut sum = Fr::ZERO;
+                    for j in 0..d_in {
+                        let contrib = w1[i * d_in + j].mpc_scale(&x[j]);
+                        sum = Fr::add(&sum, &contrib);
+                    }
+                    h[i] = Fr::add(&sum, &b1[i]);
+                }
+                h
+            }
+        };
 
         // RECONSTRUCT h_pre: all parties exchange shares and sum.
         // This reveals pre-activations but keeps WEIGHTS private (since h_pre is a
@@ -1284,15 +1309,35 @@ impl<T: MPCTransport> MPCTrainer<T> {
 
         // Layer 2: y = W2 @ h + b2
         // h is now PUBLIC. This is share * public (no Beaver triples needed).
-        let mut y_share = vec![Fr::ZERO; d_out];
-        for i in 0..d_out {
-            let mut sum = Fr::ZERO;
-            for j in 0..d_hid {
-                let contrib = self.w2[i * d_hid + j].mpc_scale(&h_fr[j]);
-                sum = Fr::add(&sum, &contrib);
+        let y_share = {
+            let w2 = &self.w2;
+            let b2 = &self.b2;
+            #[cfg(feature = "parallel")]
+            {
+                use rayon::prelude::*;
+                (0..d_out).into_par_iter().map(|i| {
+                    let mut sum = Fr::ZERO;
+                    for j in 0..d_hid {
+                        let contrib = w2[i * d_hid + j].mpc_scale(&h_fr[j]);
+                        sum = Fr::add(&sum, &contrib);
+                    }
+                    Fr::add(&sum, &b2[i])
+                }).collect::<Vec<_>>()
             }
-            y_share[i] = Fr::add(&sum, &self.b2[i]);
-        }
+            #[cfg(not(feature = "parallel"))]
+            {
+                let mut y = vec![Fr::ZERO; d_out];
+                for i in 0..d_out {
+                    let mut sum = Fr::ZERO;
+                    for j in 0..d_hid {
+                        let contrib = w2[i * d_hid + j].mpc_scale(&h_fr[j]);
+                        sum = Fr::add(&sum, &contrib);
+                    }
+                    y[i] = Fr::add(&sum, &b2[i]);
+                }
+                y
+            }
+        };
 
         // Reconstruct y for loss computation.
         let y_bytes = SecureArithmetic::serialize_share_batch(&y_share);
@@ -1334,15 +1379,34 @@ impl<T: MPCTransport> MPCTrainer<T> {
 
         // dh = W2^T @ dy — dy is public, W2 is secret-shared.
         // This is share * public. Reconstruct dh.
-        let mut dh_share = vec![Fr::ZERO; d_hid];
-        for j in 0..d_hid {
-            let mut sum = Fr::ZERO;
-            for i in 0..d_out {
-                let contrib = self.w2[i * d_hid + j].mpc_scale(&dy_fr[i]);
-                sum = Fr::add(&sum, &contrib);
+        let dh_share = {
+            let w2 = &self.w2;
+            #[cfg(feature = "parallel")]
+            {
+                use rayon::prelude::*;
+                (0..d_hid).into_par_iter().map(|j| {
+                    let mut sum = Fr::ZERO;
+                    for i in 0..d_out {
+                        let contrib = w2[i * d_hid + j].mpc_scale(&dy_fr[i]);
+                        sum = Fr::add(&sum, &contrib);
+                    }
+                    sum
+                }).collect::<Vec<_>>()
             }
-            dh_share[j] = sum;
-        }
+            #[cfg(not(feature = "parallel"))]
+            {
+                let mut dh = vec![Fr::ZERO; d_hid];
+                for j in 0..d_hid {
+                    let mut sum = Fr::ZERO;
+                    for i in 0..d_out {
+                        let contrib = w2[i * d_hid + j].mpc_scale(&dy_fr[i]);
+                        sum = Fr::add(&sum, &contrib);
+                    }
+                    dh[j] = sum;
+                }
+                dh
+            }
+        };
         // Reconstruct dh
         let dh_bytes = SecureArithmetic::serialize_share_batch(&dh_share);
         self.transport.broadcast(&dh_bytes).await?;
@@ -1362,12 +1426,30 @@ impl<T: MPCTransport> MPCTrainer<T> {
         }
 
         // dW1 = outer(dh_pre, x) — both public. Compute in f64.
-        let mut dw1_f64 = vec![0.0f64; d_hid * d_in];
-        for i in 0..d_hid {
-            for j in 0..d_in {
-                dw1_f64[i * d_in + j] = dh_pre_f64[i] * input[j];
+        let dw1_f64 = {
+            #[cfg(feature = "parallel")]
+            {
+                use rayon::prelude::*;
+                let mut dw1 = vec![0.0f64; d_hid * d_in];
+                dw1.par_chunks_mut(d_in).enumerate().for_each(|(i, row)| {
+                    let scale = dh_pre_f64[i];
+                    for j in 0..d_in {
+                        row[j] = scale * input[j];
+                    }
+                });
+                dw1
             }
-        }
+            #[cfg(not(feature = "parallel"))]
+            {
+                let mut dw1 = vec![0.0f64; d_hid * d_in];
+                for i in 0..d_hid {
+                    for j in 0..d_in {
+                        dw1[i * d_in + j] = dh_pre_f64[i] * input[j];
+                    }
+                }
+                dw1
+            }
+        };
         // db1 = dh_pre (public)
         let db1_f64 = dh_pre_f64;
 
@@ -1376,21 +1458,44 @@ impl<T: MPCTransport> MPCTrainer<T> {
         // maintaining the additive sharing property.
         let lr_f64 = self.config.learning_rate;
         if self.party_index == 0 {
-            for i in 0..self.w1.len() {
-                let update = Fr::from_f64(lr_f64 * dw1_f64[i]);
-                self.w1[i] = Fr::sub(&self.w1[i], &update);
+            #[cfg(feature = "parallel")]
+            {
+                use rayon::prelude::*;
+                self.w1.par_iter_mut().enumerate().for_each(|(i, w)| {
+                    let update = Fr::from_f64(lr_f64 * dw1_f64[i]);
+                    *w = Fr::sub(w, &update);
+                });
+                self.b1.par_iter_mut().enumerate().for_each(|(i, b)| {
+                    let update = Fr::from_f64(lr_f64 * db1_f64[i]);
+                    *b = Fr::sub(b, &update);
+                });
+                self.w2.par_iter_mut().enumerate().for_each(|(i, w)| {
+                    let update = Fr::from_f64(lr_f64 * dw2_f64[i]);
+                    *w = Fr::sub(w, &update);
+                });
+                self.b2.par_iter_mut().enumerate().for_each(|(i, b)| {
+                    let update = Fr::from_f64(lr_f64 * db2_f64[i]);
+                    *b = Fr::sub(b, &update);
+                });
             }
-            for i in 0..self.b1.len() {
-                let update = Fr::from_f64(lr_f64 * db1_f64[i]);
-                self.b1[i] = Fr::sub(&self.b1[i], &update);
-            }
-            for i in 0..self.w2.len() {
-                let update = Fr::from_f64(lr_f64 * dw2_f64[i]);
-                self.w2[i] = Fr::sub(&self.w2[i], &update);
-            }
-            for i in 0..self.b2.len() {
-                let update = Fr::from_f64(lr_f64 * db2_f64[i]);
-                self.b2[i] = Fr::sub(&self.b2[i], &update);
+            #[cfg(not(feature = "parallel"))]
+            {
+                for i in 0..self.w1.len() {
+                    let update = Fr::from_f64(lr_f64 * dw1_f64[i]);
+                    self.w1[i] = Fr::sub(&self.w1[i], &update);
+                }
+                for i in 0..self.b1.len() {
+                    let update = Fr::from_f64(lr_f64 * db1_f64[i]);
+                    self.b1[i] = Fr::sub(&self.b1[i], &update);
+                }
+                for i in 0..self.w2.len() {
+                    let update = Fr::from_f64(lr_f64 * dw2_f64[i]);
+                    self.w2[i] = Fr::sub(&self.w2[i], &update);
+                }
+                for i in 0..self.b2.len() {
+                    let update = Fr::from_f64(lr_f64 * db2_f64[i]);
+                    self.b2[i] = Fr::sub(&self.b2[i], &update);
+                }
             }
         }
         // Parties 1,2: their shares are unchanged (update is 0 for them).
@@ -1425,6 +1530,410 @@ impl<T: MPCTransport> MPCTrainer<T> {
         })
     }
 
+    /// Mini-batch training step: processes B samples per communication round.
+    ///
+    /// Instead of 1 sample per step (6 async round-trips), this processes B
+    /// samples with the same 6 round-trips by batching the broadcast messages.
+    /// Gradient computation is parallelized across samples using rayon.
+    /// The averaged gradient is applied as a single weight update.
+    pub async fn training_step_batched(
+        &mut self,
+        batch: &[(Vec<f64>, Vec<f64>)],
+    ) -> MPCResult<UnprovedStepResult> {
+        let step = self.current_step;
+        let d_in = self.config.d_in;
+        let d_hid = self.config.d_hid;
+        let d_out = self.config.d_out;
+        let b = batch.len();
+        let peers = self.transport.peers();
+
+        // ---- Forward pass (batched) ----
+        // Layer 1: H_pre[s] = W1 @ x[s] + b1 for all samples s in batch.
+        // Compute all B vectors in parallel, then broadcast them as one message.
+        let h_pre_batch: Vec<Vec<Fr>> = {
+            let w1 = &self.w1;
+            let b1 = &self.b1;
+            #[cfg(feature = "parallel")]
+            {
+                use rayon::prelude::*;
+                batch.par_iter().map(|(input, _)| {
+                    let x: Vec<Fr> = input.iter().map(|&v| Fr::from_f64(v)).collect();
+                    (0..d_hid).map(|i| {
+                        let mut sum = Fr::ZERO;
+                        for j in 0..d_in {
+                            let contrib = w1[i * d_in + j].mpc_scale(&x[j]);
+                            sum = Fr::add(&sum, &contrib);
+                        }
+                        Fr::add(&sum, &b1[i])
+                    }).collect()
+                }).collect()
+            }
+            #[cfg(not(feature = "parallel"))]
+            {
+                batch.iter().map(|(input, _)| {
+                    let x: Vec<Fr> = input.iter().map(|&v| Fr::from_f64(v)).collect();
+                    (0..d_hid).map(|i| {
+                        let mut sum = Fr::ZERO;
+                        for j in 0..d_in {
+                            let contrib = w1[i * d_in + j].mpc_scale(&x[j]);
+                            sum = Fr::add(&sum, &contrib);
+                        }
+                        Fr::add(&sum, &b1[i])
+                    }).collect()
+                }).collect()
+            }
+        };
+
+        // Flatten and broadcast all h_pre as one message.
+        let flat_h_pre: Vec<Fr> = h_pre_batch.iter().flat_map(|v| v.iter().cloned()).collect();
+        let h_pre_bytes = SecureArithmetic::serialize_share_batch(&flat_h_pre);
+        self.transport.broadcast(&h_pre_bytes).await?;
+
+        let mut flat_h_pre_recon = flat_h_pre.clone();
+        for peer in &peers {
+            let msg = self.transport.recv(peer).await?;
+            let peer_h = SecureArithmetic::deserialize_share_batch(&msg)?;
+            for i in 0..flat_h_pre_recon.len() {
+                flat_h_pre_recon[i] = Fr::add(&flat_h_pre_recon[i], &peer_h[i]);
+            }
+        }
+
+        // ReLU + Layer 2 for all samples (parallel).
+        struct SampleForward {
+            h_f64: Vec<f64>,
+            relu_mask_f64: Vec<f64>,
+            h_fr: Vec<Fr>,
+            y_share: Vec<Fr>,
+        }
+
+        let sample_forwards: Vec<SampleForward> = {
+            let w2 = &self.w2;
+            let b2 = &self.b2;
+            #[cfg(feature = "parallel")]
+            {
+                use rayon::prelude::*;
+                (0..b).into_par_iter().map(|s| {
+                    let h_pre_recon = &flat_h_pre_recon[s * d_hid..(s + 1) * d_hid];
+                    let mut h_f64 = vec![0.0f64; d_hid];
+                    let mut relu_mask_f64 = vec![0.0f64; d_hid];
+                    let mut h_fr = vec![Fr::ZERO; d_hid];
+                    for i in 0..d_hid {
+                        let val = h_pre_recon[i].to_f64();
+                        if val > 0.0 {
+                            h_f64[i] = val;
+                            relu_mask_f64[i] = 1.0;
+                            h_fr[i] = Fr::from_f64(val);
+                        }
+                    }
+                    // Layer 2: y = W2 @ h + b2
+                    let y_share: Vec<Fr> = (0..d_out).map(|i| {
+                        let mut sum = Fr::ZERO;
+                        for j in 0..d_hid {
+                            let contrib = w2[i * d_hid + j].mpc_scale(&h_fr[j]);
+                            sum = Fr::add(&sum, &contrib);
+                        }
+                        Fr::add(&sum, &b2[i])
+                    }).collect();
+                    SampleForward { h_f64, relu_mask_f64, h_fr, y_share }
+                }).collect()
+            }
+            #[cfg(not(feature = "parallel"))]
+            {
+                (0..b).map(|s| {
+                    let h_pre_recon = &flat_h_pre_recon[s * d_hid..(s + 1) * d_hid];
+                    let mut h_f64 = vec![0.0f64; d_hid];
+                    let mut relu_mask_f64 = vec![0.0f64; d_hid];
+                    let mut h_fr = vec![Fr::ZERO; d_hid];
+                    for i in 0..d_hid {
+                        let val = h_pre_recon[i].to_f64();
+                        if val > 0.0 {
+                            h_f64[i] = val;
+                            relu_mask_f64[i] = 1.0;
+                            h_fr[i] = Fr::from_f64(val);
+                        }
+                    }
+                    let y_share: Vec<Fr> = (0..d_out).map(|i| {
+                        let mut sum = Fr::ZERO;
+                        for j in 0..d_hid {
+                            let contrib = w2[i * d_hid + j].mpc_scale(&h_fr[j]);
+                            sum = Fr::add(&sum, &contrib);
+                        }
+                        Fr::add(&sum, &b2[i])
+                    }).collect();
+                    SampleForward { h_f64, relu_mask_f64, h_fr, y_share }
+                }).collect()
+            }
+        };
+
+        // Broadcast all y_shares as one message.
+        let flat_y: Vec<Fr> = sample_forwards.iter().flat_map(|sf| sf.y_share.iter().cloned()).collect();
+        let y_bytes = SecureArithmetic::serialize_share_batch(&flat_y);
+        self.transport.broadcast(&y_bytes).await?;
+
+        let mut flat_y_recon = flat_y.clone();
+        for peer in &peers {
+            let msg = self.transport.recv(peer).await?;
+            let peer_y = SecureArithmetic::deserialize_share_batch(&msg)?;
+            for i in 0..flat_y_recon.len() {
+                flat_y_recon[i] = Fr::add(&flat_y_recon[i], &peer_y[i]);
+            }
+        }
+
+        // ---- Loss + Backward (parallel across samples) ----
+        struct SampleGradients {
+            loss: f64,
+            dw1_f64: Vec<f64>,
+            db1_f64: Vec<f64>,
+            dw2_f64: Vec<f64>,
+            db2_f64: Vec<f64>,
+            dh_share: Vec<Fr>,
+        }
+
+        let sample_grads: Vec<SampleGradients> = {
+            let w2 = &self.w2;
+            #[cfg(feature = "parallel")]
+            {
+                use rayon::prelude::*;
+                (0..b).into_par_iter().map(|s| {
+                    let sf = &sample_forwards[s];
+                    let y_recon = &flat_y_recon[s * d_out..(s + 1) * d_out];
+                    let target = &batch[s].1;
+                    let input = &batch[s].0;
+
+                    // Loss
+                    let mut loss = 0.0f64;
+                    let mut dy_f64 = vec![0.0f64; d_out];
+                    let mut dy_fr = vec![Fr::ZERO; d_out];
+                    for i in 0..d_out {
+                        let y_f64 = y_recon[i].to_f64();
+                        let diff = y_f64 - target[i];
+                        loss += 0.5 * diff * diff;
+                        dy_f64[i] = diff;
+                        dy_fr[i] = Fr::from_f64(diff);
+                    }
+
+                    // dW2 = outer(dy, h) — both public
+                    let mut dw2_f64 = vec![0.0f64; d_out * d_hid];
+                    for i in 0..d_out {
+                        for j in 0..d_hid {
+                            dw2_f64[i * d_hid + j] = dy_f64[i] * sf.h_f64[j];
+                        }
+                    }
+                    let db2_f64 = dy_f64.clone();
+
+                    // dh = W2^T @ dy — secret-shared
+                    let dh_share: Vec<Fr> = (0..d_hid).map(|j| {
+                        let mut sum = Fr::ZERO;
+                        for i in 0..d_out {
+                            let contrib = w2[i * d_hid + j].mpc_scale(&dy_fr[i]);
+                            sum = Fr::add(&sum, &contrib);
+                        }
+                        sum
+                    }).collect();
+
+                    // dh_pre and dW1 need reconstructed dh, so we defer them
+                    SampleGradients {
+                        loss,
+                        dw1_f64: Vec::new(), // filled after dh reconstruction
+                        db1_f64: Vec::new(),
+                        dw2_f64,
+                        db2_f64,
+                        dh_share,
+                    }
+                }).collect()
+            }
+            #[cfg(not(feature = "parallel"))]
+            {
+                (0..b).map(|s| {
+                    let sf = &sample_forwards[s];
+                    let y_recon = &flat_y_recon[s * d_out..(s + 1) * d_out];
+                    let target = &batch[s].1;
+
+                    let mut loss = 0.0f64;
+                    let mut dy_f64 = vec![0.0f64; d_out];
+                    let mut dy_fr = vec![Fr::ZERO; d_out];
+                    for i in 0..d_out {
+                        let y_f64 = y_recon[i].to_f64();
+                        let diff = y_f64 - target[i];
+                        loss += 0.5 * diff * diff;
+                        dy_f64[i] = diff;
+                        dy_fr[i] = Fr::from_f64(diff);
+                    }
+
+                    let mut dw2_f64 = vec![0.0f64; d_out * d_hid];
+                    for i in 0..d_out {
+                        for j in 0..d_hid {
+                            dw2_f64[i * d_hid + j] = dy_f64[i] * sf.h_f64[j];
+                        }
+                    }
+                    let db2_f64 = dy_f64.clone();
+
+                    let dh_share: Vec<Fr> = (0..d_hid).map(|j| {
+                        let mut sum = Fr::ZERO;
+                        for i in 0..d_out {
+                            let contrib = w2[i * d_hid + j].mpc_scale(&dy_fr[i]);
+                            sum = Fr::add(&sum, &contrib);
+                        }
+                        sum
+                    }).collect();
+
+                    SampleGradients {
+                        loss,
+                        dw1_f64: Vec::new(),
+                        db1_f64: Vec::new(),
+                        dw2_f64,
+                        db2_f64,
+                        dh_share,
+                    }
+                }).collect()
+            }
+        };
+
+        // Broadcast all dh_shares (need reconstruction for dW1).
+        let flat_dh: Vec<Fr> = sample_grads.iter().flat_map(|sg| sg.dh_share.iter().cloned()).collect();
+        let dh_bytes = SecureArithmetic::serialize_share_batch(&flat_dh);
+        self.transport.broadcast(&dh_bytes).await?;
+
+        let mut flat_dh_recon = flat_dh.clone();
+        for peer in &peers {
+            let msg = self.transport.recv(peer).await?;
+            let peer_dh = SecureArithmetic::deserialize_share_batch(&msg)?;
+            for i in 0..flat_dh_recon.len() {
+                flat_dh_recon[i] = Fr::add(&flat_dh_recon[i], &peer_dh[i]);
+            }
+        }
+
+        // Compute dW1 for all samples (parallel), then average all gradients.
+        let inv_b = 1.0 / b as f64;
+        let mut avg_dw1 = vec![0.0f64; d_hid * d_in];
+        let mut avg_db1 = vec![0.0f64; d_hid];
+        let mut avg_dw2 = vec![0.0f64; d_out * d_hid];
+        let mut avg_db2 = vec![0.0f64; d_out];
+        let mut avg_loss = 0.0f64;
+
+        {
+            #[cfg(feature = "parallel")]
+            {
+                use rayon::prelude::*;
+                // Compute dW1/db1 for each sample in parallel.
+                let per_sample: Vec<(Vec<f64>, Vec<f64>)> = (0..b).into_par_iter().map(|s| {
+                    let dh_recon = &flat_dh_recon[s * d_hid..(s + 1) * d_hid];
+                    let relu_mask = &sample_forwards[s].relu_mask_f64;
+                    let input = &batch[s].0;
+
+                    let mut dh_pre = vec![0.0f64; d_hid];
+                    for j in 0..d_hid {
+                        dh_pre[j] = dh_recon[j].to_f64() * relu_mask[j];
+                    }
+
+                    let mut dw1 = vec![0.0f64; d_hid * d_in];
+                    for i in 0..d_hid {
+                        for j in 0..d_in {
+                            dw1[i * d_in + j] = dh_pre[i] * input[j];
+                        }
+                    }
+                    (dw1, dh_pre)
+                }).collect();
+
+                // Accumulate averages.
+                for (s, (dw1, db1)) in per_sample.iter().enumerate() {
+                    avg_loss += sample_grads[s].loss;
+                    for i in 0..avg_dw1.len() { avg_dw1[i] += dw1[i]; }
+                    for i in 0..avg_db1.len() { avg_db1[i] += db1[i]; }
+                    for i in 0..avg_dw2.len() { avg_dw2[i] += sample_grads[s].dw2_f64[i]; }
+                    for i in 0..avg_db2.len() { avg_db2[i] += sample_grads[s].db2_f64[i]; }
+                }
+            }
+            #[cfg(not(feature = "parallel"))]
+            {
+                for s in 0..b {
+                    let dh_recon = &flat_dh_recon[s * d_hid..(s + 1) * d_hid];
+                    let relu_mask = &sample_forwards[s].relu_mask_f64;
+                    let input = &batch[s].0;
+
+                    let mut dh_pre = vec![0.0f64; d_hid];
+                    for j in 0..d_hid {
+                        dh_pre[j] = dh_recon[j].to_f64() * relu_mask[j];
+                    }
+
+                    avg_loss += sample_grads[s].loss;
+                    for i in 0..d_hid {
+                        for j in 0..d_in {
+                            avg_dw1[i * d_in + j] += dh_pre[i] * input[j];
+                        }
+                    }
+                    for i in 0..d_hid { avg_db1[i] += dh_pre[i]; }
+                    for i in 0..avg_dw2.len() { avg_dw2[i] += sample_grads[s].dw2_f64[i]; }
+                    for i in 0..avg_db2.len() { avg_db2[i] += sample_grads[s].db2_f64[i]; }
+                }
+            }
+        }
+
+        // Average over batch.
+        avg_loss *= inv_b;
+        for v in avg_dw1.iter_mut() { *v *= inv_b; }
+        for v in avg_db1.iter_mut() { *v *= inv_b; }
+        for v in avg_dw2.iter_mut() { *v *= inv_b; }
+        for v in avg_db2.iter_mut() { *v *= inv_b; }
+
+        // ---- Weight update (same as single-sample path) ----
+        let lr_f64 = self.config.learning_rate;
+        if self.party_index == 0 {
+            #[cfg(feature = "parallel")]
+            {
+                use rayon::prelude::*;
+                self.w1.par_iter_mut().enumerate().for_each(|(i, w)| {
+                    *w = Fr::sub(w, &Fr::from_f64(lr_f64 * avg_dw1[i]));
+                });
+                self.b1.par_iter_mut().enumerate().for_each(|(i, b)| {
+                    *b = Fr::sub(b, &Fr::from_f64(lr_f64 * avg_db1[i]));
+                });
+                self.w2.par_iter_mut().enumerate().for_each(|(i, w)| {
+                    *w = Fr::sub(w, &Fr::from_f64(lr_f64 * avg_dw2[i]));
+                });
+                self.b2.par_iter_mut().enumerate().for_each(|(i, b)| {
+                    *b = Fr::sub(b, &Fr::from_f64(lr_f64 * avg_db2[i]));
+                });
+            }
+            #[cfg(not(feature = "parallel"))]
+            {
+                for i in 0..self.w1.len() { self.w1[i] = Fr::sub(&self.w1[i], &Fr::from_f64(lr_f64 * avg_dw1[i])); }
+                for i in 0..self.b1.len() { self.b1[i] = Fr::sub(&self.b1[i], &Fr::from_f64(lr_f64 * avg_db1[i])); }
+                for i in 0..self.w2.len() { self.w2[i] = Fr::sub(&self.w2[i], &Fr::from_f64(lr_f64 * avg_dw2[i])); }
+                for i in 0..self.b2.len() { self.b2[i] = Fr::sub(&self.b2[i], &Fr::from_f64(lr_f64 * avg_db2[i])); }
+            }
+        }
+
+        // ---- Re-sharing ----
+        let reshared = if Resharing::should_reshare(step + 1, self.config.reshare_interval) {
+            self.reshare_weights().await?;
+            true
+        } else {
+            false
+        };
+
+        let num_ops = (d_hid * d_in + d_hid + d_out * d_hid + d_out) as f64 * b as f64;
+        let step_error = self.config.base_error * num_ops;
+
+        self.current_step += 1;
+
+        debug!(
+            step = step,
+            party = self.party_index,
+            loss = avg_loss,
+            batch_size = b,
+            reshared = reshared,
+            "Batched training step completed"
+        );
+
+        Ok(UnprovedStepResult {
+            step,
+            loss: avg_loss,
+            step_error,
+            reshared,
+        })
+    }
+
     /// Runs a complete checkpoint epoch: N training steps with proof at the end.
     ///
     /// This is the primary API for checkpoint-based training:
@@ -1453,18 +1962,34 @@ impl<T: MPCTransport> MPCTrainer<T> {
         let mut reshared_steps = Vec::with_capacity(interval as usize);
 
         let steps_to_run = interval as usize;
+        let bs = self.config.batch_size.max(1);
         for i in 0..steps_to_run {
-            let data_idx = i % data.len();
-            let (input, target) = &data[data_idx];
-
             if i < steps_to_run - 1 || !self.config.generate_proofs {
                 // Unproved step (the fast path)
-                let result = self.training_step_unproved(input, target).await?;
-                losses.push(result.loss);
-                total_error += result.step_error;
-                reshared_steps.push(result.reshared);
+                if bs > 1 {
+                    // Mini-batch: gather bs samples and process them together.
+                    let batch: Vec<(Vec<f64>, Vec<f64>)> = (0..bs)
+                        .map(|b_idx| {
+                            let data_idx = (i * bs + b_idx) % data.len();
+                            data[data_idx].clone()
+                        })
+                        .collect();
+                    let result = self.training_step_batched(&batch).await?;
+                    losses.push(result.loss);
+                    total_error += result.step_error;
+                    reshared_steps.push(result.reshared);
+                } else {
+                    let data_idx = i % data.len();
+                    let (input, target) = &data[data_idx];
+                    let result = self.training_step_unproved(input, target).await?;
+                    losses.push(result.loss);
+                    total_error += result.step_error;
+                    reshared_steps.push(result.reshared);
+                }
             } else {
                 // Last step: use full training_step with proof generation
+                let data_idx = i % data.len();
+                let (input, target) = &data[data_idx];
                 let result = self.training_step(input, target).await?;
                 losses.push(result.loss);
                 total_error += result.total_error;

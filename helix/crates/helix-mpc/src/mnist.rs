@@ -1229,6 +1229,7 @@ pub fn mnist_trainer_config(config: &MnistMpcConfig) -> MPCTrainerConfig {
         base_error: 1e-6,
         checkpoint_interval: 1,
         mac_config: None,
+        batch_size: 1,
     };
 
     if let Some(interval) = config.mac_check_interval {

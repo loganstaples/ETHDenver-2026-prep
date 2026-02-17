@@ -115,6 +115,9 @@ pub struct TrainingJobRequest {
     /// Random seed
     #[serde(default = "default_seed")]
     pub seed: u64,
+    /// Mini-batch size for training
+    #[serde(default)]
+    pub batch_size: Option<usize>,
 }
 
 fn default_architecture() -> Vec<usize> { vec![784, 32, 10] }
@@ -963,6 +966,7 @@ async fn start_training_handler(
         checkpoint_frequency: req.checkpoint_freq,
         mac_check_interval: req.mac_interval,
         beaver_batch_size: 2048,
+        batch_size: req.batch_size.unwrap_or(1),
         seed: req.seed,
         worker_endpoints,
         initial_weights_path: None,

@@ -332,6 +332,7 @@ impl MPCTrainingOrchestrator {
             use_node_transport: self.config.use_node_transport,
             use_tcp_transport: self.config.use_tcp_transport,
             worker_endpoints: None,
+            batch_size: 1,
         }
     }
 

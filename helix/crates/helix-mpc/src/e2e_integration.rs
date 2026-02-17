@@ -78,6 +78,10 @@ pub struct MPCIntegrationConfig {
     /// When set, `run_with_tcp_transport` uses these addresses instead of
     /// binding ephemeral ports. Length must match `num_workers`.
     pub worker_endpoints: Option<Vec<String>>,
+    /// Mini-batch size for training. Default 1 (standard SGD).
+    /// Higher values (e.g. 32) improve CPU utilization by amortizing
+    /// communication overhead across more parallel compute per step.
+    pub batch_size: usize,
 }
 
 /// Serializable initial weights for the integration config.
@@ -112,6 +116,7 @@ impl Default for MPCIntegrationConfig {
             use_node_transport: false,
             use_tcp_transport: false,
             worker_endpoints: None,
+            batch_size: 1,
         }
     }
 }
@@ -230,6 +235,7 @@ pub async fn run_mpc_training(
         } else {
             None
         },
+        batch_size: config.batch_size.max(1),
     };
 
     // Build initial weights.
@@ -319,6 +325,7 @@ pub async fn run_mpc_training_with_cheater(
         } else {
             None
         },
+        batch_size: config.batch_size.max(1),
     };
 
     let initial_weights = config.initial_weights.as_ref().map(|iw| {
@@ -908,10 +915,8 @@ async fn run_party_training<T: crate::session::transport::MPCTransport + 'static
     let mut checkpoints: Vec<OnChainCheckpoint> = Vec::new();
     let mut rng = ChaCha20Rng::seed_from_u64(seed.wrapping_add(party_index as u64 * 1000));
 
+    let bs = config.batch_size.max(1);
     for step in 0..num_steps {
-        let data_idx = step % training_data.len();
-        let (input, target) = &training_data[data_idx];
-
         // Inject cheater corruption if configured.
         if cheater_info.is_some() && step as u64 == corrupt_at_step {
             info!(
@@ -919,16 +924,15 @@ async fn run_party_training<T: crate::session::transport::MPCTransport + 'static
                 step = step,
                 "Injecting weight corruption (cheater)"
             );
-            // Corrupt weight share by adding a large delta to break MAC consistency.
             trainer.corrupt_weight_share(0, Fr::from_f64(999.0));
         }
 
-        // Run training step.
+        // Run training step (batched or single-sample).
         let step_result = if use_mac {
+            let data_idx = step % training_data.len();
+            let (input, target) = &training_data[data_idx];
             match trainer.training_step_with_mac(input, target).await {
                 Ok(result) => {
-                    // MAC check is performed inside training_step_with_mac at the
-                    // configured interval. A successful return means the check passed.
                     if config.mac_config.as_ref().map_or(false, |mc| {
                         mc.check_interval > 0 && (step as u64 + 1) % mc.check_interval == 0
                     }) {
@@ -963,7 +967,18 @@ async fn run_party_training<T: crate::session::transport::MPCTransport + 'static
                 }
                 Err(e) => return Err(e.into()),
             }
+        } else if bs > 1 {
+            // Mini-batch: gather bs samples and process together.
+            let batch: Vec<(Vec<f64>, Vec<f64>)> = (0..bs)
+                .map(|b_idx| {
+                    let data_idx = (step * bs + b_idx) % training_data.len();
+                    training_data[data_idx].clone()
+                })
+                .collect();
+            trainer.training_step_batched(&batch).await?
         } else {
+            let data_idx = step % training_data.len();
+            let (input, target) = &training_data[data_idx];
             trainer.training_step_unproved(input, target).await?
         };
 
