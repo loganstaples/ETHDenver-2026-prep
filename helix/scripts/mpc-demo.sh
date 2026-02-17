@@ -206,9 +206,34 @@ fi
 # 2. Start Backend API (port 3001)
 # ============================================================================
 if ! $CLI_ONLY; then
+    # ========================================================================
+    # 2. Deploy V4 Coordinator on-chain
+    # ========================================================================
+    V4_ADDR=""
+    log "Deploying V4 coordinator on-chain..."
+    cd "$HELIX_ROOT/contracts"
+    DEPLOY_OUT=$(forge script script/DeployV4.s.sol \
+        --rpc-url http://localhost:8545 --broadcast -q 2>&1 || true)
+    # Extract the deployed address (last 0x... on any line)
+    V4_ADDR=$(echo "$DEPLOY_OUT" | grep -oE '0x[0-9a-fA-F]{40}' | tail -1)
+    cd "$HELIX_ROOT"
+
+    if [ -n "$V4_ADDR" ]; then
+        ok "V4 coordinator deployed at $V4_ADDR"
+    else
+        warn "V4 deployment failed — workers will register off-chain only"
+        V4_ADDR=""
+    fi
+
+    # ========================================================================
+    # 3. Start Backend API (port 3001)
+    # ========================================================================
     log "Starting backend API on port 3001..."
-    "$HELIX_ROOT/target/release/helix" dashboard --port 3001 --host 0.0.0.0 --cors \
-        > "$HELIX_ROOT/.helix/api.log" 2>&1 &
+    API_CMD=("$HELIX_ROOT/target/release/helix" dashboard --port 3001 --host 0.0.0.0 --cors)
+    if [ -n "$V4_ADDR" ]; then
+        API_CMD+=(--rpc-url http://localhost:8545 --coordinator "$V4_ADDR")
+    fi
+    "${API_CMD[@]}" > "$HELIX_ROOT/.helix/api.log" 2>&1 &
     API_PID=$!
     sleep 1
 
@@ -220,15 +245,18 @@ if ! $CLI_ONLY; then
     fi
 
     # ========================================================================
-    # 3. Spawn MPC Workers (register with API)
+    # 4. Spawn MPC Workers (register on-chain + API fallback)
     # ========================================================================
     log "Launching $NUM_WORKERS MPC workers..."
-    "$HELIX_ROOT/target/release/helix" spawn-workers \
-        --count "$NUM_WORKERS" \
-        --api-url http://localhost:3001 \
-        > "$HELIX_ROOT/.helix/workers.log" 2>&1 &
+    WORKER_CMD=("$HELIX_ROOT/target/release/helix" spawn-workers --count "$NUM_WORKERS")
+    WORKER_CMD+=(--api-url http://localhost:3001)
+    if [ -n "$V4_ADDR" ]; then
+        WORKER_CMD+=(--rpc-url http://localhost:8545 --coordinator "$V4_ADDR")
+    fi
+
+    "${WORKER_CMD[@]}" > "$HELIX_ROOT/.helix/workers.log" 2>&1 &
     WORKERS_PID=$!
-    sleep 2
+    sleep 3
 
     if kill -0 "$WORKERS_PID" 2>/dev/null; then
         ok "$NUM_WORKERS workers launched and registered (PID: $WORKERS_PID)"
@@ -238,7 +266,7 @@ if ! $CLI_ONLY; then
     fi
 
     # ========================================================================
-    # 4. Start Dashboard (port 3000)
+    # 5. Start Dashboard (port 3000)
     # ========================================================================
     log "Starting Next.js dashboard on port 3000..."
     cd "$HELIX_ROOT/dashboard"
@@ -263,10 +291,11 @@ if ! $CLI_ONLY; then
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "${BOLD}  HELIX Demo Ready${NC}"
     echo ""
-    echo -e "  ${BOLD}Dashboard:${NC}  http://localhost:3000/train"
-    echo -e "  ${BOLD}API:${NC}        http://localhost:3001"
-    echo -e "  ${BOLD}Chain:${NC}      http://localhost:8545"
-    echo -e "  ${BOLD}Workers:${NC}    $NUM_WORKERS MPC workers registered"
+    echo -e "  ${BOLD}Dashboard:${NC}    http://localhost:3000/train"
+    echo -e "  ${BOLD}API:${NC}          http://localhost:3001"
+    echo -e "  ${BOLD}Chain:${NC}        http://localhost:8545"
+    echo -e "  ${BOLD}Coordinator:${NC}  ${V4_ADDR:-not deployed}"
+    echo -e "  ${BOLD}Workers:${NC}      $NUM_WORKERS MPC workers registered on-chain"
     echo ""
     echo -e "  Open the dashboard and click ${BOLD}Start Training${NC}"
     echo -e "  Workers will be auto-assigned when training starts."

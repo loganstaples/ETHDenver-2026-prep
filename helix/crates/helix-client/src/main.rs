@@ -567,6 +567,27 @@ struct SpawnWorkersArgs {
     /// Dashboard API URL to register workers with (e.g. http://localhost:3001)
     #[arg(long)]
     api_url: Option<String>,
+
+    /// Ethereum RPC URL for on-chain worker pool registration
+    #[cfg(feature = "chain")]
+    #[arg(long)]
+    rpc_url: Option<String>,
+
+    /// V4 coordinator contract address for on-chain pool registration
+    #[cfg(feature = "chain")]
+    #[arg(long)]
+    coordinator: Option<String>,
+
+    /// Comma-separated private keys for workers (one per worker, or a single base key
+    /// from which N keys are derived). If not provided, uses Anvil default accounts.
+    #[cfg(feature = "chain")]
+    #[arg(long)]
+    private_keys: Option<String>,
+
+    /// Stake amount in ETH per worker for on-chain pool registration
+    #[cfg(feature = "chain")]
+    #[arg(long, default_value = "0.1")]
+    stake_eth: f64,
 }
 
 #[derive(Args)]
@@ -716,6 +737,14 @@ struct DashboardArgs {
     /// Enable CORS
     #[arg(long)]
     cors: bool,
+
+    /// Ethereum RPC URL (for on-chain worker pool queries)
+    #[arg(long)]
+    rpc_url: Option<String>,
+
+    /// V4 coordinator contract address (for on-chain worker pool)
+    #[arg(long)]
+    coordinator: Option<String>,
 }
 
 #[derive(Args)]
@@ -2025,6 +2054,9 @@ async fn cmd_health(args: &HealthArgs, cli: &Cli) -> Result<()> {
 async fn cmd_dashboard(args: &DashboardArgs, _cli: &Cli, mut shutdown: broadcast::Receiver<()>) -> Result<()> {
     println!("{}", "Starting HELIX Status Dashboard...".cyan().bold());
     println!("  Address: http://{}:{}", args.host, args.port);
+    if let Some(ref coord) = args.coordinator {
+        println!("  Coordinator: {}", coord);
+    }
 
     let config = dashboard::DashboardConfig {
         auth_token: None,
@@ -2032,7 +2064,17 @@ async fn cmd_dashboard(args: &DashboardArgs, _cli: &Cli, mut shutdown: broadcast
         rate_limit_per_second: 30,
     };
 
-    let app = dashboard::create_dashboard_router(config);
+    let state = Arc::new(dashboard::DashboardState::new(config));
+
+    // Set on-chain config from CLI args
+    if let Some(ref rpc_url) = args.rpc_url {
+        *state.eth_rpc_url.write().await = Some(rpc_url.clone());
+    }
+    if let Some(ref coordinator) = args.coordinator {
+        *state.coordinator_address.write().await = Some(coordinator.clone());
+    }
+
+    let app = dashboard::create_dashboard_router_with_state(state);
 
     let listener = tokio::net::TcpListener::bind(format!("{}:{}", args.host, args.port)).await?;
 
@@ -2805,6 +2847,8 @@ async fn cmd_mpc_train(args: &MpcTrainArgs, _cli: &Cli) -> Result<()> {
         #[cfg(feature = "chain")]
         coordinator_address: args.coordinator.clone(),
         #[cfg(feature = "chain")]
+        use_pool_workers: false, // CLI mpc-train manages its own workers
+        #[cfg(feature = "chain")]
         enable_withdrawal: args.enable_withdrawal,
         zk_mode: parse_zk_mode(&args.zk_mode)?,
         custom_training_data: None,
@@ -3156,68 +3200,152 @@ async fn cmd_spawn_workers(args: &SpawnWorkersArgs, _cli: &Cli) -> Result<()> {
     }
     println!();
 
-    // Register with dashboard API if --api-url is provided
+    // ── On-chain pool registration ──
+    #[cfg(feature = "chain")]
+    let chain_registered = {
+        use crate::rpc::chain_v4::ChainClientV4;
+        use ethers::signers::{LocalWallet, Signer};
+        use std::str::FromStr;
+
+        let mut registered = false;
+
+        if let (Some(ref rpc_url), Some(ref coordinator)) = (&args.rpc_url, &args.coordinator) {
+            println!("{}", "Registering workers in on-chain pool...".yellow().bold());
+
+            // Resolve private keys: explicit list, or Anvil defaults
+            let keys: Vec<String> = if let Some(ref pk_csv) = args.private_keys {
+                pk_csv.split(',').map(|s| s.trim().to_string()).collect()
+            } else {
+                // Anvil default accounts 1..N
+                let anvil = vec![
+                    "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
+                    "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a",
+                    "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6",
+                    "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a",
+                    "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba",
+                    "0x92db14e403b83dfe3df233f83dfa3a0d7096f21ca9b0d6d6b8d88b2b4ec1564e",
+                    "0x4bbbf85ce3377467afe5d46f804f221813b2bb87f24d81f60f1fcdbf7cbf4356",
+                    "0xdbda1821b80551c9d65939329250298aa3472ba22feea921c0cf5d620ea67b97",
+                    "0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6",
+                ];
+                anvil[..args.count.min(anvil.len())]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            };
+
+            let stake_wei = ethers::utils::parse_ether(args.stake_eth)
+                .unwrap_or(ethers::types::U256::from(100_000_000_000_000_000u64)); // 0.1 ETH
+
+            for (i, key) in keys.iter().enumerate().take(args.count) {
+                let pk = key.strip_prefix("0x").unwrap_or(key);
+                let wallet = match LocalWallet::from_str(pk) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        eprintln!("  {} [worker-{}] invalid private key: {}", "✗".red(), i, e);
+                        continue;
+                    }
+                };
+                let addr = wallet.address();
+
+                match ChainClientV4::with_wallet(rpc_url, wallet, coordinator).await {
+                    Ok(client) => {
+                        let endpoint = worker_addrs[i].replace("0.0.0.0", "127.0.0.1");
+                        match client.register_in_pool(&endpoint, stake_wei).await {
+                            Ok(receipt) => {
+                                let gas = receipt.gas_used.map(|g| g.as_u64()).unwrap_or(0);
+                                println!(
+                                    "  {} [worker-{}] registered on-chain (addr: {:#x}, gas: {})",
+                                    "✓".green(), i, addr, gas
+                                );
+                                registered = true;
+                            }
+                            Err(e) => {
+                                eprintln!("  {} [worker-{}] on-chain registration failed: {}", "✗".red(), i, e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("  {} [worker-{}] chain client error: {}", "✗".red(), i, e);
+                    }
+                }
+            }
+            println!();
+        }
+        registered
+    };
+
+    #[cfg(not(feature = "chain"))]
+    let chain_registered = false;
+
+    // ── Off-chain API registration (fallback) ──
     let http_client = reqwest::Client::new();
     let mut worker_ids: Vec<String> = Vec::new();
 
-    if let Some(ref api_url) = args.api_url {
-        println!("{}", "Registering workers with dashboard API...".yellow().bold());
-        for (i, addr) in worker_addrs.iter().enumerate() {
-            let endpoint = addr.replace("0.0.0.0", "127.0.0.1");
-            let resp = http_client
-                .post(format!("{}/api/workers/register", api_url))
-                .json(&serde_json::json!({
-                    "endpoint": endpoint,
-                    "party_index": i,
-                }))
-                .send()
-                .await;
+    if !chain_registered {
+        if let Some(ref api_url) = args.api_url {
+            println!("{}", "Registering workers with dashboard API...".yellow().bold());
+            for (i, addr) in worker_addrs.iter().enumerate() {
+                let endpoint = addr.replace("0.0.0.0", "127.0.0.1");
+                let resp = http_client
+                    .post(format!("{}/api/workers/register", api_url))
+                    .json(&serde_json::json!({
+                        "endpoint": endpoint,
+                        "party_index": i,
+                    }))
+                    .send()
+                    .await;
 
-            match resp {
-                Ok(r) if r.status().is_success() => {
-                    let body: serde_json::Value = r.json().await.unwrap_or_default();
-                    let wid = body["worker_id"].as_str().unwrap_or("unknown").to_string();
-                    println!("  {} [worker-{}] registered (id: {})", "✓".green(), i, &wid[..8]);
-                    worker_ids.push(wid);
-                }
-                Ok(r) => {
-                    eprintln!("  {} [worker-{}] registration failed: HTTP {}", "✗".red(), i, r.status());
-                    worker_ids.push(String::new());
-                }
-                Err(e) => {
-                    eprintln!("  {} [worker-{}] registration failed: {}", "✗".red(), i, e);
-                    worker_ids.push(String::new());
+                match resp {
+                    Ok(r) if r.status().is_success() => {
+                        let body: serde_json::Value = r.json().await.unwrap_or_default();
+                        let wid = body["worker_id"].as_str().unwrap_or("unknown").to_string();
+                        println!("  {} [worker-{}] registered (id: {})", "✓".green(), i, &wid[..8]);
+                        worker_ids.push(wid);
+                    }
+                    Ok(r) => {
+                        eprintln!("  {} [worker-{}] registration failed: HTTP {}", "✗".red(), i, r.status());
+                        worker_ids.push(String::new());
+                    }
+                    Err(e) => {
+                        eprintln!("  {} [worker-{}] registration failed: {}", "✗".red(), i, e);
+                        worker_ids.push(String::new());
+                    }
                 }
             }
+            println!();
+        } else {
+            // Print copy-paste command for --workers flag (legacy mode)
+            let workers_flag: Vec<String> = worker_addrs.iter()
+                .map(|a| a.replace("0.0.0.0", "127.0.0.1"))
+                .collect();
+            println!("{}", "Copy-paste for mpc-train:".yellow().bold());
+            println!("  --workers {}", workers_flag.join(","));
+            println!();
         }
-        println!();
-    } else {
-        // Print copy-paste command for --workers flag (legacy mode)
-        let workers_flag: Vec<String> = worker_addrs.iter()
-            .map(|a| a.replace("0.0.0.0", "127.0.0.1"))
-            .collect();
-        println!("{}", "Copy-paste for mpc-train:".yellow().bold());
-        println!("  --workers {}", workers_flag.join(","));
-        println!();
     }
 
-    // Spawn heartbeat task if registered
-    let heartbeat_handle = if let Some(ref api_url) = args.api_url {
-        let url = api_url.clone();
-        let ids: Vec<String> = worker_ids.iter().filter(|id| !id.is_empty()).cloned().collect();
-        let client = http_client.clone();
-        Some(tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                for wid in &ids {
-                    let _ = client
-                        .post(format!("{}/api/workers/heartbeat", url))
-                        .json(&serde_json::json!({ "worker_id": wid }))
-                        .send()
-                        .await;
+    // Spawn heartbeat task if registered with API (not needed for on-chain)
+    let heartbeat_handle = if !chain_registered {
+        if let Some(ref api_url) = args.api_url {
+            let url = api_url.clone();
+            let ids: Vec<String> = worker_ids.iter().filter(|id| !id.is_empty()).cloned().collect();
+            let client = http_client.clone();
+            Some(tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    for wid in &ids {
+                        let _ = client
+                            .post(format!("{}/api/workers/heartbeat", url))
+                            .json(&serde_json::json!({ "worker_id": wid }))
+                            .send()
+                            .await;
+                    }
                 }
-            }
-        }))
+            }))
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -3264,7 +3392,9 @@ async fn cmd_spawn_workers(args: &SpawnWorkersArgs, _cli: &Cli) -> Result<()> {
     }
 
     println!("{}", "All workers started. Waiting for training jobs...".green().bold());
-    if args.api_url.is_some() {
+    if chain_registered {
+        println!("{}", "Workers registered on-chain — any user can assign them via the V4 coordinator.".cyan());
+    } else if args.api_url.is_some() {
         println!("{}", "Workers registered with dashboard — they will be auto-assigned when training starts.".cyan());
     }
     println!("{}", "Press Ctrl+C to shut down.".dimmed());

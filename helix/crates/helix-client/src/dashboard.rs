@@ -362,8 +362,12 @@ pub struct DashboardState {
     pub uploaded_data: RwLock<Option<Vec<(Vec<f64>, Vec<f64>)>>>,
     /// Uploaded initial weights (for continue-training)
     pub uploaded_weights: RwLock<Option<serde_json::Value>>,
-    /// Registered MPC workers available for training jobs
+    /// Registered MPC workers available for training jobs (off-chain fallback)
     pub registered_workers: RwLock<Vec<RegisteredWorker>>,
+    /// On-chain coordinator address (set after first job deploys or from config)
+    pub coordinator_address: RwLock<Option<String>>,
+    /// Ethereum RPC URL for reading on-chain state
+    pub eth_rpc_url: RwLock<Option<String>>,
 }
 
 impl DashboardState {
@@ -384,6 +388,8 @@ impl DashboardState {
             uploaded_data: RwLock::new(None),
             uploaded_weights: RwLock::new(None),
             registered_workers: RwLock::new(Vec::new()),
+            coordinator_address: RwLock::new(None),
+            eth_rpc_url: RwLock::new(None),
         }
     }
 
@@ -956,7 +962,7 @@ async fn start_training_handler(
         ).into_response();
     }
 
-    // Use registered workers if available, otherwise fall back to num_workers
+    // Determine workers: check off-chain registry, then fall back to num_workers
     let now_ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -969,6 +975,9 @@ async fn start_training_handler(
             .collect()
     };
 
+    // Note: On-chain pool worker assignment happens inside the orchestrator
+    // (via assignPoolWorkers on the V4 contract). The off-chain registry here
+    // is just for endpoint discovery so the orchestrator knows where to connect.
     let (num_workers, worker_endpoints) = if !registered.is_empty() {
         let count = registered.len().min(10); // cap at 10 (Anvil key limit)
         if count < 2 {
@@ -978,7 +987,7 @@ async fn start_training_handler(
             ).into_response();
         }
         let endpoints: Vec<String> = registered[..count].iter().map(|w| w.endpoint.clone()).collect();
-        info!(count, "Using {} registered workers", count);
+        info!(count, "Using {} registered workers (on-chain pool assignment at job creation)", count);
 
         // Mark workers as busy
         {
@@ -1067,7 +1076,7 @@ async fn start_training_handler(
         train_size: req.train_size,
         test_size: req.test_size,
         #[cfg(feature = "chain")]
-        eth_rpc_url: None, // Will start Anvil
+        eth_rpc_url: None, // Will be set below from dashboard state or Anvil default
         #[cfg(feature = "chain")]
         private_key: String::new(), // Will be set from Anvil default accounts
         #[cfg(feature = "chain")]
@@ -1077,7 +1086,9 @@ async fn start_training_handler(
         #[cfg(feature = "chain")]
         stake_amount_eth: req.stake_per_worker_eth.max(0.1), // Contract minStake is 0.1 ETH
         #[cfg(feature = "chain")]
-        coordinator_address: None,
+        coordinator_address: None, // Will be set below from dashboard state if available
+        #[cfg(feature = "chain")]
+        use_pool_workers: false, // Will be set to true below if coordinator is pre-deployed
         #[cfg(feature = "chain")]
         enable_withdrawal: false,
         custom_training_data: None,
@@ -1105,6 +1116,16 @@ async fn start_training_handler(
             .iter()
             .map(|k| k.to_string())
             .collect();
+
+        // Use pre-deployed coordinator if dashboard was started with --coordinator
+        if let Some(ref coord_addr) = *state.coordinator_address.read().await {
+            config.coordinator_address = Some(coord_addr.clone());
+            config.use_pool_workers = true;
+            info!(coordinator = %coord_addr, "Using pre-deployed V4 coordinator with on-chain worker pool");
+        }
+        if let Some(ref rpc_url) = *state.eth_rpc_url.read().await {
+            config.eth_rpc_url = Some(rpc_url.clone());
+        }
     }
 
     // If custom training data was uploaded, pass it to the orchestrator
@@ -1241,6 +1262,15 @@ async fn run_training_session(
                     session.coordinator_address = result.coordinator_address.clone();
                     session.zk_proofs_generated = result.zk_proofs_generated;
                     session.final_weights = weights_json;
+                }
+            }
+
+            // Store coordinator address for on-chain worker queries
+            if !result.coordinator_address.is_empty() {
+                *state.coordinator_address.write().await = Some(result.coordinator_address.clone());
+                // Default to localhost Anvil
+                if state.eth_rpc_url.read().await.is_none() {
+                    *state.eth_rpc_url.write().await = Some("http://localhost:8545".to_string());
                 }
             }
 
@@ -1624,10 +1654,23 @@ async fn heartbeat_worker_handler(
     }
 }
 
-/// GET /api/workers — list all registered workers
+/// GET /api/workers — list all registered workers (on-chain pool + off-chain fallback)
 async fn list_workers_handler(
     State(state): State<Arc<DashboardState>>,
 ) -> Json<serde_json::Value> {
+    // Try to read from on-chain pool first
+    #[cfg(feature = "chain")]
+    {
+        let coord_addr = state.coordinator_address.read().await.clone();
+        let rpc_url = state.eth_rpc_url.read().await.clone();
+        if let (Some(coord), Some(rpc)) = (coord_addr, rpc_url) {
+            if let Ok(chain_workers) = query_pool_workers_from_chain(&rpc, &coord).await {
+                return Json(chain_workers);
+            }
+        }
+    }
+
+    // Fallback: off-chain registry
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1647,6 +1690,7 @@ async fn list_workers_handler(
             "status": effective_status,
             "registered_at": w.registered_at,
             "last_heartbeat": w.last_heartbeat,
+            "source": "off-chain",
         })
     }).collect();
 
@@ -1656,6 +1700,49 @@ async fn list_workers_handler(
         "workers": worker_list,
         "total": workers.len(),
         "online": online_count,
+        "source": "off-chain",
+    }))
+}
+
+/// Query pool workers directly from the V4 contract on-chain.
+#[cfg(feature = "chain")]
+async fn query_pool_workers_from_chain(rpc_url: &str, coordinator_addr: &str) -> Result<serde_json::Value, anyhow::Error> {
+    use crate::rpc::chain_v4::ChainClientV4;
+    use ethers::signers::LocalWallet;
+    use std::str::FromStr;
+
+    // Read-only key (dummy) just for view calls
+    let dummy_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+    let wallet = dummy_key.parse::<LocalWallet>().map_err(|e| anyhow::anyhow!("wallet: {}", e))?;
+
+    let client = ChainClientV4::with_wallet(rpc_url, wallet, coordinator_addr).await?;
+    let addresses = client.get_pool_workers().await?;
+
+    let mut worker_list = Vec::new();
+    let mut available_count = 0u64;
+
+    for addr in &addresses {
+        if let Ok(info) = client.get_pool_worker_info(*addr).await {
+            let status = if info.available { "idle" } else { "busy" };
+            if info.available { available_count += 1; }
+            worker_list.push(serde_json::json!({
+                "address": format!("{:?}", addr),
+                "endpoint": info.endpoint,
+                "stake_eth": ethers::utils::format_ether(info.stake_amount),
+                "status": status,
+                "registered_at": info.registered_at,
+                "active_job_id": info.active_job_id,
+                "source": "on-chain",
+            }));
+        }
+    }
+
+    Ok(serde_json::json!({
+        "workers": worker_list,
+        "total": addresses.len(),
+        "online": available_count,
+        "source": "on-chain",
+        "coordinator": coordinator_addr,
     }))
 }
 

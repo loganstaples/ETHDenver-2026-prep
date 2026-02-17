@@ -231,6 +231,13 @@ pub struct FullOrchestrationConfig {
     /// Existing coordinator contract address. None = deploy a new V4.
     #[cfg(feature = "chain")]
     pub coordinator_address: Option<String>,
+    /// Use the on-chain global worker pool (V4 `assignPoolWorkers`) instead of
+    /// individual per-worker `stakeAndJoin`.  When true, Phase 6 calls
+    /// `assign_pool_workers(job_id, count)` from the owner's wallet, and
+    /// `worker_private_keys` are only needed for signing attestations (demo mode).
+    #[cfg(feature = "chain")]
+    pub use_pool_workers: bool,
+
     /// Whether to execute the stake withdrawal phase after training completion.
     /// Requires local Anvil (uses `evm_increaseTime` to advance past the 7-day cooldown).
     /// Defaults to false. Enable for demo/integration test scenarios.
@@ -286,6 +293,8 @@ impl Default for FullOrchestrationConfig {
             stake_amount_eth: 0.1,
             #[cfg(feature = "chain")]
             coordinator_address: None,
+            #[cfg(feature = "chain")]
+            use_pool_workers: false,
             #[cfg(feature = "chain")]
             enable_withdrawal: false,
             custom_training_data: None,
@@ -797,7 +806,12 @@ impl FullOrchestrator {
             if self.config.private_key.is_empty() {
                 return Err(anyhow!("Owner private_key is required for on-chain interaction"));
             }
-            if self.config.worker_private_keys.len() != self.config.worker_endpoints.len() {
+            // When using the on-chain pool, worker_private_keys are still needed for
+            // demo-mode signing but we don't require a 1:1 match since the pool
+            // dynamically assigns workers.
+            if !self.config.use_pool_workers
+                && self.config.worker_private_keys.len() != self.config.worker_endpoints.len()
+            {
                 return Err(anyhow!(
                     "Number of worker_private_keys ({}) must match worker_endpoints ({})",
                     self.config.worker_private_keys.len(),
@@ -1188,12 +1202,33 @@ impl FullOrchestrator {
         info!("Phase 6: Workers staking and joining");
         let phase6_start = Instant::now();
 
-        let stake_wei = ethers::utils::parse_ether(self.config.stake_amount_eth)
-            .context("Phase 6: Invalid stake amount")?;
-
         let mut worker_wallets = Vec::with_capacity(num_workers);
-        for (i, wk_key) in self.config.worker_private_keys.iter().enumerate() {
-            let pk = wk_key.strip_prefix("0x").unwrap_or(wk_key);
+
+        if self.config.use_pool_workers {
+            // ── On-chain pool assignment ──
+            // Workers have already registered in the global pool via `registerInPool()`.
+            // The owner simply assigns available pool workers to this job.
+            info!(
+                "Phase 6: Using on-chain worker pool — assigning {} workers to job {}",
+                num_workers, job_id
+            );
+
+            let assign_receipt = chain_client
+                .assign_pool_workers(job_id, num_workers as u64)
+                .await
+                .context("Phase 6: assign_pool_workers failed — are enough workers registered in the pool?")?;
+
+            let assign_gas = assign_receipt.gas_used.map(|g| g.as_u64()).unwrap_or(0);
+            total_gas += assign_gas;
+
+            info!(
+                workers_assigned = num_workers,
+                gas_used = assign_gas,
+                "Pool workers assigned on-chain"
+            );
+
+            // Parse worker wallets for demo-mode attestation signing.
+            // In production, workers sign their own attestations via their nodes.
             let provider = ethers::providers::Provider::<ethers::providers::Http>::try_from(&rpc_url)
                 .map_err(|e| anyhow!("Invalid RPC URL: {}", e))?;
             let chain_id = provider
@@ -1201,36 +1236,57 @@ impl FullOrchestrator {
                 .await
                 .map_err(|e| anyhow!("Failed to get chain ID: {}", e))?
                 .as_u64();
-            let wallet = LocalWallet::from_str(pk)
-                .map_err(|e| anyhow!("Invalid worker {} private key: {}", i, e))?
-                .with_chain_id(chain_id);
 
-            // In demo mode on Anvil, workers are funded by default accounts.
-            // Create a per-worker client to send the staking transaction.
-            let worker_client = ChainClientV4::with_wallet(
-                &rpc_url,
-                wallet.clone(),
-                &coordinator_addr_str,
-            )
-            .await
-            .with_context(|| format!("Phase 6: Failed to create worker {} client", i))?;
+            for (i, wk_key) in self.config.worker_private_keys.iter().enumerate() {
+                let pk = wk_key.strip_prefix("0x").unwrap_or(wk_key);
+                let wallet = LocalWallet::from_str(pk)
+                    .map_err(|e| anyhow!("Invalid worker {} private key: {}", i, e))?
+                    .with_chain_id(chain_id);
+                worker_wallets.push(wallet);
+            }
+        } else {
+            // ── Legacy per-worker staking ──
+            let stake_wei = ethers::utils::parse_ether(self.config.stake_amount_eth)
+                .context("Phase 6: Invalid stake amount")?;
 
-            let stake_receipt = worker_client
-                .stake_and_join(job_id, stake_wei)
+            for (i, wk_key) in self.config.worker_private_keys.iter().enumerate() {
+                let pk = wk_key.strip_prefix("0x").unwrap_or(wk_key);
+                let provider = ethers::providers::Provider::<ethers::providers::Http>::try_from(&rpc_url)
+                    .map_err(|e| anyhow!("Invalid RPC URL: {}", e))?;
+                let chain_id = provider
+                    .get_chainid()
+                    .await
+                    .map_err(|e| anyhow!("Failed to get chain ID: {}", e))?
+                    .as_u64();
+                let wallet = LocalWallet::from_str(pk)
+                    .map_err(|e| anyhow!("Invalid worker {} private key: {}", i, e))?
+                    .with_chain_id(chain_id);
+
+                let worker_client = ChainClientV4::with_wallet(
+                    &rpc_url,
+                    wallet.clone(),
+                    &coordinator_addr_str,
+                )
                 .await
-                .with_context(|| format!("Phase 6: Worker {} stake_and_join failed", i))?;
+                .with_context(|| format!("Phase 6: Failed to create worker {} client", i))?;
 
-            let stake_gas = stake_receipt.gas_used.map(|g| g.as_u64()).unwrap_or(0);
-            total_gas += stake_gas;
+                let stake_receipt = worker_client
+                    .stake_and_join(job_id, stake_wei)
+                    .await
+                    .with_context(|| format!("Phase 6: Worker {} stake_and_join failed", i))?;
 
-            info!(
-                worker = i,
-                address = %wallet.address(),
-                gas_used = stake_gas,
-                "Worker staked and joined"
-            );
+                let stake_gas = stake_receipt.gas_used.map(|g| g.as_u64()).unwrap_or(0);
+                total_gas += stake_gas;
 
-            worker_wallets.push(wallet);
+                info!(
+                    worker = i,
+                    address = %wallet.address(),
+                    gas_used = stake_gas,
+                    "Worker staked and joined"
+                );
+
+                worker_wallets.push(wallet);
+            }
         }
 
         info!(

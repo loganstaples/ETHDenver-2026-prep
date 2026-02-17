@@ -94,6 +94,16 @@ pub struct V4MACFailureReport {
     pub reporter_count: u64,
 }
 
+/// Pool worker info from getPoolWorkerInfo().
+#[derive(Debug, Clone)]
+pub struct V4PoolWorkerInfo {
+    pub endpoint: String,
+    pub stake_amount: U256,
+    pub registered_at: u64,
+    pub available: bool,
+    pub active_job_id: u64,
+}
+
 // ============ Message Builders ============
 
 /// Build the checkpoint attestation message hash.
@@ -967,6 +977,148 @@ impl ChainClientV4 {
             .call()
             .await
             .map_err(|e| anyhow!("is_active_worker: {}", e));
+        if result.is_ok() {
+            self.ok().await;
+        } else {
+            self.fail().await;
+        }
+        result
+    }
+
+    // ============ Global Worker Pool ============
+
+    /// Register in the global worker pool with an endpoint and ETH stake.
+    pub async fn register_in_pool(&self, endpoint: &str, stake: U256) -> Result<TransactionReceipt> {
+        self.check_cb().await?;
+        let result = self
+            .coordinator
+            .register_in_pool(endpoint.to_string())
+            .value(stake)
+            .send()
+            .await
+            .map_err(|e| anyhow!("register_in_pool send: {}", e))?
+            .await
+            .map_err(|e| anyhow!("register_in_pool receipt: {}", e))?
+            .ok_or_else(|| anyhow!("register_in_pool: no receipt"));
+        if result.is_ok() {
+            self.ok().await;
+        } else {
+            self.fail().await;
+        }
+        result
+    }
+
+    /// Deregister from the worker pool and withdraw stake.
+    pub async fn deregister_from_pool(&self) -> Result<TransactionReceipt> {
+        self.check_cb().await?;
+        let result = self
+            .coordinator
+            .deregister_from_pool()
+            .send()
+            .await
+            .map_err(|e| anyhow!("deregister_from_pool send: {}", e))?
+            .await
+            .map_err(|e| anyhow!("deregister_from_pool receipt: {}", e))?
+            .ok_or_else(|| anyhow!("deregister_from_pool: no receipt"));
+        if result.is_ok() {
+            self.ok().await;
+        } else {
+            self.fail().await;
+        }
+        result
+    }
+
+    /// Assign available pool workers to a job.
+    pub async fn assign_pool_workers(&self, job_id: u64, count: u64) -> Result<TransactionReceipt> {
+        self.check_cb().await?;
+        let result = self
+            .coordinator
+            .assign_pool_workers(U256::from(job_id), U256::from(count))
+            .send()
+            .await
+            .map_err(|e| anyhow!("assign_pool_workers send: {}", e))?
+            .await
+            .map_err(|e| anyhow!("assign_pool_workers receipt: {}", e))?
+            .ok_or_else(|| anyhow!("assign_pool_workers: no receipt"));
+        if result.is_ok() {
+            self.ok().await;
+        } else {
+            self.fail().await;
+        }
+        result
+    }
+
+    /// Get list of all pool worker addresses.
+    pub async fn get_pool_workers(&self) -> Result<Vec<Address>> {
+        self.check_cb().await?;
+        let result = self
+            .coordinator
+            .get_pool_workers()
+            .call()
+            .await
+            .map_err(|e| anyhow!("get_pool_workers: {}", e));
+        if result.is_ok() {
+            self.ok().await;
+        } else {
+            self.fail().await;
+        }
+        result
+    }
+
+    /// Get total pool worker count.
+    pub async fn get_pool_worker_count(&self) -> Result<u64> {
+        self.check_cb().await?;
+        let result = self
+            .coordinator
+            .get_pool_worker_count()
+            .call()
+            .await
+            .map(|v| v.as_u64())
+            .map_err(|e| anyhow!("get_pool_worker_count: {}", e));
+        if result.is_ok() {
+            self.ok().await;
+        } else {
+            self.fail().await;
+        }
+        result
+    }
+
+    /// Get available (idle) pool worker count.
+    pub async fn get_available_pool_worker_count(&self) -> Result<u64> {
+        self.check_cb().await?;
+        let result = self
+            .coordinator
+            .get_available_pool_worker_count()
+            .call()
+            .await
+            .map(|v| v.as_u64())
+            .map_err(|e| anyhow!("get_available_pool_worker_count: {}", e));
+        if result.is_ok() {
+            self.ok().await;
+        } else {
+            self.fail().await;
+        }
+        result
+    }
+
+    /// Get pool worker info.
+    pub async fn get_pool_worker_info(&self, worker: Address) -> Result<V4PoolWorkerInfo> {
+        self.check_cb().await?;
+        let result = self
+            .coordinator
+            .get_pool_worker_info(worker)
+            .call()
+            .await
+            .map(|(endpoint, stake_amount, registered_at, available, active_job_id)| {
+                V4PoolWorkerInfo {
+                    endpoint,
+                    stake_amount,
+                    registered_at: registered_at.as_u64(),
+                    available,
+                    active_job_id: active_job_id.as_u64(),
+                }
+            })
+            .map_err(|e| anyhow!("get_pool_worker_info: {}", e));
         if result.is_ok() {
             self.ok().await;
         } else {

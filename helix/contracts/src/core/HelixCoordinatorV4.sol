@@ -72,6 +72,15 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
         uint256 reporterCount;
     }
 
+    /// @notice Global worker pool entry — workers register once, available for any job
+    struct PoolWorker {
+        string endpoint;            // TCP endpoint (e.g. "192.168.1.5:9001")
+        uint256 stakeAmount;        // ETH staked as collateral
+        uint256 registeredAt;       // block.timestamp when registered
+        bool available;             // true = accepting new jobs
+        uint256 activeJobId;        // current job assignment (0 = none)
+    }
+
     // ============ Constants ============
 
     /// @notice Bounty percentage for MAC failure reporters (basis points)
@@ -140,6 +149,20 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
     /// @notice ZK weight hash chain: jobId => index => value (index 0 = lo, index 1 = hi)
     mapping(uint256 => mapping(uint256 => uint256)) public zkWeightHash;
 
+    // ============ Global Worker Pool State ============
+
+    /// @notice Pool worker registry: address => PoolWorker
+    mapping(address => PoolWorker) public poolWorkers;
+
+    /// @notice Ordered list of pool worker addresses (for enumeration)
+    address[] internal _poolWorkerList;
+
+    /// @notice Pool worker index: address => index+1 in _poolWorkerList (0 = not registered)
+    mapping(address => uint256) internal _poolWorkerIndex;
+
+    /// @notice Minimum stake required to join the worker pool
+    uint256 public poolMinStake = 0.1 ether;
+
     // ============ Events ============
 
     event JobRegistered(
@@ -205,6 +228,11 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
     event VerifierUpdated(address indexed oldVerifier, address indexed newVerifier);
     event ZkActivatedByRisk(uint256 indexed jobId, uint256 activeWorkerCount);
 
+    // Worker pool events
+    event WorkerPoolRegistered(address indexed worker, string endpoint, uint256 stakeAmount);
+    event WorkerPoolDeregistered(address indexed worker, uint256 stakeReturned);
+    event WorkerPoolAssigned(uint256 indexed jobId, address indexed worker, uint256 stakeAmount);
+
     // ============ Errors ============
 
     error OnlyOwner();
@@ -238,6 +266,10 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
     error WorkerAlreadySlashed();
     error RateLimited();
     error ZkRequired();
+    error WorkerAlreadyInPool();
+    error WorkerNotInPool();
+    error WorkerBusy();
+    error NotEnoughPoolWorkers();
 
     // ============ Modifiers ============
 
@@ -497,6 +529,27 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
             workerTotalStaked[cheater] = 0;
         }
 
+        // Remove slashed worker from pool entirely (they lose their pool registration)
+        if (_poolWorkerIndex[cheater] != 0) {
+            uint256 poolStake = poolWorkers[cheater].stakeAmount;
+            // Remove from pool list (swap-and-pop)
+            uint256 pIdx = _poolWorkerIndex[cheater] - 1;
+            uint256 pLast = _poolWorkerList.length - 1;
+            if (pIdx != pLast) {
+                address lastPw = _poolWorkerList[pLast];
+                _poolWorkerList[pIdx] = lastPw;
+                _poolWorkerIndex[lastPw] = pIdx + 1;
+            }
+            _poolWorkerList.pop();
+            _poolWorkerIndex[cheater] = 0;
+            delete poolWorkers[cheater];
+            // Pool stake is also forfeited (already held in contract)
+            if (poolStake > 0) {
+                (bool s, ) = treasury.call{value: poolStake}("");
+                if (!s) revert TransferFailed();
+            }
+        }
+
         // Check risk threshold: activate ZK if workers drop below minimum
         uint256 activeWorkerCount = _activeWorkers[jobId].length;
         if (jobs[jobId].riskZkEnabled && !jobs[jobId].zkActivatedByRisk && activeWorkerCount < jobs[jobId].minWorkersForMpc) {
@@ -552,6 +605,11 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
             // Decrement active job count for rate limiting
             if (workerActiveJobs[w] > 0) {
                 workerActiveJobs[w]--;
+            }
+            // Release pool workers back to available
+            if (_poolWorkerIndex[w] != 0) {
+                poolWorkers[w].available = true;
+                poolWorkers[w].activeJobId = 0;
             }
         }
 
@@ -804,6 +862,105 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
         }
     }
 
+    // ============ Global Worker Pool ============
+
+    /// @notice Register in the global worker pool, staking ETH as collateral.
+    ///         Any user who submits a training job can auto-assign pool workers.
+    /// @param endpoint TCP endpoint the worker is listening on (e.g. "192.168.1.5:9001")
+    function registerInPool(string calldata endpoint) external payable nonReentrant {
+        if (_poolWorkerIndex[msg.sender] != 0) revert WorkerAlreadyInPool();
+        if (msg.value < poolMinStake) revert InsufficientStake();
+
+        poolWorkers[msg.sender] = PoolWorker({
+            endpoint: endpoint,
+            stakeAmount: msg.value,
+            registeredAt: block.timestamp,
+            available: true,
+            activeJobId: 0
+        });
+
+        _poolWorkerList.push(msg.sender);
+        _poolWorkerIndex[msg.sender] = _poolWorkerList.length; // 1-indexed
+
+        emit WorkerPoolRegistered(msg.sender, endpoint, msg.value);
+    }
+
+    /// @notice Leave the worker pool and withdraw staked ETH.
+    ///         Only possible if the worker is not currently assigned to a job.
+    function deregisterFromPool() external nonReentrant {
+        if (_poolWorkerIndex[msg.sender] == 0) revert WorkerNotInPool();
+        if (poolWorkers[msg.sender].activeJobId != 0) revert WorkerBusy();
+
+        uint256 stake = poolWorkers[msg.sender].stakeAmount;
+
+        // Remove from list (swap-and-pop)
+        uint256 index = _poolWorkerIndex[msg.sender] - 1;
+        uint256 lastIndex = _poolWorkerList.length - 1;
+        if (index != lastIndex) {
+            address lastWorker = _poolWorkerList[lastIndex];
+            _poolWorkerList[index] = lastWorker;
+            _poolWorkerIndex[lastWorker] = index + 1;
+        }
+        _poolWorkerList.pop();
+        _poolWorkerIndex[msg.sender] = 0;
+        delete poolWorkers[msg.sender];
+
+        // Return stake
+        if (stake > 0) {
+            (bool success, ) = msg.sender.call{value: stake}("");
+            if (!success) revert TransferFailed();
+        }
+
+        emit WorkerPoolDeregistered(msg.sender, stake);
+    }
+
+    /// @notice Assign available pool workers to a job. Called by the job owner.
+    ///         Each assigned worker's pool stake is locked into the job.
+    /// @param jobId The job to assign workers to
+    /// @param count Number of workers to assign
+    function assignPoolWorkers(uint256 jobId, uint256 count) external nonReentrant jobExists(jobId) jobActive(jobId) {
+        if (msg.sender != jobs[jobId].owner) revert OnlyOwner();
+
+        uint256 assigned = 0;
+        uint256 poolLen = _poolWorkerList.length;
+
+        for (uint256 i = 0; i < poolLen && assigned < count; i++) {
+            address w = _poolWorkerList[i];
+            PoolWorker storage pw = poolWorkers[w];
+
+            if (!pw.available || pw.activeJobId != 0) continue;
+            if (pw.stakeAmount < jobs[jobId].minStake) continue;
+            if (workers[jobId][w].registered) continue; // already in this job
+
+            // Register this pool worker into the job
+            uint256 jobStake = jobs[jobId].minStake;
+            workers[jobId][w] = WorkerInfo({
+                stakeAmount: jobStake,
+                joinedAtStep: jobs[jobId].currentStep,
+                lastActiveStep: jobs[jobId].currentStep,
+                registered: true,
+                slashed: false
+            });
+
+            _activeWorkers[jobId].push(w);
+            _workerIndex[jobId][w] = _activeWorkers[jobId].length;
+
+            workerTotalStaked[w] += jobStake;
+            workerActiveJobs[w]++;
+
+            // Mark pool worker as busy
+            pw.available = false;
+            pw.activeJobId = jobId;
+
+            assigned++;
+
+            emit WorkerPoolAssigned(jobId, w, jobStake);
+            emit WorkerJoined(jobId, w, jobStake);
+        }
+
+        if (assigned < count) revert NotEnoughPoolWorkers();
+    }
+
     // ============ View Functions ============
 
     /// @notice Get the number of active workers for a job
@@ -896,6 +1053,37 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
     /// @notice Check if ZK proofs are required for a job (either user-enabled or risk-activated)
     function isZkRequired(uint256 jobId) external view returns (bool) {
         return jobs[jobId].zkEnabled || jobs[jobId].zkActivatedByRisk;
+    }
+
+    /// @notice Get the total number of workers in the pool
+    function getPoolWorkerCount() external view returns (uint256) {
+        return _poolWorkerList.length;
+    }
+
+    /// @notice Get the number of available (idle) pool workers
+    function getAvailablePoolWorkerCount() external view returns (uint256) {
+        uint256 count = 0;
+        for (uint256 i = 0; i < _poolWorkerList.length; i++) {
+            if (poolWorkers[_poolWorkerList[i]].available) count++;
+        }
+        return count;
+    }
+
+    /// @notice Get all pool worker addresses
+    function getPoolWorkers() external view returns (address[] memory) {
+        return _poolWorkerList;
+    }
+
+    /// @notice Get pool worker info
+    function getPoolWorkerInfo(address worker) external view returns (
+        string memory endpoint,
+        uint256 stakeAmount,
+        uint256 registeredAt,
+        bool available,
+        uint256 activeJobId
+    ) {
+        PoolWorker storage pw = poolWorkers[worker];
+        return (pw.endpoint, pw.stakeAmount, pw.registeredAt, pw.available, pw.activeJobId);
     }
 
     // ============ Admin Functions ============
