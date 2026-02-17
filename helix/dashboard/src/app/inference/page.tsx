@@ -353,25 +353,33 @@ export default function InferencePage() {
   const [isRunning, setIsRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Load models from history
+  // Load models that have retrievable weights
   useEffect(() => {
     const history = getTrainingHistory();
-    const completed = history.filter((e) => e.status === 'complete');
+    // Only show models with stored weights:
+    // - Stored on 0G with a root hash (persistent, always retrievable)
+    // - From a real training session (backend may have weights)
+    const withWeights = history.filter(
+      (e) => e.status === 'complete' && (
+        (e.storedOn0G && e.rootHash) ||
+        (!e.sessionId.startsWith('upload-'))
+      ),
+    );
     // Sort: 0G-stored first, then by accuracy descending
-    completed.sort((a, b) => {
+    withWeights.sort((a, b) => {
       if (a.storedOn0G && !b.storedOn0G) return -1;
       if (!a.storedOn0G && b.storedOn0G) return 1;
       return (b.accuracy ?? 0) - (a.accuracy ?? 0);
     });
-    setModels(completed);
+    setModels(withWeights);
 
     // Auto-select from URL params
     const sessionParam = searchParams.get('session');
     if (sessionParam) {
-      const match = completed.find((e) => e.sessionId === sessionParam);
+      const match = withWeights.find((e) => e.sessionId === sessionParam);
       if (match) setSelected(match);
-    } else if (completed.length > 0) {
-      setSelected(completed[0]);
+    } else if (withWeights.length > 0) {
+      setSelected(withWeights[0]);
     }
   }, [searchParams]);
 
@@ -438,9 +446,9 @@ export default function InferencePage() {
         <Card variant="default">
           <div className="flex flex-col items-center justify-center py-12">
             <Sparkles size={32} className="text-helix-dim mb-3" />
-            <p className="text-sm font-medium text-helix-text2">No trained models available</p>
+            <p className="text-sm font-medium text-helix-text2">No models with stored weights</p>
             <p className="text-2xs text-helix-muted mt-1">
-              Train a model first, then come back to run inference.
+              Train a model and store it on 0G, or upload weights on the My Models page.
             </p>
           </div>
         </Card>

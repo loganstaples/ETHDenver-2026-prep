@@ -540,7 +540,7 @@ function VersionRow({ entry, isExpanded, onToggle, onDelete, onRegisterOnChain, 
 
               {/* Actions */}
               <div className="flex items-center gap-3 pt-1 flex-wrap">
-                {isComplete && (
+                {isComplete && ((entry.storedOn0G && entry.rootHash) || !entry.sessionId.startsWith('upload-')) && (
                   <Link
                     href={`/inference?session=${entry.sessionId}${entry.rootHash ? `&hash=${entry.rootHash}` : ''}&version=${entry.version}`}
                     className="flex items-center gap-2 px-4 py-2 rounded-lg bg-white text-black text-sm font-medium hover:bg-white/90 transition-colors"
