@@ -36,10 +36,10 @@ const TRAINING_SESSIONS = [
 ];
 
 const INFERENCE_REQUESTS = [
-  { id: 'inf-1', model: 'MNIST Classifier v2', status: 'processing' as const, progress: 72, phase: 'MPC computation', workers: 3, created: Date.now() - 45000, inputLabel: 'Digit image (28×28)', result: null, confidence: null },
-  { id: 'inf-2', model: 'CIFAR-10 ResNet', status: 'processing' as const, progress: 31, phase: 'Encrypting input', workers: 3, created: Date.now() - 12000, inputLabel: 'Image (32×32×3)', result: null, confidence: null },
-  { id: 'inf-3', model: 'MNIST Classifier v2', status: 'completed' as const, progress: 100, phase: 'Complete', workers: 3, created: Date.now() - 180000, inputLabel: 'Digit image (28×28)', result: '7', confidence: 0.982 },
-  { id: 'inf-4', model: 'MNIST Classifier v2', status: 'completed' as const, progress: 100, phase: 'Complete', workers: 3, created: Date.now() - 420000, inputLabel: 'Digit image (28×28)', result: '3', confidence: 0.947 },
+  { id: 'inf-1', model: 'MNIST Classifier v2', status: 'processing' as const, progress: 72, phase: 'MPC computation', workers: 3, created: Date.now() - 45000, inputLabel: 'Digit image (28×28)', result: null, confidence: null, duration: null },
+  { id: 'inf-2', model: 'CIFAR-10 ResNet', status: 'processing' as const, progress: 31, phase: 'Encrypting input', workers: 3, created: Date.now() - 12000, inputLabel: 'Image (32×32×3)', result: null, confidence: null, duration: null },
+  { id: 'inf-3', model: 'MNIST Classifier v2', status: 'completed' as const, progress: 100, phase: 'Complete', workers: 3, created: Date.now() - 180000, inputLabel: 'Digit image (28×28)', result: '7', confidence: 0.982, duration: 62000 },
+  { id: 'inf-4', model: 'MNIST Classifier v2', status: 'completed' as const, progress: 100, phase: 'Complete', workers: 3, created: Date.now() - 420000, inputLabel: 'Digit image (28×28)', result: '3', confidence: 0.947, duration: 48000 },
 ];
 
 // ============================================================================
@@ -58,6 +58,20 @@ function timeAgo(ts: number): string {
   if (s < 60) return `${s}s ago`;
   if (s < 3600) return `${Math.floor(s / 60)}m ago`;
   return `${Math.floor(s / 3600)}h ago`;
+}
+
+/** Format milliseconds as "Xm Ys" or just "Ys" */
+function formatDuration(ms: number): string {
+  const totalSec = Math.floor(ms / 1000);
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
+/** Live elapsed since timestamp, with seconds */
+function elapsedSince(ts: number): string {
+  return formatDuration(Date.now() - ts);
 }
 
 // ============================================================================
@@ -763,8 +777,8 @@ export default function DashboardPage() {
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center justify-between mb-1">
                           <div className="flex items-center gap-3">
-                            <span className="text-base font-medium text-white">{req.model}</span>
-                            <span className="text-[10px] uppercase tracking-wider px-2 py-0.5 rounded-md bg-white/[0.06] text-helix-text2">
+                            <span className="text-lg font-medium text-white">{req.model}</span>
+                            <span className="text-[11px] uppercase tracking-wider px-2.5 py-0.5 rounded-md bg-white/[0.06] text-helix-text2">
                               {req.phase}
                             </span>
                           </div>
@@ -773,7 +787,7 @@ export default function DashboardPage() {
                           </button>
                         </div>
 
-                        <div className="text-xs text-helix-muted mb-5">{req.inputLabel}</div>
+                        <div className="text-sm text-helix-muted mb-5">{req.inputLabel}</div>
 
                         <div className="flex items-center gap-8">
                           <div>
@@ -783,7 +797,7 @@ export default function DashboardPage() {
                           <div className="w-px h-8 bg-helix-border" />
                           <div>
                             <div className="text-[10px] uppercase tracking-wider text-helix-muted mb-1">Elapsed</div>
-                            <div className="text-lg font-medium text-white tabular-nums font-mono">{timeAgo(req.created)}</div>
+                            <div className="text-lg font-medium text-white tabular-nums font-mono">{elapsedSince(req.created)}</div>
                           </div>
                           <div className="w-px h-8 bg-helix-border" />
                           <div>
@@ -829,15 +843,15 @@ export default function DashboardPage() {
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center justify-between mb-1">
                           <div className="flex items-center gap-3">
-                            <span className="text-base font-medium text-white">{req.model}</span>
-                            <span className="text-[10px] uppercase tracking-wider px-2 py-0.5 rounded-md bg-green-400/10 text-green-400">
+                            <span className="text-lg font-medium text-white">{req.model}</span>
+                            <span className="text-[11px] uppercase tracking-wider px-2.5 py-0.5 rounded-md bg-green-400/10 text-green-400">
                               Complete
                             </span>
                           </div>
-                          <span className="text-xs text-helix-muted font-mono tabular-nums">{timeAgo(req.created)}</span>
+                          <span className="text-sm text-helix-muted font-mono tabular-nums">{timeAgo(req.created)}</span>
                         </div>
 
-                        <div className="text-xs text-helix-muted mb-5">
+                        <div className="text-sm text-helix-muted mb-5">
                           Predicted &ldquo;{req.result}&rdquo; with {req.confidence != null ? `${(req.confidence * 100).toFixed(1)}%` : '—'} confidence
                         </div>
 
@@ -855,10 +869,9 @@ export default function DashboardPage() {
                           </div>
                           <div className="w-px h-8 bg-helix-border" />
                           <div>
-                            <div className="text-[10px] uppercase tracking-wider text-helix-muted mb-1">Status</div>
-                            <div className="flex items-center gap-2">
-                              <CheckCircle size={14} className="text-green-400" />
-                              <span className="text-lg font-medium text-white">Done</span>
+                            <div className="text-[10px] uppercase tracking-wider text-helix-muted mb-1">Duration</div>
+                            <div className="text-lg font-medium text-white tabular-nums font-mono">
+                              {req.duration != null ? formatDuration(req.duration) : '—'}
                             </div>
                           </div>
                         </div>
