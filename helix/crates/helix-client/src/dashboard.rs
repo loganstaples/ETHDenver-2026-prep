@@ -1679,19 +1679,23 @@ async fn heartbeat_worker_handler(
 async fn list_workers_handler(
     State(state): State<Arc<DashboardState>>,
 ) -> Json<serde_json::Value> {
-    // Try to read from on-chain pool first
+    // Merge on-chain pool workers with off-chain registered workers
+    #[cfg(feature = "chain")]
+    let mut chain_worker_list: Vec<serde_json::Value> = Vec::new();
     #[cfg(feature = "chain")]
     {
         let coord_addr = state.coordinator_address.read().await.clone();
         let rpc_url = state.eth_rpc_url.read().await.clone();
         if let (Some(coord), Some(rpc)) = (coord_addr, rpc_url) {
-            if let Ok(chain_workers) = query_pool_workers_from_chain(&rpc, &coord).await {
-                return Json(chain_workers);
+            if let Ok(chain_result) = query_pool_workers_from_chain(&rpc, &coord).await {
+                if let Some(workers) = chain_result.get("workers").and_then(|w| w.as_array()) {
+                    chain_worker_list = workers.clone();
+                }
             }
         }
     }
 
-    // Fallback: off-chain registry
+    // Off-chain registry
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1717,11 +1721,19 @@ async fn list_workers_handler(
 
     let online_count = workers.iter().filter(|w| now - w.last_heartbeat <= 30.0).count();
 
+    // Merge on-chain + off-chain workers
+    let mut all_workers = worker_list;
+    #[cfg(feature = "chain")]
+    {
+        all_workers.extend(chain_worker_list);
+    }
+    let total = all_workers.len();
+
     Json(serde_json::json!({
-        "workers": worker_list,
-        "total": workers.len(),
+        "workers": all_workers,
+        "total": total,
         "online": online_count,
-        "source": "off-chain",
+        "source": "merged",
     }))
 }
 

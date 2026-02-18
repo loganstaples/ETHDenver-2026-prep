@@ -545,13 +545,14 @@ function ConfigForm({
             </SettingRow>
           </div>
 
-          {/* Uploads */}
+          {/* Uploads (optional — MNIST is loaded automatically) */}
           <div className="space-y-3">
             <UploadRow
-              label="Training Data"
-              accept=".json"
+              label="Training Data (optional — MNIST auto-loaded)"
+              accept=".json,.csv,.idx,.idx3-ubyte,.idx1-ubyte,.gz"
               onUpload={onUploadData}
               uploaded={uploadedData ? `${uploadedData.samples} samples · ${uploadedData.inputDim}D` : null}
+              optional
             />
             <UploadRow
               label={fetchedModelName ? `Weights · ${fetchedModelName}` : 'Initial Weights'}
