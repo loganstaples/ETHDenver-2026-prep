@@ -1,44 +1,35 @@
 'use client';
 
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useMemo, useEffect, useCallback, useRef, Suspense } from 'react';
 import { useSearchParams } from 'next/navigation';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
-  Sparkles,
   Loader2,
   Eraser,
-  HardDrive,
-  Server,
   CheckCircle,
   AlertTriangle,
-  Tag,
-  ChevronDown,
   Upload,
   Image as ImageIcon,
   Pencil,
   Shield,
   Clock,
   Users,
+  Search,
+  HardDrive,
+  X,
+  Coins,
+  ExternalLink,
 } from 'lucide-react';
-import { Card } from '@/components/ui/Card';
+import { useAccount, useSignMessage } from 'wagmi';
 import { Badge } from '@/components/ui/Badge';
 import { cn } from '@/lib/utils';
+import { usePublicModels, type PublicModel } from '@/hooks/usePublicModels';
+import { useModelRegistry } from '@/hooks/useModelRegistry';
+import { deriveModelKey, decryptWeights } from '@/lib/model-encryption';
 
 // ============================================================================
-// Types
+// Types & Constants
 // ============================================================================
-
-interface TrainingHistoryEntry {
-  sessionId: string;
-  version: string;
-  accuracy: number | null;
-  steps: number;
-  totalSteps: number;
-  date: string;
-  storedOn0G: boolean;
-  rootHash?: string;
-  status: 'complete' | 'failed';
-}
 
 interface MPCInferenceResult {
   prediction: number;
@@ -63,26 +54,18 @@ interface MPCInferenceResult {
 
 type InferencePhase = 'idle' | 'submitting' | 'done' | 'error';
 type InputMode = 'draw' | 'upload';
-
-const HISTORY_KEY = 'helix-training-history';
-
-function getTrainingHistory(): TrainingHistoryEntry[] {
-  if (typeof window === 'undefined') return [];
-  try {
-    const raw = localStorage.getItem(HISTORY_KEY);
-    return raw ? JSON.parse(raw) : [];
-  } catch {
-    return [];
-  }
-}
-
-// ============================================================================
-// Drawing Canvas
-// ============================================================================
+type ModelFilter = 'all' | 'mine' | 'others';
+type WeightFetchStatus = 'idle' | 'fetching' | 'decrypting' | 'uploading' | 'done' | 'error';
 
 const CANVAS_SIZE = 280;
 const GRID_SIZE = 28;
 const BRUSH_RADIUS = 12;
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
+const BASE_INFERENCE_COST = 0.001; // ETH per inference
+
+// ============================================================================
+// Drawing Canvas
+// ============================================================================
 
 interface DrawingCanvasProps {
   onPixelsReady: (pixels: number[]) => void;
@@ -113,12 +96,10 @@ function DrawingCanvas({ onPixelsReady, canvasRef }: DrawingCanvasProps) {
       const canvas = canvasRef.current;
       const ctx = canvas?.getContext('2d');
       if (!ctx) return;
-
       ctx.fillStyle = '#ffffff';
       ctx.beginPath();
       ctx.arc(x, y, BRUSH_RADIUS, 0, Math.PI * 2);
       ctx.fill();
-
       if (lastPos.current) {
         const dx = x - lastPos.current.x;
         const dy = y - lastPos.current.y;
@@ -126,10 +107,8 @@ function DrawingCanvas({ onPixelsReady, canvasRef }: DrawingCanvasProps) {
         const steps = Math.ceil(dist / 4);
         for (let i = 1; i < steps; i++) {
           const t = i / steps;
-          const ix = lastPos.current.x + dx * t;
-          const iy = lastPos.current.y + dy * t;
           ctx.beginPath();
-          ctx.arc(ix, iy, BRUSH_RADIUS, 0, Math.PI * 2);
+          ctx.arc(lastPos.current.x + dx * t, lastPos.current.y + dy * t, BRUSH_RADIUS, 0, Math.PI * 2);
           ctx.fill();
         }
       }
@@ -164,7 +143,6 @@ function DrawingCanvas({ onPixelsReady, canvasRef }: DrawingCanvasProps) {
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
-
     const tempCanvas = document.createElement('canvas');
     tempCanvas.width = GRID_SIZE;
     tempCanvas.height = GRID_SIZE;
@@ -172,7 +150,6 @@ function DrawingCanvas({ onPixelsReady, canvasRef }: DrawingCanvasProps) {
     tempCtx.imageSmoothingEnabled = true;
     tempCtx.imageSmoothingQuality = 'high';
     tempCtx.drawImage(canvas, 0, 0, GRID_SIZE, GRID_SIZE);
-
     const imageData = tempCtx.getImageData(0, 0, GRID_SIZE, GRID_SIZE);
     const pixels: number[] = [];
     for (let i = 0; i < GRID_SIZE * GRID_SIZE; i++) {
@@ -201,7 +178,7 @@ function DrawingCanvas({ onPixelsReady, canvasRef }: DrawingCanvasProps) {
       ref={canvasRef as React.RefObject<HTMLCanvasElement>}
       width={CANVAS_SIZE}
       height={CANVAS_SIZE}
-      className="rounded-lg border border-helix-border cursor-crosshair touch-none"
+      className="rounded-xl border border-helix-border cursor-crosshair touch-none"
       style={{ width: CANVAS_SIZE, height: CANVAS_SIZE }}
       onMouseDown={handleStart}
       onMouseMove={handleMove}
@@ -237,17 +214,12 @@ function ImageUpload({ onPixelsReady, canvasRef }: ImageUploadProps) {
           if (!canvas) return;
           const ctx = canvas.getContext('2d');
           if (!ctx) return;
-
           ctx.fillStyle = '#000000';
           ctx.fillRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
-
           const scale = Math.min(CANVAS_SIZE / img.width, CANVAS_SIZE / img.height);
           const w = img.width * scale;
           const h = img.height * scale;
-          const x = (CANVAS_SIZE - w) / 2;
-          const y = (CANVAS_SIZE - h) / 2;
-          ctx.drawImage(img, x, y, w, h);
-
+          ctx.drawImage(img, (CANVAS_SIZE - w) / 2, (CANVAS_SIZE - h) / 2, w, h);
           const tempCanvas = document.createElement('canvas');
           tempCanvas.width = GRID_SIZE;
           tempCanvas.height = GRID_SIZE;
@@ -255,7 +227,6 @@ function ImageUpload({ onPixelsReady, canvasRef }: ImageUploadProps) {
           tempCtx.imageSmoothingEnabled = true;
           tempCtx.imageSmoothingQuality = 'high';
           tempCtx.drawImage(canvas, 0, 0, GRID_SIZE, GRID_SIZE);
-
           const imageData = tempCtx.getImageData(0, 0, GRID_SIZE, GRID_SIZE);
           const pixels: number[] = [];
           for (let i = 0; i < GRID_SIZE * GRID_SIZE; i++) {
@@ -289,32 +260,26 @@ function ImageUpload({ onPixelsReady, canvasRef }: ImageUploadProps) {
         ref={canvasRef as React.RefObject<HTMLCanvasElement>}
         width={CANVAS_SIZE}
         height={CANVAS_SIZE}
-        className="rounded-lg border border-helix-border"
-        style={{
-          width: CANVAS_SIZE,
-          height: CANVAS_SIZE,
-          display: fileName ? 'block' : 'none',
-        }}
+        className="rounded-xl border border-helix-border"
+        style={{ width: CANVAS_SIZE, height: CANVAS_SIZE, display: fileName ? 'block' : 'none' }}
       />
-
       {!fileName && (
         <div
           onClick={() => fileRef.current?.click()}
           onDragOver={(e) => e.preventDefault()}
           onDrop={handleDrop}
-          className="flex flex-col items-center justify-center gap-3 rounded-lg border-2 border-dashed border-helix-border hover:border-helix-border2 bg-helix-bg cursor-pointer transition-colors"
+          className="flex flex-col items-center justify-center gap-3 rounded-xl border-2 border-dashed border-helix-border hover:border-helix-border2 bg-helix-bg cursor-pointer transition-colors"
           style={{ width: CANVAS_SIZE, height: CANVAS_SIZE }}
         >
           <Upload size={24} className="text-helix-muted" />
           <p className="text-sm text-helix-text2">Drop an image or click to upload</p>
-          <p className="text-2xs text-helix-muted">PNG, JPG, or any image of a digit</p>
+          <p className="text-xs text-helix-muted">PNG, JPG, or any image of a digit</p>
         </div>
       )}
-
       {fileName && (
         <div className="flex items-center gap-2">
           <ImageIcon size={12} className="text-green-400" />
-          <span className="text-2xs text-helix-text truncate">{fileName}</span>
+          <span className="text-xs text-helix-text truncate">{fileName}</span>
           <button
             type="button"
             onClick={() => {
@@ -323,28 +288,21 @@ function ImageUpload({ onPixelsReady, canvasRef }: ImageUploadProps) {
               const canvas = canvasRef.current;
               if (canvas) {
                 const ctx = canvas.getContext('2d');
-                if (ctx) {
-                  ctx.fillStyle = '#000000';
-                  ctx.fillRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
-                }
+                if (ctx) { ctx.fillStyle = '#000000'; ctx.fillRect(0, 0, CANVAS_SIZE, CANVAS_SIZE); }
               }
             }}
-            className="text-2xs text-helix-muted hover:text-white ml-auto"
+            className="text-xs text-helix-muted hover:text-white ml-auto"
           >
             Remove
           </button>
         </div>
       )}
-
       <input
         ref={fileRef}
         type="file"
         accept="image/*"
         className="hidden"
-        onChange={(e) => {
-          const file = e.target.files?.[0];
-          if (file) handleFile(file);
-        }}
+        onChange={(e) => { const file = e.target.files?.[0]; if (file) handleFile(file); }}
       />
     </div>
   );
@@ -354,23 +312,12 @@ function ImageUpload({ onPixelsReady, canvasRef }: ImageUploadProps) {
 // Probability Bars
 // ============================================================================
 
-function ProbabilityBars({
-  probabilities,
-  prediction,
-}: {
-  probabilities: number[];
-  prediction: number;
-}) {
+function ProbabilityBars({ probabilities, prediction }: { probabilities: number[]; prediction: number }) {
   return (
     <div className="space-y-1.5">
       {probabilities.map((prob, digit) => (
         <div key={digit} className="flex items-center gap-3">
-          <span
-            className={cn(
-              'w-5 text-right text-sm font-mono',
-              digit === prediction ? 'text-white font-semibold' : 'text-helix-muted',
-            )}
-          >
+          <span className={cn('w-5 text-right text-sm font-mono', digit === prediction ? 'text-white font-semibold' : 'text-helix-muted')}>
             {digit}
           </span>
           <div className="flex-1 h-5 bg-helix-border rounded-sm overflow-hidden">
@@ -378,121 +325,14 @@ function ProbabilityBars({
               initial={{ width: 0 }}
               animate={{ width: `${prob * 100}%` }}
               transition={{ duration: 0.4, ease: 'easeOut' }}
-              className={cn(
-                'h-full rounded-sm',
-                digit === prediction ? 'bg-white' : 'bg-white/20',
-              )}
+              className={cn('h-full rounded-sm', digit === prediction ? 'bg-white' : 'bg-white/20')}
             />
           </div>
-          <span
-            className={cn(
-              'w-14 text-right text-xs font-mono',
-              digit === prediction ? 'text-white' : 'text-helix-muted',
-            )}
-          >
+          <span className={cn('w-14 text-right text-xs font-mono', digit === prediction ? 'text-white' : 'text-helix-muted')}>
             {(prob * 100).toFixed(1)}%
           </span>
         </div>
       ))}
-    </div>
-  );
-}
-
-// ============================================================================
-// Model Selector
-// ============================================================================
-
-function ModelSelector({
-  models,
-  selected,
-  onSelect,
-}: {
-  models: TrainingHistoryEntry[];
-  selected: TrainingHistoryEntry | null;
-  onSelect: (entry: TrainingHistoryEntry) => void;
-}) {
-  const [open, setOpen] = useState(false);
-
-  if (models.length === 0) return null;
-
-  return (
-    <div className="relative">
-      <button
-        type="button"
-        onClick={() => setOpen(!open)}
-        className="w-full flex items-center justify-between px-4 py-3 bg-helix-bg border border-helix-border rounded-lg text-left hover:border-helix-border2 transition-colors"
-      >
-        {selected ? (
-          <div className="flex items-center gap-3">
-            {selected.storedOn0G ? (
-              <HardDrive size={14} className="text-green-400" />
-            ) : (
-              <Server size={14} className="text-helix-text2" />
-            )}
-            <Badge variant="default" className="font-mono text-2xs">
-              v{selected.version}
-            </Badge>
-            <span className="text-sm text-helix-text">
-              {selected.accuracy !== null
-                ? `${(selected.accuracy * 100).toFixed(1)}% accuracy`
-                : 'No accuracy data'}
-            </span>
-            <span className="text-2xs text-helix-muted font-mono">
-              {selected.sessionId.slice(0, 8)}
-            </span>
-          </div>
-        ) : (
-          <span className="text-sm text-helix-muted">Select a model version...</span>
-        )}
-        <ChevronDown
-          size={14}
-          className={cn('text-helix-muted transition-transform', open && 'rotate-180')}
-        />
-      </button>
-
-      <AnimatePresence>
-        {open && (
-          <motion.div
-            initial={{ opacity: 0, y: -4 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -4 }}
-            transition={{ duration: 0.15 }}
-            className="absolute z-20 top-full mt-1 w-full bg-helix-surface border border-helix-border rounded-lg shadow-xl overflow-hidden max-h-64 overflow-y-auto"
-          >
-            {models.map((entry) => (
-              <button
-                key={entry.sessionId}
-                type="button"
-                onClick={() => {
-                  onSelect(entry);
-                  setOpen(false);
-                }}
-                className={cn(
-                  'w-full flex items-center gap-3 px-4 py-2.5 text-left transition-colors',
-                  selected?.sessionId === entry.sessionId
-                    ? 'bg-white/[0.06]'
-                    : 'hover:bg-white/[0.03]',
-                )}
-              >
-                {entry.storedOn0G ? (
-                  <HardDrive size={12} className="text-green-400 shrink-0" />
-                ) : (
-                  <Server size={12} className="text-helix-muted shrink-0" />
-                )}
-                <Badge variant="default" className="font-mono text-2xs shrink-0">
-                  v{entry.version}
-                </Badge>
-                <span className="text-xs text-helix-text">
-                  {entry.accuracy !== null ? `${(entry.accuracy * 100).toFixed(1)}%` : '--'}
-                </span>
-                <span className="text-2xs text-helix-dim font-mono ml-auto">
-                  {new Date(entry.date).toLocaleDateString()}
-                </span>
-              </button>
-            ))}
-          </motion.div>
-        )}
-      </AnimatePresence>
     </div>
   );
 }
@@ -507,20 +347,19 @@ function TimingBreakdown({ timing }: { timing: MPCInferenceResult['timing'] }) {
     { label: 'Distributed forward pass', ms: timing.forward_pass_ms, color: 'bg-cyan-400' },
     { label: 'Worker attestation signing', ms: timing.signing_ms, color: 'bg-green-400' },
   ];
-
   return (
     <div className="space-y-1.5">
       {phases.map((p) => (
         <div key={p.label} className="flex items-center gap-3">
           <div className={cn('w-2 h-2 rounded-full shrink-0', p.color)} />
-          <span className="text-2xs text-helix-text flex-1">{p.label}</span>
-          <span className="text-2xs text-helix-muted font-mono">{p.ms}ms</span>
+          <span className="text-xs text-helix-text flex-1">{p.label}</span>
+          <span className="text-xs text-helix-muted font-mono">{p.ms}ms</span>
         </div>
       ))}
       <div className="flex items-center gap-3 pt-1 border-t border-helix-border">
         <Clock size={10} className="text-white shrink-0" />
-        <span className="text-2xs text-white font-medium flex-1">Total</span>
-        <span className="text-2xs text-white font-mono font-medium">{timing.total_ms}ms</span>
+        <span className="text-xs text-white font-medium flex-1">Total</span>
+        <span className="text-xs text-white font-mono font-medium">{timing.total_ms}ms</span>
       </div>
     </div>
   );
@@ -534,169 +373,292 @@ function MPCResultCard({ result }: { result: MPCInferenceResult }) {
   const [showDetails, setShowDetails] = useState(false);
 
   return (
-    <Card variant="glass">
-      <div className="flex items-center justify-between mb-4">
-        <div className="flex items-center gap-2">
-          <Shield size={14} className="text-green-400" />
-          <h3 className="text-sm font-medium text-white">Distributed MPC Result</h3>
-        </div>
-        <div className="flex items-center gap-2">
-          {result.distributed && (
-            <Badge variant="default" className="text-green-400">
-              <Shield size={10} />
-              Distributed
-            </Badge>
-          )}
-          <Badge variant="default" className="text-blue-400">
-            <Users size={10} />
-            {result.num_parties} workers
-          </Badge>
-          <Badge variant="default" className="text-helix-text2">
-            <Clock size={10} />
-            {result.timing.total_ms}ms
-          </Badge>
-        </div>
-      </div>
-
-      <div className="flex items-center gap-6 mb-4">
-        <div className="w-20 h-20 rounded-xl bg-white/[0.06] flex items-center justify-center">
-          <span className="text-4xl font-light text-white font-mono">{result.prediction}</span>
-        </div>
-        <div>
-          <p className="text-2xl font-mono font-light text-white">
-            {(result.confidence * 100).toFixed(1)}%
-          </p>
-          <p className="text-2xs text-helix-muted mt-0.5">confidence</p>
-        </div>
-        <div className="ml-auto">
-          <CheckCircle size={24} className="text-green-400" />
-        </div>
-      </div>
-
-      <ProbabilityBars probabilities={result.probabilities} prediction={result.prediction} />
-
-      {/* Attestation summary */}
-      {result.attestation && (
-        <div className="mt-4 pt-3 border-t border-helix-border">
-          <div className="flex items-center gap-2 mb-2">
-            <Shield size={12} className="text-green-400" />
-            <span className="text-2xs font-medium text-white">On-chain Attestation</span>
+    <div className="rounded-2xl bg-helix-surface border border-helix-border overflow-hidden">
+      <div className="p-5">
+        <div className="flex items-center justify-between mb-4">
+          <div className="flex items-center gap-2">
+            <Shield size={14} className="text-green-400" />
+            <h3 className="text-base font-medium text-white">MPC Result</h3>
           </div>
-          <div className="space-y-1.5">
-            <div className="flex items-center gap-2">
-              <span className="text-2xs text-helix-muted w-20">Input hash</span>
-              <span className="text-2xs text-helix-text font-mono truncate">
-                {result.attestation.input_hash.slice(0, 16)}...
-              </span>
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="text-2xs text-helix-muted w-20">Output hash</span>
-              <span className="text-2xs text-helix-text font-mono truncate">
-                {result.attestation.output_hash.slice(0, 16)}...
-              </span>
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="text-2xs text-helix-muted w-20">Signatures</span>
-              <div className="flex items-center gap-1">
-                {result.attestation.worker_signatures.map((sig, i) => (
-                  <div
-                    key={i}
-                    className="w-5 h-5 rounded-full bg-green-400/20 flex items-center justify-center"
-                    title={`Worker ${i}: ${sig.slice(0, 16)}...`}
-                  >
-                    <CheckCircle size={10} className="text-green-400" />
-                  </div>
-                ))}
-                <span className="text-2xs text-green-400 ml-1">
-                  {result.attestation.worker_signatures.length}/{result.num_parties} signed
-                </span>
-              </div>
-            </div>
-            {result.attestation.chain_tx_hash && (
-              <div className="flex items-center gap-2 mt-1">
-                <span className="text-2xs text-helix-muted w-20">On-chain TX</span>
-                <span className="text-2xs text-green-400 font-mono truncate">
-                  {result.attestation.chain_tx_hash.slice(0, 18)}...
-                </span>
-                {result.attestation.inference_id && (
-                  <span className="text-2xs text-helix-muted">(ID: {result.attestation.inference_id})</span>
-                )}
-              </div>
+          <div className="flex items-center gap-2">
+            {result.distributed && (
+              <Badge variant="default" className="text-green-400">
+                <Shield size={10} /> Distributed
+              </Badge>
             )}
+            <Badge variant="default" className="text-blue-400">
+              <Users size={10} /> {result.num_parties} workers
+            </Badge>
+            <Badge variant="default" className="text-helix-text2">
+              <Clock size={10} /> {result.timing.total_ms}ms
+            </Badge>
           </div>
         </div>
-      )}
 
-      {/* Expandable timing details */}
-      <div className="mt-4 pt-3 border-t border-helix-border">
-        <button
-          type="button"
-          onClick={() => setShowDetails(!showDetails)}
-          className="text-2xs text-helix-muted hover:text-white transition-colors flex items-center gap-1"
-        >
-          <Clock size={10} />
-          {showDetails ? 'Hide' : 'Show'} timing breakdown
-        </button>
+        {/* Prediction */}
+        <div className="flex items-center gap-6 mb-5">
+          <div className="w-20 h-20 rounded-xl bg-white/[0.06] flex items-center justify-center">
+            <span className="text-4xl font-light text-white font-mono">{result.prediction}</span>
+          </div>
+          <div>
+            <p className="text-2xl font-mono font-light text-white">
+              {(result.confidence * 100).toFixed(1)}%
+            </p>
+            <p className="text-xs text-helix-muted mt-0.5">confidence</p>
+          </div>
+          <div className="ml-auto">
+            <CheckCircle size={24} className="text-green-400" />
+          </div>
+        </div>
 
-        <AnimatePresence>
-          {showDetails && (
-            <motion.div
-              initial={{ height: 0, opacity: 0 }}
-              animate={{ height: 'auto', opacity: 1 }}
-              exit={{ height: 0, opacity: 0 }}
-              className="overflow-hidden"
-            >
-              <div className="mt-3">
-                <TimingBreakdown timing={result.timing} />
+        <ProbabilityBars probabilities={result.probabilities} prediction={result.prediction} />
+
+        {/* Attestation */}
+        {result.attestation && (
+          <div className="mt-4 pt-3 border-t border-helix-border">
+            <div className="flex items-center gap-2 mb-2">
+              <Shield size={12} className="text-green-400" />
+              <span className="text-xs font-medium text-white">On-chain Attestation</span>
+            </div>
+            <div className="space-y-1.5">
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-helix-muted w-20">Input hash</span>
+                <span className="text-xs text-helix-text font-mono truncate">
+                  {result.attestation.input_hash.slice(0, 16)}...
+                </span>
               </div>
-            </motion.div>
-          )}
-        </AnimatePresence>
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-helix-muted w-20">Output hash</span>
+                <span className="text-xs text-helix-text font-mono truncate">
+                  {result.attestation.output_hash.slice(0, 16)}...
+                </span>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-helix-muted w-20">Signatures</span>
+                <div className="flex items-center gap-1">
+                  {result.attestation.worker_signatures.map((sig, i) => (
+                    <div
+                      key={i}
+                      className="w-5 h-5 rounded-full bg-green-400/20 flex items-center justify-center"
+                      title={`Worker ${i}: ${sig.slice(0, 16)}...`}
+                    >
+                      <CheckCircle size={10} className="text-green-400" />
+                    </div>
+                  ))}
+                  <span className="text-xs text-green-400 ml-1">
+                    {result.attestation.worker_signatures.length}/{result.num_parties} signed
+                  </span>
+                </div>
+              </div>
+              {result.attestation.chain_tx_hash && (
+                <div className="flex items-center gap-2 mt-1">
+                  <span className="text-xs text-helix-muted w-20">On-chain TX</span>
+                  <span className="text-xs text-green-400 font-mono truncate">
+                    {result.attestation.chain_tx_hash.slice(0, 18)}...
+                  </span>
+                  {result.attestation.inference_id != null && (
+                    <span className="text-xs text-helix-muted">(ID: {result.attestation.inference_id})</span>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Timing */}
+        <div className="mt-4 pt-3 border-t border-helix-border">
+          <button
+            type="button"
+            onClick={() => setShowDetails(!showDetails)}
+            className="text-xs text-helix-muted hover:text-white transition-colors flex items-center gap-1"
+          >
+            <Clock size={10} />
+            {showDetails ? 'Hide' : 'Show'} timing breakdown
+          </button>
+          <AnimatePresence>
+            {showDetails && (
+              <motion.div
+                initial={{ height: 0, opacity: 0 }}
+                animate={{ height: 'auto', opacity: 1 }}
+                exit={{ height: 0, opacity: 0 }}
+                className="overflow-hidden"
+              >
+                <div className="mt-3">
+                  <TimingBreakdown timing={result.timing} />
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
       </div>
-    </Card>
+    </div>
   );
 }
 
 // ============================================================================
-// Main Page
+// Inner Page
 // ============================================================================
 
-export default function InferencePage() {
+function InferencePageInner() {
   const searchParams = useSearchParams();
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const { address } = useAccount();
+  const { signMessageAsync } = useSignMessage();
 
-  const [models, setModels] = useState<TrainingHistoryEntry[]>([]);
-  const [selected, setSelected] = useState<TrainingHistoryEntry | null>(null);
+  // Model discovery
+  const { allModels, isLoading: isLoadingPublic } = usePublicModels();
+  const { models: myModels, isLoading: isLoadingMine } = useModelRegistry();
+
+  const [filter, setFilter] = useState<ModelFilter>('all');
+  const [search, setSearch] = useState('');
+  const [selectedModel, setSelectedModel] = useState<PublicModel | null>(null);
+
+  // Weights
+  const [weightFetchStatus, setWeightFetchStatus] = useState<WeightFetchStatus>('idle');
+  const [weightFetchError, setWeightFetchError] = useState<string | null>(null);
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const fetchingForRef = useRef<number | null>(null);
+  const weightsFileRef = useRef<HTMLInputElement>(null);
+
+  // Inference
   const [pixels, setPixels] = useState<number[]>([]);
   const [result, setResult] = useState<MPCInferenceResult | null>(null);
   const [phase, setPhase] = useState<InferencePhase>('idle');
   const [error, setError] = useState<string | null>(null);
   const [inputMode, setInputMode] = useState<InputMode>('draw');
 
-  // Load models that have retrievable weights
-  useEffect(() => {
-    const history = getTrainingHistory();
-    const withWeights = history.filter(
-      (e) =>
-        e.status === 'complete' &&
-        ((e.storedOn0G && e.rootHash) || !e.sessionId.startsWith('upload-')),
-    );
-    withWeights.sort((a, b) => {
-      if (a.storedOn0G && !b.storedOn0G) return -1;
-      if (!a.storedOn0G && b.storedOn0G) return 1;
-      return (b.accuracy ?? 0) - (a.accuracy ?? 0);
-    });
-    setModels(withWeights);
-
-    const sessionParam = searchParams.get('session');
-    if (sessionParam) {
-      const match = withWeights.find((e) => e.sessionId === sessionParam);
-      if (match) setSelected(match);
-    } else if (withWeights.length > 0) {
-      setSelected(withWeights[0]);
+  // Filtered models
+  const filteredModels = useMemo(() => {
+    let models = allModels;
+    if (filter === 'mine') {
+      models = allModels.filter((m) => m.owner.toLowerCase() === address?.toLowerCase());
+    } else if (filter === 'others') {
+      models = allModels.filter((m) => m.owner.toLowerCase() !== address?.toLowerCase());
     }
-  }, [searchParams]);
+    if (search.trim()) {
+      const q = search.toLowerCase();
+      models = models.filter(
+        (m) =>
+          m.name.toLowerCase().includes(q) ||
+          m.slug.toLowerCase().includes(q) ||
+          m.description.toLowerCase().includes(q),
+      );
+    }
+    return models;
+  }, [allModels, filter, search, address]);
 
+  // Fee calculation
+  const ownerFeeBps = selectedModel?.inferenceFee ?? 0;
+  const ownerCommission = BASE_INFERENCE_COST * (ownerFeeBps / 10000);
+  const totalFee = BASE_INFERENCE_COST + ownerCommission;
+
+  // Auto-select from query param
+  useEffect(() => {
+    const tokenIdParam = searchParams.get('model');
+    if (!tokenIdParam || allModels.length === 0) return;
+    const tokenId = Number(tokenIdParam);
+    if (isNaN(tokenId)) return;
+    const found = allModels.find((m) => m.tokenId === tokenId);
+    if (found && !selectedModel) setSelectedModel(found);
+  }, [searchParams, allModels, selectedModel]);
+
+  // Upload weights to MPC backend
+  const uploadWeightsToBackend = useCallback(async (weightsData: unknown): Promise<string | null> => {
+    const res = await fetch(`${API_BASE}/api/training/weights`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(weightsData),
+    });
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({}));
+      throw new Error(errBody.message || errBody.error || `HTTP ${res.status}`);
+    }
+    const result = await res.json();
+    return result.session_id ?? null;
+  }, []);
+
+  // Fetch weights from 0G when model selected
+  useEffect(() => {
+    if (!selectedModel) {
+      fetchingForRef.current = null;
+      setWeightFetchStatus('idle');
+      setWeightFetchError(null);
+      return;
+    }
+
+    const lv = selectedModel.latestVersion;
+    if (!lv || !lv.weightsStored || !lv.rootHash) {
+      setWeightFetchStatus('idle');
+      setWeightFetchError(null);
+      return;
+    }
+
+    if (fetchingForRef.current === selectedModel.tokenId) return;
+    fetchingForRef.current = selectedModel.tokenId;
+
+    const doFetch = async () => {
+      setWeightFetchStatus('fetching');
+      setWeightFetchError(null);
+
+      try {
+        const res = await fetch('/api/fetch-from-0g', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ rootHash: lv.rootHash }),
+        });
+
+        if (!res.ok) {
+          const errBody = await res.json().catch(() => ({}));
+          throw new Error(errBody.error || `Failed to fetch from 0G (HTTP ${res.status})`);
+        }
+
+        const result = await res.json();
+        let weightsData: unknown;
+
+        if (result.encoding === 'base64') {
+          setWeightFetchStatus('decrypting');
+          const rawBytes = Uint8Array.from(atob(result.data), (c) => c.charCodeAt(0));
+          const signMsg = async (message: string): Promise<string> => signMessageAsync({ message });
+          const key = await deriveModelKey(signMsg, selectedModel.tokenId);
+          const decryptedJson = await decryptWeights(key, rawBytes);
+          weightsData = JSON.parse(decryptedJson);
+        } else {
+          weightsData = result.data;
+        }
+
+        setWeightFetchStatus('uploading');
+        const backendSessionId = await uploadWeightsToBackend(weightsData);
+        setActiveSessionId(backendSessionId ?? lv.sessionId);
+        setWeightFetchStatus('done');
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Failed to fetch weights';
+        setWeightFetchError(message);
+        setWeightFetchStatus('error');
+        fetchingForRef.current = null;
+      }
+    };
+
+    doFetch();
+  }, [selectedModel, signMessageAsync, uploadWeightsToBackend]);
+
+  // Manual weight upload
+  const handleManualWeightUpload = useCallback(async (file: File) => {
+    try {
+      setWeightFetchStatus('uploading');
+      setWeightFetchError(null);
+      const text = await file.text();
+      const data = JSON.parse(text);
+      const backendSessionId = await uploadWeightsToBackend(data);
+      setActiveSessionId(backendSessionId ?? `manual-${Date.now()}`);
+      setWeightFetchStatus('done');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to upload weights';
+      setWeightFetchError(message);
+      setWeightFetchStatus('error');
+    }
+  }, [uploadWeightsToBackend]);
+
+  // Clear canvas
   const clearCanvas = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -710,9 +672,9 @@ export default function InferencePage() {
     setError(null);
   }, []);
 
+  // Run inference
   const runInference = useCallback(async () => {
-    if (!selected || !pixels.length) return;
-
+    if (!activeSessionId || !pixels.length) return;
     setPhase('submitting');
     setError(null);
     setResult(null);
@@ -722,17 +684,15 @@ export default function InferencePage() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          session_id: selected.sessionId,
+          session_id: activeSessionId,
           pixels,
           num_parties: 3,
         }),
       });
-
       if (!res.ok) {
         const errBody = await res.json().catch(() => ({}));
         throw new Error(errBody.error || `Inference HTTP ${res.status}`);
       }
-
       const data: MPCInferenceResult = await res.json();
       setResult(data);
       setPhase('done');
@@ -740,10 +700,24 @@ export default function InferencePage() {
       setError(err instanceof Error ? err.message : 'Inference failed');
       setPhase('error');
     }
-  }, [selected, pixels]);
+  }, [activeSessionId, pixels]);
 
   const hasDrawing = pixels.length > 0 && pixels.some((p) => p > 0.01);
   const isRunning = phase === 'submitting';
+  const weightsReady = weightFetchStatus === 'done';
+  const canRunInference = weightsReady && hasDrawing && !isRunning && !!activeSessionId;
+
+  // Select model handler
+  const handleSelectModel = useCallback((model: PublicModel) => {
+    fetchingForRef.current = null;
+    setSelectedModel(model);
+    setResult(null);
+    setPhase('idle');
+    setError(null);
+    setWeightFetchStatus('idle');
+    setWeightFetchError(null);
+    setActiveSessionId(null);
+  }, []);
 
   return (
     <motion.div
@@ -753,258 +727,469 @@ export default function InferencePage() {
       className="space-y-6"
     >
       {/* Header */}
-      <div className="flex items-center gap-3">
-        <h1 className="page-title">Inference</h1>
-        <Badge variant="default">MNIST</Badge>
-        <Badge variant="default" className="text-green-400">
-          <Shield size={10} />
-          MPC
-        </Badge>
+      <div className="flex items-end justify-between">
+        <div>
+          <h1 className="text-4xl font-semibold tracking-tight text-white">Inference</h1>
+          <p className="text-base text-helix-muted mt-1">
+            MNIST 784 → 128 → 10 · ~102K params · Secure MPC
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <Badge variant="default">MNIST</Badge>
+          <Badge variant="default" className="text-green-400">
+            <Shield size={10} /> MPC
+          </Badge>
+        </div>
       </div>
 
-      {models.length === 0 ? (
-        <Card variant="default">
-          <div className="flex flex-col items-center justify-center py-12">
-            <Sparkles size={32} className="text-helix-dim mb-3" />
-            <p className="text-sm font-medium text-helix-text2">No models with stored weights</p>
-            <p className="text-2xs text-helix-muted mt-1">
-              Train a model and store it on 0G, or upload weights on the My Models page.
-            </p>
-          </div>
-        </Card>
-      ) : (
-        <>
-          {/* Model Selection */}
-          <Card variant="default">
-            <div className="flex items-center gap-2 mb-3">
-              <Tag size={14} className="text-helix-text2" />
-              <h3 className="text-sm font-medium text-white">Model</h3>
-            </div>
-            <ModelSelector
-              models={models}
-              selected={selected}
-              onSelect={(entry) => {
-                setSelected(entry);
-                setResult(null);
-                setPhase('idle');
-                setError(null);
-              }}
+      {/* Two-column grid */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+
+        {/* ── LEFT COLUMN: Model Discovery ──────────────────────── */}
+        <div className="flex flex-col gap-5">
+
+          {/* Search bar */}
+          <div className="relative">
+            <Search size={16} className="absolute left-4 top-1/2 -translate-y-1/2 text-helix-muted pointer-events-none" />
+            <input
+              type="text"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search models..."
+              className="w-full pl-11 pr-4 py-3.5 bg-helix-surface border border-helix-border rounded-2xl text-base text-white placeholder:text-helix-dim focus:outline-none focus:border-helix-border2 transition-colors"
             />
-            {selected && (
-              <div className="flex items-center gap-4 mt-3 text-2xs text-helix-muted">
-                <span className="font-mono">784 &rarr; 128 &rarr; 10</span>
-                <span>&middot;</span>
-                <span className="flex items-center gap-1">
-                  {selected.storedOn0G ? (
-                    <>
-                      <HardDrive size={10} className="text-green-400" /> 0G Storage
-                    </>
-                  ) : (
-                    <>
-                      <Server size={10} /> Backend
-                    </>
-                  )}
-                </span>
-                <span>&middot;</span>
-                <span>Trained {new Date(selected.date).toLocaleDateString()}</span>
-              </div>
-            )}
-          </Card>
-
-          {/* Input + Results */}
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            {/* Input Card */}
-            <Card variant="default">
-              <div className="flex items-center justify-between mb-4">
-                <div className="flex items-center gap-1 p-0.5 rounded-lg bg-helix-bg border border-helix-border">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setInputMode('draw');
-                      clearCanvas();
-                    }}
-                    className={cn(
-                      'flex items-center gap-1.5 px-3 py-1.5 rounded-md text-2xs font-medium transition-all',
-                      inputMode === 'draw'
-                        ? 'bg-white/[0.08] text-white'
-                        : 'text-helix-muted hover:text-helix-text',
-                    )}
-                  >
-                    <Pencil size={12} />
-                    Draw
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setInputMode('upload');
-                      clearCanvas();
-                    }}
-                    className={cn(
-                      'flex items-center gap-1.5 px-3 py-1.5 rounded-md text-2xs font-medium transition-all',
-                      inputMode === 'upload'
-                        ? 'bg-white/[0.08] text-white'
-                        : 'text-helix-muted hover:text-helix-text',
-                    )}
-                  >
-                    <Upload size={12} />
-                    Upload Image
-                  </button>
-                </div>
-
-                {inputMode === 'draw' && (
-                  <button
-                    type="button"
-                    onClick={clearCanvas}
-                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-2xs text-helix-muted bg-helix-bg border border-helix-border hover:text-white hover:border-helix-border2 transition-colors"
-                  >
-                    <Eraser size={12} />
-                    Clear
-                  </button>
-                )}
-              </div>
-
-              <div className="flex justify-center mb-4">
-                {inputMode === 'draw' ? (
-                  <div className="relative">
-                    <DrawingCanvas canvasRef={canvasRef} onPixelsReady={setPixels} />
-                    <div
-                      className="absolute inset-0 pointer-events-none rounded-lg opacity-[0.03]"
-                      style={{
-                        backgroundImage: `linear-gradient(rgba(255,255,255,0.5) 1px, transparent 1px),
-                           linear-gradient(90deg, rgba(255,255,255,0.5) 1px, transparent 1px)`,
-                        backgroundSize: `${CANVAS_SIZE / GRID_SIZE}px ${CANVAS_SIZE / GRID_SIZE}px`,
-                      }}
-                    />
-                  </div>
-                ) : (
-                  <ImageUpload canvasRef={canvasRef} onPixelsReady={setPixels} />
-                )}
-              </div>
-
-              <p className="text-2xs text-helix-dim text-center mb-4">
-                {inputMode === 'draw'
-                  ? 'Draw a digit (0-9) on the canvas above'
-                  : 'Upload an image of a handwritten digit (0-9)'}
-              </p>
-
+            {search && (
               <button
                 type="button"
-                onClick={runInference}
-                disabled={!selected || !hasDrawing || isRunning}
+                onClick={() => setSearch('')}
+                className="absolute right-4 top-1/2 -translate-y-1/2 text-helix-muted hover:text-white"
+              >
+                <X size={14} />
+              </button>
+            )}
+          </div>
+
+          {/* Filter tabs */}
+          <div className="grid grid-cols-3 gap-2">
+            {(['all', 'mine', 'others'] as const).map((f) => (
+              <button
+                key={f}
+                type="button"
+                onClick={() => setFilter(f)}
                 className={cn(
-                  'w-full flex items-center justify-center gap-2 py-3 rounded-lg font-medium text-sm transition-all',
-                  !selected || !hasDrawing || isRunning
-                    ? 'bg-helix-border text-helix-muted cursor-not-allowed'
-                    : 'bg-white text-black hover:bg-white/90',
+                  'py-2.5 rounded-xl text-base font-medium transition-all',
+                  filter === f
+                    ? 'bg-white text-black shadow-lg shadow-white/5'
+                    : 'bg-helix-surface border border-helix-border text-helix-muted hover:text-white hover:border-helix-border2',
                 )}
               >
-                {isRunning ? (
+                {f === 'all' ? 'All' : f === 'mine' ? 'Mine' : 'Others'}
+              </button>
+            ))}
+          </div>
+
+          {/* Model cards */}
+          <div className="space-y-2 max-h-[420px] overflow-y-auto pr-1">
+            {isLoadingPublic ? (
+              <div className="flex items-center justify-center py-12">
+                <Loader2 size={20} className="animate-spin text-helix-muted" />
+              </div>
+            ) : filteredModels.length === 0 ? (
+              <div className="flex flex-col items-center justify-center py-12 rounded-2xl bg-helix-surface border border-helix-border">
+                <Search size={20} className="text-helix-dim mb-2" />
+                <p className="text-base text-helix-text2">
+                  {filter === 'mine' && !address ? 'Connect wallet to see your models' : 'No models found'}
+                </p>
+                {search && (
+                  <p className="text-sm text-helix-muted mt-1">Try a different search term</p>
+                )}
+              </div>
+            ) : (
+              filteredModels.map((model) => {
+                const isSelected = selectedModel?.tokenId === model.tokenId;
+                const lv = model.latestVersion;
+                return (
+                  <button
+                    key={model.tokenId}
+                    type="button"
+                    onClick={() => handleSelectModel(model)}
+                    className={cn(
+                      'w-full text-left px-4 py-3.5 rounded-2xl border transition-all',
+                      isSelected
+                        ? 'bg-white/[0.06] border-white/30'
+                        : 'bg-helix-surface border-helix-border hover:border-helix-border2',
+                    )}
+                  >
+                    <div className="flex items-center justify-between mb-1.5">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <span className="text-base font-medium text-white truncate">{model.name}</span>
+                        {lv?.weightsStored && (
+                          <HardDrive size={12} className="text-green-400 shrink-0" />
+                        )}
+                      </div>
+                      {model.bestAccuracy > 0 && (
+                        <span className="text-sm font-mono text-green-400 shrink-0">
+                          {(model.bestAccuracy * 100).toFixed(1)}%
+                        </span>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-3 text-sm text-helix-muted">
+                      {model.inferenceFee > 0 && (
+                        <span className="flex items-center gap-1">
+                          <Coins size={10} />
+                          {(model.inferenceFee / 100).toFixed(1)}% fee
+                        </span>
+                      )}
+                      {lv && (
+                        <span className="font-mono">v{lv.semver}</span>
+                      )}
+                      <span className="font-mono truncate ml-auto">
+                        {model.owner.slice(0, 6)}...{model.owner.slice(-4)}
+                      </span>
+                    </div>
+                  </button>
+                );
+              })
+            )}
+          </div>
+
+          {/* Divider */}
+          <div className="flex items-center gap-3 py-1">
+            <div className="flex-1 border-t border-helix-border" />
+            <span className="text-sm text-helix-dim">or</span>
+            <div className="flex-1 border-t border-helix-border" />
+          </div>
+
+          {/* Manual weight upload */}
+          <div
+            className={cn(
+              'flex items-center justify-between px-5 py-3.5 rounded-2xl border transition-colors',
+              weightFetchStatus === 'done' && !selectedModel
+                ? 'bg-green-500/[0.04] border-green-500/15'
+                : 'bg-helix-surface border-helix-border',
+            )}
+          >
+            <div className="flex items-center gap-3 min-w-0">
+              {weightFetchStatus === 'done' && !selectedModel ? (
+                <CheckCircle size={16} className="text-green-400 shrink-0" />
+              ) : (
+                <Upload size={16} className="text-helix-muted shrink-0" />
+              )}
+              <div className="min-w-0">
+                <p className={cn(
+                  'text-base truncate',
+                  weightFetchStatus === 'done' && !selectedModel ? 'text-green-300' : 'text-helix-text2',
+                )}>
+                  Upload Weights
+                  <span className="text-helix-dim ml-1.5">.json</span>
+                </p>
+              </div>
+            </div>
+            <label className="shrink-0 px-3.5 py-1.5 rounded-xl bg-white/[0.06] text-xs text-helix-text2 hover:text-white hover:bg-white/[0.1] transition-colors cursor-pointer">
+              Upload
+              <input
+                ref={weightsFileRef}
+                type="file"
+                accept=".json"
+                className="hidden"
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (file) {
+                    setSelectedModel(null);
+                    fetchingForRef.current = null;
+                    handleManualWeightUpload(file);
+                  }
+                }}
+              />
+            </label>
+          </div>
+
+          {/* Weight fetch status */}
+          <AnimatePresence mode="wait">
+            {weightFetchStatus === 'fetching' && (
+              <motion.div
+                key="fetching"
+                initial={{ opacity: 0, y: -4 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -4 }}
+                className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-white/[0.03] border border-white/[0.06]"
+              >
+                <Loader2 size={14} className="animate-spin text-white" />
+                <span className="text-sm text-helix-text2">Fetching weights from 0G...</span>
+              </motion.div>
+            )}
+            {weightFetchStatus === 'decrypting' && (
+              <motion.div
+                key="decrypting"
+                initial={{ opacity: 0, y: -4 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -4 }}
+                className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-white/[0.03] border border-white/[0.06]"
+              >
+                <Loader2 size={14} className="animate-spin text-white" />
+                <span className="text-sm text-helix-text2">Decrypting weights (sign wallet prompt)...</span>
+              </motion.div>
+            )}
+            {weightFetchStatus === 'uploading' && (
+              <motion.div
+                key="uploading"
+                initial={{ opacity: 0, y: -4 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -4 }}
+                className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-white/[0.03] border border-white/[0.06]"
+              >
+                <Loader2 size={14} className="animate-spin text-white" />
+                <span className="text-sm text-helix-text2">Uploading to MPC workers...</span>
+              </motion.div>
+            )}
+            {weightFetchStatus === 'done' && selectedModel && (
+              <motion.div
+                key="done"
+                initial={{ opacity: 0, y: -4 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -4 }}
+                className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-green-500/[0.06] border border-green-500/20"
+              >
+                <CheckCircle size={14} className="text-green-400" />
+                <span className="text-sm text-green-300">
+                  <span className="font-medium">{selectedModel.name}</span>
+                  <span className="text-green-400/60 ml-1.5">weights loaded</span>
+                </span>
+              </motion.div>
+            )}
+            {weightFetchStatus === 'error' && (
+              <motion.div
+                key="error"
+                initial={{ opacity: 0, y: -4 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -4 }}
+                className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-red-500/[0.06] border border-red-500/20"
+              >
+                <AlertTriangle size={14} className="text-red-400" />
+                <span className="text-sm text-red-300 truncate">{weightFetchError}</span>
+              </motion.div>
+            )}
+            {selectedModel && selectedModel.latestVersion && !selectedModel.latestVersion.weightsStored && weightFetchStatus === 'idle' && (
+              <motion.div
+                key="no-weights"
+                initial={{ opacity: 0, y: -4 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -4 }}
+                className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-yellow-500/[0.06] border border-yellow-500/20"
+              >
+                <AlertTriangle size={14} className="text-yellow-400" />
+                <span className="text-sm text-yellow-300/80">No stored weights — upload manually below</span>
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
+
+        {/* ── RIGHT COLUMN: Fee, Input, Results ────────────────── */}
+        <div className="flex flex-col gap-5">
+
+          {/* Fee / Payment + Run button */}
+          <div className="rounded-2xl bg-helix-surface border border-helix-border overflow-hidden">
+            <div className="p-6">
+              <div className="flex items-center justify-between mb-4">
+                <span className="text-base font-medium text-helix-text2">Inference Fee</span>
+                {selectedModel && ownerFeeBps > 0 && (
+                  <Badge variant="default" className="text-helix-text2">
+                    <Coins size={10} />
+                    {(ownerFeeBps / 100).toFixed(1)}% owner fee
+                  </Badge>
+                )}
+              </div>
+
+              {/* Big fee number */}
+              <div className="flex items-baseline justify-center gap-4 py-2">
+                <span className="text-5xl font-bold tracking-tighter tabular-nums text-white">
+                  {totalFee.toFixed(6)}
+                </span>
+                <span className="text-xl font-semibold text-helix-text2">ETH</span>
+              </div>
+
+              {/* Fee breakdown */}
+              <div className="flex items-center justify-center gap-4 mt-3 text-sm text-helix-dim">
+                <span>Workers: {BASE_INFERENCE_COST.toFixed(4)} ETH</span>
+                {ownerFeeBps > 0 && (
                   <>
-                    <Loader2 size={16} className="animate-spin" />
-                    Running MPC Inference...
-                  </>
-                ) : (
-                  <>
-                    <Shield size={16} />
-                    Classify with MPC
+                    <span>+</span>
+                    <span>Owner: {(ownerFeeBps / 100).toFixed(1)}%</span>
                   </>
                 )}
-              </button>
+              </div>
+            </div>
 
-              {/* How it works */}
-              <div className="mt-4 p-3 bg-helix-bg rounded-lg border border-helix-border">
-                <p className="text-2xs font-medium text-helix-text2 mb-2">How distributed MPC inference works</p>
-                <div className="space-y-1.5 text-2xs text-helix-muted">
-                  <div className="flex items-center gap-2">
-                    <Shield size={10} className="text-green-400 shrink-0" />
-                    <span>Weights are <strong className="text-helix-text">secret-shared</strong> across independent workers</span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <Users size={10} className="text-blue-400 shrink-0" />
-                    <span>Each worker computes on their <strong className="text-helix-text">share only</strong> via inter-party transport</span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <CheckCircle size={10} className="text-cyan-400 shrink-0" />
-                    <span>Workers <strong className="text-helix-text">sign attestations</strong> for on-chain verification</span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <HardDrive size={10} className="text-purple-400 shrink-0" />
-                    <span>Multi-party attestation recorded on <strong className="text-helix-text">HelixCoordinatorV4</strong></span>
+            {/* Run button */}
+            <motion.button
+              type="button"
+              onClick={runInference}
+              disabled={!canRunInference}
+              whileTap={canRunInference ? { scale: 0.98 } : {}}
+              className={cn(
+                'w-full py-5 text-xl font-bold tracking-tight transition-all',
+                'flex items-center justify-center gap-3 border-t',
+                canRunInference
+                  ? 'bg-zinc-200 text-black border-zinc-200 hover:bg-zinc-300 active:bg-zinc-400'
+                  : 'bg-helix-border text-helix-muted border-helix-border cursor-not-allowed',
+              )}
+            >
+              {isRunning ? (
+                <><Loader2 size={22} className="animate-spin" /> Running MPC Inference...</>
+              ) : (
+                <><Shield size={22} /> Run Inference</>
+              )}
+            </motion.button>
+          </div>
+
+          {/* Input card */}
+          <div className="rounded-2xl bg-helix-surface border border-helix-border overflow-hidden p-5">
+            <div className="flex items-center justify-between mb-4">
+              <div className="flex items-center gap-1 p-0.5 rounded-xl bg-helix-bg border border-helix-border">
+                <button
+                  type="button"
+                  onClick={() => { setInputMode('draw'); clearCanvas(); }}
+                  className={cn(
+                    'flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-all',
+                    inputMode === 'draw'
+                      ? 'bg-white/[0.08] text-white'
+                      : 'text-helix-muted hover:text-helix-text',
+                  )}
+                >
+                  <Pencil size={12} /> Draw
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { setInputMode('upload'); clearCanvas(); }}
+                  className={cn(
+                    'flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-all',
+                    inputMode === 'upload'
+                      ? 'bg-white/[0.08] text-white'
+                      : 'text-helix-muted hover:text-helix-text',
+                  )}
+                >
+                  <Upload size={12} /> Upload
+                </button>
+              </div>
+              {inputMode === 'draw' && (
+                <button
+                  type="button"
+                  onClick={clearCanvas}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm text-helix-muted bg-helix-bg border border-helix-border hover:text-white hover:border-helix-border2 transition-colors"
+                >
+                  <Eraser size={12} /> Clear
+                </button>
+              )}
+            </div>
+
+            <div className="flex justify-center mb-3">
+              {inputMode === 'draw' ? (
+                <div className="relative">
+                  <DrawingCanvas canvasRef={canvasRef} onPixelsReady={setPixels} />
+                  <div
+                    className="absolute inset-0 pointer-events-none rounded-xl opacity-[0.03]"
+                    style={{
+                      backgroundImage: `linear-gradient(rgba(255,255,255,0.5) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.5) 1px, transparent 1px)`,
+                      backgroundSize: `${CANVAS_SIZE / GRID_SIZE}px ${CANVAS_SIZE / GRID_SIZE}px`,
+                    }}
+                  />
+                </div>
+              ) : (
+                <ImageUpload canvasRef={canvasRef} onPixelsReady={setPixels} />
+              )}
+            </div>
+
+            <p className="text-sm text-helix-dim text-center">
+              {inputMode === 'draw' ? 'Draw a digit (0-9)' : 'Upload an image of a handwritten digit'}
+            </p>
+          </div>
+
+          {/* Results */}
+          <div className="space-y-4">
+            {isRunning && (
+              <div className="rounded-2xl bg-helix-surface border border-helix-border p-5">
+                <div className="flex items-center gap-3">
+                  <Loader2 size={16} className="animate-spin text-white" />
+                  <div>
+                    <p className="text-base text-white">Running distributed MPC inference...</p>
+                    <p className="text-sm text-helix-muted mt-0.5">
+                      Secret-sharing across 3 workers, running forward pass via transport
+                    </p>
                   </div>
                 </div>
               </div>
-            </Card>
+            )}
 
-            {/* Results Column */}
-            <div className="space-y-4">
-              {/* Submitting indicator */}
-              {isRunning && (
-                <Card variant="default">
-                  <div className="flex items-center gap-3 py-4">
-                    <Loader2 size={16} className="animate-spin text-white" />
-                    <div>
-                      <p className="text-sm text-white">Running distributed MPC inference...</p>
-                      <p className="text-2xs text-helix-muted mt-0.5">
-                        Secret-sharing weights across 3 independent workers, running forward pass via transport
-                      </p>
-                    </div>
+            {error && (
+              <motion.div
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                className="bg-red-500/10 border border-red-500/30 rounded-2xl px-5 py-4"
+              >
+                <div className="flex items-start gap-2">
+                  <AlertTriangle size={14} className="text-red-400 shrink-0 mt-0.5" />
+                  <div>
+                    <p className="text-sm text-red-300">{error}</p>
+                    <button
+                      type="button"
+                      onClick={() => { setError(null); setPhase('idle'); }}
+                      className="text-xs text-red-400 hover:text-red-300 mt-1 underline"
+                    >
+                      Dismiss
+                    </button>
                   </div>
-                </Card>
-              )}
+                </div>
+              </motion.div>
+            )}
 
-              {/* Error */}
-              {error && (
-                <motion.div
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  className="bg-red-500/10 border border-red-500/30 rounded-lg px-4 py-3"
-                >
-                  <div className="flex items-start gap-2">
-                    <AlertTriangle size={14} className="text-red-400 shrink-0 mt-0.5" />
-                    <div>
-                      <p className="text-sm text-red-300">{error}</p>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setError(null);
-                          setPhase('idle');
-                        }}
-                        className="text-2xs text-red-400 hover:text-red-300 mt-1 underline"
-                      >
-                        Dismiss
-                      </button>
-                    </div>
-                  </div>
-                </motion.div>
-              )}
+            {phase === 'done' && result && (
+              <motion.div
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ duration: 0.3 }}
+              >
+                <MPCResultCard result={result} />
+              </motion.div>
+            )}
 
-              {/* Result */}
-              {phase === 'done' && result && (
-                <motion.div
-                  initial={{ opacity: 0, y: 8 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ duration: 0.3 }}
-                >
-                  <MPCResultCard result={result} />
-                </motion.div>
-              )}
-
-              {/* Empty state */}
-              {!isRunning && !error && phase === 'idle' && (
-                <Card variant="default">
-                  <div className="flex flex-col items-center justify-center py-16">
-                    <Shield size={24} className="text-helix-dim mb-3" />
-                    <p className="text-sm text-helix-text2">Draw a digit and click Classify</p>
-                    <p className="text-2xs text-helix-muted mt-1">
-                      Runs inference via secure multi-party computation
-                    </p>
-                  </div>
-                </Card>
-              )}
-            </div>
+            {!isRunning && !error && phase === 'idle' && (
+              <div className="rounded-2xl bg-helix-surface border border-helix-border p-5">
+                <div className="flex flex-col items-center justify-center py-8">
+                  <Shield size={24} className="text-helix-dim mb-3" />
+                  <p className="text-base text-helix-text2">
+                    {!weightsReady
+                      ? 'Select a model to get started'
+                      : !hasDrawing
+                        ? 'Draw a digit and click Run Inference'
+                        : 'Ready to classify'}
+                  </p>
+                  <p className="text-sm text-helix-muted mt-1">
+                    Secure multi-party computation across independent workers
+                  </p>
+                </div>
+              </div>
+            )}
           </div>
-        </>
-      )}
+        </div>
+      </div>
     </motion.div>
+  );
+}
+
+// ============================================================================
+// Page (Suspense wrapper)
+// ============================================================================
+
+export default function InferencePage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="flex items-center justify-center py-20">
+          <Loader2 size={24} className="animate-spin text-helix-muted" />
+        </div>
+      }
+    >
+      <InferencePageInner />
+    </Suspense>
   );
 }
