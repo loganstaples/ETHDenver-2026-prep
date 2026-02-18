@@ -460,12 +460,12 @@ struct MpcTrainArgs {
 
     /// Payment amount in ETH for job registration
     #[cfg(feature = "chain")]
-    #[arg(long, default_value = "1.0")]
+    #[arg(long, default_value = "0.01")]
     payment_eth: f64,
 
     /// Stake amount in ETH per worker
     #[cfg(feature = "chain")]
-    #[arg(long, default_value = "0.1")]
+    #[arg(long, default_value = "0.001")]
     stake_eth: f64,
 
     /// Existing V4 coordinator contract address (omit to deploy new)
@@ -548,7 +548,7 @@ struct MpcWorkerArgs {
 
     /// Stake amount in ETH
     #[cfg(feature = "chain")]
-    #[arg(long, default_value = "0.1")]
+    #[arg(long, default_value = "0.001")]
     stake_eth: f64,
 }
 
@@ -599,7 +599,7 @@ struct SpawnWorkersArgs {
 
     /// Stake amount in ETH per worker for on-chain pool registration
     #[cfg(feature = "chain")]
-    #[arg(long, default_value = "0.1")]
+    #[arg(long, default_value = "0.001")]
     stake_eth: f64,
 }
 

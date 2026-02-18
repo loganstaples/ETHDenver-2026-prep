@@ -24,6 +24,7 @@ broadcast/
 .env
 .env.local
 .env.*.local
+.env.adi
 
 # Debug
 npm-debug.log*

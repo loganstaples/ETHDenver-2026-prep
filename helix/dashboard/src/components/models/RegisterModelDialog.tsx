@@ -125,7 +125,7 @@ export function RegisterModelDialog({ isOpen, onClose }: RegisterModelDialogProp
               type="text"
               value={minStake}
               onChange={(e) => setMinStake(e.target.value)}
-              placeholder="0.1"
+              placeholder="0.001"
               className={inputClassName}
               disabled={isRegistering}
             />

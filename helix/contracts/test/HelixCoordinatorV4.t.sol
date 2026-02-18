@@ -297,7 +297,7 @@ contract HelixCoordinatorV4Test is Test {
 
         vm.prank(worker1);
         vm.expectRevert(HelixCoordinatorV4.InsufficientStake.selector);
-        coordinator.stakeAndJoin{value: 0.01 ether}(jobId); // Below 0.1 ether min
+        coordinator.stakeAndJoin{value: 0.0001 ether}(jobId); // Below 0.001 ether min
     }
 
     function test_StakeAndJoin_RejectsDuplicateRegistration() public {

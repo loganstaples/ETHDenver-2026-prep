@@ -404,6 +404,28 @@ export default function DashboardPage() {
     });
   }, [healthWorkers]);
 
+  // Always exactly 3 Y-axis ticks spanning the data range (no 0 baseline)
+  function niceTicks3(values: number[], decimals: number): number[] {
+    if (values.length === 0) return [0, 0.5, 1];
+    let min = Math.min(...values);
+    let max = Math.max(...values);
+    // If flat or single point, pad ±10% around the value
+    if (max - min < 0.001) {
+      const pad = Math.max(Math.abs(max) * 0.1, 0.5);
+      min = min - pad;
+      max = max + pad;
+    }
+    const step = (max - min) / 2;
+    return [
+      Number(min.toFixed(decimals)),
+      Number((min + step).toFixed(decimals)),
+      Number(max.toFixed(decimals)),
+    ];
+  }
+
+  const lossTicks = useMemo(() => niceTicks3(lossData.map((d) => d.value), 2), [lossData]);
+  const accTicks = useMemo(() => niceTicks3(accData.map((d) => d.value), 1), [accData]);
+
   const chartTooltipStyle = {
     backgroundColor: '#111113',
     border: '1px solid #1e1e22',
@@ -517,15 +539,31 @@ export default function DashboardPage() {
                   {lossDelta <= 0 ? '\u2193' : '\u2191'} {Math.abs(lossDelta).toFixed(4)}
                 </span>
               </div>
-              <div className="mt-4 h-28">
+              <div className="mt-4 h-36">
                 <ResponsiveContainer width="100%" height="100%">
-                  <AreaChart data={lossData} margin={{ top: 4, right: 0, bottom: 0, left: 0 }}>
+                  <AreaChart data={lossData} margin={{ top: 4, right: 4, bottom: 0, left: 0 }}>
                     <defs>
                       <linearGradient id="lG" x1="0" y1="0" x2="0" y2="1">
                         <stop offset="0%" stopColor="#ffffff" stopOpacity={0.08} />
                         <stop offset="100%" stopColor="#ffffff" stopOpacity={0} />
                       </linearGradient>
                     </defs>
+                    <XAxis
+                      dataKey="step"
+                      tick={{ fill: '#63636e', fontSize: 10, fontFamily: 'var(--font-geist-mono)' }}
+                      axisLine={{ stroke: '#1e1e22' }}
+                      tickLine={false}
+                      tickMargin={6}
+                    />
+                    <YAxis
+                      domain={[lossTicks[0], lossTicks[lossTicks.length - 1]]}
+                      ticks={lossTicks}
+                      tick={{ fill: '#63636e', fontSize: 10, fontFamily: 'var(--font-geist-mono)' }}
+                      axisLine={false}
+                      tickLine={false}
+                      tickMargin={4}
+                      width={38}
+                    />
                     <Tooltip contentStyle={chartTooltipStyle} labelStyle={{ color: '#63636e' }} />
                     <Area
                       type="monotone"
@@ -554,15 +592,32 @@ export default function DashboardPage() {
                   {accDelta >= 0 ? '\u2191' : '\u2193'} {Math.abs(accDelta).toFixed(1)}%
                 </span>
               </div>
-              <div className="mt-4 h-28">
+              <div className="mt-4 h-36">
                 <ResponsiveContainer width="100%" height="100%">
-                  <AreaChart data={accData} margin={{ top: 4, right: 0, bottom: 0, left: 0 }}>
+                  <AreaChart data={accData} margin={{ top: 4, right: 4, bottom: 0, left: 0 }}>
                     <defs>
                       <linearGradient id="aG" x1="0" y1="0" x2="0" y2="1">
                         <stop offset="0%" stopColor="#4ade80" stopOpacity={0.1} />
                         <stop offset="100%" stopColor="#4ade80" stopOpacity={0} />
                       </linearGradient>
                     </defs>
+                    <XAxis
+                      dataKey="epoch"
+                      tick={{ fill: '#63636e', fontSize: 10, fontFamily: 'var(--font-geist-mono)' }}
+                      axisLine={{ stroke: '#1e1e22' }}
+                      tickLine={false}
+                      tickMargin={6}
+                    />
+                    <YAxis
+                      domain={[accTicks[0], accTicks[accTicks.length - 1]]}
+                      ticks={accTicks}
+                      tick={{ fill: '#63636e', fontSize: 10, fontFamily: 'var(--font-geist-mono)' }}
+                      axisLine={false}
+                      tickLine={false}
+                      tickMargin={4}
+                      width={42}
+                      unit="%"
+                    />
                     <Tooltip contentStyle={chartTooltipStyle} labelStyle={{ color: '#63636e' }} />
                     <Area
                       type="monotone"

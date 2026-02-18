@@ -343,8 +343,8 @@ function ConfigForm({
   const [zkMode, setZkMode] = useState<'off' | 'always' | 'risk'>('off');
   const [zkCheckpointFreq, setZkCheckpointFreq] = useState(5);
   const [minWorkersForMpc, setMinWorkersForMpc] = useState(2);
-  const [paymentEth, setPaymentEth] = useState(1.0);
-  const [stakePerWorkerEth, setStakePerWorkerEth] = useState(0.1);
+  const [paymentEth, setPaymentEth] = useState(0.01);
+  const [stakePerWorkerEth, setStakePerWorkerEth] = useState(0.001);
   const [storeOn0G, setStoreOn0G] = useState(false);
   const [version, setVersion] = useState(defaultVersion);
   const [versionError, setVersionError] = useState<string | null>(null);
@@ -354,7 +354,7 @@ function ConfigForm({
   const recommendedPayment = useMemo(() => {
     const workers = workersOnline > 0 ? workersOnline : 3;
     const zkMult = zkMode === 'always' ? 1.75 : zkMode === 'risk' ? 1.25 : 1.0;
-    return parseFloat((0.0002 * numSteps * workers * zkMult).toFixed(4));
+    return parseFloat((0.000002 * numSteps * workers * zkMult).toFixed(6));
   }, [numSteps, workersOnline, zkMode]);
 
   const effectivePayment = autoPropose ? recommendedPayment : paymentEth;

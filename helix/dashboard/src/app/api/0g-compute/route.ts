@@ -82,11 +82,11 @@ async function ensureSetup(broker: Awaited<ReturnType<typeof createZGComputeNetw
     const account = await broker.inference.getAccount(providerAddress);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const balance = (account as any)?.balance ?? BigInt(0);
-    if (BigInt(balance) < ethers.parseEther('0.1')) {
+    if (BigInt(balance) < ethers.parseEther('0.001')) {
       await broker.ledger.transferFund(
         providerAddress,
         'inference',
-        ethers.parseEther('1.0'),
+        ethers.parseEther('0.01'),
       );
     }
   } catch {
@@ -95,7 +95,7 @@ async function ensureSetup(broker: Awaited<ReturnType<typeof createZGComputeNetw
       await broker.ledger.transferFund(
         providerAddress,
         'inference',
-        ethers.parseEther('1.0'),
+        ethers.parseEther('0.01'),
       );
     } catch {
       // May already have funds

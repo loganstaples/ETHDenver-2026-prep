@@ -154,7 +154,7 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
     mapping(address => uint256) public workerActiveJobs;
 
     /// @notice Stake required per active job slot (rate limiting)
-    uint256 public stakePerJobSlot = 0.1 ether;
+    uint256 public stakePerJobSlot = 0.001 ether;
 
     /// @notice ZK weight hash chain: jobId => index => value (index 0 = lo, index 1 = hi)
     mapping(uint256 => mapping(uint256 => uint256)) public zkWeightHash;
@@ -177,7 +177,7 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
     mapping(address => uint256) internal _poolWorkerIndex;
 
     /// @notice Minimum stake required to join the worker pool
-    uint256 public poolMinStake = 0.1 ether;
+    uint256 public poolMinStake = 0.001 ether;
 
     // ============ Events ============
 
@@ -364,7 +364,7 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
             checkpointFreq: checkpointFreq,
             numRounds: numRounds,
             paymentAmount: paymentAmount,
-            minStake: 0.1 ether,
+            minStake: 0.001 ether,
             currentStep: 0,
             latestWeightCommitment: bytes32(0),
             latestLoss: 0,

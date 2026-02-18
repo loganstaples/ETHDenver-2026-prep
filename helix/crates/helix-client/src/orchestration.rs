@@ -665,7 +665,7 @@ impl TrainingOrchestrator {
         let (d_in, d_hid, d_out) = self.config.model_dims;
         let ipfs_hash = format!("QmHelix_{}x{}x{}_seed{}", d_in, d_hid, d_out, self.config.model_seed);
         let initial_commitment = U256::from(self.config.model_seed);
-        let min_stake = U256::from(100_000_000_000_000_000u64); // 0.1 ETH
+        let min_stake = U256::from(1_000_000_000_000_000u64); // 0.001 ETH
 
         let (_receipt, model_id) = chain
             .register_model(&ipfs_hash, initial_commitment, min_stake)
@@ -676,8 +676,8 @@ impl TrainingOrchestrator {
         self.model_id = Some(model_id);
 
         // Stake
-        info!("Staking 0.5 ETH for model {}...", model_id);
-        let stake_amount = U256::from(500_000_000_000_000_000u64); // 0.5 ETH
+        info!("Staking 0.005 ETH for model {}...", model_id);
+        let stake_amount = U256::from(5_000_000_000_000_000u64); // 0.005 ETH
         chain
             .stake(model_id, stake_amount)
             .await

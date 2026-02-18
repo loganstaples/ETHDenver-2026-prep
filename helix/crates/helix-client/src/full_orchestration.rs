@@ -297,9 +297,9 @@ impl Default for FullOrchestrationConfig {
             #[cfg(feature = "chain")]
             worker_private_keys: Vec::new(),
             #[cfg(feature = "chain")]
-            payment_amount_eth: 1.0,
+            payment_amount_eth: 0.01,
             #[cfg(feature = "chain")]
-            stake_amount_eth: 0.1,
+            stake_amount_eth: 0.001,
             #[cfg(feature = "chain")]
             coordinator_address: None,
             #[cfg(feature = "chain")]
@@ -2790,9 +2790,9 @@ mod tests {
                 "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6".to_string(),
             ],
             #[cfg(feature = "chain")]
-            payment_amount_eth: 1.0,
+            payment_amount_eth: 0.01,
             #[cfg(feature = "chain")]
-            stake_amount_eth: 0.1,
+            stake_amount_eth: 0.001,
             #[cfg(feature = "chain")]
             coordinator_address: None,
             #[cfg(feature = "chain")]
