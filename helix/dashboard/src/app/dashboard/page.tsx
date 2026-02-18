@@ -21,7 +21,7 @@ import {
   ResponsiveContainer,
 } from 'recharts';
 import { cn } from '@/lib/utils';
-import { useDashboardSessions } from '@/hooks/useDashboardSessions';
+import { useDashboardSessions, type TrainingEvent } from '@/hooks/useDashboardSessions';
 import { useWorkerHealth, type WorkerHealth } from '@/hooks/useWorkerHealth';
 import { formatEther } from 'viem';
 
@@ -319,9 +319,9 @@ export default function DashboardPage() {
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const [selectedWorker, setSelectedWorker] = useState<WorkerHealth | null>(null);
 
-  // Editable settings
-  const [editLR, setEditLR] = useState('0.001');
-  const [editBatch, setEditBatch] = useState('64');
+  // Config display values (read-only — backend doesn't support mid-training changes)
+  const displayLR = '0.001';
+  const displayBatch = '64';
 
   // Backend data via useDashboardSessions
   const {
@@ -403,7 +403,7 @@ export default function DashboardPage() {
 
     events.forEach((e, i) => {
       const evt = e.event;
-      const ts = Date.now() - (events.length - i) * 100; // approximate timestamps
+      const ts = (e as TrainingEvent & { receivedAt?: number }).receivedAt ?? (Date.now() - (events.length - i) * 100);
 
       if (evt.type === 'training_step') {
         const step = evt.step as number;
@@ -796,21 +796,15 @@ export default function DashboardPage() {
               <div className="space-y-4 flex-1">
                 <div>
                   <label className="text-xs text-helix-muted block mb-1.5">Learning Rate</label>
-                  <input
-                    type="text"
-                    value={editLR}
-                    onChange={(e) => setEditLR(e.target.value)}
-                    className="w-full px-3 py-2 bg-helix-bg border border-helix-border rounded-xl text-sm text-white font-mono focus:outline-none focus:border-helix-border2 transition-colors"
-                  />
+                  <div className="px-3 py-2 bg-helix-bg border border-helix-border rounded-xl text-sm text-helix-text2 font-mono">
+                    {displayLR}
+                  </div>
                 </div>
                 <div>
                   <label className="text-xs text-helix-muted block mb-1.5">Batch Size</label>
-                  <input
-                    type="text"
-                    value={editBatch}
-                    onChange={(e) => setEditBatch(e.target.value)}
-                    className="w-full px-3 py-2 bg-helix-bg border border-helix-border rounded-xl text-sm text-white font-mono focus:outline-none focus:border-helix-border2 transition-colors"
-                  />
+                  <div className="px-3 py-2 bg-helix-bg border border-helix-border rounded-xl text-sm text-helix-text2 font-mono">
+                    {displayBatch}
+                  </div>
                 </div>
                 <div>
                   <label className="text-xs text-helix-muted block mb-1.5">Optimizer</label>

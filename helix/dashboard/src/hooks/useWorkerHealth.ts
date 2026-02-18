@@ -586,9 +586,11 @@ export function useWorkerHealth(options: UseWorkerHealthOptions = {}): UseWorker
 
     useEffect(() => {
         if (!enablePolling) return;
-        // Real metrics come from WebSocket worker_metrics/worker_activity messages
-        return undefined;
-    }, [enablePolling]);
+        const interval = setInterval(() => {
+            initializeWorkers();
+        }, 10000);
+        return () => clearInterval(interval);
+    }, [enablePolling, initializeWorkers]);
 
     // ========================================================================
     // Effects

@@ -419,12 +419,14 @@ export function useNodes(options: UseNodesOptions = {}): UseNodesReturn {
         };
     }, [fetchNodes, setupWebSocket, apiClient]);
 
-    // Auto refresh
+    // Auto refresh — poll backend for updated node list
     useEffect(() => {
         if (!autoRefresh) return;
-        // No simulation — real metrics come from WebSocket
-        return undefined;
-    }, [autoRefresh]);
+        const interval = setInterval(() => {
+            fetchNodes();
+        }, 10000);
+        return () => clearInterval(interval);
+    }, [autoRefresh, fetchNodes]);
 
     // Update nodes when contract events change
     useEffect(() => {

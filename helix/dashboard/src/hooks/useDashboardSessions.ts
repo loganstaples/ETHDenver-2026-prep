@@ -111,7 +111,8 @@ export function useDashboardSessions(): UseDashboardSessionsReturn {
 
           if (!data.event) return;
 
-          setEvents((prev) => [...prev, data as TrainingEvent].slice(-200));
+          const stamped = { ...data, receivedAt: Date.now() } as TrainingEvent & { receivedAt: number };
+          setEvents((prev) => [...prev, stamped].slice(-200));
 
           const evt = data.event;
 
