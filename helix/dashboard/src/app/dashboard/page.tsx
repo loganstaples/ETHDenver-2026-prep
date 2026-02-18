@@ -27,22 +27,6 @@ import { useWorkerHealth, type WorkerHealth } from '@/hooks/useWorkerHealth';
 import { formatEther } from 'viem';
 
 // ============================================================================
-// Mock sessions
-// ============================================================================
-
-const TRAINING_SESSIONS = [
-  { id: 'session-1', name: 'MNIST Classifier v2', modelId: BigInt(1), status: 'training' as const },
-  { id: 'session-2', name: 'CIFAR-10 ResNet', modelId: BigInt(2), status: 'paused' as const },
-];
-
-const INFERENCE_REQUESTS = [
-  { id: 'inf-1', model: 'MNIST Classifier v2', status: 'processing' as const, progress: 72, phase: 'MPC computation', workers: 3, created: Date.now() - 45000, inputLabel: 'Digit image (28×28)', result: null, confidence: null, duration: null },
-  { id: 'inf-2', model: 'CIFAR-10 ResNet', status: 'processing' as const, progress: 31, phase: 'Encrypting input', workers: 3, created: Date.now() - 12000, inputLabel: 'Image (32×32×3)', result: null, confidence: null, duration: null },
-  { id: 'inf-3', model: 'MNIST Classifier v2', status: 'completed' as const, progress: 100, phase: 'Complete', workers: 3, created: Date.now() - 180000, inputLabel: 'Digit image (28×28)', result: '7', confidence: 0.982, duration: 62000 },
-  { id: 'inf-4', model: 'MNIST Classifier v2', status: 'completed' as const, progress: 100, phase: 'Complete', workers: 3, created: Date.now() - 420000, inputLabel: 'Digit image (28×28)', result: '3', confidence: 0.947, duration: 48000 },
-];
-
-// ============================================================================
 // Alert icon/color helpers
 // ============================================================================
 
@@ -72,6 +56,31 @@ function formatDuration(ms: number): string {
 /** Live elapsed since timestamp, with seconds */
 function elapsedSince(ts: number): string {
   return formatDuration(Date.now() - ts);
+}
+
+// ============================================================================
+// Types (populated from API)
+// ============================================================================
+
+interface TrainingSession {
+  id: string;
+  name: string;
+  modelId: bigint;
+  status: 'training' | 'paused';
+}
+
+interface DashboardInferenceRequest {
+  id: string;
+  model: string;
+  status: 'processing' | 'completed';
+  progress: number;
+  phase: string;
+  workers: number;
+  created: number;
+  inputLabel: string;
+  result: string | null;
+  confidence: number | null;
+  duration: number | null;
 }
 
 // ============================================================================
@@ -307,7 +316,11 @@ function WorkerModal({ worker, onClose }: { worker: WorkerHealth; onClose: () =>
 
 export default function DashboardPage() {
   const [tab, setTab] = useState<'training' | 'inference'>('training');
-  const [selectedSession, setSelectedSession] = useState(TRAINING_SESSIONS[0]);
+  // TODO: Populate from GET /api/training/sessions
+  const [sessions] = useState<TrainingSession[]>([]);
+  const [selectedSession, setSelectedSession] = useState<TrainingSession | null>(null);
+  // TODO: Populate from inference API/WebSocket
+  const [inferenceRequests] = useState<DashboardInferenceRequest[]>([]);
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const [selectedWorker, setSelectedWorker] = useState<WorkerHealth | null>(null);
 
@@ -325,7 +338,7 @@ export default function DashboardPage() {
     alerts: trainingAlerts,
     pauseTraining,
     resumeTraining,
-  } = useTrainingStatus({ modelId: selectedSession.modelId });
+  } = useTrainingStatus({ modelId: selectedSession?.modelId ?? BigInt(1) });
 
   const { workers: healthWorkers } = useWorkerHealth();
 
@@ -447,7 +460,7 @@ export default function DashboardPage() {
 
         <div className="flex items-center gap-3">
           {/* Session Selector */}
-          {tab === 'training' && (
+          {tab === 'training' && selectedSession && (
             <div className="relative">
               <button
                 onClick={() => setDropdownOpen(!dropdownOpen)}
@@ -469,7 +482,7 @@ export default function DashboardPage() {
                     exit={{ opacity: 0, y: -4 }}
                     className="absolute right-0 top-full mt-2 w-64 bg-helix-surface border border-helix-border rounded-xl shadow-xl z-50 overflow-hidden"
                   >
-                    {TRAINING_SESSIONS.map((s) => (
+                    {sessions.map((s) => (
                       <button
                         key={s.id}
                         onClick={() => { setSelectedSession(s); setDropdownOpen(false); }}
@@ -515,7 +528,21 @@ export default function DashboardPage() {
       {/* ================================================================ */}
       {/* Training Tab */}
       {/* ================================================================ */}
-      {tab === 'training' && (
+      {tab === 'training' && !selectedSession && (
+        <motion.div
+          key="training-empty"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          transition={{ duration: 0.25 }}
+        >
+          <div className="bg-helix-surface border border-helix-border rounded-2xl p-16 text-center">
+            <div className="text-sm text-helix-muted">No active training sessions</div>
+            <div className="text-xs text-helix-dim mt-2">Start a training session from the Train page</div>
+          </div>
+        </motion.div>
+      )}
+
+      {tab === 'training' && selectedSession && (
         <motion.div
           key="training"
           initial={{ opacity: 0 }}
@@ -803,11 +830,11 @@ export default function DashboardPage() {
           className="space-y-8"
         >
           {/* Active Requests */}
-          {INFERENCE_REQUESTS.filter((r) => r.status === 'processing').length > 0 && (
+          {inferenceRequests.filter((r) => r.status === 'processing').length > 0 && (
             <div>
               <span className="text-xs uppercase tracking-wider text-helix-muted block mb-4">In Progress</span>
               <div className="space-y-4">
-                {INFERENCE_REQUESTS.filter((r) => r.status === 'processing').map((req, i) => (
+                {inferenceRequests.filter((r) => r.status === 'processing').map((req, i) => (
                   <motion.div
                     key={req.id}
                     initial={{ opacity: 0, y: 12 }}
@@ -870,11 +897,11 @@ export default function DashboardPage() {
           )}
 
           {/* Completed Requests */}
-          {INFERENCE_REQUESTS.filter((r) => r.status === 'completed').length > 0 && (
+          {inferenceRequests.filter((r) => r.status === 'completed').length > 0 && (
             <div>
               <span className="text-xs uppercase tracking-wider text-helix-muted block mb-4">Completed</span>
               <div className="space-y-4">
-                {INFERENCE_REQUESTS.filter((r) => r.status === 'completed').map((req, i) => (
+                {inferenceRequests.filter((r) => r.status === 'completed').map((req, i) => (
                   <motion.div
                     key={req.id}
                     initial={{ opacity: 0, y: 12 }}
@@ -886,7 +913,7 @@ export default function DashboardPage() {
                     <div className="absolute top-0 left-0 w-full h-[1px] bg-gradient-to-r from-transparent via-white/10 to-transparent" />
 
                     <div className="flex items-center gap-8">
-                      {/* Horseshoe with radial backdrop — same as active */}
+                      {/* Horseshoe with radial backdrop */}
                       <div className="relative shrink-0 flex items-center justify-center">
                         <div className="absolute inset-0 rounded-full bg-white/[0.02] blur-xl scale-110" />
                         <HorseshoeProgress progress={100} size={150} />
@@ -905,7 +932,7 @@ export default function DashboardPage() {
                         </div>
 
                         <div className="text-sm text-helix-muted mb-5">
-                          Predicted &ldquo;{req.result}&rdquo; with {req.confidence != null ? `${(req.confidence * 100).toFixed(1)}%` : '—'} confidence
+                          Predicted &ldquo;{req.result}&rdquo; with {req.confidence != null ? `${(req.confidence * 100).toFixed(1)}%` : '\u2014'} confidence
                         </div>
 
                         <div className="grid grid-cols-3 gap-4">
@@ -916,13 +943,13 @@ export default function DashboardPage() {
                           <div className="border-l border-helix-border pl-4">
                             <div className="text-[10px] uppercase tracking-wider text-helix-muted mb-1">Confidence</div>
                             <div className="text-lg font-medium text-white tabular-nums font-mono">
-                              {req.confidence != null ? `${(req.confidence * 100).toFixed(1)}%` : '—'}
+                              {req.confidence != null ? `${(req.confidence * 100).toFixed(1)}%` : '\u2014'}
                             </div>
                           </div>
                           <div className="border-l border-helix-border pl-4">
                             <div className="text-[10px] uppercase tracking-wider text-helix-muted mb-1">Duration</div>
                             <div className="text-lg font-medium text-white tabular-nums font-mono">
-                              {req.duration != null ? formatDuration(req.duration) : '—'}
+                              {req.duration != null ? formatDuration(req.duration) : '\u2014'}
                             </div>
                           </div>
                         </div>
@@ -934,9 +961,10 @@ export default function DashboardPage() {
             </div>
           )}
 
-          {INFERENCE_REQUESTS.length === 0 && (
+          {inferenceRequests.length === 0 && (
             <div className="bg-helix-surface border border-helix-border rounded-2xl p-16 text-center">
               <div className="text-sm text-helix-muted">No inference requests yet</div>
+              <div className="text-xs text-helix-dim mt-2">Run inference from the Inference page</div>
             </div>
           )}
         </motion.div>

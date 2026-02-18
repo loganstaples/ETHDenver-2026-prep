@@ -7,7 +7,6 @@ import {
   useReadContracts,
 } from 'wagmi';
 import { getContractAddress, HELIX_MODEL_STORE_ABI, type OnChainVersion } from '@/lib/contracts';
-import { USE_MOCK_DATA, MOCK_MODELS, MOCK_CURRENT_USER } from '@/lib/mock-models';
 
 const ZERO_ADDR = '0x0000000000000000000000000000000000000000';
 
@@ -28,7 +27,6 @@ export interface ModelDetail {
 
 export function useModelDetail(tokenId: number) {
   const { address, isConnected, chainId } = useAccount();
-  const live = !USE_MOCK_DATA;
 
   const contractAddress = useMemo(() => {
     if (!chainId) return ZERO_ADDR;
@@ -40,7 +38,7 @@ export function useModelDetail(tokenId: number) {
 
   // Batch: models(), ownerOf(), getVersions(), isForSale(), salePrice() in one multicall
   const calls = useMemo(() => {
-    if (!live || !isContractDeployed) return [];
+    if (!isContractDeployed) return [];
     return [
       {
         address: addr,
@@ -73,7 +71,7 @@ export function useModelDetail(tokenId: number) {
         args: [BigInt(tokenId)],
       },
     ];
-  }, [live, tokenId, addr, isContractDeployed]);
+  }, [tokenId, addr, isContractDeployed]);
 
   const {
     data: results,
@@ -93,12 +91,12 @@ export function useModelDetail(tokenId: number) {
     abi: HELIX_MODEL_STORE_ABI,
     functionName: 'hasModelAccess',
     args: address ? [BigInt(tokenId), address] : undefined,
-    query: { enabled: live && isContractDeployed && isConnected && !!address },
+    query: { enabled: isContractDeployed && isConnected && !!address },
   });
 
   // ── Parse on-chain data ────────────────────────────────────────────
   const chainModel: ModelDetail | null = useMemo(() => {
-    if (USE_MOCK_DATA || !results || results.length < 3) return null;
+    if (!results || results.length < 3) return null;
 
     const modelResult = results[0];
     const ownerResult = results[1];
@@ -153,27 +151,11 @@ export function useModelDetail(tokenId: number) {
     };
   }, [results, tokenId]);
 
-  // ── Mock path ──────────────────────────────────────────────────────
-  const mockModel: ModelDetail | null = useMemo(() => {
-    if (!USE_MOCK_DATA) return null;
-    const found = MOCK_MODELS.find((m) => m.tokenId === tokenId);
-    if (!found) return null;
-    return {
-      ...found,
-      forSale: found.forSale ?? false,
-      salePrice: found.salePrice ?? 0,
-    };
-  }, [tokenId]);
-
-  const model = USE_MOCK_DATA ? mockModel : chainModel;
-  const isLoading = USE_MOCK_DATA ? false : isLoadingChain;
-  const isError = USE_MOCK_DATA ? false : isErrorChain;
-  const isOwner = USE_MOCK_DATA
-    ? (!!model && model.owner === MOCK_CURRENT_USER)
-    : (!!address && !!model && model.owner.toLowerCase() === address.toLowerCase());
-  const hasAccess = USE_MOCK_DATA
-    ? (isOwner || (model?.isPublic ?? false))
-    : (hasAccessChain === true);
+  const model = chainModel;
+  const isLoading = isLoadingChain;
+  const isError = isErrorChain;
+  const isOwner = !!address && !!model && model.owner.toLowerCase() === address.toLowerCase();
+  const hasAccess = hasAccessChain === true;
 
   return {
     model,
@@ -181,8 +163,8 @@ export function useModelDetail(tokenId: number) {
     isError,
     isOwner,
     hasAccess,
-    isConnected: USE_MOCK_DATA ? true : isConnected,
-    isContractDeployed: USE_MOCK_DATA ? true : isContractDeployed,
+    isConnected,
+    isContractDeployed,
     refetch,
   };
 }

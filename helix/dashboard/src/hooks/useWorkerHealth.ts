@@ -9,7 +9,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useWebSocket } from '@/lib/websocket';
 import { useContractEvents } from './useContract';
-import { generateMockNodeInfo } from '@/lib/api';
 import { formatEther } from 'viem';
 
 // ============================================================================
@@ -394,33 +393,33 @@ export function useWorkerHealth(options: UseWorkerHealthOptions = {}): UseWorker
 
             // Process staked events
             stakedEvents.forEach(event => {
-                const mockData = generateMockNodeInfo(event.prover, workerMap.size);
+                const roles: WorkerRole[] = ['compute', 'aggregator', 'verifier'];
                 workerMap.set(event.prover, {
                     id: `worker-${event.prover.slice(2, 10)}`,
                     address: event.prover,
-                    role: mockData.type,
+                    role: roles[workerMap.size % 3],
                     activity: 'idle',
                     lastSeen: event.timestamp,
                     lastHeartbeat: event.timestamp,
                     metrics: {
-                        cpu: mockData.metrics.cpu,
-                        memory: mockData.metrics.memory,
-                        gpu: mockData.metrics.gpu,
-                        gpuMemory: mockData.metrics.gpuMemory,
-                        networkIn: mockData.metrics.networkIn,
-                        networkOut: mockData.metrics.networkOut,
-                        diskUsage: mockData.metrics.diskUsage || 30,
-                        temperature: mockData.metrics.temperature,
-                        latency: mockData.location?.latency || 50,
+                        cpu: 0,
+                        memory: 0,
+                        gpu: undefined,
+                        gpuMemory: undefined,
+                        networkIn: 0,
+                        networkOut: 0,
+                        diskUsage: 0,
+                        temperature: undefined,
+                        latency: 0,
                     },
                     capabilities: {
-                        gpuModel: mockData.capabilities.gpuModel,
-                        gpuMemoryMb: mockData.capabilities.gpuMemoryMb,
-                        cudaVersion: mockData.capabilities.cudaVersion,
-                        maxBatchSize: mockData.capabilities.maxBatchSize,
-                        canTrain: mockData.capabilities.canTrain,
-                        canProve: mockData.capabilities.canProve,
-                        canAggregate: mockData.capabilities.canAggregate,
+                        gpuModel: undefined,
+                        gpuMemoryMb: 0,
+                        cudaVersion: undefined,
+                        maxBatchSize: 64,
+                        canTrain: true,
+                        canProve: workerMap.size % 3 === 2,
+                        canAggregate: workerMap.size % 3 === 1,
                     },
                     performance: {
                         proofsSubmitted: 0,
@@ -429,17 +428,17 @@ export function useWorkerHealth(options: UseWorkerHealthOptions = {}): UseWorker
                         roundsParticipated: 0,
                         averageProofTime: 0,
                         successRate: 1,
-                        uptime: mockData.performance.uptime,
-                        totalEarnings: mockData.performance.totalEarnings,
+                        uptime: 1,
+                        totalEarnings: BigInt(0),
                     },
                     stake: {
                         amount: event.amount,
                         amountFormatted: formatEther(event.amount),
-                        lockedUntil: Number(mockData.stake.lockedUntil),
-                        isLocked: Number(mockData.stake.lockedUntil) > Date.now(),
+                        lockedUntil: 0,
+                        isLocked: false,
                         slashed: false,
                     },
-                    region: mockData.location?.region,
+                    region: undefined,
                 });
             });
 
@@ -463,70 +462,6 @@ export function useWorkerHealth(options: UseWorkerHealthOptions = {}): UseWorker
                     worker.performance.proofsFailed++;
                 }
             });
-
-            // Generate demo workers if no contract data
-            if (workerMap.size === 0) {
-                const demoAddresses = [
-                    '0x742d35Cc6634C0532925a3b844Bc9e7595f01231',
-                    '0x8626f6940E2eb28930eFb4CeF49B2d1F2C9C1199',
-                    '0xdD2FD4581271e230360230F9337D5c0430Bf44C0',
-                    '0xbDA5747bFD65F08deb54cb465eB87D40e51B197E',
-                    '0x2546BcD3c84621e976D8185a91A922aE77ECEc30',
-                    '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266',
-                ];
-
-                const activities: WorkerActivity[] = ['idle', 'training', 'proving', 'aggregating', 'syncing', 'idle'];
-
-                demoAddresses.forEach((addr, i) => {
-                    const mockData = generateMockNodeInfo(addr, i);
-                    workerMap.set(addr, {
-                        id: `worker-${addr.slice(2, 10)}`,
-                        address: addr,
-                        role: mockData.type,
-                        activity: activities[i % activities.length],
-                        lastSeen: Date.now() - Math.random() * 60000,
-                        lastHeartbeat: Date.now() - Math.random() * 30000,
-                        metrics: {
-                            cpu: 20 + Math.random() * 60,
-                            memory: 30 + Math.random() * 50,
-                            gpu: Math.random() > 0.2 ? 30 + Math.random() * 60 : undefined,
-                            gpuMemory: Math.random() > 0.2 ? 20 + Math.random() * 70 : undefined,
-                            networkIn: Math.random() * 1000,
-                            networkOut: Math.random() * 500,
-                            diskUsage: 20 + Math.random() * 40,
-                            temperature: 40 + Math.random() * 35,
-                            latency: 10 + Math.random() * 100,
-                        },
-                        capabilities: {
-                            gpuModel: mockData.capabilities.gpuModel,
-                            gpuMemoryMb: mockData.capabilities.gpuMemoryMb,
-                            cudaVersion: mockData.capabilities.cudaVersion,
-                            maxBatchSize: mockData.capabilities.maxBatchSize,
-                            canTrain: mockData.capabilities.canTrain,
-                            canProve: mockData.capabilities.canProve,
-                            canAggregate: mockData.capabilities.canAggregate,
-                        },
-                        performance: {
-                            proofsSubmitted: Math.floor(Math.random() * 100) + 10,
-                            proofsVerified: Math.floor(Math.random() * 95) + 10,
-                            proofsFailed: Math.floor(Math.random() * 5),
-                            roundsParticipated: Math.floor(Math.random() * 50) + 5,
-                            averageProofTime: 200 + Math.random() * 300,
-                            successRate: 0.85 + Math.random() * 0.15,
-                            uptime: 0.9 + Math.random() * 0.1,
-                            totalEarnings: BigInt(Math.floor(Math.random() * 5 * 1e18)),
-                        },
-                        stake: {
-                            amount: BigInt(Math.floor((1 + Math.random() * 9) * 1e18)),
-                            amountFormatted: (1 + Math.random() * 9).toFixed(2),
-                            lockedUntil: Date.now() + Math.random() * 86400000 * 7,
-                            isLocked: Math.random() > 0.3,
-                            slashed: i === 4, // One slashed worker for demo
-                        },
-                        region: mockData.location?.region,
-                    });
-                });
-            }
 
             // Finalize workers with health status and issues
             const finalWorkers: WorkerHealth[] = Array.from(workerMap.values()).map(w => {
@@ -605,55 +540,9 @@ export function useWorkerHealth(options: UseWorkerHealthOptions = {}): UseWorker
 
     useEffect(() => {
         if (!enablePolling) return;
-
-        pollingRef.current = setInterval(() => {
-            setWorkers(prev => prev.map(w => {
-                // Simulate metric fluctuations
-                const newMetrics: WorkerMetrics = {
-                    cpu: Math.max(5, Math.min(99, w.metrics.cpu + (Math.random() - 0.5) * 10)),
-                    memory: Math.max(10, Math.min(99, w.metrics.memory + (Math.random() - 0.5) * 5)),
-                    gpu: w.metrics.gpu
-                        ? Math.max(5, Math.min(99, w.metrics.gpu + (Math.random() - 0.5) * 15))
-                        : undefined,
-                    gpuMemory: w.metrics.gpuMemory
-                        ? Math.max(5, Math.min(99, w.metrics.gpuMemory + (Math.random() - 0.5) * 10))
-                        : undefined,
-                    networkIn: Math.max(0, w.metrics.networkIn + (Math.random() - 0.5) * 200),
-                    networkOut: Math.max(0, w.metrics.networkOut + (Math.random() - 0.5) * 100),
-                    diskUsage: Math.max(10, Math.min(95, w.metrics.diskUsage + (Math.random() - 0.5) * 2)),
-                    temperature: w.metrics.temperature
-                        ? Math.max(30, Math.min(90, w.metrics.temperature + (Math.random() - 0.5) * 3))
-                        : undefined,
-                    latency: Math.max(5, Math.min(500, w.metrics.latency + (Math.random() - 0.5) * 20)),
-                };
-
-                // Simulate activity changes
-                const activities: WorkerActivity[] = ['idle', 'training', 'proving', 'aggregating', 'syncing'];
-                const newActivity = Math.random() > 0.9
-                    ? activities[Math.floor(Math.random() * activities.length)]
-                    : w.activity;
-
-                const updated = {
-                    ...w,
-                    metrics: newMetrics,
-                    activity: newActivity,
-                    lastHeartbeat: w.status !== 'offline' ? Date.now() : w.lastHeartbeat,
-                    lastSeen: w.status !== 'offline' ? Date.now() : w.lastSeen,
-                };
-
-                const newStatus = calculateHealthStatus(updated);
-                const newIssues = detectWorkerIssues({ ...updated, status: newStatus, issues: [] });
-
-                return { ...updated, status: newStatus, issues: newIssues };
-            }));
-        }, pollingInterval);
-
-        return () => {
-            if (pollingRef.current) {
-                clearInterval(pollingRef.current);
-            }
-        };
-    }, [enablePolling, pollingInterval]);
+        // Real metrics come from WebSocket worker_metrics/worker_activity messages
+        return undefined;
+    }, [enablePolling]);
 
     // ========================================================================
     // Effects

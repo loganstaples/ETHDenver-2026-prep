@@ -125,165 +125,12 @@ export function useProofs(options: UseProofsOptions = {}): UseProofsReturn {
 
     // Refs
     const wsUnsubscribeRef = useRef<(() => void) | null>(null);
-    const refreshIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-    const proofIdCounterRef = useRef(0);
 
     // Contract data
     const { proofEvents } = useContractEvents(modelId ? BigInt(modelId) : undefined);
 
     // API client
     const apiClient = useMemo(() => getApiClient(), []);
-
-    // ========================================================================
-    // Data Generation
-    // ========================================================================
-
-    const generateDemoProofs = useCallback((): ProofData[] => {
-        const types: ProofData['type'][] = ['training', 'aggregation', 'gradient', 'computation', 'verification'];
-        const statuses: ProofData['status'][] = ['verified', 'verified', 'verified', 'pending', 'generating', 'failed'];
-        const circuitTypes = ['nova_folding', 'groth16', 'plonk', 'stark'];
-
-        return Array.from({ length: 20 }, (_, index) => {
-            const status = statuses[Math.floor(Math.random() * statuses.length)];
-            const createdAt = Date.now() - Math.random() * 3600000;
-            const generationTime = 100 + Math.random() * 400;
-
-            return {
-                id: `proof-${Date.now()}-${index}`,
-                hash: `0x${Array(64).fill(0).map(() => Math.floor(Math.random() * 16).toString(16)).join('')}`,
-                modelId: modelId ? BigInt(modelId) : BigInt(1),
-                roundId: roundId ? BigInt(roundId) : BigInt(Math.floor(Math.random() * 50) + 1),
-                prover: `0x${Array(40).fill(0).map(() => Math.floor(Math.random() * 16).toString(16)).join('')}`,
-                type: types[index % types.length],
-                status,
-                createdAt,
-                verifiedAt: status === 'verified' ? createdAt + generationTime + Math.random() * 100 : undefined,
-                size: 1024 + Math.floor(Math.random() * 4096),
-                generationTime,
-                verificationTime: status === 'verified' ? 20 + Math.random() * 80 : undefined,
-                errorBound: Math.random() * 0.001,
-                publicInputsHash: `0x${Array(64).fill(0).map(() => Math.floor(Math.random() * 16).toString(16)).join('')}`,
-                commitment: BigInt(Math.floor(Math.random() * 1e18)),
-                gasUsed: status === 'verified' ? BigInt(Math.floor(100000 + Math.random() * 400000)) : undefined,
-                transactionHash: status === 'verified' ? `0x${Array(64).fill(0).map(() => Math.floor(Math.random() * 16).toString(16)).join('')}` : undefined,
-                blockNumber: status === 'verified' ? Math.floor(18000000 + Math.random() * 1000000) : undefined,
-                circuitType: circuitTypes[Math.floor(Math.random() * circuitTypes.length)],
-                constraintCount: 10000 + Math.floor(Math.random() * 100000),
-            };
-        });
-    }, [modelId, roundId]);
-
-    const generateDemoTimeline = useCallback((proofList: ProofData[]): ProofTimelineEvent[] => {
-        const events: ProofTimelineEvent[] = [];
-
-        proofList.forEach((proof) => {
-            const baseTime = proof.createdAt;
-
-            events.push({
-                id: `event-${proof.id}-started`,
-                proofId: proof.id,
-                timestamp: baseTime,
-                type: 'started',
-                details: { circuitType: proof.circuitType, constraintCount: proof.constraintCount },
-            });
-
-            if (proof.status !== 'generating') {
-                events.push({
-                    id: `event-${proof.id}-witness`,
-                    proofId: proof.id,
-                    timestamp: baseTime + proof.generationTime * 0.2,
-                    type: 'witness_generated',
-                    details: { witnessSize: Math.floor(Math.random() * 1000000) },
-                    duration: proof.generationTime * 0.2,
-                });
-
-                events.push({
-                    id: `event-${proof.id}-proving`,
-                    proofId: proof.id,
-                    timestamp: baseTime + proof.generationTime * 0.3,
-                    type: 'proving',
-                    details: { progress: 100 },
-                    duration: proof.generationTime * 0.7,
-                });
-
-                events.push({
-                    id: `event-${proof.id}-generated`,
-                    proofId: proof.id,
-                    timestamp: baseTime + proof.generationTime,
-                    type: 'proof_generated',
-                    details: { size: proof.size, errorBound: proof.errorBound },
-                    duration: proof.generationTime,
-                });
-            }
-
-            if (proof.status === 'verified' && proof.verifiedAt) {
-                events.push({
-                    id: `event-${proof.id}-submitted`,
-                    proofId: proof.id,
-                    timestamp: baseTime + proof.generationTime + 10,
-                    type: 'submitted',
-                    details: { transactionHash: proof.transactionHash },
-                });
-
-                events.push({
-                    id: `event-${proof.id}-verified`,
-                    proofId: proof.id,
-                    timestamp: proof.verifiedAt,
-                    type: 'verified',
-                    details: { gasUsed: proof.gasUsed?.toString(), blockNumber: proof.blockNumber },
-                    duration: proof.verificationTime,
-                });
-            }
-
-            if (proof.status === 'failed') {
-                events.push({
-                    id: `event-${proof.id}-failed`,
-                    proofId: proof.id,
-                    timestamp: baseTime + proof.generationTime,
-                    type: 'failed',
-                    details: { reason: 'Constraint verification failed', errorCode: 'INVALID_WITNESS' },
-                });
-            }
-
-            if (proof.status === 'challenged') {
-                events.push({
-                    id: `event-${proof.id}-challenged`,
-                    proofId: proof.id,
-                    timestamp: baseTime + proof.generationTime + 500,
-                    type: 'challenged',
-                    details: { challenger: `0x${Array(40).fill(0).map(() => Math.floor(Math.random() * 16).toString(16)).join('')}` },
-                });
-            }
-        });
-
-        return events.sort((a, b) => b.timestamp - a.timestamp);
-    }, []);
-
-    const generateActiveGenerations = useCallback((): ProofGenerationProgress[] => {
-        return Array.from({ length: 3 }, (_, index) => {
-            const stages: ProofGenerationProgress['stage'][] = ['witness', 'setup', 'proving', 'verifying'];
-            const stage = stages[Math.floor(Math.random() * stages.length)];
-            const progress = Math.random() * 100;
-
-            return {
-                proofId: `proof-active-${index}`,
-                stage,
-                progress,
-                currentStep: {
-                    witness: 'Computing witness vectors',
-                    setup: 'Preparing circuit setup',
-                    proving: 'Generating ZK proof',
-                    verifying: 'Verifying constraints',
-                    complete: 'Complete',
-                    failed: 'Failed',
-                }[stage],
-                totalSteps: 4,
-                estimatedTimeRemaining: Math.floor((100 - progress) * 5),
-                memoryUsage: 2000 + Math.random() * 6000,
-                cpuUsage: 60 + Math.random() * 35,
-            };
-        });
-    }, []);
 
     // ========================================================================
     // Data Fetching
@@ -318,23 +165,15 @@ export function useProofs(options: UseProofsOptions = {}): UseProofsReturn {
                 constraintCount: 50000,
             }));
 
-            if (eventProofs.length > 0) {
-                setProofs(eventProofs.slice(0, maxProofs));
-                setTimeline(generateDemoTimeline(eventProofs));
-            } else {
-                // Use demo data
-                const demoProofs = generateDemoProofs();
-                setProofs(demoProofs);
-                setTimeline(generateDemoTimeline(demoProofs));
-            }
-
-            setActiveGenerations(generateActiveGenerations());
+            setProofs(eventProofs.slice(0, maxProofs));
+            setTimeline([]);
+            setActiveGenerations([]);
         } catch (err) {
             setError(err instanceof Error ? err.message : 'Failed to fetch proofs');
         } finally {
             setIsLoading(false);
         }
-    }, [proofEvents, maxProofs, generateDemoProofs, generateDemoTimeline, generateActiveGenerations]);
+    }, [proofEvents, maxProofs]);
 
     // ========================================================================
     // WebSocket Setup
@@ -402,98 +241,11 @@ export function useProofs(options: UseProofsOptions = {}): UseProofsReturn {
         };
     }, [fetchProofs, setupWebSocket]);
 
-    // Auto refresh with simulated progress updates
     useEffect(() => {
         if (!autoRefresh) return;
-
-        refreshIntervalRef.current = setInterval(() => {
-            // Update active generations progress
-            setActiveGenerations((prev) =>
-                prev.map((gen) => {
-                    const newProgress = Math.min(100, gen.progress + Math.random() * 10);
-                    const stages: ProofGenerationProgress['stage'][] = ['witness', 'setup', 'proving', 'verifying', 'complete'];
-                    let newStage = gen.stage;
-
-                    if (newProgress >= 100) {
-                        const currentIndex = stages.indexOf(gen.stage);
-                        if (currentIndex < stages.length - 1) {
-                            newStage = stages[currentIndex + 1];
-                            return {
-                                ...gen,
-                                stage: newStage,
-                                progress: newStage === 'complete' ? 100 : 0,
-                                currentStep: {
-                                    witness: 'Computing witness vectors',
-                                    setup: 'Preparing circuit setup',
-                                    proving: 'Generating ZK proof',
-                                    verifying: 'Verifying constraints',
-                                    complete: 'Complete',
-                                    failed: 'Failed',
-                                }[newStage],
-                                estimatedTimeRemaining: newStage === 'complete' ? 0 : Math.floor(Math.random() * 200),
-                            };
-                        }
-                    }
-
-                    return {
-                        ...gen,
-                        progress: newProgress,
-                        estimatedTimeRemaining: Math.max(0, Math.floor((100 - newProgress) * 5)),
-                        memoryUsage: gen.memoryUsage + (Math.random() - 0.5) * 500,
-                        cpuUsage: Math.min(99, Math.max(40, gen.cpuUsage + (Math.random() - 0.5) * 10)),
-                    };
-                }).filter((gen) => gen.stage !== 'complete' || Math.random() > 0.3)
-            );
-
-            // Occasionally add new generating proof
-            if (Math.random() > 0.8) {
-                proofIdCounterRef.current++;
-                setActiveGenerations((prev) => [
-                    ...prev,
-                    {
-                        proofId: `proof-new-${proofIdCounterRef.current}`,
-                        stage: 'witness' as const,
-                        progress: 0,
-                        currentStep: 'Computing witness vectors',
-                        totalSteps: 4,
-                        estimatedTimeRemaining: 500,
-                        memoryUsage: 2000 + Math.random() * 2000,
-                        cpuUsage: 60 + Math.random() * 20,
-                    },
-                ].slice(0, 5));
-            }
-
-            // Simulate pending proofs becoming verified
-            setProofs((prev) =>
-                prev.map((proof) => {
-                    if (proof.status === 'pending' && Math.random() > 0.9) {
-                        return {
-                            ...proof,
-                            status: 'verified' as const,
-                            verifiedAt: Date.now(),
-                            verificationTime: 20 + Math.random() * 80,
-                            gasUsed: BigInt(Math.floor(100000 + Math.random() * 400000)),
-                            transactionHash: `0x${Array(64).fill(0).map(() => Math.floor(Math.random() * 16).toString(16)).join('')}`,
-                            blockNumber: Math.floor(18000000 + Math.random() * 1000000),
-                        };
-                    }
-                    if (proof.status === 'generating' && Math.random() > 0.7) {
-                        return {
-                            ...proof,
-                            status: 'pending' as const,
-                        };
-                    }
-                    return proof;
-                })
-            );
-        }, refreshInterval);
-
-        return () => {
-            if (refreshIntervalRef.current) {
-                clearInterval(refreshIntervalRef.current);
-            }
-        };
-    }, [autoRefresh, refreshInterval]);
+        // Real updates come from WebSocket proof_update messages
+        return undefined;
+    }, [autoRefresh]);
 
     // Update when contract events change
     useEffect(() => {
@@ -658,54 +410,8 @@ export function useProofGeneration(proofId: string) {
     const [isComplete, setIsComplete] = useState(false);
     const [error, _setError] = useState<string | null>(null);
 
-    useEffect(() => {
-        const stages: ProofGenerationProgress['stage'][] = ['witness', 'setup', 'proving', 'verifying'];
-        let currentStageIndex = 0;
-        let currentProgress = 0;
-
-        const interval = setInterval(() => {
-            currentProgress += Math.random() * 15;
-
-            if (currentProgress >= 100) {
-                currentStageIndex++;
-                if (currentStageIndex >= stages.length) {
-                    setProgress({
-                        proofId,
-                        stage: 'complete',
-                        progress: 100,
-                        currentStep: 'Proof generation complete',
-                        totalSteps: 4,
-                        estimatedTimeRemaining: 0,
-                        memoryUsage: 0,
-                        cpuUsage: 0,
-                    });
-                    setIsComplete(true);
-                    clearInterval(interval);
-                    return;
-                }
-                currentProgress = 0;
-            }
-
-            const stepDescriptions: Record<string, string> = {
-                witness: 'Computing witness vectors',
-                setup: 'Preparing circuit setup',
-                proving: 'Generating ZK proof',
-                verifying: 'Verifying constraints',
-            };
-            setProgress({
-                proofId,
-                stage: stages[currentStageIndex],
-                progress: currentProgress,
-                currentStep: stepDescriptions[stages[currentStageIndex]] || 'Processing',
-                totalSteps: 4,
-                estimatedTimeRemaining: Math.floor((4 - currentStageIndex) * 100 + (100 - currentProgress) * 2),
-                memoryUsage: 4000 + Math.random() * 4000,
-                cpuUsage: 70 + Math.random() * 25,
-            });
-        }, 500);
-
-        return () => clearInterval(interval);
-    }, [proofId]);
+    // Real progress comes from WebSocket proof_progress messages
+    // This hook returns null until real data arrives
 
     return { progress, isComplete, error };
 }

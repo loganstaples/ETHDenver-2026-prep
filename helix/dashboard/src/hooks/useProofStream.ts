@@ -5,10 +5,9 @@
  * Real-time proof generation and verification streaming with WebSocket integration.
  */
 
-import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useWebSocket } from '@/lib/websocket';
 import { useContractEvents } from './useContract';
-import { generateMockProofInfo } from '@/lib/api';
 
 // ============================================================================
 // Types
@@ -80,8 +79,6 @@ export interface UseProofStreamOptions {
     modelId?: bigint | number;
     maxProofs?: number;
     enableWebSocket?: boolean;
-    enableSimulation?: boolean;
-    simulationInterval?: number;
     onProofGenerated?: (proof: ProofStreamItem) => void;
     onProofVerified?: (verification: OnChainVerification) => void;
     onProofFailed?: (proof: ProofStreamItem) => void;
@@ -124,8 +121,6 @@ export function useProofStream(options: UseProofStreamOptions = {}): UseProofStr
         modelId,
         maxProofs = 100,
         enableWebSocket = true,
-        enableSimulation = true,
-        simulationInterval = 1000,
         onProofGenerated,
         onProofVerified,
         onProofFailed,
@@ -141,10 +136,6 @@ export function useProofStream(options: UseProofStreamOptions = {}): UseProofStr
     const [confirmedVerifications, setConfirmedVerifications] = useState<OnChainVerification[]>([]);
     const [isLoading, setIsLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
-
-    // Refs
-    const simulationRef = useRef<ReturnType<typeof setInterval> | null>(null);
-    const proofIdCounter = useRef(0);
 
     // Contract Events
     const { proofEvents } = useContractEvents(modelIdBigInt);
@@ -195,48 +186,7 @@ export function useProofStream(options: UseProofStreamOptions = {}): UseProofStr
                 },
             }));
 
-            // If no event proofs, generate demo proofs
-            if (eventProofs.length === 0) {
-                const demoProofs: ProofStreamItem[] = [];
-                const stages: ProofStage[] = ['verified', 'verified', 'verified', 'verifying', 'proving', 'witness'];
-
-                for (let i = 0; i < 15; i++) {
-                    const mockInfo = generateMockProofInfo(BigInt(i + 1), i);
-                    const stage = stages[i % stages.length];
-                    const isComplete = stage === 'verified';
-
-                    demoProofs.push({
-                        id: mockInfo.id,
-                        hash: mockInfo.hash,
-                        modelId: modelIdBigInt || BigInt(1),
-                        roundId: mockInfo.roundId,
-                        prover: mockInfo.prover,
-                        type: mockInfo.type as ProofStreamItem['type'],
-                        stage,
-                        progress: isComplete ? 100 : stage === 'verifying' ? 90 : stage === 'proving' ? 60 : 30,
-                        startedAt: mockInfo.createdAt,
-                        completedAt: isComplete ? mockInfo.verifiedAt : undefined,
-                        errorBound: mockInfo.errorBound,
-                        constraintCount: mockInfo.constraintCount,
-                        circuitType: mockInfo.circuitType,
-                        gasUsed: mockInfo.gasUsed,
-                        transactionHash: mockInfo.transactionHash,
-                        blockNumber: mockInfo.blockNumber,
-                        metrics: {
-                            witnessTime: 50 + Math.random() * 50,
-                            setupTime: 20 + Math.random() * 30,
-                            provingTime: mockInfo.generationTime,
-                            verificationTime: mockInfo.verificationTime,
-                            totalTime: mockInfo.generationTime + (mockInfo.verificationTime || 0),
-                            memoryPeak: 4000 + Math.random() * 4000,
-                            cpuPeak: 70 + Math.random() * 25,
-                        },
-                    });
-                }
-                setProofs(demoProofs);
-            } else {
-                setProofs(eventProofs);
-            }
+            setProofs(eventProofs);
 
         } catch (err) {
             setError(err instanceof Error ? err.message : 'Failed to load proofs');
@@ -298,122 +248,7 @@ export function useProofStream(options: UseProofStreamOptions = {}): UseProofStr
         };
     }, [enableWebSocket, on, maxProofs, onProofVerified]);
 
-    // ========================================================================
-    // Simulation
-    // ========================================================================
-
-    useEffect(() => {
-        if (!enableSimulation) return;
-
-        simulationRef.current = setInterval(() => {
-            setProofs(prev => {
-                const updated = prev.map(proof => {
-                    // Progress active proofs
-                    if (proof.stage === 'queued') {
-                        if (Math.random() > 0.7) {
-                            return { ...proof, stage: 'witness' as ProofStage, progress: 0 };
-                        }
-                    } else if (proof.stage === 'witness') {
-                        const newProgress = Math.min(100, proof.progress + Math.random() * 20);
-                        if (newProgress >= 100) {
-                            return {
-                                ...proof,
-                                stage: 'setup' as ProofStage,
-                                progress: 0,
-                                metrics: { ...proof.metrics, witnessTime: Date.now() - proof.startedAt },
-                            };
-                        }
-                        return { ...proof, progress: newProgress };
-                    } else if (proof.stage === 'setup') {
-                        const newProgress = Math.min(100, proof.progress + Math.random() * 30);
-                        if (newProgress >= 100) {
-                            return {
-                                ...proof,
-                                stage: 'proving' as ProofStage,
-                                progress: 0,
-                                metrics: { ...proof.metrics, setupTime: 50 + Math.random() * 30 },
-                            };
-                        }
-                        return { ...proof, progress: newProgress };
-                    } else if (proof.stage === 'proving') {
-                        const newProgress = Math.min(100, proof.progress + Math.random() * 10);
-                        if (newProgress >= 100) {
-                            return {
-                                ...proof,
-                                stage: 'submitting' as ProofStage,
-                                progress: 0,
-                                metrics: { ...proof.metrics, provingTime: 150 + Math.random() * 150 },
-                            };
-                        }
-                        return { ...proof, progress: newProgress };
-                    } else if (proof.stage === 'submitting') {
-                        const newProgress = Math.min(100, proof.progress + Math.random() * 40);
-                        if (newProgress >= 100) {
-                            return { ...proof, stage: 'verifying' as ProofStage, progress: 0 };
-                        }
-                        return { ...proof, progress: newProgress };
-                    } else if (proof.stage === 'verifying') {
-                        const newProgress = Math.min(100, proof.progress + Math.random() * 25);
-                        if (newProgress >= 100) {
-                            const success = Math.random() > 0.05;
-                            const completedProof = {
-                                ...proof,
-                                stage: (success ? 'verified' : 'failed') as ProofStage,
-                                progress: 100,
-                                completedAt: Date.now(),
-                                transactionHash: `0x${Array(64).fill(0).map(() => Math.floor(Math.random() * 16).toString(16)).join('')}`,
-                                blockNumber: 18000000 + Math.floor(Math.random() * 100000),
-                                gasUsed: BigInt(150000 + Math.floor(Math.random() * 100000)),
-                                error: success ? undefined : 'Constraint verification failed',
-                                metrics: {
-                                    ...proof.metrics,
-                                    verificationTime: 30 + Math.random() * 40,
-                                    totalTime: Date.now() - proof.startedAt,
-                                },
-                            };
-                            if (success) {
-                                onProofGenerated?.(completedProof);
-                            } else {
-                                onProofFailed?.(completedProof);
-                            }
-                            return completedProof;
-                        }
-                        return { ...proof, progress: newProgress };
-                    }
-                    return proof;
-                });
-
-                // Occasionally add a new proof
-                if (Math.random() > 0.9) {
-                    proofIdCounter.current++;
-                    const newProof: ProofStreamItem = {
-                        id: `proof-sim-${proofIdCounter.current}-${Date.now()}`,
-                        hash: `0x${Array(64).fill(0).map(() => Math.floor(Math.random() * 16).toString(16)).join('')}`,
-                        modelId: modelIdBigInt || BigInt(1),
-                        roundId: BigInt(Math.floor(Math.random() * 50) + 1),
-                        prover: `0x${Array(40).fill(0).map(() => Math.floor(Math.random() * 16).toString(16)).join('')}`,
-                        type: ['training', 'aggregation', 'gradient'][Math.floor(Math.random() * 3)] as ProofStreamItem['type'],
-                        stage: 'queued',
-                        progress: 0,
-                        startedAt: Date.now(),
-                        errorBound: Math.random() * 0.001,
-                        constraintCount: 30000 + Math.floor(Math.random() * 70000),
-                        circuitType: ['nova_folding', 'groth16', 'plonk'][Math.floor(Math.random() * 3)],
-                        metrics: {},
-                    };
-                    return [newProof, ...updated].slice(0, maxProofs);
-                }
-
-                return updated;
-            });
-        }, simulationInterval);
-
-        return () => {
-            if (simulationRef.current) {
-                clearInterval(simulationRef.current);
-            }
-        };
-    }, [enableSimulation, simulationInterval, maxProofs, modelIdBigInt, onProofGenerated, onProofFailed]);
+    // No simulation — real proof updates come from WebSocket
 
     // ========================================================================
     // Effects

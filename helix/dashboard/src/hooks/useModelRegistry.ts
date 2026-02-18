@@ -9,7 +9,6 @@ import {
   useWaitForTransactionReceipt,
 } from 'wagmi';
 import { getContractAddress, HELIX_MODEL_STORE_ABI, type OnChainVersion } from '@/lib/contracts';
-import { USE_MOCK_DATA, MOCK_MODELS, MOCK_CURRENT_USER } from '@/lib/mock-models';
 
 const ZERO_ADDR = '0x0000000000000000000000000000000000000000';
 
@@ -56,7 +55,6 @@ export interface UseModelRegistryReturn {
 
 export function useModelRegistry(): UseModelRegistryReturn {
   const { address, isConnected, chainId } = useAccount();
-  const live = !USE_MOCK_DATA;
 
   const contractAddress = useMemo(() => {
     if (!chainId) return ZERO_ADDR;
@@ -76,21 +74,21 @@ export function useModelRegistry(): UseModelRegistryReturn {
     abi: HELIX_MODEL_STORE_ABI,
     functionName: 'balanceOf',
     args: address ? [address] : undefined,
-    query: { enabled: live && isConnected && isContractDeployed && !!address },
+    query: { enabled: isConnected && isContractDeployed && !!address },
   });
 
   const balance = rawBalance ? Number(rawBalance) : 0;
 
   // ── Phase 2: Get token IDs ────────────────────────────────────────
   const tokenIdCalls = useMemo(() => {
-    if (!live || !address || balance === 0) return [];
+    if (!address || balance === 0) return [];
     return Array.from({ length: balance }, (_, i) => ({
       address: addr,
       abi: HELIX_MODEL_STORE_ABI,
       functionName: 'tokenOfOwnerByIndex' as const,
       args: [address, BigInt(i)],
     }));
-  }, [live, address, balance, addr]);
+  }, [address, balance, addr]);
 
   const {
     data: tokenIdResults,
@@ -110,7 +108,7 @@ export function useModelRegistry(): UseModelRegistryReturn {
   // ── Phase 3: Get model data + versions + sale info ────────────────
   const CALLS_PER_TOKEN = 4;
   const modelDataCalls = useMemo(() => {
-    if (!live || tokenIds.length === 0) return [];
+    if (tokenIds.length === 0) return [];
     const calls: {
       address: `0x${string}`;
       abi: typeof HELIX_MODEL_STORE_ABI;
@@ -144,7 +142,7 @@ export function useModelRegistry(): UseModelRegistryReturn {
       });
     }
     return calls;
-  }, [live, tokenIds, addr]);
+  }, [tokenIds, addr]);
 
   const {
     data: modelDataResults,
@@ -157,7 +155,7 @@ export function useModelRegistry(): UseModelRegistryReturn {
 
   // ── Parse on-chain results ─────────────────────────────────────────
   const chainModels: ModelWithVersions[] = useMemo(() => {
-    if (USE_MOCK_DATA || !modelDataResults || tokenIds.length === 0) return [];
+    if (!modelDataResults || tokenIds.length === 0) return [];
     const result: ModelWithVersions[] = [];
 
     for (let i = 0; i < tokenIds.length; i++) {
@@ -214,28 +212,8 @@ export function useModelRegistry(): UseModelRegistryReturn {
     return result;
   }, [modelDataResults, tokenIds]);
 
-  // ── Mock path ──────────────────────────────────────────────────────
-  const mockModels: ModelWithVersions[] = useMemo(() => {
-    if (!USE_MOCK_DATA) return [];
-    return MOCK_MODELS
-      .filter((m) => m.owner === MOCK_CURRENT_USER)
-      .map((m) => ({
-        tokenId: m.tokenId,
-        slug: m.slug,
-        name: m.name,
-        description: m.description,
-        creator: m.creator,
-        createdAt: m.createdAt,
-        isPublic: m.isPublic,
-        inferenceFee: m.inferenceFee,
-        forSale: m.forSale ?? false,
-        salePrice: m.salePrice ?? 0,
-        versions: m.versions,
-      }));
-  }, []);
-
-  const models = USE_MOCK_DATA ? mockModels : chainModels;
-  const isLoading = USE_MOCK_DATA ? false : (isLoadingBalance || isLoadingTokenIds || isLoadingModelData);
+  const models = chainModels;
+  const isLoading = isLoadingBalance || isLoadingTokenIds || isLoadingModelData;
 
   // ── Writes ────────────────────────────────────────────────────────
   const {
@@ -251,7 +229,7 @@ export function useModelRegistry(): UseModelRegistryReturn {
 
   const createModel = useCallback(
     (params: { slug: string; name: string; description: string }) => {
-      if (USE_MOCK_DATA || !isConnected || !isContractDeployed) return;
+      if (!isConnected || !isContractDeployed) return;
       writeContract({
         address: addr,
         abi: HELIX_MODEL_STORE_ABI,
@@ -271,7 +249,7 @@ export function useModelRegistry(): UseModelRegistryReturn {
       sessionId: string;
       weightsStored: boolean;
     }) => {
-      if (USE_MOCK_DATA || !isConnected || !isContractDeployed) return;
+      if (!isConnected || !isContractDeployed) return;
       const scaledAccuracy = BigInt(Math.round(params.accuracy * 100));
       writeContract({
         address: addr,
@@ -292,7 +270,7 @@ export function useModelRegistry(): UseModelRegistryReturn {
 
   const setPublic = useCallback(
     (params: { tokenId: number; isPublic: boolean }) => {
-      if (USE_MOCK_DATA || !isConnected || !isContractDeployed) return;
+      if (!isConnected || !isContractDeployed) return;
       writeContract({
         address: addr,
         abi: HELIX_MODEL_STORE_ABI,
@@ -305,7 +283,7 @@ export function useModelRegistry(): UseModelRegistryReturn {
 
   const setInferenceFee = useCallback(
     (params: { tokenId: number; feeBps: number }) => {
-      if (USE_MOCK_DATA || !isConnected || !isContractDeployed) return;
+      if (!isConnected || !isContractDeployed) return;
       writeContract({
         address: addr,
         abi: HELIX_MODEL_STORE_ABI,
@@ -318,7 +296,7 @@ export function useModelRegistry(): UseModelRegistryReturn {
 
   const setForSale = useCallback(
     (params: { tokenId: number; forSale: boolean }) => {
-      if (USE_MOCK_DATA || !isConnected || !isContractDeployed) return;
+      if (!isConnected || !isContractDeployed) return;
       writeContract({
         address: addr,
         abi: HELIX_MODEL_STORE_ABI,
@@ -331,7 +309,7 @@ export function useModelRegistry(): UseModelRegistryReturn {
 
   const setSalePrice = useCallback(
     (params: { tokenId: number; priceEth: number }) => {
-      if (USE_MOCK_DATA || !isConnected || !isContractDeployed) return;
+      if (!isConnected || !isContractDeployed) return;
       // Convert ADI to wei (BigInt)
       const priceWei = BigInt(Math.round(params.priceEth * 1e18));
       writeContract({
@@ -346,7 +324,7 @@ export function useModelRegistry(): UseModelRegistryReturn {
 
   const buyModel = useCallback(
     (params: { tokenId: number; priceEth: number }) => {
-      if (USE_MOCK_DATA || !isConnected || !isContractDeployed) return;
+      if (!isConnected || !isContractDeployed) return;
       const priceWei = BigInt(Math.round(params.priceEth * 1e18));
       writeContract({
         address: addr,
@@ -360,16 +338,14 @@ export function useModelRegistry(): UseModelRegistryReturn {
   );
 
   const refetch = useCallback(() => {
-    if (!USE_MOCK_DATA) {
-      refetchBalance();
-      refetchModelData();
-    }
+    refetchBalance();
+    refetchModelData();
   }, [refetchBalance, refetchModelData]);
 
   return {
-    address: USE_MOCK_DATA ? (address || MOCK_CURRENT_USER) : address,
-    isConnected: USE_MOCK_DATA ? true : isConnected,
-    isContractDeployed: USE_MOCK_DATA ? true : isContractDeployed,
+    address,
+    isConnected,
+    isContractDeployed,
     models,
     isLoading,
     createModel,

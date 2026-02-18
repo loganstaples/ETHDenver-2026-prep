@@ -6,7 +6,6 @@ import {
     type NodeInfo,
     type NodeMetrics,
     getApiClient,
-    generateMockNodeInfo,
 } from '@/lib/api';
 
 // ============================================================================
@@ -158,11 +157,11 @@ export function useNodes(options: UseNodesOptions = {}): UseNodesReturn {
         stakedEvents.forEach((event) => {
             const addr = event.prover;
             if (!nodeMap.has(addr)) {
-                const mockData = generateMockNodeInfo(addr, nodeMap.size);
+                const types: WorkerNode['type'][] = ['compute', 'aggregator', 'verifier'];
                 nodeMap.set(addr, {
                     id: `node-${addr.slice(2, 10)}`,
                     address: addr,
-                    type: mockData.type,
+                    type: types[nodeMap.size % 3],
                     status: 'active',
                     lastSeen: event.timestamp,
                     lastHeartbeat: event.timestamp,
@@ -174,23 +173,23 @@ export function useNodes(options: UseNodesOptions = {}): UseNodesReturn {
                     roundsCompleted: 0,
                     reputation: 100,
                     metrics: {
-                        cpu: mockData.metrics.cpu,
-                        memory: mockData.metrics.memory,
-                        gpu: mockData.metrics.gpu,
-                        gpuMemory: mockData.metrics.gpuMemory,
-                        networkIn: mockData.metrics.networkIn,
-                        networkOut: mockData.metrics.networkOut,
-                        temperature: mockData.metrics.temperature,
+                        cpu: 0,
+                        memory: 0,
+                        gpu: undefined,
+                        gpuMemory: undefined,
+                        networkIn: 0,
+                        networkOut: 0,
+                        temperature: undefined,
                     },
                     capabilities: {
-                        canTrain: mockData.capabilities.canTrain,
-                        canAggregate: mockData.capabilities.canAggregate,
-                        canProve: mockData.capabilities.canProve,
-                        gpuModel: mockData.capabilities.gpuModel,
-                        gpuMemoryMb: mockData.capabilities.gpuMemoryMb,
-                        maxBatchSize: mockData.capabilities.maxBatchSize,
+                        canTrain: true,
+                        canAggregate: nodeMap.size % 3 === 1,
+                        canProve: nodeMap.size % 3 === 2,
+                        gpuModel: undefined,
+                        gpuMemoryMb: 0,
+                        maxBatchSize: 64,
                     },
-                    location: mockData.location,
+                    location: undefined,
                     earningsTotal: BigInt(0),
                     slashed: false,
                 });
@@ -243,60 +242,6 @@ export function useNodes(options: UseNodesOptions = {}): UseNodesReturn {
         return nodeMap;
     }, [stakedEvents, proofEvents, slashedEvents]);
 
-    const generateDemoNodes = useCallback((): WorkerNode[] => {
-        const demoAddresses = [
-            '0x742d35Cc6634C0532925a3b844Bc9e7595f01231',
-            '0x8626f6940E2eb28930eFb4CeF49B2d1F2C9C1199',
-            '0xdD2FD4581271e230360230F9337D5c0430Bf44C0',
-            '0xbDA5747bFD65F08deb54cb465eB87D40e51B197E',
-            '0x2546BcD3c84621e976D8185a91A922aE77ECEc30',
-            '0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266',
-            '0x70997970C51812dc3A010C7d01b50e0d17dc79C8',
-            '0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC',
-        ];
-
-        return demoAddresses.map((addr, index) => {
-            const mockData = generateMockNodeInfo(addr, index);
-            const statuses: WorkerNode['status'][] = ['active', 'active', 'active', 'proving', 'training', 'idle', 'syncing', 'active'];
-
-            return {
-                id: `node-${addr.slice(2, 10)}`,
-                address: addr,
-                type: mockData.type,
-                status: statuses[index % statuses.length],
-                lastSeen: Date.now() - Math.random() * 60000,
-                lastHeartbeat: Date.now() - Math.random() * 30000,
-                stakedAmount: BigInt(Math.floor((1 + Math.random() * 9) * 1e18)),
-                proofsSubmitted: Math.floor(Math.random() * 150),
-                proofsVerified: Math.floor(Math.random() * 140),
-                proofsFailed: Math.floor(Math.random() * 5),
-                roundsParticipated: Math.floor(Math.random() * 80),
-                roundsCompleted: Math.floor(Math.random() * 75),
-                reputation: 75 + Math.random() * 25,
-                metrics: {
-                    cpu: mockData.metrics.cpu,
-                    memory: mockData.metrics.memory,
-                    gpu: mockData.metrics.gpu,
-                    gpuMemory: mockData.metrics.gpuMemory,
-                    networkIn: mockData.metrics.networkIn,
-                    networkOut: mockData.metrics.networkOut,
-                    temperature: mockData.metrics.temperature,
-                },
-                capabilities: {
-                    canTrain: mockData.capabilities.canTrain,
-                    canAggregate: mockData.capabilities.canAggregate,
-                    canProve: mockData.capabilities.canProve,
-                    gpuModel: mockData.capabilities.gpuModel,
-                    gpuMemoryMb: mockData.capabilities.gpuMemoryMb,
-                    maxBatchSize: mockData.capabilities.maxBatchSize,
-                },
-                location: mockData.location,
-                earningsTotal: BigInt(Math.floor(Math.random() * 5 * 1e18)),
-                slashed: index === 5, // One slashed node for demo
-            };
-        });
-    }, []);
-
     const fetchNodes = useCallback(async () => {
         try {
             setIsLoading(true);
@@ -305,28 +250,9 @@ export function useNodes(options: UseNodesOptions = {}): UseNodesReturn {
             // Build nodes from contract events
             const eventNodes = buildNodesFromEvents();
 
-            // If we have no event data, use demo data
             if (eventNodes.size === 0) {
-                const demoNodes = generateDemoNodes();
-                setNodes(demoNodes);
-
-                // Generate demo connections
-                const demoConnections: NetworkConnection[] = [];
-                const aggregatorNodes = demoNodes.filter(n => n.type === 'aggregator');
-                demoNodes.forEach((node, idx) => {
-                    if (node.type !== 'aggregator' && aggregatorNodes.length > 0) {
-                        const aggregator = aggregatorNodes[idx % aggregatorNodes.length];
-                        demoConnections.push({
-                            from: node.id,
-                            to: aggregator.id,
-                            latency: 10 + Math.random() * 50,
-                            bandwidth: 100 + Math.random() * 400,
-                            status: node.status === 'offline' ? 'offline' : 'active',
-                            lastUpdated: Date.now(),
-                        });
-                    }
-                });
-                setConnections(demoConnections);
+                setNodes([]);
+                setConnections([]);
             } else {
                 setNodes(Array.from(eventNodes.values()));
             }
@@ -337,7 +263,7 @@ export function useNodes(options: UseNodesOptions = {}): UseNodesReturn {
         } finally {
             setIsLoading(false);
         }
-    }, [buildNodesFromEvents, generateDemoNodes]);
+    }, [buildNodesFromEvents]);
 
     // ========================================================================
     // WebSocket Setup
@@ -433,33 +359,9 @@ export function useNodes(options: UseNodesOptions = {}): UseNodesReturn {
     // Auto refresh
     useEffect(() => {
         if (!autoRefresh) return;
-
-        refreshIntervalRef.current = setInterval(() => {
-            // Simulate real-time metric updates
-            setNodes((prevNodes) =>
-                prevNodes.map((node) => ({
-                    ...node,
-                    metrics: {
-                        ...node.metrics,
-                        cpu: Math.max(5, Math.min(95, node.metrics.cpu + (Math.random() - 0.5) * 10)),
-                        memory: Math.max(10, Math.min(95, node.metrics.memory + (Math.random() - 0.5) * 5)),
-                        gpu: node.metrics.gpu
-                            ? Math.max(10, Math.min(100, node.metrics.gpu + (Math.random() - 0.5) * 15))
-                            : undefined,
-                        networkIn: Math.max(0, node.metrics.networkIn + (Math.random() - 0.5) * 200),
-                        networkOut: Math.max(0, node.metrics.networkOut + (Math.random() - 0.5) * 100),
-                    },
-                    lastHeartbeat: node.status !== 'offline' ? Date.now() : node.lastHeartbeat,
-                }))
-            );
-        }, refreshInterval);
-
-        return () => {
-            if (refreshIntervalRef.current) {
-                clearInterval(refreshIntervalRef.current);
-            }
-        };
-    }, [autoRefresh, refreshInterval]);
+        // No simulation — real metrics come from WebSocket
+        return undefined;
+    }, [autoRefresh]);
 
     // Update nodes when contract events change
     useEffect(() => {
@@ -612,29 +514,9 @@ export function useNodeMetrics(nodeId: string, pollingInterval = 2000) {
     const [isLoading, setIsLoading] = useState(true);
 
     useEffect(() => {
-        // Simulate real-time metrics polling
-        const interval = setInterval(() => {
-            const newMetrics: NodeMetrics = {
-                cpu: 20 + Math.random() * 60,
-                memory: 30 + Math.random() * 50,
-                gpu: Math.random() > 0.3 ? 40 + Math.random() * 50 : undefined,
-                gpuMemory: Math.random() > 0.3 ? 30 + Math.random() * 60 : undefined,
-                networkIn: Math.random() * 1000,
-                networkOut: Math.random() * 500,
-                diskUsage: 20 + Math.random() * 40,
-                temperature: 40 + Math.random() * 30,
-            };
-
-            setMetrics(newMetrics);
-            setHistory((prev) => [
-                ...prev.slice(-59), // Keep last 60 data points
-                { timestamp: Date.now(), metrics: newMetrics },
-            ]);
-            setIsLoading(false);
-        }, pollingInterval);
-
-        return () => clearInterval(interval);
-    }, [nodeId, pollingInterval]);
+        setIsLoading(false);
+        // Real metrics come from WebSocket node_update messages
+    }, [nodeId]);
 
     return { metrics, history, isLoading };
 }

@@ -301,7 +301,7 @@ function NetworkGraph({
 }
 
 // ============================================================================
-// Mock inference request data
+// Request type (for when real data arrives)
 // ============================================================================
 
 interface InferenceRequest {
@@ -317,50 +317,6 @@ interface InferenceRequest {
   latency: number;
   workers: number;
   status: 'completed' | 'pending' | 'failed';
-}
-
-function generateMockRequests(modelNames: Map<number, string>): InferenceRequest[] {
-  const requesters = [
-    '0x742d35Cc6634C0532925a3b844Bc9e7595f01231',
-    '0x8626f6940E2eb28930eFb4CeF49B2d1F2C9C1199',
-    '0xdD2FD4581271e230360230F9337D5c0430Bf44C0',
-    '0xbDA5747bFD65F08deb54cb465eB87D40e51B197E',
-    '0x2546BcD3c84621e976D8185a91A922aE77ECEc30',
-  ];
-
-  const tokenIds = Array.from(modelNames.keys());
-  if (tokenIds.length === 0) tokenIds.push(1, 2, 3);
-
-  return Array.from({ length: 40 }, (_, i) => {
-    const tokenId = tokenIds[Math.floor(Math.random() * tokenIds.length)];
-    const fee = 0.001;
-    const ownerRevenue = fee * (0.01 + Math.random() * 0.04);
-
-    return {
-      id: `inf-${Date.now()}-${i}`,
-      timestamp: Date.now() - i * (30000 + Math.random() * 60000),
-      requester: requesters[Math.floor(Math.random() * requesters.length)],
-      modelTokenId: tokenId,
-      modelName: modelNames.get(tokenId) ?? `Model #${tokenId}`,
-      prediction: Math.floor(Math.random() * 10),
-      confidence: 0.75 + Math.random() * 0.24,
-      fee,
-      ownerRevenue,
-      latency: 80 + Math.random() * 200,
-      workers: 3,
-      status: Math.random() > 0.05 ? 'completed' : Math.random() > 0.5 ? 'pending' : 'failed',
-    };
-  });
-}
-
-function generateTimelineData(): Array<{ time: string; requests: number }> {
-  return Array.from({ length: 24 }, (_, i) => {
-    const h = (new Date().getHours() - (23 - i) + 24) % 24;
-    return {
-      time: `${h.toString().padStart(2, '0')}:00`,
-      requests: Math.floor(5 + Math.random() * 20),
-    };
-  });
 }
 
 // ============================================================================
@@ -386,11 +342,12 @@ export default function ActivityPage() {
     [allModels, address],
   );
 
-  const requests = useMemo(() => generateMockRequests(modelNames), [modelNames]);
-  const timelineData = useMemo(() => generateTimelineData(), []);
+  // TODO: Populate from real API (GET /api/events or inference endpoint)
+  const [requests] = useState<InferenceRequest[]>([]);
+  const [timelineData] = useState<{ time: string; requests: number }[]>([]);
 
   const filtered = useMemo(() => {
-    let result = requests;
+    let result = [...requests];
     if (search.trim()) {
       const q = search.toLowerCase();
       result = result.filter(

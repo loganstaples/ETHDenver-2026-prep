@@ -6,8 +6,6 @@ import {
     type TrainingMetrics,
     type AdversarialEvent,
     getApiClient,
-    generateMockTrainingMetrics,
-    generateMockAdversarialEvent,
 } from '@/lib/api';
 
 // ============================================================================
@@ -154,10 +152,10 @@ export function useTraining(options: UseTrainingOptions = {}): UseTrainingReturn
     const {
         modelId = BigInt(1),
         sessionId: _sessionId,
-        autoRefresh = true,
-        refreshInterval = 2000,
+        autoRefresh: _autoRefresh = true,
+        refreshInterval: _refreshInterval = 2000,
         enableWebSocket = true,
-        enableAnimations = true,
+        enableAnimations: _enableAnimations = true,
     } = options;
 
     // State
@@ -206,9 +204,6 @@ export function useTraining(options: UseTrainingOptions = {}): UseTrainingReturn
     // Refs
     const wsUnsubscribeRef = useRef<(() => void) | null>(null);
     const refreshIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-    const epochRef = useRef(0);
-    const batchRef = useRef(0);
-    const roundRef = useRef(BigInt(0));
 
     // Contract data
     const { proofEvents, roundStartedEvents, roundCompletedEvents, slashedEvents } = useContractEvents(BigInt(modelId));
@@ -235,59 +230,6 @@ export function useTraining(options: UseTrainingOptions = {}): UseTrainingReturn
         ];
     }, []);
 
-    const generateDemoRounds = useCallback((currentRound: bigint): TrainingRoundData[] => {
-        const roundCount = Number(currentRound) + 1;
-        return Array.from({ length: Math.min(roundCount, 20) }, (_, index) => {
-            const roundId = BigInt(roundCount - index);
-            const isCurrentRound = roundId === currentRound;
-            const status: TrainingRoundData['status'] = isCurrentRound
-                ? 'in_progress'
-                : index === 0 && Math.random() > 0.8
-                    ? 'proving'
-                    : 'completed';
-
-            const startedAt = Date.now() - (roundCount - Number(roundId)) * 60000;
-
-            return {
-                id: roundId,
-                status,
-                startedAt,
-                completedAt: status === 'completed' ? startedAt + 30000 + Math.random() * 30000 : undefined,
-                deadline: startedAt + 120000,
-                participants: Array.from({ length: 3 + Math.floor(Math.random() * 5) }, () =>
-                    `0x${Array(40).fill(0).map(() => Math.floor(Math.random() * 16).toString(16)).join('')}`
-                ),
-                prover: status === 'completed' || status === 'proving'
-                    ? `0x${Array(40).fill(0).map(() => Math.floor(Math.random() * 16).toString(16)).join('')}`
-                    : undefined,
-                proofId: status === 'completed' ? `proof-round-${roundId}` : undefined,
-                errorBound: 0.0001 + Math.random() * 0.0005,
-                gasUsed: status === 'completed' ? BigInt(Math.floor(150000 + Math.random() * 100000)) : undefined,
-                transactionHash: status === 'completed'
-                    ? `0x${Array(64).fill(0).map(() => Math.floor(Math.random() * 16).toString(16)).join('')}`
-                    : undefined,
-            };
-        });
-    }, []);
-
-    const generateDemoAdversarialEvents = useCallback((): AdversarialEventData[] => {
-        return Array.from({ length: 5 }, (_, index) => {
-            const event = generateMockAdversarialEvent(index);
-            return {
-                id: event.id,
-                type: event.type,
-                severity: event.severity,
-                timestamp: event.timestamp,
-                modelId: BigInt(modelId),
-                roundId: event.roundId,
-                prover: event.prover,
-                description: event.description,
-                slashAmount: event.slashAmount,
-                resolved: event.resolved,
-            };
-        });
-    }, [modelId]);
-
     // ========================================================================
     // Data Fetching
     // ========================================================================
@@ -306,43 +248,26 @@ export function useTraining(options: UseTrainingOptions = {}): UseTrainingReturn
                 updatedAt: Date.now(),
             });
 
-            // Initialize metrics from mock data
-            const mockMetrics = generateMockTrainingMetrics(epochRef.current);
+            // Initialize metrics with defaults — wait for real data from WebSocket or API
             setMetrics({
-                loss: mockMetrics.loss,
-                accuracy: mockMetrics.accuracy,
-                gradientNorm: mockMetrics.gradientNorm,
-                learningRate: mockMetrics.learningRate,
-                throughput: mockMetrics.throughput,
-                accumulatedErrorBound: mockMetrics.accumulatedErrorBound,
+                loss: 0,
+                accuracy: 0,
+                gradientNorm: 0,
+                learningRate: config.learningRate,
+                throughput: 0,
+                accumulatedErrorBound: 0,
             });
 
-            // Initialize history
-            setLossHistory(mockMetrics.lossHistory.map((h, i) => ({
-                epoch: h.epoch,
-                loss: h.loss,
-                timestamp: h.timestamp,
-                smoothedLoss: i > 0
-                    ? mockMetrics.lossHistory.slice(Math.max(0, i - 3), i + 1).reduce((s, p) => s + p.loss, 0) / Math.min(i + 1, 4)
-                    : h.loss,
-            })));
+            // Initialize history as empty
+            setLossHistory([]);
+            setAccuracyHistory([]);
 
-            setAccuracyHistory(mockMetrics.accuracyHistory);
-
-            // Initialize error bounds
+            // Initialize layer error bounds (static layer info, not mock data)
             setLayerErrorBounds(generateLayerErrorBounds());
-            setErrorBoundHistory(mockMetrics.errorBoundHistory.map((h) => ({
-                epoch: h.epoch,
-                round: BigInt(h.epoch * 10),
-                bound: h.bound,
-                amplification: 1 + Math.random() * 0.5,
-                timestamp: h.timestamp,
-                riskLevel: h.bound < 0.0002 ? 'low' : h.bound < 0.0005 ? 'medium' : h.bound < 0.001 ? 'high' : 'critical',
-            })));
+            setErrorBoundHistory([]);
 
             // Initialize rounds from contract events
-            const currentRound = model?.currentRound || BigInt(roundStartedEvents.length || 5);
-            roundRef.current = currentRound;
+            const currentRound = model?.currentRound || BigInt(roundStartedEvents.length || 0);
 
             const contractRounds: TrainingRoundData[] = roundStartedEvents.map((event, _index) => {
                 const completedEvent = roundCompletedEvents.find(
@@ -365,7 +290,7 @@ export function useTraining(options: UseTrainingOptions = {}): UseTrainingReturn
             if (contractRounds.length > 0) {
                 setRounds(contractRounds);
             } else {
-                setRounds(generateDemoRounds(currentRound));
+                setRounds([]);
             }
 
             // Initialize adversarial events from slashed events
@@ -385,7 +310,7 @@ export function useTraining(options: UseTrainingOptions = {}): UseTrainingReturn
             if (slashEvents.length > 0) {
                 setAdversarialEvents(slashEvents);
             } else {
-                setAdversarialEvents(generateDemoAdversarialEvents());
+                setAdversarialEvents([]);
             }
         } catch (err) {
             setError(err instanceof Error ? err.message : 'Failed to fetch training data');
@@ -395,13 +320,12 @@ export function useTraining(options: UseTrainingOptions = {}): UseTrainingReturn
     }, [
         modelId,
         model,
+        config.learningRate,
         roundStartedEvents,
         roundCompletedEvents,
         proofEvents,
         slashedEvents,
         generateLayerErrorBounds,
-        generateDemoRounds,
-        generateDemoAdversarialEvents,
     ]);
 
     // ========================================================================
@@ -468,144 +392,6 @@ export function useTraining(options: UseTrainingOptions = {}): UseTrainingReturn
             wsUnsubscribeRef.current?.();
         };
     }, [fetchTrainingData, setupWebSocket]);
-
-    // Auto refresh with animated training progress
-    useEffect(() => {
-        if (!autoRefresh || !enableAnimations) return;
-
-        refreshIntervalRef.current = setInterval(() => {
-            // Advance batch
-            batchRef.current += 1;
-            if (batchRef.current >= config.totalBatches) {
-                batchRef.current = 0;
-                epochRef.current = Math.min(epochRef.current + 1, config.totalEpochs);
-
-                // Add new loss/accuracy points at epoch boundaries
-                const newLoss = 2.5 * Math.exp(-0.3 * epochRef.current) + 0.1 + (Math.random() - 0.5) * 0.1;
-                const newAccuracy = Math.min(0.99, 1 - Math.exp(-0.2 * epochRef.current) * 0.8 + (Math.random() - 0.5) * 0.05);
-
-                setLossHistory((prev) => {
-                    const newPoint: LossPoint = {
-                        epoch: epochRef.current,
-                        loss: newLoss,
-                        timestamp: Date.now(),
-                        smoothedLoss: prev.length > 0
-                            ? (prev.slice(-3).reduce((s, p) => s + p.loss, 0) + newLoss) / Math.min(prev.length + 1, 4)
-                            : newLoss,
-                    };
-                    return [...prev, newPoint].slice(-50);
-                });
-
-                setAccuracyHistory((prev) => [
-                    ...prev,
-                    { epoch: epochRef.current, accuracy: newAccuracy, timestamp: Date.now() },
-                ].slice(-50));
-
-                // Add error bound point
-                const newErrorBound = 0.0001 * epochRef.current + Math.random() * 0.00005;
-                const riskLevel: ErrorBoundPoint['riskLevel'] = newErrorBound < 0.0002 ? 'low' : newErrorBound < 0.0005 ? 'medium' : newErrorBound < 0.001 ? 'high' : 'critical';
-                setErrorBoundHistory((prev) => [
-                    ...prev,
-                    {
-                        epoch: epochRef.current,
-                        round: roundRef.current,
-                        bound: newErrorBound,
-                        amplification: 1 + Math.random() * 0.5,
-                        timestamp: Date.now(),
-                        riskLevel,
-                    },
-                ].slice(-50));
-
-                // Advance round every few epochs
-                if (epochRef.current % 2 === 0) {
-                    roundRef.current = roundRef.current + BigInt(1);
-                    setRounds((prev) => {
-                        const newRound: TrainingRoundData = {
-                            id: roundRef.current,
-                            status: 'in_progress',
-                            startedAt: Date.now(),
-                            deadline: Date.now() + 120000,
-                            participants: Array.from({ length: 3 + Math.floor(Math.random() * 5) }, () =>
-                                `0x${Array(40).fill(0).map(() => Math.floor(Math.random() * 16).toString(16)).join('')}`
-                            ),
-                            errorBound: 0.0001 + Math.random() * 0.0005,
-                        };
-                        // Mark previous round as completed
-                        const updated = prev.map((r) =>
-                            r.status === 'in_progress' ? { ...r, status: 'completed' as const, completedAt: Date.now() } : r
-                        );
-                        return [newRound, ...updated].slice(0, 20);
-                    });
-                }
-            }
-
-            // Update progress
-            setProgress({
-                currentEpoch: epochRef.current,
-                totalEpochs: config.totalEpochs,
-                currentBatch: batchRef.current,
-                totalBatches: config.totalBatches,
-                currentRound: roundRef.current,
-                epochProgress: (epochRef.current / config.totalEpochs) * 100,
-                batchProgress: (batchRef.current / config.totalBatches) * 100,
-                overallProgress: ((epochRef.current * config.totalBatches + batchRef.current) / (config.totalEpochs * config.totalBatches)) * 100,
-                estimatedTimeRemaining: Math.floor((config.totalEpochs - epochRef.current) * 60 + (config.totalBatches - batchRef.current) * 0.6),
-            });
-
-            // Update metrics with small variations
-            setMetrics((prev) => {
-                const baseLoss = 2.5 * Math.exp(-0.3 * epochRef.current) + 0.1;
-                const baseAccuracy = Math.min(0.99, 1 - Math.exp(-0.2 * epochRef.current) * 0.8);
-
-                return {
-                    loss: baseLoss + (Math.random() - 0.5) * 0.05,
-                    accuracy: baseAccuracy + (Math.random() - 0.5) * 0.02,
-                    gradientNorm: Math.max(0.01, prev.gradientNorm + (Math.random() - 0.5) * 0.1),
-                    learningRate: config.learningRate * Math.pow(0.95, epochRef.current),
-                    throughput: prev.throughput + (Math.random() - 0.5) * 10,
-                    accumulatedErrorBound: 0.0001 * epochRef.current + Math.random() * 0.00005,
-                };
-            });
-
-            // Update layer error bounds occasionally
-            if (Math.random() > 0.95) {
-                setLayerErrorBounds((prev) =>
-                    prev.map((layer) => ({
-                        ...layer,
-                        outputBound: layer.outputBound * (1 + (Math.random() - 0.5) * 0.1),
-                        amplification: layer.amplification * (1 + (Math.random() - 0.5) * 0.05),
-                    }))
-                );
-            }
-
-            // Occasionally add adversarial event
-            if (Math.random() > 0.995) {
-                const types: AdversarialEventData['type'][] = ['timeout', 'invalid_proof', 'malicious_gradient'];
-                const severities: AdversarialEventData['severity'][] = ['warning', 'critical'];
-
-                setAdversarialEvents((prev) => [{
-                    id: `event-${Date.now()}`,
-                    type: types[Math.floor(Math.random() * types.length)],
-                    severity: severities[Math.floor(Math.random() * severities.length)],
-                    timestamp: Date.now(),
-                    modelId: BigInt(modelId),
-                    roundId: roundRef.current,
-                    prover: `0x${Array(40).fill(0).map(() => Math.floor(Math.random() * 16).toString(16)).join('')}`,
-                    description: 'Suspicious activity detected',
-                    resolved: false,
-                }, ...prev].slice(0, 50));
-            }
-
-            // Update state timestamp
-            setState((prev) => prev ? { ...prev, updatedAt: Date.now() } : prev);
-        }, refreshInterval);
-
-        return () => {
-            if (refreshIntervalRef.current) {
-                clearInterval(refreshIntervalRef.current);
-            }
-        };
-    }, [autoRefresh, enableAnimations, refreshInterval, config, modelId]);
 
     // Update contract error bound
     useEffect(() => {

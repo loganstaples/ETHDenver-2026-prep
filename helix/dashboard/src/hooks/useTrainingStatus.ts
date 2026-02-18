@@ -8,7 +8,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useWebSocket } from '@/lib/websocket';
 import { useContractEvents, useModel, useErrorBound } from './useContract';
-import { generateMockTrainingMetrics } from '@/lib/api';
 
 // ============================================================================
 // Types
@@ -125,8 +124,8 @@ export function useTrainingStatus(options: UseTrainingStatusOptions): UseTrainin
         modelId,
         sessionId,
         enableWebSocket = true,
-        enablePolling = true,
-        pollingInterval = 2000,
+        enablePolling: _enablePolling = true,
+        pollingInterval: _pollingInterval = 2000,
         onStatusChange,
         onMetricsUpdate,
         onAlert,
@@ -155,9 +154,7 @@ export function useTrainingStatus(options: UseTrainingStatusOptions): UseTrainin
     const [isLoading, setIsLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
 
-    // Refs for animation
-    const epochRef = useRef(0);
-    const batchRef = useRef(0);
+    // Refs
     const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
     // Contract Integration
@@ -184,20 +181,20 @@ export function useTrainingStatus(options: UseTrainingStatusOptions): UseTrainin
             const initialStatus: TrainingStatus = {
                 modelId: modelIdBigInt,
                 sessionId: sessionId || `session-${Date.now()}`,
-                status: 'training',
-                phase: 'forward',
+                status: 'idle',
+                phase: 'setup',
                 progress: 0,
-                startedAt: Date.now() - 3600000,
+                startedAt: Date.now(),
                 updatedAt: Date.now(),
             };
             setStatus(initialStatus);
 
-            // Initialize config
+            // Initialize config from model data if available
             const initialConfig: TrainingConfig = {
                 modelId: modelIdBigInt,
-                modelName: model?.ipfsHash || 'HELIX Transformer',
+                modelName: model?.ipfsHash || 'HELIX Model',
                 architecture: 'Transformer',
-                parameters: 1_500_000,
+                parameters: 0,
                 epochs: 10,
                 batchSize: 64,
                 learningRate: 0.001,
@@ -209,32 +206,13 @@ export function useTrainingStatus(options: UseTrainingStatusOptions): UseTrainin
             };
             setConfig(initialConfig);
 
-            // Initialize metrics with mock data
-            const mockMetrics = generateMockTrainingMetrics(0);
-            const initialMetrics: TrainingMetricsLive = {
-                epoch: 0,
-                batch: 0,
-                totalEpochs: 10,
-                totalBatches: 100,
-                loss: mockMetrics.loss,
-                accuracy: mockMetrics.accuracy,
-                learningRate: 0.001,
-                gradientNorm: mockMetrics.gradientNorm,
-                throughput: mockMetrics.throughput,
-                errorBound: mockMetrics.accumulatedErrorBound,
-                timestamp: Date.now(),
-            };
-            setMetrics(initialMetrics);
+            // No initial metrics — wait for real data from WebSocket or API
+            setMetrics(null);
+            setLossHistory([]);
+            setAccuracyHistory([]);
+            setErrorBoundHistory([]);
 
-            // Initialize history
-            setLossHistory(mockMetrics.lossHistory.map(h => ({
-                ...h,
-                batch: 0,
-            })));
-            setAccuracyHistory(mockMetrics.accuracyHistory);
-            setErrorBoundHistory(mockMetrics.errorBoundHistory);
-
-            // Initialize workers from proof events
+            // Initialize workers from proof events only (no demo workers)
             const workerMap = new Map<string, WorkerContribution>();
             proofEvents.forEach(event => {
                 const existing = workerMap.get(event.prover);
@@ -245,24 +223,6 @@ export function useTrainingStatus(options: UseTrainingStatusOptions): UseTrainin
                     status: 'active',
                 });
             });
-
-            // Add some demo workers if none from events
-            if (workerMap.size === 0) {
-                const demoWorkers = [
-                    '0x742d35Cc6634C0532925a3b844Bc9e7595f01231',
-                    '0x8626f6940E2eb28930eFb4CeF49B2d1F2C9C1199',
-                    '0xdD2FD4581271e230360230F9337D5c0430Bf44C0',
-                ];
-                demoWorkers.forEach((addr, i) => {
-                    workerMap.set(addr, {
-                        address: addr,
-                        proofsSubmitted: Math.floor(Math.random() * 50) + 10,
-                        lastContribution: Date.now() - Math.random() * 60000,
-                        status: i === 0 ? 'active' : i === 1 ? 'idle' : 'active',
-                        currentTask: i === 0 ? 'Computing gradients' : undefined,
-                    });
-                });
-            }
             setWorkers(Array.from(workerMap.values()));
 
         } catch (err) {
@@ -331,101 +291,6 @@ export function useTrainingStatus(options: UseTrainingStatusOptions): UseTrainin
             unsubWorker();
         };
     }, [enableWebSocket, on, onStatusChange, onMetricsUpdate, onAlert]);
-
-    // ========================================================================
-    // Polling Animation
-    // ========================================================================
-
-    useEffect(() => {
-        if (!enablePolling) return;
-
-        pollingRef.current = setInterval(() => {
-            // Advance batch
-            batchRef.current += 1;
-            const totalBatches = config?.batchSize ? 100 : 100;
-
-            if (batchRef.current >= totalBatches) {
-                batchRef.current = 0;
-                epochRef.current = Math.min(epochRef.current + 1, (config?.epochs || 10));
-            }
-
-            // Calculate new metrics
-            const epoch = epochRef.current;
-            const batch = batchRef.current;
-            const baseLoss = 2.5 * Math.exp(-0.3 * epoch) + 0.1;
-            const baseAccuracy = Math.min(0.99, 1 - Math.exp(-0.2 * epoch) * 0.8);
-
-            const newMetrics: TrainingMetricsLive = {
-                epoch,
-                batch,
-                totalEpochs: config?.epochs || 10,
-                totalBatches,
-                loss: baseLoss + (Math.random() - 0.5) * 0.05,
-                accuracy: baseAccuracy + (Math.random() - 0.5) * 0.02,
-                learningRate: 0.001 * Math.pow(0.95, epoch),
-                gradientNorm: 0.1 + Math.random() * 0.4,
-                throughput: 50 + Math.random() * 30,
-                errorBound: 0.0001 * epoch + Math.random() * 0.00005,
-                timestamp: Date.now(),
-            };
-
-            setMetrics(newMetrics);
-
-            // Update loss history at batch boundaries
-            if (batch % 10 === 0) {
-                setLossHistory(prev => [...prev, {
-                    epoch,
-                    batch,
-                    loss: newMetrics.loss,
-                    timestamp: Date.now(),
-                }].slice(-500));
-            }
-
-            // Update accuracy/error at epoch boundaries
-            if (batch === 0 && epoch > 0) {
-                setAccuracyHistory(prev => [...prev, {
-                    epoch,
-                    accuracy: newMetrics.accuracy,
-                    timestamp: Date.now(),
-                }].slice(-100));
-
-                setErrorBoundHistory(prev => [...prev, {
-                    epoch,
-                    bound: newMetrics.errorBound,
-                    timestamp: Date.now(),
-                }].slice(-100));
-            }
-
-            // Update status
-            setStatus(prev => prev ? {
-                ...prev,
-                progress: ((epoch * totalBatches + batch) / ((config?.epochs || 10) * totalBatches)) * 100,
-                phase: batch < 30 ? 'forward' : batch < 60 ? 'backward' : batch < 80 ? 'aggregation' : 'proof_generation',
-                updatedAt: Date.now(),
-            } : prev);
-
-            // Update throughput history
-            setThroughputHistory(prev => [...prev, {
-                timestamp: Date.now(),
-                value: newMetrics.throughput,
-            }].slice(-100));
-
-            // Simulate worker activity
-            setWorkers(prev => prev.map(w => ({
-                ...w,
-                status: Math.random() > 0.1 ? 'active' : 'idle',
-                lastContribution: Math.random() > 0.7 ? Date.now() : w.lastContribution,
-                proofsSubmitted: Math.random() > 0.9 ? w.proofsSubmitted + 1 : w.proofsSubmitted,
-            })));
-
-        }, pollingInterval);
-
-        return () => {
-            if (pollingRef.current) {
-                clearInterval(pollingRef.current);
-            }
-        };
-    }, [enablePolling, pollingInterval, config]);
 
     // ========================================================================
     // Effects
