@@ -242,6 +242,8 @@ export function useNodes(options: UseNodesOptions = {}): UseNodesReturn {
         return nodeMap;
     }, [stakedEvents, proofEvents, slashedEvents]);
 
+    const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
+
     const fetchNodes = useCallback(async () => {
         try {
             setIsLoading(true);
@@ -251,8 +253,69 @@ export function useNodes(options: UseNodesOptions = {}): UseNodesReturn {
             const eventNodes = buildNodesFromEvents();
 
             if (eventNodes.size === 0) {
-                setNodes([]);
-                setConnections([]);
+                // Fallback: fetch workers from backend API
+                try {
+                    const res = await fetch(`${API_BASE}/api/workers`);
+                    if (res.ok) {
+                        const data = await res.json();
+                        const workers: { address?: string; addr?: string; id?: string; status?: string }[] =
+                            Array.isArray(data) ? data : (data.workers ?? []);
+
+                        const backendNodes: WorkerNode[] = workers.map((w, i) => {
+                            const addr = w.address || w.addr || w.id || `0x${i.toString(16).padStart(40, '0')}`;
+                            const types: WorkerNode['type'][] = ['compute', 'aggregator', 'verifier'];
+                            return {
+                                id: `node-${addr.slice(0, 10)}`,
+                                address: addr,
+                                type: types[i % 3],
+                                status: 'active' as WorkerNode['status'],
+                                lastSeen: Date.now(),
+                                lastHeartbeat: Date.now(),
+                                stakedAmount: BigInt(0),
+                                proofsSubmitted: 0,
+                                proofsVerified: 0,
+                                proofsFailed: 0,
+                                roundsParticipated: 0,
+                                roundsCompleted: 0,
+                                reputation: 100,
+                                metrics: { cpu: 0, memory: 0, networkIn: 0, networkOut: 0 },
+                                capabilities: {
+                                    canTrain: true,
+                                    canAggregate: i % 3 === 1,
+                                    canProve: i % 3 === 2,
+                                    gpuMemoryMb: 0,
+                                    maxBatchSize: 64,
+                                },
+                                earningsTotal: BigInt(0),
+                                slashed: false,
+                            };
+                        });
+
+                        setNodes(backendNodes);
+
+                        // Generate mesh connections
+                        const conns: NetworkConnection[] = [];
+                        for (let i = 0; i < backendNodes.length; i++) {
+                            for (let j = i + 1; j < backendNodes.length; j++) {
+                                conns.push({
+                                    from: backendNodes[i].id,
+                                    to: backendNodes[j].id,
+                                    latency: 10 + Math.floor(Math.random() * 40),
+                                    bandwidth: 100,
+                                    status: 'active',
+                                    lastUpdated: Date.now(),
+                                });
+                            }
+                        }
+                        setConnections(conns);
+                    } else {
+                        setNodes([]);
+                        setConnections([]);
+                    }
+                } catch {
+                    setNodes([]);
+                    setConnections([]);
+                }
             } else {
                 setNodes(Array.from(eventNodes.values()));
             }
@@ -263,7 +326,7 @@ export function useNodes(options: UseNodesOptions = {}): UseNodesReturn {
         } finally {
             setIsLoading(false);
         }
-    }, [buildNodesFromEvents]);
+    }, [buildNodesFromEvents, API_BASE]);
 
     // ========================================================================
     // WebSocket Setup

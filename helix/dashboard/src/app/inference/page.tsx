@@ -696,6 +696,29 @@ function InferencePageInner() {
       const data: MPCInferenceResult = await res.json();
       setResult(data);
       setPhase('done');
+
+      // Persist to localStorage for Dashboard inference tab
+      try {
+        const entry = {
+          id: `inf-${Date.now()}`,
+          model: selectedModel?.name ?? 'Unknown',
+          status: 'completed' as const,
+          progress: 100,
+          phase: 'done',
+          workers: data.num_parties,
+          created: Date.now(),
+          inputLabel: `Digit prediction`,
+          result: String(data.prediction),
+          confidence: data.confidence,
+          duration: data.timing.total_ms,
+        };
+        const raw = localStorage.getItem('helix-inference-history');
+        const history = raw ? JSON.parse(raw) : [];
+        history.unshift(entry);
+        localStorage.setItem('helix-inference-history', JSON.stringify(history.slice(0, 50)));
+      } catch {
+        // Non-critical
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Inference failed');
       setPhase('error');

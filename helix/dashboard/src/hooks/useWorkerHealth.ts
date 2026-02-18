@@ -383,6 +383,8 @@ export function useWorkerHealth(options: UseWorkerHealthOptions = {}): UseWorker
     // Initialize
     // ========================================================================
 
+    const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
+
     const initializeWorkers = useCallback(async () => {
         try {
             setIsLoading(true);
@@ -463,6 +465,50 @@ export function useWorkerHealth(options: UseWorkerHealthOptions = {}): UseWorker
                 }
             });
 
+            // Fallback: fetch from backend API when contract events produce no workers
+            if (workerMap.size === 0) {
+                try {
+                    const res = await fetch(`${API_BASE}/api/workers`);
+                    if (res.ok) {
+                        const data = await res.json();
+                        const backendWorkers: { address?: string; addr?: string; id?: string }[] =
+                            Array.isArray(data) ? data : (data.workers ?? []);
+
+                        backendWorkers.forEach((bw, i) => {
+                            const addr = bw.address || bw.addr || bw.id || `0x${i.toString(16).padStart(40, '0')}`;
+                            const roles: WorkerRole[] = ['compute', 'aggregator', 'verifier'];
+                            workerMap.set(addr, {
+                                id: `worker-${addr.slice(0, 10)}`,
+                                address: addr,
+                                role: roles[i % 3],
+                                activity: 'idle',
+                                lastSeen: Date.now(),
+                                lastHeartbeat: Date.now(),
+                                metrics: {
+                                    cpu: 0, memory: 0, networkIn: 0, networkOut: 0,
+                                    diskUsage: 0, latency: 20,
+                                },
+                                capabilities: {
+                                    gpuMemoryMb: 0, maxBatchSize: 64,
+                                    canTrain: true, canProve: i % 3 === 2, canAggregate: i % 3 === 1,
+                                },
+                                performance: {
+                                    proofsSubmitted: 0, proofsVerified: 0, proofsFailed: 0,
+                                    roundsParticipated: 0, averageProofTime: 0,
+                                    successRate: 1, uptime: 1, totalEarnings: BigInt(0),
+                                },
+                                stake: {
+                                    amount: BigInt(0), amountFormatted: '0',
+                                    lockedUntil: 0, isLocked: false, slashed: false,
+                                },
+                            });
+                        });
+                    }
+                } catch {
+                    // Non-fatal — backend may not be running
+                }
+            }
+
             // Finalize workers with health status and issues
             const finalWorkers: WorkerHealth[] = Array.from(workerMap.values()).map(w => {
                 const partialWorker = w as Omit<WorkerHealth, 'status' | 'issues'>;
@@ -483,7 +529,7 @@ export function useWorkerHealth(options: UseWorkerHealthOptions = {}): UseWorker
         } finally {
             setIsLoading(false);
         }
-    }, [stakedEvents, proofEvents, slashedEvents]);
+    }, [stakedEvents, proofEvents, slashedEvents, API_BASE]);
 
     // ========================================================================
     // WebSocket Handlers

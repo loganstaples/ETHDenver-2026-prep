@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { useState, useEffect, useRef, useMemo } from 'react';
 import { motion } from 'framer-motion';
 import {
   Search,
@@ -342,9 +342,110 @@ export default function ActivityPage() {
     [allModels, address],
   );
 
-  // TODO: Populate from real API (GET /api/events or inference endpoint)
-  const [requests] = useState<InferenceRequest[]>([]);
-  const [timelineData] = useState<{ time: string; requests: number }[]>([]);
+  const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
+
+  // Fetch backend events + localStorage inference history
+  const [backendEvents, setBackendEvents] = useState<Array<{
+    type: string;
+    timestamp?: number;
+    [key: string]: unknown;
+  }>>([]);
+
+  useEffect(() => {
+    const fetchEvents = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/events`);
+        if (res.ok) {
+          const data = await res.json();
+          setBackendEvents(Array.isArray(data) ? data : []);
+        }
+      } catch {
+        // Non-fatal
+      }
+    };
+    fetchEvents();
+    const interval = setInterval(fetchEvents, 10000);
+    return () => clearInterval(interval);
+  }, [API_BASE]);
+
+  // Build unified request list from backend events + localStorage inference history
+  const requests = useMemo(() => {
+    const items: InferenceRequest[] = [];
+
+    // Map backend events to InferenceRequest
+    backendEvents.forEach((evt, i) => {
+      const ts = (evt.timestamp as number) ?? Date.now() - i * 1000;
+      if (evt.type === 'training_step' || evt.type === 'phase_started' || evt.type === 'checkpoint_submitted') {
+        items.push({
+          id: `evt-${i}`,
+          timestamp: ts,
+          requester: (evt.session_id as string) ?? '0x000000',
+          modelTokenId: 0,
+          modelName: modelNames.get(0) ?? 'Training',
+          prediction: 0,
+          confidence: 0,
+          fee: 0,
+          ownerRevenue: 0,
+          latency: 0,
+          workers: 3,
+          status: 'completed',
+        });
+      }
+    });
+
+    // Map localStorage inference history
+    try {
+      const raw = localStorage.getItem('helix-inference-history');
+      if (raw) {
+        const history = JSON.parse(raw) as Array<{
+          id: string;
+          model: string;
+          result: string | null;
+          confidence: number | null;
+          duration: number | null;
+          workers: number;
+          created: number;
+        }>;
+        history.forEach((entry) => {
+          items.push({
+            id: entry.id,
+            timestamp: entry.created,
+            requester: address ?? '0x000000',
+            modelTokenId: 0,
+            modelName: entry.model,
+            prediction: entry.result ? Number(entry.result) : 0,
+            confidence: entry.confidence ?? 0,
+            fee: 0.001,
+            ownerRevenue: 0,
+            latency: entry.duration ?? 0,
+            workers: entry.workers,
+            status: 'completed',
+          });
+        });
+      }
+    } catch {
+      // Ignore parse errors
+    }
+
+    return items.sort((a, b) => b.timestamp - a.timestamp);
+  }, [backendEvents, modelNames, address]);
+
+  // Build timeline data from requests (hourly bins over last 24h)
+  const timelineData = useMemo(() => {
+    const now = Date.now();
+    const bins: { time: string; requests: number }[] = [];
+    for (let h = 23; h >= 0; h--) {
+      const binStart = now - (h + 1) * 3600000;
+      const binEnd = now - h * 3600000;
+      const count = requests.filter((r) => r.timestamp >= binStart && r.timestamp < binEnd).length;
+      const d = new Date(binEnd);
+      bins.push({
+        time: `${d.getHours().toString().padStart(2, '0')}:00`,
+        requests: count,
+      });
+    }
+    return bins;
+  }, [requests]);
 
   const filtered = useMemo(() => {
     let result = [...requests];

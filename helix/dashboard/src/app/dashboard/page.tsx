@@ -1,11 +1,10 @@
 'use client';
 
-import { useState, useMemo } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   ChevronDown,
   Pause,
-  Play,
   Square,
   CheckCircle,
   AlertTriangle,
@@ -22,7 +21,7 @@ import {
   ResponsiveContainer,
 } from 'recharts';
 import { cn } from '@/lib/utils';
-import { useTrainingStatus } from '@/hooks/useTrainingStatus';
+import { useDashboardSessions } from '@/hooks/useDashboardSessions';
 import { useWorkerHealth, type WorkerHealth } from '@/hooks/useWorkerHealth';
 import { formatEther } from 'viem';
 
@@ -316,11 +315,7 @@ function WorkerModal({ worker, onClose }: { worker: WorkerHealth; onClose: () =>
 
 export default function DashboardPage() {
   const [tab, setTab] = useState<'training' | 'inference'>('training');
-  // TODO: Populate from GET /api/training/sessions
-  const [sessions] = useState<TrainingSession[]>([]);
-  const [selectedSession, setSelectedSession] = useState<TrainingSession | null>(null);
-  // TODO: Populate from inference API/WebSocket
-  const [inferenceRequests] = useState<DashboardInferenceRequest[]>([]);
+  const [inferenceRequests, setInferenceRequests] = useState<DashboardInferenceRequest[]>([]);
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const [selectedWorker, setSelectedWorker] = useState<WorkerHealth | null>(null);
 
@@ -328,85 +323,145 @@ export default function DashboardPage() {
   const [editLR, setEditLR] = useState('0.001');
   const [editBatch, setEditBatch] = useState('64');
 
-  // Data
+  // Backend data via useDashboardSessions
   const {
-    status,
-    metrics,
-    config,
-    lossHistory,
-    accuracyHistory,
-    alerts: trainingAlerts,
-    pauseTraining,
-    resumeTraining,
-  } = useTrainingStatus({ modelId: selectedSession?.modelId ?? BigInt(1) });
+    sessions: backendSessions,
+    activeSession,
+    losses,
+    events,
+    selectSession,
+  } = useDashboardSessions();
 
   const { workers: healthWorkers } = useWorkerHealth();
 
-  // Chart data
+  // Map backend sessions to dropdown items
+  const sessions: TrainingSession[] = useMemo(
+    () => backendSessions.map((s) => ({
+      id: s.session_id,
+      name: `Session ${s.session_id.slice(0, 8)}`,
+      modelId: BigInt(s.job_id || 0),
+      status: (s.status === 'running' || s.status === 'starting') ? 'training' as const : 'paused' as const,
+    })),
+    [backendSessions],
+  );
+
+  const selectedSession = useMemo(
+    () => activeSession ? sessions.find((s) => s.id === activeSession.session_id) ?? null : null,
+    [activeSession, sessions],
+  );
+
+  // Load inference history from localStorage
+  useEffect(() => {
+    const loadInferenceHistory = () => {
+      try {
+        const raw = localStorage.getItem('helix-inference-history');
+        if (raw) {
+          const parsed = JSON.parse(raw) as DashboardInferenceRequest[];
+          setInferenceRequests(parsed);
+        }
+      } catch {
+        // Ignore parse errors
+      }
+    };
+    loadInferenceHistory();
+    // Re-check periodically in case inference page writes new entries
+    const interval = setInterval(loadInferenceHistory, 3000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Chart data from losses array
   const lossData = useMemo(
-    () => lossHistory.slice(-80).map((l, i) => ({ step: i, value: Number(l.loss.toFixed(4)) })),
-    [lossHistory],
-  );
-  const accData = useMemo(
-    () => accuracyHistory.map((a) => ({ epoch: a.epoch, value: Number((a.accuracy * 100).toFixed(1)) })),
-    [accuracyHistory],
+    () => losses.slice(-80).map((l) => ({ step: l.step, value: Number(l.loss.toFixed(4)) })),
+    [losses],
   );
 
-  // Current / delta values
-  const currentLoss = metrics?.loss ?? 0;
-  const currentAcc = metrics?.accuracy ?? 0;
-  const prevLoss = lossHistory.length > 10 ? lossHistory[lossHistory.length - 11].loss : currentLoss;
-  const prevAcc = accuracyHistory.length > 1 ? (accuracyHistory[accuracyHistory.length - 2]?.accuracy ?? currentAcc) : currentAcc;
+  // Accuracy chart: single point at completion or empty during training
+  const accData = useMemo(() => {
+    if (activeSession?.accuracy != null) {
+      return [{ epoch: 1, value: Number((activeSession.accuracy * 100).toFixed(1)) }];
+    }
+    return [];
+  }, [activeSession]);
+
+  // Current / delta values from activeSession
+  const currentLoss = activeSession?.current_loss ?? 0;
+  const currentAcc = activeSession?.accuracy ?? 0;
+  const prevLoss = losses.length > 10 ? losses[losses.length - 11].loss : currentLoss;
   const lossDelta = currentLoss - prevLoss;
-  const accDelta = (currentAcc - prevAcc) * 100;
+  const accDelta = 0; // No previous accuracy to compare
 
-  const isPaused = status?.status === 'paused';
-  const progress = status?.progress ?? 0;
+  const progress = activeSession
+    ? activeSession.total_steps > 0
+      ? (activeSession.current_step / activeSession.total_steps) * 100
+      : 0
+    : 0;
 
-  // Generate activity feed from training data + alerts
+  // Generate activity feed from WebSocket events
   const activityFeed = useMemo(() => {
     type FeedItem = { id: string; type: string; title: string; message: string; timestamp: number };
     const items: FeedItem[] = [];
 
-    // Training alerts
-    trainingAlerts.forEach((a) => {
-      items.push({ id: a.id, type: a.type, title: a.title, message: a.message, timestamp: a.timestamp });
-    });
+    events.forEach((e, i) => {
+      const evt = e.event;
+      const ts = Date.now() - (events.length - i) * 100; // approximate timestamps
 
-    // Epoch milestones
-    const seenEpochs = new Set<number>();
-    accuracyHistory.forEach((a) => {
-      if (a.epoch > 0 && !seenEpochs.has(a.epoch)) {
-        seenEpochs.add(a.epoch);
+      if (evt.type === 'training_step') {
+        const step = evt.step as number;
+        // Show every 20 steps
+        if (step > 0 && step % 20 === 0) {
+          items.push({
+            id: `step-${step}`,
+            type: 'info',
+            title: `Step ${step}`,
+            message: `loss ${(evt.loss as number).toFixed(4)}`,
+            timestamp: ts,
+          });
+        }
+      } else if (evt.type === 'phase_started') {
         items.push({
-          id: `epoch-${a.epoch}`,
-          type: 'success',
-          title: `Epoch ${a.epoch} complete`,
-          message: `${(a.accuracy * 100).toFixed(1)}% accuracy`,
-          timestamp: a.timestamp,
-        });
-      }
-    });
-
-    // Step milestones (every 20)
-    const seenSteps = new Set<number>();
-    lossHistory.forEach((l) => {
-      const step = l.epoch * 100 + l.batch;
-      const m = Math.floor(step / 20) * 20;
-      if (m > 0 && !seenSteps.has(m)) {
-        seenSteps.add(m);
-        items.push({
-          id: `step-${m}`,
+          id: `phase-${evt.phase}`,
           type: 'info',
-          title: `Step ${m}`,
-          message: `loss ${l.loss.toFixed(4)}`,
-          timestamp: l.timestamp,
+          title: `Phase ${evt.phase}`,
+          message: (evt.description as string) || '',
+          timestamp: ts,
+        });
+      } else if (evt.type === 'checkpoint_submitted') {
+        items.push({
+          id: `checkpoint-${i}`,
+          type: 'success',
+          title: 'Checkpoint submitted',
+          message: 'On-chain attestation',
+          timestamp: ts,
+        });
+      } else if (evt.type === 'cheater_detected') {
+        items.push({
+          id: `cheater-${i}`,
+          type: 'error',
+          title: 'Cheater detected',
+          message: `Worker ${evt.party_index} at step ${evt.step}`,
+          timestamp: ts,
+        });
+      } else if (evt.type === 'session_complete' || evt.type === 'training_complete') {
+        items.push({
+          id: `complete-${i}`,
+          type: 'success',
+          title: 'Training complete',
+          message: evt.accuracy ? `${((evt.accuracy as number) * 100).toFixed(1)}% accuracy` : '',
+          timestamp: ts,
+        });
+      } else if (evt.type === 'session_failed') {
+        items.push({
+          id: `failed-${i}`,
+          type: 'error',
+          title: 'Session failed',
+          message: (evt.error as string) || (evt.reason as string) || '',
+          timestamp: ts,
         });
       }
     });
 
     return items.sort((a, b) => b.timestamp - a.timestamp).slice(0, 20);
-  }, [trainingAlerts, accuracyHistory, lossHistory]);
+  }, [events]);
 
   // Workers sorted: active first by earnings, then offline
   const sortedWorkers = useMemo(() => {
@@ -485,7 +540,7 @@ export default function DashboardPage() {
                     {sessions.map((s) => (
                       <button
                         key={s.id}
-                        onClick={() => { setSelectedSession(s); setDropdownOpen(false); }}
+                        onClick={() => { selectSession(s.id); setDropdownOpen(false); }}
                         className={cn(
                           'w-full flex items-center gap-3 px-4 py-3 text-sm text-left hover:bg-white/[0.04] transition-colors',
                           s.id === selectedSession.id && 'bg-white/[0.06]',
@@ -664,9 +719,10 @@ export default function DashboardPage() {
           <div className="bg-helix-surface border border-helix-border rounded-2xl p-6">
             <div className="flex items-center justify-between mb-3">
               <span className="text-sm text-white">
-                Epoch {metrics?.epoch ?? 0} of {metrics?.totalEpochs ?? 10}
-                <span className="text-helix-muted mx-2">&middot;</span>
-                Batch {metrics?.batch ?? 0} of {metrics?.totalBatches ?? 100}
+                Step {activeSession?.current_step ?? 0} of {activeSession?.total_steps ?? 0}
+                {activeSession?.phase_description && (
+                  <><span className="text-helix-muted mx-2">&middot;</span>{activeSession.phase_description}</>
+                )}
               </span>
               <span className="text-sm text-helix-muted tabular-nums font-mono">{progress.toFixed(0)}%</span>
             </div>
@@ -678,8 +734,11 @@ export default function DashboardPage() {
                 transition={{ duration: 0.5, ease: 'easeOut' }}
               />
             </div>
-            {isPaused && (
-              <div className="mt-2 text-xs text-yellow-400">Training is paused</div>
+            {activeSession?.status === 'complete' && (
+              <div className="mt-2 text-xs text-green-400">Training complete</div>
+            )}
+            {activeSession?.status === 'failed' && (
+              <div className="mt-2 text-xs text-red-400">Training failed</div>
             )}
           </div>
 
@@ -756,32 +815,32 @@ export default function DashboardPage() {
                 <div>
                   <label className="text-xs text-helix-muted block mb-1.5">Optimizer</label>
                   <div className="px-3 py-2 bg-helix-bg border border-helix-border rounded-xl text-sm text-helix-text2">
-                    {config?.optimizer ?? 'AdamW'}
+                    AdamW
                   </div>
                 </div>
                 <div>
                   <label className="text-xs text-helix-muted block mb-1.5">Loss Function</label>
                   <div className="px-3 py-2 bg-helix-bg border border-helix-border rounded-xl text-sm text-helix-text2">
-                    {config?.lossFunction ?? 'CrossEntropy'}
+                    CrossEntropy
                   </div>
                 </div>
               </div>
 
-              {/* Actions */}
+              {/* Actions (disabled — backend doesn't support pause/resume) */}
               <div className="flex gap-3 mt-6">
                 <button
-                  onClick={() => isPaused ? resumeTraining() : pauseTraining()}
-                  className={cn(
-                    'flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm font-medium transition-all',
-                    isPaused
-                      ? 'bg-white text-black hover:bg-white/90'
-                      : 'bg-white/10 text-white hover:bg-white/15',
-                  )}
+                  disabled
+                  title="Pause/resume not supported by backend"
+                  className="flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm font-medium bg-white/5 text-helix-dim cursor-not-allowed"
                 >
-                  {isPaused ? <Play size={14} /> : <Pause size={14} />}
-                  {isPaused ? 'Resume' : 'Pause'}
+                  <Pause size={14} />
+                  Pause
                 </button>
-                <button className="flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl text-sm font-medium bg-red-500/10 text-red-400 hover:bg-red-500/15 transition-all">
+                <button
+                  disabled
+                  title="Stop not supported by backend"
+                  className="flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl text-sm font-medium bg-red-500/5 text-red-300/30 cursor-not-allowed"
+                >
                   <Square size={14} />
                   Stop
                 </button>
