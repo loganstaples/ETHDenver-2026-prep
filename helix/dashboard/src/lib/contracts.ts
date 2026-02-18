@@ -23,10 +23,10 @@ export const CONTRACT_ADDRESSES = {
     },
     // ADI Network Testnet
     99999: {
-        helixCoordinator: '0x0000000000000000000000000000000000000000', // Set after deploy
-        helixVerifier: '0x0000000000000000000000000000000000000000',
+        helixCoordinator: '0x45EF05ac69ea0064CD9037ef8F2A05e2D758F4A7',
+        helixVerifier: '0x9105B3cE2EaFDed8C7326ddF34025411d0951297',
         helixToken: '0x0000000000000000000000000000000000000000',
-        helixModelStore: '0x0000000000000000000000000000000000000000', // Set after deploy
+        helixModelStore: '0x0000000000000000000000000000000000000000',
     },
 } as const;
 
