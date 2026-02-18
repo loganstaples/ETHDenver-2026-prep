@@ -132,6 +132,10 @@ pub struct TrainingJobRequest {
     /// When set, the backend skips Phase 5 (job registration).
     #[serde(default)]
     pub job_id: Option<u64>,
+    /// On-chain model token ID. When set, final weights are cached by this ID
+    /// for non-owner inference access.
+    #[serde(default)]
+    pub model_token_id: Option<u64>,
 }
 
 fn default_architecture() -> Vec<usize> { vec![784, 32, 10] }
@@ -187,6 +191,9 @@ pub struct TrainingSessionState {
     /// Kebab-case slug for the model
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_slug: Option<String>,
+    /// On-chain model token ID (for weight caching)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_token_id: Option<u64>,
 }
 
 /// Request body for uploading training data.
@@ -389,6 +396,8 @@ pub struct DashboardState {
     pub coordinator_address: RwLock<Option<String>>,
     /// Ethereum RPC URL for reading on-chain state
     pub eth_rpc_url: RwLock<Option<String>>,
+    /// Model weights cache: keyed by on-chain token ID string for non-owner inference
+    pub model_weights_cache: RwLock<HashMap<String, serde_json::Value>>,
 }
 
 impl DashboardState {
@@ -411,6 +420,7 @@ impl DashboardState {
             registered_workers: RwLock::new(Vec::new()),
             coordinator_address: RwLock::new(None),
             eth_rpc_url: RwLock::new(None),
+            model_weights_cache: RwLock::new(HashMap::new()),
         }
     }
 
@@ -495,6 +505,7 @@ impl Default for TrainingSessionState {
             final_weights: None,
             model_name: None,
             model_slug: None,
+            model_token_id: None,
         }
     }
 }
@@ -674,6 +685,10 @@ pub fn create_dashboard_router_with_state(state: Arc<DashboardState>) -> Router 
         .route("/api/training/sessions/:id/model", get(get_model_handler))
         // MPC inference endpoint
         .route("/api/inference", post(inference_handler))
+        // Model-based inference endpoints (non-owner access via cached weights)
+        .route("/api/models/:id/inference-ready", get(model_inference_ready_handler))
+        .route("/api/models/:id/cache-weights", post(model_cache_weights_handler))
+        .route("/api/models/inference", post(model_inference_handler))
         // Data/weights upload endpoints
         .route("/api/training/data", post(upload_data_handler))
         .route("/api/training/weights", post(upload_weights_handler))
@@ -1103,6 +1118,7 @@ async fn start_training_handler(
         final_weights: None,
         model_name: req.model_name.clone(),
         model_slug: req.model_slug.clone(),
+        model_token_id: req.model_token_id,
     };
 
     // Store session
@@ -1339,6 +1355,18 @@ async fn run_training_session(
                     session.coordinator_address = result.coordinator_address.clone();
                     session.zk_proofs_generated = result.zk_proofs_generated;
                     session.final_weights = weights_json;
+                }
+            }
+
+            // Cache weights by model_token_id for non-owner inference
+            {
+                let sessions = state.sessions.read().await;
+                if let Some(session) = sessions.get(&session_id) {
+                    if let (Some(token_id), Some(ref weights)) = (session.model_token_id, &session.final_weights) {
+                        let key = token_id.to_string();
+                        state.model_weights_cache.write().await.insert(key.clone(), weights.clone());
+                        info!(token_id, "Cached final weights for model token ID {}", key);
+                    }
                 }
             }
 
@@ -2053,6 +2081,139 @@ async fn inference_handler(
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": format!("Distributed inference failed: {e}") })),
+        ).into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Model-based inference endpoints (non-owner access via cached weights)
+// ---------------------------------------------------------------------------
+
+/// GET /api/models/:id/inference-ready — check if cached weights exist for a model
+async fn model_inference_ready_handler(
+    State(state): State<Arc<DashboardState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let cache = state.model_weights_cache.read().await;
+    let ready = cache.contains_key(&id);
+    Json(serde_json::json!({ "ready": ready }))
+}
+
+/// POST /api/models/:id/cache-weights — owner uploads weights for non-owner inference
+async fn model_cache_weights_handler(
+    State(state): State<Arc<DashboardState>>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    // Accept the weights body and store by token ID
+    state.model_weights_cache.write().await.insert(id.clone(), body);
+    info!(token_id = %id, "Cached weights for model token ID (owner upload)");
+    Json(serde_json::json!({ "cached": true, "token_id": id }))
+}
+
+/// Request body for model-based inference
+#[derive(Debug, Deserialize)]
+struct ModelInferenceRequest {
+    model_token_id: u64,
+    pixels: Vec<f64>,
+    #[serde(default = "default_num_parties")]
+    num_parties: usize,
+    /// Wallet address of the caller (owner check)
+    wallet_address: Option<String>,
+    /// On-chain payment tx hash (non-owner proof of payment)
+    payment_tx: Option<String>,
+}
+
+/// POST /api/models/inference — run inference using cached model weights
+async fn model_inference_handler(
+    State(state): State<Arc<DashboardState>>,
+    Json(req): Json<ModelInferenceRequest>,
+) -> impl IntoResponse {
+    if req.pixels.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "pixels array is empty" })),
+        ).into_response();
+    }
+
+    let token_key = req.model_token_id.to_string();
+
+    // Look up cached weights
+    let weights = {
+        let cache = state.model_weights_cache.read().await;
+        match cache.get(&token_key) {
+            Some(w) => w.clone(),
+            None => return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "Weights not cached for this model. Owner must run inference first or cache weights." })),
+            ).into_response(),
+        }
+    };
+
+    // Access control: owner (free) or non-owner with payment proof
+    let is_owner = req.wallet_address.is_some(); // Simplified: trust wallet_address claim for hackathon
+    let has_payment = req.payment_tx.is_some();
+
+    if !is_owner && !has_payment {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "Payment required for non-owner inference" })),
+        ).into_response();
+    }
+
+    // Parse weights
+    let model_weights: ModelWeights = match serde_json::from_value(weights) {
+        Ok(w) => w,
+        Err(e) => return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("Failed to parse cached weights: {e}") })),
+        ).into_response(),
+    };
+
+    // Run distributed MPC inference
+    let config = crate::inference_orchestration::InferenceConfig {
+        num_parties: req.num_parties,
+        job_id: None,
+    };
+
+    let result = crate::inference_orchestration::run_inference_orchestration(
+        &model_weights,
+        &req.pixels,
+        &config,
+    )
+    .await;
+
+    match result {
+        Ok(inference) => {
+            let input_hash_hex = hex::encode(inference.input_hash);
+            let output_hash_hex = hex::encode(inference.output_hash);
+            let sig_hexes: Vec<String> = inference.worker_signatures
+                .iter()
+                .map(|s| hex::encode(s))
+                .collect();
+
+            Json(serde_json::json!({
+                "prediction": inference.prediction,
+                "confidence": inference.confidence,
+                "probabilities": inference.probabilities,
+                "num_parties": inference.num_parties,
+                "distributed": true,
+                "attestation": {
+                    "input_hash": input_hash_hex,
+                    "output_hash": output_hash_hex,
+                    "worker_signatures": sig_hexes,
+                },
+                "timing": {
+                    "share_generation_ms": inference.timing.share_generation_ms,
+                    "forward_pass_ms": inference.timing.forward_pass_ms,
+                    "signing_ms": inference.timing.signing_ms,
+                    "total_ms": inference.timing.total_ms,
+                },
+            })).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("Model inference failed: {e}") })),
         ).into_response(),
     }
 }

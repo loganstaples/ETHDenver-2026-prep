@@ -563,6 +563,20 @@ export const HELIX_MODEL_STORE_ABI = [
         outputs: [{ name: '', type: 'bool' }],
         stateMutability: 'view',
     },
+    {
+        type: 'function',
+        name: 'payForInference',
+        inputs: [{ name: 'tokenId', type: 'uint256' }],
+        outputs: [{ name: 'nonce', type: 'uint256' }],
+        stateMutability: 'payable',
+    },
+    {
+        type: 'function',
+        name: 'withdrawInferenceFees',
+        inputs: [{ name: 'tokenId', type: 'uint256' }],
+        outputs: [],
+        stateMutability: 'nonpayable',
+    },
     // ── Sale / marketplace reads ───────────────────────────────────────
     {
         type: 'function',
@@ -574,6 +588,13 @@ export const HELIX_MODEL_STORE_ABI = [
     {
         type: 'function',
         name: 'salePrice',
+        inputs: [{ name: 'tokenId', type: 'uint256' }],
+        outputs: [{ name: '', type: 'uint256' }],
+        stateMutability: 'view',
+    },
+    {
+        type: 'function',
+        name: 'inferenceFeesAccrued',
         inputs: [{ name: 'tokenId', type: 'uint256' }],
         outputs: [{ name: '', type: 'uint256' }],
         stateMutability: 'view',
@@ -701,6 +722,17 @@ export const HELIX_MODEL_STORE_ABI = [
             { name: 'seller', type: 'address', indexed: true },
             { name: 'buyer', type: 'address', indexed: true },
             { name: 'price', type: 'uint256', indexed: false },
+        ],
+    },
+    {
+        type: 'event',
+        name: 'InferencePaid',
+        inputs: [
+            { name: 'tokenId', type: 'uint256', indexed: true },
+            { name: 'payer', type: 'address', indexed: true },
+            { name: 'nonce', type: 'uint256', indexed: false },
+            { name: 'amount', type: 'uint256', indexed: false },
+            { name: 'ownerShare', type: 'uint256', indexed: false },
         ],
     },
     {

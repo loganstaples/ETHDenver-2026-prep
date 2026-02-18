@@ -36,12 +36,22 @@ contract HelixModelStore is ERC721Enumerable {
     /// @dev tokenId => (address => hasAccess)
     mapping(uint256 => mapping(address => bool)) public accessGranted;
 
+    // Marketplace state
+    mapping(uint256 => bool) public isForSale;
+    mapping(uint256 => uint256) public salePrice;
+    mapping(uint256 => uint256) public inferenceFeesAccrued;
+    uint256 private _inferenceNonce;
+
     // Events
     event ModelCreated(uint256 indexed tokenId, address indexed creator, string slug, string name);
     event VersionAdded(uint256 indexed tokenId, uint256 indexed versionIndex, string semver, string rootHash);
     event ModelPublicityChanged(uint256 indexed tokenId, bool isPublic);
     event InferenceFeeChanged(uint256 indexed tokenId, uint16 feeBps);
     event AccessChanged(uint256 indexed tokenId, address indexed account, bool granted);
+    event ModelForSaleChanged(uint256 indexed tokenId, bool forSale);
+    event SalePriceChanged(uint256 indexed tokenId, uint256 price);
+    event ModelSold(uint256 indexed tokenId, address indexed seller, address indexed buyer, uint256 price);
+    event InferencePaid(uint256 indexed tokenId, address indexed payer, uint256 nonce, uint256 amount, uint256 ownerShare);
 
     modifier onlyModelOwner(uint256 tokenId) {
         require(ownerOf(tokenId) == msg.sender, "Not model owner");
@@ -142,6 +152,66 @@ contract HelixModelStore is ERC721Enumerable {
     function revokeAccess(uint256 tokenId, address account) external onlyModelOwner(tokenId) {
         accessGranted[tokenId][account] = false;
         emit AccessChanged(tokenId, account, false);
+    }
+
+    // ─── Marketplace ──────────────────────────────────────────────────
+
+    /// @notice List or delist a model for sale
+    function setForSale(uint256 tokenId, bool _forSale) external onlyModelOwner(tokenId) {
+        isForSale[tokenId] = _forSale;
+        emit ModelForSaleChanged(tokenId, _forSale);
+    }
+
+    /// @notice Set the asking price for a model
+    function setSalePrice(uint256 tokenId, uint256 price) external onlyModelOwner(tokenId) {
+        salePrice[tokenId] = price;
+        emit SalePriceChanged(tokenId, price);
+    }
+
+    /// @notice Buy a model NFT that is listed for sale
+    function buyModel(uint256 tokenId) external payable {
+        require(isForSale[tokenId], "Model not for sale");
+        require(salePrice[tokenId] > 0, "Sale price not set");
+        require(msg.value >= salePrice[tokenId], "Insufficient payment");
+        address seller = ownerOf(tokenId);
+        require(msg.sender != seller, "Cannot buy own model");
+
+        // Clear listing
+        isForSale[tokenId] = false;
+        salePrice[tokenId] = 0;
+
+        // Transfer NFT
+        _transfer(seller, msg.sender, tokenId);
+
+        // Pay seller
+        (bool sent, ) = payable(seller).call{value: msg.value}("");
+        require(sent, "Payment failed");
+
+        emit ModelSold(tokenId, seller, msg.sender, msg.value);
+    }
+
+    /// @notice Pay for inference on a public model (non-owner only)
+    /// @return nonce Unique nonce for this inference payment
+    function payForInference(uint256 tokenId) external payable returns (uint256 nonce) {
+        require(models[tokenId].isPublic, "Model is not public");
+        require(msg.sender != ownerOf(tokenId), "Owner does not pay for inference");
+        require(msg.value > 0, "Payment required");
+
+        uint16 feeBps = models[tokenId].inferenceFee;
+        uint256 ownerShare = (msg.value * feeBps) / 10000;
+        inferenceFeesAccrued[tokenId] += ownerShare;
+
+        nonce = _inferenceNonce++;
+        emit InferencePaid(tokenId, msg.sender, nonce, msg.value, ownerShare);
+    }
+
+    /// @notice Withdraw accrued inference fees
+    function withdrawInferenceFees(uint256 tokenId) external onlyModelOwner(tokenId) {
+        uint256 amount = inferenceFeesAccrued[tokenId];
+        require(amount > 0, "No fees to withdraw");
+        inferenceFeesAccrued[tokenId] = 0;
+        (bool sent, ) = payable(msg.sender).call{value: amount}("");
+        require(sent, "Withdrawal failed");
     }
 
     /// @notice Check if an account has access to a model

@@ -16,12 +16,18 @@ contract HelixModelStoreTest is Test {
     event ModelPublicityChanged(uint256 indexed tokenId, bool isPublic);
     event InferenceFeeChanged(uint256 indexed tokenId, uint16 feeBps);
     event AccessChanged(uint256 indexed tokenId, address indexed account, bool granted);
+    event ModelForSaleChanged(uint256 indexed tokenId, bool forSale);
+    event SalePriceChanged(uint256 indexed tokenId, uint256 price);
+    event ModelSold(uint256 indexed tokenId, address indexed seller, address indexed buyer, uint256 price);
+    event InferencePaid(uint256 indexed tokenId, address indexed payer, uint256 nonce, uint256 amount, uint256 ownerShare);
 
     function setUp() public {
         store = new HelixModelStore();
         alice = makeAddr("alice");
         bob = makeAddr("bob");
         charlie = makeAddr("charlie");
+        vm.deal(alice, 10 ether);
+        vm.deal(bob, 10 ether);
     }
 
     // -------------------------------------------------------
@@ -590,5 +596,301 @@ contract HelixModelStoreTest is Test {
         assertTrue(store.supportsInterface(0x80ac58cd));
         // ERC-721 Enumerable interface ID
         assertTrue(store.supportsInterface(0x780e9d63));
+    }
+
+    // -------------------------------------------------------
+    // setForSale
+    // -------------------------------------------------------
+
+    function test_setForSale() public {
+        vm.startPrank(alice);
+        uint256 tokenId = store.createModel("sale-1", "Sale 1", "");
+        assertFalse(store.isForSale(tokenId));
+
+        store.setForSale(tokenId, true);
+        assertTrue(store.isForSale(tokenId));
+
+        store.setForSale(tokenId, false);
+        assertFalse(store.isForSale(tokenId));
+        vm.stopPrank();
+    }
+
+    function test_setForSale_nonOwnerReverts() public {
+        vm.prank(alice);
+        uint256 tokenId = store.createModel("sale-2", "Sale 2", "");
+
+        vm.prank(bob);
+        vm.expectRevert("Not model owner");
+        store.setForSale(tokenId, true);
+    }
+
+    function test_setForSale_emitsEvent() public {
+        vm.startPrank(alice);
+        uint256 tokenId = store.createModel("sale-evt", "Sale Evt", "");
+
+        vm.expectEmit(true, false, false, true);
+        emit ModelForSaleChanged(tokenId, true);
+        store.setForSale(tokenId, true);
+        vm.stopPrank();
+    }
+
+    // -------------------------------------------------------
+    // setSalePrice
+    // -------------------------------------------------------
+
+    function test_setSalePrice() public {
+        vm.startPrank(alice);
+        uint256 tokenId = store.createModel("price-1", "Price 1", "");
+        store.setSalePrice(tokenId, 1 ether);
+        assertEq(store.salePrice(tokenId), 1 ether);
+        vm.stopPrank();
+    }
+
+    function test_setSalePrice_nonOwnerReverts() public {
+        vm.prank(alice);
+        uint256 tokenId = store.createModel("price-2", "Price 2", "");
+
+        vm.prank(bob);
+        vm.expectRevert("Not model owner");
+        store.setSalePrice(tokenId, 1 ether);
+    }
+
+    function test_setSalePrice_emitsEvent() public {
+        vm.startPrank(alice);
+        uint256 tokenId = store.createModel("price-evt", "Price Evt", "");
+
+        vm.expectEmit(true, false, false, true);
+        emit SalePriceChanged(tokenId, 2 ether);
+        store.setSalePrice(tokenId, 2 ether);
+        vm.stopPrank();
+    }
+
+    // -------------------------------------------------------
+    // buyModel
+    // -------------------------------------------------------
+
+    function test_buyModel_transfersAndPays() public {
+        vm.startPrank(alice);
+        uint256 tokenId = store.createModel("buy-1", "Buy 1", "");
+        store.setForSale(tokenId, true);
+        store.setSalePrice(tokenId, 1 ether);
+        vm.stopPrank();
+
+        uint256 aliceBalBefore = alice.balance;
+
+        vm.prank(bob);
+        store.buyModel{value: 1 ether}(tokenId);
+
+        assertEq(store.ownerOf(tokenId), bob);
+        assertEq(alice.balance, aliceBalBefore + 1 ether);
+    }
+
+    function test_buyModel_clearsListing() public {
+        vm.startPrank(alice);
+        uint256 tokenId = store.createModel("buy-clear", "Buy Clear", "");
+        store.setForSale(tokenId, true);
+        store.setSalePrice(tokenId, 1 ether);
+        vm.stopPrank();
+
+        vm.prank(bob);
+        store.buyModel{value: 1 ether}(tokenId);
+
+        assertFalse(store.isForSale(tokenId));
+        assertEq(store.salePrice(tokenId), 0);
+    }
+
+    function test_buyModel_revertsNotForSale() public {
+        vm.prank(alice);
+        uint256 tokenId = store.createModel("buy-nfs", "Not For Sale", "");
+
+        vm.prank(bob);
+        vm.expectRevert("Model not for sale");
+        store.buyModel{value: 1 ether}(tokenId);
+    }
+
+    function test_buyModel_revertsInsufficientPayment() public {
+        vm.startPrank(alice);
+        uint256 tokenId = store.createModel("buy-low", "Buy Low", "");
+        store.setForSale(tokenId, true);
+        store.setSalePrice(tokenId, 2 ether);
+        vm.stopPrank();
+
+        vm.prank(bob);
+        vm.expectRevert("Insufficient payment");
+        store.buyModel{value: 1 ether}(tokenId);
+    }
+
+    function test_buyModel_revertsOwnModel() public {
+        vm.startPrank(alice);
+        uint256 tokenId = store.createModel("buy-self", "Buy Self", "");
+        store.setForSale(tokenId, true);
+        store.setSalePrice(tokenId, 1 ether);
+
+        vm.expectRevert("Cannot buy own model");
+        store.buyModel{value: 1 ether}(tokenId);
+        vm.stopPrank();
+    }
+
+    function test_buyModel_emitsEvent() public {
+        vm.startPrank(alice);
+        uint256 tokenId = store.createModel("buy-evt", "Buy Evt", "");
+        store.setForSale(tokenId, true);
+        store.setSalePrice(tokenId, 1 ether);
+        vm.stopPrank();
+
+        vm.prank(bob);
+        vm.expectEmit(true, true, true, true);
+        emit ModelSold(tokenId, alice, bob, 1 ether);
+        store.buyModel{value: 1 ether}(tokenId);
+    }
+
+    function test_buyModel_revertsSalePriceNotSet() public {
+        vm.startPrank(alice);
+        uint256 tokenId = store.createModel("buy-noprice", "No Price", "");
+        store.setForSale(tokenId, true);
+        // salePrice is 0
+        vm.stopPrank();
+
+        vm.prank(bob);
+        vm.expectRevert("Sale price not set");
+        store.buyModel{value: 1 ether}(tokenId);
+    }
+
+    // -------------------------------------------------------
+    // payForInference
+    // -------------------------------------------------------
+
+    function test_payForInference() public {
+        vm.startPrank(alice);
+        uint256 tokenId = store.createModel("infer-1", "Infer 1", "");
+        store.setPublic(tokenId, true);
+        store.setInferenceFee(tokenId, 1000); // 10%
+        vm.stopPrank();
+
+        vm.prank(bob);
+        uint256 nonce = store.payForInference{value: 0.01 ether}(tokenId);
+        assertEq(nonce, 0);
+    }
+
+    function test_payForInference_ownerShareCorrect() public {
+        vm.startPrank(alice);
+        uint256 tokenId = store.createModel("infer-share", "Infer Share", "");
+        store.setPublic(tokenId, true);
+        store.setInferenceFee(tokenId, 500); // 5%
+        vm.stopPrank();
+
+        vm.prank(bob);
+        store.payForInference{value: 1 ether}(tokenId);
+
+        // 5% of 1 ether = 0.05 ether
+        assertEq(store.inferenceFeesAccrued(tokenId), 0.05 ether);
+    }
+
+    function test_payForInference_revertsPrivate() public {
+        vm.prank(alice);
+        uint256 tokenId = store.createModel("infer-priv", "Infer Priv", "");
+        // isPublic defaults to false
+
+        vm.prank(bob);
+        vm.expectRevert("Model is not public");
+        store.payForInference{value: 0.01 ether}(tokenId);
+    }
+
+    function test_payForInference_revertsOwner() public {
+        vm.startPrank(alice);
+        uint256 tokenId = store.createModel("infer-own", "Infer Own", "");
+        store.setPublic(tokenId, true);
+
+        vm.expectRevert("Owner does not pay for inference");
+        store.payForInference{value: 0.01 ether}(tokenId);
+        vm.stopPrank();
+    }
+
+    function test_payForInference_revertsZeroPayment() public {
+        vm.startPrank(alice);
+        uint256 tokenId = store.createModel("infer-zero", "Infer Zero", "");
+        store.setPublic(tokenId, true);
+        vm.stopPrank();
+
+        vm.prank(bob);
+        vm.expectRevert("Payment required");
+        store.payForInference{value: 0}(tokenId);
+    }
+
+    function test_payForInference_incrementsNonce() public {
+        vm.startPrank(alice);
+        uint256 tokenId = store.createModel("infer-nonce", "Infer Nonce", "");
+        store.setPublic(tokenId, true);
+        vm.stopPrank();
+
+        vm.startPrank(bob);
+        uint256 n0 = store.payForInference{value: 0.01 ether}(tokenId);
+        uint256 n1 = store.payForInference{value: 0.01 ether}(tokenId);
+        vm.stopPrank();
+
+        assertEq(n0, 0);
+        assertEq(n1, 1);
+    }
+
+    function test_payForInference_emitsEvent() public {
+        vm.startPrank(alice);
+        uint256 tokenId = store.createModel("infer-evt", "Infer Evt", "");
+        store.setPublic(tokenId, true);
+        store.setInferenceFee(tokenId, 1000); // 10%
+        vm.stopPrank();
+
+        vm.prank(bob);
+        vm.expectEmit(true, true, false, true);
+        // ownerShare = 0.01 ether * 1000 / 10000 = 0.001 ether
+        emit InferencePaid(tokenId, bob, 0, 0.01 ether, 0.001 ether);
+        store.payForInference{value: 0.01 ether}(tokenId);
+    }
+
+    // -------------------------------------------------------
+    // withdrawInferenceFees
+    // -------------------------------------------------------
+
+    function test_withdrawInferenceFees() public {
+        vm.startPrank(alice);
+        uint256 tokenId = store.createModel("withdraw-1", "Withdraw 1", "");
+        store.setPublic(tokenId, true);
+        store.setInferenceFee(tokenId, 1000); // 10%
+        vm.stopPrank();
+
+        vm.prank(bob);
+        store.payForInference{value: 1 ether}(tokenId);
+        // ownerShare = 0.1 ether
+
+        uint256 aliceBalBefore = alice.balance;
+
+        vm.prank(alice);
+        store.withdrawInferenceFees(tokenId);
+
+        assertEq(alice.balance, aliceBalBefore + 0.1 ether);
+        assertEq(store.inferenceFeesAccrued(tokenId), 0);
+    }
+
+    function test_withdrawInferenceFees_revertsNoFees() public {
+        vm.startPrank(alice);
+        uint256 tokenId = store.createModel("withdraw-none", "Withdraw None", "");
+
+        vm.expectRevert("No fees to withdraw");
+        store.withdrawInferenceFees(tokenId);
+        vm.stopPrank();
+    }
+
+    function test_withdrawInferenceFees_nonOwnerReverts() public {
+        vm.startPrank(alice);
+        uint256 tokenId = store.createModel("withdraw-no", "Withdraw No", "");
+        store.setPublic(tokenId, true);
+        store.setInferenceFee(tokenId, 1000);
+        vm.stopPrank();
+
+        vm.prank(bob);
+        store.payForInference{value: 1 ether}(tokenId);
+
+        vm.prank(bob);
+        vm.expectRevert("Not model owner");
+        store.withdrawInferenceFees(tokenId);
     }
 }
