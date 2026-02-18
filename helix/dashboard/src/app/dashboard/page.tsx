@@ -64,8 +64,8 @@ function timeAgo(ts: number): string {
 // Horseshoe Progress
 // ============================================================================
 
-function HorseshoeProgress({ progress, size = 140 }: { progress: number; size?: number }) {
-  const pad = 14; // extra padding so glow never clips
+function HorseshoeProgress({ progress, size = 150 }: { progress: number; size?: number }) {
+  const pad = 16; // extra padding so glow never clips
   const full = size + pad * 2;
   const strokeWidth = 7;
   const radius = (size - strokeWidth) / 2;
@@ -80,6 +80,10 @@ function HorseshoeProgress({ progress, size = 140 }: { progress: number; size?: 
   // Rotate so gap is at the bottom center: start at 135° (bottom-left)
   const rotation = 135;
 
+  // The 90° gap at the bottom shifts the visual center upward.
+  // Nudge the whole SVG down to compensate (~8% of size).
+  const yOffset = size * 0.08;
+
   const filterId = `glow-${size}`;
 
   return (
@@ -87,7 +91,7 @@ function HorseshoeProgress({ progress, size = 140 }: { progress: number; size?: 
       width={full}
       height={full}
       viewBox={`0 0 ${full} ${full}`}
-      style={{ margin: -pad, overflow: 'visible' }}
+      style={{ margin: -pad, marginTop: -pad + yOffset, overflow: 'visible' }}
     >
       <defs>
         <filter id={filterId} x="-100%" y="-100%" width="400%" height="400%">
@@ -129,14 +133,14 @@ function HorseshoeProgress({ progress, size = 140 }: { progress: number; size?: 
         />
       )}
 
-      {/* Percentage text — large, sans-serif, bold */}
+      {/* Percentage text */}
       <text
         x={center}
-        y={center - size * 0.03}
+        y={center - size * 0.02}
         textAnchor="middle"
         dominantBaseline="central"
         className="fill-white font-sans"
-        style={{ fontSize: size * 0.24, fontWeight: 600, letterSpacing: '-0.02em' }}
+        style={{ fontSize: size * 0.26, fontWeight: 600, letterSpacing: '-0.02em' }}
       >
         {Math.round(progress)}%
       </text>
@@ -752,7 +756,7 @@ export default function DashboardPage() {
                       {/* Horseshoe with radial backdrop */}
                       <div className="relative shrink-0 flex items-center justify-center">
                         <div className="absolute inset-0 rounded-full bg-white/[0.02] blur-xl scale-110" />
-                        <HorseshoeProgress progress={req.progress} size={130} />
+                        <HorseshoeProgress progress={req.progress} size={150} />
                       </div>
 
                       {/* Details */}
@@ -818,7 +822,7 @@ export default function DashboardPage() {
                       {/* Horseshoe with radial backdrop — same as active */}
                       <div className="relative shrink-0 flex items-center justify-center">
                         <div className="absolute inset-0 rounded-full bg-white/[0.02] blur-xl scale-110" />
-                        <HorseshoeProgress progress={100} size={130} />
+                        <HorseshoeProgress progress={100} size={150} />
                       </div>
 
                       {/* Details */}
