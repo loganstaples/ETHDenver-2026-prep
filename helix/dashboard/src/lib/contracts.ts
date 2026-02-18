@@ -832,11 +832,16 @@ export interface OnChainVersion {
 // Helper to get contract address for current chain.
 // Supports env-var override: NEXT_PUBLIC_MODEL_STORE_ADDRESS takes precedence.
 export function getContractAddress(chainId: number, contract: keyof typeof CONTRACT_ADDRESSES[31337]): string {
+    // Allow env-var override for coordinator (set after deploy-adi.sh)
+    if (contract === 'helixCoordinator') {
+        const envAddr = process.env.NEXT_PUBLIC_COORDINATOR_ADDRESS;
+        if (envAddr && envAddr !== '0x0000000000000000000000000000000000000000') {
+            return envAddr;
+        }
+    }
     // Allow env-var override for HelixModelStore (set after deploy)
     if (contract === 'helixModelStore') {
-        const envAddr = typeof window !== 'undefined'
-            ? process.env.NEXT_PUBLIC_MODEL_STORE_ADDRESS
-            : process.env.NEXT_PUBLIC_MODEL_STORE_ADDRESS;
+        const envAddr = process.env.NEXT_PUBLIC_MODEL_STORE_ADDRESS;
         if (envAddr && envAddr !== '0x0000000000000000000000000000000000000000') {
             return envAddr;
         }

@@ -1092,7 +1092,7 @@ async fn start_training_handler(
         #[cfg(feature = "chain")]
         payment_amount_eth: req.payment_eth,
         #[cfg(feature = "chain")]
-        stake_amount_eth: req.stake_per_worker_eth.max(0.1), // Contract minStake is 0.1 ETH
+        stake_amount_eth: req.stake_per_worker_eth.max(0.001), // Contract minStake is 0.001 ETH
         #[cfg(feature = "chain")]
         coordinator_address: None, // Will be set below from dashboard state if available
         #[cfg(feature = "chain")]
@@ -1927,9 +1927,10 @@ async fn inference_handler(
                         let rpc_url = state.eth_rpc_url.read().await.clone();
                         if let (Some(coord), Some(rpc)) = (coord_addr, rpc_url) {
                             use crate::rpc::chain_v4::ChainClientV4;
-                            // Use owner's default key for submission
-                            let owner_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-                            if let Ok(client) = ChainClientV4::new(&rpc, owner_key, &coord, None).await {
+                            // Use TESTNET_PRIVATE_KEY (real chain) or Anvil default (local dev)
+                            let owner_key = std::env::var("TESTNET_PRIVATE_KEY")
+                                .unwrap_or_else(|_| "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".to_string());
+                            if let Ok(client) = ChainClientV4::new(&rpc, &owner_key, &coord, None).await {
                                 let sigs: Vec<ethers::types::Bytes> = inference.worker_signatures
                                     .iter()
                                     .map(|s| ethers::types::Bytes::from(s.clone()))
