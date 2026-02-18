@@ -572,8 +572,8 @@ export function useMpcTraining(): UseMpcTrainingReturn {
         const res = await fetch(`${API_BASE}/api/workers`);
         if (res.ok) {
           const data = await res.json();
-          const arr = Array.isArray(data) ? data : (data.workers ?? []);
-          setWorkersOnline(arr.length);
+          const arr: { status?: string }[] = Array.isArray(data) ? data : (data.workers ?? []);
+          setWorkersOnline(arr.filter(w => w.status !== 'offline').length);
         }
       } catch {
         // Non-fatal

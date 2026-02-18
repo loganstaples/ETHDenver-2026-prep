@@ -527,6 +527,26 @@ function InferencePageInner() {
   const [error, setError] = useState<string | null>(null);
   const [inputMode, setInputMode] = useState<InputMode>('draw');
 
+  // Auto-discover latest completed training session when no on-chain models
+  useEffect(() => {
+    if (activeSessionId || allModels.length > 0) return;
+    const discover = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/training/sessions`);
+        if (!res.ok) return;
+        const sessions = await res.json();
+        const completed = (Array.isArray(sessions) ? sessions : [])
+          .filter((s: { status: string }) => s.status === 'complete')
+          .pop();
+        if (completed) {
+          setActiveSessionId(completed.session_id);
+          setWeightFetchStatus('done');
+        }
+      } catch { /* non-fatal */ }
+    };
+    discover();
+  }, [activeSessionId, allModels.length]);
+
   // Filtered models
   const filteredModels = useMemo(() => {
     let models = allModels;

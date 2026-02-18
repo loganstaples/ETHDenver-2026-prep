@@ -1834,29 +1834,45 @@ async fn inference_handler(
         ).into_response();
     }
 
-    // Load weights from session
+    // Load weights: try session first, then uploaded_weights, then any completed session
     let weights = {
         let sessions = state.sessions.read().await;
-        match sessions.get(&req.session_id) {
-            Some(session) => {
-                if session.status != "complete" {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({ "error": "Training not yet complete" })),
-                    ).into_response();
-                }
-                match &session.final_weights {
-                    Some(w) => w.clone(),
+        if let Some(session) = sessions.get(&req.session_id) {
+            if session.status != "complete" {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "Training not yet complete" })),
+                ).into_response();
+            }
+            match &session.final_weights {
+                Some(w) => w.clone(),
+                None => return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": "Weights not available for this session" })),
+                ).into_response(),
+            }
+        } else {
+            // Fallback 1: uploaded weights (manual upload via POST /api/training/weights)
+            let uploaded = state.uploaded_weights.read().await;
+            if let Some(w) = uploaded.as_ref() {
+                info!("Session '{}' not found, using uploaded weights", req.session_id);
+                w.clone()
+            } else {
+                // Fallback 2: most recent completed session's weights
+                let completed = sessions.values()
+                    .filter(|s| s.status == "complete" && s.final_weights.is_some())
+                    .last();
+                match completed {
+                    Some(s) => {
+                        info!("Session '{}' not found, using latest completed session", req.session_id);
+                        s.final_weights.clone().unwrap()
+                    }
                     None => return (
                         StatusCode::NOT_FOUND,
-                        Json(serde_json::json!({ "error": "Weights not available for this session" })),
+                        Json(serde_json::json!({ "error": "No weights available — train a model or upload weights first" })),
                     ).into_response(),
                 }
             }
-            None => return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "error": "Session not found" })),
-            ).into_response(),
         }
     };
 

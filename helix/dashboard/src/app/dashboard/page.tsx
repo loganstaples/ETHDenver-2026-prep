@@ -917,9 +917,9 @@ export default function DashboardPage() {
                               {req.phase}
                             </span>
                           </div>
-                          <button className="text-sm px-5 py-2 rounded-xl bg-white/[0.06] text-helix-text2 hover:bg-red-500/10 hover:text-red-400 transition-all font-medium">
-                            Cancel
-                          </button>
+                          <span className="text-[11px] uppercase tracking-wider px-2.5 py-0.5 rounded-md bg-green-500/10 text-green-400">
+                            Live
+                          </span>
                         </div>
 
                         <div className="text-sm text-helix-muted mb-5">{req.inputLabel}</div>
