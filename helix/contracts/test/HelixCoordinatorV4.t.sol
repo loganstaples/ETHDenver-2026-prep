@@ -66,7 +66,7 @@ contract HelixCoordinatorV4Test is Test {
     function _setupJobWith3Workers() internal returns (uint256 jobId) {
         vm.prank(jobOwner);
         jobId = coordinator.registerTrainingJob{value: PAYMENT_AMOUNT}(
-            ARCH_HASH, CHECKPOINT_FREQ, NUM_ROUNDS, PAYMENT_AMOUNT, false, 0, false, 0
+            ARCH_HASH, CHECKPOINT_FREQ, NUM_ROUNDS, PAYMENT_AMOUNT, false, 0, false, 0, address(0)
         );
 
         vm.prank(worker1);
@@ -222,7 +222,7 @@ contract HelixCoordinatorV4Test is Test {
     function test_RegisterTrainingJob() public {
         vm.prank(jobOwner);
         uint256 jobId = coordinator.registerTrainingJob{value: PAYMENT_AMOUNT}(
-            ARCH_HASH, CHECKPOINT_FREQ, NUM_ROUNDS, PAYMENT_AMOUNT, false, 0, false, 0
+            ARCH_HASH, CHECKPOINT_FREQ, NUM_ROUNDS, PAYMENT_AMOUNT, false, 0, false, 0, address(0)
         );
         assertEq(jobId, 0);
 
@@ -240,31 +240,31 @@ contract HelixCoordinatorV4Test is Test {
     function test_RegisterTrainingJob_RejectsZeroPayment() public {
         vm.prank(jobOwner);
         vm.expectRevert(HelixCoordinatorV4.InvalidPayment.selector);
-        coordinator.registerTrainingJob{value: 0}(ARCH_HASH, CHECKPOINT_FREQ, NUM_ROUNDS, 0, false, 0, false, 0);
+        coordinator.registerTrainingJob{value: 0}(ARCH_HASH, CHECKPOINT_FREQ, NUM_ROUNDS, 0, false, 0, false, 0, address(0));
     }
 
     function test_RegisterTrainingJob_RejectsMismatchedPayment() public {
         vm.prank(jobOwner);
         vm.expectRevert(HelixCoordinatorV4.InvalidPayment.selector);
-        coordinator.registerTrainingJob{value: 1 ether}(ARCH_HASH, CHECKPOINT_FREQ, NUM_ROUNDS, 2 ether, false, 0, false, 0);
+        coordinator.registerTrainingJob{value: 1 ether}(ARCH_HASH, CHECKPOINT_FREQ, NUM_ROUNDS, 2 ether, false, 0, false, 0, address(0));
     }
 
     function test_RegisterTrainingJob_RejectsZeroCheckpointFreq() public {
         vm.prank(jobOwner);
         vm.expectRevert(HelixCoordinatorV4.InvalidCheckpointFreq.selector);
-        coordinator.registerTrainingJob{value: PAYMENT_AMOUNT}(ARCH_HASH, 0, NUM_ROUNDS, PAYMENT_AMOUNT, false, 0, false, 0);
+        coordinator.registerTrainingJob{value: PAYMENT_AMOUNT}(ARCH_HASH, 0, NUM_ROUNDS, PAYMENT_AMOUNT, false, 0, false, 0, address(0));
     }
 
     function test_RegisterTrainingJob_RejectsZeroRounds() public {
         vm.prank(jobOwner);
         vm.expectRevert(HelixCoordinatorV4.InvalidNumRounds.selector);
-        coordinator.registerTrainingJob{value: PAYMENT_AMOUNT}(ARCH_HASH, CHECKPOINT_FREQ, 0, PAYMENT_AMOUNT, false, 0, false, 0);
+        coordinator.registerTrainingJob{value: PAYMENT_AMOUNT}(ARCH_HASH, CHECKPOINT_FREQ, 0, PAYMENT_AMOUNT, false, 0, false, 0, address(0));
     }
 
     function test_RegisterMultipleJobs() public {
         vm.startPrank(jobOwner);
-        uint256 j1 = coordinator.registerTrainingJob{value: 1 ether}(ARCH_HASH, 10, 100, 1 ether, false, 0, false, 0);
-        uint256 j2 = coordinator.registerTrainingJob{value: 2 ether}(ARCH_HASH, 20, 200, 2 ether, false, 0, false, 0);
+        uint256 j1 = coordinator.registerTrainingJob{value: 1 ether}(ARCH_HASH, 10, 100, 1 ether, false, 0, false, 0, address(0));
+        uint256 j2 = coordinator.registerTrainingJob{value: 2 ether}(ARCH_HASH, 20, 200, 2 ether, false, 0, false, 0, address(0));
         vm.stopPrank();
 
         assertEq(j1, 0);
@@ -276,7 +276,7 @@ contract HelixCoordinatorV4Test is Test {
     function test_StakeAndJoin() public {
         vm.prank(jobOwner);
         uint256 jobId = coordinator.registerTrainingJob{value: PAYMENT_AMOUNT}(
-            ARCH_HASH, CHECKPOINT_FREQ, NUM_ROUNDS, PAYMENT_AMOUNT, false, 0, false, 0
+            ARCH_HASH, CHECKPOINT_FREQ, NUM_ROUNDS, PAYMENT_AMOUNT, false, 0, false, 0, address(0)
         );
 
         vm.prank(worker1);
@@ -292,7 +292,7 @@ contract HelixCoordinatorV4Test is Test {
     function test_StakeAndJoin_RejectsInsufficientStake() public {
         vm.prank(jobOwner);
         uint256 jobId = coordinator.registerTrainingJob{value: PAYMENT_AMOUNT}(
-            ARCH_HASH, CHECKPOINT_FREQ, NUM_ROUNDS, PAYMENT_AMOUNT, false, 0, false, 0
+            ARCH_HASH, CHECKPOINT_FREQ, NUM_ROUNDS, PAYMENT_AMOUNT, false, 0, false, 0, address(0)
         );
 
         vm.prank(worker1);
@@ -303,7 +303,7 @@ contract HelixCoordinatorV4Test is Test {
     function test_StakeAndJoin_RejectsDuplicateRegistration() public {
         vm.prank(jobOwner);
         uint256 jobId = coordinator.registerTrainingJob{value: PAYMENT_AMOUNT}(
-            ARCH_HASH, CHECKPOINT_FREQ, NUM_ROUNDS, PAYMENT_AMOUNT, false, 0, false, 0
+            ARCH_HASH, CHECKPOINT_FREQ, NUM_ROUNDS, PAYMENT_AMOUNT, false, 0, false, 0, address(0)
         );
 
         vm.prank(worker1);
@@ -608,7 +608,7 @@ contract HelixCoordinatorV4Test is Test {
         HelixCoordinatorV4 noVerifier = new HelixCoordinatorV4(treasuryAddr, address(0));
 
         vm.prank(jobOwner);
-        uint256 jobId = noVerifier.registerTrainingJob{value: 1 ether}(ARCH_HASH, 10, 100, 1 ether, false, 0, false, 0);
+        uint256 jobId = noVerifier.registerTrainingJob{value: 1 ether}(ARCH_HASH, 10, 100, 1 ether, false, 0, false, 0, address(0));
 
         bytes memory proof = hex"deadbeef";
         uint256[] memory publicInputs = new uint256[](6);
@@ -733,7 +733,7 @@ contract HelixCoordinatorV4Test is Test {
         // Register job
         vm.prank(jobOwner);
         uint256 jobId = coordinator.registerTrainingJob{value: PAYMENT_AMOUNT}(
-            ARCH_HASH, CHECKPOINT_FREQ, NUM_ROUNDS, PAYMENT_AMOUNT, false, 0, false, 0
+            ARCH_HASH, CHECKPOINT_FREQ, NUM_ROUNDS, PAYMENT_AMOUNT, false, 0, false, 0, address(0)
         );
 
         // Worker1 and Worker2 join at start
@@ -862,7 +862,7 @@ contract HelixCoordinatorV4Test is Test {
     function test_checkpoint_no_workers_reverts() public {
         vm.prank(jobOwner);
         uint256 jobId = coordinator.registerTrainingJob{value: PAYMENT_AMOUNT}(
-            ARCH_HASH, CHECKPOINT_FREQ, NUM_ROUNDS, PAYMENT_AMOUNT, false, 0, false, 0
+            ARCH_HASH, CHECKPOINT_FREQ, NUM_ROUNDS, PAYMENT_AMOUNT, false, 0, false, 0, address(0)
         );
 
         bytes[] memory sigs = new bytes[](0);
@@ -873,7 +873,7 @@ contract HelixCoordinatorV4Test is Test {
     function test_complete_training_no_workers_reverts() public {
         vm.prank(jobOwner);
         uint256 jobId = coordinator.registerTrainingJob{value: PAYMENT_AMOUNT}(
-            ARCH_HASH, CHECKPOINT_FREQ, NUM_ROUNDS, PAYMENT_AMOUNT, false, 0, false, 0
+            ARCH_HASH, CHECKPOINT_FREQ, NUM_ROUNDS, PAYMENT_AMOUNT, false, 0, false, 0, address(0)
         );
 
         bytes[] memory sigs = new bytes[](0);

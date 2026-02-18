@@ -447,11 +447,15 @@ impl ChainClientV4 {
             0,
             false,
             0,
+            Address::zero(),
         )
         .await
     }
 
     /// Register a new MPC training job with full ZK/risk configuration.
+    ///
+    /// `operator` can call `assignPoolWorkers` on behalf of the job owner.
+    /// Pass `Address::zero()` if not needed (owner-only).
     ///
     /// Returns `(receipt, job_id)`.
     pub async fn register_training_job_with_zk(
@@ -464,6 +468,7 @@ impl ChainClientV4 {
         zk_checkpoint_freq: u64,
         risk_zk_enabled: bool,
         min_workers_for_mpc: u64,
+        operator: Address,
     ) -> Result<(TransactionReceipt, u64)> {
         self.check_cb().await?;
         let result: Result<(TransactionReceipt, u64)> = async {
@@ -478,6 +483,7 @@ impl ChainClientV4 {
                     U256::from(zk_checkpoint_freq),
                     risk_zk_enabled,
                     U256::from(min_workers_for_mpc),
+                    operator,
                 )
                 .value(payment_amount);
             let pending = call

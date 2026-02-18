@@ -27,6 +27,7 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
     /// @notice Training job configuration and state
     struct Job {
         address owner;
+        address operator;          // Can call assignPoolWorkers on behalf of owner
         bytes32 architectureHash;
         uint256 checkpointFreq;
         uint256 numRounds;
@@ -347,7 +348,8 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
         bool zkEnabled,
         uint256 zkCheckpointFreq,
         bool riskZkEnabled,
-        uint256 minWorkersForMpc
+        uint256 minWorkersForMpc,
+        address operator
     ) external payable nonReentrant returns (uint256 jobId) {
         if (msg.value != paymentAmount || paymentAmount == 0) revert InvalidPayment();
         if (checkpointFreq == 0) revert InvalidCheckpointFreq();
@@ -360,6 +362,7 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
 
         jobs[jobId] = Job({
             owner: msg.sender,
+            operator: operator,
             architectureHash: architectureHash,
             checkpointFreq: checkpointFreq,
             numRounds: numRounds,
@@ -944,7 +947,7 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
     /// @param jobId The job to assign workers to
     /// @param count Number of workers to assign
     function assignPoolWorkers(uint256 jobId, uint256 count) external nonReentrant jobExists(jobId) jobActive(jobId) {
-        if (msg.sender != jobs[jobId].owner) revert OnlyOwner();
+        if (msg.sender != jobs[jobId].owner && msg.sender != jobs[jobId].operator) revert OnlyOwner();
 
         uint256 assigned = 0;
         uint256 poolLen = _poolWorkerList.length;

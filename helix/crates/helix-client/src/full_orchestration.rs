@@ -244,6 +244,12 @@ pub struct FullOrchestrationConfig {
     #[cfg(feature = "chain")]
     pub enable_withdrawal: bool,
 
+    /// When set, skip Phase 5 (job registration) and use this pre-registered job ID.
+    /// The user's wallet already registered and paid for the job on-chain.
+    #[cfg(feature = "chain")]
+    #[serde(default)]
+    pub pre_registered_job_id: Option<u64>,
+
     // -- Transport Mode --
     /// When true, workers run the MPC training loop on their own machines
     /// using TcpTransport (distributed/multi-machine mode). The orchestrator
@@ -306,6 +312,8 @@ impl Default for FullOrchestrationConfig {
             use_pool_workers: false,
             #[cfg(feature = "chain")]
             enable_withdrawal: false,
+            #[cfg(feature = "chain")]
+            pre_registered_job_id: None,
             distributed: false,
             custom_training_data: None,
             simulate_cheater: false,
@@ -1399,7 +1407,6 @@ impl FullOrchestrator {
             phase: 5, total: 13,
             description: "Registering training job on-chain".to_string(),
         });
-        info!("Phase 5: Registering training job");
         let phase5_start = Instant::now();
 
         let arch_hash = compute_architecture_hash(d_in, d_hid, d_out);
@@ -1407,77 +1414,92 @@ impl FullOrchestrator {
             .context("Phase 5: Invalid payment amount")?;
         let num_checkpoints = self.config.num_steps / self.config.checkpoint_frequency;
 
-        // Check owner balance before attempting registration.
-        {
-            let provider = Provider::<Http>::try_from(rpc_url.as_str())
-                .map_err(|e| anyhow!("Invalid RPC URL: {}", e))?;
-            let owner_pk = self.config.private_key.strip_prefix("0x")
-                .unwrap_or(&self.config.private_key);
-            let owner_wallet = LocalWallet::from_str(owner_pk)
-                .map_err(|e| anyhow!("Invalid owner private key: {}", e))?;
-            let balance = provider.get_balance(owner_wallet.address(), None).await
-                .context("Phase 5: Failed to check owner balance")?;
-            if balance < payment_wei {
-                return Err(anyhow!(
-                    "Phase 5: Insufficient funds. Owner balance is {} wei but payment requires {} wei. \
-                     Fund the owner address {:?} before starting.",
-                    balance, payment_wei, owner_wallet.address()
-                ));
+        let job_id = if let Some(pre_id) = self.config.pre_registered_job_id {
+            // Job already registered by user's wallet — skip on-chain registration.
+            info!(
+                job_id = pre_id,
+                "Phase 5: Using pre-registered job (user wallet paid)"
+            );
+            pre_id
+        } else {
+            info!("Phase 5: Registering training job");
+
+            // Check owner balance before attempting registration.
+            {
+                let provider = Provider::<Http>::try_from(rpc_url.as_str())
+                    .map_err(|e| anyhow!("Invalid RPC URL: {}", e))?;
+                let owner_pk = self.config.private_key.strip_prefix("0x")
+                    .unwrap_or(&self.config.private_key);
+                let owner_wallet = LocalWallet::from_str(owner_pk)
+                    .map_err(|e| anyhow!("Invalid owner private key: {}", e))?;
+                let balance = provider.get_balance(owner_wallet.address(), None).await
+                    .context("Phase 5: Failed to check owner balance")?;
+                if balance < payment_wei {
+                    return Err(anyhow!(
+                        "Phase 5: Insufficient funds. Owner balance is {} wei but payment requires {} wei. \
+                         Fund the owner address {:?} before starting.",
+                        balance, payment_wei, owner_wallet.address()
+                    ));
+                }
             }
-        }
 
-        // Derive ZK parameters from zk_mode for the on-chain registration.
-        let zk_enabled = matches!(self.config.zk_mode, ZkMode::Always);
-        let risk_zk_enabled = matches!(self.config.zk_mode, ZkMode::Risk { .. });
-        let min_workers_for_mpc = match self.config.zk_mode {
-            ZkMode::Risk { min_workers } => min_workers as u64,
-            _ => 0,
+            // Derive ZK parameters from zk_mode for the on-chain registration.
+            let zk_enabled = matches!(self.config.zk_mode, ZkMode::Always);
+            let risk_zk_enabled = matches!(self.config.zk_mode, ZkMode::Risk { .. });
+            let min_workers_for_mpc = match self.config.zk_mode {
+                ZkMode::Risk { min_workers } => min_workers as u64,
+                _ => 0,
+            };
+            let zk_checkpoint_freq: u64 = 0;
+
+            info!(
+                zk_mode = ?self.config.zk_mode,
+                zk_enabled = zk_enabled,
+                risk_zk_enabled = risk_zk_enabled,
+                min_workers_for_mpc = min_workers_for_mpc,
+                zk_checkpoint_freq = zk_checkpoint_freq,
+                "Phase 5: Registering job with ZK configuration"
+            );
+
+            // Pass the backend's own address as operator so it can call assignPoolWorkers.
+            let operator_addr = chain_client.signer_address();
+
+            let (reg_receipt, registered_job_id) = retry_chain_op(
+                "job registration",
+                || async {
+                    chain_client
+                        .register_training_job_with_zk(
+                            arch_hash,
+                            self.config.checkpoint_frequency as u64,
+                            self.config.num_steps as u64,
+                            payment_wei,
+                            zk_enabled,
+                            zk_checkpoint_freq,
+                            risk_zk_enabled,
+                            min_workers_for_mpc,
+                            operator_addr,
+                        )
+                        .await
+                },
+                &self.progress,
+                5,
+            ).await
+            .context("Phase 5: Job registration failed after retries")?;
+
+            let reg_gas = reg_receipt.gas_used.map(|g| g.as_u64()).unwrap_or(0);
+            total_gas += reg_gas;
+
+            info!(
+                job_id = registered_job_id,
+                gas_used = reg_gas,
+                "Phase 5: Job registered on-chain"
+            );
+
+            registered_job_id
         };
-        // In MPC training, intermediate weights stay secret-shared — ZK proofs can
-        // only be generated for the final checkpoint where weights are reconstructed.
-        // Setting zkCheckpointFreq=0 on-chain tells the contract: "require ZK only
-        // for the last checkpoint (stepNumber >= numRounds)", not every N-th.
-        let zk_checkpoint_freq: u64 = 0;
-
-        info!(
-            zk_mode = ?self.config.zk_mode,
-            zk_enabled = zk_enabled,
-            risk_zk_enabled = risk_zk_enabled,
-            min_workers_for_mpc = min_workers_for_mpc,
-            zk_checkpoint_freq = zk_checkpoint_freq,
-            "Phase 5: Registering job with ZK configuration"
-        );
-
-        let (reg_receipt, job_id) = retry_chain_op(
-            "job registration",
-            || async {
-                chain_client
-                    .register_training_job_with_zk(
-                        arch_hash,
-                        self.config.checkpoint_frequency as u64,
-                        // Use num_steps as numRounds so the contract's ZK check
-                        // `stepNumber >= numRounds` only triggers at the final
-                        // checkpoint (where weights are reconstructed and ZK is possible).
-                        self.config.num_steps as u64,
-                        payment_wei,
-                        zk_enabled,
-                        zk_checkpoint_freq,
-                        risk_zk_enabled,
-                        min_workers_for_mpc,
-                    )
-                    .await
-            },
-            &self.progress,
-            5,
-        ).await
-        .context("Phase 5: Job registration failed after retries")?;
-
-        let reg_gas = reg_receipt.gas_used.map(|g| g.as_u64()).unwrap_or(0);
-        total_gas += reg_gas;
 
         info!(
             job_id = job_id,
-            gas_used = reg_gas,
             elapsed_ms = phase5_start.elapsed().as_millis(),
             "Phase 5 complete: training job registered"
         );
@@ -2799,6 +2821,8 @@ mod tests {
             enable_withdrawal: false,
             #[cfg(feature = "chain")]
             use_pool_workers: false,
+            #[cfg(feature = "chain")]
+            pre_registered_job_id: None,
             distributed: false,
             zk_proof: ZkProofConfig::default(),
             zk_mode: ZkMode::Off,

@@ -24,6 +24,8 @@ import {
   ChevronDown,
   Link2,
   Layers,
+  Search,
+  Lock,
 } from 'lucide-react';
 import {
   ResponsiveContainer,
@@ -33,7 +35,8 @@ import {
   YAxis,
   Tooltip as RechartsTooltip,
 } from 'recharts';
-import { useSignMessage } from 'wagmi';
+import { useSignMessage, useAccount, useChainId, useWriteContract, useWaitForTransactionReceipt } from 'wagmi';
+import { parseEther, keccak256, toBytes, decodeEventLog } from 'viem';
 import { Badge } from '@/components/ui/Badge';
 import { cn } from '@/lib/utils';
 import {
@@ -45,6 +48,14 @@ import {
 } from '@/hooks/useMpcTraining';
 import { useModelRegistry, type ModelWithVersions } from '@/hooks/useModelRegistry';
 import { deriveModelKey, decryptWeights } from '@/lib/model-encryption';
+import { HELIX_COORDINATOR_V4_ABI, getContractAddress } from '@/lib/contracts';
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
+
+function computeArchitectureHash(dims: number[]): `0x${string}` {
+  const archString = `HELIX_ARCH:${dims[0]}:${dims[1]}:${dims[2]}`;
+  return keccak256(toBytes(archString));
+}
 
 // ============================================================================
 // Constants
@@ -76,6 +87,13 @@ type WeightFetchStatus = 'idle' | 'fetching' | 'decrypting' | 'uploading' | 'don
 
 const VERSION_REGEX = /^\d+(\.\d+){0,2}$/;
 function isValidVersion(v: string): boolean { return VERSION_REGEX.test(v.trim()); }
+
+function toSlug(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
 
 interface TrainingHistoryEntry {
   sessionId: string;
@@ -317,7 +335,7 @@ function PaymentNumber({
 // ============================================================================
 
 interface ConfigFormProps {
-  onStart: (config: TrainingJobConfig, opts: { storeOn0G: boolean; version: string }) => void;
+  onStart: (config: TrainingJobConfig, opts: { storeOn0G: boolean; version: string; modelName: string; modelSlug: string }) => void;
   isStarting: boolean;
   onUploadData: (file: File) => Promise<void>;
   onUploadWeights: (file: File) => Promise<void>;
@@ -330,12 +348,16 @@ interface ConfigFormProps {
   onSelectModel: (tokenId: number | null) => void;
   isFetchingWeights: boolean;
   fetchedModelName: string | null;
+  isWalletPrompting: boolean;
+  isConfirmingPayment: boolean;
+  walletConnected: boolean;
 }
 
 function ConfigForm({
   onStart, isStarting, onUploadData, onUploadWeights,
   uploadedData, uploadedWeights, workersOnline, defaultVersion,
   models, selectedModelId, onSelectModel, isFetchingWeights, fetchedModelName,
+  isWalletPrompting, isConfirmingPayment, walletConnected,
 }: ConfigFormProps) {
   const [numSteps, setNumSteps] = useState(500);
   const [learningRate, setLearningRate] = useState(0.001);
@@ -349,6 +371,25 @@ function ConfigForm({
   const [version, setVersion] = useState(defaultVersion);
   const [versionError, setVersionError] = useState<string | null>(null);
   const [autoPropose, setAutoPropose] = useState(true);
+
+  // Model identity
+  const [modelMode, setModelMode] = useState<'new' | 'existing'>(selectedModelId !== null ? 'existing' : 'new');
+  const [modelName, setModelName] = useState('');
+  const [modelSlug, setModelSlug] = useState('');
+  const [modelSearch, setModelSearch] = useState('');
+
+  const handleModelNameChange = (name: string) => {
+    setModelName(name);
+    setModelSlug(toSlug(name));
+  };
+
+  const filteredModels = useMemo(() => {
+    if (!modelSearch.trim()) return models;
+    const q = modelSearch.toLowerCase();
+    return models.filter(
+      (m) => m.name.toLowerCase().includes(q) || (m.slug && m.slug.toLowerCase().includes(q)),
+    );
+  }, [models, modelSearch]);
 
   // Auto-compute recommended payment: base rate × steps × workers × ZK overhead
   const recommendedPayment = useMemo(() => {
@@ -380,6 +421,14 @@ function ConfigForm({
   const handleSubmit = () => {
     const v = version.trim() || defaultVersion;
     if (!isValidVersion(v)) return;
+
+    const effectiveModelName = modelMode === 'existing' && selectedModel
+      ? selectedModel.name
+      : modelName.trim();
+    const effectiveModelSlug = modelMode === 'existing' && selectedModel
+      ? (selectedModel.slug || '')
+      : modelSlug.trim();
+
     onStart({
       architecture: [784, 128, 10],
       num_workers: workersOnline > 0 ? workersOnline : 3,
@@ -397,7 +446,9 @@ function ConfigForm({
       stake_per_worker_eth: stakePerWorkerEth,
       simulate_cheater: false,
       seed: 42,
-    }, { storeOn0G, version: v });
+      model_name: effectiveModelName || undefined,
+      model_slug: effectiveModelSlug || undefined,
+    }, { storeOn0G, version: v, modelName: effectiveModelName, modelSlug: effectiveModelSlug });
   };
 
   const selectedModel = models.find((m) => m.tokenId === selectedModelId) ?? null;
@@ -405,7 +456,11 @@ function ConfigForm({
     ? selectedModel.versions[selectedModel.versions.length - 1]
     : null;
 
-  const canStart = !isStarting && !versionError && !isFetchingWeights;
+  const canStart = !isStarting && !isWalletPrompting && !isConfirmingPayment
+    && !versionError && !isFetchingWeights && walletConnected
+    && (modelMode === 'existing'
+      ? selectedModelId !== null
+      : (modelName.trim() !== '' && modelSlug.trim() !== ''));
 
   return (
     <div className="space-y-6">
@@ -433,86 +488,194 @@ function ConfigForm({
         {/* ── LEFT COLUMN ──────────────────────────────────────── */}
         <div className="flex flex-col gap-5">
 
-          {/* Continue from existing model */}
-          {models.length > 0 && (
-            <div className="space-y-3">
-              <div className="relative">
-                <Layers size={14} className="absolute left-4 top-1/2 -translate-y-1/2 text-helix-muted pointer-events-none" />
-                <select
-                  value={selectedModelId ?? ''}
-                  onChange={(e) => onSelectModel(e.target.value ? Number(e.target.value) : null)}
-                  className="w-full appearance-none pl-10 pr-10 py-3.5 bg-helix-surface border border-helix-border rounded-2xl text-base text-white focus:outline-none focus:border-helix-border2 transition-colors cursor-pointer"
-                >
-                  <option value="">Start from scratch</option>
-                  {models.map((m) => {
-                    const latest = m.versions.length ? m.versions[m.versions.length - 1] : null;
-                    return (
-                      <option key={m.tokenId} value={m.tokenId}>
-                        {m.name} {latest ? `v${latest.semver}` : '(no versions)'}
-                      </option>
-                    );
-                  })}
-                </select>
-                <ChevronDown size={14} className="absolute right-4 top-1/2 -translate-y-1/2 text-helix-muted pointer-events-none" />
-              </div>
-
-              <AnimatePresence mode="wait">
-                {isFetchingWeights && (
-                  <motion.div
-                    key="fetching"
-                    initial={{ opacity: 0, y: -4 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    exit={{ opacity: 0, y: -4 }}
-                    className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-white/[0.03] border border-white/[0.06]"
-                  >
-                    <Loader2 size={14} className="animate-spin text-white" />
-                    <span className="text-sm text-helix-text2">Fetching weights from 0G...</span>
-                  </motion.div>
+          {/* Model Identity */}
+          <div className="space-y-3">
+            {/* Segmented toggle */}
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => { setModelMode('new'); onSelectModel(null); }}
+                className={cn(
+                  'py-2.5 rounded-xl text-base font-medium transition-all',
+                  modelMode === 'new'
+                    ? 'bg-white text-black shadow-lg shadow-white/5'
+                    : 'bg-helix-surface border border-helix-border text-helix-muted hover:text-white hover:border-helix-border2',
                 )}
-                {!isFetchingWeights && fetchedModelName && uploadedWeights && (
-                  <motion.div
-                    key="loaded"
-                    initial={{ opacity: 0, y: -4 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    exit={{ opacity: 0, y: -4 }}
-                    className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-green-500/[0.06] border border-green-500/20"
-                  >
-                    <CheckCircle size={14} className="text-green-400" />
-                    <span className="text-sm text-green-300">
-                      <span className="font-medium">{fetchedModelName}</span>
-                      <span className="text-green-400/60 ml-1.5">
-                        {uploadedWeights.totalParams.toLocaleString()} params
-                      </span>
-                    </span>
-                  </motion.div>
+              >
+                New Model
+              </button>
+              <button
+                type="button"
+                onClick={() => models.length > 0 && setModelMode('existing')}
+                disabled={models.length === 0}
+                className={cn(
+                  'py-2.5 rounded-xl text-base font-medium transition-all',
+                  modelMode === 'existing'
+                    ? 'bg-white text-black shadow-lg shadow-white/5'
+                    : 'bg-helix-surface border border-helix-border text-helix-muted hover:text-white hover:border-helix-border2',
+                  models.length === 0 && 'opacity-40 cursor-not-allowed',
                 )}
-                {selectedModel && latestVersion && !latestVersion.weightsStored && !isFetchingWeights && (
-                  <motion.div
-                    key="no-weights"
-                    initial={{ opacity: 0, y: -4 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    exit={{ opacity: 0, y: -4 }}
-                    className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-yellow-500/[0.06] border border-yellow-500/20"
-                  >
-                    <AlertTriangle size={14} className="text-yellow-400" />
-                    <span className="text-sm text-yellow-300/80">No stored weights — upload manually or start fresh</span>
-                  </motion.div>
-                )}
-                {selectedModel && !latestVersion && !isFetchingWeights && (
-                  <motion.div
-                    key="no-versions"
-                    initial={{ opacity: 0, y: -4 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    exit={{ opacity: 0, y: -4 }}
-                    className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-yellow-500/[0.06] border border-yellow-500/20"
-                  >
-                    <AlertTriangle size={14} className="text-yellow-400" />
-                    <span className="text-sm text-yellow-300/80">No versions yet — upload weights or start fresh</span>
-                  </motion.div>
-                )}
-              </AnimatePresence>
+              >
+                Continue Existing
+              </button>
             </div>
-          )}
+
+            <AnimatePresence mode="wait">
+              {modelMode === 'new' ? (
+                <motion.div
+                  key="new-model"
+                  initial={{ opacity: 0, y: -4 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -4 }}
+                  className="space-y-3"
+                >
+                  {/* Model Name + read-only slug */}
+                  <div className="grid grid-cols-2 gap-2">
+                    <input
+                      type="text"
+                      value={modelName}
+                      onChange={(e) => handleModelNameChange(e.target.value)}
+                      placeholder="Model Name"
+                      className="min-w-0 px-4 py-3.5 bg-helix-surface border border-helix-border rounded-2xl text-base text-white placeholder:text-helix-dim focus:outline-none focus:border-helix-border2 transition-colors"
+                    />
+                    <div className="min-w-0 px-4 py-3.5 bg-black border border-white/20 rounded-2xl text-base text-helix-muted select-none truncate">
+                      {modelSlug || '\u00A0'}
+                    </div>
+                  </div>
+                </motion.div>
+              ) : (
+                <motion.div
+                  key="existing-model"
+                  initial={{ opacity: 0, y: -4 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -4 }}
+                  className="space-y-3"
+                >
+                  {selectedModel ? (
+                    <>
+                      {/* Selected model — locked display */}
+                      <div className="flex items-center gap-3 px-4 py-3.5 rounded-2xl bg-white/[0.03] border border-white/[0.08]">
+                        <Lock size={14} className="text-helix-muted shrink-0" />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-base text-white font-medium truncate">{selectedModel.name}</p>
+                          <p className="text-xs text-helix-dim truncate">
+                            {selectedModel.slug}
+                            {latestVersion && <span className="ml-1.5">· v{latestVersion.semver}</span>}
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => onSelectModel(null)}
+                          className="text-xs text-helix-dim hover:text-white transition-colors shrink-0"
+                        >
+                          Change
+                        </button>
+                      </div>
+
+                      {/* Weight fetch status */}
+                      <AnimatePresence mode="wait">
+                        {isFetchingWeights && (
+                          <motion.div
+                            key="fetching"
+                            initial={{ opacity: 0, y: -4 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            exit={{ opacity: 0, y: -4 }}
+                            className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-white/[0.03] border border-white/[0.06]"
+                          >
+                            <Loader2 size={14} className="animate-spin text-white" />
+                            <span className="text-sm text-helix-text2">Fetching weights from 0G...</span>
+                          </motion.div>
+                        )}
+                        {!isFetchingWeights && fetchedModelName && uploadedWeights && (
+                          <motion.div
+                            key="loaded"
+                            initial={{ opacity: 0, y: -4 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            exit={{ opacity: 0, y: -4 }}
+                            className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-green-500/[0.06] border border-green-500/20"
+                          >
+                            <CheckCircle size={14} className="text-green-400" />
+                            <span className="text-sm text-green-300">
+                              <span className="font-medium">{fetchedModelName}</span>
+                              <span className="text-green-400/60 ml-1.5">
+                                {uploadedWeights.totalParams.toLocaleString()} params
+                              </span>
+                            </span>
+                          </motion.div>
+                        )}
+                        {selectedModel && latestVersion && !latestVersion.weightsStored && !isFetchingWeights && (
+                          <motion.div
+                            key="no-weights"
+                            initial={{ opacity: 0, y: -4 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            exit={{ opacity: 0, y: -4 }}
+                            className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-yellow-500/[0.06] border border-yellow-500/20"
+                          >
+                            <AlertTriangle size={14} className="text-yellow-400" />
+                            <span className="text-sm text-yellow-300/80">No stored weights — upload manually or start fresh</span>
+                          </motion.div>
+                        )}
+                        {selectedModel && !latestVersion && !isFetchingWeights && (
+                          <motion.div
+                            key="no-versions"
+                            initial={{ opacity: 0, y: -4 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            exit={{ opacity: 0, y: -4 }}
+                            className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-yellow-500/[0.06] border border-yellow-500/20"
+                          >
+                            <AlertTriangle size={14} className="text-yellow-400" />
+                            <span className="text-sm text-yellow-300/80">No versions yet — upload weights or start fresh</span>
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
+                    </>
+                  ) : (
+                    <>
+                      {/* Search input */}
+                      <div className="relative">
+                        <Search size={14} className="absolute left-4 top-1/2 -translate-y-1/2 text-helix-muted pointer-events-none" />
+                        <input
+                          type="text"
+                          value={modelSearch}
+                          onChange={(e) => setModelSearch(e.target.value)}
+                          placeholder="Search your models..."
+                          className="w-full pl-10 pr-4 py-3.5 bg-helix-surface border border-helix-border rounded-2xl text-base text-white placeholder:text-helix-dim focus:outline-none focus:border-helix-border2 transition-colors"
+                        />
+                      </div>
+
+                      {/* Model list */}
+                      <div className="max-h-48 overflow-y-auto space-y-1.5 rounded-2xl">
+                        {filteredModels.map((m) => {
+                          const latest = m.versions.length ? m.versions[m.versions.length - 1] : null;
+                          return (
+                            <button
+                              key={m.tokenId}
+                              type="button"
+                              onClick={() => onSelectModel(m.tokenId)}
+                              className="w-full flex items-center gap-3 px-4 py-3 rounded-xl bg-helix-surface border border-helix-border hover:border-helix-border2 transition-colors text-left"
+                            >
+                              <Layers size={14} className="text-helix-muted shrink-0" />
+                              <div className="flex-1 min-w-0">
+                                <p className="text-base text-white truncate">{m.name}</p>
+                                <p className="text-xs text-helix-dim truncate">
+                                  {m.slug}
+                                  {latest && <span className="ml-1.5">· v{latest.semver}</span>}
+                                </p>
+                              </div>
+                              <ChevronDown size={12} className="text-helix-dim -rotate-90 shrink-0" />
+                            </button>
+                          );
+                        })}
+                        {filteredModels.length === 0 && (
+                          <p className="text-sm text-helix-dim text-center py-4">No models found</p>
+                        )}
+                      </div>
+                    </>
+                  )}
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </div>
 
           {/* Core training settings */}
           <div className="rounded-2xl bg-helix-surface border border-helix-border overflow-hidden divide-y divide-helix-border">
@@ -629,7 +792,13 @@ function ConfigForm({
                   : 'bg-helix-border text-helix-muted border-helix-border cursor-not-allowed',
               )}
             >
-              {isStarting ? (
+              {!walletConnected ? (
+                <><Lock size={22} /> Connect Wallet</>
+              ) : isWalletPrompting ? (
+                <><Loader2 size={22} className="animate-spin" /> Confirm in Wallet...</>
+              ) : isConfirmingPayment ? (
+                <><Loader2 size={22} className="animate-spin" /> Confirming Payment...</>
+              ) : isStarting ? (
                 <><Loader2 size={22} className="animate-spin" /> Starting...</>
               ) : isFetchingWeights ? (
                 <><Loader2 size={22} className="animate-spin" /> Loading Weights...</>
@@ -716,6 +885,7 @@ interface LiveProgressProps {
   isConnected: boolean;
   error: string | null;
   version: string;
+  modelName: string;
   onDownloadModel: (sessionId: string) => Promise<void>;
   onStoreOnZeroG: (sessionId: string, version?: string) => Promise<void>;
   isStoringOnZeroG: boolean;
@@ -723,7 +893,7 @@ interface LiveProgressProps {
   showStoreOn0G: boolean;
 }
 
-function LiveProgress({ session, losses, isConnected, error, version, onDownloadModel, onStoreOnZeroG, isStoringOnZeroG, zeroGResult, showStoreOn0G }: LiveProgressProps) {
+function LiveProgress({ session, losses, isConnected, error, version, modelName, onDownloadModel, onStoreOnZeroG, isStoringOnZeroG, zeroGResult, showStoreOn0G }: LiveProgressProps) {
   const stepProgress = session.total_steps > 0
     ? (session.current_step / session.total_steps) * 100
     : 0;
@@ -732,7 +902,10 @@ function LiveProgress({ session, losses, isConnected, error, version, onDownload
 
   return (
     <div className="space-y-6">
-      {/* ── Status bar ──────────────────────────────────────── */}
+      {/* ── Model name + Status bar ─────────────────────────── */}
+      {modelName && (
+        <h2 className="text-2xl font-semibold tracking-tight text-white">{modelName}</h2>
+      )}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
           {isConnected ? (
@@ -1188,9 +1361,79 @@ function TrainPageInner() {
   const { models, isLoading: isLoadingModels } = useModelRegistry();
   const { signMessageAsync } = useSignMessage();
 
+  // Wallet payment flow
+  const { address } = useAccount();
+  const chainId = useChainId();
+  const { writeContract, data: paymentTxHash, isPending: isWalletPrompting, error: walletError, reset: resetWalletWrite } = useWriteContract();
+  const { isLoading: isConfirmingPayment, isSuccess: paymentConfirmed } = useWaitForTransactionReceipt({ hash: paymentTxHash });
+
+  const [operatorAddress, setOperatorAddress] = useState<string | null>(null);
+  const [walletPaymentError, setWalletPaymentError] = useState<string | null>(null);
+  const pendingConfigRef = useRef<{ config: TrainingJobConfig; opts: { storeOn0G: boolean; version: string; modelName: string; modelSlug: string } } | null>(null);
+
+  // Fetch operator address from backend on mount
+  useEffect(() => {
+    fetch(`${API_BASE}/api/operator-address`)
+      .then((res) => res.ok ? res.json() : null)
+      .then((data) => {
+        if (data?.address) setOperatorAddress(data.address);
+      })
+      .catch(() => {});
+  }, []);
+
+  // When payment is confirmed, extract jobId and start training
+  useEffect(() => {
+    if (!paymentConfirmed || !paymentTxHash || !pendingConfigRef.current) return;
+    const { config, opts } = pendingConfigRef.current;
+    pendingConfigRef.current = null;
+
+    // Extract jobId from transaction receipt logs
+    const extractJobId = async () => {
+      try {
+        const { createPublicClient, http } = await import('viem');
+        const rpcUrl = process.env.NEXT_PUBLIC_ETH_RPC_URL || 'http://localhost:8545';
+        // Dynamically determine the chain
+        const publicClient = createPublicClient({ transport: http(rpcUrl) });
+        const receipt = await publicClient.getTransactionReceipt({ hash: paymentTxHash });
+
+        let jobId: number | undefined;
+        for (const log of receipt.logs) {
+          try {
+            const decoded = decodeEventLog({
+              abi: HELIX_COORDINATOR_V4_ABI,
+              data: log.data,
+              topics: log.topics,
+            });
+            if (decoded.eventName === 'JobRegistered') {
+              jobId = Number((decoded.args as { jobId: bigint }).jobId);
+              break;
+            }
+          } catch {
+            // Not our event, skip
+          }
+        }
+
+        if (jobId !== undefined) {
+          setWalletPaymentError(null);
+          startTraining({ ...config, job_id: jobId, payment_eth: 0 });
+        } else {
+          setWalletPaymentError('Could not extract job ID from transaction');
+        }
+      } catch (err) {
+        setWalletPaymentError(err instanceof Error ? err.message : 'Failed to read transaction receipt');
+      }
+    };
+
+    setWantsStoreOn0G(opts.storeOn0G);
+    setCurrentVersion(opts.version);
+    setCurrentModelName(opts.modelName);
+    extractJobId();
+  }, [paymentConfirmed, paymentTxHash, startTraining]);
+
   const hasSession = session !== null;
   const [wantsStoreOn0G, setWantsStoreOn0G] = useState(false);
   const [currentVersion, setCurrentVersion] = useState('1.0.0');
+  const [currentModelName, setCurrentModelName] = useState('');
   const [history, setHistory] = useState<TrainingHistoryEntry[]>([]);
   const historyRecordedRef = useRef(false);
 
@@ -1339,10 +1582,32 @@ function TrainPageInner() {
     });
   }, [zeroGResult, session]);
 
-  const handleStart = (config: TrainingJobConfig, opts: { storeOn0G: boolean; version: string }) => {
-    setWantsStoreOn0G(opts.storeOn0G);
-    setCurrentVersion(opts.version);
-    startTraining(config);
+  const handleStart = (config: TrainingJobConfig, opts: { storeOn0G: boolean; version: string; modelName: string; modelSlug: string }) => {
+    // Save config for after wallet confirmation
+    pendingConfigRef.current = { config, opts };
+    setWalletPaymentError(null);
+
+    const coordinatorAddress = getContractAddress(chainId, 'helixCoordinator') as `0x${string}`;
+    const archHash = computeArchitectureHash(config.architecture);
+    const paymentWei = parseEther(String(config.payment_eth));
+
+    writeContract({
+      address: coordinatorAddress,
+      abi: HELIX_COORDINATOR_V4_ABI,
+      functionName: 'registerTrainingJob',
+      args: [
+        archHash,
+        BigInt(config.checkpoint_freq),
+        BigInt(config.num_steps),
+        paymentWei,
+        config.zk_mode === 'always',
+        BigInt(config.zk_checkpoint_freq),
+        config.zk_mode === 'risk',
+        BigInt(config.min_workers_for_mpc),
+        (operatorAddress ?? '0x0000000000000000000000000000000000000000') as `0x${string}`,
+      ],
+      value: paymentWei,
+    });
   };
 
   const handleClearHistory = useCallback(() => {
@@ -1373,6 +1638,27 @@ function TrainPageInner() {
         </motion.div>
       )}
 
+      {/* Wallet / payment errors */}
+      {(walletError || walletPaymentError) && (
+        <motion.div
+          initial={{ opacity: 0, y: -4 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="flex items-center gap-2.5 px-4 py-3 rounded-2xl bg-red-500/[0.06] border border-red-500/20"
+        >
+          <XCircle size={14} className="text-red-400 shrink-0" />
+          <p className="text-sm text-red-300">
+            {walletPaymentError || (walletError instanceof Error ? walletError.message : 'Wallet transaction failed')}
+          </p>
+          <button
+            type="button"
+            onClick={() => { resetWalletWrite(); setWalletPaymentError(null); }}
+            className="ml-auto text-xs text-red-400/60 hover:text-red-300 transition-colors shrink-0"
+          >
+            Dismiss
+          </button>
+        </motion.div>
+      )}
+
       {!hasSession ? (
         <ConfigForm
           onStart={handleStart}
@@ -1388,6 +1674,9 @@ function TrainPageInner() {
           onSelectModel={handleSelectModel}
           isFetchingWeights={isFetchingWeights}
           fetchedModelName={fetchedModelName}
+          isWalletPrompting={isWalletPrompting}
+          isConfirmingPayment={isConfirmingPayment}
+          walletConnected={!!address}
         />
       ) : (
         <LiveProgress
@@ -1396,6 +1685,7 @@ function TrainPageInner() {
           isConnected={isConnected}
           error={trainingError}
           version={currentVersion}
+          modelName={currentModelName}
           onDownloadModel={downloadModel}
           onStoreOnZeroG={storeOnZeroG}
           isStoringOnZeroG={isStoringOnZeroG}

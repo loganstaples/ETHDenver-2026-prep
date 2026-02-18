@@ -23,6 +23,10 @@ export interface TrainingJobConfig {
   stake_per_worker_eth: number;
   simulate_cheater: boolean;
   seed: number;
+  model_name?: string;
+  model_slug?: string;
+  /** Pre-registered on-chain job ID (user wallet already paid) */
+  job_id?: number;
 }
 
 export interface CheaterInfo {
@@ -49,6 +53,8 @@ export interface TrainingSessionState {
   job_id: number;
   elapsed_secs: number;
   started_at: number;
+  model_name?: string;
+  model_slug?: string;
 }
 
 export interface TrainingEvent {

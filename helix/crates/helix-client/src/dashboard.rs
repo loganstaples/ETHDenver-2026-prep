@@ -122,6 +122,16 @@ pub struct TrainingJobRequest {
     /// Transport mode: "local" (default) or "distributed"
     #[serde(default = "default_transport")]
     pub transport: String,
+    /// Display name for the model (e.g. "MNIST Classifier")
+    #[serde(default)]
+    pub model_name: Option<String>,
+    /// Kebab-case slug for the model (e.g. "mnist-classifier")
+    #[serde(default)]
+    pub model_slug: Option<String>,
+    /// Pre-registered on-chain job ID (user's wallet already paid).
+    /// When set, the backend skips Phase 5 (job registration).
+    #[serde(default)]
+    pub job_id: Option<u64>,
 }
 
 fn default_architecture() -> Vec<usize> { vec![784, 32, 10] }
@@ -171,6 +181,12 @@ pub struct TrainingSessionState {
     /// Final trained weights (populated when training completes)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub final_weights: Option<serde_json::Value>,
+    /// Display name for the model
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_name: Option<String>,
+    /// Kebab-case slug for the model
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_slug: Option<String>,
 }
 
 /// Request body for uploading training data.
@@ -477,6 +493,8 @@ impl Default for TrainingSessionState {
             elapsed_secs: 0.0,
             started_at: 0.0,
             final_weights: None,
+            model_name: None,
+            model_slug: None,
         }
     }
 }
@@ -646,6 +664,8 @@ pub fn create_dashboard_router_with_state(state: Arc<DashboardState>) -> Router 
         .route("/api/nodes", get(nodes_handler))
         .route("/api/metrics", get(metrics_handler))
         .route("/api/events", get(events_handler))
+        // Operator address (for wallet payment flow)
+        .route("/api/operator-address", get(operator_address_handler))
         // Training job endpoints
         .route("/api/training/start", post(start_training_handler))
         .route("/api/training/sessions", get(list_sessions_handler))
@@ -950,6 +970,38 @@ async fn events_handler(
 }
 
 // ---------------------------------------------------------------------------
+// Handler: Operator Address
+// ---------------------------------------------------------------------------
+
+/// GET /api/operator-address — return the backend's ETH address (for use as operator param)
+async fn operator_address_handler() -> Json<serde_json::Value> {
+    // Derive the backend's ETH address from its private key.
+    let private_key = std::env::var("TESTNET_PRIVATE_KEY").unwrap_or_else(|_| {
+        // Anvil account #0
+        "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".to_string()
+    });
+    let pk = private_key.strip_prefix("0x").unwrap_or(&private_key);
+
+    let address = match pk.parse::<ethers::signers::LocalWallet>() {
+        Ok(wallet) => {
+            use ethers::signers::Signer;
+            format!("{:?}", wallet.address())
+        }
+        Err(_) => "0x0000000000000000000000000000000000000000".to_string(),
+    };
+
+    let chain_id: u64 = std::env::var("CHAIN_ID")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(31337);
+
+    Json(serde_json::json!({
+        "address": address,
+        "chain_id": chain_id,
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // Handlers: Training Job Submission
 // ---------------------------------------------------------------------------
 
@@ -1049,6 +1101,8 @@ async fn start_training_handler(
         elapsed_secs: 0.0,
         started_at: now,
         final_weights: None,
+        model_name: req.model_name.clone(),
+        model_slug: req.model_slug.clone(),
     };
 
     // Store session
@@ -1099,6 +1153,8 @@ async fn start_training_handler(
         use_pool_workers: false, // Will be set to true below if coordinator is pre-deployed
         #[cfg(feature = "chain")]
         enable_withdrawal: false,
+        #[cfg(feature = "chain")]
+        pre_registered_job_id: req.job_id,
         // Auto-detect: registered remote workers → distributed, otherwise local (single-machine)
         distributed: use_registered_workers || req.transport == "distributed",
         custom_training_data: None,

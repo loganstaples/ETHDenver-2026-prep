@@ -723,6 +723,39 @@ export const HELIX_MODEL_STORE_ABI = [
     },
 ] as const;
 
+// HelixCoordinatorV4 ABI — MPC-primary coordinator (wallet payment flow)
+export const HELIX_COORDINATOR_V4_ABI = [
+    {
+        name: 'registerTrainingJob',
+        type: 'function',
+        stateMutability: 'payable',
+        inputs: [
+            { name: 'architectureHash', type: 'bytes32' },
+            { name: 'checkpointFreq', type: 'uint256' },
+            { name: 'numRounds', type: 'uint256' },
+            { name: 'paymentAmount', type: 'uint256' },
+            { name: 'zkEnabled', type: 'bool' },
+            { name: 'zkCheckpointFreq', type: 'uint256' },
+            { name: 'riskZkEnabled', type: 'bool' },
+            { name: 'minWorkersForMpc', type: 'uint256' },
+            { name: 'operator', type: 'address' },
+        ],
+        outputs: [{ name: 'jobId', type: 'uint256' }],
+    },
+    {
+        name: 'JobRegistered',
+        type: 'event',
+        inputs: [
+            { name: 'jobId', type: 'uint256', indexed: true },
+            { name: 'owner', type: 'address', indexed: true },
+            { name: 'architectureHash', type: 'bytes32', indexed: false },
+            { name: 'checkpointFreq', type: 'uint256', indexed: false },
+            { name: 'numRounds', type: 'uint256', indexed: false },
+            { name: 'paymentAmount', type: 'uint256', indexed: false },
+        ],
+    },
+] as const;
+
 export const ABIS = {
     helixCoordinator: HELIX_COORDINATOR_ABI,
     helixToken: HELIX_TOKEN_ABI,

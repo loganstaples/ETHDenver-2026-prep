@@ -578,7 +578,7 @@ struct SpawnWorkersArgs {
     public_addr: Option<String>,
 
     /// Dashboard API URL to register workers with (e.g. http://localhost:3001)
-    #[arg(long)]
+    #[arg(long, default_value = "http://localhost:3001")]
     api_url: Option<String>,
 
     /// Ethereum RPC URL for on-chain worker pool registration
@@ -2073,7 +2073,7 @@ async fn cmd_dashboard(args: &DashboardArgs, _cli: &Cli, mut shutdown: broadcast
 
     let config = dashboard::DashboardConfig {
         auth_token: None,
-        allowed_origins: if args.cors { Vec::new() } else { vec!["http://localhost".to_string()] },
+        allowed_origins: Vec::new(), // Allow all origins (dev/demo mode)
         rate_limit_per_second: 30,
     };
 
@@ -2859,6 +2859,8 @@ async fn cmd_mpc_train(args: &MpcTrainArgs, _cli: &Cli) -> Result<()> {
         use_pool_workers: false, // CLI mpc-train manages its own workers
         #[cfg(feature = "chain")]
         enable_withdrawal: args.enable_withdrawal,
+        #[cfg(feature = "chain")]
+        pre_registered_job_id: None,
         zk_mode: parse_zk_mode(&args.zk_mode)?,
         distributed: args.transport == "distributed",
         custom_training_data: None,
