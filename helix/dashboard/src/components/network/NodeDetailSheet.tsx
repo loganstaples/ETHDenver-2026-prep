@@ -293,12 +293,12 @@ export function NodeDetailSheet({ node, onClose }: NodeDetailSheetProps) {
                   <StatRow
                     icon={Coins}
                     label="Staked"
-                    value={`${Number(formatEther(node.stakedAmount)).toFixed(2)} ETH`}
+                    value={`${Number(formatEther(node.stakedAmount)).toFixed(2)} ADI`}
                   />
                   <StatRow
                     icon={Coins}
                     label="Total Earnings"
-                    value={`${Number(formatEther(node.earningsTotal)).toFixed(2)} ETH`}
+                    value={`${Number(formatEther(node.earningsTotal)).toFixed(2)} ADI`}
                   />
                   <StatRow
                     icon={ShieldCheck}

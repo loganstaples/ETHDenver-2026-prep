@@ -843,7 +843,7 @@ function SettingsTab({
           <>
             <div className="flex items-end gap-3">
               <div className="flex-1">
-                <label className="label-text block mb-1.5">Sale Price (ETH)</label>
+                <label className="label-text block mb-1.5">Sale Price (ADI)</label>
                 <input
                   type="number"
                   value={priceInput}
@@ -878,12 +878,12 @@ function SettingsTab({
             <div className="mt-3 px-3 py-2 bg-helix-bg rounded-md border border-helix-border/50">
               <div className="flex items-center justify-between text-2xs text-helix-muted">
                 <span>Current on-chain price</span>
-                <span className="font-mono">{model.salePrice > 0 ? `${model.salePrice} ETH` : 'Not set'}</span>
+                <span className="font-mono">{model.salePrice > 0 ? `${model.salePrice} ADI` : 'Not set'}</span>
               </div>
               {priceChanged && (
                 <div className="flex items-center justify-between text-2xs text-white mt-1">
                   <span>New price</span>
-                  <span className="font-mono">{parsedPrice} ETH</span>
+                  <span className="font-mono">{parsedPrice} ADI</span>
                 </div>
               )}
             </div>

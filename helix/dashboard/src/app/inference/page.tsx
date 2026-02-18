@@ -61,7 +61,7 @@ const CANVAS_SIZE = 280;
 const GRID_SIZE = 28;
 const BRUSH_RADIUS = 12;
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
-const BASE_INFERENCE_COST = 0.001; // ETH per inference
+const BASE_INFERENCE_COST = 0.001; // ADI per inference
 
 // ============================================================================
 // Drawing Canvas
@@ -1005,12 +1005,12 @@ function InferencePageInner() {
                 <span className="text-5xl font-bold tracking-tighter tabular-nums text-white">
                   {totalFee.toFixed(6)}
                 </span>
-                <span className="text-xl font-semibold text-helix-text2">ETH</span>
+                <span className="text-xl font-semibold text-helix-text2">ADI</span>
               </div>
 
               {/* Fee breakdown */}
               <div className="flex items-center justify-center gap-4 mt-3 text-sm text-helix-dim">
-                <span>Workers: {BASE_INFERENCE_COST.toFixed(4)} ETH</span>
+                <span>Workers: {BASE_INFERENCE_COST.toFixed(4)} ADI</span>
                 {ownerFeeBps > 0 && (
                   <>
                     <span>+</span>

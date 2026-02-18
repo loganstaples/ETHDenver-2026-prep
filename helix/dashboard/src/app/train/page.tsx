@@ -306,7 +306,7 @@ function PaymentNumber({
         )}
       </div>
       <span className={cn('text-2xl font-semibold transition-colors duration-500', colorClass)}>
-        ETH
+        ADI
       </span>
     </div>
   );
@@ -540,7 +540,7 @@ function ConfigForm({
             <SettingRow label="Stake / Worker">
               <div className="flex items-center gap-1.5">
                 <NumberInput value={stakePerWorkerEth} onChange={setStakePerWorkerEth} step={0.01} min={0} />
-                <span className="text-sm text-helix-dim shrink-0">ETH</span>
+                <span className="text-sm text-helix-dim shrink-0">ADI</span>
               </div>
             </SettingRow>
           </div>
@@ -607,7 +607,7 @@ function ConfigForm({
                       transition={{ duration: 0.2 }}
                       className="absolute top-0 right-0 text-sm text-helix-dim whitespace-nowrap"
                     >
-                      Rec: {recommendedPayment.toFixed(4)} ETH
+                      Rec: {recommendedPayment.toFixed(4)} ADI
                     </motion.span>
                   )}
                 </AnimatePresence>

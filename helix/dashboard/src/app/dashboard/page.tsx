@@ -251,12 +251,12 @@ function WorkerModal({ worker, onClose }: { worker: WorkerHealth; onClose: () =>
             <div className="bg-helix-bg rounded-xl px-4 py-3">
               <div className="text-xs text-helix-muted mb-1">Earnings</div>
               <div className="text-lg font-mono font-medium text-white tabular-nums">{earnings.toFixed(2)}</div>
-              <div className="text-xs text-helix-muted">ETH</div>
+              <div className="text-xs text-helix-muted">ADI</div>
             </div>
             <div className="bg-helix-bg rounded-xl px-4 py-3">
               <div className="text-xs text-helix-muted mb-1">Stake</div>
               <div className="text-lg font-mono font-medium text-white tabular-nums">{stake.toFixed(2)}</div>
-              <div className="text-xs text-helix-muted">ETH</div>
+              <div className="text-xs text-helix-muted">ADI</div>
             </div>
             <div className="bg-helix-bg rounded-xl px-4 py-3">
               <div className="text-xs text-helix-muted mb-1">Success</div>
@@ -637,7 +637,7 @@ export default function DashboardPage() {
                       </span>
                       <span className="text-xs text-helix-muted capitalize w-20">{w.activity}</span>
                       <span className="text-sm text-white font-mono tabular-nums w-20 text-right">
-                        {eth.toFixed(2)} <span className="text-helix-muted text-xs">ETH</span>
+                        {eth.toFixed(2)} <span className="text-helix-muted text-xs">ADI</span>
                       </span>
                     </button>
                   );
@@ -782,25 +782,23 @@ export default function DashboardPage() {
                               {req.phase}
                             </span>
                           </div>
-                          <button className="text-xs px-3.5 py-1.5 rounded-lg bg-white/[0.04] text-helix-text2 hover:bg-red-500/10 hover:text-red-400 transition-all">
+                          <button className="text-sm px-5 py-2 rounded-xl bg-white/[0.06] text-helix-text2 hover:bg-red-500/10 hover:text-red-400 transition-all font-medium">
                             Cancel
                           </button>
                         </div>
 
                         <div className="text-sm text-helix-muted mb-5">{req.inputLabel}</div>
 
-                        <div className="flex items-center gap-8">
+                        <div className="grid grid-cols-3 gap-4">
                           <div>
                             <div className="text-[10px] uppercase tracking-wider text-helix-muted mb-1">Workers</div>
                             <div className="text-lg font-medium text-white tabular-nums">{req.workers} nodes</div>
                           </div>
-                          <div className="w-px h-8 bg-helix-border" />
-                          <div>
+                          <div className="border-l border-helix-border pl-4">
                             <div className="text-[10px] uppercase tracking-wider text-helix-muted mb-1">Elapsed</div>
                             <div className="text-lg font-medium text-white tabular-nums font-mono">{elapsedSince(req.created)}</div>
                           </div>
-                          <div className="w-px h-8 bg-helix-border" />
-                          <div>
+                          <div className="border-l border-helix-border pl-4">
                             <div className="text-[10px] uppercase tracking-wider text-helix-muted mb-1">Status</div>
                             <div className="flex items-center gap-2">
                               <div className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
@@ -855,20 +853,18 @@ export default function DashboardPage() {
                           Predicted &ldquo;{req.result}&rdquo; with {req.confidence != null ? `${(req.confidence * 100).toFixed(1)}%` : '—'} confidence
                         </div>
 
-                        <div className="flex items-center gap-8">
+                        <div className="grid grid-cols-3 gap-4">
                           <div>
                             <div className="text-[10px] uppercase tracking-wider text-helix-muted mb-1">Result</div>
                             <div className="text-lg font-medium text-white tabular-nums">{req.result}</div>
                           </div>
-                          <div className="w-px h-8 bg-helix-border" />
-                          <div>
+                          <div className="border-l border-helix-border pl-4">
                             <div className="text-[10px] uppercase tracking-wider text-helix-muted mb-1">Confidence</div>
                             <div className="text-lg font-medium text-white tabular-nums font-mono">
                               {req.confidence != null ? `${(req.confidence * 100).toFixed(1)}%` : '—'}
                             </div>
                           </div>
-                          <div className="w-px h-8 bg-helix-border" />
-                          <div>
+                          <div className="border-l border-helix-border pl-4">
                             <div className="text-[10px] uppercase tracking-wider text-helix-muted mb-1">Duration</div>
                             <div className="text-lg font-medium text-white tabular-nums font-mono">
                               {req.duration != null ? formatDuration(req.duration) : '—'}

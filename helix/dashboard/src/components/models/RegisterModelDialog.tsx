@@ -118,7 +118,7 @@ export function RegisterModelDialog({ isOpen, onClose }: RegisterModelDialogProp
               htmlFor="min-stake"
               className="block text-2xs font-mono uppercase tracking-wider text-helix-muted"
             >
-              Minimum Stake (ETH)
+              Minimum Stake (ADI)
             </label>
             <input
               id="min-stake"

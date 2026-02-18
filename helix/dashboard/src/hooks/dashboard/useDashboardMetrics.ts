@@ -44,7 +44,7 @@ export function useDashboardMetrics(selectedModelId: bigint) {
             ...proofEvents.map(e => ({ ...e, type: 'PROOF', severity: 'info', message: `Proof submitted for model #${e.modelId}` })),
             ...roundStartedEvents.map(e => ({ ...e, type: 'ROUND_START', severity: 'success', message: `Round #${e.roundId} started` })),
             ...roundCompletedEvents.map(e => ({ ...e, type: 'ROUND_END', severity: 'success', message: `Round #${e.roundId} completed` })),
-            ...stakedEvents.map(e => ({ ...e, type: 'STAKE', severity: 'warning', message: `New stake deposit: ${(Number(e.amount) / 1e18).toFixed(2)} ETH` })),
+            ...stakedEvents.map(e => ({ ...e, type: 'STAKE', severity: 'warning', message: `New stake deposit: ${(Number(e.amount) / 1e18).toFixed(2)} ADI` })),
             ...slashedEvents.map(e => ({ ...e, type: 'SLASH', severity: 'error', message: `Prover slashed for misconduct` })),
         ].sort((a, b) => b.timestamp - a.timestamp);
 

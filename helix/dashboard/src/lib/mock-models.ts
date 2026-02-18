@@ -29,7 +29,7 @@ export const MOCK_MODELS = [
     isPublic: true,
     inferenceFee: 250, // 2.5%
     forSale: true,
-    salePrice: 0.5, // ETH
+    salePrice: 0.5, // ADI
     versions: [
       {
         semver: '1.0.0',
@@ -68,7 +68,7 @@ export const MOCK_MODELS = [
     isPublic: true,
     inferenceFee: 500, // 5%
     forSale: true,
-    salePrice: 1.2, // ETH
+    salePrice: 1.2, // ADI
     versions: [
       {
         semver: '0.1.0',
@@ -130,7 +130,7 @@ export const MOCK_MODELS = [
     isPublic: true,
     inferenceFee: 1000, // 10%
     forSale: true,
-    salePrice: 2.5, // ETH
+    salePrice: 2.5, // ADI
     versions: [
       {
         semver: '1.0.0',

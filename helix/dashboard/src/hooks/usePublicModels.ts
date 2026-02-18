@@ -22,7 +22,7 @@ export interface PublicModel {
   isPublic: boolean;
   inferenceFee: number;
   forSale: boolean;
-  salePrice: number; // in ETH
+  salePrice: number; // in ADI
   versionCount: number;
   latestVersion: OnChainVersion | null;
   bestAccuracy: number;

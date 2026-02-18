@@ -99,7 +99,7 @@ export function StakingPanel({ modelId }: StakingPanelProps) {
             <p className="text-2xl font-light tracking-tight text-helix-text">
               {stake ? formatEth(stake.amount) : '0'}
             </p>
-            <p className="text-2xs text-helix-dim font-mono">ETH</p>
+            <p className="text-2xs text-helix-dim font-mono">ADI</p>
           </div>
 
           {/* Lock Status */}
@@ -158,7 +158,7 @@ export function StakingPanel({ modelId }: StakingPanelProps) {
             htmlFor="stake-amount"
             className="text-2xs text-helix-muted uppercase tracking-wider"
           >
-            Amount (ETH)
+            Amount (ADI)
           </label>
           <input
             id="stake-amount"

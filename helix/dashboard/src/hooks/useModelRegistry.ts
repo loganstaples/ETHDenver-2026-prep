@@ -23,7 +23,7 @@ export interface ModelWithVersions {
   isPublic: boolean;
   inferenceFee: number;
   forSale: boolean;
-  salePrice: number; // in ETH
+  salePrice: number; // in ADI
   versions: OnChainVersion[];
 }
 
@@ -332,7 +332,7 @@ export function useModelRegistry(): UseModelRegistryReturn {
   const setSalePrice = useCallback(
     (params: { tokenId: number; priceEth: number }) => {
       if (USE_MOCK_DATA || !isConnected || !isContractDeployed) return;
-      // Convert ETH to wei (BigInt)
+      // Convert ADI to wei (BigInt)
       const priceWei = BigInt(Math.round(params.priceEth * 1e18));
       writeContract({
         address: addr,

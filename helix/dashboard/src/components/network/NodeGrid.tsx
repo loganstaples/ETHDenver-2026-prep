@@ -92,7 +92,7 @@ function NodeCard({ node, index, onClick }: NodeCardProps) {
           <Stat label="Rep." value={node.reputation.toFixed(1)} />
           <Stat
             label="Stake"
-            value={`${Number(formatEther(node.stakedAmount)).toFixed(1)} ETH`}
+            value={`${Number(formatEther(node.stakedAmount)).toFixed(1)} ADI`}
           />
         </div>
       </Card>

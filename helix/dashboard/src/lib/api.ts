@@ -1008,13 +1008,13 @@ export function generateMockErrorLogs(): StatusErrorLog[] {
 export function generateMockContractState(): ContractStateSnapshot {
     return {
         nextModelId: '5',
-        defaultMinStake: '1000000000000000000', // 1 ETH
+        defaultMinStake: '1000000000000000000', // 1 ADI
         stakeLockPeriod: '604800', // 7 days in seconds
         slashPercentage: '10',
         maxErrorBound: '1000000000000000', // 0.001 in wei-like format
         slashingRecordCount: '3',
         activeModels: 4,
-        totalStaked: '150000000000000000000', // 150 ETH
+        totalStaked: '150000000000000000000', // 150 ADI
     };
 }
 

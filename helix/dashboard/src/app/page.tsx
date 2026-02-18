@@ -47,11 +47,11 @@ function formatFee(bps: number): string {
   return `${(bps / 100).toFixed(bps % 100 === 0 ? 0 : 1)}%`;
 }
 
-function formatEthPrice(eth: number): string {
-  if (eth === 0) return 'Free';
-  if (eth < 0.001) return `${eth.toExponential(2)} ETH`;
-  if (eth < 1) return `${eth.toFixed(4)} ETH`;
-  return `${eth.toFixed(2)} ETH`;
+function formatAdiPrice(adi: number): string {
+  if (adi === 0) return 'Free';
+  if (adi < 0.001) return `${adi.toExponential(2)} ADI`;
+  if (adi < 1) return `${adi.toFixed(4)} ADI`;
+  return `${adi.toFixed(2)} ADI`;
 }
 
 // ============================================================================
@@ -292,7 +292,7 @@ function BuyConfirmationModal({
           <div className="border-t border-helix-border my-2" />
           <div className="flex items-center justify-between">
             <span className="text-sm font-medium text-helix-muted">Price</span>
-            <span className="text-lg font-mono font-medium text-green-400">{formatEthPrice(model.salePrice)}</span>
+            <span className="text-lg font-mono font-medium text-green-400">{formatAdiPrice(model.salePrice)}</span>
           </div>
         </div>
 
@@ -319,7 +319,7 @@ function BuyConfirmationModal({
             ) : (
               <>
                 <ShoppingCart size={14} />
-                Buy for {formatEthPrice(model.salePrice)}
+                Buy for {formatAdiPrice(model.salePrice)}
               </>
             )}
           </button>
@@ -477,7 +477,7 @@ function MarketplaceModelCard({
             Sale Price
           </span>
           <span className="text-xl font-mono font-medium text-green-400">
-            {isContactOwner ? 'Contact Owner' : formatEthPrice(model.salePrice)}
+            {isContactOwner ? 'Contact Owner' : formatAdiPrice(model.salePrice)}
           </span>
         </div>
       </div>
@@ -525,7 +525,7 @@ function MarketplaceModelCard({
         <div className="bg-helix-bg rounded-md px-3 py-2 text-center">
           <p className="text-2xs text-helix-muted">Sale Price</p>
           <p className="text-lg font-mono font-light text-green-400">
-            {isContactOwner ? 'N/A' : formatEthPrice(model.salePrice)}
+            {isContactOwner ? 'N/A' : formatAdiPrice(model.salePrice)}
           </p>
         </div>
       </div>
@@ -769,14 +769,14 @@ export default function ModelsPage() {
           />
           <StatCard
             label="Avg Price"
-            value={marketplaceStats.avgPrice > 0 ? formatEthPrice(marketplaceStats.avgPrice) : '--'}
+            value={marketplaceStats.avgPrice > 0 ? formatAdiPrice(marketplaceStats.avgPrice) : '--'}
             icon={<DollarSign size={14} />}
           />
           <StatCard
             label="Price Range"
             value={
               marketplaceStats.minPrice > 0
-                ? `${formatEthPrice(marketplaceStats.minPrice)} - ${formatEthPrice(marketplaceStats.maxPrice)}`
+                ? `${formatAdiPrice(marketplaceStats.minPrice)} - ${formatAdiPrice(marketplaceStats.maxPrice)}`
                 : '--'
             }
             icon={<ArrowUpDown size={14} />}

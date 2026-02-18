@@ -464,7 +464,7 @@ export default function ActivityPage() {
               <div className="text-3xl font-semibold text-white tabular-nums font-mono">
                 {totalRevenue.toFixed(4)}
               </div>
-              <div className="text-xs text-helix-muted mt-0.5">ETH</div>
+              <div className="text-xs text-helix-muted mt-0.5">ADI</div>
             </div>
             <div>
               <div className="text-xs text-helix-muted mb-1">Total Requests</div>
