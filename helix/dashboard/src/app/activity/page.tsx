@@ -30,17 +30,28 @@ import type { SimulationNodeDatum, SimulationLinkDatum, Simulation } from 'd3-fo
 import { cn } from '@/lib/utils';
 import { useNodes, type WorkerNode, type NetworkConnection } from '@/hooks/useNodes';
 import { usePublicModels } from '@/hooks/usePublicModels';
+import { useBackendApi, type BackendEvent } from '@/hooks/useBackendApi';
 import { useAccount } from 'wagmi';
 
 // ============================================================================
 // Network Graph
 // ============================================================================
 
+interface InferenceCluster {
+  requestId: string;
+  modelName: string;
+  modelTokenId: number;
+  workerIds: string[];
+  status: 'active' | 'completed';
+}
+
 interface GNode extends SimulationNodeDatum {
   id: string;
-  type: WorkerNode['type'];
+  type: WorkerNode['type'] | 'model';
   radius: number;
   cluster: number;
+  isModelNode?: boolean;
+  label?: string;
 }
 
 interface GLink extends SimulationLinkDatum<GNode> {
@@ -56,9 +67,11 @@ interface GLink extends SimulationLinkDatum<GNode> {
 function NetworkGraph({
   nodes,
   connections,
+  clusters,
 }: {
   nodes: WorkerNode[];
   connections: NetworkConnection[];
+  clusters: InferenceCluster[];
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -86,12 +99,13 @@ function NetworkGraph({
     return () => obs.disconnect();
   }, []);
 
-  // Topology key — only recreate sim when node IDs or connections change
+  // Topology key — only recreate sim when node IDs, connections, or clusters change
   const topologyKey = useMemo(() => {
     const ids = nodes.map((n) => n.id).sort().join(',');
     const conns = connections.map((c) => `${c.from}-${c.to}`).sort().join(',');
-    return `${ids}|${conns}`;
-  }, [nodes, connections]);
+    const cls = clusters.map((c) => `${c.modelTokenId}:${c.workerIds.sort().join('+')}`).join(',');
+    return `${ids}|${conns}|${cls}`;
+  }, [nodes, connections, clusters]);
 
   // Build simulation
   useEffect(() => {
@@ -109,11 +123,30 @@ function NetworkGraph({
     const cx = w / 2;
     const cy = h / 2;
 
-    // Assign clusters (simulate grouping by request)
-    const clusterCount = Math.max(2, Math.ceil(nodes.length / 3));
-    const gNodes: GNode[] = nodes.map((n, i) => {
+    // Build cluster map: workerId -> cluster index
+    const workerClusterMap = new Map<string, number>();
+    clusters.forEach((c, idx) => {
+      c.workerIds.forEach((wid) => workerClusterMap.set(wid, idx));
+    });
+
+    const clusterCount = Math.max(1, clusters.length);
+
+    // Model center nodes (one per cluster)
+    const modelCenterNodes: GNode[] = clusters.map((c, idx) => ({
+      id: `model-${c.modelTokenId}-${idx}`,
+      type: 'model' as const,
+      radius: 14,
+      cluster: idx,
+      isModelNode: true,
+      label: c.modelName,
+      x: oldPositions.get(`model-${c.modelTokenId}-${idx}`)?.x ?? cx + (Math.random() - 0.5) * w * 0.2,
+      y: oldPositions.get(`model-${c.modelTokenId}-${idx}`)?.y ?? cy + (Math.random() - 0.5) * h * 0.2,
+    }));
+
+    // Worker nodes assigned to clusters
+    const workerGNodes: GNode[] = nodes.map((n) => {
       const old = oldPositions.get(n.id);
-      const cluster = i % clusterCount;
+      const cluster = workerClusterMap.get(n.id) ?? 0;
       return {
         id: n.id,
         type: n.type,
@@ -124,8 +157,23 @@ function NetworkGraph({
       };
     });
 
+    const gNodes: GNode[] = [...modelCenterNodes, ...workerGNodes];
+
+    // Create links: each worker connects to its model center
+    const clusterLinks: GLink[] = clusters.flatMap((c, idx) =>
+      c.workerIds
+        .filter((wid) => nodes.some((n) => n.id === wid))
+        .map((wid) => ({
+          source: `model-${c.modelTokenId}-${idx}`,
+          target: wid,
+          latency: 50,
+          connectionStatus: 'active' as const,
+        })),
+    );
+
+    // Also keep any real inter-worker connections
     const nodeIds = new Set(gNodes.map((n) => n.id));
-    const gLinks: GLink[] = connections
+    const workerLinks: GLink[] = connections
       .filter((c) => nodeIds.has(c.from) && nodeIds.has(c.to))
       .map((c) => ({
         source: c.from,
@@ -133,6 +181,8 @@ function NetworkGraph({
         latency: c.latency,
         connectionStatus: c.status,
       }));
+
+    const gLinks = [...clusterLinks, ...workerLinks];
 
     graphNodesRef.current = gNodes;
     graphLinksRef.current = gLinks;
@@ -169,7 +219,16 @@ function NetworkGraph({
 
     simRef.current = sim;
     return () => { sim.stop(); };
-  }, [topologyKey, canvasSize.width, canvasSize.height, nodes, connections]);
+  }, [topologyKey, canvasSize.width, canvasSize.height, nodes, connections, clusters]);
+
+  // Cluster colors (soft pastels)
+  const CLUSTER_COLORS = [
+    'rgba(96,165,250,',   // blue
+    'rgba(167,139,250,',  // purple
+    'rgba(251,146,60,',   // orange
+    'rgba(52,211,153,',   // green
+    'rgba(251,113,133,',  // pink
+  ];
 
   // Render loop
   useEffect(() => {
@@ -221,9 +280,44 @@ function NetworkGraph({
         ctx.setLineDash([]);
       });
 
-      // Nodes — all white-ish
+      // Nodes
       gNodes.forEach((node) => {
         if (node.x == null || node.y == null) return;
+
+        if (node.isModelNode) {
+          // Model center node — colored by cluster
+          const clr = CLUSTER_COLORS[node.cluster % CLUSTER_COLORS.length];
+
+          // Outer glow
+          const glowR = node.radius * 5;
+          const glow = ctx.createRadialGradient(node.x, node.y, node.radius * 0.5, node.x, node.y, glowR);
+          glow.addColorStop(0, `${clr}${0.12 + Math.sin(pulse * 1.5) * 0.04})`);
+          glow.addColorStop(1, `${clr}0)`);
+          ctx.beginPath();
+          ctx.arc(node.x, node.y, glowR, 0, Math.PI * 2);
+          ctx.fillStyle = glow;
+          ctx.fill();
+
+          // Core
+          ctx.beginPath();
+          ctx.arc(node.x, node.y, node.radius, 0, Math.PI * 2);
+          ctx.fillStyle = `${clr}0.9)`;
+          ctx.fill();
+          ctx.strokeStyle = `${clr}0.3)`;
+          ctx.lineWidth = 1;
+          ctx.stroke();
+
+          // Label
+          if (node.label) {
+            ctx.fillStyle = 'rgba(255,255,255,0.6)';
+            ctx.font = '9px monospace';
+            ctx.textAlign = 'center';
+            ctx.fillText(node.label.slice(0, 16), node.x, node.y + node.radius + 12);
+          }
+          return;
+        }
+
+        // Worker nodes — white-ish rendering
         const status = statusMap.get(node.id) ?? 'active';
         const isOffline = status === 'offline';
         const isActive = status === 'active' || status === 'proving' || status === 'training';
@@ -342,93 +436,64 @@ export default function ActivityPage() {
     [allModels, address],
   );
 
-  const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
-
-  // Fetch backend events + localStorage inference history
-  const [backendEvents, setBackendEvents] = useState<Array<{
-    type: string;
-    timestamp?: number;
-    [key: string]: unknown;
-  }>>([]);
+  const { fetchInferenceEvents } = useBackendApi({ enabled: false });
+  const [inferenceEvents, setInferenceEvents] = useState<BackendEvent[]>([]);
 
   useEffect(() => {
-    const fetchEvents = async () => {
-      try {
-        const res = await fetch(`${API_BASE}/api/events`);
-        if (res.ok) {
-          const data = await res.json();
-          setBackendEvents(Array.isArray(data) ? data : []);
-        }
-      } catch {
-        // Non-fatal
-      }
+    if (!address) return;
+    const load = async () => {
+      const evts = await fetchInferenceEvents(address);
+      setInferenceEvents(evts);
     };
-    fetchEvents();
-    const interval = setInterval(fetchEvents, 10000);
+    load();
+    const interval = setInterval(load, 10000);
     return () => clearInterval(interval);
-  }, [API_BASE]);
+  }, [address, fetchInferenceEvents]);
 
-  // Build unified request list from backend events + localStorage inference history
+  // Build unified request list from backend inference events
   const requests = useMemo(() => {
-    const items: InferenceRequest[] = [];
+    return inferenceEvents
+      .map((evt, i) => ({
+        id: (evt.session_id as string) ?? `evt-${i}`,
+        timestamp: (evt.timestamp as number) ?? Date.now() - i * 1000,
+        requester: (evt.requester as string) ?? '0x000000',
+        modelTokenId: (evt.model_token_id as number) ?? 0,
+        modelName: modelNames.get((evt.model_token_id as number) ?? 0) ?? 'Unknown',
+        prediction: (evt.prediction as number) ?? 0,
+        confidence: (evt.confidence as number) ?? 0,
+        fee: (evt.fee as number) ?? 0,
+        ownerRevenue: (evt.fee as number) ?? 0,
+        latency: (evt.latency as number) ?? 0,
+        workers: (evt.workers as number) ?? 3,
+        status: 'completed' as const,
+      }))
+      .sort((a, b) => b.timestamp - a.timestamp);
+  }, [inferenceEvents, modelNames]);
 
-    // Map backend events to InferenceRequest
-    backendEvents.forEach((evt, i) => {
-      const ts = (evt.timestamp as number) ?? Date.now() - i * 1000;
-      if (evt.type === 'training_step' || evt.type === 'phase_started' || evt.type === 'checkpoint_submitted') {
-        items.push({
-          id: `evt-${i}`,
-          timestamp: ts,
-          requester: (evt.session_id as string) ?? '0x000000',
-          modelTokenId: 0,
-          modelName: modelNames.get(0) ?? 'Training',
-          prediction: 0,
-          confidence: 0,
-          fee: 0,
-          ownerRevenue: 0,
-          latency: 0,
-          workers: 3,
-          status: 'completed',
+  // Build clusters from inference events (grouped by model token ID)
+  const clusters = useMemo(() => {
+    const clusterMap = new Map<number, InferenceCluster>();
+    inferenceEvents.forEach((evt) => {
+      const tokenId = (evt.model_token_id as number) ?? 0;
+      if (!clusterMap.has(tokenId)) {
+        clusterMap.set(tokenId, {
+          requestId: (evt.session_id as string) ?? `req-${tokenId}`,
+          modelName: modelNames.get(tokenId) ?? `Model #${tokenId}`,
+          modelTokenId: tokenId,
+          workerIds: [],
+          status: 'active',
+        });
+      }
+      const cluster = clusterMap.get(tokenId)!;
+      const wids = evt.worker_ids;
+      if (Array.isArray(wids)) {
+        (wids as string[]).forEach((wid) => {
+          if (!cluster.workerIds.includes(wid)) cluster.workerIds.push(wid);
         });
       }
     });
-
-    // Map localStorage inference history
-    try {
-      const raw = localStorage.getItem('helix-inference-history');
-      if (raw) {
-        const history = JSON.parse(raw) as Array<{
-          id: string;
-          model: string;
-          result: string | null;
-          confidence: number | null;
-          duration: number | null;
-          workers: number;
-          created: number;
-        }>;
-        history.forEach((entry) => {
-          items.push({
-            id: entry.id,
-            timestamp: entry.created,
-            requester: address ?? '0x000000',
-            modelTokenId: 0,
-            modelName: entry.model,
-            prediction: entry.result ? Number(entry.result) : 0,
-            confidence: entry.confidence ?? 0,
-            fee: 0.001,
-            ownerRevenue: 0,
-            latency: entry.duration ?? 0,
-            workers: entry.workers,
-            status: 'completed',
-          });
-        });
-      }
-    } catch {
-      // Ignore parse errors
-    }
-
-    return items.sort((a, b) => b.timestamp - a.timestamp);
-  }, [backendEvents, modelNames, address]);
+    return Array.from(clusterMap.values());
+  }, [inferenceEvents, modelNames]);
 
   // Build timeline data from requests (hourly bins over last 24h)
   const timelineData = useMemo(() => {
@@ -467,9 +532,15 @@ export default function ActivityPage() {
     return result;
   }, [requests, search, sortField, sortAsc]);
 
-  const totalRevenue = requests.reduce((s, r) => s + r.ownerRevenue, 0);
+  const totalRevenue = useMemo(
+    () => requests.reduce((s, r) => s + r.ownerRevenue, 0),
+    [requests],
+  );
   const totalRequests = requests.length;
-  const avgLatency = requests.reduce((s, r) => s + r.latency, 0) / (requests.length || 1);
+  const avgLatency = useMemo(() => {
+    const latencies = requests.filter((r) => r.latency > 0).map((r) => r.latency);
+    return latencies.length > 0 ? latencies.reduce((a, b) => a + b, 0) / latencies.length : 0;
+  }, [requests]);
 
   const toggleSort = (field: typeof sortField) => {
     if (sortField === field) setSortAsc(!sortAsc);
@@ -507,11 +578,18 @@ export default function ActivityPage() {
         </div>
       </div>
 
+      {myModels.length === 0 && !address && (
+        <div className="bg-helix-surface border border-helix-border rounded-2xl p-16 text-center">
+          <div className="text-sm text-helix-muted">Connect your wallet to see activity</div>
+          <div className="text-xs text-helix-dim mt-2">Inference requests on your models will appear here</div>
+        </div>
+      )}
+
       {/* Network Graph + Summary */}
       <div className="grid grid-cols-3 gap-4">
         {/* Graph */}
         <div className="col-span-2 bg-helix-surface border border-helix-border rounded-2xl overflow-hidden" style={{ height: 340 }}>
-          <NetworkGraph nodes={nodes} connections={topology.connections} />
+          <NetworkGraph nodes={nodes} connections={topology.connections} clusters={clusters} />
         </div>
 
         {/* Summary */}
