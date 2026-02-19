@@ -389,11 +389,14 @@ export default function DashboardPage() {
     return () => clearInterval(interval);
   }, []);
 
-  // Chart data from losses array
-  const lossData = useMemo(
-    () => losses.slice(-80).map((l) => ({ step: l.step, value: Number(l.loss.toFixed(4)) })),
-    [losses],
-  );
+  // Chart data from losses array — downsample to ~200 points max, preserving full precision
+  const lossData = useMemo(() => {
+    if (losses.length <= 200) return losses.map((l) => ({ step: l.step, value: l.loss }));
+    const s = Math.ceil(losses.length / 200);
+    return losses
+      .filter((_, i) => i % s === 0 || i === losses.length - 1)
+      .map((l) => ({ step: l.step, value: l.loss }));
+  }, [losses]);
 
   // Accuracy chart: single point at completion or empty during training
   const accData = useMemo(() => {
