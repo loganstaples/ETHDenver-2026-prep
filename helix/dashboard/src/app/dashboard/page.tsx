@@ -4,6 +4,7 @@ import { useState, useEffect, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   ChevronDown,
+  ChevronRight,
   Pause,
   Square,
   CheckCircle,
@@ -11,6 +12,8 @@ import {
   Info,
   XCircle,
   X,
+  Users,
+  Shield,
 } from 'lucide-react';
 import {
   AreaChart,
@@ -22,6 +25,7 @@ import {
 } from 'recharts';
 import { cn } from '@/lib/utils';
 import { useDashboardSessions, type TrainingEvent } from '@/hooks/useDashboardSessions';
+import { useBackendApi, type BackendWorker } from '@/hooks/useBackendApi';
 import { useWorkerHealth, type WorkerHealth } from '@/hooks/useWorkerHealth';
 import { formatEther } from 'viem';
 
@@ -55,6 +59,18 @@ function formatDuration(ms: number): string {
 /** Live elapsed since timestamp, with seconds */
 function elapsedSince(ts: number): string {
   return formatDuration(Date.now() - ts);
+}
+
+function ReputationBadge({ score }: { score: number }) {
+  const display = Math.round(score * 100);
+  const color = display >= 80 ? 'text-green-400 bg-green-400/10'
+    : display >= 50 ? 'text-yellow-400 bg-yellow-400/10'
+    : 'text-red-400 bg-red-400/10';
+  return (
+    <span className={cn('text-xs font-mono font-medium px-2 py-0.5 rounded-md tabular-nums', color)}>
+      {display}
+    </span>
+  );
 }
 
 // ============================================================================
@@ -334,6 +350,10 @@ export default function DashboardPage() {
 
   const { workers: healthWorkers } = useWorkerHealth();
 
+  const { workers: backendWorkers, health: backendHealth, roundStatus } = useBackendApi({ refreshInterval: 5000 });
+  const [workerTab, setWorkerTab] = useState<'active' | 'inactive'>('active');
+  const [expandedWorker, setExpandedWorker] = useState<string | null>(null);
+
   // Map backend sessions to dropdown items
   const sessions: TrainingSession[] = useMemo(
     () => backendSessions.map((s) => ({
@@ -471,6 +491,16 @@ export default function DashboardPage() {
       return Number(formatEther(b.performance.totalEarnings)) - Number(formatEther(a.performance.totalEarnings));
     });
   }, [healthWorkers]);
+
+  const activeWorkers = useMemo(
+    () => backendWorkers.filter((w) => w.status !== 'offline' && w.status !== 'Excluded'),
+    [backendWorkers],
+  );
+  const inactiveWorkers = useMemo(
+    () => backendWorkers.filter((w) => w.status === 'offline' || w.status === 'Excluded'),
+    [backendWorkers],
+  );
+  const displayWorkers = workerTab === 'active' ? activeWorkers : inactiveWorkers;
 
   // Always exactly 3 Y-axis ticks spanning the data range (no 0 baseline)
   function niceTicks3(values: number[], decimals: number): number[] {
@@ -865,6 +895,163 @@ export default function DashboardPage() {
                     </div>
                   );
                 })
+              )}
+            </div>
+          </div>
+
+          {/* Worker Panel */}
+          <div className="bg-helix-surface border border-helix-border rounded-2xl overflow-hidden">
+            <div className="flex items-center justify-between px-6 py-4 border-b border-helix-border">
+              <div className="flex items-center gap-3">
+                <Users size={16} className="text-helix-muted" />
+                <span className="text-sm font-medium text-white">Workers</span>
+                {backendHealth && (
+                  <span className="text-xs text-helix-muted">
+                    {backendHealth.fault_tolerance.healthy_workers} healthy &middot; {backendHealth.fault_tolerance.degraded_workers} degraded &middot; {backendHealth.fault_tolerance.failed_workers} failed
+                  </span>
+                )}
+              </div>
+              <div className="flex bg-helix-bg rounded-lg p-0.5 border border-helix-border">
+                {(['active', 'inactive'] as const).map((t) => (
+                  <button
+                    key={t}
+                    onClick={() => setWorkerTab(t)}
+                    className={cn(
+                      'px-3 py-1 rounded-md text-xs font-medium transition-all capitalize',
+                      workerTab === t ? 'bg-white text-black' : 'text-helix-muted hover:text-white',
+                    )}
+                  >
+                    {t} ({t === 'active' ? activeWorkers.length : inactiveWorkers.length})
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Table Header */}
+            <div className="grid grid-cols-[1fr_70px_55px_50px_55px_65px_55px_65px_24px] gap-2 px-6 py-2.5 border-b border-helix-border bg-helix-bg/30 text-[10px] text-helix-muted uppercase tracking-wider">
+              <span>Worker</span>
+              <span>Status</span>
+              <span>Rep</span>
+              <span>CPU</span>
+              <span>Mem</span>
+              <span>Rounds</span>
+              <span>Success</span>
+              <span>Earnings</span>
+              <span></span>
+            </div>
+
+            {/* Worker Rows */}
+            <div className="max-h-[320px] overflow-y-auto">
+              {displayWorkers.map((w) => (
+                <div key={w.id}>
+                  <button
+                    type="button"
+                    onClick={() => setExpandedWorker(expandedWorker === w.id ? null : w.id)}
+                    className="w-full grid grid-cols-[1fr_70px_55px_50px_55px_65px_55px_65px_24px] gap-2 px-6 py-3 border-b border-helix-border/50 hover:bg-white/[0.015] text-xs transition-colors items-center text-left"
+                  >
+                    <span className="text-white font-mono truncate">
+                      {w.id.length > 12 ? `${w.id.slice(0, 8)}...${w.id.slice(-4)}` : w.id}
+                    </span>
+                    <span className={cn(
+                      'text-[10px] px-1.5 py-0.5 rounded text-center capitalize truncate',
+                      w.status === 'Available' || w.status === 'idle' ? 'bg-green-400/10 text-green-400'
+                        : w.status === 'Computing' || w.status === 'busy' ? 'bg-blue-400/10 text-blue-400'
+                        : w.status === 'Assigned' ? 'bg-yellow-400/10 text-yellow-400'
+                        : 'bg-helix-border text-helix-muted',
+                    )}>
+                      {w.status.toLowerCase()}
+                    </span>
+                    <ReputationBadge score={w.reputation_score} />
+                    <span className="text-white font-mono tabular-nums text-right">{w.cpu_load}%</span>
+                    <span className="text-helix-text2 font-mono tabular-nums text-right">{w.memory_mb}M</span>
+                    <span className="text-helix-text2 font-mono tabular-nums">
+                      {w.rounds_completed}/{w.rounds_participated}
+                    </span>
+                    <span className="text-white font-mono tabular-nums">
+                      {(w.success_rate * 100).toFixed(0)}%
+                    </span>
+                    <span className="text-white font-mono tabular-nums text-right">
+                      {(w.earnings_wei / 1e18).toFixed(3)}
+                    </span>
+                    <ChevronRight size={12} className={cn(
+                      'text-helix-dim transition-transform',
+                      expandedWorker === w.id && 'rotate-90',
+                    )} />
+                  </button>
+
+                  {/* Expanded Detail */}
+                  <AnimatePresence>
+                    {expandedWorker === w.id && (
+                      <motion.div
+                        initial={{ height: 0, opacity: 0 }}
+                        animate={{ height: 'auto', opacity: 1 }}
+                        exit={{ height: 0, opacity: 0 }}
+                        transition={{ duration: 0.2 }}
+                        className="overflow-hidden"
+                      >
+                        <div className="px-6 py-4 bg-helix-bg/50 border-b border-helix-border/50">
+                          <div className="grid grid-cols-3 gap-6">
+                            <div>
+                              <div className="text-[10px] uppercase tracking-wider text-helix-muted mb-2">Capabilities</div>
+                              <div className="flex flex-wrap gap-1.5">
+                                {w.capabilities.can_train && <span className="text-[10px] px-2 py-0.5 rounded bg-white/5 text-helix-text2">Train</span>}
+                                {w.capabilities.can_prove && <span className="text-[10px] px-2 py-0.5 rounded bg-white/5 text-helix-text2">Prove</span>}
+                                {w.capabilities.can_aggregate && <span className="text-[10px] px-2 py-0.5 rounded bg-white/5 text-helix-text2">Aggregate</span>}
+                                {w.capabilities.gpu_model && <span className="text-[10px] px-2 py-0.5 rounded bg-white/5 text-helix-text2">{w.capabilities.gpu_model}</span>}
+                                <span className="text-[10px] px-2 py-0.5 rounded bg-white/5 text-helix-text2">Batch: {w.capabilities.max_batch_size}</span>
+                              </div>
+                            </div>
+                            <div>
+                              <div className="text-[10px] uppercase tracking-wider text-helix-muted mb-2">Resources</div>
+                              <div className="space-y-2">
+                                {[
+                                  { label: 'CPU', value: w.cpu_load },
+                                  { label: 'Mem', value: Math.min(100, Math.round(w.memory_mb / 10)) },
+                                ].map((r) => (
+                                  <div key={r.label} className="flex items-center gap-2">
+                                    <span className="text-[10px] text-helix-text2 w-8">{r.label}</span>
+                                    <div className="flex-1 h-1 bg-helix-border rounded-full overflow-hidden">
+                                      <div
+                                        className={cn(
+                                          'h-full rounded-full transition-all',
+                                          r.value > 90 ? 'bg-red-400' : r.value > 70 ? 'bg-yellow-400' : 'bg-white/70',
+                                        )}
+                                        style={{ width: `${Math.min(100, r.value)}%` }}
+                                      />
+                                    </div>
+                                    <span className="text-[10px] text-white font-mono w-8 text-right">{r.value}%</span>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                            <div>
+                              <div className="text-[10px] uppercase tracking-wider text-helix-muted mb-2">Reputation</div>
+                              <div className="flex items-baseline gap-2">
+                                <span className="text-2xl font-mono font-semibold text-white tabular-nums">
+                                  {Math.round(w.reputation_score * 100)}
+                                </span>
+                                <span className="text-xs text-helix-muted">/ 100</span>
+                              </div>
+                              <div className="text-[10px] text-helix-muted mt-1">
+                                {w.rounds_participated > 0
+                                  ? `${w.rounds_completed} of ${w.rounds_participated} rounds completed`
+                                  : 'No rounds yet'}
+                              </div>
+                              <div className="text-[10px] text-helix-muted">
+                                Success rate: {(w.success_rate * 100).toFixed(1)}%
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+                </div>
+              ))}
+              {displayWorkers.length === 0 && (
+                <div className="flex items-center justify-center py-8 text-sm text-helix-muted">
+                  No {workerTab} workers
+                </div>
               )}
             </div>
           </div>
