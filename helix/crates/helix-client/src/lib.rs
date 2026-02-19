@@ -20,6 +20,7 @@ pub mod progress;
 pub mod rpc;
 pub mod session;
 pub mod share_distributor;
+pub mod training_db;
 pub mod visualization;
 pub mod wallet;
 pub mod worker_entry;

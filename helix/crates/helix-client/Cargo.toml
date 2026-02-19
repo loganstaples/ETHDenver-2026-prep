@@ -93,6 +93,9 @@ zeroize = { version = "1.7", features = ["derive"] }
 bs58 = "0.5"
 base64 = "0.21"
 
+# SQLite for training session persistence
+rusqlite = { version = "0.31", features = ["bundled"] }
+
 # Secure random number generation
 getrandom = "0.2"
 

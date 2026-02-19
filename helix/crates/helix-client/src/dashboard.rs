@@ -452,12 +452,43 @@ pub struct DashboardState {
     pub eth_rpc_url: RwLock<Option<String>>,
     /// Model weights cache: keyed by on-chain token ID string for non-owner inference
     pub model_weights_cache: RwLock<HashMap<String, serde_json::Value>>,
+    /// SQLite persistence for training session history
+    pub training_db: Option<std::sync::Arc<crate::training_db::TrainingDb>>,
 }
 
 impl DashboardState {
     /// Create new dashboard state with the given config
     pub fn new(config: DashboardConfig) -> Self {
         let (ws_broadcast, _) = broadcast::channel(1024);
+
+        // Initialize training DB
+        let training_db = {
+            let db_path = std::path::PathBuf::from("./helix-data/training.db");
+            match crate::training_db::TrainingDb::open(&db_path) {
+                Ok(db) => Some(std::sync::Arc::new(db)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to open training DB, history will not persist");
+                    None
+                }
+            }
+        };
+
+        // Load persisted sessions from DB
+        let sessions = {
+            let mut map = HashMap::new();
+            if let Some(ref db) = training_db {
+                for s in db.load_all_sessions() {
+                    if s.status == "complete" || s.status == "failed" {
+                        map.insert(s.session_id.clone(), s);
+                    }
+                }
+                if !map.is_empty() {
+                    tracing::info!(count = map.len(), "Loaded persisted sessions from DB");
+                }
+            }
+            RwLock::new(map)
+        };
+
         Self {
             start_time: Instant::now(),
             network_status: RwLock::new(NetworkStatus::default()),
@@ -467,7 +498,7 @@ impl DashboardState {
             events: RwLock::new(Vec::new()),
             config,
             rate_limiter: RwLock::new(HashMap::new()),
-            sessions: RwLock::new(HashMap::new()),
+            sessions,
             ws_broadcast,
             uploaded_data: RwLock::new(None),
             uploaded_weights: RwLock::new(None),
@@ -475,6 +506,7 @@ impl DashboardState {
             coordinator_address: RwLock::new(None),
             eth_rpc_url: RwLock::new(None),
             model_weights_cache: RwLock::new(HashMap::new()),
+            training_db,
         }
     }
 
@@ -1205,7 +1237,12 @@ async fn start_training_handler(
     };
 
     // Store session
-    state.sessions.write().await.insert(session_id.clone(), session);
+    state.sessions.write().await.insert(session_id.clone(), session.clone());
+
+    // Persist initial session to SQLite
+    if let Some(ref db) = state.training_db {
+        db.save_session(&session);
+    }
 
     // Build orchestration config
     let zk_enabled = req.zk_mode == "always";
@@ -1440,6 +1477,13 @@ async fn run_training_session(
                     session.zk_proofs_generated = result.zk_proofs_generated;
                     session.final_weights = weights_json;
                 }
+
+                // Persist completed session to SQLite
+                if let Some(ref db) = state.training_db {
+                    if let Some(session) = sessions.get(&session_id) {
+                        db.save_session(session);
+                    }
+                }
             }
 
             // Cache weights by model_token_id:version_index for non-owner inference
@@ -1484,6 +1528,13 @@ async fn run_training_session(
                 if let Some(session) = sessions.get_mut(&session_id) {
                     session.status = "failed".to_string();
                     session.phase_description = format!("Error: {}", e);
+                }
+
+                // Persist failed session to SQLite
+                if let Some(ref db) = state.training_db {
+                    if let Some(session) = sessions.get(&session_id) {
+                        db.save_session(session);
+                    }
                 }
             }
 
