@@ -617,6 +617,8 @@ impl FullOrchestrator {
             .context("Phase 8: Distributed MPC training failed")?
         } else {
             // Local mode: all MPC parties run in this process using LocalTransport.
+            // Clone the progress callback so live per-step events fire during training.
+            let progress_for_step = self.progress.clone();
             let mpc_config = MPCIntegrationConfig {
                 d_in,
                 d_hid,
@@ -634,7 +636,11 @@ impl FullOrchestrator {
                 use_tcp_transport: false,
                 worker_endpoints: None,
                 batch_size: self.config.batch_size,
-                on_step: None,
+                on_step: progress_for_step.map(|cb| -> std::sync::Arc<dyn Fn(usize, usize, f64, bool) + Send + Sync> {
+                    std::sync::Arc::new(move |step, total, loss, mac_ok| {
+                        cb(ProgressEvent::TrainingStep { step, total, loss, mac_ok });
+                    })
+                }),
             };
 
             if self.config.simulate_cheater {
@@ -659,19 +665,8 @@ impl FullOrchestrator {
             }
         };
 
-        // Emit per-step progress for non-distributed mode (local MPC).
-        // In distributed mode, progress events are already emitted inside
-        // run_distributed_training as soon as worker 0 reports results.
-        if !self.config.distributed {
-            for (i, loss) in mpc_result.losses.iter().enumerate() {
-                self.emit(ProgressEvent::TrainingStep {
-                    step: i + 1,
-                    total: self.config.num_steps,
-                    loss: *loss,
-                    mac_ok: true,
-                });
-            }
-        }
+        // Note: per-step progress for local mode is now emitted live via the
+        // on_step callback wired into the MPC config above.
 
         if let Some(ref cheater) = mpc_result.cheater_detected {
             self.emit(ProgressEvent::CheaterDetected {
