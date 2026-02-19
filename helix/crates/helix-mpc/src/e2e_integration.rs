@@ -817,6 +817,7 @@ async fn run_with_cheater(
     for (i, (transport, bundle)) in transports.into_iter().zip(bundles.into_iter()).enumerate() {
         let cfg = trainer_config.clone();
         let data = training_data.clone();
+        let step_cb = if i == 0 { on_step.clone() } else { None };
 
         let cheater_info = if i == cheater_party {
             Some(cheater_party)
@@ -834,6 +835,7 @@ async fn run_with_cheater(
                 num_steps, checkpoint_interval, seed,
                 cheater_info, corrupt_at_step,
                 Some(bundle),
+                step_cb,
             ))
         });
         handles.push(handle);
@@ -1144,6 +1146,7 @@ pub async fn run_party_training<T: crate::session::transport::MPCTransport + 'st
     cheater_info: Option<usize>,
     corrupt_at_step: u64,
     encrypted_bundle: Option<EncryptedShareBundle>,
+    on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, bool) + Send + Sync>>,
 ) -> Result<PartyResult, anyhow::Error> {
     // Phase 1: Initialize weight shares.
     let mut trainer = MPCTrainer::new(config.clone(), transport, party_index, seed);
@@ -1250,6 +1253,9 @@ pub async fn run_party_training<T: crate::session::transport::MPCTransport + 'st
                             },
                         },
                     });
+                    if let Some(ref cb) = on_step {
+                        cb(step + 1, num_steps, 0.0, false);
+                    }
                     break;
                 }
                 Err(e) => return Err(e.into()),
@@ -1271,6 +1277,10 @@ pub async fn run_party_training<T: crate::session::transport::MPCTransport + 'st
 
         losses.push(step_result.loss);
         steps_completed += 1;
+
+        if let Some(ref cb) = on_step {
+            cb(step + 1, num_steps, step_result.loss, true);
+        }
 
         debug!(
             party = party_index,
@@ -1559,6 +1569,7 @@ mod tests {
             use_tcp_transport: false,
             worker_endpoints: None,
             batch_size: 1,
+            on_step: None,
         };
 
         let result = run_mpc_training(config).await.expect("training should succeed");
@@ -1596,6 +1607,7 @@ mod tests {
             use_tcp_transport: false,
             worker_endpoints: None,
             batch_size: 1,
+            on_step: None,
         };
 
         let result = run_mpc_training(config).await.expect("training should succeed");
@@ -1636,6 +1648,7 @@ mod tests {
             use_tcp_transport: false,
             worker_endpoints: None,
             batch_size: 1,
+            on_step: None,
         };
 
         let result = run_mpc_training(config).await.expect("training should succeed");
@@ -1666,6 +1679,7 @@ mod tests {
             use_tcp_transport: false,
             worker_endpoints: None,
             batch_size: 1,
+            on_step: None,
         };
 
         let result = run_mpc_training(config).await.expect("training should succeed");
@@ -1723,6 +1737,7 @@ mod tests {
                 use_tcp_transport: false,
                 worker_endpoints: None,
                 batch_size: 1,
+                on_step: None,
             };
 
             let result = run_mpc_training(config).await.expect("should succeed");

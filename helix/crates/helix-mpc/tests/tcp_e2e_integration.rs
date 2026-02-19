@@ -45,6 +45,8 @@ async fn test_tcp_e2e_basic_no_mac() {
         use_node_transport: false,
         use_tcp_transport: true,
         worker_endpoints: None,
+        batch_size: 1,
+        on_step: None,
     };
 
     let result = run_mpc_training(config).await.expect("TCP training should succeed");
@@ -84,6 +86,8 @@ async fn test_tcp_e2e_with_mac() {
         use_node_transport: false,
         use_tcp_transport: true,
         worker_endpoints: None,
+        batch_size: 1,
+        on_step: None,
     };
 
     let result = run_mpc_training(config).await.expect("TCP MAC training should succeed");
@@ -127,6 +131,8 @@ async fn test_tcp_e2e_with_checkpoints() {
         use_node_transport: false,
         use_tcp_transport: true,
         worker_endpoints: None,
+        batch_size: 1,
+        on_step: None,
     };
 
     let result = run_mpc_training(config).await.expect("TCP checkpoint training should succeed");
@@ -169,6 +175,8 @@ async fn test_tcp_e2e_loss_decreases() {
         use_node_transport: false,
         use_tcp_transport: true,
         worker_endpoints: None,
+        batch_size: 1,
+        on_step: None,
     };
 
     let result = run_mpc_training(config).await.expect("TCP training should succeed");
@@ -211,6 +219,8 @@ async fn test_tcp_e2e_weight_reconstruction() {
         use_node_transport: false,
         use_tcp_transport: true,
         worker_endpoints: None,
+        batch_size: 1,
+        on_step: None,
     };
 
     let result = run_mpc_training(config).await.expect("TCP training should succeed");
@@ -275,6 +285,8 @@ async fn test_tcp_e2e_cheater_detection() {
         use_node_transport: false,
         use_tcp_transport: true,
         worker_endpoints: None,
+        batch_size: 1,
+        on_step: None,
     };
 
     let cheater_party = 2;
@@ -339,6 +351,8 @@ async fn test_tcp_e2e_cheater_early_corruption() {
         use_node_transport: false,
         use_tcp_transport: true,
         worker_endpoints: None,
+        batch_size: 1,
+        on_step: None,
     };
 
     // Worker 1 corrupts at step 2.
@@ -387,6 +401,8 @@ async fn test_tcp_e2e_dealer_cheats() {
         use_node_transport: false,
         use_tcp_transport: true,
         worker_endpoints: None,
+        batch_size: 1,
+        on_step: None,
     };
 
     // Party 0 (the dealer) corrupts at step 8.
@@ -437,6 +453,8 @@ async fn test_tcp_e2e_larger_model() {
         use_node_transport: false,
         use_tcp_transport: true,
         worker_endpoints: None,
+        batch_size: 1,
+        on_step: None,
     };
 
     let result = run_mpc_training(config).await.expect("TCP larger model training should succeed");
@@ -492,6 +510,8 @@ async fn test_tcp_e2e_matches_local_transport() {
         use_node_transport: false,
         use_tcp_transport: false,
         worker_endpoints: None,
+        batch_size: 1,
+        on_step: None,
     };
 
     // Run with local transport.
@@ -567,6 +587,8 @@ async fn test_tcp_e2e_training_time_tracked() {
         use_node_transport: false,
         use_tcp_transport: true,
         worker_endpoints: None,
+        batch_size: 1,
+        on_step: None,
     };
 
     let result = run_mpc_training(config).await.expect("TCP training should succeed");
@@ -609,6 +631,8 @@ async fn test_tcp_e2e_mnist_scale_50_steps() {
         use_node_transport: false,
         use_tcp_transport: true,
         worker_endpoints: None,
+        batch_size: 1,
+        on_step: None,
     };
 
     let result = run_mpc_training(config).await.expect("MNIST TCP training should succeed");

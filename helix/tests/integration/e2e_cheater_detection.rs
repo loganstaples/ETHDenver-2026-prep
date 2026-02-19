@@ -63,6 +63,8 @@ async fn test_cheater_detection_worker2_step10() {
         use_node_transport: false,
         use_tcp_transport: false,
         worker_endpoints: None,
+        batch_size: 1,
+        on_step: None,
     };
 
     let cheater_party = 2;
@@ -153,6 +155,8 @@ async fn test_honest_execution_passes_all_mac_checks() {
         use_node_transport: false,
         use_tcp_transport: false,
         worker_endpoints: None,
+        batch_size: 1,
+        on_step: None,
     };
 
     let result = run_mpc_training(config).await
@@ -210,6 +214,8 @@ async fn test_cheater_detection_early_corruption() {
         use_node_transport: false,
         use_tcp_transport: false,
         worker_endpoints: None,
+        batch_size: 1,
+        on_step: None,
     };
 
     // Worker 1 corrupts at step 2.
@@ -270,6 +276,8 @@ async fn test_cheater_detection_dealer_cheats() {
         use_node_transport: false,
         use_tcp_transport: false,
         worker_endpoints: None,
+        batch_size: 1,
+        on_step: None,
     };
 
     // Party 0 (the dealer) corrupts at step 8.

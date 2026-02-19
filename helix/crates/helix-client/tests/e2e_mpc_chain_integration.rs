@@ -221,6 +221,8 @@ fn test_mpc_config(num_steps: usize, checkpoint_interval: usize) -> MPCIntegrati
         use_node_transport: false,
         use_tcp_transport: false,
         worker_endpoints: None,
+        batch_size: 1,
+        on_step: None,
     }
 }
 

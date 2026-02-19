@@ -189,6 +189,8 @@ async fn test_mpc_training_with_onchain_checkpoints() {
         use_node_transport: false,
         use_tcp_transport: false,
         worker_endpoints: None,
+        batch_size: 1,
+        on_step: None,
     };
 
     let training_result = run_mpc_training(mpc_config)

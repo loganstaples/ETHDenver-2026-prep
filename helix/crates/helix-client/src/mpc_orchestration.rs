@@ -333,6 +333,7 @@ impl MPCTrainingOrchestrator {
             use_tcp_transport: self.config.use_tcp_transport,
             worker_endpoints: None,
             batch_size: 1,
+            on_step: None,
         }
     }
 

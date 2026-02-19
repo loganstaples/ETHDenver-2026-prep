@@ -634,6 +634,7 @@ impl FullOrchestrator {
                 use_tcp_transport: false,
                 worker_endpoints: None,
                 batch_size: self.config.batch_size,
+                on_step: None,
             };
 
             if self.config.simulate_cheater {
