@@ -52,6 +52,7 @@ interface GNode extends SimulationNodeDatum {
   cluster: number;
   isModelNode?: boolean;
   label?: string;
+  reputation?: number; // 0-100, for worker color
 }
 
 interface GLink extends SimulationLinkDatum<GNode> {
@@ -152,6 +153,7 @@ function NetworkGraph({
         type: n.type,
         radius: n.type === 'aggregator' ? 10 : n.type === 'verifier' ? 8 : 7,
         cluster,
+        reputation: n.reputation ?? 50,
         x: old?.x ?? cx + (Math.random() - 0.5) * w * 0.3,
         y: old?.y ?? cy + (Math.random() - 0.5) * h * 0.3,
       };
@@ -221,14 +223,17 @@ function NetworkGraph({
     return () => { sim.stop(); };
   }, [topologyKey, canvasSize.width, canvasSize.height, nodes, connections, clusters]);
 
-  // Cluster colors (soft pastels)
-  const CLUSTER_COLORS = [
-    'rgba(96,165,250,',   // blue
-    'rgba(167,139,250,',  // purple
-    'rgba(251,146,60,',   // orange
-    'rgba(52,211,153,',   // green
-    'rgba(251,113,133,',  // pink
-  ];
+  // Reputation → color: cherry red (0) → amber (50) → emerald green (100)
+  function reputationColor(rep: number, alpha: number): string {
+    const t = Math.max(0, Math.min(100, rep)) / 100; // 0-1
+    // Red channel: 239 at 0, drops to 16 at 100
+    const r = Math.round(239 + (16 - 239) * t);
+    // Green channel: 68 at 0, rises to 185 at 100
+    const g = Math.round(68 + (185 - 68) * t);
+    // Blue channel: 68 at 0, rises to 129 at 100
+    const b = Math.round(68 + (129 - 68) * t);
+    return `rgba(${r},${g},${b},${alpha})`;
+  }
 
   // Render loop
   useEffect(() => {
@@ -285,14 +290,12 @@ function NetworkGraph({
         if (node.x == null || node.y == null) return;
 
         if (node.isModelNode) {
-          // Model center node — colored by cluster
-          const clr = CLUSTER_COLORS[node.cluster % CLUSTER_COLORS.length];
-
+          // Model center node — bright white
           // Outer glow
           const glowR = node.radius * 5;
           const glow = ctx.createRadialGradient(node.x, node.y, node.radius * 0.5, node.x, node.y, glowR);
-          glow.addColorStop(0, `${clr}${0.12 + Math.sin(pulse * 1.5) * 0.04})`);
-          glow.addColorStop(1, `${clr}0)`);
+          glow.addColorStop(0, `rgba(255,255,255,${0.14 + Math.sin(pulse * 1.5) * 0.04})`);
+          glow.addColorStop(1, 'rgba(255,255,255,0)');
           ctx.beginPath();
           ctx.arc(node.x, node.y, glowR, 0, Math.PI * 2);
           ctx.fillStyle = glow;
@@ -301,9 +304,9 @@ function NetworkGraph({
           // Core
           ctx.beginPath();
           ctx.arc(node.x, node.y, node.radius, 0, Math.PI * 2);
-          ctx.fillStyle = `${clr}0.9)`;
+          ctx.fillStyle = 'rgba(255,255,255,0.95)';
           ctx.fill();
-          ctx.strokeStyle = `${clr}0.3)`;
+          ctx.strokeStyle = 'rgba(255,255,255,0.3)';
           ctx.lineWidth = 1;
           ctx.stroke();
 
@@ -317,10 +320,11 @@ function NetworkGraph({
           return;
         }
 
-        // Worker nodes — white-ish rendering
+        // Worker nodes — colored by reputation (green=100, red=0)
         const status = statusMap.get(node.id) ?? 'active';
         const isOffline = status === 'offline';
         const isActive = status === 'active' || status === 'proving' || status === 'training';
+        const rep = node.reputation ?? 50;
 
         // Soft outer glow
         if (!isOffline) {
@@ -329,9 +333,9 @@ function NetworkGraph({
             node.x, node.y, node.radius * 0.5,
             node.x, node.y, glowR,
           );
-          const pa = isActive ? 0.06 + Math.sin(pulse * 1.5 + node.x * 0.01) * 0.03 : 0.04;
-          glow.addColorStop(0, `rgba(255, 255, 255, ${pa})`);
-          glow.addColorStop(1, 'rgba(255, 255, 255, 0)');
+          const pa = isActive ? 0.08 + Math.sin(pulse * 1.5 + node.x * 0.01) * 0.03 : 0.04;
+          glow.addColorStop(0, reputationColor(rep, pa));
+          glow.addColorStop(1, reputationColor(rep, 0));
           ctx.beginPath();
           ctx.arc(node.x, node.y, glowR, 0, Math.PI * 2);
           ctx.fillStyle = glow;
@@ -345,8 +349,8 @@ function NetworkGraph({
             node.x, node.y, node.radius,
             node.x, node.y, ringR,
           );
-          ring.addColorStop(0, 'rgba(255, 255, 255, 0.08)');
-          ring.addColorStop(1, 'rgba(255, 255, 255, 0)');
+          ring.addColorStop(0, reputationColor(rep, 0.1));
+          ring.addColorStop(1, reputationColor(rep, 0));
           ctx.beginPath();
           ctx.arc(node.x, node.y, ringR, 0, Math.PI * 2);
           ctx.fillStyle = ring;
@@ -357,16 +361,16 @@ function NetworkGraph({
         ctx.beginPath();
         ctx.arc(node.x, node.y, node.radius, 0, Math.PI * 2);
         if (isOffline) {
-          ctx.fillStyle = 'rgba(255, 255, 255, 0.08)';
+          ctx.fillStyle = reputationColor(rep, 0.08);
         } else {
           const brightness = isActive ? 0.9 : 0.5;
-          ctx.fillStyle = `rgba(255, 255, 255, ${brightness})`;
+          ctx.fillStyle = reputationColor(rep, brightness);
         }
         ctx.fill();
 
         // Subtle border
         if (!isOffline) {
-          ctx.strokeStyle = 'rgba(255, 255, 255, 0.15)';
+          ctx.strokeStyle = reputationColor(rep, 0.2);
           ctx.lineWidth = 0.5;
           ctx.stroke();
         }
