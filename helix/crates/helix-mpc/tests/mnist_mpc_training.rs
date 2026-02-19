@@ -66,6 +66,7 @@ async fn run_mpc_training(
             base_error: 1e-6,
             checkpoint_interval: 1,
             mac_config: None,
+            batch_size: 1,
         };
 
         if use_mac {
@@ -207,6 +208,7 @@ async fn test_mnist_mpc_training_converges() {
             base_error: 1e-6,
             checkpoint_interval: 1,
             mac_config: None,
+            batch_size: 1,
         };
         let weights = if i == 0 {
             Some(initial_weights.clone())
@@ -388,6 +390,7 @@ async fn test_mnist_mpc_with_cheater() {
             base_error: 1e-6,
             checkpoint_interval: 1,
             mac_config: None,
+            batch_size: 1,
         }.with_mac_seed(mac_check_interval, 42 + 1000);
 
         let weights = if i == 0 {
@@ -556,6 +559,7 @@ async fn test_beaver_triple_pregeneration() {
             base_error: 1e-6,
             checkpoint_interval: 1,
             mac_config: None,
+            batch_size: 1,
         };
 
         let handle = tokio::spawn(async move {

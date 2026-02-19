@@ -550,6 +550,14 @@ struct MpcWorkerArgs {
     #[cfg(feature = "chain")]
     #[arg(long, default_value = "0.001")]
     stake_eth: f64,
+
+    /// Dashboard API URL for self-registration and heartbeat (e.g. http://localhost:3001)
+    #[arg(long)]
+    api_url: Option<String>,
+
+    /// Loop mode: restart worker after each job completes (used by spawn-workers)
+    #[arg(long)]
+    r#loop: bool,
 }
 
 /// Arguments for spawning multiple local MPC workers.
@@ -3108,6 +3116,10 @@ async fn cmd_mpc_worker(args: &MpcWorkerArgs, _cli: &Cli) -> Result<()> {
     println!("  Control Channel: {}:{}", data_addr.ip(), control_port);
     println!("  Party Index:     {}", args.party_index);
     println!("  Seed:            {}", args.seed);
+    if let Some(ref url) = args.api_url {
+        println!("  API URL:         {}", url);
+    }
+    println!("  Loop Mode:       {}", if args.r#loop { "enabled" } else { "disabled" });
     #[cfg(feature = "chain")]
     {
         if let Some(ref rpc) = args.rpc_url {
@@ -3122,6 +3134,59 @@ async fn cmd_mpc_worker(args: &MpcWorkerArgs, _cli: &Cli) -> Result<()> {
         }
     }
     println!();
+
+    // Self-register with dashboard API if --api-url is provided.
+    let http_client = reqwest::Client::new();
+    let worker_id: Option<String> = if let Some(ref api_url) = args.api_url {
+        let public_addr = format!("127.0.0.1:{}", data_addr.port());
+        let resp = http_client
+            .post(format!("{}/api/workers/register", api_url))
+            .json(&serde_json::json!({
+                "endpoint": public_addr,
+                "party_index": args.party_index,
+                "seed": args.seed,
+            }))
+            .send()
+            .await;
+
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                let body: serde_json::Value = r.json().await.unwrap_or_default();
+                let wid = body["worker_id"].as_str().unwrap_or("unknown").to_string();
+                println!("  {} Registered with dashboard (id: {})", "✓".green(), &wid[..8.min(wid.len())]);
+                Some(wid)
+            }
+            Ok(r) => {
+                eprintln!("  {} Registration failed: HTTP {}", "✗".red(), r.status());
+                None
+            }
+            Err(e) => {
+                eprintln!("  {} Registration failed: {}", "✗".red(), e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Spawn heartbeat task if registered.
+    let heartbeat_handle = if let (Some(ref api_url), Some(ref wid)) = (&args.api_url, &worker_id) {
+        let url = api_url.clone();
+        let id = wid.clone();
+        let client = http_client.clone();
+        Some(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                let _ = client
+                    .post(format!("{}/api/workers/heartbeat", url))
+                    .json(&serde_json::json!({ "worker_id": id }))
+                    .send()
+                    .await;
+            }
+        }))
+    } else {
+        None
+    };
 
     let config = WorkerConfig {
         listen_addr: data_addr.to_string(),
@@ -3161,37 +3226,64 @@ async fn cmd_mpc_worker(args: &MpcWorkerArgs, _cli: &Cli) -> Result<()> {
     }
     println!();
 
-    let result = launch_worker(config).await?;
+    // Main worker loop: run once or loop depending on --loop flag.
+    loop {
+        let job_config = config.clone();
+        match launch_worker(job_config).await {
+            Ok(result) => {
+                println!();
+                println!("{}", "═".repeat(64).cyan());
+                println!("{}", " Worker Session Complete".green().bold());
+                println!("{}", "═".repeat(64).cyan());
+                println!("  Steps Completed:       {}", result.steps_completed);
+                println!("  Checkpoints Signed:    {}", result.checkpoint_signatures);
+                println!("  Slashing Reports:      {}", result.slashing_reports_signed);
+                let share_status = if result.final_share_sent {
+                    "Yes".green().to_string()
+                } else {
+                    "No".red().to_string()
+                };
+                println!("  Final Share Sent:      {}", share_status);
+                println!();
 
-    println!();
-    println!("{}", "═".repeat(64).cyan());
-    println!("{}", " Worker Session Complete".green().bold());
-    println!("{}", "═".repeat(64).cyan());
-    println!("  Steps Completed:       {}", result.steps_completed);
-    println!("  Checkpoints Signed:    {}", result.checkpoint_signatures);
-    println!("  Slashing Reports:      {}", result.slashing_reports_signed);
-    let share_status = if result.final_share_sent {
-        "Yes".green().to_string()
-    } else {
-        "No".red().to_string()
-    };
-    println!("  Final Share Sent:      {}", share_status);
-    println!();
+                if !args.r#loop {
+                    break;
+                }
+                println!("[worker-{}] Job done. Restarting...", args.party_index);
+            }
+            Err(e) => {
+                if !args.r#loop {
+                    // Abort heartbeat before returning error.
+                    if let Some(hb) = heartbeat_handle {
+                        hb.abort();
+                    }
+                    return Err(e);
+                }
+                eprintln!("[worker-{}] Error: {}. Restarting in 2s...", args.party_index, e);
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+    }
+
+    // Clean up heartbeat.
+    if let Some(hb) = heartbeat_handle {
+        hb.abort();
+    }
 
     Ok(())
 }
 
 // ============================================================================
-// spawn-workers: Launch multiple MPC workers in-process
+// spawn-workers: Launch multiple MPC workers as separate OS processes
 // ============================================================================
 
 async fn cmd_spawn_workers(args: &SpawnWorkersArgs, _cli: &Cli) -> Result<()> {
-    use helix_client::worker_entry::{WorkerConfig, launch_worker};
+    use std::process::Command;
     use tokio::signal;
 
     println!();
     println!("{}", "═".repeat(64).cyan());
-    println!("{}", " HELIX MPC Worker Spawner".cyan().bold());
+    println!("{}", " HELIX MPC Worker Spawner (multi-process)".cyan().bold());
     println!("{}", "═".repeat(64).cyan());
     println!();
 
@@ -3199,10 +3291,8 @@ async fn cmd_spawn_workers(args: &SpawnWorkersArgs, _cli: &Cli) -> Result<()> {
         anyhow::bail!("Need at least 2 workers (got {})", args.count);
     }
 
-    let colors = ["red", "green", "yellow", "blue", "magenta", "cyan", "white", "bright_red", "bright_green", "bright_blue"];
-
     // Resolve the public address for registration (so remote machines can reach these workers).
-    let public_host = args.public_addr.clone().unwrap_or_else(|| {
+    let _public_host = args.public_addr.clone().unwrap_or_else(|| {
         if args.bind == "0.0.0.0" {
             "127.0.0.1".to_string()
         } else {
@@ -3210,38 +3300,40 @@ async fn cmd_spawn_workers(args: &SpawnWorkersArgs, _cli: &Cli) -> Result<()> {
         }
     });
 
-    // Print summary of worker addresses
+    // Find the current executable path for spawning child processes.
+    let exe_path = std::env::current_exe()
+        .map_err(|e| anyhow::anyhow!("Failed to get current executable path: {}", e))?;
+
+    // Create logs directory.
+    let logs_dir = std::path::Path::new("logs");
+    std::fs::create_dir_all(logs_dir)
+        .map_err(|e| anyhow::anyhow!("Failed to create logs directory: {}", e))?;
+
+    // Print summary of worker addresses.
     println!("{}", "Workers:".yellow().bold());
     let mut worker_addrs = Vec::new();
-    let mut worker_public_addrs = Vec::new();
     for i in 0..args.count {
         let port = args.base_port + (i as u16) * 3;
         let addr = format!("{}:{}", args.bind, port);
-        let pub_addr = format!("{}:{}", public_host, port);
-        let color = colors[i % colors.len()];
-        println!("  [worker-{}] bind={} public={} (data={}, ctrl={}, mpc={})", i, addr, pub_addr, port, port+1, port+2);
+        println!("  [worker-{}] {} (data={}, ctrl={}, mpc={})", i, addr, port, port+1, port+2);
         worker_addrs.push(addr);
-        worker_public_addrs.push(pub_addr);
     }
     println!();
 
-    // ── On-chain pool registration ──
+    // ── On-chain pool registration (still done by parent for staking) ──
     #[cfg(feature = "chain")]
-    let chain_registered = {
+    {
         use crate::rpc::chain_v4::ChainClientV4;
         use ethers::signers::{LocalWallet, Signer};
         use std::str::FromStr;
 
-        let mut registered = false;
-
         if let (Some(ref rpc_url), Some(ref coordinator)) = (&args.rpc_url, &args.coordinator) {
+            let public_host = &_public_host;
             println!("{}", "Registering workers in on-chain pool...".yellow().bold());
 
-            // Resolve private keys: explicit list, or Anvil defaults
             let keys: Vec<String> = if let Some(ref pk_csv) = args.private_keys {
                 pk_csv.split(',').map(|s| s.trim().to_string()).collect()
             } else {
-                // Anvil default accounts 1..N
                 let anvil = vec![
                     "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
                     "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a",
@@ -3260,7 +3352,7 @@ async fn cmd_spawn_workers(args: &SpawnWorkersArgs, _cli: &Cli) -> Result<()> {
             };
 
             let stake_wei = ethers::utils::parse_ether(args.stake_eth)
-                .unwrap_or(ethers::types::U256::from(100_000_000_000_000_000u64)); // 0.1 ETH
+                .unwrap_or(ethers::types::U256::from(100_000_000_000_000_000u64));
 
             for (i, key) in keys.iter().enumerate().take(args.count) {
                 let pk = key.strip_prefix("0x").unwrap_or(key);
@@ -3272,18 +3364,17 @@ async fn cmd_spawn_workers(args: &SpawnWorkersArgs, _cli: &Cli) -> Result<()> {
                     }
                 };
                 let addr = wallet.address();
+                let worker_pub_addr = format!("{}:{}", public_host, args.base_port + (i as u16) * 3);
 
                 match ChainClientV4::with_wallet(rpc_url, wallet, coordinator).await {
                     Ok(client) => {
-                        let endpoint = &worker_public_addrs[i];
-                        match client.register_in_pool(endpoint, stake_wei).await {
+                        match client.register_in_pool(&worker_pub_addr, stake_wei).await {
                             Ok(receipt) => {
                                 let gas = receipt.gas_used.map(|g| g.as_u64()).unwrap_or(0);
                                 println!(
                                     "  {} [worker-{}] registered on-chain (addr: {:#x}, gas: {})",
                                     "✓".green(), i, addr, gas
                                 );
-                                registered = true;
                             }
                             Err(e) => {
                                 eprintln!("  {} [worker-{}] on-chain registration failed: {}", "✗".red(), i, e);
@@ -3297,157 +3388,74 @@ async fn cmd_spawn_workers(args: &SpawnWorkersArgs, _cli: &Cli) -> Result<()> {
             }
             println!();
         }
-        registered
-    };
-
-    #[cfg(not(feature = "chain"))]
-    let chain_registered = false;
-
-    // ── Off-chain API registration (fallback) ──
-    let http_client = reqwest::Client::new();
-    let mut worker_ids: Vec<String> = Vec::new();
-
-    if !chain_registered {
-        if let Some(ref api_url) = args.api_url {
-            println!("{}", "Registering workers with dashboard API...".yellow().bold());
-            for (i, pub_addr) in worker_public_addrs.iter().enumerate() {
-                let worker_seed = args.seed + i as u64;
-                let resp = http_client
-                    .post(format!("{}/api/workers/register", api_url))
-                    .json(&serde_json::json!({
-                        "endpoint": pub_addr,
-                        "party_index": i,
-                        "seed": worker_seed,
-                    }))
-                    .send()
-                    .await;
-
-                match resp {
-                    Ok(r) if r.status().is_success() => {
-                        let body: serde_json::Value = r.json().await.unwrap_or_default();
-                        let wid = body["worker_id"].as_str().unwrap_or("unknown").to_string();
-                        println!("  {} [worker-{}] registered (id: {})", "✓".green(), i, &wid[..8]);
-                        worker_ids.push(wid);
-                    }
-                    Ok(r) => {
-                        eprintln!("  {} [worker-{}] registration failed: HTTP {}", "✗".red(), i, r.status());
-                        worker_ids.push(String::new());
-                    }
-                    Err(e) => {
-                        eprintln!("  {} [worker-{}] registration failed: {}", "✗".red(), i, e);
-                        worker_ids.push(String::new());
-                    }
-                }
-            }
-            println!();
-        } else {
-            // Print copy-paste command for --workers flag (legacy mode)
-            println!("{}", "Copy-paste for mpc-train:".yellow().bold());
-            println!("  --workers {}", worker_public_addrs.join(","));
-            println!();
-        }
     }
 
-    // Spawn heartbeat task if registered with API (not needed for on-chain)
-    let heartbeat_handle = if !chain_registered {
-        if let Some(ref api_url) = args.api_url {
-            let url = api_url.clone();
-            let ids: Vec<String> = worker_ids.iter().filter(|id| !id.is_empty()).cloned().collect();
-            let client = http_client.clone();
-            Some(tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                    for wid in &ids {
-                        let _ = client
-                            .post(format!("{}/api/workers/heartbeat", url))
-                            .json(&serde_json::json!({ "worker_id": wid }))
-                            .send()
-                            .await;
-                    }
-                }
-            }))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    // Spawn each worker as a separate OS process.
+    // Each child process runs `helix mpc-worker --loop --api-url ...` and self-registers.
+    let mut children: Vec<(usize, std::process::Child)> = Vec::new();
 
-    // Spawn all workers as tokio tasks
-    let mut handles = Vec::new();
-
+    println!("{}", "Spawning worker processes...".yellow().bold());
     for i in 0..args.count {
         let port = args.base_port + (i as u16) * 3;
         let listen_addr = format!("{}:{}", args.bind, port);
         let seed = args.seed + i as u64;
 
-        let handle = tokio::spawn(async move {
-            // Workers loop: restart after each job so they can handle multiple
-            // training sessions without manual restart.
-            loop {
-                println!("[worker-{}] Starting on {} (waiting for job...)", i, listen_addr);
-                let job_config = WorkerConfig {
-                    listen_addr: listen_addr.clone(),
-                    party_index: i,
-                    seed,
-                    #[cfg(feature = "chain")]
-                    eth_rpc_url: None,
-                    #[cfg(feature = "chain")]
-                    private_key: String::new(),
-                    #[cfg(feature = "chain")]
-                    job_id: None,
-                    #[cfg(feature = "chain")]
-                    coordinator_address: None,
-                    #[cfg(feature = "chain")]
-                    stake_amount_eth: 0.0,
-                };
-                match launch_worker(job_config).await {
-                    Ok(result) => {
-                        println!(
-                            "[worker-{}] Job done: {} steps, {} checkpoints signed. Restarting...",
-                            i, result.steps_completed, result.checkpoint_signatures
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!("[worker-{}] Error: {}. Restarting in 2s...", i, e);
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    }
-                }
-            }
-        });
-        handles.push(handle);
-    }
+        let log_path = logs_dir.join(format!("worker-{}.log", i));
+        let log_file = std::fs::File::create(&log_path)
+            .map_err(|e| anyhow::anyhow!("Failed to create log file {}: {}", log_path.display(), e))?;
+        let stderr_file = log_file.try_clone()
+            .map_err(|e| anyhow::anyhow!("Failed to clone log file handle: {}", e))?;
 
-    println!("{}", "All workers started. Waiting for training jobs...".green().bold());
-    if chain_registered {
-        println!("{}", "Workers registered on-chain — any user can assign them via the V4 coordinator.".cyan());
-    } else if args.api_url.is_some() {
-        println!("{}", "Workers registered with dashboard — they will be auto-assigned when training starts.".cyan());
+        let mut cmd = Command::new(&exe_path);
+        cmd.arg("mpc-worker")
+            .arg("--listen").arg(&listen_addr)
+            .arg("--party-index").arg(i.to_string())
+            .arg("--seed").arg(seed.to_string())
+            .arg("--loop")
+            .stdout(log_file)
+            .stderr(stderr_file);
+
+        // Pass --api-url so each child self-registers and heartbeats.
+        if let Some(ref api_url) = args.api_url {
+            cmd.arg("--api-url").arg(api_url);
+        }
+
+        let child = cmd.spawn()
+            .map_err(|e| anyhow::anyhow!("Failed to spawn worker-{}: {}", i, e))?;
+
+        println!(
+            "  {} [worker-{}] PID {} on {} (log: {})",
+            "✓".green(), i, child.id(), listen_addr, log_path.display()
+        );
+        children.push((i, child));
     }
-    println!("{}", "Press Ctrl+C to shut down.".dimmed());
     println!();
 
-    // Wait for SIGINT
+    println!("{}", "All workers started as separate processes.".green().bold());
+    if args.api_url.is_some() {
+        println!("{}", "Each worker self-registers with the dashboard and sends heartbeats.".cyan());
+    }
+    println!("{}", "Press Ctrl+C to shut down all workers.".dimmed());
+    println!();
+
+    // Wait for SIGINT.
     signal::ctrl_c().await?;
     println!();
-    println!("{}", "Shutting down workers...".yellow());
+    println!("{}", "Shutting down worker processes...".yellow());
 
-    // Abort heartbeat task
-    if let Some(hb) = heartbeat_handle {
-        hb.abort();
+    // Kill all child processes.
+    for (i, child) in children.iter_mut() {
+        match child.kill() {
+            Ok(()) => println!("  [worker-{}] Killed (PID {})", i, child.id()),
+            Err(e) => eprintln!("  [worker-{}] Failed to kill PID {}: {}", i, child.id(), e),
+        }
     }
 
-    // Abort all worker tasks
-    for handle in &handles {
-        handle.abort();
-    }
-
-    // Wait for tasks to finish
-    for (i, handle) in handles.into_iter().enumerate() {
-        match handle.await {
-            Ok(()) => println!("[worker-{}] Stopped cleanly", i),
-            Err(e) if e.is_cancelled() => println!("[worker-{}] Stopped", i),
-            Err(e) => eprintln!("[worker-{}] Error during shutdown: {}", i, e),
+    // Wait for all children to fully exit.
+    for (i, child) in children.iter_mut() {
+        match child.wait() {
+            Ok(status) => println!("  [worker-{}] Exited ({})", i, status),
+            Err(e) => eprintln!("  [worker-{}] Wait error: {}", i, e),
         }
     }
 

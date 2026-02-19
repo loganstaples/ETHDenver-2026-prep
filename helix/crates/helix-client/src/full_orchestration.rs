@@ -289,7 +289,7 @@ impl Default for FullOrchestrationConfig {
             checkpoint_frequency: 10,
             mac_check_interval: 10,
             beaver_batch_size: 2048,
-            batch_size: 1,
+            batch_size: 4,
             seed: 42,
             worker_endpoints: vec![
                 "127.0.0.1:9001".to_string(),

@@ -69,6 +69,7 @@ async fn run_mpc_training(
             base_error: 1e-6,
             checkpoint_interval: 1,
             mac_config: None,
+            batch_size: 1,
         };
 
         if use_mac {
@@ -155,6 +156,7 @@ async fn run_mpc_training_with_eval(
             base_error: 1e-6,
             checkpoint_interval: 1,
             mac_config: None,
+            batch_size: 1,
         };
 
         if use_mac {

@@ -928,44 +928,59 @@ pub async fn run_distributed_party<T: crate::session::transport::MPCTransport + 
     let bs = config.batch_size.max(1);
     for step in 0..num_steps {
         let step_result = if use_mac {
-            let data_idx = step % training_data.len();
-            let (input, target) = &training_data[data_idx];
-            match trainer.training_step_with_mac(input, target).await {
-                Ok(result) => {
-                    if config.mac_config.as_ref().map_or(false, |mc| {
-                        mc.check_interval > 0 && (step as u64 + 1) % mc.check_interval == 0
-                    }) {
-                        mac_checks_passed += 1;
+            // MAC path: process bs samples per logical step, averaging loss.
+            // Each sub-sample gets full MAC tracking (no correctness compromise).
+            let mut batch_loss = 0.0f64;
+            let mut last_result = None;
+            let mut mac_break = false;
+            for b_idx in 0..bs {
+                let data_idx = (step * bs + b_idx) % training_data.len();
+                let (input, target) = &training_data[data_idx];
+                match trainer.training_step_with_mac(input, target).await {
+                    Ok(result) => {
+                        batch_loss += result.loss;
+                        if config.mac_config.as_ref().map_or(false, |mc| {
+                            mc.check_interval > 0 && (step as u64 + 1) % mc.check_interval == 0
+                        }) && b_idx == bs - 1 {
+                            mac_checks_passed += 1;
+                        }
+                        last_result = Some(result);
                     }
-                    result
-                }
-                Err(MPCError::MACCheckFailed { step: fail_step, cheater }) => {
-                    warn!(
-                        party = party_index,
-                        step = fail_step,
-                        cheater = ?cheater,
-                        "MAC check failed - cheater detected (distributed)"
-                    );
-                    cheater_detected = Some(CheaterRecord {
-                        party_index: cheater.unwrap_or(usize::MAX),
-                        detected_at_step: fail_step,
-                        failure_report: MACFailureReport {
-                            session_id: "distributed-training".to_string(),
-                            step_number: fail_step,
-                            identified_cheater: cheater,
-                            sigma_values: Vec::new(),
-                            commitments: Vec::new(),
-                            evidence: crate::mac_verification::CheaterEvidence {
-                                pairwise_results: Vec::new(),
-                                round1_sigmas: Vec::new(),
-                                round2_sigmas: Vec::new(),
+                    Err(MPCError::MACCheckFailed { step: fail_step, cheater }) => {
+                        warn!(
+                            party = party_index,
+                            step = fail_step,
+                            cheater = ?cheater,
+                            "MAC check failed - cheater detected (distributed)"
+                        );
+                        cheater_detected = Some(CheaterRecord {
+                            party_index: cheater.unwrap_or(usize::MAX),
+                            detected_at_step: fail_step,
+                            failure_report: MACFailureReport {
+                                session_id: "distributed-training".to_string(),
+                                step_number: fail_step,
+                                identified_cheater: cheater,
+                                sigma_values: Vec::new(),
+                                commitments: Vec::new(),
+                                evidence: crate::mac_verification::CheaterEvidence {
+                                    pairwise_results: Vec::new(),
+                                    round1_sigmas: Vec::new(),
+                                    round2_sigmas: Vec::new(),
+                                },
                             },
-                        },
-                    });
-                    break;
+                        });
+                        mac_break = true;
+                        break;
+                    }
+                    Err(e) => return Err(e.into()),
                 }
-                Err(e) => return Err(e.into()),
             }
+            if mac_break {
+                break;
+            }
+            let mut result = last_result.unwrap();
+            result.loss = batch_loss / bs as f64;
+            result
         } else if bs > 1 {
             let batch: Vec<(Vec<f64>, Vec<f64>)> = (0..bs)
                 .map(|b_idx| {
@@ -1505,6 +1520,7 @@ mod tests {
             use_node_transport: false,
             use_tcp_transport: false,
             worker_endpoints: None,
+            batch_size: 1,
         };
 
         let result = run_mpc_training(config).await.expect("training should succeed");
@@ -1541,6 +1557,7 @@ mod tests {
             use_node_transport: false,
             use_tcp_transport: false,
             worker_endpoints: None,
+            batch_size: 1,
         };
 
         let result = run_mpc_training(config).await.expect("training should succeed");
@@ -1580,6 +1597,7 @@ mod tests {
             use_node_transport: true,
             use_tcp_transport: false,
             worker_endpoints: None,
+            batch_size: 1,
         };
 
         let result = run_mpc_training(config).await.expect("training should succeed");
@@ -1609,6 +1627,7 @@ mod tests {
             use_node_transport: false,
             use_tcp_transport: false,
             worker_endpoints: None,
+            batch_size: 1,
         };
 
         let result = run_mpc_training(config).await.expect("training should succeed");
@@ -1665,6 +1684,7 @@ mod tests {
                 use_node_transport: false,
                 use_tcp_transport: false,
                 worker_endpoints: None,
+                batch_size: 1,
             };
 
             let result = run_mpc_training(config).await.expect("should succeed");

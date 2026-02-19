@@ -33,6 +33,7 @@ fn mac_config(num_parties: usize, check_interval: u64) -> MPCTrainerConfig {
             enable_cheater_identification: true,
             mac_seed: 0xDEAD_BEEF_CAFE_BABE,
         }),
+        batch_size: 1,
     }
 }
 

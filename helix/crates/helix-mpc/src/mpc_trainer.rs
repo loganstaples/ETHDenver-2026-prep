@@ -48,6 +48,19 @@ use crate::session::transport::MPCTransport;
 use crate::sharing::tensor::TensorShare;
 use crate::types::{PartyId, ShareId};
 
+/// Receives messages from all peers in parallel using `try_join_all`.
+///
+/// Instead of sequential `for peer in &peers { recv(peer).await }`, this
+/// issues all recv futures concurrently, reducing latency from N round-trips
+/// to 1 (the slowest peer). Safe because each peer has independent channels.
+async fn recv_all<T: MPCTransport>(transport: &T) -> MPCResult<Vec<Vec<u8>>> {
+    let peers = transport.peers();
+    let futs: Vec<_> = peers.iter()
+        .map(|peer| transport.recv(peer))
+        .collect();
+    futures::future::try_join_all(futs).await
+}
+
 /// Number of bits used for the secure sign-bit comparison protocol.
 /// This controls the range of values that can be correctly compared.
 /// For ML values in fixed-point representation, 64 bits is sufficient.
@@ -99,7 +112,7 @@ impl Default for MPCTrainerConfig {
             base_error: 1e-6,
             checkpoint_interval: 1,
             mac_config: None,
-            batch_size: 1,
+            batch_size: 4,
         }
     }
 }
@@ -582,10 +595,9 @@ impl<T: MPCTransport> MPCTrainer<T> {
             let mut full_w2 = self.w2.clone();
             let mut full_b2 = self.b2.clone();
 
-            let peers = self.transport.peers();
-            for peer in &peers {
-                let data = self.transport.recv(peer).await?;
-                let msg = TrainingMessage::decode(&data)?;
+            let all_msgs = recv_all(&self.transport).await?;
+            for data in &all_msgs {
+                let msg = TrainingMessage::decode(data)?;
                 if let TrainingMessage::WeightUpdate { w1, b1, w2, b2 } = msg {
                     let pw1 = SecureArithmetic::deserialize_share_batch(&w1)?;
                     let pb1 = SecureArithmetic::deserialize_share_batch(&b1)?;
@@ -622,6 +634,7 @@ impl<T: MPCTransport> MPCTrainer<T> {
             ms.b2_macs = b2_mac_shares[0].clone();
 
             // Send MAC init to each peer.
+            let peers = self.transport.peers();
             for (i, peer) in peers.iter().enumerate() {
                 let peer_idx = i + 1;
                 let msg = TrainingMessage::MACInit {
@@ -758,10 +771,9 @@ impl<T: MPCTransport> MPCTrainer<T> {
         let mut total_d = d_share;
         let mut total_e = e_share;
 
-        let peers = self.transport.peers();
-        for peer in &peers {
-            let msg = self.transport.recv(peer).await?;
-            let shares = SecureArithmetic::deserialize_share_batch(&msg)?;
+        let all_msgs = recv_all(&self.transport).await?;
+        for msg in &all_msgs {
+            let shares = SecureArithmetic::deserialize_share_batch(msg)?;
             if shares.len() < 2 {
                 return Err(MPCError::CommunicationError(
                     "expected 2 shares in Beaver mask message".into(),
@@ -807,14 +819,13 @@ impl<T: MPCTransport> MPCTrainer<T> {
         let batch_msg = SecureArithmetic::serialize_share_batch(&all_shares);
         self.transport.broadcast(&batch_msg).await?;
 
-        // Collect from peers.
+        // Collect from peers (parallel recv).
         let mut total_d = d_batch;
         let mut total_e = e_batch;
 
-        let peers = self.transport.peers();
-        for peer in &peers {
-            let msg = self.transport.recv(peer).await?;
-            let shares = SecureArithmetic::deserialize_share_batch(&msg)?;
+        let all_msgs = recv_all(&self.transport).await?;
+        for msg in &all_msgs {
+            let shares = SecureArithmetic::deserialize_share_batch(msg)?;
             if shares.len() < 2 * dim {
                 return Err(MPCError::CommunicationError(format!(
                     "expected {} shares in batched Beaver mask, got {}",
@@ -905,9 +916,9 @@ impl<T: MPCTransport> MPCTrainer<T> {
         self.transport.broadcast(&masked_bytes).await?;
 
         let mut opened = masked.clone();
-        for peer in &peers {
-            let msg = self.transport.recv(peer).await?;
-            let peer_masked = SecureArithmetic::deserialize_share_batch(&msg)?;
+        let all_msgs = recv_all(&self.transport).await?;
+        for msg in &all_msgs {
+            let peer_masked = SecureArithmetic::deserialize_share_batch(msg)?;
             for i in 0..dim {
                 opened[i] = Fr::add(&opened[i], &peer_masked[i]);
             }
@@ -1050,9 +1061,9 @@ impl<T: MPCTransport> MPCTrainer<T> {
         self.transport.broadcast(&y_bytes).await?;
 
         let mut y_reconstructed = y_share.clone();
-        for peer in &peers {
-            let msg = self.transport.recv(peer).await?;
-            let peer_y = SecureArithmetic::deserialize_share_batch(&msg)?;
+        let all_msgs = recv_all(&self.transport).await?;
+        for msg in &all_msgs {
+            let peer_y = SecureArithmetic::deserialize_share_batch(msg)?;
             for i in 0..d_out {
                 y_reconstructed[i] = Fr::add(&y_reconstructed[i], &peer_y[i]);
             }
@@ -1284,9 +1295,9 @@ impl<T: MPCTransport> MPCTrainer<T> {
         self.transport.broadcast(&h_pre_bytes).await?;
 
         let mut h_pre_recon = h_pre_share.clone();
-        for peer in &peers {
-            let msg = self.transport.recv(peer).await?;
-            let peer_h = SecureArithmetic::deserialize_share_batch(&msg)?;
+        let all_msgs = recv_all(&self.transport).await?;
+        for msg in &all_msgs {
+            let peer_h = SecureArithmetic::deserialize_share_batch(msg)?;
             for i in 0..d_hid {
                 h_pre_recon[i] = Fr::add(&h_pre_recon[i], &peer_h[i]);
             }
@@ -1344,9 +1355,9 @@ impl<T: MPCTransport> MPCTrainer<T> {
         self.transport.broadcast(&y_bytes).await?;
 
         let mut y_reconstructed = y_share.clone();
-        for peer in &peers {
-            let msg = self.transport.recv(peer).await?;
-            let peer_y = SecureArithmetic::deserialize_share_batch(&msg)?;
+        let all_msgs = recv_all(&self.transport).await?;
+        for msg in &all_msgs {
+            let peer_y = SecureArithmetic::deserialize_share_batch(msg)?;
             for i in 0..d_out {
                 y_reconstructed[i] = Fr::add(&y_reconstructed[i], &peer_y[i]);
             }
@@ -1411,9 +1422,9 @@ impl<T: MPCTransport> MPCTrainer<T> {
         let dh_bytes = SecureArithmetic::serialize_share_batch(&dh_share);
         self.transport.broadcast(&dh_bytes).await?;
         let mut dh_recon = dh_share.clone();
-        for peer in &peers {
-            let msg = self.transport.recv(peer).await?;
-            let peer_dh = SecureArithmetic::deserialize_share_batch(&msg)?;
+        let all_msgs = recv_all(&self.transport).await?;
+        for msg in &all_msgs {
+            let peer_dh = SecureArithmetic::deserialize_share_batch(msg)?;
             for j in 0..d_hid {
                 dh_recon[j] = Fr::add(&dh_recon[j], &peer_dh[j]);
             }
@@ -1590,9 +1601,9 @@ impl<T: MPCTransport> MPCTrainer<T> {
         self.transport.broadcast(&h_pre_bytes).await?;
 
         let mut flat_h_pre_recon = flat_h_pre.clone();
-        for peer in &peers {
-            let msg = self.transport.recv(peer).await?;
-            let peer_h = SecureArithmetic::deserialize_share_batch(&msg)?;
+        let all_msgs = recv_all(&self.transport).await?;
+        for msg in &all_msgs {
+            let peer_h = SecureArithmetic::deserialize_share_batch(msg)?;
             for i in 0..flat_h_pre_recon.len() {
                 flat_h_pre_recon[i] = Fr::add(&flat_h_pre_recon[i], &peer_h[i]);
             }
@@ -1671,9 +1682,9 @@ impl<T: MPCTransport> MPCTrainer<T> {
         self.transport.broadcast(&y_bytes).await?;
 
         let mut flat_y_recon = flat_y.clone();
-        for peer in &peers {
-            let msg = self.transport.recv(peer).await?;
-            let peer_y = SecureArithmetic::deserialize_share_batch(&msg)?;
+        let all_msgs = recv_all(&self.transport).await?;
+        for msg in &all_msgs {
+            let peer_y = SecureArithmetic::deserialize_share_batch(msg)?;
             for i in 0..flat_y_recon.len() {
                 flat_y_recon[i] = Fr::add(&flat_y_recon[i], &peer_y[i]);
             }
@@ -1795,9 +1806,9 @@ impl<T: MPCTransport> MPCTrainer<T> {
         self.transport.broadcast(&dh_bytes).await?;
 
         let mut flat_dh_recon = flat_dh.clone();
-        for peer in &peers {
-            let msg = self.transport.recv(peer).await?;
-            let peer_dh = SecureArithmetic::deserialize_share_batch(&msg)?;
+        let all_msgs = recv_all(&self.transport).await?;
+        for msg in &all_msgs {
+            let peer_dh = SecureArithmetic::deserialize_share_batch(msg)?;
             for i in 0..flat_dh_recon.len() {
                 flat_dh_recon[i] = Fr::add(&flat_dh_recon[i], &peer_dh[i]);
             }
@@ -2085,10 +2096,10 @@ impl<T: MPCTransport> MPCTrainer<T> {
             self.transport.send(peer, &msg.encode()).await?;
         }
 
-        // Receive zero-shares from all peers and add to weights.
-        for peer in &peers {
-            let data = self.transport.recv(peer).await?;
-            let msg = TrainingMessage::decode(&data)?;
+        // Receive zero-shares from all peers (parallel) and add to weights.
+        let all_data = recv_all(&self.transport).await?;
+        for data in &all_data {
+            let msg = TrainingMessage::decode(data)?;
 
             if let TrainingMessage::ReshareZeros { values } = msg {
                 let peer_zeros = SecureArithmetic::deserialize_share_batch(&values)?;
@@ -2259,12 +2270,12 @@ impl<T: MPCTransport> MPCTrainer<T> {
             return Ok(None);
         }
 
-        // Party 0: receive shares from all peers and accumulate.
+        // Party 0: receive shares from all peers (parallel) and accumulate.
         let mut accumulated = all_shares;
 
-        for peer in &peers {
-            let data = self.transport.recv(peer).await?;
-            let peer_msg = TrainingMessage::decode(&data)?;
+        let all_data = recv_all(&self.transport).await?;
+        for data in &all_data {
+            let peer_msg = TrainingMessage::decode(data)?;
 
             let peer_shares = match peer_msg {
                 TrainingMessage::ProofShares { shares } => {
@@ -2701,10 +2712,9 @@ impl<T: MPCTransport> MPCTrainer<T> {
 
         let mut total_d = d_share;
         let mut total_e = e_share;
-        let peers = self.transport.peers();
-        for peer in &peers {
-            let msg = self.transport.recv(peer).await?;
-            let shares = SecureArithmetic::deserialize_share_batch(&msg)?;
+        let all_msgs = recv_all(&self.transport).await?;
+        for msg in &all_msgs {
+            let shares = SecureArithmetic::deserialize_share_batch(msg)?;
             if shares.len() < 2 {
                 return Err(MPCError::CommunicationError(
                     "expected 2 shares in Beaver mask".into(),
@@ -2765,10 +2775,9 @@ impl<T: MPCTransport> MPCTrainer<T> {
 
         let mut total_d = d_batch;
         let mut total_e = e_batch;
-        let peers = self.transport.peers();
-        for peer in &peers {
-            let msg = self.transport.recv(peer).await?;
-            let shares = SecureArithmetic::deserialize_share_batch(&msg)?;
+        let all_msgs = recv_all(&self.transport).await?;
+        for msg in &all_msgs {
+            let shares = SecureArithmetic::deserialize_share_batch(msg)?;
             if shares.len() < 2 * dim {
                 return Err(MPCError::CommunicationError(format!(
                     "expected {} shares, got {}", 2 * dim, shares.len()
@@ -2880,10 +2889,9 @@ impl<T: MPCTransport> MPCTrainer<T> {
             self.transport.broadcast(&sign_bytes).await?;
 
             let mut reconstructed_sign = relu_mask_share.clone();
-            let peers = self.transport.peers();
-            for peer in &peers {
-                let msg = self.transport.recv(peer).await?;
-                let peer_sign = SecureArithmetic::deserialize_share_batch(&msg)?;
+            let all_msgs = recv_all(&self.transport).await?;
+            for msg in &all_msgs {
+                let peer_sign = SecureArithmetic::deserialize_share_batch(msg)?;
                 for i in 0..d_hid {
                     reconstructed_sign[i] = Fr::add(&reconstructed_sign[i], &peer_sign[i]);
                 }
@@ -2911,9 +2919,9 @@ impl<T: MPCTransport> MPCTrainer<T> {
         self.transport.broadcast(&h_bytes).await?;
 
         let mut h_recon = h_share.clone();
-        for peer in &peers {
-            let msg = self.transport.recv(peer).await?;
-            let peer_h = SecureArithmetic::deserialize_share_batch(&msg)?;
+        let all_msgs = recv_all(&self.transport).await?;
+        for msg in &all_msgs {
+            let peer_h = SecureArithmetic::deserialize_share_batch(msg)?;
             for j in 0..d_hid {
                 h_recon[j] = Fr::add(&h_recon[j], &peer_h[j]);
             }
@@ -2948,9 +2956,9 @@ impl<T: MPCTransport> MPCTrainer<T> {
         self.transport.broadcast(&y_bytes).await?;
 
         let mut y_reconstructed = y_share.clone();
-        for peer in &peers {
-            let msg = self.transport.recv(peer).await?;
-            let peer_y = SecureArithmetic::deserialize_share_batch(&msg)?;
+        let all_msgs = recv_all(&self.transport).await?;
+        for msg in &all_msgs {
+            let peer_y = SecureArithmetic::deserialize_share_batch(msg)?;
             for i in 0..d_out {
                 y_reconstructed[i] = Fr::add(&y_reconstructed[i], &peer_y[i]);
             }
@@ -3005,9 +3013,9 @@ impl<T: MPCTransport> MPCTrainer<T> {
         let dh_bytes = SecureArithmetic::serialize_share_batch(&dh_share);
         self.transport.broadcast(&dh_bytes).await?;
         let mut dh_recon = dh_share.clone();
-        for peer in &peers {
-            let msg = self.transport.recv(peer).await?;
-            let peer_dh = SecureArithmetic::deserialize_share_batch(&msg)?;
+        let all_msgs = recv_all(&self.transport).await?;
+        for msg in &all_msgs {
+            let peer_dh = SecureArithmetic::deserialize_share_batch(msg)?;
             for j in 0..d_hid {
                 dh_recon[j] = Fr::add(&dh_recon[j], &peer_dh[j]);
             }
@@ -3221,10 +3229,10 @@ impl<T: MPCTransport> MPCTrainer<T> {
             self.transport.send(peer, &msg.encode()).await?;
         }
 
+        let all_data = recv_all(&self.transport).await?;
         let ms = self.mac_state.as_mut().unwrap();
-        for peer in &peers {
-            let data = self.transport.recv(peer).await?;
-            let msg = TrainingMessage::decode(&data)?;
+        for data in &all_data {
+            let msg = TrainingMessage::decode(data)?;
             if let TrainingMessage::ReshareZeros { values } = msg {
                 let peer_zeros = SecureArithmetic::deserialize_share_batch(&values)?;
                 if peer_zeros.len() != all_macs_len {
@@ -3537,6 +3545,7 @@ mod tests {
             base_error: 1e-6,
             checkpoint_interval: 1,
             mac_config: None,
+            batch_size: 1,
         };
 
         let initial_weights = ModelWeights::from_f64(
@@ -3607,6 +3616,7 @@ mod tests {
             base_error: 1e-6,
             checkpoint_interval: 1,
             mac_config: None,
+            batch_size: 1,
         };
 
         let initial_weights = ModelWeights::from_f64(
@@ -3701,6 +3711,7 @@ mod tests {
             base_error: 1e-6,
             checkpoint_interval: 1,
             mac_config: None,
+            batch_size: 1,
         };
 
         let initial_weights = ModelWeights::from_f64(
@@ -3839,6 +3850,7 @@ mod tests {
             base_error: 1e-6,
             checkpoint_interval: 1,
             mac_config: None,
+            batch_size: 1,
         };
 
         let initial_weights = ModelWeights::from_f64(
@@ -3913,6 +3925,7 @@ mod tests {
             base_error: 1e-6,
             checkpoint_interval: 1,
             mac_config: None,
+            batch_size: 1,
         };
 
         // Use tiny weights in the 0.001 range so they quantize to small Fr
@@ -4017,6 +4030,7 @@ mod tests {
             base_error: 1e-6,
             checkpoint_interval: 1,
             mac_config: None,
+            batch_size: 1,
         };
 
         let initial_weights = ModelWeights::from_f64(
@@ -4087,6 +4101,7 @@ mod tests {
             base_error: 1e-6,
             checkpoint_interval: 1,
             mac_config: None,
+            batch_size: 1,
         };
 
         let initial_weights = ModelWeights::from_f64(
@@ -4159,6 +4174,7 @@ mod tests {
             base_error: 1e-6,
             checkpoint_interval: 3, // Run 3 steps per epoch
             mac_config: None,
+            batch_size: 1,
         };
 
         let initial_weights = ModelWeights::from_f64(
@@ -4232,6 +4248,7 @@ mod tests {
             base_error: 1e-6,
             checkpoint_interval: 1, // epoch = single step
             mac_config: None,
+            batch_size: 1,
         };
 
         let initial_weights = ModelWeights::from_f64(
@@ -4329,6 +4346,7 @@ mod tests {
                 enable_cheater_identification: true,
                 mac_seed: 0xDEAD_BEEF_CAFE_BABE,
             }),
+            batch_size: 1,
         }
     }
 
@@ -4632,6 +4650,7 @@ mod tests {
             base_error: 1e-6,
             checkpoint_interval: 1,
             mac_config: None, // Disable MAC for recovery (new MAC init needed otherwise)
+            batch_size: 1,
         };
 
         let recovery_data = mac_test_data(5);

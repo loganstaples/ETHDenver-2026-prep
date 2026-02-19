@@ -40,6 +40,15 @@ use crate::protocols::arithmetic::SecureArithmetic;
 use crate::session::transport::MPCTransport;
 use crate::types::PartyId;
 
+/// Receives messages from all peers in parallel using `try_join_all`.
+async fn recv_all<T: MPCTransport>(transport: &T) -> crate::error::MPCResult<Vec<Vec<u8>>> {
+    let peers = transport.peers();
+    let futs: Vec<_> = peers.iter()
+        .map(|peer| transport.recv(peer))
+        .collect();
+    futures::future::try_join_all(futs).await
+}
+
 // ============================================================================
 // Configuration
 // ============================================================================
@@ -485,9 +494,9 @@ pub async fn run_sigma_check<T: MPCTransport>(
 
     let mut v_total = v_i;
     let peers = transport.peers();
-    for peer in &peers {
-        let data = transport.recv(peer).await?;
-        let msg = SigmaMessage::decode(&data)?;
+    let all_data = recv_all(transport).await?;
+    for data in &all_data {
+        let msg = SigmaMessage::decode(data)?;
         if let SigmaMessage::Open { v_share } = msg {
             let peer_v = SecureArithmetic::deserialize_share_batch(&v_share)?;
             v_total = Fr::add(&v_total, &peer_v[0]);
@@ -519,9 +528,9 @@ pub async fn run_sigma_check<T: MPCTransport>(
 
     let mut all_commitments = vec![[0u8; 32]; num_parties];
     all_commitments[party_index] = commitment;
-    for peer in &peers {
-        let data = transport.recv(peer).await?;
-        let msg = SigmaMessage::decode(&data)?;
+    let all_data = recv_all(transport).await?;
+    for (peer, data) in peers.iter().zip(all_data.iter()) {
+        let msg = SigmaMessage::decode(data)?;
         if let SigmaMessage::Commitment { hash } = msg {
             let peer_idx = party_index_from_id(peer);
             all_commitments[peer_idx] = hash;
@@ -539,9 +548,9 @@ pub async fn run_sigma_check<T: MPCTransport>(
 
     let mut all_sigmas = vec![Fr::ZERO; num_parties];
     all_sigmas[party_index] = sigma_i;
-    for peer in &peers {
-        let data = transport.recv(peer).await?;
-        let msg = SigmaMessage::decode(&data)?;
+    let all_data = recv_all(transport).await?;
+    for (peer, data) in peers.iter().zip(all_data.iter()) {
+        let msg = SigmaMessage::decode(data)?;
         if let SigmaMessage::Reveal { sigma, nonce: peer_nonce } = msg {
             let peer_idx = party_index_from_id(peer);
             // Verify commitment.
@@ -860,10 +869,10 @@ pub async fn authenticate_beaver_triples<T: MPCTransport>(
         all_c[i] = t.c;
     }
 
-    // Receive from peers.
-    for peer in &peers {
-        let data = transport.recv(peer).await?;
-        let shares = SecureArithmetic::deserialize_share_batch(&data)?;
+    // Receive from peers (parallel).
+    let all_data = recv_all(transport).await?;
+    for data in &all_data {
+        let shares = SecureArithmetic::deserialize_share_batch(data)?;
         if shares.len() != count * 3 {
             return Err(MPCError::ProtocolError(format!(
                 "expected {} triple shares, got {}", count * 3, shares.len()
