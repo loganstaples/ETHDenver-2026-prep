@@ -343,7 +343,7 @@ export function useNodes(options: UseNodesOptions = {}): UseNodesReturn {
             apiClient.subscribeToChannel('nodes');
 
             // Handle node update messages
-            wsUnsubscribeRef.current = apiClient.onWebSocketMessage<NodeInfo>(
+            const unsubNodeUpdate = apiClient.onWebSocketMessage<NodeInfo>(
                 'node_update',
                 (message) => {
                     const nodeData = message.data;
@@ -398,6 +398,98 @@ export function useNodes(options: UseNodesOptions = {}): UseNodesReturn {
                     });
                 }
             );
+
+            // Handle worker_joined — add new worker node to the network graph
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const unsubWorkerJoined = apiClient.onWebSocketMessage<any>(
+                'worker_joined',
+                (message) => {
+                    const w = message.data?.worker || (message as any).event?.worker;
+                    if (!w?.id) return;
+
+                    setNodes((prev) => {
+                        // Don't add if already exists
+                        if (prev.some((n) => n.id === w.id)) return prev;
+                        const newNode: WorkerNode = {
+                            id: w.id,
+                            address: w.endpoint || w.id,
+                            type: 'compute',
+                            status: 'active',
+                            lastSeen: Date.now(),
+                            lastHeartbeat: Date.now(),
+                            stakedAmount: BigInt(0),
+                            proofsSubmitted: 0,
+                            proofsVerified: 0,
+                            proofsFailed: 0,
+                            roundsParticipated: 0,
+                            roundsCompleted: 0,
+                            reputation: w.reputation_score ? Math.round(w.reputation_score * 100) : 50,
+                            metrics: { cpu: w.cpu_load || 0, memory: 0, networkIn: 0, networkOut: 0 },
+                            capabilities: {
+                                canTrain: w.capabilities?.can_train ?? true,
+                                canAggregate: w.capabilities?.can_aggregate ?? false,
+                                canProve: w.capabilities?.can_prove ?? false,
+                                gpuMemoryMb: 0,
+                                maxBatchSize: w.capabilities?.max_batch_size ?? 64,
+                            },
+                            earningsTotal: BigInt(0),
+                            slashed: false,
+                        };
+                        return [...prev, newNode];
+                    });
+
+                    // Also add mesh connections to existing nodes
+                    setConnections((prev) => {
+                        const newConns: NetworkConnection[] = [];
+                        const existingNodeIds = new Set(prev.flatMap((c) => [c.from, c.to]));
+                        existingNodeIds.forEach((existingId) => {
+                            newConns.push({
+                                from: existingId,
+                                to: w.id,
+                                latency: 10 + Math.floor(Math.random() * 40),
+                                bandwidth: 100,
+                                status: 'active',
+                                lastUpdated: Date.now(),
+                            });
+                        });
+                        return [...prev, ...newConns];
+                    });
+                }
+            );
+
+            // Handle worker_left — mark worker as offline in the network graph
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const unsubWorkerLeft = apiClient.onWebSocketMessage<any>(
+                'worker_left',
+                (message) => {
+                    const workerId = message.data?.worker_id || (message as any).event?.worker_id;
+                    if (!workerId) return;
+
+                    setNodes((prev) =>
+                        prev.map((n) =>
+                            n.id === workerId
+                                ? { ...n, status: 'offline' as const, lastSeen: Date.now() }
+                                : n
+                        )
+                    );
+
+                    // Mark connections involving this worker as offline
+                    setConnections((prev) =>
+                        prev.map((c) =>
+                            c.from === workerId || c.to === workerId
+                                ? { ...c, status: 'offline' as const, lastUpdated: Date.now() }
+                                : c
+                        )
+                    );
+                }
+            );
+
+            // Combine unsubscribe functions
+            wsUnsubscribeRef.current = () => {
+                unsubNodeUpdate();
+                unsubWorkerJoined();
+                unsubWorkerLeft();
+            };
         } catch (err) {
             console.warn('WebSocket connection failed, falling back to polling:', err);
             setIsConnected(false);

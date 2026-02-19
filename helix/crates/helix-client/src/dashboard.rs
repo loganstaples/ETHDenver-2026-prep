@@ -1565,8 +1565,12 @@ async fn handle_websocket(socket: WebSocket, state: Arc<DashboardState>) {
     let forward_task = tokio::spawn(async move {
         while let Ok((session_id, event)) = rx.recv().await {
             // Send to the mpsc channel; the main loop will check subscriptions
+            // Include the event's "type" at the top level so the frontend
+            // WebSocket client can dispatch on `message.type` directly.
+            let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("unknown").to_string();
             let msg = serde_json::json!({
                 "session_id": session_id,
+                "type": event_type,
                 "event": event,
             });
             if tx.send(msg).await.is_err() {
@@ -1800,6 +1804,26 @@ async fn register_worker_handler(
         "count": count,
     })));
 
+    // Broadcast detailed worker_joined event for real-time network graph updates
+    let join_event = serde_json::json!({
+        "type": "worker_joined",
+        "worker": {
+            "id": &worker_id,
+            "endpoint": &req.endpoint,
+            "party_index": req.party_index,
+            "status": "idle",
+            "reputation_score": 0.5,
+            "cpu_load": 0,
+            "capabilities": {
+                "can_train": false,
+                "can_prove": false,
+                "can_aggregate": false,
+                "max_batch_size": 0,
+            },
+        }
+    });
+    let _ = state.ws_broadcast.send(("__system__".to_string(), join_event));
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -1820,6 +1844,29 @@ async fn heartbeat_worker_handler(
         .unwrap_or_default()
         .as_secs_f64();
 
+    let mut workers = state.registered_workers.write().await;
+
+    // Detect workers that have gone offline (no heartbeat for >30s) and broadcast leave events
+    let stale_timeout = 30.0;
+    let mut newly_offline = Vec::new();
+    for w in workers.iter_mut() {
+        if w.id != req.worker_id && w.status != "offline" && (now - w.last_heartbeat) > stale_timeout {
+            w.status = "offline".to_string();
+            newly_offline.push(w.id.clone());
+        }
+    }
+    drop(workers);
+
+    // Broadcast worker_left for each newly-offline worker
+    for worker_id in newly_offline {
+        let leave_event = serde_json::json!({
+            "type": "worker_left",
+            "worker_id": worker_id,
+        });
+        let _ = state.ws_broadcast.send(("__system__".to_string(), leave_event));
+    }
+
+    // Now update the heartbeat for the requesting worker
     let mut workers = state.registered_workers.write().await;
     if let Some(worker) = workers.iter_mut().find(|w| w.id == req.worker_id) {
         worker.last_heartbeat = now;
