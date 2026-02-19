@@ -21,7 +21,6 @@ import {
   HardDrive,
   ExternalLink,
   Copy,
-  History,
   ChevronDown,
   Link2,
   Layers,
@@ -97,40 +96,6 @@ function toSlug(name: string): string {
     .replace(/^-+|-+$/g, '');
 }
 
-interface TrainingHistoryEntry {
-  sessionId: string;
-  version: string;
-  accuracy: number | null;
-  steps: number;
-  totalSteps: number;
-  date: string;
-  storedOn0G: boolean;
-  rootHash?: string;
-  status: 'complete' | 'failed';
-}
-
-const HISTORY_KEY = 'helix-training-history';
-
-function getTrainingHistory(): TrainingHistoryEntry[] {
-  if (typeof window === 'undefined') return [];
-  try { const raw = localStorage.getItem(HISTORY_KEY); return raw ? JSON.parse(raw) : []; }
-  catch { return []; }
-}
-
-function saveTrainingHistory(entries: TrainingHistoryEntry[]): void {
-  try { localStorage.setItem(HISTORY_KEY, JSON.stringify(entries)); }
-  catch { /* noop */ }
-}
-
-function getNextVersion(history: TrainingHistoryEntry[]): string {
-  if (history.length === 0) return '1.0.0';
-  let maxMajor = 0;
-  for (const entry of history) {
-    const major = parseInt(entry.version.split('.')[0], 10);
-    if (!isNaN(major) && major > maxMajor) maxMajor = major;
-  }
-  return `${maxMajor + 1}.0.0`;
-}
 
 // ============================================================================
 // Shared micro-components
@@ -928,9 +893,10 @@ interface LiveProgressProps {
   isStoringOnZeroG: boolean;
   zeroGResult: ZeroGStorageResult | null;
   showStoreOn0G: boolean;
+  elapsedTime: number;
 }
 
-function LiveProgress({ session, losses, isConnected, error, version, modelName, onDownloadModel, onStoreOnZeroG, isStoringOnZeroG, zeroGResult, showStoreOn0G }: LiveProgressProps) {
+function LiveProgress({ session, losses, isConnected, error, version, modelName, onDownloadModel, onStoreOnZeroG, isStoringOnZeroG, zeroGResult, showStoreOn0G, elapsedTime }: LiveProgressProps) {
   const stepProgress = session.total_steps > 0
     ? (session.current_step / session.total_steps) * 100
     : 0;
@@ -1069,7 +1035,7 @@ function LiveProgress({ session, losses, isConnected, error, version, modelName,
             <StatCard label="Elapsed" value={
               session.elapsed_secs > 0
                 ? `${session.elapsed_secs.toFixed(0)}s`
-                : `${Math.floor((Date.now() / 1000) - session.started_at)}s`
+                : `${elapsedTime}s`
             } icon={null} />
           </div>
 
@@ -1317,69 +1283,6 @@ function ResultsActions({ session, version, onDownloadModel, onStoreOnZeroG, isS
   );
 }
 
-// ============================================================================
-// Training History
-// ============================================================================
-
-function TrainingHistoryList({ history, onClearHistory }: { history: TrainingHistoryEntry[]; onClearHistory: () => void }) {
-  if (history.length === 0) return null;
-
-  return (
-    <div>
-      <div className="flex items-center justify-between mb-3">
-        <div className="flex items-center gap-2">
-          <History size={14} className="text-helix-muted" />
-          <span className="text-sm font-medium text-helix-text2">History</span>
-          <span className="text-sm text-helix-dim">{history.length}</span>
-        </div>
-        <button
-          type="button"
-          onClick={onClearHistory}
-          className="text-xs text-helix-dim hover:text-red-400 transition-colors"
-        >
-          Clear
-        </button>
-      </div>
-
-      <div className="space-y-1.5">
-        {history.slice().reverse().map((entry) => (
-          <div
-            key={entry.sessionId}
-            className="flex items-center gap-3 px-4 py-3 rounded-xl bg-helix-surface border border-helix-border"
-          >
-            {entry.status === 'complete' ? (
-              <CheckCircle size={12} className="text-green-400 shrink-0" />
-            ) : (
-              <XCircle size={12} className="text-red-400 shrink-0" />
-            )}
-
-            <span className="text-sm text-helix-muted">v{entry.version}</span>
-
-            <div className="flex-1" />
-
-            {entry.accuracy !== null && (
-              <span className="text-base font-medium text-white tabular-nums">
-                {(entry.accuracy * 100).toFixed(1)}%
-              </span>
-            )}
-
-            <span className="text-sm text-helix-dim tabular-nums">
-              {entry.steps}/{entry.totalSteps}
-            </span>
-
-            {entry.storedOn0G && (
-              <HardDrive size={10} className="text-green-400/60" />
-            )}
-
-            <span className="text-sm text-helix-dim">
-              {new Date(entry.date).toLocaleDateString()}
-            </span>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
 
 // ============================================================================
 // Inner page (needs useSearchParams, so must be inside Suspense)
@@ -1393,6 +1296,7 @@ function TrainPageInner() {
     startTraining, uploadData, uploadWeights, downloadModel, storeOnZeroG,
     session, losses, isConnected, isStarting, error: trainingError,
     uploadedData, uploadedWeights, workersOnline, zeroGResult, isStoringOnZeroG,
+    elapsedTime, history, fetchHistory, isLoadingHistory,
   } = useMpcTraining();
 
   const { models, isLoading: isLoadingModels } = useModelRegistry();
@@ -1476,8 +1380,6 @@ function TrainPageInner() {
   const [wantsStoreOn0G, setWantsStoreOn0G] = useState(false);
   const [currentVersion, setCurrentVersion] = useState('1.0.0');
   const [currentModelName, setCurrentModelName] = useState('');
-  const [history, setHistory] = useState<TrainingHistoryEntry[]>([]);
-  const historyRecordedRef = useRef(false);
 
   const [selectedModelId, setSelectedModelId] = useState<number | null>(null);
   const [weightFetchStatus, setWeightFetchStatus] = useState<WeightFetchStatus>('idle');
@@ -1578,52 +1480,6 @@ function TrainPageInner() {
     setSelectedModelId(tokenId);
   }, []);
 
-  // Load history on mount
-  useEffect(() => {
-    const h = getTrainingHistory();
-    setHistory(h);
-    setCurrentVersion(getNextVersion(h));
-  }, []);
-
-  // Record to history when session reaches terminal state
-  useEffect(() => {
-    if (!session) { historyRecordedRef.current = false; return; }
-    if (historyRecordedRef.current) return;
-    if (session.status !== 'complete' && session.status !== 'failed') return;
-
-    historyRecordedRef.current = true;
-    const entry: TrainingHistoryEntry = {
-      sessionId: session.session_id,
-      version: currentVersion,
-      accuracy: session.accuracy,
-      steps: session.current_step,
-      totalSteps: session.total_steps,
-      date: new Date().toISOString(),
-      storedOn0G: false,
-      status: session.status as 'complete' | 'failed',
-    };
-
-    setHistory((prev) => {
-      const updated = [...prev, entry];
-      saveTrainingHistory(updated);
-      return updated;
-    });
-  }, [session, currentVersion]);
-
-  // Update history when 0G storage completes
-  useEffect(() => {
-    if (!zeroGResult || !session) return;
-    setHistory((prev) => {
-      const updated = prev.map((e) =>
-        e.sessionId === session.session_id
-          ? { ...e, storedOn0G: true, rootHash: zeroGResult.rootHash }
-          : e,
-      );
-      saveTrainingHistory(updated);
-      return updated;
-    });
-  }, [zeroGResult, session]);
-
   const handleStart = async (config: TrainingJobConfig, opts: { storeOn0G: boolean; version: string; modelName: string; modelSlug: string }) => {
     pendingConfigRef.current = { config, opts };
     setWalletPaymentError(null);
@@ -1676,13 +1532,10 @@ function TrainPageInner() {
     });
   };
 
-  const handleClearHistory = useCallback(() => {
-    setHistory([]);
-    saveTrainingHistory([]);
-    setCurrentVersion('1.0.0');
-  }, []);
-
-  const defaultVersion = useMemo(() => getNextVersion(history), [history]);
+  const defaultVersion = useMemo(() => {
+    if (history.length === 0) return '1.0.0';
+    return `${history.length + 1}.0.0`;
+  }, [history]);
   const isFetchingWeights = weightFetchStatus === 'fetching' || weightFetchStatus === 'decrypting' || weightFetchStatus === 'uploading';
 
   return (
@@ -1780,10 +1633,11 @@ function TrainPageInner() {
           isStoringOnZeroG={isStoringOnZeroG}
           zeroGResult={zeroGResult}
           showStoreOn0G={wantsStoreOn0G}
+          elapsedTime={elapsedTime}
         />
       )}
 
-      <TrainingHistoryList history={history} onClearHistory={handleClearHistory} />
+      {/* History UI will be added in Task 7 */}
     </motion.div>
   );
 }

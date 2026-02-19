@@ -105,6 +105,10 @@ export interface UseMpcTrainingReturn {
   workersOnline: number;
   zeroGResult: ZeroGStorageResult | null;
   isStoringOnZeroG: boolean;
+  elapsedTime: number;
+  history: TrainingSessionState[];
+  isLoadingHistory: boolean;
+  fetchHistory: () => Promise<void>;
 }
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
@@ -126,11 +130,54 @@ export function useMpcTraining(): UseMpcTrainingReturn {
   const [workersOnline, setWorkersOnline] = useState(0);
   const [zeroGResult, setZeroGResult] = useState<ZeroGStorageResult | null>(null);
   const [isStoringOnZeroG, setIsStoringOnZeroG] = useState(false);
+  const [elapsedTime, setElapsedTime] = useState(0);
+  const [history, setHistory] = useState<TrainingSessionState[]>([]);
+  const [isLoadingHistory, setIsLoadingHistory] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const sessionIdRef = useRef<string | null>(null);
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // ========================================================================
+  // Fetch training history from server
+  // ========================================================================
+
+  const fetchHistory = useCallback(async () => {
+    setIsLoadingHistory(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/training/sessions`);
+      if (res.ok) {
+        const sessions: TrainingSessionState[] = await res.json();
+        setHistory(sessions.filter(s => s.status === 'complete' || s.status === 'failed'));
+      }
+    } catch {
+      // Silently fail
+    } finally {
+      setIsLoadingHistory(false);
+    }
+  }, []);
+
+  // Fetch history on mount
+  useEffect(() => {
+    fetchHistory();
+  }, [fetchHistory]);
+
+  // ========================================================================
+  // Live elapsed time counter
+  // ========================================================================
+
+  useEffect(() => {
+    if (!session || session.status === 'complete' || session.status === 'failed') {
+      return;
+    }
+    const interval = setInterval(() => {
+      if (session.started_at > 0) {
+        setElapsedTime(Math.floor(Date.now() / 1000 - session.started_at));
+      }
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [session?.status, session?.started_at]);
 
   // ========================================================================
   // WebSocket connection
@@ -298,6 +345,7 @@ export function useMpcTraining(): UseMpcTrainingReturn {
                 accuracy: accuracy ?? prev.accuracy,
               };
             });
+            fetchHistory();
           }
 
           // Handle worker count updates
@@ -316,6 +364,7 @@ export function useMpcTraining(): UseMpcTrainingReturn {
               return { ...prev, status: 'failed' };
             });
             setError(reason || 'Training session failed');
+            fetchHistory();
           }
         } catch {
           // Ignore malformed messages
@@ -324,7 +373,7 @@ export function useMpcTraining(): UseMpcTrainingReturn {
     } catch {
       setIsConnected(false);
     }
-  }, []);
+  }, [fetchHistory]);
 
   // ========================================================================
   // Polling fallback (supplements WebSocket)
@@ -634,6 +683,10 @@ export function useMpcTraining(): UseMpcTrainingReturn {
     workersOnline,
     zeroGResult,
     isStoringOnZeroG,
+    elapsedTime,
+    history,
+    isLoadingHistory,
+    fetchHistory,
   };
 }
 
