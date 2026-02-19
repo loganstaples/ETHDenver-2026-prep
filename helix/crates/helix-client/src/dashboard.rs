@@ -16,7 +16,7 @@ use axum::{
     Router,
     routing::{get, post},
     extract::{
-        ConnectInfo, Path, Query, State,
+        ConnectInfo, DefaultBodyLimit, Path, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     response::{IntoResponse, Json},
@@ -753,6 +753,7 @@ pub fn create_dashboard_router_with_state(state: Arc<DashboardState>) -> Router 
         .route("/api/workers/heartbeat", post(heartbeat_worker_handler))
         // WebSocket endpoint
         .route("/ws", get(websocket_handler))
+        .layer(DefaultBodyLimit::max(50 * 1024 * 1024)) // 50 MB for weight uploads
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .layer(middleware::from_fn_with_state(state.clone(), rate_limit_middleware))
         .layer(cors_layer)
@@ -1729,10 +1730,39 @@ async fn upload_data_handler(
 // ---------------------------------------------------------------------------
 
 /// POST /api/training/weights — upload initial model weights (for continue-training)
+///
+/// Accepts either flat format `{w1, b1, w2, b2}` or the wrapped format from
+/// model download `{weights: {w1, b1, w2, b2}, ...}`.
 async fn upload_weights_handler(
     State(state): State<Arc<DashboardState>>,
-    Json(req): Json<WeightsUpload>,
+    Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    // Try to extract weights from either flat or wrapped format
+    let weights_obj = if body.get("weights").is_some() {
+        body.get("weights").unwrap().clone()
+    } else {
+        body.clone()
+    };
+
+    let parse = || -> Option<WeightsUpload> {
+        Some(WeightsUpload {
+            w1: serde_json::from_value(weights_obj.get("w1")?.clone()).ok()?,
+            b1: serde_json::from_value(weights_obj.get("b1")?.clone()).ok()?,
+            w2: serde_json::from_value(weights_obj.get("w2")?.clone()).ok()?,
+            b2: serde_json::from_value(weights_obj.get("b2")?.clone()).ok()?,
+        })
+    };
+
+    let req = match parse() {
+        Some(w) => w,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "Expected {w1, b1, w2, b2} or {weights: {w1, b1, w2, b2}}" })),
+            ).into_response();
+        }
+    };
+
     let w1_len = req.w1.len();
     let b1_len = req.b1.len();
     let w2_len = req.w2.len();
@@ -2036,12 +2066,7 @@ async fn get_model_handler(
                 ).into_response();
             }
             match &session.final_weights {
-                Some(weights) => Json(serde_json::json!({
-                    "session_id": id,
-                    "status": "complete",
-                    "accuracy": session.accuracy,
-                    "weights": weights,
-                })).into_response(),
+                Some(weights) => Json(weights.clone()).into_response(),
                 None => (
                     StatusCode::NOT_FOUND,
                     Json(serde_json::json!({ "error": "Weights not available for this session" })),

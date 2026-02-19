@@ -10,6 +10,7 @@ import {
   CheckCircle,
   XCircle,
   AlertTriangle,
+  AlertCircle,
   Shield,
   Zap,
   Activity,
@@ -211,36 +212,70 @@ function UploadRow({ label, accept, onUpload, uploaded, optional }: {
   uploaded: string | null;
   optional?: boolean;
 }) {
+  const [isUploading, setIsUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [fileName, setFileName] = useState<string | null>(null);
+
+  const handleUpload = async (file: File) => {
+    setIsUploading(true);
+    setUploadError(null);
+    setFileName(file.name);
+    try {
+      await onUpload(file);
+    } catch (err) {
+      setUploadError(err instanceof Error ? err.message : 'Upload failed');
+      setFileName(null);
+    } finally {
+      setIsUploading(false);
+    }
+  };
+
   return (
-    <div className={cn(
-      'flex items-center justify-between px-5 py-3.5 rounded-2xl border transition-colors',
-      uploaded
-        ? 'bg-green-500/[0.04] border-green-500/15'
-        : 'bg-helix-surface border-helix-border',
-    )}>
-      <div className="flex items-center gap-3 min-w-0">
-        {uploaded ? (
-          <CheckCircle size={16} className="text-green-400 shrink-0" />
-        ) : (
-          <Upload size={16} className="text-helix-muted shrink-0" />
-        )}
-        <div className="min-w-0">
-          <p className={cn('text-base truncate', uploaded ? 'text-green-300' : 'text-helix-text2')}>
-            {label}
-            {optional && !uploaded && <span className="text-helix-dim ml-1.5">optional</span>}
-          </p>
-          {uploaded && (
-            <p className="text-xs text-green-400/60 truncate">{uploaded}</p>
+    <div className="space-y-1.5">
+      <div className={cn(
+        'flex items-center justify-between px-5 py-3.5 rounded-2xl border transition-colors',
+        uploaded
+          ? 'bg-green-500/[0.04] border-green-500/15'
+          : uploadError
+            ? 'bg-red-500/[0.04] border-red-500/20'
+            : 'bg-helix-surface border-helix-border',
+      )}>
+        <div className="flex items-center gap-3 min-w-0">
+          {isUploading ? (
+            <Loader2 size={16} className="text-helix-accent shrink-0 animate-spin" />
+          ) : uploaded ? (
+            <CheckCircle size={16} className="text-green-400 shrink-0" />
+          ) : uploadError ? (
+            <AlertCircle size={16} className="text-red-400 shrink-0" />
+          ) : (
+            <Upload size={16} className="text-helix-muted shrink-0" />
           )}
+          <div className="min-w-0">
+            <p className={cn('text-base truncate', uploaded ? 'text-green-300' : uploadError ? 'text-red-300' : 'text-helix-text2')}>
+              {isUploading ? 'Uploading…' : label}
+              {optional && !uploaded && !isUploading && <span className="text-helix-dim ml-1.5">optional</span>}
+            </p>
+            {uploaded && (
+              <p className="text-xs text-green-400/60 truncate">{fileName ? `${fileName} · ${uploaded}` : uploaded}</p>
+            )}
+          </div>
         </div>
+        <label className={cn(
+          'shrink-0 px-3.5 py-1.5 rounded-xl text-xs transition-colors',
+          isUploading
+            ? 'bg-white/[0.04] text-helix-dim cursor-wait'
+            : 'bg-white/[0.06] text-helix-text2 hover:text-white hover:bg-white/[0.1] cursor-pointer',
+        )}>
+          {isUploading ? 'Uploading…' : uploaded ? 'Replace' : 'Upload'}
+          <input type="file" accept={accept} className="hidden" disabled={isUploading} onChange={(e) => {
+            const file = e.target.files?.[0];
+            if (file) handleUpload(file);
+          }} />
+        </label>
       </div>
-      <label className="shrink-0 px-3.5 py-1.5 rounded-xl bg-white/[0.06] text-xs text-helix-text2 hover:text-white hover:bg-white/[0.1] transition-colors cursor-pointer">
-        {uploaded ? 'Replace' : 'Upload'}
-        <input type="file" accept={accept} className="hidden" onChange={(e) => {
-          const file = e.target.files?.[0];
-          if (file) onUpload(file);
-        }} />
-      </label>
+      {uploadError && (
+        <p className="text-xs text-red-400 px-5">{uploadError}</p>
+      )}
     </div>
   );
 }

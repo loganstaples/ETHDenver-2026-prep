@@ -42,7 +42,7 @@ use crate::types::PartyId;
 // ============================================================================
 
 /// Configuration for an end-to-end MPC training session.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct MPCIntegrationConfig {
     /// Input dimension of the model.
     pub d_in: usize,
@@ -82,6 +82,34 @@ pub struct MPCIntegrationConfig {
     /// Higher values (e.g. 32) improve CPU utilization by amortizing
     /// communication overhead across more parallel compute per step.
     pub batch_size: usize,
+    /// Optional callback invoked after each training step on party 0.
+    /// Arguments: (step_1indexed, total_steps, loss, mac_ok).
+    #[serde(skip)]
+    pub on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, bool) + Send + Sync>>,
+}
+
+impl std::fmt::Debug for MPCIntegrationConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MPCIntegrationConfig")
+            .field("d_in", &self.d_in)
+            .field("d_hid", &self.d_hid)
+            .field("d_out", &self.d_out)
+            .field("num_workers", &self.num_workers)
+            .field("num_steps", &self.num_steps)
+            .field("learning_rate", &self.learning_rate)
+            .field("checkpoint_interval", &self.checkpoint_interval)
+            .field("mac_check_interval", &self.mac_check_interval)
+            .field("beaver_batch_size", &self.beaver_batch_size)
+            .field("initial_weights", &self.initial_weights)
+            .field("training_data", &self.training_data)
+            .field("seed", &self.seed)
+            .field("use_node_transport", &self.use_node_transport)
+            .field("use_tcp_transport", &self.use_tcp_transport)
+            .field("worker_endpoints", &self.worker_endpoints)
+            .field("batch_size", &self.batch_size)
+            .field("on_step", &self.on_step.as_ref().map(|_| "<callback>"))
+            .finish()
+    }
 }
 
 /// Serializable initial weights for the integration config.
@@ -117,6 +145,7 @@ impl Default for MPCIntegrationConfig {
             use_tcp_transport: false,
             worker_endpoints: None,
             batch_size: 1,
+            on_step: None,
         }
     }
 }
@@ -204,6 +233,7 @@ pub async fn run_mpc_training(
     let num_workers = config.num_workers;
     let num_steps = config.num_steps;
     let checkpoint_interval = config.checkpoint_interval;
+    let on_step = config.on_step.clone();
 
     info!(
         num_workers = num_workers,
@@ -256,6 +286,7 @@ pub async fn run_mpc_training(
                 parties, trainer_config, initial_weights, training_data,
                 num_steps, checkpoint_interval, config.seed, start,
                 config.worker_endpoints.clone(),
+                on_step.clone(),
             ).await
         }
         #[cfg(not(feature = "network-mpc"))]
@@ -268,11 +299,13 @@ pub async fn run_mpc_training(
         run_with_node_transport(
             parties, trainer_config, initial_weights, training_data,
             num_steps, checkpoint_interval, config.seed, start,
+            on_step.clone(),
         ).await
     } else {
         run_with_local_transport(
             parties, trainer_config, initial_weights, training_data,
             num_steps, checkpoint_interval, config.seed, start,
+            on_step.clone(),
         ).await
     }
 }
@@ -290,6 +323,7 @@ pub async fn run_mpc_training_with_cheater(
     let num_workers = config.num_workers;
     let num_steps = config.num_steps;
     let checkpoint_interval = config.checkpoint_interval;
+    let on_step = config.on_step.clone();
 
     if cheater_party >= num_workers {
         return Err(anyhow::anyhow!(
@@ -343,6 +377,7 @@ pub async fn run_mpc_training_with_cheater(
                 num_steps, checkpoint_interval, config.seed, start,
                 cheater_party, corrupt_at_step,
                 config.worker_endpoints.clone(),
+                on_step.clone(),
             ).await
         }
         #[cfg(not(feature = "network-mpc"))]
@@ -356,6 +391,7 @@ pub async fn run_mpc_training_with_cheater(
             parties, trainer_config, initial_weights, training_data,
             num_steps, checkpoint_interval, config.seed, start,
             cheater_party, corrupt_at_step,
+            on_step.clone(),
         ).await
     }
 }
@@ -445,6 +481,7 @@ async fn run_with_local_transport(
     checkpoint_interval: usize,
     seed: u64,
     start: Instant,
+    on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, bool) + Send + Sync>>,
 ) -> Result<MPCIntegrationResult, anyhow::Error> {
     let num_workers = parties.len();
     let transports = LocalTransport::create_mesh(&parties);
@@ -457,6 +494,7 @@ async fn run_with_local_transport(
     for (i, (transport, bundle)) in transports.into_iter().zip(bundles.into_iter()).enumerate() {
         let cfg = trainer_config.clone();
         let data = training_data.clone();
+        let step_cb = if i == 0 { on_step.clone() } else { None };
 
         // Spawn each worker on a dedicated OS thread so rayon parallelism
         // from multiple workers runs truly concurrently across all CPU cores.
@@ -470,6 +508,7 @@ async fn run_with_local_transport(
                 num_steps, checkpoint_interval, seed,
                 None, 0, // no cheater
                 Some(bundle),
+                step_cb,
             ))
         });
         handles.push(handle);
@@ -487,6 +526,7 @@ async fn run_with_node_transport(
     checkpoint_interval: usize,
     seed: u64,
     start: Instant,
+    on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, bool) + Send + Sync>>,
 ) -> Result<MPCIntegrationResult, anyhow::Error> {
     let num_workers = parties.len();
     let transports = NodeTransport::create_mesh(&parties, "e2e-integration");
@@ -499,6 +539,7 @@ async fn run_with_node_transport(
     for (i, (transport, bundle)) in transports.into_iter().zip(bundles.into_iter()).enumerate() {
         let cfg = trainer_config.clone();
         let data = training_data.clone();
+        let step_cb = if i == 0 { on_step.clone() } else { None };
 
         let handle = tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -510,6 +551,7 @@ async fn run_with_node_transport(
                 num_steps, checkpoint_interval, seed,
                 None, 0,
                 Some(bundle),
+                step_cb,
             ))
         });
         handles.push(handle);
@@ -533,6 +575,7 @@ async fn run_with_tcp_transport(
     seed: u64,
     start: Instant,
     worker_endpoints: Option<Vec<String>>,
+    on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, bool) + Send + Sync>>,
 ) -> Result<MPCIntegrationResult, anyhow::Error> {
     use std::collections::HashMap;
     use std::net::SocketAddr;
@@ -613,6 +656,7 @@ async fn run_with_tcp_transport(
     for (i, (transport, bundle)) in transports.into_iter().zip(bundles.into_iter()).enumerate() {
         let cfg = trainer_config.clone();
         let data = training_data.clone();
+        let step_cb = if i == 0 { on_step.clone() } else { None };
 
         let handle = tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -624,6 +668,7 @@ async fn run_with_tcp_transport(
                 num_steps, checkpoint_interval, seed,
                 None, 0, // no cheater
                 Some(bundle),
+                step_cb,
             ))
         });
         handles.push(handle);
@@ -645,6 +690,7 @@ async fn run_with_tcp_cheater(
     cheater_party: usize,
     corrupt_at_step: u64,
     worker_endpoints: Option<Vec<String>>,
+    on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, bool) + Send + Sync>>,
 ) -> Result<MPCIntegrationResult, anyhow::Error> {
     use std::collections::HashMap;
     use std::net::SocketAddr;
@@ -720,6 +766,7 @@ async fn run_with_tcp_cheater(
     for (i, (transport, bundle)) in transports.into_iter().zip(bundles.into_iter()).enumerate() {
         let cfg = trainer_config.clone();
         let data = training_data.clone();
+        let step_cb = if i == 0 { on_step.clone() } else { None };
 
         let cheater_info = if i == cheater_party {
             Some(cheater_party)
@@ -737,6 +784,7 @@ async fn run_with_tcp_cheater(
                 num_steps, checkpoint_interval, seed,
                 cheater_info, corrupt_at_step,
                 Some(bundle),
+                step_cb,
             ))
         });
         handles.push(handle);
@@ -756,6 +804,7 @@ async fn run_with_cheater(
     start: Instant,
     cheater_party: usize,
     corrupt_at_step: u64,
+    on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, bool) + Send + Sync>>,
 ) -> Result<MPCIntegrationResult, anyhow::Error> {
     let num_workers = parties.len();
     let transports = LocalTransport::create_mesh(&parties);

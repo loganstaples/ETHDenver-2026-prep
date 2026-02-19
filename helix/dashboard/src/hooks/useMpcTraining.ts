@@ -456,6 +456,7 @@ export function useMpcTraining(): UseMpcTrainingReturn {
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to upload data';
       setError(message);
+      throw err;
     }
   }, []);
 
@@ -489,6 +490,7 @@ export function useMpcTraining(): UseMpcTrainingReturn {
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to upload weights';
       setError(message);
+      throw err;
     }
   }, []);
 
@@ -540,13 +542,13 @@ export function useMpcTraining(): UseMpcTrainingReturn {
       const modelData = await modelRes.json();
 
       // Upload to 0G Storage via our Next.js API route
+      // Model endpoint returns raw weights {w1, b1, w2, b2}
       const res = await fetch('/api/store-on-0g', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           session_id: sessionId,
-          weights: modelData.weights,
-          accuracy: modelData.accuracy,
+          weights: modelData,
           version,
         }),
       });
