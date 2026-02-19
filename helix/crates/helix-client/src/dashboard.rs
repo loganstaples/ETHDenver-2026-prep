@@ -365,6 +365,9 @@ pub struct RegisteredWorker {
     pub earnings_wei: u64,
     /// Worker capabilities
     pub capabilities: WorkerCapabilitiesJson,
+    /// Worker seed for x25519 key derivation (seed + party_index).
+    #[serde(default = "default_worker_seed")]
+    pub seed: u64,
 }
 
 /// Worker capabilities for the dashboard JSON API.
@@ -397,7 +400,13 @@ pub struct WorkerRegisterRequest {
     /// Party index hint
     #[serde(default)]
     pub party_index: usize,
+    /// Worker seed for deterministic x25519 key derivation (seed + party_index).
+    /// If omitted, defaults to 42 (the spawn-workers default).
+    #[serde(default = "default_worker_seed")]
+    pub seed: u64,
 }
+
+fn default_worker_seed() -> u64 { 42 }
 
 /// Request body for worker heartbeat.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1119,7 +1128,7 @@ async fn start_training_handler(
     // (via assignPoolWorkers on the V4 contract). The off-chain registry here
     // is just for endpoint discovery so the orchestrator knows where to connect.
     let use_registered_workers = !registered.is_empty();
-    let (num_workers, worker_endpoints) = if use_registered_workers {
+    let (num_workers, worker_endpoints, worker_seeds) = if use_registered_workers {
         let count = registered.len().min(10); // cap at 10 (Anvil key limit)
         if count < 2 {
             return (
@@ -1128,6 +1137,7 @@ async fn start_training_handler(
             ).into_response();
         }
         let endpoints: Vec<String> = registered[..count].iter().map(|w| w.endpoint.clone()).collect();
+        let seeds: Vec<u64> = registered[..count].iter().map(|w| w.seed).collect();
         info!(count, "Using {} registered workers (on-chain pool assignment at job creation)", count);
 
         // Mark workers as busy
@@ -1140,7 +1150,7 @@ async fn start_training_handler(
             }
         }
 
-        (count, endpoints)
+        (count, endpoints, seeds)
     } else {
         // Fallback: generate endpoints from num_workers (legacy/CLI mode)
         let nw = req.num_workers;
@@ -1153,7 +1163,7 @@ async fn start_training_handler(
         let endpoints: Vec<String> = (0..nw)
             .map(|i| format!("127.0.0.1:{}", 9001 + (i as u16) * 3))
             .collect();
-        (nw, endpoints)
+        (nw, endpoints, Vec::new())
     };
 
     let now = std::time::SystemTime::now()
@@ -1241,6 +1251,7 @@ async fn start_training_handler(
         // Auto-detect: registered remote workers → distributed, otherwise local (single-machine)
         distributed: use_registered_workers || req.transport == "distributed",
         custom_training_data: None,
+        worker_seeds,
         simulate_cheater: req.simulate_cheater,
     };
 
@@ -1786,6 +1797,7 @@ async fn register_worker_handler(
         success_rate: 0.0,
         earnings_wei: 0,
         capabilities: WorkerCapabilitiesJson::default(),
+        seed: req.seed,
     };
 
     let mut workers = state.registered_workers.write().await;

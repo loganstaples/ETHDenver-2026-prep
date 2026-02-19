@@ -265,6 +265,13 @@ pub struct FullOrchestrationConfig {
     #[serde(skip)]
     pub custom_training_data: Option<Vec<(Vec<f64>, Vec<f64>)>>,
 
+    // -- Worker Seeds --
+    /// Per-worker seeds for deterministic x25519 key derivation.
+    /// worker_seeds[i] is the seed for worker i (used as: seeded_rng(seed, party_index)).
+    /// If empty, falls back to self.seed + i (legacy behavior).
+    #[serde(default)]
+    pub worker_seeds: Vec<u64>,
+
     // -- Cheater Simulation (demo feature) --
     /// When true, one worker will inject corrupt shares mid-training to demonstrate
     /// cheater detection and slashing. The cheater party and corruption step are
@@ -316,6 +323,7 @@ impl Default for FullOrchestrationConfig {
             pre_registered_job_id: None,
             distributed: false,
             custom_training_data: None,
+            worker_seeds: Vec::new(),
             simulate_cheater: false,
         }
     }
@@ -541,9 +549,40 @@ impl FullOrchestrator {
 
         // ================================================================
         // Phases 3-7: On-chain setup (feature-gated)
+        // Skip entirely when payment_amount_eth == 0 (local dev / no on-chain registration)
         // ================================================================
         #[cfg(feature = "chain")]
-        let (job_id, coordinator_address, chain_client, worker_wallets, chain_gas) = {
+        let skip_chain = self.config.payment_amount_eth == 0.0
+            && self.config.pre_registered_job_id.is_none();
+
+        #[cfg(feature = "chain")]
+        let (job_id, coordinator_address, chain_client, worker_wallets, chain_gas) = if skip_chain {
+            info!("Skipping on-chain phases (payment=0, no pre-registered job). Using local-only mode.");
+            for phase in 3..=7 {
+                self.emit(ProgressEvent::PhaseStarted {
+                    phase, total: 13,
+                    description: format!("Phase {} skipped (local mode)", phase),
+                });
+                self.emit(ProgressEvent::PhaseCompleted { phase, elapsed_ms: 0 });
+            }
+            // Create a dummy chain client (unused) and empty wallets
+            let rpc_url = self.config.eth_rpc_url.clone().unwrap_or_else(|| "http://127.0.0.1:8545".to_string());
+            let coord_addr = self.config.coordinator_address.clone().unwrap_or_default();
+            let pk = if self.config.private_key.is_empty() {
+                "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".to_string()
+            } else {
+                self.config.private_key.clone()
+            };
+            let pk_clean = pk.strip_prefix("0x").unwrap_or(&pk);
+            let wallet = ethers::signers::LocalWallet::from_str(pk_clean)
+                .unwrap_or_else(|_| ethers::signers::LocalWallet::new(&mut rand::thread_rng()));
+            let client = ChainClientV4::with_wallet(&rpc_url, wallet, &coord_addr).await
+                .unwrap_or_else(|_| {
+                    // If chain connection fails in skip mode, that's fine
+                    panic!("Chain client creation failed even in skip mode — check RPC URL");
+                });
+            (0u64, coord_addr, client, Vec::new(), 0u64)
+        } else {
             self.run_chain_setup_phases(d_in, d_hid, d_out, num_workers).await?
         };
 
@@ -619,14 +658,18 @@ impl FullOrchestrator {
             }
         };
 
-        // Emit per-step progress for the completed training.
-        for (i, loss) in mpc_result.losses.iter().enumerate() {
-            self.emit(ProgressEvent::TrainingStep {
-                step: i + 1,
-                total: self.config.num_steps,
-                loss: *loss,
-                mac_ok: true,
-            });
+        // Emit per-step progress for non-distributed mode (local MPC).
+        // In distributed mode, progress events are already emitted inside
+        // run_distributed_training as soon as worker 0 reports results.
+        if !self.config.distributed {
+            for (i, loss) in mpc_result.losses.iter().enumerate() {
+                self.emit(ProgressEvent::TrainingStep {
+                    step: i + 1,
+                    total: self.config.num_steps,
+                    loss: *loss,
+                    mac_ok: true,
+                });
+            }
         }
 
         if let Some(ref cheater) = mpc_result.cheater_detected {
@@ -876,12 +919,16 @@ impl FullOrchestrator {
             .collect();
 
         // Compute worker x25519 public keys using the same derivation as workers.
-        // spawn-workers gives worker i seed = base_seed + i, party_index = i.
-        // worker_public_key_from_seed(seed, party_index) uses seeded_rng(seed, party_index).
+        // Each worker generates its key with seeded_rng(seed, party_index).
+        // The seed comes from the worker's registration (worker_seeds), NOT the
+        // training session seed. This ensures key agreement across sessions.
         let mut worker_publics = Vec::with_capacity(num_workers);
         for i in 0..num_workers {
+            let worker_seed = self.config.worker_seeds.get(i)
+                .copied()
+                .unwrap_or(self.config.seed + i as u64);
             let pk_bytes = crate::worker_entry::worker_public_key_from_seed(
-                self.config.seed + i as u64, i,
+                worker_seed, i,
             );
             worker_publics.push(X25519PublicKey::from(pk_bytes));
         }
@@ -920,7 +967,45 @@ impl FullOrchestrator {
         }
         info!("Encrypted shares distributed and commitment verified");
 
-        // Send StartDistributedTraining to each worker over the open data channel.
+        // Connect to each worker's control channel (data_port + 1) BEFORE
+        // sending StartDistributedTraining. Workers bind their control port
+        // after receiving shares, so we retry briefly if not yet ready. We must
+        // connect here first because workers block on control_accept before
+        // reading the next data channel message. If we sent
+        // StartDistributedTraining first, the large message (~6 MB training
+        // data) would fill TCP buffers while workers aren't reading, causing a
+        // deadlock.
+        let mut control_streams = Vec::with_capacity(num_workers);
+        for (i, addr) in worker_addrs.iter().enumerate() {
+            let control_addr = SocketAddr::new(addr.ip(), addr.port() + 1);
+            let mut stream_opt = None;
+            for attempt in 0..10 {
+                match tokio::time::timeout(
+                    Duration::from_secs(2),
+                    tokio::net::TcpStream::connect(control_addr),
+                ).await {
+                    Ok(Ok(s)) => {
+                        stream_opt = Some(s);
+                        break;
+                    }
+                    _ => {
+                        if attempt < 9 {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                        }
+                    }
+                }
+            }
+            let stream = stream_opt.ok_or_else(|| {
+                anyhow!("Failed to connect to worker {} control channel at {} after 10 attempts", i, control_addr)
+            })?;
+            info!(worker = i, addr = %control_addr, "Connected to worker control channel");
+            control_streams.push(stream);
+        }
+        info!("Control channels connected to all {} workers", num_workers);
+
+        // Now send StartDistributedTraining to each worker over the open data
+        // channel. Workers have completed control_accept and are now waiting on
+        // recv_message, so the data channel writes will not block.
         for (i, (_party_id, stream)) in dist_result.worker_streams.iter_mut().enumerate() {
             let msg = ProtocolMessage::StartDistributedTraining {
                 trainer_config: trainer_config.clone(),
@@ -971,6 +1056,16 @@ impl FullOrchestrator {
                     );
 
                     if i == 0 {
+                        // Emit per-step progress immediately so the dashboard
+                        // shows live updates instead of jumping from 0% to 100%.
+                        for (step_idx, step_loss) in losses.iter().enumerate() {
+                            self.emit(ProgressEvent::TrainingStep {
+                                step: step_idx + 1,
+                                total: self.config.num_steps,
+                                loss: *step_loss,
+                                mac_ok: true,
+                            });
+                        }
                         all_losses = losses;
                         total_steps = steps_completed;
                         total_mac_checks = mac_checks_passed;

@@ -707,39 +707,18 @@ impl WorkerRunner {
             .with_context(|| format!("Failed to bind data channel on {}", data_addr))?;
         let actual_data_addr = data_listener.local_addr()?;
 
-        let control_listener = TcpListener::bind(control_addr)
-            .await
-            .with_context(|| format!("Failed to bind control channel on {}", control_addr))?;
-        let actual_control_addr = control_listener.local_addr()?;
-
         info!(
             party = %party_id,
             data_addr = %actual_data_addr,
-            control_addr = %actual_control_addr,
-            "TCP listeners ready -- waiting for owner connection"
+            control_addr = %control_addr,
+            "Data listener ready -- waiting for owner connection"
         );
 
         // ----------------------------------------------------------------
-        // Phase 4: Accept owner connections (data + control in parallel)
+        // Phase 4: Accept data connection and receive encrypted shares
         // ----------------------------------------------------------------
         let receiver = ShareReceiver::new(secret_key.clone(), party_id.clone());
 
-        // Accept data channel connection and receive share distribution.
-        // The control channel is accepted concurrently with a timeout to prevent
-        // indefinite hangs if the owner never connects.
-        let control_accept = tokio::spawn(async move {
-            let accept_fut = control_listener.accept();
-            let (stream, addr) = tokio::time::timeout(Duration::from_secs(120), accept_fut)
-                .await
-                .map_err(|_| anyhow!("Control channel accept timed out after 120s — owner never connected"))?
-                .map_err(|e| anyhow!("Control channel accept failed: {}", e))?;
-            info!(addr = %addr, "Control channel connection accepted");
-            Ok::<_, anyhow::Error>(stream)
-        });
-
-        // ----------------------------------------------------------------
-        // Phase 5: Receive encrypted weight shares from owner
-        // ----------------------------------------------------------------
         info!(party = %party_id, "Waiting for share distribution on data channel");
 
         let (share_state, mut data_stream) =
@@ -752,6 +731,29 @@ impl WorkerRunner {
             share_len = share_state.weight_share.data.len(),
             "Weight shares received and commitment verified"
         );
+
+        // ----------------------------------------------------------------
+        // Phase 5: Bind control channel and accept owner connection
+        // ----------------------------------------------------------------
+        // The control port is bound AFTER shares are received (not at startup)
+        // so that idle workers don't hit the 120s accept timeout while waiting
+        // for the next training job. The orchestrator connects to control ports
+        // after distribute_shares completes, so the listener will be ready.
+        let control_listener = TcpListener::bind(control_addr)
+            .await
+            .with_context(|| format!("Failed to bind control channel on {}", control_addr))?;
+        let actual_control_addr = control_listener.local_addr()?;
+        info!(party = %party_id, control_addr = %actual_control_addr, "Control listener bound");
+
+        let control_accept = tokio::spawn(async move {
+            let accept_fut = control_listener.accept();
+            let (stream, addr) = tokio::time::timeout(Duration::from_secs(30), accept_fut)
+                .await
+                .map_err(|_| anyhow!("Control channel accept timed out after 30s — owner never connected"))?
+                .map_err(|e| anyhow!("Control channel accept failed: {}", e))?;
+            info!(addr = %addr, "Control channel connection accepted");
+            Ok::<_, anyhow::Error>(stream)
+        });
 
         // ----------------------------------------------------------------
         // Phase 6: Start control channel signing service

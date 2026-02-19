@@ -2865,6 +2865,7 @@ async fn cmd_mpc_train(args: &MpcTrainArgs, _cli: &Cli) -> Result<()> {
         distributed: args.transport == "distributed",
         custom_training_data: None,
         simulate_cheater: args.simulate_cheater,
+        worker_seeds: Vec::new(), // CLI mode: seeds derived from config.seed + i
     };
 
     // Load custom training data from --data flag if provided
@@ -3310,11 +3311,13 @@ async fn cmd_spawn_workers(args: &SpawnWorkersArgs, _cli: &Cli) -> Result<()> {
         if let Some(ref api_url) = args.api_url {
             println!("{}", "Registering workers with dashboard API...".yellow().bold());
             for (i, pub_addr) in worker_public_addrs.iter().enumerate() {
+                let worker_seed = args.seed + i as u64;
                 let resp = http_client
                     .post(format!("{}/api/workers/register", api_url))
                     .json(&serde_json::json!({
                         "endpoint": pub_addr,
                         "party_index": i,
+                        "seed": worker_seed,
                     }))
                     .send()
                     .await;
