@@ -55,6 +55,7 @@ export interface TrainingSessionState {
   job_id: number;
   elapsed_secs: number;
   started_at: number;
+  workers_active?: number;
   model_name?: string;
   model_slug?: string;
 }
@@ -70,6 +71,7 @@ export interface TrainingEvent {
 export type LossDataPoint = {
   step: number;
   loss: number;
+  accuracy?: number;
 };
 
 export interface UploadedData {
@@ -225,7 +227,12 @@ export function useMpcTraining(): UseMpcTrainingReturn {
             const s = data.state as TrainingSessionState;
             setSession(s);
             if (s.losses && s.losses.length > 0) {
-              setLosses(s.losses.map((loss: number, i: number) => ({ step: i + 1, loss })));
+              setLosses(s.losses.map((loss: number, i: number) => ({
+                step: i + 1,
+                loss,
+                // Estimate accuracy from cross-entropy loss (same formula as backend)
+                accuracy: Math.max(0, Math.min(1, 1 - loss / 2.302585)),
+              })));
             }
             return;
           }
@@ -240,6 +247,7 @@ export function useMpcTraining(): UseMpcTrainingReturn {
           if (evt.type === 'training_step') {
             const step = evt.step as number;
             const loss = evt.loss as number;
+            const accuracy = evt.accuracy as number | undefined;
             const macOk = evt.mac_ok as boolean;
 
             setSession((prev) => {
@@ -248,11 +256,13 @@ export function useMpcTraining(): UseMpcTrainingReturn {
                 ...prev,
                 current_step: step,
                 current_loss: loss,
+                accuracy: accuracy ?? prev.accuracy,
+                phase_description: `Training step ${step}/${prev.total_steps} — loss: ${loss.toFixed(4)}`,
                 mac_checks_passed: macOk ? prev.mac_checks_passed + 1 : prev.mac_checks_passed,
               };
             });
 
-            setLosses((prev) => [...prev, { step, loss }]);
+            setLosses((prev) => [...prev, { step, loss, accuracy: accuracy ?? undefined }]);
           }
 
           // Handle phase events
@@ -393,7 +403,11 @@ export function useMpcTraining(): UseMpcTrainingReturn {
 
           // Update losses from server state
           if (data.losses && data.losses.length > 0) {
-            setLosses(data.losses.map((loss, i) => ({ step: i + 1, loss })));
+            setLosses(data.losses.map((loss, i) => ({
+              step: i + 1,
+              loss,
+              accuracy: Math.max(0, Math.min(1, 1 - loss / 2.302585)),
+            })));
           }
 
           // Stop polling if terminal state
@@ -462,6 +476,7 @@ export function useMpcTraining(): UseMpcTrainingReturn {
         job_id: 0,
         elapsed_secs: 0,
         started_at: Date.now() / 1000,
+        workers_active: config.num_workers ?? 3,
       });
 
       // Connect WebSocket and start polling

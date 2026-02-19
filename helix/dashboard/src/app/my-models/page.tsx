@@ -219,7 +219,7 @@ function CreateModelModal({ isOpen, onClose, onCreate, isPending }: CreateModelM
               <textarea
                 value={description}
                 onChange={(e) => setDescription(e.target.value)}
-                placeholder="784 to 32 to 10 neural network for handwritten digit classification"
+                placeholder="784 to 128 to 10 neural network for handwritten digit classification"
                 rows={3}
                 className="w-full px-3 py-2 bg-helix-bg border border-helix-border rounded-md text-sm text-helix-text focus:outline-none focus:border-helix-border2 transition-colors resize-none"
               />

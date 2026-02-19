@@ -75,18 +75,18 @@ function computeArchitectureHash(dims: number[]): `0x${string}` {
 // ============================================================================
 
 const PHASE_DESCRIPTIONS: Record<number, string> = {
-  1: 'Deploying contracts',
-  2: 'Registering model',
-  3: 'Staking tokens',
-  4: 'Starting training round',
-  5: 'Spawning MPC workers',
-  6: 'Distributing data',
-  7: 'Generating Beaver triples',
+  1: 'Loading training data',
+  2: 'Initializing model weights',
+  3: 'Deploying contracts',
+  4: 'Deploying coordinator',
+  5: 'Registering training job',
+  6: 'Staking workers',
+  7: 'Preparing workers',
   8: 'Running MPC training',
-  9: 'Submitting checkpoint',
+  9: 'Submitting checkpoints',
   10: 'Verifying MACs',
-  11: 'Generating ZK proof',
-  12: 'On-chain settlement',
+  11: 'Completing on-chain',
+  12: 'Evaluating accuracy',
   13: 'Complete',
 };
 
@@ -140,6 +140,7 @@ function NumberInput({ value, onChange, ...rest }: { value: number; onChange: (v
       type="number"
       value={value}
       onChange={(e) => onChange(Number(e.target.value))}
+      onWheel={(e) => e.currentTarget.blur()}
       className="w-full bg-transparent text-right text-base text-white outline-none placeholder:text-helix-dim [-moz-appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
       {...rest}
     />
@@ -154,8 +155,12 @@ function ChartTooltip({ active, payload, label }: any) {
       <p className="text-helix-dim mb-0.5">Step {label}</p>
       {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
       {payload.map((entry: any, i: number) => (
-        <p key={i} className="text-white font-medium">
-          {typeof entry.value === 'number' ? entry.value.toFixed(4) : entry.value}
+        <p key={i} className={cn('font-medium', entry.name === 'Accuracy' ? 'text-green-400' : 'text-white')}>
+          {entry.name === 'Accuracy' && typeof entry.value === 'number'
+            ? `${(entry.value * 100).toFixed(1)}%`
+            : typeof entry.value === 'number'
+              ? entry.value.toFixed(4)
+              : entry.value}
         </p>
       ))}
     </div>
@@ -895,7 +900,7 @@ function ConfigForm({
 
 interface LiveProgressProps {
   session: NonNullable<ReturnType<typeof useMpcTraining>['session']>;
-  losses: { step: number; loss: number }[];
+  losses: { step: number; loss: number; accuracy?: number }[];
   isConnected: boolean;
   error: string | null;
   version: string;
@@ -1041,14 +1046,18 @@ function LiveProgress({ session, losses, isConnected, error, version, modelName,
 
           {/* Stats grid */}
           <div className="grid grid-cols-2 gap-3">
+            <StatCard label="Workers" value={
+              session.workers_active
+                ? `${session.workers_active} (local)`
+                : '—'
+            } icon={<Activity size={14} />} />
             <StatCard label="MAC Checks" value={session.mac_checks_passed} icon={<Shield size={14} />} />
             <StatCard label="Checkpoints" value={session.checkpoints_submitted} icon={<Zap size={14} />} />
-            <StatCard label="ZK Proofs" value={session.zk_proofs_generated} icon={<Activity size={14} />} />
             <StatCard label="Elapsed" value={
               session.elapsed_secs > 0
-                ? `${session.elapsed_secs.toFixed(0)}s`
-                : `${elapsedTime}s`
-            } icon={null} />
+                ? formatDuration(Math.round(session.elapsed_secs))
+                : formatDuration(elapsedTime)
+            } icon={<Clock size={14} />} />
           </div>
 
           {/* Cheater alert */}
@@ -1106,12 +1115,14 @@ function StatCard({ label, value, icon }: { label: string; value: string | numbe
 // Loss Curve — area chart
 // ============================================================================
 
-function LossCurve({ data }: { data: { step: number; loss: number }[] }) {
+function LossCurve({ data }: { data: { step: number; loss: number; accuracy?: number }[] }) {
   const chartData = useMemo(() => {
     if (data.length <= 200) return data;
     const step = Math.ceil(data.length / 200);
     return data.filter((_, i) => i % step === 0 || i === data.length - 1);
   }, [data]);
+
+  const hasAccuracy = chartData.some(d => d.accuracy !== undefined && d.accuracy > 0);
 
   if (chartData.length < 2) {
     return (
@@ -1121,13 +1132,27 @@ function LossCurve({ data }: { data: { step: number; loss: number }[] }) {
     );
   }
 
+  const lastPoint = chartData[chartData.length - 1];
+
   return (
     <div className="rounded-2xl bg-helix-surface border border-helix-border p-5 pt-4">
       <div className="flex items-center justify-between mb-3">
-        <span className="text-sm text-helix-muted">Loss</span>
-        <span className="text-sm text-helix-dim tabular-nums">
-          {chartData[chartData.length - 1].loss.toFixed(4)}
-        </span>
+        <div className="flex items-center gap-4">
+          <span className="text-sm text-helix-muted">Loss</span>
+          {hasAccuracy && (
+            <span className="text-sm text-green-400/70">Accuracy</span>
+          )}
+        </div>
+        <div className="flex items-center gap-4">
+          <span className="text-sm text-helix-dim tabular-nums">
+            {lastPoint.loss.toFixed(4)}
+          </span>
+          {hasAccuracy && lastPoint.accuracy !== undefined && (
+            <span className="text-sm text-green-400/60 tabular-nums">
+              {(lastPoint.accuracy * 100).toFixed(1)}%
+            </span>
+          )}
+        </div>
       </div>
       <ResponsiveContainer width="100%" height={200}>
         <AreaChart data={chartData}>
@@ -1135,6 +1160,10 @@ function LossCurve({ data }: { data: { step: number; loss: number }[] }) {
             <linearGradient id="lossGrad" x1="0" y1="0" x2="0" y2="1">
               <stop offset="0%" stopColor="rgba(255,255,255,0.12)" />
               <stop offset="100%" stopColor="rgba(255,255,255,0)" />
+            </linearGradient>
+            <linearGradient id="accGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="rgba(74,222,128,0.15)" />
+              <stop offset="100%" stopColor="rgba(74,222,128,0)" />
             </linearGradient>
           </defs>
           <XAxis
@@ -1145,6 +1174,7 @@ function LossCurve({ data }: { data: { step: number; loss: number }[] }) {
             axisLine={false}
           />
           <YAxis
+            yAxisId="loss"
             stroke="transparent"
             tick={{ fill: '#3e3e44', fontSize: 11 }}
             tickLine={false}
@@ -1152,8 +1182,22 @@ function LossCurve({ data }: { data: { step: number; loss: number }[] }) {
             width={40}
             tickFormatter={(v: number) => v.toFixed(2)}
           />
+          {hasAccuracy && (
+            <YAxis
+              yAxisId="accuracy"
+              orientation="right"
+              stroke="transparent"
+              tick={{ fill: '#4ade80', fontSize: 11, opacity: 0.5 }}
+              tickLine={false}
+              axisLine={false}
+              width={40}
+              domain={[0, 1]}
+              tickFormatter={(v: number) => `${(v * 100).toFixed(0)}%`}
+            />
+          )}
           <RechartsTooltip content={<ChartTooltip />} cursor={{ stroke: '#2a2a2e', strokeWidth: 1 }} />
           <Area
+            yAxisId="loss"
             type="monotone"
             dataKey="loss"
             name="Loss"
@@ -1164,6 +1208,20 @@ function LossCurve({ data }: { data: { step: number; loss: number }[] }) {
             activeDot={{ r: 3, fill: '#ffffff', stroke: '#111113', strokeWidth: 2 }}
             isAnimationActive={false}
           />
+          {hasAccuracy && (
+            <Area
+              yAxisId="accuracy"
+              type="monotone"
+              dataKey="accuracy"
+              name="Accuracy"
+              stroke="#4ade80"
+              strokeWidth={1.5}
+              fill="url(#accGrad)"
+              dot={false}
+              activeDot={{ r: 3, fill: '#4ade80', stroke: '#111113', strokeWidth: 2 }}
+              isAnimationActive={false}
+            />
+          )}
         </AreaChart>
       </ResponsiveContainer>
     </div>

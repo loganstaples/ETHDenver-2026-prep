@@ -64,6 +64,9 @@ pub struct MPCOrchestrationConfig {
     /// Takes precedence over `use_node_transport` when true.
     /// Requires the `network-mpc` feature in helix-mpc.
     pub use_tcp_transport: bool,
+    /// Training batch size (samples per step). Higher values smooth loss curves
+    /// and amortize MPC communication overhead.
+    pub batch_size: Option<usize>,
 }
 
 impl Default for MPCOrchestrationConfig {
@@ -89,6 +92,7 @@ impl Default for MPCOrchestrationConfig {
             model_id: None,
             use_node_transport: false,
             use_tcp_transport: false,
+            batch_size: None,
         }
     }
 }
@@ -120,6 +124,7 @@ impl MPCOrchestrationConfig {
             model_id: None,
             use_node_transport: false,
             use_tcp_transport: false,
+            batch_size: None,
         }
     }
 
@@ -141,6 +146,7 @@ impl MPCOrchestrationConfig {
             model_id: None,
             use_node_transport: false,
             use_tcp_transport: false,
+            batch_size: None,
         }
     }
 }
@@ -332,7 +338,7 @@ impl MPCTrainingOrchestrator {
             use_node_transport: self.config.use_node_transport,
             use_tcp_transport: self.config.use_tcp_transport,
             worker_endpoints: None,
-            batch_size: 1,
+            batch_size: self.config.batch_size.unwrap_or(32),
             on_step: None,
         }
     }

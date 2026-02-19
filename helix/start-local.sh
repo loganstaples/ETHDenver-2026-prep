@@ -135,7 +135,7 @@ fi
 
 # ── 6. Start Dashboard Backend ──
 echo "▸ Starting dashboard backend (port 3001)..."
-"$HELIX_BIN" dashboard \
+"$HELIX_BIN" -v dashboard \
     --port 3001 \
     --host 0.0.0.0 \
     --cors \
@@ -155,7 +155,7 @@ echo "  ✓ Dashboard backend running (PID $DASHBOARD_PID)"
 
 # ── 7. Spawn MPC Workers ──
 echo "▸ Spawning 6 MPC workers (ports 9001, 9004, 9007, 9010, 9013, 9016)..."
-"$HELIX_BIN" spawn-workers \
+"$HELIX_BIN" -v spawn-workers \
     --count 6 \
     --base-port 9001 \
     --api-url http://localhost:3001 \

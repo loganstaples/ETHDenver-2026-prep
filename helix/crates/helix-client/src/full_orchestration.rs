@@ -110,7 +110,7 @@ pub enum ProgressEvent {
     /// A phase completed successfully. Fields: (phase_number, elapsed_ms).
     PhaseCompleted { phase: u32, elapsed_ms: u128 },
     /// Training step progress. Fields: (step, total_steps, loss, accuracy_estimate, mac_ok).
-    TrainingStep { step: usize, total: usize, loss: f64, mac_ok: bool },
+    TrainingStep { step: usize, total: usize, loss: f64, accuracy: f64, mac_ok: bool },
     /// A checkpoint was submitted on-chain.
     CheckpointSubmitted { index: usize, total: usize, step: u64, tx_hash: String },
     /// A cheater was detected.
@@ -152,7 +152,7 @@ const CHAIN_RETRY_DELAY: Duration = Duration::from_secs(2);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FullOrchestrationConfig {
     // -- Model Architecture --
-    /// Layer dimensions, e.g. [784, 32, 10] for MNIST.
+    /// Layer dimensions, e.g. [784, 128, 10] for MNIST.
     /// Currently supports exactly 3 elements (input, hidden, output).
     pub architecture: Vec<usize>,
 
@@ -283,7 +283,7 @@ pub struct FullOrchestrationConfig {
 impl Default for FullOrchestrationConfig {
     fn default() -> Self {
         Self {
-            architecture: vec![784, 32, 10],
+            architecture: vec![784, 128, 10],
             num_steps: 100,
             learning_rate: 0.01,
             checkpoint_frequency: 10,
@@ -492,7 +492,10 @@ impl FullOrchestrator {
         // ================================================================
         self.emit(ProgressEvent::PhaseStarted {
             phase: 1, total: 13,
-            description: "Loading training data".to_string(),
+            description: format!(
+                "Loading MNIST training data ({} samples)",
+                self.config.train_size,
+            ),
         });
         info!("Phase 1: Loading training data");
         let phase1_start = Instant::now();
@@ -516,9 +519,13 @@ impl FullOrchestrator {
         // ================================================================
         // Phase 2: Generate or load initial weights
         // ================================================================
+        let weight_source = if self.config.initial_weights_path.is_some() { "file" } else { "xavier" };
         self.emit(ProgressEvent::PhaseStarted {
             phase: 2, total: 13,
-            description: "Initializing model weights".to_string(),
+            description: format!(
+                "Initializing model weights ({}x{}x{}, {})",
+                d_in, d_hid, d_out, weight_source,
+            ),
         });
         info!("Phase 2: Initializing model weights");
         let phase2_start = Instant::now();
@@ -565,25 +572,14 @@ impl FullOrchestrator {
                 });
                 self.emit(ProgressEvent::PhaseCompleted { phase, elapsed_ms: 0 });
             }
-            // Create a dummy chain client (unused) and empty wallets
-            let rpc_url = self.config.eth_rpc_url.clone().unwrap_or_else(|| "http://127.0.0.1:8545".to_string());
+            // No chain client needed — job_id=0 gates all downstream chain usage
+            // (settlement and withdrawal phases both check job_id==0 and skip).
             let coord_addr = self.config.coordinator_address.clone().unwrap_or_default();
-            let pk = if self.config.private_key.is_empty() {
-                "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".to_string()
-            } else {
-                self.config.private_key.clone()
-            };
-            let pk_clean = pk.strip_prefix("0x").unwrap_or(&pk);
-            let wallet = ethers::signers::LocalWallet::from_str(pk_clean)
-                .unwrap_or_else(|_| ethers::signers::LocalWallet::new(&mut rand::thread_rng()));
-            let client = ChainClientV4::with_wallet(&rpc_url, wallet, &coord_addr).await
-                .unwrap_or_else(|_| {
-                    // If chain connection fails in skip mode, that's fine
-                    panic!("Chain client creation failed even in skip mode — check RPC URL");
-                });
-            (0u64, coord_addr, client, Vec::new(), 0u64)
+            (0u64, coord_addr, None, Vec::new(), 0u64)
         } else {
-            self.run_chain_setup_phases(d_in, d_hid, d_out, num_workers).await?
+            let (jid, addr, client, wallets, gas) =
+                self.run_chain_setup_phases(d_in, d_hid, d_out, num_workers).await?;
+            (jid, addr, Some(client), wallets, gas)
         };
 
         #[cfg(not(feature = "chain"))]
@@ -593,9 +589,13 @@ impl FullOrchestrator {
         // ================================================================
         // Phase 8: Run MPC training
         // ================================================================
+        let total_params = d_hid * d_in + d_hid + d_out * d_hid + d_out;
         self.emit(ProgressEvent::PhaseStarted {
             phase: 8, total: 13,
-            description: "Running MPC training".to_string(),
+            description: format!(
+                "Running MPC training — {} workers, {} params",
+                num_workers, total_params,
+            ),
         });
         info!("Phase 8: Running MPC training");
         let phase8_start = Instant::now();
@@ -636,9 +636,9 @@ impl FullOrchestrator {
                 use_tcp_transport: false,
                 worker_endpoints: None,
                 batch_size: self.config.batch_size,
-                on_step: progress_for_step.map(|cb| -> std::sync::Arc<dyn Fn(usize, usize, f64, bool) + Send + Sync> {
-                    std::sync::Arc::new(move |step, total, loss, mac_ok| {
-                        cb(ProgressEvent::TrainingStep { step, total, loss, mac_ok });
+                on_step: progress_for_step.map(|cb| -> std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync> {
+                    std::sync::Arc::new(move |step, total, loss, accuracy, mac_ok| {
+                        cb(ProgressEvent::TrainingStep { step, total, loss, accuracy, mac_ok });
                     })
                 }),
             };
@@ -713,7 +713,7 @@ impl FullOrchestrator {
             self.run_chain_settlement_phases(
                 job_id,
                 &mpc_result,
-                &chain_client,
+                chain_client.as_ref().expect("chain_client must exist when job_id != 0"),
                 &worker_wallets,
             )
             .await?
@@ -758,7 +758,7 @@ impl FullOrchestrator {
         // ================================================================
         self.emit(ProgressEvent::PhaseStarted {
             phase: 12, total: 13,
-            description: "Evaluating test accuracy".to_string(),
+            description: format!("Evaluating accuracy on {} test samples", test_samples.len()),
         });
         info!("Phase 12: Evaluating test accuracy");
         let phase12_start = Instant::now();
@@ -809,7 +809,7 @@ impl FullOrchestrator {
 
         self.emit(ProgressEvent::PhaseStarted {
             phase: 13, total: 13,
-            description: "Printing summary".to_string(),
+            description: "Training complete".to_string(),
         });
         self.print_summary(&result);
         self.emit(ProgressEvent::TrainingComplete {
@@ -1072,10 +1072,12 @@ impl FullOrchestrator {
                         // Emit per-step progress immediately so the dashboard
                         // shows live updates instead of jumping from 0% to 100%.
                         for (step_idx, step_loss) in losses.iter().enumerate() {
+                            let acc_est = (1.0 - step_loss / 2.302585_f64).clamp(0.0, 1.0);
                             self.emit(ProgressEvent::TrainingStep {
                                 step: step_idx + 1,
                                 total: self.config.num_steps,
                                 loss: *step_loss,
+                                accuracy: acc_est,
                                 mac_ok: true,
                             });
                         }
@@ -2883,7 +2885,7 @@ mod tests {
     #[test]
     fn test_config_default_architecture() {
         let config = FullOrchestrationConfig::default();
-        assert_eq!(config.architecture, vec![784, 32, 10]);
+        assert_eq!(config.architecture, vec![784, 128, 10]);
         assert_eq!(config.num_steps, 100);
         assert_eq!(config.worker_endpoints.len(), 3);
     }

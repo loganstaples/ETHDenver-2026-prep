@@ -68,7 +68,7 @@ impl Default for DashboardConfig {
 /// Training job submission from the web app.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrainingJobRequest {
-    /// Layer dimensions, e.g. [784, 32, 10]
+    /// Layer dimensions, e.g. [784, 128, 10]
     #[serde(default = "default_architecture")]
     pub architecture: Vec<usize>,
     /// Number of MPC workers
@@ -142,7 +142,7 @@ pub struct TrainingJobRequest {
     pub model_version_index: Option<u64>,
 }
 
-fn default_architecture() -> Vec<usize> { vec![784, 32, 10] }
+fn default_architecture() -> Vec<usize> { vec![784, 128, 10] }
 fn default_num_workers() -> usize { 3 }
 fn default_num_steps() -> usize { 500 }
 fn default_learning_rate() -> f64 { 0.01 }
@@ -186,6 +186,8 @@ pub struct TrainingSessionState {
     pub job_id: u64,
     pub elapsed_secs: f64,
     pub started_at: f64,
+    /// Number of active MPC workers (local threads or remote)
+    pub workers_active: usize,
     /// Final trained weights (populated when training completes)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub final_weights: Option<serde_json::Value>,
@@ -465,9 +467,12 @@ impl DashboardState {
         let training_db = {
             let db_path = std::path::PathBuf::from("./helix-data/training.db");
             match crate::training_db::TrainingDb::open(&db_path) {
-                Ok(db) => Some(std::sync::Arc::new(db)),
+                Ok(db) => {
+                    tracing::info!(path = %db_path.display(), "[Dashboard] Training DB opened at {}", db_path.display());
+                    Some(std::sync::Arc::new(db))
+                }
                 Err(e) => {
-                    tracing::warn!(error = %e, "Failed to open training DB, history will not persist");
+                    tracing::warn!(error = %e, "[Dashboard] Failed to open training DB, history will not persist");
                     None
                 }
             }
@@ -588,6 +593,7 @@ impl Default for TrainingSessionState {
             job_id: 0,
             elapsed_secs: 0.0,
             started_at: 0.0,
+            workers_active: 0,
             final_weights: None,
             model_name: None,
             model_slug: None,
@@ -830,12 +836,13 @@ fn progress_event_to_json(event: &ProgressEvent) -> serde_json::Value {
                 "elapsed_ms": elapsed_ms,
             })
         }
-        ProgressEvent::TrainingStep { step, total, loss, mac_ok } => {
+        ProgressEvent::TrainingStep { step, total, loss, accuracy, mac_ok } => {
             serde_json::json!({
                 "type": "training_step",
                 "step": step,
                 "total": total,
                 "loss": loss,
+                "accuracy": accuracy,
                 "mac_ok": mac_ok,
             })
         }
@@ -1134,7 +1141,17 @@ async fn start_training_handler(
     Json(req): Json<TrainingJobRequest>,
 ) -> impl IntoResponse {
     let session_id = uuid::Uuid::new_v4().to_string();
-    info!(session_id = %session_id, "Starting new training session");
+    info!(
+        session_id = %session_id,
+        architecture = ?req.architecture,
+        num_workers = req.num_workers,
+        num_steps = req.num_steps,
+        learning_rate = req.learning_rate,
+        zk_mode = %req.zk_mode,
+        transport = %req.transport,
+        "[Dashboard] Training job submitted: {:?} | {} steps | {} workers | zk={} | transport={}",
+        req.architecture, req.num_steps, req.num_workers, req.zk_mode, req.transport
+    );
 
     // Validate request
     if req.architecture.len() != 3 {
@@ -1229,6 +1246,7 @@ async fn start_training_handler(
         job_id: 0,
         elapsed_secs: 0.0,
         started_at: now,
+        workers_active: num_workers,
         final_weights: None,
         model_name: req.model_name.clone(),
         model_slug: req.model_slug.clone(),
@@ -1259,7 +1277,7 @@ async fn start_training_handler(
         checkpoint_frequency: req.checkpoint_freq,
         mac_check_interval: req.mac_interval,
         beaver_batch_size: 2048,
-        batch_size: req.batch_size.unwrap_or(1),
+        batch_size: req.batch_size.unwrap_or(32),
         seed: req.seed,
         worker_endpoints,
         initial_weights_path: None,
@@ -1393,12 +1411,100 @@ async fn run_training_session(
     let progress_cb: ProgressCallback = Arc::new(move |event: ProgressEvent| {
         let event_json = progress_event_to_json(&event);
 
+        // Log key training events to dashboard.log
+        match &event {
+            ProgressEvent::PhaseStarted { phase, description, total } => {
+                tracing::info!(
+                    session_id = %sid_for_cb,
+                    phase = phase,
+                    total_phases = total,
+                    "[Dashboard] Phase {}/{}: {}",
+                    phase, total, description
+                );
+            }
+            ProgressEvent::TrainingStep { step, total, loss, accuracy, mac_ok } => {
+                tracing::info!(
+                    session_id = %sid_for_cb,
+                    step = step,
+                    total = total,
+                    loss = loss,
+                    accuracy = accuracy,
+                    mac_ok = mac_ok,
+                    "[Dashboard] Step {}/{} | loss={:.4} | accuracy={:.1}% | MAC: {}",
+                    step, total, loss, accuracy * 100.0,
+                    if *mac_ok { "PASS" } else { "FAIL" }
+                );
+            }
+            ProgressEvent::CheckpointSubmitted { index, total, step, tx_hash } => {
+                tracing::info!(
+                    session_id = %sid_for_cb,
+                    checkpoint = index,
+                    total = total,
+                    step = step,
+                    "[Dashboard] Checkpoint {}/{} at step {} | tx={}",
+                    index, total, step, tx_hash
+                );
+            }
+            ProgressEvent::CheaterDetected { party_index, step } => {
+                tracing::warn!(
+                    session_id = %sid_for_cb,
+                    party_index = party_index,
+                    step = step,
+                    "[Dashboard] CHEATER DETECTED: party {} at step {}",
+                    party_index, step
+                );
+            }
+            ProgressEvent::TrainingComplete { accuracy, steps, time_secs, checkpoints } => {
+                tracing::info!(
+                    session_id = %sid_for_cb,
+                    accuracy = accuracy,
+                    steps = steps,
+                    time_secs = time_secs,
+                    checkpoints = checkpoints,
+                    "[Dashboard] Training complete | accuracy={:.1}% | {} steps | {:.1}s | {} checkpoints",
+                    accuracy * 100.0, steps, time_secs, checkpoints
+                );
+            }
+            ProgressEvent::ZkProofGenerated { checkpoint_index, step, proof_size, time_ms, verified } => {
+                tracing::info!(
+                    session_id = %sid_for_cb,
+                    checkpoint = checkpoint_index,
+                    step = step,
+                    proof_size = proof_size,
+                    time_ms = time_ms,
+                    verified = verified,
+                    "[Dashboard] ZK proof generated: checkpoint {} step {} | size={} | {}ms | verified={}",
+                    checkpoint_index, step, proof_size, time_ms, verified
+                );
+            }
+            ProgressEvent::RecoverableError { phase, message, retry_count } => {
+                tracing::warn!(
+                    session_id = %sid_for_cb,
+                    phase = phase,
+                    retry_count = retry_count,
+                    "[Dashboard] Recoverable error in phase {}: {} (retry {})",
+                    phase, message, retry_count
+                );
+            }
+            _ => {}
+        }
+
         // Broadcast to WebSocket subscribers (send is sync-safe on broadcast::Sender)
         let _ = state_for_cb.ws_broadcast.send((sid_for_cb.clone(), event_json));
 
-        // Update session state synchronously using try_write.
-        // Scoped block ensures the write guard is dropped before the closure returns.
-        let sessions_guard = state_for_cb.sessions.try_write();
+        // Update session state synchronously with retry.
+        // try_write() can fail when polling handlers hold a read lock, causing
+        // dropped updates that desync the frontend. Retry up to 3 times with
+        // a short sleep to handle transient contention.
+        let sessions_guard = {
+            let mut guard = state_for_cb.sessions.try_write();
+            for _ in 0..3 {
+                if guard.is_ok() { break; }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                guard = state_for_cb.sessions.try_write();
+            }
+            guard
+        };
         if let Ok(mut sessions) = sessions_guard {
             if let Some(session) = sessions.get_mut(&sid_for_cb) {
                 match &event {
@@ -1406,12 +1512,22 @@ async fn run_training_session(
                         session.phase = *phase;
                         session.phase_description = description.clone();
                         session.status = "running".to_string();
+                        // Phase 8 = MPC training — emit worker count
+                        if *phase == 8 {
+                            // workers_active is already set from the job request
+                        }
                     }
-                    ProgressEvent::TrainingStep { step, loss, .. } => {
+                    ProgressEvent::TrainingStep { step, loss, accuracy, .. } => {
                         session.current_step = *step;
                         session.current_loss = *loss;
                         session.losses.push(*loss);
+                        session.accuracy = Some(*accuracy);
                         session.mac_checks_passed += 1;
+                        // Dynamically update phase description during training
+                        session.phase_description = format!(
+                            "Training step {}/{} — loss: {:.4}",
+                            step, session.total_steps, loss
+                        );
                     }
                     ProgressEvent::CheckpointSubmitted { .. } => {
                         session.checkpoints_submitted += 1;
@@ -1444,7 +1560,11 @@ async fn run_training_session(
     orchestrator.set_progress_callback(progress_cb);
 
     // Run the orchestration pipeline
-    info!(session_id = %session_id, "Running training orchestration");
+    info!(
+        session_id = %session_id,
+        "[Dashboard] Starting orchestration pipeline for session {}",
+        &session_id[..8.min(session_id.len())]
+    );
     match orchestrator.run().await {
         Ok(result) => {
             info!(
@@ -1521,8 +1641,13 @@ async fn run_training_session(
             })));
         }
         Err(e) => {
-            error!(session_id = %session_id, error = %e, "Training failed");
-            error!(session_id = %session_id, "Full error chain: {:?}", e);
+            error!(
+                session_id = %session_id,
+                error = %e,
+                "[Dashboard] Training FAILED for session {}: {}",
+                &session_id[..8.min(session_id.len())], e
+            );
+            error!(session_id = %session_id, "[Dashboard] Full error chain: {:?}", e);
 
             if let Ok(mut sessions) = state.sessions.try_write() {
                 if let Some(session) = sessions.get_mut(&session_id) {
@@ -1551,10 +1676,19 @@ async fn run_training_session(
 
     // Mark all busy workers as idle again
     if let Ok(mut workers) = state.registered_workers.try_write() {
+        let mut released = 0;
         for w in workers.iter_mut() {
             if w.status == "busy" {
                 w.status = "idle".to_string();
+                released += 1;
             }
+        }
+        if released > 0 {
+            info!(
+                released = released,
+                "[Dashboard] Released {} workers back to idle",
+                released
+            );
         }
     }
 
@@ -1625,7 +1759,13 @@ async fn handle_websocket(socket: WebSocket, state: Arc<DashboardState>) {
     let mut subscriptions: Vec<String> = Vec::new();
     let mut rx = state.ws_broadcast.subscribe();
 
-    info!("WebSocket client connected");
+    // Count current WebSocket subscribers
+    let ws_count = state.ws_broadcast.receiver_count();
+    info!(
+        total_ws_clients = ws_count,
+        "[Dashboard] WebSocket client connected (total: {})",
+        ws_count
+    );
 
     // Spawn a task to forward broadcast messages to this client
     let (tx, mut forward_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(256);
@@ -1713,7 +1853,10 @@ async fn handle_websocket(socket: WebSocket, state: Arc<DashboardState>) {
     }
 
     forward_task.abort();
-    info!("WebSocket client disconnected");
+    info!(
+        "[Dashboard] WebSocket client disconnected (remaining: {})",
+        state.ws_broadcast.receiver_count().saturating_sub(1)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1894,7 +2037,15 @@ async fn register_worker_handler(
     let count = workers.len();
     drop(workers);
 
-    info!(worker_id = %worker_id, endpoint = %req.endpoint, total = count, "Worker registered");
+    info!(
+        worker_id = %worker_id,
+        endpoint = %req.endpoint,
+        party_index = req.party_index,
+        seed = req.seed,
+        total_workers = count,
+        "[Dashboard] Worker registered: party_index={} endpoint={} id={} (total: {}/{})",
+        req.party_index, req.endpoint, &worker_id[..8.min(worker_id.len())], count, count
+    );
 
     // Broadcast worker count update to WebSocket clients
     let _ = state.ws_broadcast.send(("__system__".to_string(), serde_json::json!({
@@ -1956,7 +2107,12 @@ async fn heartbeat_worker_handler(
     drop(workers);
 
     // Broadcast worker_left for each newly-offline worker
-    for worker_id in newly_offline {
+    for worker_id in &newly_offline {
+        warn!(
+            worker_id = %worker_id,
+            "[Dashboard] Worker went offline (no heartbeat for >30s): {}",
+            &worker_id[..8.min(worker_id.len())]
+        );
         let leave_event = serde_json::json!({
             "type": "worker_left",
             "worker_id": worker_id,
@@ -1966,13 +2122,32 @@ async fn heartbeat_worker_handler(
 
     // Now update the heartbeat for the requesting worker
     let mut workers = state.registered_workers.write().await;
-    if let Some(worker) = workers.iter_mut().find(|w| w.id == req.worker_id) {
-        worker.last_heartbeat = now;
+    let found = workers.iter_mut().find(|w| w.id == req.worker_id).map(|w| {
+        w.last_heartbeat = now;
+        w.party_index
+    });
+
+    if let Some(party_index) = found {
+        let active_count = workers.iter().filter(|w| w.status != "offline" && (now - w.last_heartbeat) <= 30.0).count();
+        let total_count = workers.len();
+        debug!(
+            worker_id = %req.worker_id,
+            party_index = party_index,
+            active = active_count,
+            total = total_count,
+            "[Dashboard] Heartbeat from worker {} (active: {}/{})",
+            party_index, active_count, total_count
+        );
         (
             StatusCode::OK,
             Json(serde_json::json!({ "status": "ok" })),
         ).into_response()
     } else {
+        warn!(
+            worker_id = %req.worker_id,
+            "[Dashboard] Heartbeat from unknown worker: {}",
+            &req.worker_id[..8.min(req.worker_id.len())]
+        );
         (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": "Worker not found" })),

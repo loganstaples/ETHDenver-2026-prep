@@ -127,6 +127,7 @@ impl PrivateTrainingConfig {
             base_error: self.base_error,
             checkpoint_interval: 1,
             mac_config: None,
+            batch_size: 1,
         }
     }
 }

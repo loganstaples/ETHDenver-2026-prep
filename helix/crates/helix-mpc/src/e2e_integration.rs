@@ -83,9 +83,10 @@ pub struct MPCIntegrationConfig {
     /// communication overhead across more parallel compute per step.
     pub batch_size: usize,
     /// Optional callback invoked after each training step on party 0.
-    /// Arguments: (step_1indexed, total_steps, loss, mac_ok).
+    /// Arguments: (step_1indexed, total_steps, loss, accuracy_estimate, mac_ok).
+    /// Accuracy estimate is derived from cross-entropy loss (0.0-1.0).
     #[serde(skip)]
-    pub on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, bool) + Send + Sync>>,
+    pub on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync>>,
 }
 
 impl std::fmt::Debug for MPCIntegrationConfig {
@@ -481,7 +482,7 @@ async fn run_with_local_transport(
     checkpoint_interval: usize,
     seed: u64,
     start: Instant,
-    on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, bool) + Send + Sync>>,
+    on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync>>,
 ) -> Result<MPCIntegrationResult, anyhow::Error> {
     let num_workers = parties.len();
     let transports = LocalTransport::create_mesh(&parties);
@@ -526,7 +527,7 @@ async fn run_with_node_transport(
     checkpoint_interval: usize,
     seed: u64,
     start: Instant,
-    on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, bool) + Send + Sync>>,
+    on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync>>,
 ) -> Result<MPCIntegrationResult, anyhow::Error> {
     let num_workers = parties.len();
     let transports = NodeTransport::create_mesh(&parties, "e2e-integration");
@@ -575,7 +576,7 @@ async fn run_with_tcp_transport(
     seed: u64,
     start: Instant,
     worker_endpoints: Option<Vec<String>>,
-    on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, bool) + Send + Sync>>,
+    on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync>>,
 ) -> Result<MPCIntegrationResult, anyhow::Error> {
     use std::collections::HashMap;
     use std::net::SocketAddr;
@@ -690,7 +691,7 @@ async fn run_with_tcp_cheater(
     cheater_party: usize,
     corrupt_at_step: u64,
     worker_endpoints: Option<Vec<String>>,
-    on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, bool) + Send + Sync>>,
+    on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync>>,
 ) -> Result<MPCIntegrationResult, anyhow::Error> {
     use std::collections::HashMap;
     use std::net::SocketAddr;
@@ -804,7 +805,7 @@ async fn run_with_cheater(
     start: Instant,
     cheater_party: usize,
     corrupt_at_step: u64,
-    on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, bool) + Send + Sync>>,
+    on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync>>,
 ) -> Result<MPCIntegrationResult, anyhow::Error> {
     let num_workers = parties.len();
     let transports = LocalTransport::create_mesh(&parties);
@@ -1146,7 +1147,7 @@ pub async fn run_party_training<T: crate::session::transport::MPCTransport + 'st
     cheater_info: Option<usize>,
     corrupt_at_step: u64,
     encrypted_bundle: Option<EncryptedShareBundle>,
-    on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, bool) + Send + Sync>>,
+    on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync>>,
 ) -> Result<PartyResult, anyhow::Error> {
     // Phase 1: Initialize weight shares.
     let mut trainer = MPCTrainer::new(config.clone(), transport, party_index, seed);
@@ -1254,7 +1255,7 @@ pub async fn run_party_training<T: crate::session::transport::MPCTransport + 'st
                         },
                     });
                     if let Some(ref cb) = on_step {
-                        cb(step + 1, num_steps, 0.0, false);
+                        cb(step + 1, num_steps, 0.0, 0.0, false);
                     }
                     break;
                 }
@@ -1279,7 +1280,10 @@ pub async fn run_party_training<T: crate::session::transport::MPCTransport + 'st
         steps_completed += 1;
 
         if let Some(ref cb) = on_step {
-            cb(step + 1, num_steps, step_result.loss, true);
+            // Estimate accuracy from cross-entropy loss: random baseline for
+            // 10-class is ln(10) ≈ 2.3026. Map loss linearly to 0-100%.
+            let acc_est = (1.0 - step_result.loss / 2.302585).clamp(0.0, 1.0);
+            cb(step + 1, num_steps, step_result.loss, acc_est, true);
         }
 
         debug!(

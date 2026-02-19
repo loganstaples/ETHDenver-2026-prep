@@ -11,6 +11,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, Args};
 use colored::*;
 use tokio::sync::broadcast;
+use tracing::{info, warn};
 
 mod commands;
 mod config;
@@ -2079,6 +2080,17 @@ async fn cmd_dashboard(args: &DashboardArgs, _cli: &Cli, mut shutdown: broadcast
         println!("  Coordinator: {}", coord);
     }
 
+    info!(
+        host = %args.host,
+        port = args.port,
+        coordinator = ?args.coordinator,
+        rpc_url = ?args.rpc_url,
+        "[Dashboard] Starting | http://{}:{} coordinator={} rpc={}",
+        args.host, args.port,
+        args.coordinator.as_deref().unwrap_or("none"),
+        args.rpc_url.as_deref().unwrap_or("none")
+    );
+
     let config = dashboard::DashboardConfig {
         auth_token: None,
         allowed_origins: Vec::new(), // Allow all origins (dev/demo mode)
@@ -2099,6 +2111,12 @@ async fn cmd_dashboard(args: &DashboardArgs, _cli: &Cli, mut shutdown: broadcast
 
     let listener = tokio::net::TcpListener::bind(format!("{}:{}", args.host, args.port)).await?;
 
+    info!(
+        host = %args.host,
+        port = args.port,
+        "[Dashboard] Listening on {}:{}",
+        args.host, args.port
+    );
     println!("{}", "Dashboard is running. Press Ctrl+C to stop.".green());
 
     tokio::select! {
@@ -2917,7 +2935,7 @@ async fn cmd_mpc_train(args: &MpcTrainArgs, _cli: &Cli) -> Result<()> {
                     );
                 }
             }
-            ProgressEvent::TrainingStep { step, total, loss, mac_ok } => {
+            ProgressEvent::TrainingStep { step, total, loss, accuracy, mac_ok } => {
                 // Show progress at regular intervals to avoid flooding.
                 let show = step == 1
                     || step == total
@@ -2940,10 +2958,11 @@ async fn cmd_mpc_train(args: &MpcTrainArgs, _cli: &Cli) -> Result<()> {
                         "-".repeat(bar_width - filled)
                     );
                     println!(
-                        "  Step {}/{} {} Loss: {:.4} -- {}",
+                        "  Step {}/{} {} Loss: {:.4} Acc: {:.1}% -- {}",
                         step, total,
                         bar.dimmed(),
                         loss,
+                        accuracy * 100.0,
                         mac_indicator,
                     );
                 }
@@ -3110,6 +3129,18 @@ async fn cmd_mpc_worker(args: &MpcWorkerArgs, _cli: &Cli) -> Result<()> {
             "Invalid --listen address '{}'. Expected format: IP:PORT (e.g. 0.0.0.0:9001). Error: {}", args.listen, e
         ))?;
     let control_port = data_addr.port() + 1;
+    let mpc_port = data_addr.port() + 2;
+
+    info!(
+        party_index = args.party_index,
+        data_addr = %args.listen,
+        control_port = control_port,
+        mpc_port = mpc_port,
+        seed = args.seed,
+        loop_mode = args.r#loop,
+        "[Worker {}] Starting up | data={} ctrl=:{} mpc=:{}",
+        args.party_index, args.listen, control_port, mpc_port
+    );
 
     println!("{}", "Configuration:".yellow().bold());
     println!("  Data Channel:    {}", args.listen);
@@ -3153,14 +3184,33 @@ async fn cmd_mpc_worker(args: &MpcWorkerArgs, _cli: &Cli) -> Result<()> {
             Ok(r) if r.status().is_success() => {
                 let body: serde_json::Value = r.json().await.unwrap_or_default();
                 let wid = body["worker_id"].as_str().unwrap_or("unknown").to_string();
+                info!(
+                    party_index = args.party_index,
+                    worker_id = %wid,
+                    api_url = %api_url,
+                    "[Worker {}] Registered with dashboard | id={} api={}",
+                    args.party_index, &wid[..8.min(wid.len())], api_url
+                );
                 println!("  {} Registered with dashboard (id: {})", "✓".green(), &wid[..8.min(wid.len())]);
                 Some(wid)
             }
             Ok(r) => {
+                warn!(
+                    party_index = args.party_index,
+                    status = %r.status(),
+                    "[Worker {}] Registration failed: HTTP {}",
+                    args.party_index, r.status()
+                );
                 eprintln!("  {} Registration failed: HTTP {}", "✗".red(), r.status());
                 None
             }
             Err(e) => {
+                warn!(
+                    party_index = args.party_index,
+                    error = %e,
+                    "[Worker {}] Registration failed: {}",
+                    args.party_index, e
+                );
                 eprintln!("  {} Registration failed: {}", "✗".red(), e);
                 None
             }
@@ -3174,14 +3224,43 @@ async fn cmd_mpc_worker(args: &MpcWorkerArgs, _cli: &Cli) -> Result<()> {
         let url = api_url.clone();
         let id = wid.clone();
         let client = http_client.clone();
+        let hb_party_index = args.party_index;
         Some(tokio::spawn(async move {
+            let start = std::time::Instant::now();
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                let _ = client
+                let uptime = start.elapsed().as_secs();
+                match client
                     .post(format!("{}/api/workers/heartbeat", url))
                     .json(&serde_json::json!({ "worker_id": id }))
                     .send()
-                    .await;
+                    .await
+                {
+                    Ok(r) if r.status().is_success() => {
+                        info!(
+                            party_index = hb_party_index,
+                            uptime_secs = uptime,
+                            "[Worker {}] Heartbeat sent (uptime: {}s)",
+                            hb_party_index, uptime
+                        );
+                    }
+                    Ok(r) => {
+                        warn!(
+                            party_index = hb_party_index,
+                            status = %r.status(),
+                            "[Worker {}] Heartbeat failed: HTTP {}",
+                            hb_party_index, r.status()
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            party_index = hb_party_index,
+                            error = %e,
+                            "[Worker {}] Heartbeat failed: {}",
+                            hb_party_index, e
+                        );
+                    }
+                }
             }
         }))
     } else {
@@ -3203,6 +3282,12 @@ async fn cmd_mpc_worker(args: &MpcWorkerArgs, _cli: &Cli) -> Result<()> {
         #[cfg(feature = "chain")]
         stake_amount_eth: args.stake_eth,
     };
+
+    info!(
+        party_index = args.party_index,
+        "[Worker {}] Waiting for owner connection on data channel",
+        args.party_index
+    );
 
     println!("{}", "Worker starting...".green().bold());
     println!(
@@ -3231,6 +3316,20 @@ async fn cmd_mpc_worker(args: &MpcWorkerArgs, _cli: &Cli) -> Result<()> {
         let job_config = config.clone();
         match launch_worker(job_config).await {
             Ok(result) => {
+                info!(
+                    party_index = args.party_index,
+                    steps = result.steps_completed,
+                    checkpoints_signed = result.checkpoint_signatures,
+                    slashing_reports = result.slashing_reports_signed,
+                    final_share_sent = result.final_share_sent,
+                    "[Worker {}] Session complete | steps={} checkpoints={} slashing={} share_sent={}",
+                    args.party_index,
+                    result.steps_completed,
+                    result.checkpoint_signatures,
+                    result.slashing_reports_signed,
+                    result.final_share_sent
+                );
+
                 println!();
                 println!("{}", "═".repeat(64).cyan());
                 println!("{}", " Worker Session Complete".green().bold());
@@ -3249,6 +3348,11 @@ async fn cmd_mpc_worker(args: &MpcWorkerArgs, _cli: &Cli) -> Result<()> {
                 if !args.r#loop {
                     break;
                 }
+                info!(
+                    party_index = args.party_index,
+                    "[Worker {}] Job finished, waiting for next assignment...",
+                    args.party_index
+                );
                 println!("[worker-{}] Job done. Restarting...", args.party_index);
             }
             Err(e) => {
@@ -3259,6 +3363,12 @@ async fn cmd_mpc_worker(args: &MpcWorkerArgs, _cli: &Cli) -> Result<()> {
                     }
                     return Err(e);
                 }
+                warn!(
+                    party_index = args.party_index,
+                    error = %e,
+                    "[Worker {}] Error: {}. Restarting in 2s...",
+                    args.party_index, e
+                );
                 eprintln!("[worker-{}] Error: {}. Restarting in 2s...", args.party_index, e);
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
@@ -3407,7 +3517,8 @@ async fn cmd_spawn_workers(args: &SpawnWorkersArgs, _cli: &Cli) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("Failed to clone log file handle: {}", e))?;
 
         let mut cmd = Command::new(&exe_path);
-        cmd.arg("mpc-worker")
+        cmd.arg("-v")  // info-level logging for detailed worker state in log files
+            .arg("mpc-worker")
             .arg("--listen").arg(&listen_addr)
             .arg("--party-index").arg(i.to_string())
             .arg("--seed").arg(seed.to_string())

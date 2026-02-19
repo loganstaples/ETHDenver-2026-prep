@@ -138,6 +138,7 @@ export function useNodes(options: UseNodesOptions = {}): UseNodesReturn {
     const wsUnsubscribeRef = useRef<(() => void) | null>(null);
     const refreshIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
     const lastUpdateRef = useRef<number>(0);
+    const initialLoadDone = useRef(false);
 
     // Contract data
     const { proofEvents, stakedEvents, slashedEvents } = useContractEvents();
@@ -246,7 +247,9 @@ export function useNodes(options: UseNodesOptions = {}): UseNodesReturn {
 
     const fetchNodes = useCallback(async () => {
         try {
-            setIsLoading(true);
+            if (!initialLoadDone.current) {
+                setIsLoading(true);
+            }
             setError(null);
 
             // Build nodes from contract events
@@ -325,6 +328,7 @@ export function useNodes(options: UseNodesOptions = {}): UseNodesReturn {
             setError(err instanceof Error ? err.message : 'Failed to fetch nodes');
         } finally {
             setIsLoading(false);
+            initialLoadDone.current = true;
         }
     }, [buildNodesFromEvents, API_BASE]);
 

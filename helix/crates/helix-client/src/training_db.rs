@@ -228,6 +228,7 @@ impl TrainingDb {
                 job_id: job_id as u64,
                 elapsed_secs,
                 started_at,
+                workers_active: 0,          // Not stored in DB
                 final_weights: None,       // Not stored in DB (too large)
                 model_name,
                 model_slug,

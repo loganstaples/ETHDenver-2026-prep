@@ -162,6 +162,7 @@ impl DemoRunner {
             base_error: 1e-6,
             checkpoint_interval: 1,
             mac_config: Some(mac_config),
+            batch_size: 1,
         };
 
         // Spawn each party's trainer in its own tokio task for weight sharing.
