@@ -23,6 +23,7 @@ export interface PublicModel {
   forSale: boolean;
   salePrice: number; // in ADI
   versionCount: number;
+  versions: OnChainVersion[];
   latestVersion: OnChainVersion | null;
   bestAccuracy: number;
 }
@@ -157,6 +158,7 @@ export function usePublicModels() {
       const salePrice = Number(salePriceWei) / 1e18;
 
       let versionCount = 0;
+      const versions: OnChainVersion[] = [];
       let latestVersion: OnChainVersion | null = null;
       let bestAccuracy = 0;
 
@@ -175,18 +177,18 @@ export function usePublicModels() {
         for (const v of rawVersions) {
           const acc = Number(v.accuracy) / 1e4;
           if (acc > bestAccuracy) bestAccuracy = acc;
+          versions.push({
+            semver: v.semver,
+            rootHash: v.rootHash,
+            accuracy: acc,
+            timestamp: Number(v.timestamp),
+            sessionId: v.sessionId,
+            weightsStored: v.weightsStored,
+          });
         }
 
-        if (rawVersions.length > 0) {
-          const last = rawVersions[rawVersions.length - 1];
-          latestVersion = {
-            semver: last.semver,
-            rootHash: last.rootHash,
-            accuracy: Number(last.accuracy) / 1e4,
-            timestamp: Number(last.timestamp),
-            sessionId: last.sessionId,
-            weightsStored: last.weightsStored,
-          };
+        if (versions.length > 0) {
+          latestVersion = versions[versions.length - 1];
         }
       }
 
@@ -203,6 +205,7 @@ export function usePublicModels() {
         forSale,
         salePrice,
         versionCount,
+        versions,
         latestVersion,
         bestAccuracy,
       });

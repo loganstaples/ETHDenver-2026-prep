@@ -516,12 +516,19 @@ function InferencePageInner() {
   const [filter, setFilter] = useState<ModelFilter>('all');
   const [search, setSearch] = useState('');
   const [selectedModel, setSelectedModel] = useState<PublicModel | null>(null);
+  const [selectedVersionIndex, setSelectedVersionIndex] = useState<number>(0);
+
+  // Selected version (derived from model + index)
+  const selectedVersion = useMemo(() => {
+    if (!selectedModel || selectedModel.versions.length === 0) return selectedModel?.latestVersion ?? null;
+    const idx = Math.min(selectedVersionIndex, selectedModel.versions.length - 1);
+    return selectedModel.versions[idx] ?? null;
+  }, [selectedModel, selectedVersionIndex]);
 
   // Weights
   const [weightFetchStatus, setWeightFetchStatus] = useState<WeightFetchStatus>('idle');
   const [weightFetchError, setWeightFetchError] = useState<string | null>(null);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
-  const fetchingForRef = useRef<number | null>(null);
   const weightsFileRef = useRef<HTMLInputElement>(null);
 
   // Owner detection
@@ -615,25 +622,28 @@ function InferencePageInner() {
   }, []);
 
   // Fetch weights from 0G (owner) or check backend cache (non-owner)
+  // Re-triggers when model or version selection changes
+  const fetchKeyRef = useRef<string | null>(null);
   useEffect(() => {
     if (!selectedModel) {
-      fetchingForRef.current = null;
+      fetchKeyRef.current = null;
       setWeightFetchStatus('idle');
       setWeightFetchError(null);
       setBackendWeightsReady(false);
       return;
     }
 
-    if (fetchingForRef.current === selectedModel.tokenId) return;
-    fetchingForRef.current = selectedModel.tokenId;
+    const versionKey = `${selectedModel.tokenId}:${selectedVersionIndex}`;
+    if (fetchKeyRef.current === versionKey) return;
+    fetchKeyRef.current = versionKey;
 
     const isOwner = address && selectedModel.owner.toLowerCase() === address.toLowerCase();
 
-    // Non-owner: check if backend has cached weights
+    // Non-owner: check if backend has cached weights for this version
     if (!isOwner) {
       const checkBackend = async () => {
         try {
-          const res = await fetch(`${API_BASE}/api/models/${selectedModel.tokenId}/inference-ready`);
+          const res = await fetch(`${API_BASE}/api/models/${selectedModel.tokenId}/inference-ready?version=${selectedVersionIndex}`);
           if (res.ok) {
             const data = await res.json();
             if (data.ready) {
@@ -644,17 +654,17 @@ function InferencePageInner() {
           }
         } catch { /* non-fatal */ }
         // Backend doesn't have weights cached — show message
-        setWeightFetchError('Weights not available. The model owner must run inference first.');
+        setWeightFetchError('Weights not available for this version. The model owner must run inference first.');
         setWeightFetchStatus('error');
-        fetchingForRef.current = null;
+        fetchKeyRef.current = null;
       };
       checkBackend();
       return;
     }
 
-    // Owner: fetch from 0G, decrypt, upload to backend
-    const lv = selectedModel.latestVersion;
-    if (!lv || !lv.weightsStored || !lv.rootHash) {
+    // Owner: fetch from 0G using the selected version's rootHash, decrypt, upload to backend
+    const sv = selectedVersion;
+    if (!sv || !sv.weightsStored || !sv.rootHash) {
       setWeightFetchStatus('idle');
       setWeightFetchError(null);
       return;
@@ -668,7 +678,7 @@ function InferencePageInner() {
         const res = await fetch('/api/fetch-from-0g', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ rootHash: lv.rootHash }),
+          body: JSON.stringify({ rootHash: sv.rootHash }),
         });
 
         if (!res.ok) {
@@ -692,12 +702,12 @@ function InferencePageInner() {
 
         setWeightFetchStatus('uploading');
         const backendSessionId = await uploadWeightsToBackend(weightsData);
-        setActiveSessionId(backendSessionId ?? lv.sessionId);
+        setActiveSessionId(backendSessionId ?? sv.sessionId);
         setWeightFetchStatus('done');
 
-        // Also cache weights by token ID for future non-owner inference
+        // Also cache weights by token ID + version for future non-owner inference
         try {
-          await fetch(`${API_BASE}/api/models/${selectedModel.tokenId}/cache-weights`, {
+          await fetch(`${API_BASE}/api/models/${selectedModel.tokenId}/cache-weights?version=${selectedVersionIndex}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(weightsData),
@@ -707,12 +717,12 @@ function InferencePageInner() {
         const message = err instanceof Error ? err.message : 'Failed to fetch weights';
         setWeightFetchError(message);
         setWeightFetchStatus('error');
-        fetchingForRef.current = null;
+        fetchKeyRef.current = null;
       }
     };
 
     doFetch();
-  }, [selectedModel, signMessageAsync, uploadWeightsToBackend, address]);
+  }, [selectedModel, selectedVersion, selectedVersionIndex, signMessageAsync, uploadWeightsToBackend, address]);
 
   // Manual weight upload
   const handleManualWeightUpload = useCallback(async (file: File) => {
@@ -760,6 +770,7 @@ function InferencePageInner() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(useModelEndpoint ? {
           model_token_id: selectedModel.tokenId,
+          model_version_index: selectedVersionIndex,
           pixels,
           num_parties: 3,
           wallet_address: isOwnerOfSelected ? address : undefined,
@@ -804,7 +815,7 @@ function InferencePageInner() {
       setError(err instanceof Error ? err.message : 'Inference failed');
       setPhase('error');
     }
-  }, [activeSessionId, pixels, selectedModel, backendWeightsReady, isOwnerOfSelected, address]);
+  }, [activeSessionId, pixels, selectedModel, selectedVersionIndex, backendWeightsReady, isOwnerOfSelected, address]);
 
   // Non-owner: initiate on-chain payment then run inference
   const handlePayAndRun = useCallback(() => {
@@ -836,8 +847,10 @@ function InferencePageInner() {
 
   // Select model handler
   const handleSelectModel = useCallback((model: PublicModel) => {
-    fetchingForRef.current = null;
+    fetchKeyRef.current = null;
     setSelectedModel(model);
+    // Default to latest version
+    setSelectedVersionIndex(model.versions.length > 0 ? model.versions.length - 1 : 0);
     setResult(null);
     setPhase('idle');
     setError(null);
@@ -1024,7 +1037,7 @@ function InferencePageInner() {
                   const file = e.target.files?.[0];
                   if (file) {
                     setSelectedModel(null);
-                    fetchingForRef.current = null;
+                    fetchKeyRef.current = null;
                     handleManualWeightUpload(file);
                   }
                 }}
@@ -1081,6 +1094,7 @@ function InferencePageInner() {
                 <CheckCircle size={14} className="text-green-400" />
                 <span className="text-sm text-green-300">
                   <span className="font-medium">{selectedModel.name}</span>
+                  {selectedVersion && <span className="text-green-400/60 ml-1"> {selectedVersion.semver || `v${selectedVersionIndex + 1}`}</span>}
                   <span className="text-green-400/60 ml-1.5">weights loaded</span>
                 </span>
               </motion.div>
@@ -1097,7 +1111,7 @@ function InferencePageInner() {
                 <span className="text-sm text-red-300 truncate">{weightFetchError}</span>
               </motion.div>
             )}
-            {selectedModel && selectedModel.latestVersion && !selectedModel.latestVersion.weightsStored && weightFetchStatus === 'idle' && (
+            {selectedModel && selectedVersion && !selectedVersion.weightsStored && weightFetchStatus === 'idle' && (
               <motion.div
                 key="no-weights"
                 initial={{ opacity: 0, y: -4 }}
@@ -1110,6 +1124,34 @@ function InferencePageInner() {
               </motion.div>
             )}
           </AnimatePresence>
+
+          {/* Version selector (only show when model has multiple versions) */}
+          {selectedModel && selectedModel.versions.length > 1 && (
+            <div className="rounded-2xl bg-helix-surface border border-helix-border p-4">
+              <label className="text-xs text-helix-muted block mb-2">Version</label>
+              <select
+                value={selectedVersionIndex}
+                onChange={(e) => {
+                  const idx = Number(e.target.value);
+                  setSelectedVersionIndex(idx);
+                  // Reset weight fetch so it re-triggers for the new version
+                  fetchKeyRef.current = null;
+                  setWeightFetchStatus('idle');
+                  setWeightFetchError(null);
+                  setBackendWeightsReady(false);
+                  setActiveSessionId(null);
+                }}
+                className="w-full px-3 py-2.5 bg-helix-bg border border-helix-border rounded-xl text-sm text-white focus:outline-none focus:border-helix-border2 transition-colors"
+              >
+                {selectedModel.versions.map((v, i) => (
+                  <option key={i} value={i}>
+                    {v.semver || `v${i + 1}`} — {(v.accuracy * 100).toFixed(1)}% accuracy
+                    {i === selectedModel.versions.length - 1 ? ' (latest)' : ''}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
         </div>
 
         {/* ── RIGHT COLUMN: Fee, Input, Results ────────────────── */}

@@ -18,7 +18,7 @@ import {
     hardhat,
     localhost,
 } from 'wagmi/chains';
-import { defineChain } from 'viem';
+import { defineChain, http } from 'viem';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { WagmiProvider } from 'wagmi';
 import '@rainbow-me/rainbowkit/styles.css';
@@ -49,6 +49,12 @@ if (projectId === 'PLACEHOLDER_PROJECT_ID' && typeof window !== 'undefined') {
     );
 }
 
+const chains = [
+    mainnet,
+    sepolia,
+    ...(process.env.NEXT_PUBLIC_ENABLE_TESTNETS === 'true' ? [hardhat, localhost, adiTestnet] : []),
+] as const;
+
 const config = getDefaultConfig({
     appName: 'Helix Dashboard',
     projectId,
@@ -63,11 +69,14 @@ const config = getDefaultConfig({
             ],
         },
     ],
-    chains: [
-        mainnet,
-        sepolia,
-        ...(process.env.NEXT_PUBLIC_ENABLE_TESTNETS === 'true' ? [hardhat, localhost, adiTestnet] : []),
-    ],
+    chains,
+    transports: {
+        [mainnet.id]: http(),
+        [sepolia.id]: http(),
+        [hardhat.id]: http('http://127.0.0.1:8545'),
+        [localhost.id]: http('http://127.0.0.1:8545'),
+        [adiTestnet.id]: http('https://rpc.ab.testnet.adifoundation.ai'),
+    },
     ssr: true,
 });
 

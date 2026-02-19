@@ -55,7 +55,7 @@ use crate::share_distribution::{
 use crate::types::PartyId;
 
 /// Maximum allowed message size (64 MB) to prevent OOM from malicious length prefixes.
-const MAX_MSG_SIZE: usize = 64 * 1024 * 1024;
+const MAX_MSG_SIZE: usize = 256 * 1024 * 1024;
 
 // ============================================================================
 // Protocol messages

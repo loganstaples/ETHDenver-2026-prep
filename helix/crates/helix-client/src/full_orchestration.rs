@@ -285,7 +285,7 @@ impl Default for FullOrchestrationConfig {
         Self {
             architecture: vec![784, 32, 10],
             num_steps: 100,
-            learning_rate: 0.001,
+            learning_rate: 0.01,
             checkpoint_frequency: 10,
             mac_check_interval: 10,
             beaver_batch_size: 2048,
@@ -696,7 +696,24 @@ impl FullOrchestrator {
         // Phases 9-11: On-chain settlement (feature-gated)
         // ================================================================
         #[cfg(feature = "chain")]
-        let (checkpoints_on_chain, cheater_info, settlement_gas, zk_proofs_on_chain) = {
+        let (checkpoints_on_chain, cheater_info, settlement_gas, zk_proofs_on_chain) = if job_id == 0 {
+            // Local-only mode (skip_chain): no on-chain settlement.
+            info!("Skipping on-chain settlement phases (local mode, job_id=0)");
+            for phase in 9..=11 {
+                self.emit(ProgressEvent::PhaseStarted {
+                    phase, total: 13,
+                    description: format!("Phase {} skipped (local mode)", phase),
+                });
+                self.emit(ProgressEvent::PhaseCompleted { phase, elapsed_ms: 0 });
+            }
+            let ci = mpc_result.cheater_detected.as_ref().map(|c| CheaterInfo {
+                party_index: c.party_index,
+                detected_at_step: c.detected_at_step,
+                slashed: false,
+                slash_tx_hash: None,
+            });
+            (0, ci, 0u64, 0usize)
+        } else {
             self.run_chain_settlement_phases(
                 job_id,
                 &mpc_result,
@@ -879,7 +896,7 @@ impl FullOrchestrator {
             beaver_batch_size: self.config.beaver_batch_size,
             generate_proofs: false,
             base_error: 1e-6,
-            checkpoint_interval: 1,
+            checkpoint_interval: self.config.checkpoint_frequency as u64,
             mac_config: if self.config.mac_check_interval > 0 {
                 Some(MACVerificationConfig {
                     check_interval: self.config.mac_check_interval,

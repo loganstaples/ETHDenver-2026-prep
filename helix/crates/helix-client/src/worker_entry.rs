@@ -842,6 +842,26 @@ impl WorkerRunner {
                 ).await?;
 
                 // Send result back over data channel.
+                // Strip per-element commitments from checkpoint party_shares to
+                // reduce message size. The aggregate commitment is sufficient for
+                // on-chain verification; element commitments are only for audit.
+                let slim_checkpoints: Vec<_> = result.checkpoints.iter().map(|cp| {
+                    use helix_mpc::share_distribution::CommitmentShare;
+                    helix_mpc::checkpoint_attestation::OnChainCheckpoint {
+                        step: cp.step,
+                        commitment_bytes32: cp.commitment_bytes32,
+                        combined_commitment: helix_mpc::share_distribution::VectorCommitment {
+                            element_commitments: vec![], // strip per-element (saves ~5MB/checkpoint)
+                            aggregate: cp.combined_commitment.aggregate.clone(),
+                        },
+                        loss: cp.loss,
+                        party_shares: cp.party_shares.iter().map(|ps| CommitmentShare {
+                            party: ps.party.clone(),
+                            element_commitments: vec![], // strip per-element
+                            aggregate: ps.aggregate.clone(),
+                        }).collect(),
+                    }
+                }).collect();
                 let response = ProtocolMessage::DistributedTrainingResult {
                     steps_completed: result.steps_completed,
                     losses: result.losses.clone(),
@@ -849,7 +869,7 @@ impl WorkerRunner {
                     cheater_detected: result.cheater_detected.is_some(),
                     cheater_party: result.cheater_detected.as_ref().map(|c| c.party_index),
                     encrypted_final_share: result.encrypted_final_share.clone(),
-                    checkpoints: result.checkpoints.clone(),
+                    checkpoints: slim_checkpoints,
                 };
                 send_message(&mut data_stream, &response).await
                     .map_err(|e| anyhow!("Failed to send training result: {}", e))?;

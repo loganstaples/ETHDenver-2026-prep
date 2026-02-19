@@ -145,7 +145,7 @@ pub struct TrainingJobRequest {
 fn default_architecture() -> Vec<usize> { vec![784, 32, 10] }
 fn default_num_workers() -> usize { 3 }
 fn default_num_steps() -> usize { 500 }
-fn default_learning_rate() -> f64 { 0.001 }
+fn default_learning_rate() -> f64 { 0.01 }
 fn default_checkpoint_freq() -> usize { 50 }
 fn default_mac_interval() -> u64 { 1 }
 fn default_zk_mode() -> String { "off".to_string() }
@@ -1118,10 +1118,15 @@ async fn start_training_handler(
         .as_secs_f64();
     let registered: Vec<RegisteredWorker> = {
         let workers = state.registered_workers.read().await;
-        workers.iter()
+        let mut filtered: Vec<RegisteredWorker> = workers.iter()
             .filter(|w| w.status == "idle" && (now_ts - w.last_heartbeat) <= 30.0)
             .cloned()
-            .collect()
+            .collect();
+        // Sort by party_index so position[i] in the endpoint list = party-i.
+        // The orchestrator assumes this mapping when distributing shares and
+        // deriving per-worker x25519 keys.
+        filtered.sort_by_key(|w| w.party_index);
+        filtered
     };
 
     // Note: On-chain pool worker assignment happens inside the orchestrator

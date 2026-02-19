@@ -796,7 +796,7 @@ export default function DashboardPage() {
               <div className="bg-helix-bg rounded-xl px-4 py-3">
                 <div className="text-[10px] uppercase tracking-wider text-helix-muted mb-1">MPC</div>
                 <div className="text-sm font-mono text-white">
-                  {backendHealth?.mpc.active_session ? (
+                  {backendHealth?.mpc?.active_session ? (
                     <span className="flex items-center gap-1.5">
                       <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
                       Active
@@ -940,9 +940,9 @@ export default function DashboardPage() {
               <div className="flex items-center gap-3">
                 <Users size={16} className="text-helix-muted" />
                 <span className="text-sm font-medium text-white">Workers</span>
-                {backendHealth && (
+                {backendWorkers.length > 0 && (
                   <span className="text-xs text-helix-muted">
-                    {backendHealth.fault_tolerance.healthy_workers} healthy &middot; {backendHealth.fault_tolerance.degraded_workers} degraded &middot; {backendHealth.fault_tolerance.failed_workers} failed
+                    {backendWorkers.filter(w => w.status === 'idle' || w.status === 'busy').length} healthy &middot; {backendWorkers.filter(w => w.status === 'offline').length} offline
                   </span>
                 )}
               </div>

@@ -35,8 +35,9 @@ import {
   YAxis,
   Tooltip as RechartsTooltip,
 } from 'recharts';
-import { useSignMessage, useAccount, useChainId, useWriteContract, useWaitForTransactionReceipt } from 'wagmi';
+import { useSignMessage, useAccount, useChainId, useWriteContract, useWaitForTransactionReceipt, useSwitchChain } from 'wagmi';
 import { parseEther, keccak256, toBytes, decodeEventLog } from 'viem';
+import { hardhat } from 'wagmi/chains';
 import { Badge } from '@/components/ui/Badge';
 import { cn } from '@/lib/utils';
 import {
@@ -360,12 +361,12 @@ function ConfigForm({
   isWalletPrompting, isConfirmingPayment, walletConnected,
 }: ConfigFormProps) {
   const [numSteps, setNumSteps] = useState(500);
-  const [learningRate, setLearningRate] = useState(0.001);
+  const [learningRate, setLearningRate] = useState(0.01);
   const [checkpointFreq] = useState(50);
   const [zkMode, setZkMode] = useState<'off' | 'always' | 'risk'>('off');
   const [zkCheckpointFreq, setZkCheckpointFreq] = useState(5);
   const [minWorkersForMpc, setMinWorkersForMpc] = useState(2);
-  const [paymentEth, setPaymentEth] = useState(0.01);
+  const [paymentEth, setPaymentEth] = useState(0.0001);
   const [stakePerWorkerEth, setStakePerWorkerEth] = useState(0.001);
   const [storeOn0G, setStoreOn0G] = useState(false);
   const [version, setVersion] = useState(defaultVersion);
@@ -395,7 +396,7 @@ function ConfigForm({
   const recommendedPayment = useMemo(() => {
     const workers = workersOnline > 0 ? workersOnline : 3;
     const zkMult = zkMode === 'always' ? 1.75 : zkMode === 'risk' ? 1.25 : 1.0;
-    return parseFloat((0.000002 * numSteps * workers * zkMult).toFixed(6));
+    return parseFloat((0.0000001 * numSteps * workers * zkMult).toFixed(6));
   }, [numSteps, workersOnline, zkMode]);
 
   const effectivePayment = autoPropose ? recommendedPayment : paymentEth;
@@ -1365,8 +1366,13 @@ function TrainPageInner() {
   // Wallet payment flow
   const { address } = useAccount();
   const chainId = useChainId();
+  const { switchChain } = useSwitchChain();
   const { writeContract, data: paymentTxHash, isPending: isWalletPrompting, error: walletError, reset: resetWalletWrite } = useWriteContract();
   const { isLoading: isConfirmingPayment, isSuccess: paymentConfirmed } = useWaitForTransactionReceipt({ hash: paymentTxHash });
+
+  // Determine expected chain from env (31337 for local Anvil, 99999 for ADI testnet)
+  const expectedChainId = Number(process.env.NEXT_PUBLIC_DEFAULT_CHAIN_ID || '31337');
+  const isWrongChain = address && chainId !== expectedChainId;
 
   const [operatorAddress, setOperatorAddress] = useState<string | null>(null);
   const [walletPaymentError, setWalletPaymentError] = useState<string | null>(null);
@@ -1583,16 +1589,40 @@ function TrainPageInner() {
     });
   }, [zeroGResult, session]);
 
-  const handleStart = (config: TrainingJobConfig, opts: { storeOn0G: boolean; version: string; modelName: string; modelSlug: string }) => {
-    // Save config for after wallet confirmation
+  const handleStart = async (config: TrainingJobConfig, opts: { storeOn0G: boolean; version: string; modelName: string; modelSlug: string }) => {
     pendingConfigRef.current = { config, opts };
     setWalletPaymentError(null);
 
-    const coordinatorAddress = getContractAddress(chainId, 'helixCoordinator') as `0x${string}`;
+    // On local Anvil (31337), skip the on-chain payment and go straight to backend.
+    // The contract call is expensive in gas and MetaMask prices local ETH at real USD rates.
+    const isLocalChain = expectedChainId === 31337;
+    if (isLocalChain) {
+      setWantsStoreOn0G(opts.storeOn0G);
+      setCurrentVersion(opts.version);
+      setCurrentModelName(opts.modelName);
+      pendingConfigRef.current = null;
+      startTraining({ ...config, job_id: undefined, payment_eth: 0 });
+      return;
+    }
+
+    // On real chains, ensure wallet is on the correct chain before sending tx
+    if (chainId !== expectedChainId) {
+      try {
+        switchChain({ chainId: expectedChainId });
+        setWalletPaymentError(`Please switch to chain ${expectedChainId} in your wallet, then try again.`);
+        return;
+      } catch {
+        setWalletPaymentError(`Please switch your wallet to chain ${expectedChainId} manually.`);
+        return;
+      }
+    }
+
+    const coordinatorAddress = getContractAddress(expectedChainId, 'helixCoordinator') as `0x${string}`;
     const archHash = computeArchitectureHash(config.architecture);
     const paymentWei = parseEther(String(config.payment_eth));
 
     writeContract({
+      chainId: expectedChainId,
       address: coordinatorAddress,
       abi: HELIX_COORDINATOR_V4_ABI,
       functionName: 'registerTrainingJob',
@@ -1627,6 +1657,29 @@ function TrainPageInner() {
       transition={{ duration: 0.4 }}
       className="py-4 space-y-8"
     >
+      {/* Wrong chain warning */}
+      {isWrongChain && (
+        <motion.div
+          initial={{ opacity: 0, y: -4 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="flex items-center justify-between px-4 py-3 rounded-2xl bg-yellow-500/[0.08] border border-yellow-500/20"
+        >
+          <div className="flex items-center gap-2.5">
+            <XCircle size={14} className="text-yellow-400 shrink-0" />
+            <p className="text-sm text-yellow-300">
+              Wrong network. Connected to chain {chainId}, expected {expectedChainId}.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => switchChain({ chainId: expectedChainId })}
+            className="px-3 py-1 text-xs font-medium text-yellow-300 bg-yellow-500/10 border border-yellow-500/20 rounded-lg hover:bg-yellow-500/20 transition-colors"
+          >
+            Switch Network
+          </button>
+        </motion.div>
+      )}
+
       {/* Weight fetch error */}
       {weightFetchStatus === 'error' && weightFetchError && (
         <motion.div
