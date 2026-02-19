@@ -166,6 +166,47 @@ pub struct WorkerInfo {
     pub id: String,
     pub status: String,
     pub rounds_completed: u64,
+    pub rounds_participated: u64,
+    pub cpu_load: u8,
+    pub memory_mb: u64,
+    pub reputation_score: f64,
+    pub success_rate: f64,
+    pub earnings_wei: u64,
+    pub last_heartbeat: u64,
+    pub capabilities: WorkerCapabilities,
+}
+
+impl WorkerInfo {
+    /// Create a WorkerInfo with only id, status, and rounds_completed set;
+    /// all other fields use sensible defaults.
+    pub fn new(id: String, status: String, rounds_completed: u64) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        Self {
+            id,
+            status,
+            rounds_participated: rounds_completed,
+            cpu_load: 0,
+            memory_mb: 0,
+            reputation_score: 0.5,
+            success_rate: if rounds_completed > 0 { 1.0 } else { 0.0 },
+            earnings_wei: 0,
+            last_heartbeat: now,
+            rounds_completed,
+            capabilities: WorkerCapabilities::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkerCapabilities {
+    pub can_train: bool,
+    pub can_prove: bool,
+    pub can_aggregate: bool,
+    pub gpu_model: Option<String>,
+    pub max_batch_size: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -576,11 +617,7 @@ mod tests {
                 }),
                 completed_rounds: 10,
                 workers: vec![
-                    WorkerInfo {
-                        id: "w1".to_string(),
-                        status: "Computing".to_string(),
-                        rounds_completed: 5,
-                    },
+                    WorkerInfo::new("w1".to_string(), "Computing".to_string(), 5),
                 ],
             })),
             round_trigger_tx: tx,

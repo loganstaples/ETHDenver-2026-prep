@@ -16,7 +16,7 @@ use axum::{
     Router,
     routing::{get, post},
     extract::{
-        ConnectInfo, Path, State,
+        ConnectInfo, Path, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     response::{IntoResponse, Json},
@@ -136,6 +136,10 @@ pub struct TrainingJobRequest {
     /// for non-owner inference access.
     #[serde(default)]
     pub model_token_id: Option<u64>,
+    /// On-chain model version index. Used with model_token_id to cache weights
+    /// per-version (e.g. cache key "42:0" for token 42, version index 0).
+    #[serde(default)]
+    pub model_version_index: Option<u64>,
 }
 
 fn default_architecture() -> Vec<usize> { vec![784, 32, 10] }
@@ -194,6 +198,9 @@ pub struct TrainingSessionState {
     /// On-chain model token ID (for weight caching)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_token_id: Option<u64>,
+    /// On-chain model version index (for per-version weight caching)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_version_index: Option<u64>,
 }
 
 /// Request body for uploading training data.
@@ -342,6 +349,44 @@ pub struct RegisteredWorker {
     pub last_heartbeat: f64,
     /// Worker status: "idle", "busy", "offline"
     pub status: String,
+    /// Number of training rounds this worker has completed
+    pub rounds_completed: u64,
+    /// Number of training rounds this worker participated in
+    pub rounds_participated: u64,
+    /// CPU load percentage (0-100)
+    pub cpu_load: u8,
+    /// Memory usage in megabytes
+    pub memory_mb: u64,
+    /// Reputation score (0.0 to 1.0)
+    pub reputation_score: f64,
+    /// Success rate (0.0 to 1.0)
+    pub success_rate: f64,
+    /// Total earnings in wei
+    pub earnings_wei: u64,
+    /// Worker capabilities
+    pub capabilities: WorkerCapabilitiesJson,
+}
+
+/// Worker capabilities for the dashboard JSON API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerCapabilitiesJson {
+    pub can_train: bool,
+    pub can_prove: bool,
+    pub can_aggregate: bool,
+    pub gpu_model: Option<String>,
+    pub max_batch_size: u64,
+}
+
+impl Default for WorkerCapabilitiesJson {
+    fn default() -> Self {
+        Self {
+            can_train: false,
+            can_prove: false,
+            can_aggregate: false,
+            gpu_model: None,
+            max_batch_size: 0,
+        }
+    }
 }
 
 /// Request body for worker registration.
@@ -506,6 +551,7 @@ impl Default for TrainingSessionState {
             model_name: None,
             model_slug: None,
             model_token_id: None,
+            model_version_index: None,
         }
     }
 }
@@ -972,16 +1018,36 @@ async fn metrics_handler(
     }
 }
 
-/// Events endpoint — reads from dynamic state
+/// Events endpoint — reads from dynamic state.
+/// Supports optional `?owner=<address>` query parameter to filter events
+/// by `model_owner`. Events without a `model_owner` field are always included.
 async fn events_handler(
+    Query(params): Query<HashMap<String, String>>,
     State(state): State<Arc<DashboardState>>,
 ) -> Json<Vec<serde_json::Value>> {
     let events = state.events.read().await;
-    if events.is_empty() {
-        Json(demo_events())
+    let event_list = if events.is_empty() {
+        demo_events()
     } else {
-        Json(events.clone())
+        events.clone()
+    };
+
+    // Filter by owner if specified
+    if let Some(owner) = params.get("owner") {
+        let owner_lower = owner.to_lowercase();
+        let filtered: Vec<_> = event_list
+            .into_iter()
+            .filter(|e| {
+                e.get("model_owner")
+                    .and_then(|o| o.as_str())
+                    .map(|o| o.to_lowercase() == owner_lower)
+                    .unwrap_or(true) // include events without model_owner
+            })
+            .collect();
+        return Json(filtered);
     }
+
+    Json(event_list)
 }
 
 // ---------------------------------------------------------------------------
@@ -1119,6 +1185,7 @@ async fn start_training_handler(
         model_name: req.model_name.clone(),
         model_slug: req.model_slug.clone(),
         model_token_id: req.model_token_id,
+        model_version_index: req.model_version_index,
     };
 
     // Store session
@@ -1358,14 +1425,15 @@ async fn run_training_session(
                 }
             }
 
-            // Cache weights by model_token_id for non-owner inference
+            // Cache weights by model_token_id:version_index for non-owner inference
             {
                 let sessions = state.sessions.read().await;
                 if let Some(session) = sessions.get(&session_id) {
                     if let (Some(token_id), Some(ref weights)) = (session.model_token_id, &session.final_weights) {
-                        let key = token_id.to_string();
+                        let vi = session.model_version_index.unwrap_or(0);
+                        let key = format!("{}:{}", token_id, vi);
                         state.model_weights_cache.write().await.insert(key.clone(), weights.clone());
-                        info!(token_id, "Cached final weights for model token ID {}", key);
+                        info!(token_id, version_index = vi, "Cached final weights for model {}:{}", token_id, vi);
                     }
                 }
             }
@@ -1706,6 +1774,14 @@ async fn register_worker_handler(
         registered_at: now,
         last_heartbeat: now,
         status: "idle".to_string(),
+        rounds_completed: 0,
+        rounds_participated: 0,
+        cpu_load: 0,
+        memory_mb: 0,
+        reputation_score: 0.5,
+        success_rate: 0.0,
+        earnings_wei: 0,
+        capabilities: WorkerCapabilitiesJson::default(),
     };
 
     let mut workers = state.registered_workers.write().await;
@@ -1799,6 +1875,20 @@ async fn list_workers_handler(
             "status": effective_status,
             "registered_at": w.registered_at,
             "last_heartbeat": w.last_heartbeat,
+            "rounds_completed": w.rounds_completed,
+            "rounds_participated": w.rounds_participated,
+            "cpu_load": w.cpu_load,
+            "memory_mb": w.memory_mb,
+            "reputation_score": w.reputation_score,
+            "success_rate": w.success_rate,
+            "earnings_wei": w.earnings_wei,
+            "capabilities": {
+                "can_train": w.capabilities.can_train,
+                "can_prove": w.capabilities.can_prove,
+                "can_aggregate": w.capabilities.can_aggregate,
+                "gpu_model": w.capabilities.gpu_model,
+                "max_batch_size": w.capabilities.max_batch_size,
+            },
             "source": "off-chain",
         })
     }).collect();
@@ -2090,31 +2180,41 @@ async fn inference_handler(
 // ---------------------------------------------------------------------------
 
 /// GET /api/models/:id/inference-ready — check if cached weights exist for a model
+/// Query param: ?version=<index> (defaults to 0)
 async fn model_inference_ready_handler(
     State(state): State<Arc<DashboardState>>,
     Path(id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
+    let version = params.get("version").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let key = format!("{}:{}", id, version);
     let cache = state.model_weights_cache.read().await;
-    let ready = cache.contains_key(&id);
-    Json(serde_json::json!({ "ready": ready }))
+    let ready = cache.contains_key(&key);
+    Json(serde_json::json!({ "ready": ready, "version": version }))
 }
 
 /// POST /api/models/:id/cache-weights — owner uploads weights for non-owner inference
+/// Query param: ?version=<index> (defaults to 0)
 async fn model_cache_weights_handler(
     State(state): State<Arc<DashboardState>>,
     Path(id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    // Accept the weights body and store by token ID
-    state.model_weights_cache.write().await.insert(id.clone(), body);
-    info!(token_id = %id, "Cached weights for model token ID (owner upload)");
-    Json(serde_json::json!({ "cached": true, "token_id": id }))
+    let version = params.get("version").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let key = format!("{}:{}", id, version);
+    state.model_weights_cache.write().await.insert(key.clone(), body);
+    info!(token_id = %id, version = version, "Cached weights for model (owner upload)");
+    Json(serde_json::json!({ "cached": true, "token_id": id, "version": version }))
 }
 
 /// Request body for model-based inference
 #[derive(Debug, Deserialize)]
 struct ModelInferenceRequest {
     model_token_id: u64,
+    /// Version index (0 = first version). Defaults to 0.
+    #[serde(default)]
+    model_version_index: u64,
     pixels: Vec<f64>,
     #[serde(default = "default_num_parties")]
     num_parties: usize,
@@ -2136,7 +2236,7 @@ async fn model_inference_handler(
         ).into_response();
     }
 
-    let token_key = req.model_token_id.to_string();
+    let token_key = format!("{}:{}", req.model_token_id, req.model_version_index);
 
     // Look up cached weights
     let weights = {
@@ -2145,7 +2245,7 @@ async fn model_inference_handler(
             Some(w) => w.clone(),
             None => return (
                 StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "error": "Weights not cached for this model. Owner must run inference first or cache weights." })),
+                Json(serde_json::json!({ "error": "Weights not cached for this model version. Owner must run inference first or cache weights." })),
             ).into_response(),
         }
     };
