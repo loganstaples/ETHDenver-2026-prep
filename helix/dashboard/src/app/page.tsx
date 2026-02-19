@@ -8,12 +8,10 @@ import {
   Search,
   Sparkles,
   Layers,
-  Trophy,
   User,
   Loader2,
   Globe,
   Lock,
-  Tag,
   ArrowUpDown,
   X,
   ShoppingCart,
@@ -22,7 +20,6 @@ import {
 } from 'lucide-react';
 import { Card } from '@/components/ui/Card';
 import { Badge } from '@/components/ui/Badge';
-import { StatCard } from '@/components/ui/StatCard';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { cn } from '@/lib/utils';
 import { usePublicModels, type PublicModel, type ModelFilter } from '@/hooks/usePublicModels';
@@ -669,24 +666,6 @@ export default function ModelsPage() {
     mine: baseModels.filter((m) => address && m.owner.toLowerCase() === address.toLowerCase()).length,
   }), [baseModels, address]);
 
-  // Aggregate stats for inference mode
-  const totalVersions = publicModels.reduce((sum, m) => sum + m.versionCount, 0);
-  const bestAccuracy = publicModels.reduce(
-    (best, m) => (m.bestAccuracy > best ? m.bestAccuracy : best),
-    0,
-  );
-  const uniqueCreators = new Set(publicModels.map((m) => m.creator.toLowerCase())).size;
-
-  // Aggregate stats for marketplace mode
-  const forSaleModels = useMemo(() => publicModels.filter((m) => m.forSale), [publicModels]);
-  const marketplaceStats = useMemo(() => {
-    const salePrices = forSaleModels.map((m) => m.salePrice).filter((p) => p > 0);
-    const avgPrice = salePrices.length > 0 ? salePrices.reduce((a, b) => a + b, 0) / salePrices.length : 0;
-    const minPrice = salePrices.length > 0 ? Math.min(...salePrices) : 0;
-    const maxPrice = salePrices.length > 0 ? Math.max(...salePrices) : 0;
-    return { count: forSaleModels.length, avgPrice, minPrice, maxPrice };
-  }, [forSaleModels]);
-
   // Sort options based on mode
   const sortOptions = mode === 'marketplace' ? MARKETPLACE_SORT_OPTIONS : INFERENCE_SORT_OPTIONS;
   const filterLabels = mode === 'marketplace' ? MARKETPLACE_FILTERS : FILTERS;
@@ -733,61 +712,6 @@ export default function ModelsPage() {
           </Link>
         )}
       </div>
-
-      {/* Stats */}
-      {mode === 'inference' && publicModels.length > 0 && (
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-          <StatCard
-            label="Public Models"
-            value={publicModels.length}
-            icon={<Boxes size={14} />}
-          />
-          <StatCard
-            label="Total Versions"
-            value={totalVersions}
-            icon={<Tag size={14} />}
-          />
-          <StatCard
-            label="Best Accuracy"
-            value={bestAccuracy > 0 ? `${(bestAccuracy * 100).toFixed(1)}%` : '--'}
-            icon={<Trophy size={14} />}
-          />
-          <StatCard
-            label="Creators"
-            value={uniqueCreators}
-            icon={<User size={14} />}
-          />
-        </div>
-      )}
-
-      {mode === 'marketplace' && (
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-          <StatCard
-            label="Models for Sale"
-            value={marketplaceStats.count}
-            icon={<Store size={14} />}
-          />
-          <StatCard
-            label="Avg Price"
-            value={marketplaceStats.avgPrice > 0 ? formatAdiPrice(marketplaceStats.avgPrice) : '--'}
-            icon={<DollarSign size={14} />}
-          />
-          <StatCard
-            label="Price Range"
-            value={
-              marketplaceStats.minPrice > 0
-                ? `${formatAdiPrice(marketplaceStats.minPrice)} - ${formatAdiPrice(marketplaceStats.maxPrice)}`
-                : '--'
-            }
-            icon={<ArrowUpDown size={14} />}
-          />
-          <StatCard
-            label="Creators"
-            value={new Set(forSaleModels.map((m) => m.creator.toLowerCase())).size}
-            icon={<User size={14} />}
-          />
-        </div>
-      )}
 
       {/* Mode Toggle + Filter + Search + Sort */}
       <div className="space-y-3">
