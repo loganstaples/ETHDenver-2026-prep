@@ -5,12 +5,13 @@ const BACKEND_TIMEOUT_MS = 30_000;
 
 // ============================================================================
 // API Handler — Proxy to Rust MPC inference backend
+// Supports both session-based (legacy) and model-based (new) inference.
 // ============================================================================
 
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { session_id, pixels, num_parties } = body;
+    const { session_id, model_token_id, pixels, num_parties, wallet_address, payment_tx } = body;
 
     if (!pixels || !Array.isArray(pixels) || pixels.length !== 784) {
       return NextResponse.json(
@@ -19,26 +20,43 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    if (!session_id) {
+    // Determine which backend endpoint to use
+    const isModelBased = model_token_id !== undefined && model_token_id !== null;
+
+    if (!isModelBased && !session_id) {
       return NextResponse.json(
-        { error: 'session_id is required' },
+        { error: 'session_id or model_token_id is required' },
         { status: 400 },
       );
     }
 
-    // Forward to Rust backend MPC inference endpoint
+    const backendUrl = isModelBased
+      ? `${API_BASE}/api/models/inference`
+      : `${API_BASE}/api/inference`;
+
+    const backendBody = isModelBased
+      ? {
+          model_token_id,
+          pixels,
+          num_parties: num_parties || 3,
+          wallet_address,
+          payment_tx,
+        }
+      : {
+          session_id,
+          pixels,
+          num_parties: num_parties || 3,
+        };
+
+    // Forward to Rust backend
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), BACKEND_TIMEOUT_MS);
 
     try {
-      const res = await fetch(`${API_BASE}/api/inference`, {
+      const res = await fetch(backendUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          session_id,
-          pixels,
-          num_parties: num_parties || 3,
-        }),
+        body: JSON.stringify(backendBody),
         signal: controller.signal,
       });
 

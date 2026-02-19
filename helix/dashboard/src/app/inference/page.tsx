@@ -20,12 +20,14 @@ import {
   Coins,
   ExternalLink,
 } from 'lucide-react';
-import { useAccount, useSignMessage } from 'wagmi';
+import { useAccount, useSignMessage, useWriteContract, useWaitForTransactionReceipt, useChainId } from 'wagmi';
+import { parseEther } from 'viem';
 import { Badge } from '@/components/ui/Badge';
 import { cn } from '@/lib/utils';
 import { usePublicModels, type PublicModel } from '@/hooks/usePublicModels';
 import { useModelRegistry } from '@/hooks/useModelRegistry';
 import { deriveModelKey, decryptWeights } from '@/lib/model-encryption';
+import { HELIX_MODEL_STORE_ABI, getContractAddress } from '@/lib/contracts';
 
 // ============================================================================
 // Types & Constants
@@ -505,6 +507,8 @@ function InferencePageInner() {
   const { address } = useAccount();
   const { signMessageAsync } = useSignMessage();
 
+  const chainId = useChainId();
+
   // Model discovery
   const { allModels, isLoading: isLoadingPublic } = usePublicModels();
   const { models: myModels, isLoading: isLoadingMine } = useModelRegistry();
@@ -519,6 +523,16 @@ function InferencePageInner() {
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const fetchingForRef = useRef<number | null>(null);
   const weightsFileRef = useRef<HTMLInputElement>(null);
+
+  // Owner detection
+  const isOwnerOfSelected = selectedModel && address
+    ? selectedModel.owner.toLowerCase() === address.toLowerCase()
+    : false;
+  const [backendWeightsReady, setBackendWeightsReady] = useState(false);
+
+  // Inference payment (non-owner flow)
+  const { writeContract, data: inferenceTxHash, isPending: isPaymentPending } = useWriteContract();
+  const { isSuccess: paymentConfirmed, isLoading: isPaymentConfirming } = useWaitForTransactionReceipt({ hash: inferenceTxHash });
 
   // Inference
   const [pixels, setPixels] = useState<number[]>([]);
@@ -549,11 +563,14 @@ function InferencePageInner() {
 
   // Filtered models
   const filteredModels = useMemo(() => {
-    let models = allModels;
+    // Hide private models from non-owners
+    let models = allModels.filter((m) =>
+      m.isPublic || m.owner.toLowerCase() === address?.toLowerCase()
+    );
     if (filter === 'mine') {
-      models = allModels.filter((m) => m.owner.toLowerCase() === address?.toLowerCase());
+      models = models.filter((m) => m.owner.toLowerCase() === address?.toLowerCase());
     } else if (filter === 'others') {
-      models = allModels.filter((m) => m.owner.toLowerCase() !== address?.toLowerCase());
+      models = models.filter((m) => m.owner.toLowerCase() !== address?.toLowerCase());
     }
     if (search.trim()) {
       const q = search.toLowerCase();
@@ -597,24 +614,51 @@ function InferencePageInner() {
     return result.session_id ?? null;
   }, []);
 
-  // Fetch weights from 0G when model selected
+  // Fetch weights from 0G (owner) or check backend cache (non-owner)
   useEffect(() => {
     if (!selectedModel) {
       fetchingForRef.current = null;
       setWeightFetchStatus('idle');
       setWeightFetchError(null);
+      setBackendWeightsReady(false);
       return;
     }
 
+    if (fetchingForRef.current === selectedModel.tokenId) return;
+    fetchingForRef.current = selectedModel.tokenId;
+
+    const isOwner = address && selectedModel.owner.toLowerCase() === address.toLowerCase();
+
+    // Non-owner: check if backend has cached weights
+    if (!isOwner) {
+      const checkBackend = async () => {
+        try {
+          const res = await fetch(`${API_BASE}/api/models/${selectedModel.tokenId}/inference-ready`);
+          if (res.ok) {
+            const data = await res.json();
+            if (data.ready) {
+              setBackendWeightsReady(true);
+              setWeightFetchStatus('done');
+              return;
+            }
+          }
+        } catch { /* non-fatal */ }
+        // Backend doesn't have weights cached — show message
+        setWeightFetchError('Weights not available. The model owner must run inference first.');
+        setWeightFetchStatus('error');
+        fetchingForRef.current = null;
+      };
+      checkBackend();
+      return;
+    }
+
+    // Owner: fetch from 0G, decrypt, upload to backend
     const lv = selectedModel.latestVersion;
     if (!lv || !lv.weightsStored || !lv.rootHash) {
       setWeightFetchStatus('idle');
       setWeightFetchError(null);
       return;
     }
-
-    if (fetchingForRef.current === selectedModel.tokenId) return;
-    fetchingForRef.current = selectedModel.tokenId;
 
     const doFetch = async () => {
       setWeightFetchStatus('fetching');
@@ -650,6 +694,15 @@ function InferencePageInner() {
         const backendSessionId = await uploadWeightsToBackend(weightsData);
         setActiveSessionId(backendSessionId ?? lv.sessionId);
         setWeightFetchStatus('done');
+
+        // Also cache weights by token ID for future non-owner inference
+        try {
+          await fetch(`${API_BASE}/api/models/${selectedModel.tokenId}/cache-weights`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(weightsData),
+          });
+        } catch { /* non-fatal */ }
       } catch (err) {
         const message = err instanceof Error ? err.message : 'Failed to fetch weights';
         setWeightFetchError(message);
@@ -659,7 +712,7 @@ function InferencePageInner() {
     };
 
     doFetch();
-  }, [selectedModel, signMessageAsync, uploadWeightsToBackend]);
+  }, [selectedModel, signMessageAsync, uploadWeightsToBackend, address]);
 
   // Manual weight upload
   const handleManualWeightUpload = useCallback(async (file: File) => {
@@ -692,18 +745,26 @@ function InferencePageInner() {
     setError(null);
   }, []);
 
-  // Run inference
-  const runInference = useCallback(async () => {
-    if (!activeSessionId || !pixels.length) return;
+  // Run inference (owner: direct, non-owner: after payment confirmation)
+  const runInference = useCallback(async (paymentTxHash?: string) => {
+    if (!pixels.length) return;
     setPhase('submitting');
     setError(null);
     setResult(null);
 
     try {
+      // Model-based inference (non-owner with cached weights, or owner with model selected)
+      const useModelEndpoint = selectedModel && (backendWeightsReady || isOwnerOfSelected);
       const res = await fetch('/api/inference', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+        body: JSON.stringify(useModelEndpoint ? {
+          model_token_id: selectedModel.tokenId,
+          pixels,
+          num_parties: 3,
+          wallet_address: isOwnerOfSelected ? address : undefined,
+          payment_tx: paymentTxHash,
+        } : {
           session_id: activeSessionId,
           pixels,
           num_parties: 3,
@@ -743,12 +804,35 @@ function InferencePageInner() {
       setError(err instanceof Error ? err.message : 'Inference failed');
       setPhase('error');
     }
-  }, [activeSessionId, pixels]);
+  }, [activeSessionId, pixels, selectedModel, backendWeightsReady, isOwnerOfSelected, address]);
+
+  // Non-owner: initiate on-chain payment then run inference
+  const handlePayAndRun = useCallback(() => {
+    if (!selectedModel) return;
+    const modelStoreAddress = getContractAddress(chainId, 'helixModelStore') as `0x${string}`;
+    const totalFeeWei = parseEther(totalFee.toFixed(18));
+    writeContract({
+      address: modelStoreAddress,
+      abi: HELIX_MODEL_STORE_ABI,
+      functionName: 'payForInference',
+      args: [BigInt(selectedModel.tokenId)],
+      value: totalFeeWei,
+    });
+  }, [selectedModel, chainId, totalFee, writeContract]);
+
+  // When payment confirms, trigger inference automatically
+  useEffect(() => {
+    if (paymentConfirmed && inferenceTxHash && phase === 'idle') {
+      runInference(inferenceTxHash);
+    }
+  }, [paymentConfirmed, inferenceTxHash, phase, runInference]);
 
   const hasDrawing = pixels.length > 0 && pixels.some((p) => p > 0.01);
   const isRunning = phase === 'submitting';
   const weightsReady = weightFetchStatus === 'done';
-  const canRunInference = weightsReady && hasDrawing && !isRunning && !!activeSessionId;
+  const canRunInference = isOwnerOfSelected
+    ? weightsReady && hasDrawing && !isRunning && !!activeSessionId
+    : backendWeightsReady && hasDrawing && !isRunning && !isPaymentPending && !isPaymentConfirming;
 
   // Select model handler
   const handleSelectModel = useCallback((model: PublicModel) => {
@@ -760,6 +844,7 @@ function InferencePageInner() {
     setWeightFetchStatus('idle');
     setWeightFetchError(null);
     setActiveSessionId(null);
+    setBackendWeightsReady(false);
   }, []);
 
   return (
@@ -1035,29 +1120,39 @@ function InferencePageInner() {
             <div className="p-6">
               <div className="flex items-center justify-between mb-4">
                 <span className="text-base font-medium text-helix-text2">Inference Fee</span>
-                {selectedModel && ownerFeeBps > 0 && (
+                {isOwnerOfSelected ? (
+                  <Badge variant="default" className="text-green-400">
+                    <CheckCircle size={10} /> Free (you own this model)
+                  </Badge>
+                ) : selectedModel && ownerFeeBps > 0 ? (
                   <Badge variant="default" className="text-helix-text2">
                     <Coins size={10} />
                     {(ownerFeeBps / 100).toFixed(1)}% owner fee
                   </Badge>
-                )}
+                ) : null}
               </div>
 
               {/* Big fee number */}
               <div className="flex items-baseline justify-center gap-4 py-2">
                 <span className="text-5xl font-bold tracking-tighter tabular-nums text-white">
-                  {totalFee.toFixed(6)}
+                  {isOwnerOfSelected ? '0.000000' : totalFee.toFixed(6)}
                 </span>
                 <span className="text-xl font-semibold text-helix-text2">ADI</span>
               </div>
 
               {/* Fee breakdown */}
               <div className="flex items-center justify-center gap-4 mt-3 text-sm text-helix-dim">
-                <span>Workers: {BASE_INFERENCE_COST.toFixed(4)} ADI</span>
-                {ownerFeeBps > 0 && (
+                {isOwnerOfSelected ? (
+                  <span>Owner inference is always free</span>
+                ) : (
                   <>
-                    <span>+</span>
-                    <span>Owner: {(ownerFeeBps / 100).toFixed(1)}%</span>
+                    <span>Workers: {BASE_INFERENCE_COST.toFixed(4)} ADI</span>
+                    {ownerFeeBps > 0 && (
+                      <>
+                        <span>+</span>
+                        <span>Owner: {(ownerFeeBps / 100).toFixed(1)}%</span>
+                      </>
+                    )}
                   </>
                 )}
               </div>
@@ -1066,7 +1161,7 @@ function InferencePageInner() {
             {/* Run button */}
             <motion.button
               type="button"
-              onClick={runInference}
+              onClick={isOwnerOfSelected ? () => runInference() : handlePayAndRun}
               disabled={!canRunInference}
               whileTap={canRunInference ? { scale: 0.98 } : {}}
               className={cn(
@@ -1077,10 +1172,16 @@ function InferencePageInner() {
                   : 'bg-helix-border text-helix-muted border-helix-border cursor-not-allowed',
               )}
             >
-              {isRunning ? (
+              {isPaymentPending ? (
+                <><Loader2 size={22} className="animate-spin" /> Confirm in Wallet...</>
+              ) : isPaymentConfirming ? (
+                <><Loader2 size={22} className="animate-spin" /> Confirming Payment...</>
+              ) : isRunning ? (
                 <><Loader2 size={22} className="animate-spin" /> Running MPC Inference...</>
-              ) : (
+              ) : isOwnerOfSelected ? (
                 <><Shield size={22} /> Run Inference</>
+              ) : (
+                <><Coins size={22} /> Pay &amp; Run Inference</>
               )}
             </motion.button>
           </div>

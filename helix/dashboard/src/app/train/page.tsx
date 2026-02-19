@@ -448,6 +448,7 @@ function ConfigForm({
       seed: 42,
       model_name: effectiveModelName || undefined,
       model_slug: effectiveModelSlug || undefined,
+      model_token_id: modelMode === 'existing' && selectedModelId !== null ? selectedModelId : undefined,
     }, { storeOn0G, version: v, modelName: effectiveModelName, modelSlug: effectiveModelSlug });
   };
 

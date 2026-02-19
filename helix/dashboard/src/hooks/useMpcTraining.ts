@@ -27,6 +27,8 @@ export interface TrainingJobConfig {
   model_slug?: string;
   /** Pre-registered on-chain job ID (user wallet already paid) */
   job_id?: number;
+  /** On-chain model token ID for weight caching */
+  model_token_id?: number;
 }
 
 export interface CheaterInfo {
