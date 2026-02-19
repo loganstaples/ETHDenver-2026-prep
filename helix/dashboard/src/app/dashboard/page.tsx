@@ -772,6 +772,41 @@ export default function DashboardPage() {
             )}
           </div>
 
+          {/* Round Status (from backend) */}
+          {roundStatus && (
+            <div className="grid grid-cols-4 gap-3">
+              <div className="bg-helix-bg rounded-xl px-4 py-3">
+                <div className="text-[10px] uppercase tracking-wider text-helix-muted mb-1">Phase</div>
+                <div className="text-sm font-mono text-white truncate">
+                  {roundStatus.current_round?.phase ?? 'Idle'}
+                </div>
+              </div>
+              <div className="bg-helix-bg rounded-xl px-4 py-3">
+                <div className="text-[10px] uppercase tracking-wider text-helix-muted mb-1">Gradients</div>
+                <div className="text-sm font-mono text-white tabular-nums">
+                  {roundStatus.current_round
+                    ? `${roundStatus.current_round.gradients_received}/${roundStatus.current_round.workers_assigned}`
+                    : '--'}
+                </div>
+              </div>
+              <div className="bg-helix-bg rounded-xl px-4 py-3">
+                <div className="text-[10px] uppercase tracking-wider text-helix-muted mb-1">Rounds Done</div>
+                <div className="text-sm font-mono text-white tabular-nums">{roundStatus.completed_rounds}</div>
+              </div>
+              <div className="bg-helix-bg rounded-xl px-4 py-3">
+                <div className="text-[10px] uppercase tracking-wider text-helix-muted mb-1">MPC</div>
+                <div className="text-sm font-mono text-white">
+                  {backendHealth?.mpc.active_session ? (
+                    <span className="flex items-center gap-1.5">
+                      <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
+                      Active
+                    </span>
+                  ) : 'Idle'}
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* Workers + Settings */}
           <div className="grid grid-cols-5 gap-4">
             {/* Workers */}
