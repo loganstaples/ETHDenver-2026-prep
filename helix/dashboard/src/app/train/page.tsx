@@ -26,6 +26,8 @@ import {
   Layers,
   Search,
   Lock,
+  History,
+  Clock,
 } from 'lucide-react';
 import {
   ResponsiveContainer,
@@ -46,12 +48,22 @@ import {
   type UploadedData,
   type UploadedWeights,
   type ZeroGStorageResult,
+  type TrainingSessionState,
 } from '@/hooks/useMpcTraining';
 import { useModelRegistry, type ModelWithVersions } from '@/hooks/useModelRegistry';
 import { deriveModelKey, decryptWeights } from '@/lib/model-encryption';
 import { HELIX_COORDINATOR_V4_ABI, getContractAddress } from '@/lib/contracts';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
+
+function formatDuration(secs: number): string {
+  if (secs < 60) return `${secs}s`;
+  const m = Math.floor(secs / 60);
+  const s = secs % 60;
+  if (m < 60) return `${m}m ${s}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${m % 60}m`;
+}
 
 function computeArchitectureHash(dims: number[]): `0x${string}` {
   const archString = `HELIX_ARCH:${dims[0]}:${dims[1]}:${dims[2]}`;
@@ -1285,6 +1297,227 @@ function ResultsActions({ session, version, onDownloadModel, onStoreOnZeroG, isS
 
 
 // ============================================================================
+// History Card Grid — responsive grid of past training sessions
+// ============================================================================
+
+function HistoryCardGrid({ sessions, onSelect }: {
+  sessions: TrainingSessionState[];
+  onSelect: (s: TrainingSessionState) => void;
+}) {
+  if (sessions.length === 0) {
+    return (
+      <div className="text-center py-16 text-helix-dim">
+        <History size={32} className="mx-auto mb-3 opacity-40" />
+        <p>No training sessions yet</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+      {sessions.map((s) => (
+        <button
+          key={s.session_id}
+          type="button"
+          onClick={() => onSelect(s)}
+          className="text-left p-5 rounded-2xl bg-helix-surface border border-helix-border hover:border-white/20 transition-all group"
+        >
+          <div className="flex items-center justify-between mb-3">
+            <span className="text-sm font-medium text-white truncate max-w-[60%]">
+              {s.model_name || 'Unnamed Model'}
+            </span>
+            <span className={cn(
+              'text-xs px-2 py-0.5 rounded-full',
+              s.status === 'complete' ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'
+            )}>
+              {s.status}
+            </span>
+          </div>
+
+          {/* Mini sparkline */}
+          {s.losses.length > 1 && (
+            <div className="h-12 mb-3 opacity-60 group-hover:opacity-100 transition-opacity">
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart data={s.losses.slice(-50).map((l, i) => ({ i, l }))}>
+                  <Area type="monotone" dataKey="l" stroke="#ffffff40" fill="#ffffff10" strokeWidth={1} dot={false} />
+                </AreaChart>
+              </ResponsiveContainer>
+            </div>
+          )}
+
+          <div className="flex items-center gap-3 text-sm text-helix-dim">
+            {s.accuracy !== null && s.accuracy !== undefined && (
+              <span className="text-white font-medium">{(s.accuracy * 100).toFixed(1)}%</span>
+            )}
+            <span>{s.current_step}/{s.total_steps} steps</span>
+            <span className="ml-auto">{formatDuration(Math.round(s.elapsed_secs))}</span>
+          </div>
+
+          <div className="text-xs text-helix-dim mt-2">
+            {new Date(s.started_at * 1000).toLocaleDateString()} {new Date(s.started_at * 1000).toLocaleTimeString()}
+          </div>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// ============================================================================
+// History Detail Modal — full-screen overlay with session details
+// ============================================================================
+
+function HistoryDetailModal({ session, onClose }: {
+  session: TrainingSessionState;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [onClose]);
+
+  const lossData = session.losses.map((l, i) => ({ step: i + 1, loss: l }));
+
+  return (
+    <AnimatePresence>
+      <motion.div
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        className="fixed inset-0 z-50 flex items-center justify-center p-4"
+        onClick={onClose}
+      >
+        <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" />
+
+        <motion.div
+          initial={{ scale: 0.95, opacity: 0 }}
+          animate={{ scale: 1, opacity: 1 }}
+          exit={{ scale: 0.95, opacity: 0 }}
+          transition={{ duration: 0.2 }}
+          className="relative w-full max-w-5xl max-h-[90vh] overflow-y-auto rounded-3xl bg-[#0a0a0a] border border-helix-border p-8"
+          onClick={(e) => e.stopPropagation()}
+        >
+          {/* Close button */}
+          <button
+            type="button"
+            onClick={onClose}
+            className="absolute top-4 right-4 p-2 rounded-xl text-helix-dim hover:text-white hover:bg-helix-surface transition-colors"
+          >
+            <XCircle size={20} />
+          </button>
+
+          {/* Header */}
+          <div className="flex items-center gap-3 mb-6">
+            <h2 className="text-xl font-semibold text-white">
+              {session.model_name || 'Training Session'}
+            </h2>
+            <span className={cn(
+              'text-xs px-2 py-0.5 rounded-full',
+              session.status === 'complete' ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'
+            )}>
+              {session.status}
+            </span>
+            <span className="text-sm text-helix-dim ml-auto font-mono">
+              {session.session_id.slice(0, 8)}
+            </span>
+          </div>
+
+          {/* Two-column layout */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            {/* LEFT: Hero metric + loss curve */}
+            <div className="space-y-4">
+              <div className="p-6 rounded-2xl bg-helix-surface border border-helix-border text-center">
+                {session.status === 'complete' && session.accuracy !== null ? (
+                  <>
+                    <p className="text-5xl font-bold text-white tabular-nums">
+                      {(session.accuracy! * 100).toFixed(1)}
+                      <span className="text-2xl text-helix-dim">%</span>
+                    </p>
+                    <p className="text-sm text-helix-dim mt-1">Final Accuracy</p>
+                  </>
+                ) : (
+                  <>
+                    <p className="text-5xl font-bold text-white tabular-nums">
+                      {session.current_loss.toFixed(4)}
+                    </p>
+                    <p className="text-sm text-helix-dim mt-1">Final Loss</p>
+                  </>
+                )}
+              </div>
+
+              {lossData.length > 1 && (
+                <div className="h-64">
+                  <LossCurve data={lossData} />
+                </div>
+              )}
+            </div>
+
+            {/* RIGHT: Stats + metadata */}
+            <div className="space-y-4">
+              {/* Progress bar */}
+              <div>
+                <div className="h-1.5 rounded-full bg-helix-border overflow-hidden">
+                  <div
+                    className="h-full rounded-full bg-white"
+                    style={{ width: `${(session.current_step / Math.max(session.total_steps, 1)) * 100}%` }}
+                  />
+                </div>
+                <p className="text-sm text-helix-dim mt-1 tabular-nums">
+                  Step {session.current_step} / {session.total_steps}
+                </p>
+              </div>
+
+              {/* Stats grid */}
+              <div className="grid grid-cols-2 gap-3">
+                <StatCard label="MAC Checks" value={session.mac_checks_passed} icon={<Shield size={14} />} />
+                <StatCard label="Checkpoints" value={session.checkpoints_submitted} icon={<Zap size={14} />} />
+                <StatCard label="ZK Proofs" value={session.zk_proofs_generated} icon={<Activity size={14} />} />
+                <StatCard label="Elapsed" value={formatDuration(Math.round(session.elapsed_secs))} icon={<Clock size={14} />} />
+              </div>
+
+              {/* Cheater alert */}
+              {session.cheater_detected && (
+                <div className="p-4 rounded-xl bg-red-500/10 border border-red-500/30 text-red-400 text-sm">
+                  <strong>Cheater Detected</strong>
+                  <span className="ml-2">Worker {session.cheater_detected.party_index}</span>
+                </div>
+              )}
+
+              {/* Session metadata */}
+              <div className="p-4 rounded-xl bg-helix-surface border border-helix-border space-y-2 text-sm">
+                <div className="flex justify-between">
+                  <span className="text-helix-dim">Session ID</span>
+                  <span className="text-helix-text2 font-mono">{session.session_id.slice(0, 16)}...</span>
+                </div>
+                {session.coordinator_address && (
+                  <div className="flex justify-between">
+                    <span className="text-helix-dim">Coordinator</span>
+                    <span className="text-helix-text2 font-mono">{session.coordinator_address.slice(0, 10)}...</span>
+                  </div>
+                )}
+                {session.job_id > 0 && (
+                  <div className="flex justify-between">
+                    <span className="text-helix-dim">Job ID</span>
+                    <span className="text-helix-text2 font-mono">{session.job_id}</span>
+                  </div>
+                )}
+                <div className="flex justify-between">
+                  <span className="text-helix-dim">Started</span>
+                  <span className="text-helix-text2">
+                    {new Date(session.started_at * 1000).toLocaleString()}
+                  </span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </motion.div>
+      </motion.div>
+    </AnimatePresence>
+  );
+}
+
+
+// ============================================================================
 // Inner page (needs useSearchParams, so must be inside Suspense)
 // ============================================================================
 
@@ -1377,6 +1610,8 @@ function TrainPageInner() {
   }, [paymentConfirmed, paymentTxHash, startTraining]);
 
   const hasSession = session !== null;
+  const [viewMode, setViewMode] = useState<'live' | 'history'>('live');
+  const [selectedHistorySession, setSelectedHistorySession] = useState<TrainingSessionState | null>(null);
   const [wantsStoreOn0G, setWantsStoreOn0G] = useState(false);
   const [currentVersion, setCurrentVersion] = useState('1.0.0');
   const [currentModelName, setCurrentModelName] = useState('');
@@ -1601,43 +1836,82 @@ function TrainPageInner() {
         </motion.div>
       )}
 
-      {!hasSession ? (
-        <ConfigForm
-          onStart={handleStart}
-          isStarting={isStarting}
-          onUploadData={uploadData}
-          onUploadWeights={uploadWeights}
-          uploadedData={uploadedData}
-          uploadedWeights={uploadedWeights}
-          workersOnline={workersOnline}
-          defaultVersion={defaultVersion}
-          models={models}
-          selectedModelId={selectedModelId}
-          onSelectModel={handleSelectModel}
-          isFetchingWeights={isFetchingWeights}
-          fetchedModelName={fetchedModelName}
-          isWalletPrompting={isWalletPrompting}
-          isConfirmingPayment={isConfirmingPayment}
-          walletConnected={!!address}
-        />
+      {/* View mode toggle */}
+      <div className="flex items-center gap-1 p-1 rounded-xl bg-helix-surface border border-helix-border w-fit">
+        <button
+          type="button"
+          onClick={() => setViewMode('live')}
+          className={cn(
+            'px-4 py-1.5 rounded-lg text-sm font-medium transition-all',
+            viewMode === 'live' ? 'bg-white text-black' : 'text-helix-dim hover:text-helix-text2'
+          )}
+        >
+          Live
+        </button>
+        <button
+          type="button"
+          onClick={() => { setViewMode('history'); fetchHistory(); }}
+          className={cn(
+            'px-4 py-1.5 rounded-lg text-sm font-medium transition-all',
+            viewMode === 'history' ? 'bg-white text-black' : 'text-helix-dim hover:text-helix-text2'
+          )}
+        >
+          History
+        </button>
+      </div>
+
+      {viewMode === 'live' ? (
+        <>
+          {!hasSession ? (
+            <ConfigForm
+              onStart={handleStart}
+              isStarting={isStarting}
+              onUploadData={uploadData}
+              onUploadWeights={uploadWeights}
+              uploadedData={uploadedData}
+              uploadedWeights={uploadedWeights}
+              workersOnline={workersOnline}
+              defaultVersion={defaultVersion}
+              models={models}
+              selectedModelId={selectedModelId}
+              onSelectModel={handleSelectModel}
+              isFetchingWeights={isFetchingWeights}
+              fetchedModelName={fetchedModelName}
+              isWalletPrompting={isWalletPrompting}
+              isConfirmingPayment={isConfirmingPayment}
+              walletConnected={!!address}
+            />
+          ) : (
+            <LiveProgress
+              session={session}
+              losses={losses}
+              isConnected={isConnected}
+              error={trainingError}
+              version={currentVersion}
+              modelName={currentModelName}
+              onDownloadModel={downloadModel}
+              onStoreOnZeroG={storeOnZeroG}
+              isStoringOnZeroG={isStoringOnZeroG}
+              zeroGResult={zeroGResult}
+              showStoreOn0G={wantsStoreOn0G}
+              elapsedTime={elapsedTime}
+            />
+          )}
+        </>
       ) : (
-        <LiveProgress
-          session={session}
-          losses={losses}
-          isConnected={isConnected}
-          error={trainingError}
-          version={currentVersion}
-          modelName={currentModelName}
-          onDownloadModel={downloadModel}
-          onStoreOnZeroG={storeOnZeroG}
-          isStoringOnZeroG={isStoringOnZeroG}
-          zeroGResult={zeroGResult}
-          showStoreOn0G={wantsStoreOn0G}
-          elapsedTime={elapsedTime}
+        <HistoryCardGrid
+          sessions={history}
+          onSelect={setSelectedHistorySession}
         />
       )}
 
-      {/* History UI will be added in Task 7 */}
+      {/* Detail modal */}
+      {selectedHistorySession && (
+        <HistoryDetailModal
+          session={selectedHistorySession}
+          onClose={() => setSelectedHistorySession(null)}
+        />
+      )}
     </motion.div>
   );
 }
