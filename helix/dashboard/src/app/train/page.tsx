@@ -377,8 +377,8 @@ function ConfigForm({
   models, selectedModelId, onSelectModel, isFetchingWeights, fetchedModelName,
   isWalletPrompting, isConfirmingPayment, walletConnected,
 }: ConfigFormProps) {
-  const [numSteps, setNumSteps] = useState(500);
-  const [learningRate, setLearningRate] = useState(0.01);
+  const [numSteps, setNumSteps] = useState(200);
+  const [learningRate, setLearningRate] = useState(0.05);
   const [checkpointFreq] = useState(50);
   const [zkMode, setZkMode] = useState<'off' | 'always' | 'risk'>('off');
   const [zkCheckpointFreq, setZkCheckpointFreq] = useState(5);
@@ -453,7 +453,7 @@ function ConfigForm({
       num_steps: numSteps,
       learning_rate: learningRate,
       checkpoint_freq: checkpointFreq,
-      mac_interval: 1,
+      mac_interval: 0,
       zk_mode: zkMode,
       zk_checkpoint_freq: zkCheckpointFreq,
       min_workers_for_mpc: minWorkersForMpc,

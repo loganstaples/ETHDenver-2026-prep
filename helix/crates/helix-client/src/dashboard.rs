@@ -144,10 +144,10 @@ pub struct TrainingJobRequest {
 
 fn default_architecture() -> Vec<usize> { vec![784, 128, 10] }
 fn default_num_workers() -> usize { 3 }
-fn default_num_steps() -> usize { 500 }
+fn default_num_steps() -> usize { 200 }
 fn default_learning_rate() -> f64 { 0.01 }
 fn default_checkpoint_freq() -> usize { 50 }
-fn default_mac_interval() -> u64 { 1 }
+fn default_mac_interval() -> u64 { 0 }
 fn default_zk_mode() -> String { "off".to_string() }
 fn default_zk_checkpoint_freq() -> u64 { 5 }
 fn default_min_workers() -> usize { 2 }

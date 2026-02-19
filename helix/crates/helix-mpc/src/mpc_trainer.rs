@@ -1069,15 +1069,26 @@ impl<T: MPCTransport> MPCTrainer<T> {
             }
         }
 
-        // Loss = 0.5 * sum((y - target)^2)
-        let mut loss = 0.0_f64;
-        let mut dy: Vec<Fr> = vec![Fr::ZERO; d_out];
-        for i in 0..d_out {
-            let diff = Fr::sub(&y_reconstructed[i], &target_fr[i]);
-            let diff_f64 = diff.to_f64();
-            loss += 0.5 * diff_f64 * diff_f64;
-            dy[i] = diff; // dy = y - target (public)
-        }
+        // Loss + gradient (cross-entropy for multi-class, sigmoid BCE for single-output).
+        let y_f64_vec: Vec<f64> = (0..d_out).map(|i| y_reconstructed[i].to_f64()).collect();
+        let (loss, dy) = if d_out > 1 {
+            let max_y = y_f64_vec.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+            let exp_y: Vec<f64> = y_f64_vec.iter().map(|&y| (y - max_y).exp()).collect();
+            let sum_exp: f64 = exp_y.iter().sum();
+            let probs: Vec<f64> = exp_y.iter().map(|&e| e / sum_exp).collect();
+            let target_f64: Vec<f64> = target_fr.iter().map(|t| t.to_f64()).collect();
+            let loss = -target_f64.iter().zip(probs.iter())
+                .map(|(&t, &p)| if t > 0.5 { (p.max(1e-10)).ln() } else { 0.0 })
+                .sum::<f64>();
+            let dy: Vec<Fr> = (0..d_out).map(|i| Fr::from_f64(probs[i] - target_f64[i])).collect();
+            (loss, dy)
+        } else {
+            let sig = 1.0 / (1.0 + (-y_f64_vec[0]).exp());
+            let t = target_fr[0].to_f64();
+            let loss = -(t * (sig.max(1e-10)).ln() + (1.0 - t) * ((1.0 - sig).max(1e-10)).ln());
+            let dy_val = sig - t;
+            (loss, vec![Fr::from_f64(dy_val)])
+        };
 
         // ---- Backward pass ----
         // Gradients stay SECRET-SHARED throughout.
@@ -1363,17 +1374,34 @@ impl<T: MPCTransport> MPCTrainer<T> {
             }
         }
 
-        // Loss = 0.5 * sum((y - target)^2). dy = y - target (public).
-        let mut loss = 0.0_f64;
-        let mut dy_f64 = vec![0.0f64; d_out];
-        let mut dy_fr = vec![Fr::ZERO; d_out];
-        for i in 0..d_out {
-            let y_f64 = y_reconstructed[i].to_f64();
-            let diff = y_f64 - target[i];
-            loss += 0.5 * diff * diff;
-            dy_f64[i] = diff;
-            dy_fr[i] = Fr::from_f64(diff); // re-aligned
-        }
+        // Loss + gradient computation.
+        let y_f64_vec: Vec<f64> = (0..d_out).map(|i| y_reconstructed[i].to_f64()).collect();
+        let (loss, mut dy_f64, mut dy_fr) = if d_out > 1 {
+            // Multi-class: cross-entropy with numerically stable softmax.
+            let max_y = y_f64_vec.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+            let exp_y: Vec<f64> = y_f64_vec.iter().map(|&y| (y - max_y).exp()).collect();
+            let sum_exp: f64 = exp_y.iter().sum();
+            let probs: Vec<f64> = exp_y.iter().map(|&e| e / sum_exp).collect();
+
+            let loss = -target.iter().zip(probs.iter())
+                .map(|(&t, &p)| if t > 0.5 { (p.max(1e-10)).ln() } else { 0.0 })
+                .sum::<f64>();
+
+            let mut dy = vec![0.0f64; d_out];
+            let mut dy_f = vec![Fr::ZERO; d_out];
+            for i in 0..d_out {
+                dy[i] = probs[i] - target[i];
+                dy_f[i] = Fr::from_f64(dy[i]);
+            }
+            (loss, dy, dy_f)
+        } else {
+            // Single-output: sigmoid + binary cross-entropy.
+            let sig = 1.0 / (1.0 + (-y_f64_vec[0]).exp());
+            let t = target[0];
+            let loss = -(t * (sig.max(1e-10)).ln() + (1.0 - t) * ((1.0 - sig).max(1e-10)).ln());
+            let dy_val = sig - t;
+            (loss, vec![dy_val], vec![Fr::from_f64(dy_val)])
+        };
 
         // ---- Backward pass ----
         // Since h and dy are both PUBLIC, most gradients can be computed publicly.
@@ -1386,7 +1414,7 @@ impl<T: MPCTransport> MPCTrainer<T> {
             }
         }
         // db2 = dy (public)
-        let db2_f64 = dy_f64.clone();
+        let mut db2_f64 = dy_f64.clone();
 
         // dh = W2^T @ dy — dy is public, W2 is secret-shared.
         // This is share * public. Reconstruct dh.
@@ -1437,7 +1465,7 @@ impl<T: MPCTransport> MPCTrainer<T> {
         }
 
         // dW1 = outer(dh_pre, x) — both public. Compute in f64.
-        let dw1_f64 = {
+        let mut dw1_f64 = {
             #[cfg(feature = "parallel")]
             {
                 use rayon::prelude::*;
@@ -1462,7 +1490,14 @@ impl<T: MPCTransport> MPCTrainer<T> {
             }
         };
         // db1 = dh_pre (public)
-        let db1_f64 = dh_pre_f64;
+        let mut db1_f64 = dh_pre_f64;
+
+        // Per-element gradient clipping at ±1.0
+        let clip = 1.0;
+        for g in dw1_f64.iter_mut() { *g = g.clamp(-clip, clip); }
+        for g in db1_f64.iter_mut() { *g = g.clamp(-clip, clip); }
+        for g in dw2_f64.iter_mut() { *g = g.clamp(-clip, clip); }
+        for g in db2_f64.iter_mut() { *g = g.clamp(-clip, clip); }
 
         // ---- Weight update: W -= lr * dW ----
         // Gradients are PUBLIC. Only party 0 applies the update to its share,
@@ -1711,17 +1746,27 @@ impl<T: MPCTransport> MPCTrainer<T> {
                     let target = &batch[s].1;
                     let input = &batch[s].0;
 
-                    // Loss
-                    let mut loss = 0.0f64;
-                    let mut dy_f64 = vec![0.0f64; d_out];
-                    let mut dy_fr = vec![Fr::ZERO; d_out];
-                    for i in 0..d_out {
-                        let y_f64 = y_recon[i].to_f64();
-                        let diff = y_f64 - target[i];
-                        loss += 0.5 * diff * diff;
-                        dy_f64[i] = diff;
-                        dy_fr[i] = Fr::from_f64(diff);
-                    }
+                    // Loss + gradient
+                    let y_f64_vec: Vec<f64> = (0..d_out).map(|i| y_recon[i].to_f64()).collect();
+                    let (loss, dy_f64, dy_fr) = if d_out > 1 {
+                        let max_y = y_f64_vec.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+                        let exp_y: Vec<f64> = y_f64_vec.iter().map(|&y| (y - max_y).exp()).collect();
+                        let sum_exp: f64 = exp_y.iter().sum();
+                        let probs: Vec<f64> = exp_y.iter().map(|&e| e / sum_exp).collect();
+                        let loss = -target.iter().zip(probs.iter())
+                            .map(|(&t, &p)| if t > 0.5 { (p.max(1e-10)).ln() } else { 0.0 })
+                            .sum::<f64>();
+                        let mut dy = vec![0.0f64; d_out];
+                        let mut dy_f = vec![Fr::ZERO; d_out];
+                        for i in 0..d_out { dy[i] = probs[i] - target[i]; dy_f[i] = Fr::from_f64(dy[i]); }
+                        (loss, dy, dy_f)
+                    } else {
+                        let sig = 1.0 / (1.0 + (-y_f64_vec[0]).exp());
+                        let t = target[0];
+                        let loss = -(t * (sig.max(1e-10)).ln() + (1.0 - t) * ((1.0 - sig).max(1e-10)).ln());
+                        let dy_val = sig - t;
+                        (loss, vec![dy_val], vec![Fr::from_f64(dy_val)])
+                    };
 
                     // dW2 = outer(dy, h) — both public
                     let mut dw2_f64 = vec![0.0f64; d_out * d_hid];
@@ -1760,16 +1805,27 @@ impl<T: MPCTransport> MPCTrainer<T> {
                     let y_recon = &flat_y_recon[s * d_out..(s + 1) * d_out];
                     let target = &batch[s].1;
 
-                    let mut loss = 0.0f64;
-                    let mut dy_f64 = vec![0.0f64; d_out];
-                    let mut dy_fr = vec![Fr::ZERO; d_out];
-                    for i in 0..d_out {
-                        let y_f64 = y_recon[i].to_f64();
-                        let diff = y_f64 - target[i];
-                        loss += 0.5 * diff * diff;
-                        dy_f64[i] = diff;
-                        dy_fr[i] = Fr::from_f64(diff);
-                    }
+                    // Loss + gradient
+                    let y_f64_vec: Vec<f64> = (0..d_out).map(|i| y_recon[i].to_f64()).collect();
+                    let (loss, dy_f64, dy_fr) = if d_out > 1 {
+                        let max_y = y_f64_vec.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+                        let exp_y: Vec<f64> = y_f64_vec.iter().map(|&y| (y - max_y).exp()).collect();
+                        let sum_exp: f64 = exp_y.iter().sum();
+                        let probs: Vec<f64> = exp_y.iter().map(|&e| e / sum_exp).collect();
+                        let loss = -target.iter().zip(probs.iter())
+                            .map(|(&t, &p)| if t > 0.5 { (p.max(1e-10)).ln() } else { 0.0 })
+                            .sum::<f64>();
+                        let mut dy = vec![0.0f64; d_out];
+                        let mut dy_f = vec![Fr::ZERO; d_out];
+                        for i in 0..d_out { dy[i] = probs[i] - target[i]; dy_f[i] = Fr::from_f64(dy[i]); }
+                        (loss, dy, dy_f)
+                    } else {
+                        let sig = 1.0 / (1.0 + (-y_f64_vec[0]).exp());
+                        let t = target[0];
+                        let loss = -(t * (sig.max(1e-10)).ln() + (1.0 - t) * ((1.0 - sig).max(1e-10)).ln());
+                        let dy_val = sig - t;
+                        (loss, vec![dy_val], vec![Fr::from_f64(dy_val)])
+                    };
 
                     let mut dw2_f64 = vec![0.0f64; d_out * d_hid];
                     for i in 0..d_out {
@@ -1886,6 +1942,13 @@ impl<T: MPCTransport> MPCTrainer<T> {
         for v in avg_db1.iter_mut() { *v *= inv_b; }
         for v in avg_dw2.iter_mut() { *v *= inv_b; }
         for v in avg_db2.iter_mut() { *v *= inv_b; }
+
+        // Per-element gradient clipping at ±1.0
+        let clip = 1.0;
+        for g in avg_dw1.iter_mut() { *g = g.clamp(-clip, clip); }
+        for g in avg_db1.iter_mut() { *g = g.clamp(-clip, clip); }
+        for g in avg_dw2.iter_mut() { *g = g.clamp(-clip, clip); }
+        for g in avg_db2.iter_mut() { *g = g.clamp(-clip, clip); }
 
         // ---- Weight update (same as single-sample path) ----
         let lr_f64 = self.config.learning_rate;
@@ -2973,17 +3036,34 @@ impl<T: MPCTransport> MPCTrainer<T> {
             }
         }
 
-        // Loss = 0.5 * sum((y - target)^2). dy = y - target (public, in f64).
-        let mut loss = 0.0_f64;
-        let mut dy_f64 = vec![0.0f64; d_out];
-        let mut dy_fr = vec![Fr::ZERO; d_out];
-        for i in 0..d_out {
-            let y_f64 = y_reconstructed[i].to_f64();
-            let diff = y_f64 - target[i];
-            loss += 0.5 * diff * diff;
-            dy_f64[i] = diff;
-            dy_fr[i] = Fr::from_f64(diff);
-        }
+        // Loss + gradient computation.
+        let y_f64_vec: Vec<f64> = (0..d_out).map(|i| y_reconstructed[i].to_f64()).collect();
+        let (loss, mut dy_f64, mut dy_fr) = if d_out > 1 {
+            // Multi-class: cross-entropy with numerically stable softmax.
+            let max_y = y_f64_vec.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+            let exp_y: Vec<f64> = y_f64_vec.iter().map(|&y| (y - max_y).exp()).collect();
+            let sum_exp: f64 = exp_y.iter().sum();
+            let probs: Vec<f64> = exp_y.iter().map(|&e| e / sum_exp).collect();
+
+            let loss = -target.iter().zip(probs.iter())
+                .map(|(&t, &p)| if t > 0.5 { (p.max(1e-10)).ln() } else { 0.0 })
+                .sum::<f64>();
+
+            let mut dy = vec![0.0f64; d_out];
+            let mut dy_f = vec![Fr::ZERO; d_out];
+            for i in 0..d_out {
+                dy[i] = probs[i] - target[i];
+                dy_f[i] = Fr::from_f64(dy[i]);
+            }
+            (loss, dy, dy_f)
+        } else {
+            // Single-output: sigmoid + binary cross-entropy.
+            let sig = 1.0 / (1.0 + (-y_f64_vec[0]).exp());
+            let t = target[0];
+            let loss = -(t * (sig.max(1e-10)).ln() + (1.0 - t) * ((1.0 - sig).max(1e-10)).ln());
+            let dy_val = sig - t;
+            (loss, vec![dy_val], vec![Fr::from_f64(dy_val)])
+        };
 
         // ---- Backward pass (public gradients, matching unproved path) ----
         // Since h and dy are both PUBLIC, gradients are computed in f64.
@@ -2996,7 +3076,7 @@ impl<T: MPCTransport> MPCTrainer<T> {
             }
         }
         // db2 = dy (public)
-        let db2_f64 = dy_f64.clone();
+        let mut db2_f64 = dy_f64.clone();
 
         // dh = W2^T @ dy — dy is public, W2 is secret-shared.
         // This is share × public. Reconstruct dh.
@@ -3035,7 +3115,14 @@ impl<T: MPCTransport> MPCTrainer<T> {
             }
         }
         // db1 = dh_pre (public)
-        let db1_f64 = dh_pre_f64;
+        let mut db1_f64 = dh_pre_f64;
+
+        // Per-element gradient clipping at ±1.0
+        let clip = 1.0;
+        for g in dw1_f64.iter_mut() { *g = g.clamp(-clip, clip); }
+        for g in db1_f64.iter_mut() { *g = g.clamp(-clip, clip); }
+        for g in dw2_f64.iter_mut() { *g = g.clamp(-clip, clip); }
+        for g in db2_f64.iter_mut() { *g = g.clamp(-clip, clip); }
 
         // ---- Weight update: W -= lr * dW ----
         // Gradients are PUBLIC. Only party 0 applies the update,
@@ -3282,6 +3369,11 @@ impl<T: MPCTransport> MPCTrainer<T> {
         if index < self.w1.len() {
             self.w1[index] = Fr::add(&self.w1[index], &delta);
         }
+    }
+
+    /// Sets the learning rate (for cosine annealing / decay schedules).
+    pub fn set_learning_rate(&mut self, lr: f64) {
+        self.config.learning_rate = lr;
     }
 
     /// Returns the current weight shares for debugging/verification.

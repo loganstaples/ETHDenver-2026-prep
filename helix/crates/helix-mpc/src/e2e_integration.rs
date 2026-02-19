@@ -1207,7 +1207,13 @@ pub async fn run_party_training<T: crate::session::transport::MPCTransport + 'st
     let mut rng = ChaCha20Rng::seed_from_u64(seed.wrapping_add(party_index as u64 * 1000));
 
     let bs = config.batch_size.max(1);
+    let base_lr = config.learning_rate;
     for step in 0..num_steps {
+        // Cosine learning rate decay: starts at base_lr, smoothly decays to 0.
+        let progress = step as f64 / num_steps.max(1) as f64;
+        let decayed_lr = base_lr * 0.5 * (1.0 + (std::f64::consts::PI * progress).cos());
+        trainer.set_learning_rate(decayed_lr);
+
         // Inject cheater corruption if configured.
         if cheater_info.is_some() && step as u64 == corrupt_at_step {
             info!(
