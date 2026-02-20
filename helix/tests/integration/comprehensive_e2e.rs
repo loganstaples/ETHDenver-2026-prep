@@ -500,6 +500,7 @@ async fn run_training(
         worker_endpoints: None,
         batch_size: 1,
         on_step: None,
+        on_sub_step: None,
     };
 
     helix_mpc::e2e_integration::run_mpc_training(config)
@@ -536,6 +537,7 @@ async fn run_training_with_cheater(
         worker_endpoints: None,
         batch_size: 1,
         on_step: None,
+        on_sub_step: None,
     };
 
     helix_mpc::e2e_integration::run_mpc_training_with_cheater(config, cheater_party, corrupt_at_step)
@@ -570,6 +572,7 @@ async fn run_training_2_workers(
         worker_endpoints: None,
         batch_size: 1,
         on_step: None,
+        on_sub_step: None,
     };
 
     helix_mpc::e2e_integration::run_mpc_training(config)
@@ -1369,6 +1372,7 @@ async fn test_e2e_full_mnist_scale() -> Result<()> {
         worker_endpoints: None,
         batch_size: 1,
         on_step: None,
+        on_sub_step: None,
     };
 
     let mpc_result = helix_mpc::e2e_integration::run_mpc_training(config)
@@ -1467,6 +1471,208 @@ async fn test_e2e_full_mnist_scale() -> Result<()> {
     info!(
         elapsed_secs = start.elapsed().as_secs_f64(),
         "Test 5: Full MNIST Scale PASSED"
+    );
+    Ok(())
+}
+
+// ============================================================================
+// Test 6: Cheater Slashing 5x Reliability
+// ============================================================================
+
+/// Runs the cheater injection → MAC detection → on-chain slashing cycle 5 times
+/// with different parameters each time. Every iteration must correctly identify
+/// the cheater and slash them on-chain. This is the demo climax reliability gate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_cheater_slashing_5x_reliability() -> Result<()> {
+    init_tracing();
+    let start = Instant::now();
+    info!("=== Test 6: Cheater Slashing 5x Reliability ===");
+
+    // Each iteration varies: cheater party, corruption step, seed, MAC interval.
+    struct TrialParams {
+        cheater_party: usize,
+        corrupt_at_step: u64,
+        seed: u64,
+        mac_check_interval: u64,
+    }
+
+    let trials = [
+        TrialParams { cheater_party: 2, corrupt_at_step: 30, seed: 100, mac_check_interval: 5 },
+        TrialParams { cheater_party: 1, corrupt_at_step: 20, seed: 200, mac_check_interval: 3 },
+        TrialParams { cheater_party: 0, corrupt_at_step: 25, seed: 300, mac_check_interval: 5 },
+        TrialParams { cheater_party: 2, corrupt_at_step: 15, seed: 400, mac_check_interval: 3 },
+        TrialParams { cheater_party: 1, corrupt_at_step: 35, seed: 500, mac_check_interval: 5 },
+    ];
+
+    // Generate data once (shared across all trials).
+    let (training_data, _test_samples) = generate_mnist_data(300, 50, 42);
+
+    // Single Anvil instance for all 5 trials.
+    let anvil = AnvilInstance::start(29600).await?;
+    let _provider = Provider::<Http>::try_from(anvil.rpc_url())?;
+
+    for (trial_num, trial) in trials.iter().enumerate() {
+        info!(
+            trial = trial_num + 1,
+            cheater_party = trial.cheater_party,
+            corrupt_at_step = trial.corrupt_at_step,
+            seed = trial.seed,
+            mac_interval = trial.mac_check_interval,
+            "--- Trial {}/5 ---",
+            trial_num + 1
+        );
+
+        let trial_start = Instant::now();
+
+        // Deploy fresh V4 coordinator per trial.
+        let deployer_wallet = make_wallet(DEPLOYER_KEY);
+        let treasury = deployer_wallet.address();
+
+        let (owner_client, deploy_result) = ChainClientV4::deploy(
+            anvil.rpc_url(),
+            DEPLOYER_KEY,
+            treasury,
+            Address::zero(),
+            Some(CHAIN_ID),
+        )
+        .await
+        .with_context(|| format!("Trial {}: V4 deployment failed", trial_num + 1))?;
+
+        let coordinator_address = deploy_result.coordinator.clone();
+
+        let worker_keys = [WORKER1_KEY, WORKER2_KEY, WORKER3_KEY];
+        let mut worker_clients = Vec::new();
+        let mut worker_wallets = Vec::new();
+        for key in &worker_keys {
+            let client = ChainClientV4::new(
+                anvil.rpc_url(), key, &coordinator_address, Some(CHAIN_ID),
+            ).await?;
+            worker_clients.push(client);
+            worker_wallets.push(make_wallet(key));
+        }
+
+        // Register job and stake workers.
+        let arch_hash = keccak256(
+            format!("HELIX_ARCH:{}:{}:{}", D_IN, D_HID, D_OUT).as_bytes(),
+        );
+        let payment = U256::from(PAYMENT_WEI);
+        let stake = U256::from(STAKE_WEI);
+
+        let (receipt, job_id) = owner_client
+            .register_training_job(arch_hash, 50, 2, payment)
+            .await
+            .with_context(|| format!("Trial {}: job registration failed", trial_num + 1))?;
+        assert!(receipt.status.map(|s| s.as_u64() == 1).unwrap_or(false));
+
+        for (i, wc) in worker_clients.iter().enumerate() {
+            let receipt = wc.stake_and_join(job_id, stake).await
+                .with_context(|| format!("Trial {}: worker {} stake failed", trial_num + 1, i))?;
+            assert!(receipt.status.map(|s| s.as_u64() == 1).unwrap_or(false));
+        }
+
+        // Run MPC training with cheater injection.
+        let mpc_result = run_training_with_cheater(
+            60, // enough steps to trigger corruption
+            50,
+            trial.mac_check_interval,
+            training_data.clone(),
+            trial.seed,
+            trial.cheater_party,
+            trial.corrupt_at_step,
+        )
+        .await
+        .with_context(|| format!("Trial {}: MPC training failed", trial_num + 1))?;
+
+        // Verify cheater detected.
+        assert!(
+            mpc_result.cheater_detected.is_some(),
+            "Trial {}: cheater was NOT detected", trial_num + 1
+        );
+        let cheater_record = mpc_result.cheater_detected.as_ref().unwrap();
+        assert_eq!(
+            cheater_record.party_index, trial.cheater_party,
+            "Trial {}: wrong cheater identified (expected party {}, got {})",
+            trial_num + 1, trial.cheater_party, cheater_record.party_index
+        );
+        assert!(
+            cheater_record.detected_at_step >= trial.corrupt_at_step,
+            "Trial {}: detected at step {} but corruption was at step {}",
+            trial_num + 1, cheater_record.detected_at_step, trial.corrupt_at_step
+        );
+
+        info!(
+            trial = trial_num + 1,
+            cheater = cheater_record.party_index,
+            detected_at = cheater_record.detected_at_step,
+            "Cheater correctly identified"
+        );
+
+        // Slash on-chain.
+        let cheater_addr = worker_wallets[trial.cheater_party].address();
+        let evidence = b"mac_sigma_mismatch_pairwise_identification";
+        let step = cheater_record.detected_at_step;
+
+        let mut reporter_sigs = Vec::new();
+        for (i, wallet) in worker_wallets.iter().enumerate() {
+            if i == trial.cheater_party {
+                continue;
+            }
+            let sig = sign_mac_failure(
+                wallet,
+                U256::from(job_id),
+                U256::from(step),
+                cheater_addr,
+                evidence,
+            ).await?;
+            reporter_sigs.push(sig);
+        }
+
+        let slash_receipt = owner_client
+            .report_mac_failure(
+                job_id, step, cheater_addr,
+                evidence.to_vec(), reporter_sigs,
+            )
+            .await
+            .with_context(|| format!("Trial {}: reportMACFailure failed", trial_num + 1))?;
+
+        assert!(
+            slash_receipt.status.map(|s| s.as_u64() == 1).unwrap_or(false),
+            "Trial {}: slash tx reverted", trial_num + 1
+        );
+
+        // Verify on-chain state.
+        let worker_info = owner_client.get_worker_info(job_id, cheater_addr).await?;
+        assert!(worker_info.slashed, "Trial {}: worker not slashed on-chain", trial_num + 1);
+        assert_eq!(
+            worker_info.stake_amount, U256::zero(),
+            "Trial {}: slashed stake not zero", trial_num + 1
+        );
+        assert!(
+            !owner_client.is_active_worker(job_id, cheater_addr).await?,
+            "Trial {}: cheater still active", trial_num + 1
+        );
+
+        let active_count = owner_client.get_active_worker_count(job_id).await?;
+        assert_eq!(
+            active_count, 2,
+            "Trial {}: expected 2 active workers, got {}", trial_num + 1, active_count
+        );
+
+        // Verify reporters got bounty.
+        let report_count = owner_client.get_mac_failure_report_count(job_id).await?;
+        assert_eq!(report_count, 1, "Trial {}: no MAC failure report stored", trial_num + 1);
+
+        info!(
+            trial = trial_num + 1,
+            elapsed_secs = trial_start.elapsed().as_secs_f64(),
+            "Trial {}/5 PASSED: cheater party {} detected and slashed",
+            trial_num + 1, trial.cheater_party
+        );
+    }
+
+    info!(
+        total_secs = start.elapsed().as_secs_f64(),
+        "Test 6: ALL 5 TRIALS PASSED — cheater correctly identified and slashed every time"
     );
     Ok(())
 }

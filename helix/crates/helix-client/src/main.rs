@@ -2142,12 +2142,6 @@ async fn cmd_dashboard(args: &DashboardArgs, _cli: &Cli, mut shutdown: broadcast
         *state.model_store_address.write().await = Some(model_store.clone());
     }
 
-    // Pre-provision worker wallets for fast testnet training (skips per-job funding).
-    // Workers are derived deterministically from TESTNET_PRIVATE_KEY so they persist
-    // across restarts and stay funded.
-    #[cfg(feature = "chain")]
-    state.provision_workers(3).await;
-
     let app = dashboard::create_dashboard_router_with_state(state);
 
     let listener = tokio::net::TcpListener::bind(format!("{}:{}", args.host, args.port)).await?;

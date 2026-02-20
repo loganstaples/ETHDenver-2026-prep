@@ -474,8 +474,6 @@ pub struct DashboardState {
     pub model_weights_cache: RwLock<HashMap<String, serde_json::Value>>,
     /// SQLite persistence for training session history
     pub training_db: Option<std::sync::Arc<crate::training_db::TrainingDb>>,
-    /// Pre-provisioned worker private keys (funded at startup for fast testnet training)
-    pub worker_private_keys: RwLock<Vec<String>>,
 }
 
 impl DashboardState {
@@ -538,7 +536,6 @@ impl DashboardState {
             model_store_address: RwLock::new(None),
             model_weights_cache: RwLock::new(HashMap::new()),
             training_db,
-            worker_private_keys: RwLock::new(Vec::new()),
         }, state_update_rx)
     }
 
@@ -553,139 +550,6 @@ impl DashboardState {
         *arc.metrics.try_write().expect("no contention at init") = demo_metrics();
         *arc.events.try_write().expect("no contention at init") = demo_events();
         arc
-    }
-
-    /// Pre-provision worker wallets for fast testnet training.
-    ///
-    /// Derives deterministic worker keys from the owner's TESTNET_PRIVATE_KEY so
-    /// the same wallets are reused across dashboard restarts (and stay funded).
-    /// Funds any workers whose balance is below the minimum threshold.
-    #[cfg(feature = "chain")]
-    pub async fn provision_workers(&self, num_workers: usize) {
-        use ethers::prelude::*;
-        use sha2::{Digest, Sha256};
-        use std::str::FromStr;
-
-        let rpc_url = match self.eth_rpc_url.read().await.clone() {
-            Some(url) => url,
-            None => return,
-        };
-        let owner_key = match std::env::var("TESTNET_PRIVATE_KEY") {
-            Ok(k) => k,
-            Err(_) => return, // No testnet key — nothing to provision
-        };
-
-        let provider = match Provider::<Http>::try_from(rpc_url.as_str()) {
-            Ok(p) => p,
-            Err(e) => {
-                warn!("Worker provisioning: bad RPC URL: {}", e);
-                return;
-            }
-        };
-        let chain_id = match provider.get_chainid().await {
-            Ok(id) => id.as_u64(),
-            Err(e) => {
-                warn!("Worker provisioning: failed to get chain ID: {}", e);
-                return;
-            }
-        };
-
-        // Don't provision on Anvil — hardcoded keys are used there
-        if chain_id == 31337 {
-            return;
-        }
-
-        info!(
-            num_workers = num_workers,
-            chain_id = chain_id,
-            "Provisioning worker wallets for fast testnet training..."
-        );
-
-        // Derive deterministic worker keys from owner key
-        let mut keys = Vec::with_capacity(num_workers);
-        let mut wallets = Vec::with_capacity(num_workers);
-        for i in 0..num_workers {
-            let mut hasher = Sha256::new();
-            hasher.update(owner_key.as_bytes());
-            hasher.update(format!("helix-worker-{}", i).as_bytes());
-            let hash = hasher.finalize();
-            let key_hex = format!("0x{}", hex::encode(&hash[..]));
-            let pk = hex::encode(&hash[..]);
-            let wallet = match LocalWallet::from_str(&pk) {
-                Ok(w) => w.with_chain_id(chain_id),
-                Err(e) => {
-                    warn!("Worker provisioning: bad derived key for worker {}: {}", i, e);
-                    return;
-                }
-            };
-            info!(
-                worker = i,
-                address = %wallet.address(),
-                "Derived worker wallet"
-            );
-            wallets.push(wallet);
-            keys.push(key_hex);
-        }
-
-        // Check balances and fund underfunded workers
-        let owner_pk = owner_key.strip_prefix("0x").unwrap_or(&owner_key);
-        let owner_wallet = match LocalWallet::from_str(owner_pk) {
-            Ok(w) => w.with_chain_id(chain_id),
-            Err(e) => {
-                warn!("Worker provisioning: invalid owner key: {}", e);
-                return;
-            }
-        };
-        let signer = SignerMiddleware::new(provider.clone(), owner_wallet);
-        let min_balance = ethers::utils::parse_ether(0.15).unwrap();
-        let fund_amount = ethers::utils::parse_ether(0.25).unwrap();
-
-        for (i, wallet) in wallets.iter().enumerate() {
-            let balance = provider
-                .get_balance(wallet.address(), None)
-                .await
-                .unwrap_or_default();
-
-            if balance >= min_balance {
-                info!(
-                    worker = i,
-                    address = %wallet.address(),
-                    balance_eth = %ethers::utils::format_ether(balance),
-                    "Worker already funded"
-                );
-                continue;
-            }
-
-            info!(
-                worker = i,
-                address = %wallet.address(),
-                balance_eth = %ethers::utils::format_ether(balance),
-                fund_eth = %ethers::utils::format_ether(fund_amount),
-                "Funding worker..."
-            );
-            let tx = TransactionRequest::new()
-                .to(wallet.address())
-                .value(fund_amount);
-            match signer.send_transaction(tx, None).await {
-                Ok(pending) => {
-                    match pending.await {
-                        Ok(Some(receipt)) => {
-                            info!(
-                                worker = i,
-                                tx_hash = ?receipt.transaction_hash,
-                                "Worker funded successfully"
-                            );
-                        }
-                        Ok(None) => warn!("Worker {} funding tx dropped", i),
-                        Err(e) => warn!("Worker {} funding tx failed: {}", i, e),
-                    }
-                }
-                Err(e) => warn!("Worker {} funding send failed: {}", i, e),
-            }
-        }
-
-        *self.worker_private_keys.write().await = keys;
-        info!("Worker provisioning complete — {} workers ready", num_workers);
     }
 
     // -- Update methods for external callers --
@@ -839,6 +703,23 @@ impl Default for TrainingSessionState {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Pre-funded testnet worker keys (kept funded by the demo operator separately)
+// ---------------------------------------------------------------------------
+
+/// Hardcoded worker private keys for testnet demos. These wallets must be funded
+/// externally — the training flow assumes they already have enough ETH for staking
+/// and gas. Same idea as the Anvil keys, but for real testnets.
+#[cfg(feature = "chain")]
+const TESTNET_WORKER_KEYS: &[&str] = &[
+    "8d684f8cf3b6a00d8a4deba9c06176132056facc7a66f7d2fa8cd31127b09806",
+    "23944b2afce56b6332c0fc74a1d11ca3508ea7a9f4b821f7a710a5f95eb6f772",
+    "67fe620ca54f907b42a2585753d2aa2a902e1933a3152d8e30255e6a9f1dacd4",
+    "880a8a9b8424533bfdaa5c03dacad0ab8f32a69d6f233b9a8301bcb2741f9867",
+    "b26bf4ed563907b04f6738e33e1c5fb9b61a5097ad63859f9d4537dae3cb6012",
+    "9c1b1d65d0bb28cb85acc34215a21a94c74171952e33c3b5749d4abb186f34a4",
+];
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -1616,21 +1497,17 @@ async fn start_training_handler(
         let is_anvil = detected_chain_id == 31337;
 
         if let Ok(testnet_key) = std::env::var("TESTNET_PRIVATE_KEY") {
-            // Testnet mode: owner key from env, use pre-provisioned worker wallets
+            // Testnet mode: owner key from env, use pre-funded worker keys
             config.private_key = testnet_key;
-            let provisioned = state.worker_private_keys.read().await;
-            if provisioned.is_empty() {
-                config.worker_private_keys = Vec::new(); // Will be generated + funded by orchestrator
-                info!(chain_id = detected_chain_id, "Using TESTNET_PRIVATE_KEY, workers will be auto-funded (not pre-provisioned)");
-            } else {
-                config.worker_private_keys = provisioned[..num_workers.min(provisioned.len())]
-                    .to_vec();
-                info!(
-                    chain_id = detected_chain_id,
-                    num_keys = config.worker_private_keys.len(),
-                    "Using pre-provisioned worker wallets (already funded)"
-                );
-            }
+            config.worker_private_keys = TESTNET_WORKER_KEYS[..num_workers.min(TESTNET_WORKER_KEYS.len())]
+                .iter()
+                .map(|k| k.to_string())
+                .collect();
+            info!(
+                chain_id = detected_chain_id,
+                num_workers = config.worker_private_keys.len(),
+                "Using pre-funded testnet worker keys"
+            );
         } else if is_anvil {
             // Local Anvil demo mode: hardcoded well-known keys
             config.private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".to_string();
@@ -2680,7 +2557,10 @@ async fn inference_handler(
     // Run distributed MPC inference (each worker only sees its share)
     let pixels = req.pixels;
     let num_parties = req.num_parties;
-    let worker_keys = state.worker_private_keys.read().await.clone();
+    #[cfg(feature = "chain")]
+    let worker_keys: Vec<String> = TESTNET_WORKER_KEYS.iter().map(|k| k.to_string()).collect();
+    #[cfg(not(feature = "chain"))]
+    let worker_keys: Vec<String> = Vec::new();
     let config = crate::inference_orchestration::InferenceConfig {
         num_parties,
         job_id: session_job_id,
@@ -2876,7 +2756,10 @@ async fn model_inference_handler(
     };
 
     // Run distributed MPC inference
-    let worker_keys = state.worker_private_keys.read().await.clone();
+    #[cfg(feature = "chain")]
+    let worker_keys: Vec<String> = TESTNET_WORKER_KEYS.iter().map(|k| k.to_string()).collect();
+    #[cfg(not(feature = "chain"))]
+    let worker_keys: Vec<String> = Vec::new();
     let config = crate::inference_orchestration::InferenceConfig {
         num_parties: req.num_parties,
         job_id: None,
