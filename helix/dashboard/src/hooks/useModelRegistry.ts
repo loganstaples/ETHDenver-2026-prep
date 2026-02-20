@@ -267,7 +267,7 @@ export function useModelRegistry(): UseModelRegistryReturn {
       weightsStored: boolean;
     }) => {
       if (!isConnected || !isContractDeployed) return;
-      const scaledAccuracy = BigInt(Math.round(params.accuracy * 100));
+      const scaledAccuracy = BigInt(Math.round(params.accuracy * 10000));
       writeContract({
         address: addr,
         abi: HELIX_MODEL_STORE_ABI,

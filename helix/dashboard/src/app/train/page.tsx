@@ -2732,7 +2732,7 @@ function TrainPageInner() {
             BigInt(currentModelTokenId),
             nextVersion,
             storeResult.root_hash,
-            BigInt(Math.round((session.accuracy || 0) * 100)),
+            BigInt(Math.round((session.accuracy || 0) * 10000)),
             sessionId,
             true, // weightsStored
           ],
@@ -2860,7 +2860,7 @@ function TrainPageInner() {
 
       // Step 5: Add version
       setMintStep('adding-version');
-      const scaledAccuracy = BigInt(Math.round((session.accuracy || 0) * 100));
+      const scaledAccuracy = BigInt(Math.round((session.accuracy || 0) * 10000));
       const addVersionHash = await walletClient.writeContract({
         address: modelStoreAddress,
         abi: HELIX_MODEL_STORE_ABI,
