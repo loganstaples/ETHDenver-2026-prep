@@ -207,6 +207,18 @@ pub enum ProtocolMessage {
         checkpoints: Vec<OnChainCheckpoint>,
     },
 
+    /// Worker → Owner: per-step training progress (sent by party 0 only).
+    ///
+    /// Sent after each training step so the orchestrator can forward live
+    /// loss/accuracy updates to the dashboard instead of batching at the end.
+    StepProgress {
+        step: usize,
+        total: usize,
+        loss: f64,
+        accuracy: f64,
+        mac_ok: bool,
+    },
+
     /// Owner → Worker: run MPC inference on a single input.
     ///
     /// The worker already has weight shares (from share distribution).

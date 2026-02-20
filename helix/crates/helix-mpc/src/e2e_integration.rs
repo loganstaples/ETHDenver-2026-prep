@@ -943,6 +943,7 @@ pub async fn run_distributed_party<T: crate::session::transport::MPCTransport + 
     seed: u64,
     owner_public_key: Option<X25519PublicKey>,
     weight_layout: Option<WeightLayout>,
+    on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync>>,
 ) -> Result<PartyResult, anyhow::Error> {
     // Phase 1: Initialize with pre-decrypted shares.
     let mut trainer = MPCTrainer::new(config.clone(), transport, party_index, seed);
@@ -1027,6 +1028,9 @@ pub async fn run_distributed_party<T: crate::session::transport::MPCTransport + 
                         detected_at_step: fail_step,
                         failure_report,
                     });
+                    if let Some(ref cb) = on_step {
+                        cb(step + 1, num_steps, 0.0, 0.0, false);
+                    }
                     break;
                 }
                 Err(e) => return Err(e.into()),
@@ -1047,6 +1051,11 @@ pub async fn run_distributed_party<T: crate::session::transport::MPCTransport + 
 
         losses.push(step_result.loss);
         steps_completed += 1;
+
+        if let Some(ref cb) = on_step {
+            let acc_est = (1.0 - step_result.loss / 2.302585_f64).clamp(0.0, 1.0);
+            cb(step + 1, num_steps, step_result.loss, acc_est, true);
+        }
 
         debug!(
             party = party_index,

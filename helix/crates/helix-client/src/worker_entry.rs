@@ -826,20 +826,54 @@ impl WorkerRunner {
                 // Split existing weight shares by layout.
                 let (w1, b1, w2, b2) = weight_layout.split(&share_state.weight_share.data);
 
-                // Run distributed training.
-                let result = run_distributed_training(
-                    self.config.party_index,
-                    &mpc_bind_addr,
-                    &peer_addrs,
-                    trainer_config,
-                    w1, b1, w2, b2,
-                    training_data,
-                    num_steps,
-                    checkpoint_interval,
-                    seed,
-                    owner_public_key,
-                    weight_layout,
-                ).await?;
+                // Set up per-step progress streaming for party 0.
+                // The on_step callback sends to an unbounded channel; a concurrent
+                // task forwards those as StepProgress messages over the data channel
+                // so the orchestrator can emit live dashboard updates.
+                let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<(usize, usize, f64, f64, bool)>();
+                let on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync>> =
+                    if self.config.party_index == 0 {
+                        Some(std::sync::Arc::new(move |step, total, loss, accuracy, mac_ok| {
+                            let _ = progress_tx.send((step, total, loss, accuracy, mac_ok));
+                        }))
+                    } else {
+                        // Drop the sender so the progress forwarder's recv() returns
+                        // None immediately and doesn't block tokio::join!.
+                        drop(progress_tx);
+                        None
+                    };
+
+                // Run training and progress forwarding concurrently.
+                // tokio::join! lets us interleave the async training steps with
+                // sending progress messages over the data stream.
+                let (training_result, _) = tokio::join!(
+                    run_distributed_training(
+                        self.config.party_index,
+                        &mpc_bind_addr,
+                        &peer_addrs,
+                        trainer_config,
+                        w1, b1, w2, b2,
+                        training_data,
+                        num_steps,
+                        checkpoint_interval,
+                        seed,
+                        owner_public_key,
+                        weight_layout,
+                        on_step,
+                    ),
+                    async {
+                        // Forward per-step progress to the orchestrator via the data channel.
+                        // Only party 0 sends StepProgress; other parties' channels close immediately.
+                        while let Some((step, total, loss, accuracy, mac_ok)) = progress_rx.recv().await {
+                            let msg = ProtocolMessage::StepProgress { step, total, loss, accuracy, mac_ok };
+                            if send_message(&mut data_stream, &msg).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                );
+
+                let result = training_result?;
 
                 // Send result back over data channel.
                 // Strip per-element commitments from checkpoint party_shares to
@@ -1392,6 +1426,7 @@ async fn run_distributed_training(
     seed: u64,
     owner_public_key: [u8; 32],
     weight_layout: helix_mpc::e2e_integration::WeightLayout,
+    on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync>>,
 ) -> Result<helix_mpc::e2e_integration::PartyResult> {
     use std::collections::HashMap;
     use std::net::SocketAddr;
@@ -1443,6 +1478,7 @@ async fn run_distributed_training(
         seed,
         Some(owner_pk),
         Some(weight_layout),
+        on_step,
     ).await
 }
 
@@ -1463,6 +1499,7 @@ async fn run_distributed_training(
     _seed: u64,
     _owner_public_key: [u8; 32],
     _weight_layout: helix_mpc::e2e_integration::WeightLayout,
+    _on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync>>,
 ) -> Result<helix_mpc::e2e_integration::PartyResult> {
     Err(anyhow!("Distributed training requires the 'network-mpc' feature"))
 }

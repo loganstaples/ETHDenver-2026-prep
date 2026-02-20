@@ -1155,6 +1155,9 @@ impl FullOrchestrator {
         info!("StartDistributedTraining sent to all {} workers", num_workers);
 
         // Collect results from all workers.
+        // Worker 0 sends StepProgress messages during training (for live dashboard
+        // updates) followed by DistributedTrainingResult. Other workers only send
+        // the final result.
         let mut all_encrypted_shares = Vec::with_capacity(num_workers);
         let mut all_losses = Vec::new();
         let mut total_steps = 0;
@@ -1163,8 +1166,25 @@ impl FullOrchestrator {
         let mut all_checkpoints = Vec::new();
 
         for (i, (_party_id, stream)) in dist_result.worker_streams.iter_mut().enumerate() {
-            let result_msg = recv_message(stream).await
-                .map_err(|e| anyhow!("Failed to receive result from worker {}: {}", i, e))?;
+            // Worker 0: read StepProgress messages until we get the final result.
+            // This streams live loss/accuracy to the dashboard via WebSocket.
+            let result_msg = if i == 0 {
+                loop {
+                    let msg = recv_message(stream).await
+                        .map_err(|e| anyhow!("Failed to receive message from worker 0: {}", e))?;
+                    match msg {
+                        ProtocolMessage::StepProgress { step, total, loss, accuracy, mac_ok } => {
+                            self.emit(ProgressEvent::TrainingStep {
+                                step, total, loss, accuracy, mac_ok,
+                            });
+                        }
+                        other => break other,
+                    }
+                }
+            } else {
+                recv_message(stream).await
+                    .map_err(|e| anyhow!("Failed to receive result from worker {}: {}", i, e))?
+            };
 
             match result_msg {
                 ProtocolMessage::DistributedTrainingResult {
@@ -1189,18 +1209,6 @@ impl FullOrchestrator {
                     );
 
                     if i == 0 {
-                        // Emit per-step progress immediately so the dashboard
-                        // shows live updates instead of jumping from 0% to 100%.
-                        for (step_idx, step_loss) in losses.iter().enumerate() {
-                            let acc_est = (1.0 - step_loss / 2.302585_f64).clamp(0.0, 1.0);
-                            self.emit(ProgressEvent::TrainingStep {
-                                step: step_idx + 1,
-                                total: self.config.num_steps,
-                                loss: *step_loss,
-                                accuracy: acc_est,
-                                mac_ok: true,
-                            });
-                        }
                         all_losses = losses;
                         total_steps = steps_completed;
                         total_mac_checks = mac_checks_passed;
