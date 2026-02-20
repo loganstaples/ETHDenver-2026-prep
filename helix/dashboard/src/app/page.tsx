@@ -18,7 +18,10 @@ import {
   DollarSign,
   Store,
   Star,
+  Copy,
+  CheckCircle,
 } from 'lucide-react';
+import { useAccount } from 'wagmi';
 import { Card } from '@/components/ui/Card';
 import { Badge } from '@/components/ui/Badge';
 import { EmptyState } from '@/components/ui/EmptyState';
@@ -381,10 +384,116 @@ function BuyConfirmationModal({
 }
 
 // ============================================================================
+// Rating Modal
+// ============================================================================
+
+function RatingModal({
+  model,
+  onSubmit,
+  onCancel,
+}: {
+  model: PublicModel;
+  onSubmit: (rating: number) => void;
+  onCancel: () => void;
+}) {
+  const [hoveredStar, setHoveredStar] = useState(0);
+  const [selectedStar, setSelectedStar] = useState(0);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  const handleSubmit = async () => {
+    if (selectedStar === 0) return;
+    setIsSubmitting(true);
+    onSubmit(selectedStar);
+  };
+
+  const displayRating = hoveredStar || selectedStar;
+
+  return (
+    <motion.div
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+      onClick={(e) => { if (e.target === e.currentTarget && !isSubmitting) onCancel(); }}
+    >
+      <motion.div
+        initial={{ scale: 0.95, opacity: 0 }}
+        animate={{ scale: 1, opacity: 1 }}
+        exit={{ scale: 0.95, opacity: 0 }}
+        className="bg-helix-card border border-helix-border rounded-xl p-6 max-w-sm w-full mx-4 shadow-2xl"
+      >
+        <div className="flex items-center gap-3 mb-4">
+          <div className="w-10 h-10 rounded-lg bg-yellow-500/10 flex items-center justify-center">
+            <Star size={20} className="text-yellow-400" />
+          </div>
+          <div>
+            <h3 className="text-lg font-medium text-white">Rate Model</h3>
+            <p className="text-2xs text-helix-muted">{model.name}</p>
+          </div>
+        </div>
+
+        <div className="flex items-center justify-center gap-2 py-6">
+          {Array.from({ length: 5 }, (_, i) => {
+            const starNum = i + 1;
+            const isFilled = starNum <= displayRating;
+            return (
+              <button
+                key={i}
+                type="button"
+                onMouseEnter={() => setHoveredStar(starNum)}
+                onMouseLeave={() => setHoveredStar(0)}
+                onClick={() => setSelectedStar(starNum)}
+                className="transition-transform hover:scale-110"
+              >
+                <Star
+                  size={32}
+                  className={cn(
+                    'transition-colors',
+                    isFilled ? 'text-yellow-400 fill-yellow-400' : 'text-white/20',
+                  )}
+                />
+              </button>
+            );
+          })}
+        </div>
+
+        <p className="text-center text-sm text-helix-muted mb-4">
+          {displayRating === 0 ? 'Select a rating' : `${displayRating} / 5`}
+        </p>
+
+        <div className="flex items-center gap-3">
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={isSubmitting}
+            className="flex-1 px-4 py-2.5 rounded-lg bg-helix-surface border border-helix-border text-sm text-helix-text hover:text-white transition-colors disabled:opacity-50"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={handleSubmit}
+            disabled={selectedStar === 0 || isSubmitting}
+            className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg bg-yellow-600 hover:bg-yellow-500 text-white text-sm font-medium transition-colors disabled:opacity-50"
+          >
+            {isSubmitting ? (
+              <Loader2 size={14} className="animate-spin" />
+            ) : (
+              <Star size={14} />
+            )}
+            Submit Rating
+          </button>
+        </div>
+      </motion.div>
+    </motion.div>
+  );
+}
+
+// ============================================================================
 // Public Model Card (Inference Mode)
 // ============================================================================
 
-function InferenceModelCard({ model, isOwner }: { model: PublicModel; isOwner: boolean }) {
+function InferenceModelCard({ model, isOwner, onRate }: { model: PublicModel; isOwner: boolean; onRate: (model: PublicModel) => void }) {
   const tags = useMemo(() => getModelTags(model), [model]);
   const qualityScore = useMemo(() => computeQualityScore(model), [model]);
 
@@ -463,7 +572,10 @@ function InferenceModelCard({ model, isOwner }: { model: PublicModel; isOwner: b
             <p className="text-2xs text-helix-muted">Inference Fee</p>
             <p className="text-lg font-mono font-light text-white">{formatFee(model.inferenceFee)}</p>
           </div>
-          <div className="bg-helix-bg rounded-md px-3 py-2 text-center">
+          <div
+            className="bg-helix-bg rounded-md px-3 py-2 text-center cursor-pointer hover:bg-white/[0.06] transition-colors"
+            onClick={(e) => { e.preventDefault(); e.stopPropagation(); onRate(model); }}
+          >
             <p className="text-2xs text-helix-muted">Rating</p>
             <div className="flex justify-center mt-1">
               <RatingStars rating={model.averageRating} count={model.ratingCount} />
@@ -490,6 +602,40 @@ function InferenceModelCard({ model, isOwner }: { model: PublicModel; isOwner: b
 }
 
 // ============================================================================
+// Contact Owner Button (copies address to clipboard)
+// ============================================================================
+
+function ContactOwnerButton({ ownerAddress }: { ownerAddress: string }) {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = () => {
+    navigator.clipboard.writeText(ownerAddress);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  return (
+    <button
+      type="button"
+      onClick={handleCopy}
+      className="flex items-center gap-2 px-4 py-2 rounded-lg bg-helix-surface border border-helix-border text-sm text-helix-text hover:text-white hover:border-helix-border2 transition-colors"
+    >
+      {copied ? (
+        <>
+          <CheckCircle size={14} className="text-green-400" />
+          <span className="text-green-400">Copied!</span>
+        </>
+      ) : (
+        <>
+          <Copy size={14} />
+          Copy Owner Address
+        </>
+      )}
+    </button>
+  );
+}
+
+// ============================================================================
 // Marketplace Model Card
 // ============================================================================
 
@@ -497,10 +643,12 @@ function MarketplaceModelCard({
   model,
   isOwner,
   onBuy,
+  onRate,
 }: {
   model: PublicModel;
   isOwner: boolean;
   onBuy: (model: PublicModel) => void;
+  onRate: (model: PublicModel) => void;
 }) {
   const tags = useMemo(() => getModelTags(model), [model]);
   const qualityScore = useMemo(() => computeQualityScore(model), [model]);
@@ -593,7 +741,10 @@ function MarketplaceModelCard({
             {model.inferenceCount > 0 ? model.inferenceCount : '--'}
           </p>
         </div>
-        <div className="bg-helix-bg rounded-md px-3 py-2 text-center">
+        <div
+          className="bg-helix-bg rounded-md px-3 py-2 text-center cursor-pointer hover:bg-white/[0.06] transition-colors"
+          onClick={() => onRate(model)}
+        >
           <p className="text-2xs text-helix-muted">Rating</p>
           <div className="flex justify-center mt-1">
             <RatingStars rating={model.averageRating} count={model.ratingCount} />
@@ -617,10 +768,7 @@ function MarketplaceModelCard({
           </button>
         )}
         {!isOwner && isContactOwner && (
-          <span className="flex items-center gap-2 px-4 py-2 rounded-lg bg-helix-surface border border-helix-border text-sm text-helix-text">
-            <User size={14} />
-            Contact Owner
-          </span>
+          <ContactOwnerButton ownerAddress={model.owner} />
         )}
         <Link
           href={`/models/${model.tokenId}`}
@@ -651,6 +799,9 @@ export default function ModelsPage() {
   const [sort, setSort] = useState<SortOption>('newest');
   const [categoryFilter, setCategoryFilter] = useState<string | null>(null);
   const [buyingModel, setBuyingModel] = useState<PublicModel | null>(null);
+  const [ratingModel, setRatingModel] = useState<PublicModel | null>(null);
+
+  const { address: walletAddress, isConnected: isWalletConnected } = useAccount();
 
   const {
     address,
@@ -658,6 +809,7 @@ export default function ModelsPage() {
     isContractDeployed,
     allModels,
     isLoading,
+    refetch,
   } = usePublicModels();
 
   const {
@@ -759,6 +911,29 @@ export default function ModelsPage() {
       setBuyingModel(null);
     }
   }, [isWritePending, isConfirming]);
+
+  // Handle rating
+  const handleRateClick = useCallback((model: PublicModel) => {
+    if (!isWalletConnected) return;
+    setRatingModel(model);
+  }, [isWalletConnected]);
+
+  const handleRateSubmit = useCallback(async (rating: number) => {
+    if (!ratingModel || !walletAddress) return;
+    try {
+      const res = await fetch(`/api/models/${ratingModel.tokenId}/rate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ wallet: walletAddress, rating }),
+      });
+      if (res.ok) {
+        refetch();
+      }
+    } catch {
+      // best-effort
+    }
+    setRatingModel(null);
+  }, [ratingModel, walletAddress, refetch]);
 
   return (
     <motion.div
@@ -929,12 +1104,14 @@ export default function ModelsPage() {
                   model={model}
                   isOwner={isOwner}
                   onBuy={handleBuyClick}
+                  onRate={handleRateClick}
                 />
               ) : (
                 <InferenceModelCard
                   key={model.tokenId}
                   model={model}
                   isOwner={isOwner}
+                  onRate={handleRateClick}
                 />
               );
             })}
@@ -951,6 +1128,17 @@ export default function ModelsPage() {
             onCancel={handleBuyCancel}
             isPending={isWritePending}
             isConfirming={isConfirming}
+          />
+        )}
+      </AnimatePresence>
+
+      {/* Rating Modal */}
+      <AnimatePresence>
+        {ratingModel && (
+          <RatingModal
+            model={ratingModel}
+            onSubmit={handleRateSubmit}
+            onCancel={() => setRatingModel(null)}
           />
         )}
       </AnimatePresence>

@@ -7,7 +7,7 @@ interface RelayEntry {
   createdAt: number;
 }
 
-// In-memory relay store (auto-clears after fetch or timeout)
+// In-memory relay store (auto-clears after timeout)
 const relay = new Map<string, RelayEntry>();
 const RELAY_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
 
@@ -57,7 +57,7 @@ export async function POST(
   }
 }
 
-/** GET: Buyer picks up decrypted weights (one-time fetch, then cleared) */
+/** GET: Buyer fetches decrypted weights (does NOT auto-delete — buyer calls DELETE after confirming upload) */
 export async function GET(
   req: NextRequest,
   { params }: { params: Promise<{ tokenId: string }> },
@@ -81,15 +81,42 @@ export async function GET(
       return NextResponse.json({ error: 'Not authorized — buyer address mismatch' }, { status: 403 });
     }
 
-    // One-time fetch: return weights and clear
-    const weights = entry.weights;
-    relay.delete(tokenId);
-
     return NextResponse.json({
       status: 'retrieved',
-      weights,
+      weights: entry.weights,
       tokenId,
     });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Unknown error';
+    return NextResponse.json({ error: message }, { status: 500 });
+  }
+}
+
+/** DELETE: Buyer confirms upload succeeded, clear relay entry */
+export async function DELETE(
+  req: NextRequest,
+  { params }: { params: Promise<{ tokenId: string }> },
+) {
+  try {
+    const { tokenId } = await params;
+    const url = new URL(req.url);
+    const buyerAddress = url.searchParams.get('buyer')?.toLowerCase();
+
+    if (!buyerAddress) {
+      return NextResponse.json({ error: 'buyer query param is required' }, { status: 400 });
+    }
+
+    const entry = relay.get(tokenId);
+    if (!entry) {
+      return NextResponse.json({ status: 'already_cleared' });
+    }
+
+    if (entry.buyerAddress !== buyerAddress) {
+      return NextResponse.json({ error: 'Not authorized — buyer address mismatch' }, { status: 403 });
+    }
+
+    relay.delete(tokenId);
+    return NextResponse.json({ status: 'cleared', tokenId });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Unknown error';
     return NextResponse.json({ error: message }, { status: 500 });

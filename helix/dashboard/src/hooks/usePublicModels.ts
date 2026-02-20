@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo } from 'react';
+import { useMemo, useState, useEffect, useCallback } from 'react';
 import {
   useAccount,
   useReadContract,
@@ -220,13 +220,49 @@ export function usePublicModels() {
     return result;
   }, [modelDataResults, tokenIds]);
 
-  const allModels = chainModels;
+  // ── Fetch stats from in-memory store ─────────────────────────────
+  const [stats, setStats] = useState<Record<string, { inferenceCount: number; averageRating: number; ratingCount: number }>>({});
+
+  const fetchStats = useCallback(async () => {
+    try {
+      const res = await fetch('/api/models/stats');
+      if (res.ok) {
+        setStats(await res.json());
+      }
+    } catch {
+      // stats are best-effort
+    }
+  }, []);
+
+  // Fetch on mount and whenever chain models change
+  useEffect(() => {
+    if (chainModels.length > 0) {
+      fetchStats();
+    }
+  }, [chainModels.length, fetchStats]);
+
+  // Merge real stats into models
+  const allModels = useMemo(() => {
+    if (Object.keys(stats).length === 0) return chainModels;
+    return chainModels.map((m) => {
+      const s = stats[String(m.tokenId)];
+      if (!s) return m;
+      return {
+        ...m,
+        inferenceCount: s.inferenceCount,
+        averageRating: s.averageRating,
+        ratingCount: s.ratingCount,
+      };
+    });
+  }, [chainModels, stats]);
+
   const isLoading = isLoadingSupply || isLoadingTokenIds || isLoadingModelData;
 
-  const refetch = () => {
+  const refetch = useCallback(() => {
     refetchSupply();
     refetchModelData();
-  };
+    fetchStats();
+  }, [refetchSupply, refetchModelData, fetchStats]);
 
   return {
     address,

@@ -22,6 +22,7 @@ import {
   Loader2,
   XCircle,
   ArrowRightLeft,
+  Download,
 } from 'lucide-react';
 import { Badge } from '@/components/ui/Badge';
 import { Card } from '@/components/ui/Card';
@@ -561,6 +562,66 @@ function PendingTransferCard({
 }
 
 // ============================================================================
+// Claim Weights Card (buyer re-encrypts after transfer)
+// ============================================================================
+
+const SENTINEL_HASH = 'pending-buyer-reencrypt';
+
+function ClaimWeightsCard({
+  model,
+  onClaim,
+  isClaiming,
+}: {
+  model: NonNullable<ReturnType<typeof useModelDetail>['model']>;
+  onClaim: () => void;
+  isClaiming: boolean;
+}) {
+  const latestVersion = model.versions[model.versions.length - 1];
+  const needsClaim = latestVersion?.rootHash === SENTINEL_HASH;
+
+  if (!needsClaim) return null;
+
+  return (
+    <Card variant="default" className="border-blue-500/20">
+      <div className="flex items-center gap-2 mb-3">
+        <Download size={14} className="text-blue-400" />
+        <h3 className="text-sm font-semibold text-blue-400">Claim Purchased Weights</h3>
+      </div>
+
+      <p className="text-2xs text-helix-muted mb-4">
+        The seller has transferred this model to you. Claim the weights to re-encrypt them
+        with your wallet key and upload to 0G. Until you claim, the weights are temporarily
+        held on the server relay.
+      </p>
+
+      <button
+        type="button"
+        onClick={onClaim}
+        disabled={isClaiming}
+        className={cn(
+          'flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm font-medium transition-colors w-full',
+          isClaiming
+            ? 'bg-helix-border text-helix-muted cursor-not-allowed'
+            : 'bg-blue-500/20 text-blue-400 hover:bg-blue-500/30',
+        )}
+      >
+        {isClaiming ? (
+          <>
+            <Loader2 size={14} className="animate-spin" />
+            Claiming & Re-encrypting...
+          </>
+        ) : (
+          <>
+            <Download size={14} />
+            Claim & Re-encrypt Weights
+          </>
+        )}
+      </button>
+    </Card>
+  );
+}
+
+// ============================================================================
 // Main Page
 // ============================================================================
 
@@ -643,6 +704,7 @@ export default function ModelDetailPage() {
   const [isEnablingInference, setIsEnablingInference] = useState(false);
   const [isDisablingInference, setIsDisablingInference] = useState(false);
   const [isCompletingTransfer, setIsCompletingTransfer] = useState(false);
+  const [isClaimingWeights, setIsClaimingWeights] = useState(false);
   const [inferenceError, setInferenceError] = useState<string | null>(null);
 
   // ── Handlers ────────────────────────────────────────────────────────
@@ -749,7 +811,7 @@ export default function ModelDetailPage() {
         weightsJson = JSON.stringify(result.data);
       }
 
-      // Step 3: Send to transfer relay
+      // Step 3: Send plaintext weights to transfer relay for buyer pickup
       const relayRes = await fetch(`/api/models/${model.tokenId}/transfer-relay`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -765,42 +827,15 @@ export default function ModelDetailPage() {
         throw new Error(errBody.error || `Transfer relay failed: HTTP ${relayRes.status}`);
       }
 
-      const relayResult = await relayRes.json();
-
-      // Step 4: Re-encrypt under buyer's key and re-upload to 0G
-      // The relay returns the re-encrypted payload root hash
-      const newRootHash = relayResult.newRootHash || relayResult.root_hash;
-
-      if (!newRootHash) {
-        // If relay did not handle re-encryption, do it client-side
-        const sessionId = `transfer-${model.tokenId}-${Date.now()}`;
-        const storeResult = await encryptAndStoreWeights(
-          sessionId,
-          weightsJson,
-          async (data: string) => {
-            // Re-encrypt with buyer context (the relay should ideally handle this)
-            // For now, re-encrypt with the same key as a placeholder
-            return encryptWeights(key, data);
-          },
-          latestVersion.semver,
-        );
-
-        // Step 5: Complete transfer on-chain
-        writeContract({
-          address: addr,
-          abi: HELIX_MODEL_STORE_ABI,
-          functionName: 'completeTransfer',
-          args: [BigInt(model.tokenId), storeResult.root_hash],
-        });
-      } else {
-        // Step 5: Complete transfer on-chain with relay-provided hash
-        writeContract({
-          address: addr,
-          abi: HELIX_MODEL_STORE_ABI,
-          functionName: 'completeTransfer',
-          args: [BigInt(model.tokenId), newRootHash],
-        });
-      }
+      // Step 4: Complete transfer on-chain with sentinel hash
+      // The buyer will re-encrypt and update the root hash after claiming
+      const SENTINEL_HASH = 'pending-buyer-reencrypt';
+      writeContract({
+        address: addr,
+        abi: HELIX_MODEL_STORE_ABI,
+        functionName: 'completeTransfer',
+        args: [BigInt(model.tokenId), SENTINEL_HASH],
+      });
     } catch (err) {
       setInferenceError(err instanceof Error ? err.message : 'Transfer failed');
       setTimeout(() => setInferenceError(null), 5000);
@@ -818,6 +853,61 @@ export default function ModelDetailPage() {
       args: [BigInt(model.tokenId)],
     });
   }, [model, addr, writeContract]);
+
+  // ── Claim weights (buyer re-encrypts after purchase) ──────────────
+  const handleClaimWeights = useCallback(async () => {
+    if (!model || !signMessageAsync || !address) return;
+    setIsClaimingWeights(true);
+    setInferenceError(null);
+    try {
+      // Step 1: Fetch plaintext weights from relay
+      const relayRes = await fetch(
+        `/api/models/${model.tokenId}/transfer-relay?buyer=${address.toLowerCase()}`,
+      );
+      if (!relayRes.ok) {
+        const errBody = await relayRes.json().catch(() => ({}));
+        throw new Error(errBody.error || `Relay fetch failed: HTTP ${relayRes.status}`);
+      }
+      const relayData = await relayRes.json();
+      const weightsJson = JSON.stringify(relayData.weights);
+
+      // Step 2: Derive buyer's own key
+      const buyerKey = await deriveModelKey(
+        (message: string) => signMessageAsync({ message }),
+        model.tokenId,
+      );
+
+      // Step 3: Encrypt with buyer's key and upload to 0G
+      const sessionId = `claim-${model.tokenId}-${Date.now()}`;
+      const latestVersion = model.versions[model.versions.length - 1];
+      const storeResult = await encryptAndStoreWeights(
+        sessionId,
+        weightsJson,
+        async (data: string) => encryptWeights(buyerKey, data),
+        latestVersion?.semver,
+      );
+
+      // Step 4: Update root hash on-chain
+      const versionIndex = model.versions.length - 1;
+      writeContract({
+        address: addr,
+        abi: HELIX_MODEL_STORE_ABI,
+        functionName: 'updateVersionRootHash',
+        args: [BigInt(model.tokenId), BigInt(versionIndex), storeResult.root_hash],
+      });
+
+      // Step 5: Clear relay entry
+      await fetch(
+        `/api/models/${model.tokenId}/transfer-relay?buyer=${address.toLowerCase()}`,
+        { method: 'DELETE' },
+      );
+    } catch (err) {
+      setInferenceError(err instanceof Error ? err.message : 'Claim failed');
+      setTimeout(() => setInferenceError(null), 5000);
+    } finally {
+      setIsClaimingWeights(false);
+    }
+  }, [model, signMessageAsync, address, addr, writeContract]);
 
   // Loading
   if (isLoading) {
@@ -959,6 +1049,15 @@ export default function ModelDetailPage() {
           isCancellingSale={isWritePending || isConfirming}
           onCompleteTransfer={handleCompleteTransfer}
           onCancelSale={handleCancelSale}
+        />
+      )}
+
+      {/* Claim Weights Card (buyer re-encrypts after purchase) */}
+      {isOwner && (
+        <ClaimWeightsCard
+          model={model}
+          onClaim={handleClaimWeights}
+          isClaiming={isClaimingWeights || isWritePending || isConfirming}
         />
       )}
 

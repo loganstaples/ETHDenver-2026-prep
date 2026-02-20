@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getWeightsForInference } from '@/lib/inference-cache';
+import { incrementInferenceCount } from '@/lib/model-stats';
 
 /**
  * Run inference on cached model weights.
@@ -34,6 +35,9 @@ export async function POST(
 
     // Simple forward pass for MNIST-style networks (784 → hidden → 10)
     const prediction = runForwardPass(weights, input);
+
+    // Track inference count for marketplace stats
+    incrementInferenceCount(tokenId);
 
     return NextResponse.json({
       prediction: prediction.label,
