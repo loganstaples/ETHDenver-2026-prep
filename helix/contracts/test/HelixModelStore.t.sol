@@ -20,6 +20,9 @@ contract HelixModelStoreTest is Test {
     event SalePriceChanged(uint256 indexed tokenId, uint256 price);
     event ModelSold(uint256 indexed tokenId, address indexed seller, address indexed buyer, uint256 price);
     event InferencePaid(uint256 indexed tokenId, address indexed payer, uint256 nonce, uint256 amount, uint256 ownerShare);
+    event TransferInitiated(uint256 indexed tokenId, address indexed seller, address indexed buyer, uint256 price, uint40 deadline);
+    event TransferCompleted(uint256 indexed tokenId, address indexed seller, address indexed buyer, string newRootHash);
+    event TransferCancelled(uint256 indexed tokenId, address indexed cancelledBy);
 
     function setUp() public {
         store = new HelixModelStore();
@@ -671,23 +674,35 @@ contract HelixModelStoreTest is Test {
     // buyModel
     // -------------------------------------------------------
 
-    function test_buyModel_transfersAndPays() public {
+    function test_buyModel_escrowsPayment() public {
         vm.startPrank(alice);
         uint256 tokenId = store.createModel("buy-1", "Buy 1", "", "");
         store.setForSale(tokenId, true);
         store.setSalePrice(tokenId, 1 ether);
         vm.stopPrank();
 
-        uint256 aliceBalBefore = alice.balance;
+        uint256 bobBalBefore = bob.balance;
+        uint256 contractBalBefore = address(store).balance;
 
         vm.prank(bob);
         store.buyModel{value: 1 ether}(tokenId);
 
-        assertEq(store.ownerOf(tokenId), bob);
-        assertEq(alice.balance, aliceBalBefore + 1 ether);
+        // NFT should still belong to alice (escrowed, not transferred yet)
+        assertEq(store.ownerOf(tokenId), alice);
+        // Bob's balance decreased
+        assertEq(bob.balance, bobBalBefore - 1 ether);
+        // Contract holds the escrow
+        assertEq(address(store).balance, contractBalBefore + 1 ether);
+        // Model delisted
+        assertFalse(store.isForSale(tokenId));
+        // Pending transfer recorded
+        (address buyer, uint256 payment, uint40 deadline) = store.pendingTransfers(tokenId);
+        assertEq(buyer, bob);
+        assertEq(payment, 1 ether);
+        assertTrue(deadline > block.timestamp);
     }
 
-    function test_buyModel_clearsListing() public {
+    function test_buyModel_delistsWhilePending() public {
         vm.startPrank(alice);
         uint256 tokenId = store.createModel("buy-clear", "Buy Clear", "", "");
         store.setForSale(tokenId, true);
@@ -698,7 +713,6 @@ contract HelixModelStoreTest is Test {
         store.buyModel{value: 1 ether}(tokenId);
 
         assertFalse(store.isForSale(tokenId));
-        assertEq(store.salePrice(tokenId), 0);
     }
 
     function test_buyModel_revertsNotForSale() public {
@@ -733,16 +747,35 @@ contract HelixModelStoreTest is Test {
         vm.stopPrank();
     }
 
-    function test_buyModel_emitsEvent() public {
+    function test_buyModel_emitsTransferInitiated() public {
         vm.startPrank(alice);
         uint256 tokenId = store.createModel("buy-evt", "Buy Evt", "", "");
         store.setForSale(tokenId, true);
         store.setSalePrice(tokenId, 1 ether);
         vm.stopPrank();
 
+        uint40 expectedDeadline = uint40(block.timestamp) + store.TRANSFER_DEADLINE_DURATION();
+
         vm.prank(bob);
         vm.expectEmit(true, true, true, true);
-        emit ModelSold(tokenId, alice, bob, 1 ether);
+        emit TransferInitiated(tokenId, alice, bob, 1 ether, expectedDeadline);
+        store.buyModel{value: 1 ether}(tokenId);
+    }
+
+    function test_buyModel_revertsIfAlreadyPending() public {
+        vm.startPrank(alice);
+        uint256 tokenId = store.createModel("escrow-dup", "Dup", "", "");
+        store.setForSale(tokenId, true);
+        store.setSalePrice(tokenId, 1 ether);
+        vm.stopPrank();
+
+        vm.prank(bob);
+        store.buyModel{value: 1 ether}(tokenId);
+
+        // isForSale is cleared by the first buyModel, so second call hits that check first
+        vm.deal(charlie, 10 ether);
+        vm.prank(charlie);
+        vm.expectRevert("Model not for sale");
         store.buyModel{value: 1 ether}(tokenId);
     }
 
@@ -927,5 +960,166 @@ contract HelixModelStoreTest is Test {
     function test_tokenURI_revertsForNonexistent() public {
         vm.expectRevert();
         store.tokenURI(999);
+    }
+
+    // -------------------------------------------------------
+    // Escrow Transfer (buyModel → completeTransfer)
+    // -------------------------------------------------------
+
+    function test_completeTransfer_transfersNFTAndPays() public {
+        vm.startPrank(alice);
+        uint256 tokenId = store.createModel("comp-1", "Complete", "", "");
+        store.addVersion(tokenId, "1.0.0", "0xoldHash", 9500, "sess-1", true);
+        store.setForSale(tokenId, true);
+        store.setSalePrice(tokenId, 1 ether);
+        vm.stopPrank();
+
+        vm.prank(bob);
+        store.buyModel{value: 1 ether}(tokenId);
+
+        uint256 aliceBalBefore = alice.balance;
+
+        vm.prank(alice);
+        store.completeTransfer(tokenId, "0xnewHashForBuyer");
+
+        // NFT transferred to bob
+        assertEq(store.ownerOf(tokenId), bob);
+        // Alice got paid
+        assertEq(alice.balance, aliceBalBefore + 1 ether);
+        // Pending transfer cleared
+        (address buyer, , ) = store.pendingTransfers(tokenId);
+        assertEq(buyer, address(0));
+        // Root hash updated
+        HelixModelStore.Version memory v = store.getVersion(tokenId, 0);
+        assertEq(v.rootHash, "0xnewHashForBuyer");
+    }
+
+    function test_completeTransfer_revertsIfNotSeller() public {
+        vm.startPrank(alice);
+        uint256 tokenId = store.createModel("comp-auth", "Auth", "", "");
+        store.setForSale(tokenId, true);
+        store.setSalePrice(tokenId, 1 ether);
+        vm.stopPrank();
+
+        vm.prank(bob);
+        store.buyModel{value: 1 ether}(tokenId);
+
+        vm.prank(bob);
+        vm.expectRevert("Only seller can complete");
+        store.completeTransfer(tokenId, "0xhash");
+    }
+
+    function test_completeTransfer_revertsIfNoPending() public {
+        vm.startPrank(alice);
+        uint256 tokenId = store.createModel("comp-none", "None", "", "");
+        vm.stopPrank();
+
+        vm.prank(alice);
+        vm.expectRevert("No pending transfer");
+        store.completeTransfer(tokenId, "0xhash");
+    }
+
+    function test_cancelSale_sellerCanCancelAnytime() public {
+        vm.startPrank(alice);
+        uint256 tokenId = store.createModel("cancel-1", "Cancel", "", "");
+        store.setForSale(tokenId, true);
+        store.setSalePrice(tokenId, 1 ether);
+        vm.stopPrank();
+
+        uint256 bobBalBefore = bob.balance;
+        vm.prank(bob);
+        store.buyModel{value: 1 ether}(tokenId);
+
+        vm.prank(alice);
+        store.cancelSale(tokenId);
+
+        // Bob refunded
+        assertEq(bob.balance, bobBalBefore);
+        // NFT still with alice
+        assertEq(store.ownerOf(tokenId), alice);
+        // Pending cleared
+        (address buyer, , ) = store.pendingTransfers(tokenId);
+        assertEq(buyer, address(0));
+    }
+
+    function test_cancelSale_buyerCanCancelAfterDeadline() public {
+        vm.startPrank(alice);
+        uint256 tokenId = store.createModel("cancel-dl", "Deadline", "", "");
+        store.setForSale(tokenId, true);
+        store.setSalePrice(tokenId, 1 ether);
+        vm.stopPrank();
+
+        vm.prank(bob);
+        store.buyModel{value: 1 ether}(tokenId);
+
+        // Buyer can't cancel before deadline
+        vm.prank(bob);
+        vm.expectRevert("Not authorized to cancel");
+        store.cancelSale(tokenId);
+
+        // Advance past deadline (24 hours)
+        vm.warp(block.timestamp + 24 hours + 1);
+
+        uint256 bobBalBefore = bob.balance;
+        vm.prank(bob);
+        store.cancelSale(tokenId);
+
+        assertEq(bob.balance, bobBalBefore + 1 ether);
+        assertEq(store.ownerOf(tokenId), alice);
+    }
+
+    function test_cancelSale_revertsIfNoPending() public {
+        vm.startPrank(alice);
+        uint256 tokenId = store.createModel("cancel-none", "None", "", "");
+        vm.stopPrank();
+
+        vm.prank(alice);
+        vm.expectRevert("No pending transfer");
+        store.cancelSale(tokenId);
+    }
+
+    function test_completeTransfer_emitsEvent() public {
+        vm.startPrank(alice);
+        uint256 tokenId = store.createModel("emit-1", "Emit", "", "");
+        store.addVersion(tokenId, "1.0.0", "0xold", 9500, "s1", true);
+        store.setForSale(tokenId, true);
+        store.setSalePrice(tokenId, 1 ether);
+        vm.stopPrank();
+
+        vm.prank(bob);
+        store.buyModel{value: 1 ether}(tokenId);
+
+        vm.prank(alice);
+        vm.expectEmit(true, true, true, true);
+        emit TransferCompleted(tokenId, alice, bob, "0xnewHash");
+        store.completeTransfer(tokenId, "0xnewHash");
+    }
+
+    function test_updateVersionRootHash_ownerOnly() public {
+        vm.startPrank(alice);
+        uint256 tokenId = store.createModel("upd-root", "Update Root", "", "");
+        store.addVersion(tokenId, "1.0.0", "0xoriginal", 9500, "s1", true);
+        store.updateVersionRootHash(tokenId, 0, "0xupdated");
+        vm.stopPrank();
+
+        HelixModelStore.Version memory v = store.getVersion(tokenId, 0);
+        assertEq(v.rootHash, "0xupdated");
+        assertTrue(v.weightsStored);
+
+        vm.prank(bob);
+        vm.expectRevert("Not model owner");
+        store.updateVersionRootHash(tokenId, 0, "0xhacked");
+    }
+
+    function test_updateVersionRootHash_clearsWeightsStoredWhenEmpty() public {
+        vm.startPrank(alice);
+        uint256 tokenId = store.createModel("upd-clear", "Clear", "", "");
+        store.addVersion(tokenId, "1.0.0", "0xhash", 9500, "s1", true);
+        store.updateVersionRootHash(tokenId, 0, "");
+        vm.stopPrank();
+
+        HelixModelStore.Version memory v = store.getVersion(tokenId, 0);
+        assertEq(v.rootHash, "");
+        assertFalse(v.weightsStored);
     }
 }
