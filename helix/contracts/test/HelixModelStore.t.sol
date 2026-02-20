@@ -36,7 +36,7 @@ contract HelixModelStoreTest is Test {
 
     function test_createModel_mintsNFTAndStoresMetadata() public {
         vm.prank(alice);
-        uint256 tokenId = store.createModel("mnist-v1", "MNIST Classifier", "A simple MNIST model");
+        uint256 tokenId = store.createModel("mnist-v1", "MNIST Classifier", "A simple MNIST model", "");
 
         assertEq(tokenId, 0);
         assertEq(store.ownerOf(tokenId), alice);
@@ -45,6 +45,7 @@ contract HelixModelStoreTest is Test {
             string memory slug,
             string memory name,
             string memory description,
+            string memory architecture,
             address creator,
             uint40 createdAt,
             bool isPublic,
@@ -54,6 +55,7 @@ contract HelixModelStoreTest is Test {
         assertEq(slug, "mnist-v1");
         assertEq(name, "MNIST Classifier");
         assertEq(description, "A simple MNIST model");
+        assertEq(architecture, "");
         assertEq(creator, alice);
         assertEq(createdAt, uint40(block.timestamp));
         assertEq(isPublic, false);
@@ -62,9 +64,9 @@ contract HelixModelStoreTest is Test {
 
     function test_createModel_incrementsTokenIds() public {
         vm.startPrank(alice);
-        uint256 id0 = store.createModel("model-a", "Model A", "");
-        uint256 id1 = store.createModel("model-b", "Model B", "");
-        uint256 id2 = store.createModel("model-c", "Model C", "");
+        uint256 id0 = store.createModel("model-a", "Model A", "", "");
+        uint256 id1 = store.createModel("model-b", "Model B", "", "");
+        uint256 id2 = store.createModel("model-c", "Model C", "", "");
         vm.stopPrank();
 
         assertEq(id0, 0);
@@ -74,7 +76,7 @@ contract HelixModelStoreTest is Test {
 
     function test_createModel_slugLookup() public {
         vm.prank(alice);
-        uint256 tokenId = store.createModel("my-slug", "My Model", "desc");
+        uint256 tokenId = store.createModel("my-slug", "My Model", "desc", "");
 
         uint256 found = store.getModelBySlug("my-slug");
         assertEq(found, tokenId);
@@ -82,36 +84,36 @@ contract HelixModelStoreTest is Test {
 
     function test_createModel_revertsOnDuplicateSlug() public {
         vm.prank(alice);
-        store.createModel("unique-slug", "Model 1", "");
+        store.createModel("unique-slug", "Model 1", "", "");
 
         vm.prank(bob);
         vm.expectRevert("Slug already taken");
-        store.createModel("unique-slug", "Model 2", "");
+        store.createModel("unique-slug", "Model 2", "", "");
     }
 
     function test_createModel_revertsOnEmptySlug() public {
         vm.prank(alice);
         vm.expectRevert("Slug required");
-        store.createModel("", "Model", "");
+        store.createModel("", "Model", "", "");
     }
 
     function test_createModel_revertsOnEmptyName() public {
         vm.prank(alice);
         vm.expectRevert("Name required");
-        store.createModel("slug", "", "");
+        store.createModel("slug", "", "", "");
     }
 
     function test_createModel_emitsEvent() public {
         vm.prank(alice);
         vm.expectEmit(true, true, false, true);
         emit ModelCreated(0, alice, "test-model", "Test Model");
-        store.createModel("test-model", "Test Model", "description");
+        store.createModel("test-model", "Test Model", "description", "");
     }
 
     function test_createModel_allowsEmptyDescription() public {
         vm.prank(alice);
-        uint256 tokenId = store.createModel("no-desc", "No Desc Model", "");
-        (, , string memory description, , , , ) = store.models(tokenId);
+        uint256 tokenId = store.createModel("no-desc", "No Desc Model", "", "");
+        (, , string memory description, , , , , ) = store.models(tokenId);
         assertEq(description, "");
     }
 
@@ -121,7 +123,7 @@ contract HelixModelStoreTest is Test {
 
     function test_addVersion_ownerCanAddVersion() public {
         vm.startPrank(alice);
-        uint256 tokenId = store.createModel("versioned", "Versioned Model", "");
+        uint256 tokenId = store.createModel("versioned", "Versioned Model", "", "");
 
         uint256 vIdx = store.addVersion(
             tokenId,
@@ -147,7 +149,7 @@ contract HelixModelStoreTest is Test {
 
     function test_addVersion_nonOwnerReverts() public {
         vm.prank(alice);
-        uint256 tokenId = store.createModel("owned", "Owned Model", "");
+        uint256 tokenId = store.createModel("owned", "Owned Model", "", "");
 
         vm.prank(bob);
         vm.expectRevert("Not model owner");
@@ -156,7 +158,7 @@ contract HelixModelStoreTest is Test {
 
     function test_addVersion_multipleVersions() public {
         vm.startPrank(alice);
-        uint256 tokenId = store.createModel("multi-ver", "Multi Version", "");
+        uint256 tokenId = store.createModel("multi-ver", "Multi Version", "", "");
 
         store.addVersion(tokenId, "0.1.0", "", 5000, "sess-1", false);
         vm.warp(block.timestamp + 1 hours);
@@ -178,7 +180,7 @@ contract HelixModelStoreTest is Test {
 
     function test_addVersion_withoutWeights() public {
         vm.startPrank(alice);
-        uint256 tokenId = store.createModel("no-weights", "No Weights", "");
+        uint256 tokenId = store.createModel("no-weights", "No Weights", "", "");
 
         store.addVersion(tokenId, "1.0.0", "", 8000, "sess-1", false);
         vm.stopPrank();
@@ -190,7 +192,7 @@ contract HelixModelStoreTest is Test {
 
     function test_addVersion_emitsEvent() public {
         vm.startPrank(alice);
-        uint256 tokenId = store.createModel("event-ver", "Event Model", "");
+        uint256 tokenId = store.createModel("event-ver", "Event Model", "", "");
 
         vm.expectEmit(true, true, false, true);
         emit VersionAdded(tokenId, 0, "1.0.0", "root-hash");
@@ -200,7 +202,7 @@ contract HelixModelStoreTest is Test {
 
     function test_getVersion_revertsOnInvalidIndex() public {
         vm.prank(alice);
-        uint256 tokenId = store.createModel("invalid-idx", "Model", "");
+        uint256 tokenId = store.createModel("invalid-idx", "Model", "", "");
 
         vm.expectRevert("Invalid version index");
         store.getVersion(tokenId, 0);
@@ -208,7 +210,7 @@ contract HelixModelStoreTest is Test {
 
     function test_getVersionCount_zeroForNewModel() public {
         vm.prank(alice);
-        uint256 tokenId = store.createModel("new-model", "New", "");
+        uint256 tokenId = store.createModel("new-model", "New", "", "");
 
         assertEq(store.getVersionCount(tokenId), 0);
     }
@@ -219,21 +221,21 @@ contract HelixModelStoreTest is Test {
 
     function test_hasModelAccess_ownerAlwaysHasAccess() public {
         vm.prank(alice);
-        uint256 tokenId = store.createModel("access-test", "Access Test", "");
+        uint256 tokenId = store.createModel("access-test", "Access Test", "", "");
 
         assertTrue(store.hasModelAccess(tokenId, alice));
     }
 
     function test_hasModelAccess_nonOwnerNoAccessByDefault() public {
         vm.prank(alice);
-        uint256 tokenId = store.createModel("private", "Private", "");
+        uint256 tokenId = store.createModel("private", "Private", "", "");
 
         assertFalse(store.hasModelAccess(tokenId, bob));
     }
 
     function test_grantAccess_grantsAccessToNonOwner() public {
         vm.startPrank(alice);
-        uint256 tokenId = store.createModel("grant-test", "Grant Test", "");
+        uint256 tokenId = store.createModel("grant-test", "Grant Test", "", "");
         store.grantAccess(tokenId, bob);
         vm.stopPrank();
 
@@ -242,7 +244,7 @@ contract HelixModelStoreTest is Test {
 
     function test_grantAccess_emitsEvent() public {
         vm.startPrank(alice);
-        uint256 tokenId = store.createModel("grant-event", "Grant Event", "");
+        uint256 tokenId = store.createModel("grant-event", "Grant Event", "", "");
 
         vm.expectEmit(true, true, false, true);
         emit AccessChanged(tokenId, bob, true);
@@ -252,7 +254,7 @@ contract HelixModelStoreTest is Test {
 
     function test_revokeAccess_removesAccess() public {
         vm.startPrank(alice);
-        uint256 tokenId = store.createModel("revoke-test", "Revoke Test", "");
+        uint256 tokenId = store.createModel("revoke-test", "Revoke Test", "", "");
         store.grantAccess(tokenId, bob);
         assertTrue(store.hasModelAccess(tokenId, bob));
 
@@ -264,7 +266,7 @@ contract HelixModelStoreTest is Test {
 
     function test_revokeAccess_emitsEvent() public {
         vm.startPrank(alice);
-        uint256 tokenId = store.createModel("revoke-event", "Revoke Event", "");
+        uint256 tokenId = store.createModel("revoke-event", "Revoke Event", "", "");
         store.grantAccess(tokenId, bob);
 
         vm.expectEmit(true, true, false, true);
@@ -275,7 +277,7 @@ contract HelixModelStoreTest is Test {
 
     function test_grantAccess_nonOwnerReverts() public {
         vm.prank(alice);
-        uint256 tokenId = store.createModel("no-grant", "No Grant", "");
+        uint256 tokenId = store.createModel("no-grant", "No Grant", "", "");
 
         vm.prank(bob);
         vm.expectRevert("Not model owner");
@@ -284,7 +286,7 @@ contract HelixModelStoreTest is Test {
 
     function test_revokeAccess_nonOwnerReverts() public {
         vm.startPrank(alice);
-        uint256 tokenId = store.createModel("no-revoke", "No Revoke", "");
+        uint256 tokenId = store.createModel("no-revoke", "No Revoke", "", "");
         store.grantAccess(tokenId, bob);
         vm.stopPrank();
 
@@ -299,7 +301,7 @@ contract HelixModelStoreTest is Test {
 
     function test_setPublic_makesModelAccessibleToEveryone() public {
         vm.startPrank(alice);
-        uint256 tokenId = store.createModel("public-model", "Public Model", "");
+        uint256 tokenId = store.createModel("public-model", "Public Model", "", "");
 
         assertFalse(store.hasModelAccess(tokenId, bob));
         assertFalse(store.hasModelAccess(tokenId, charlie));
@@ -313,7 +315,7 @@ contract HelixModelStoreTest is Test {
 
     function test_setPublic_canBeRevertedToPrivate() public {
         vm.startPrank(alice);
-        uint256 tokenId = store.createModel("toggle-public", "Toggle", "");
+        uint256 tokenId = store.createModel("toggle-public", "Toggle", "", "");
 
         store.setPublic(tokenId, true);
         assertTrue(store.hasModelAccess(tokenId, bob));
@@ -325,7 +327,7 @@ contract HelixModelStoreTest is Test {
 
     function test_setPublic_emitsEvent() public {
         vm.startPrank(alice);
-        uint256 tokenId = store.createModel("public-event", "Public Event", "");
+        uint256 tokenId = store.createModel("public-event", "Public Event", "", "");
 
         vm.expectEmit(true, false, false, true);
         emit ModelPublicityChanged(tokenId, true);
@@ -335,7 +337,7 @@ contract HelixModelStoreTest is Test {
 
     function test_setPublic_nonOwnerReverts() public {
         vm.prank(alice);
-        uint256 tokenId = store.createModel("no-public", "No Public", "");
+        uint256 tokenId = store.createModel("no-public", "No Public", "", "");
 
         vm.prank(bob);
         vm.expectRevert("Not model owner");
@@ -348,29 +350,29 @@ contract HelixModelStoreTest is Test {
 
     function test_setInferenceFee_setsFee() public {
         vm.startPrank(alice);
-        uint256 tokenId = store.createModel("fee-model", "Fee Model", "");
+        uint256 tokenId = store.createModel("fee-model", "Fee Model", "", "");
 
         store.setInferenceFee(tokenId, 500); // 5%
         vm.stopPrank();
 
-        (, , , , , , uint16 fee) = store.models(tokenId);
+        (, , , , , , , uint16 fee) = store.models(tokenId);
         assertEq(fee, 500);
     }
 
     function test_setInferenceFee_maxCap() public {
         vm.startPrank(alice);
-        uint256 tokenId = store.createModel("max-fee", "Max Fee", "");
+        uint256 tokenId = store.createModel("max-fee", "Max Fee", "", "");
 
         store.setInferenceFee(tokenId, 5000); // 50% - exactly at cap
         vm.stopPrank();
 
-        (, , , , , , uint16 fee) = store.models(tokenId);
+        (, , , , , , , uint16 fee) = store.models(tokenId);
         assertEq(fee, 5000);
     }
 
     function test_setInferenceFee_revertsAboveCap() public {
         vm.startPrank(alice);
-        uint256 tokenId = store.createModel("over-fee", "Over Fee", "");
+        uint256 tokenId = store.createModel("over-fee", "Over Fee", "", "");
 
         vm.expectRevert("Fee exceeds 50%");
         store.setInferenceFee(tokenId, 5001);
@@ -379,7 +381,7 @@ contract HelixModelStoreTest is Test {
 
     function test_setInferenceFee_emitsEvent() public {
         vm.startPrank(alice);
-        uint256 tokenId = store.createModel("fee-event", "Fee Event", "");
+        uint256 tokenId = store.createModel("fee-event", "Fee Event", "", "");
 
         vm.expectEmit(true, false, false, true);
         emit InferenceFeeChanged(tokenId, 1000);
@@ -389,7 +391,7 @@ contract HelixModelStoreTest is Test {
 
     function test_setInferenceFee_nonOwnerReverts() public {
         vm.prank(alice);
-        uint256 tokenId = store.createModel("no-fee", "No Fee", "");
+        uint256 tokenId = store.createModel("no-fee", "No Fee", "", "");
 
         vm.prank(bob);
         vm.expectRevert("Not model owner");
@@ -398,12 +400,12 @@ contract HelixModelStoreTest is Test {
 
     function test_setInferenceFee_zeroIsValid() public {
         vm.startPrank(alice);
-        uint256 tokenId = store.createModel("zero-fee", "Zero Fee", "");
+        uint256 tokenId = store.createModel("zero-fee", "Zero Fee", "", "");
         store.setInferenceFee(tokenId, 500);
         store.setInferenceFee(tokenId, 0);
         vm.stopPrank();
 
-        (, , , , , , uint16 fee) = store.models(tokenId);
+        (, , , , , , , uint16 fee) = store.models(tokenId);
         assertEq(fee, 0);
     }
 
@@ -413,20 +415,20 @@ contract HelixModelStoreTest is Test {
 
     function test_transfer_preservesCreator() public {
         vm.prank(alice);
-        uint256 tokenId = store.createModel("transfer-model", "Transfer Model", "");
+        uint256 tokenId = store.createModel("transfer-model", "Transfer Model", "", "");
 
         vm.prank(alice);
         store.transferFrom(alice, bob, tokenId);
 
         assertEq(store.ownerOf(tokenId), bob);
 
-        (, , , address creator, , , ) = store.models(tokenId);
+        (, , , , address creator, , , ) = store.models(tokenId);
         assertEq(creator, alice); // creator is preserved
     }
 
     function test_transfer_newOwnerCanAddVersion() public {
         vm.prank(alice);
-        uint256 tokenId = store.createModel("transfer-ver", "Transfer Version", "");
+        uint256 tokenId = store.createModel("transfer-ver", "Transfer Version", "", "");
 
         vm.prank(alice);
         store.transferFrom(alice, bob, tokenId);
@@ -438,7 +440,7 @@ contract HelixModelStoreTest is Test {
 
     function test_transfer_oldOwnerCannotManage() public {
         vm.prank(alice);
-        uint256 tokenId = store.createModel("old-owner", "Old Owner", "");
+        uint256 tokenId = store.createModel("old-owner", "Old Owner", "", "");
 
         vm.prank(alice);
         store.transferFrom(alice, bob, tokenId);
@@ -450,7 +452,7 @@ contract HelixModelStoreTest is Test {
 
     function test_transfer_newOwnerCanSetPublic() public {
         vm.prank(alice);
-        uint256 tokenId = store.createModel("transfer-pub", "Transfer Public", "");
+        uint256 tokenId = store.createModel("transfer-pub", "Transfer Public", "", "");
 
         vm.prank(alice);
         store.transferFrom(alice, bob, tokenId);
@@ -458,13 +460,13 @@ contract HelixModelStoreTest is Test {
         vm.prank(bob);
         store.setPublic(tokenId, true);
 
-        (, , , , , bool isPublic, ) = store.models(tokenId);
+        (, , , , , , bool isPublic, ) = store.models(tokenId);
         assertTrue(isPublic);
     }
 
     function test_transfer_newOwnerCanManageAccess() public {
         vm.prank(alice);
-        uint256 tokenId = store.createModel("transfer-access", "Transfer Access", "");
+        uint256 tokenId = store.createModel("transfer-access", "Transfer Access", "", "");
 
         vm.prank(alice);
         store.transferFrom(alice, bob, tokenId);
@@ -480,7 +482,7 @@ contract HelixModelStoreTest is Test {
 
     function test_transfer_newOwnerCanSetFee() public {
         vm.prank(alice);
-        uint256 tokenId = store.createModel("transfer-fee", "Transfer Fee", "");
+        uint256 tokenId = store.createModel("transfer-fee", "Transfer Fee", "", "");
 
         vm.prank(alice);
         store.transferFrom(alice, bob, tokenId);
@@ -488,7 +490,7 @@ contract HelixModelStoreTest is Test {
         vm.prank(bob);
         store.setInferenceFee(tokenId, 2500);
 
-        (, , , , , , uint16 fee) = store.models(tokenId);
+        (, , , , , , , uint16 fee) = store.models(tokenId);
         assertEq(fee, 2500);
     }
 
@@ -500,15 +502,15 @@ contract HelixModelStoreTest is Test {
         assertEq(store.totalSupply(), 0);
 
         vm.startPrank(alice);
-        store.createModel("enum-1", "Enum 1", "");
+        store.createModel("enum-1", "Enum 1", "", "");
         assertEq(store.totalSupply(), 1);
 
-        store.createModel("enum-2", "Enum 2", "");
+        store.createModel("enum-2", "Enum 2", "", "");
         assertEq(store.totalSupply(), 2);
         vm.stopPrank();
 
         vm.prank(bob);
-        store.createModel("enum-3", "Enum 3", "");
+        store.createModel("enum-3", "Enum 3", "", "");
         assertEq(store.totalSupply(), 3);
     }
 
@@ -517,12 +519,12 @@ contract HelixModelStoreTest is Test {
         assertEq(store.balanceOf(bob), 0);
 
         vm.startPrank(alice);
-        store.createModel("bal-1", "Bal 1", "");
-        store.createModel("bal-2", "Bal 2", "");
+        store.createModel("bal-1", "Bal 1", "", "");
+        store.createModel("bal-2", "Bal 2", "", "");
         vm.stopPrank();
 
         vm.prank(bob);
-        store.createModel("bal-3", "Bal 3", "");
+        store.createModel("bal-3", "Bal 3", "", "");
 
         assertEq(store.balanceOf(alice), 2);
         assertEq(store.balanceOf(bob), 1);
@@ -530,8 +532,8 @@ contract HelixModelStoreTest is Test {
 
     function test_enumeration_tokenOfOwnerByIndex() public {
         vm.startPrank(alice);
-        store.createModel("tok-a", "Tok A", "");
-        store.createModel("tok-b", "Tok B", "");
+        store.createModel("tok-a", "Tok A", "", "");
+        store.createModel("tok-b", "Tok B", "", "");
         vm.stopPrank();
 
         assertEq(store.tokenOfOwnerByIndex(alice, 0), 0);
@@ -540,9 +542,9 @@ contract HelixModelStoreTest is Test {
 
     function test_enumeration_tokenByIndex() public {
         vm.prank(alice);
-        store.createModel("global-1", "Global 1", "");
+        store.createModel("global-1", "Global 1", "", "");
         vm.prank(bob);
-        store.createModel("global-2", "Global 2", "");
+        store.createModel("global-2", "Global 2", "", "");
 
         assertEq(store.tokenByIndex(0), 0);
         assertEq(store.tokenByIndex(1), 1);
@@ -550,7 +552,7 @@ contract HelixModelStoreTest is Test {
 
     function test_enumeration_balanceChangesOnTransfer() public {
         vm.prank(alice);
-        uint256 tokenId = store.createModel("xfer-bal", "Transfer Balance", "");
+        uint256 tokenId = store.createModel("xfer-bal", "Transfer Balance", "", "");
 
         assertEq(store.balanceOf(alice), 1);
         assertEq(store.balanceOf(bob), 0);
@@ -573,8 +575,8 @@ contract HelixModelStoreTest is Test {
 
     function test_slugUniqueness_differentCasesAreDifferent() public {
         vm.startPrank(alice);
-        store.createModel("MyModel", "My Model Upper", "");
-        store.createModel("mymodel", "My Model Lower", ""); // different slug
+        store.createModel("MyModel", "My Model Upper", "", "");
+        store.createModel("mymodel", "My Model Lower", "", ""); // different slug
         vm.stopPrank();
 
         uint256 id0 = store.getModelBySlug("MyModel");
@@ -604,7 +606,7 @@ contract HelixModelStoreTest is Test {
 
     function test_setForSale() public {
         vm.startPrank(alice);
-        uint256 tokenId = store.createModel("sale-1", "Sale 1", "");
+        uint256 tokenId = store.createModel("sale-1", "Sale 1", "", "");
         assertFalse(store.isForSale(tokenId));
 
         store.setForSale(tokenId, true);
@@ -617,7 +619,7 @@ contract HelixModelStoreTest is Test {
 
     function test_setForSale_nonOwnerReverts() public {
         vm.prank(alice);
-        uint256 tokenId = store.createModel("sale-2", "Sale 2", "");
+        uint256 tokenId = store.createModel("sale-2", "Sale 2", "", "");
 
         vm.prank(bob);
         vm.expectRevert("Not model owner");
@@ -626,7 +628,7 @@ contract HelixModelStoreTest is Test {
 
     function test_setForSale_emitsEvent() public {
         vm.startPrank(alice);
-        uint256 tokenId = store.createModel("sale-evt", "Sale Evt", "");
+        uint256 tokenId = store.createModel("sale-evt", "Sale Evt", "", "");
 
         vm.expectEmit(true, false, false, true);
         emit ModelForSaleChanged(tokenId, true);
@@ -640,7 +642,7 @@ contract HelixModelStoreTest is Test {
 
     function test_setSalePrice() public {
         vm.startPrank(alice);
-        uint256 tokenId = store.createModel("price-1", "Price 1", "");
+        uint256 tokenId = store.createModel("price-1", "Price 1", "", "");
         store.setSalePrice(tokenId, 1 ether);
         assertEq(store.salePrice(tokenId), 1 ether);
         vm.stopPrank();
@@ -648,7 +650,7 @@ contract HelixModelStoreTest is Test {
 
     function test_setSalePrice_nonOwnerReverts() public {
         vm.prank(alice);
-        uint256 tokenId = store.createModel("price-2", "Price 2", "");
+        uint256 tokenId = store.createModel("price-2", "Price 2", "", "");
 
         vm.prank(bob);
         vm.expectRevert("Not model owner");
@@ -657,7 +659,7 @@ contract HelixModelStoreTest is Test {
 
     function test_setSalePrice_emitsEvent() public {
         vm.startPrank(alice);
-        uint256 tokenId = store.createModel("price-evt", "Price Evt", "");
+        uint256 tokenId = store.createModel("price-evt", "Price Evt", "", "");
 
         vm.expectEmit(true, false, false, true);
         emit SalePriceChanged(tokenId, 2 ether);
@@ -671,7 +673,7 @@ contract HelixModelStoreTest is Test {
 
     function test_buyModel_transfersAndPays() public {
         vm.startPrank(alice);
-        uint256 tokenId = store.createModel("buy-1", "Buy 1", "");
+        uint256 tokenId = store.createModel("buy-1", "Buy 1", "", "");
         store.setForSale(tokenId, true);
         store.setSalePrice(tokenId, 1 ether);
         vm.stopPrank();
@@ -687,7 +689,7 @@ contract HelixModelStoreTest is Test {
 
     function test_buyModel_clearsListing() public {
         vm.startPrank(alice);
-        uint256 tokenId = store.createModel("buy-clear", "Buy Clear", "");
+        uint256 tokenId = store.createModel("buy-clear", "Buy Clear", "", "");
         store.setForSale(tokenId, true);
         store.setSalePrice(tokenId, 1 ether);
         vm.stopPrank();
@@ -701,7 +703,7 @@ contract HelixModelStoreTest is Test {
 
     function test_buyModel_revertsNotForSale() public {
         vm.prank(alice);
-        uint256 tokenId = store.createModel("buy-nfs", "Not For Sale", "");
+        uint256 tokenId = store.createModel("buy-nfs", "Not For Sale", "", "");
 
         vm.prank(bob);
         vm.expectRevert("Model not for sale");
@@ -710,7 +712,7 @@ contract HelixModelStoreTest is Test {
 
     function test_buyModel_revertsInsufficientPayment() public {
         vm.startPrank(alice);
-        uint256 tokenId = store.createModel("buy-low", "Buy Low", "");
+        uint256 tokenId = store.createModel("buy-low", "Buy Low", "", "");
         store.setForSale(tokenId, true);
         store.setSalePrice(tokenId, 2 ether);
         vm.stopPrank();
@@ -722,7 +724,7 @@ contract HelixModelStoreTest is Test {
 
     function test_buyModel_revertsOwnModel() public {
         vm.startPrank(alice);
-        uint256 tokenId = store.createModel("buy-self", "Buy Self", "");
+        uint256 tokenId = store.createModel("buy-self", "Buy Self", "", "");
         store.setForSale(tokenId, true);
         store.setSalePrice(tokenId, 1 ether);
 
@@ -733,7 +735,7 @@ contract HelixModelStoreTest is Test {
 
     function test_buyModel_emitsEvent() public {
         vm.startPrank(alice);
-        uint256 tokenId = store.createModel("buy-evt", "Buy Evt", "");
+        uint256 tokenId = store.createModel("buy-evt", "Buy Evt", "", "");
         store.setForSale(tokenId, true);
         store.setSalePrice(tokenId, 1 ether);
         vm.stopPrank();
@@ -746,7 +748,7 @@ contract HelixModelStoreTest is Test {
 
     function test_buyModel_revertsSalePriceNotSet() public {
         vm.startPrank(alice);
-        uint256 tokenId = store.createModel("buy-noprice", "No Price", "");
+        uint256 tokenId = store.createModel("buy-noprice", "No Price", "", "");
         store.setForSale(tokenId, true);
         // salePrice is 0
         vm.stopPrank();
@@ -762,7 +764,7 @@ contract HelixModelStoreTest is Test {
 
     function test_payForInference() public {
         vm.startPrank(alice);
-        uint256 tokenId = store.createModel("infer-1", "Infer 1", "");
+        uint256 tokenId = store.createModel("infer-1", "Infer 1", "", "");
         store.setPublic(tokenId, true);
         store.setInferenceFee(tokenId, 1000); // 10%
         vm.stopPrank();
@@ -774,7 +776,7 @@ contract HelixModelStoreTest is Test {
 
     function test_payForInference_ownerShareCorrect() public {
         vm.startPrank(alice);
-        uint256 tokenId = store.createModel("infer-share", "Infer Share", "");
+        uint256 tokenId = store.createModel("infer-share", "Infer Share", "", "");
         store.setPublic(tokenId, true);
         store.setInferenceFee(tokenId, 500); // 5%
         vm.stopPrank();
@@ -788,7 +790,7 @@ contract HelixModelStoreTest is Test {
 
     function test_payForInference_revertsPrivate() public {
         vm.prank(alice);
-        uint256 tokenId = store.createModel("infer-priv", "Infer Priv", "");
+        uint256 tokenId = store.createModel("infer-priv", "Infer Priv", "", "");
         // isPublic defaults to false
 
         vm.prank(bob);
@@ -798,7 +800,7 @@ contract HelixModelStoreTest is Test {
 
     function test_payForInference_revertsOwner() public {
         vm.startPrank(alice);
-        uint256 tokenId = store.createModel("infer-own", "Infer Own", "");
+        uint256 tokenId = store.createModel("infer-own", "Infer Own", "", "");
         store.setPublic(tokenId, true);
 
         vm.expectRevert("Owner does not pay for inference");
@@ -808,7 +810,7 @@ contract HelixModelStoreTest is Test {
 
     function test_payForInference_revertsZeroPayment() public {
         vm.startPrank(alice);
-        uint256 tokenId = store.createModel("infer-zero", "Infer Zero", "");
+        uint256 tokenId = store.createModel("infer-zero", "Infer Zero", "", "");
         store.setPublic(tokenId, true);
         vm.stopPrank();
 
@@ -819,7 +821,7 @@ contract HelixModelStoreTest is Test {
 
     function test_payForInference_incrementsNonce() public {
         vm.startPrank(alice);
-        uint256 tokenId = store.createModel("infer-nonce", "Infer Nonce", "");
+        uint256 tokenId = store.createModel("infer-nonce", "Infer Nonce", "", "");
         store.setPublic(tokenId, true);
         vm.stopPrank();
 
@@ -834,7 +836,7 @@ contract HelixModelStoreTest is Test {
 
     function test_payForInference_emitsEvent() public {
         vm.startPrank(alice);
-        uint256 tokenId = store.createModel("infer-evt", "Infer Evt", "");
+        uint256 tokenId = store.createModel("infer-evt", "Infer Evt", "", "");
         store.setPublic(tokenId, true);
         store.setInferenceFee(tokenId, 1000); // 10%
         vm.stopPrank();
@@ -852,7 +854,7 @@ contract HelixModelStoreTest is Test {
 
     function test_withdrawInferenceFees() public {
         vm.startPrank(alice);
-        uint256 tokenId = store.createModel("withdraw-1", "Withdraw 1", "");
+        uint256 tokenId = store.createModel("withdraw-1", "Withdraw 1", "", "");
         store.setPublic(tokenId, true);
         store.setInferenceFee(tokenId, 1000); // 10%
         vm.stopPrank();
@@ -872,7 +874,7 @@ contract HelixModelStoreTest is Test {
 
     function test_withdrawInferenceFees_revertsNoFees() public {
         vm.startPrank(alice);
-        uint256 tokenId = store.createModel("withdraw-none", "Withdraw None", "");
+        uint256 tokenId = store.createModel("withdraw-none", "Withdraw None", "", "");
 
         vm.expectRevert("No fees to withdraw");
         store.withdrawInferenceFees(tokenId);
@@ -881,7 +883,7 @@ contract HelixModelStoreTest is Test {
 
     function test_withdrawInferenceFees_nonOwnerReverts() public {
         vm.startPrank(alice);
-        uint256 tokenId = store.createModel("withdraw-no", "Withdraw No", "");
+        uint256 tokenId = store.createModel("withdraw-no", "Withdraw No", "", "");
         store.setPublic(tokenId, true);
         store.setInferenceFee(tokenId, 1000);
         vm.stopPrank();
@@ -892,5 +894,38 @@ contract HelixModelStoreTest is Test {
         vm.prank(bob);
         vm.expectRevert("Not model owner");
         store.withdrawInferenceFees(tokenId);
+    }
+
+    // -------------------------------------------------------
+    // tokenURI
+    // -------------------------------------------------------
+
+    function test_tokenURI_returnsBase64Json() public {
+        vm.prank(alice);
+        uint256 tokenId = store.createModel("uri-test", "URI Test Model", "Testing tokenURI", "");
+
+        string memory uri = store.tokenURI(tokenId);
+        // Should start with data:application/json;base64,
+        assertTrue(bytes(uri).length > 35, "URI should not be empty");
+        // Check the prefix
+        bytes memory prefix = bytes("data:application/json;base64,");
+        for (uint i = 0; i < prefix.length; i++) {
+            assertEq(bytes(uri)[i], prefix[i], "URI prefix mismatch");
+        }
+    }
+
+    function test_tokenURI_includesVersionAfterAdd() public {
+        vm.startPrank(alice);
+        uint256 tokenId = store.createModel("uri-v-test", "Version URI Test", "Testing version in URI", "");
+        store.addVersion(tokenId, "1.2.3", "0xabc123", 9500, "session-42", true);
+        vm.stopPrank();
+
+        string memory uri = store.tokenURI(tokenId);
+        assertTrue(bytes(uri).length > 50, "URI with version should be longer");
+    }
+
+    function test_tokenURI_revertsForNonexistent() public {
+        vm.expectRevert();
+        store.tokenURI(999);
     }
 }

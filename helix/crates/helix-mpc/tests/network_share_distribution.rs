@@ -372,10 +372,10 @@ async fn test_commitment_verification_passes_for_valid_shares() {
                     .await
                     .expect("distribution should succeed for valid shares");
 
-            // Verify the worker received the correct initial commitment
+            // Verify the worker received a valid initial commitment (aggregate-only mode)
             assert!(
-                !state.initial_commitment.element_commitments.is_empty(),
-                "worker {} should have received element commitments",
+                state.initial_commitment.element_commitments.is_empty(),
+                "worker {} should have aggregate-only commitment during distribution",
                 i
             );
 
@@ -398,8 +398,8 @@ async fn test_commitment_verification_passes_for_valid_shares() {
     // The key assertion: commitment verification passed
     assert!(dist_result.verified);
 
-    // Also verify the initial commitment is non-trivial
-    assert_eq!(dist_result.distribution.initial_commitment.element_commitments.len(), 8);
+    // Distribution uses aggregate-only mode (no per-element commitments)
+    assert!(dist_result.distribution.initial_commitment.element_commitments.is_empty());
     assert_eq!(dist_result.distribution.encrypted_shares.len(), 3);
 
     let mut owner_rng = ChaCha20Rng::seed_from_u64(1234);

@@ -91,7 +91,7 @@ impl Default for ZkMode {
 
 #[cfg(feature = "chain")]
 use crate::rpc::chain_v4::{
-    sign_checkpoint, sign_completion, sign_mac_failure, ChainClientV4,
+    sign_checkpoint, sign_completion, sign_mac_failure, ChainClientV4, ModelStoreClient,
 };
 
 // ============================================================================
@@ -250,6 +250,27 @@ pub struct FullOrchestrationConfig {
     #[serde(default)]
     pub pre_registered_job_id: Option<u64>,
 
+    /// HelixModelStore (ERC-721) contract address. When set, a model NFT is minted
+    /// after training completion. Pass None to skip NFT minting.
+    #[cfg(feature = "chain")]
+    #[serde(default)]
+    pub model_store_address: Option<String>,
+
+    /// Model slug for the NFT (globally unique identifier). Required when model_store_address is set.
+    #[cfg(feature = "chain")]
+    #[serde(default)]
+    pub model_slug: Option<String>,
+
+    /// Model display name for the NFT. Defaults to "HELIX Model" if not set.
+    #[cfg(feature = "chain")]
+    #[serde(default)]
+    pub model_name: Option<String>,
+
+    /// Model description for the NFT.
+    #[cfg(feature = "chain")]
+    #[serde(default)]
+    pub model_description: Option<String>,
+
     // -- Transport Mode --
     /// When true, workers run the MPC training loop on their own machines
     /// using TcpTransport (distributed/multi-machine mode). The orchestrator
@@ -278,6 +299,16 @@ pub struct FullOrchestrationConfig {
     /// chosen automatically (party 2 at step num_steps/2).
     #[serde(default)]
     pub simulate_cheater: bool,
+
+    /// Which party should cheat (0-indexed). Default: last worker (num_workers - 1).
+    /// Only used when simulate_cheater is true.
+    #[serde(default)]
+    pub cheater_party: Option<usize>,
+
+    /// At which training step the cheater corrupts weights. Default: num_steps / 2.
+    /// Only used when simulate_cheater is true.
+    #[serde(default)]
+    pub cheater_step: Option<u64>,
 }
 
 impl Default for FullOrchestrationConfig {
@@ -321,10 +352,20 @@ impl Default for FullOrchestrationConfig {
             enable_withdrawal: false,
             #[cfg(feature = "chain")]
             pre_registered_job_id: None,
+            #[cfg(feature = "chain")]
+            model_store_address: None,
+            #[cfg(feature = "chain")]
+            model_slug: None,
+            #[cfg(feature = "chain")]
+            model_name: None,
+            #[cfg(feature = "chain")]
+            model_description: None,
             distributed: false,
             custom_training_data: None,
             worker_seeds: Vec::new(),
             simulate_cheater: false,
+            cheater_party: None,
+            cheater_step: None,
         }
     }
 }
@@ -365,6 +406,10 @@ pub struct FullOrchestrationResult {
     pub zk_proofs_generated: usize,
     /// Number of ZK proofs submitted on-chain (0 if ZK disabled or no chain).
     pub zk_proofs_on_chain: usize,
+    /// Model NFT token ID (None if NFT minting was not configured or failed).
+    pub model_nft_token_id: Option<u64>,
+    /// Model store contract address (empty if not configured).
+    pub model_store_address: String,
 }
 
 /// Information about a detected cheater.
@@ -644,8 +689,8 @@ impl FullOrchestrator {
             };
 
             if self.config.simulate_cheater {
-                let cheater_party = num_workers - 1;
-                let corrupt_at_step = (self.config.num_steps / 2) as u64;
+                let cheater_party = self.config.cheater_party.unwrap_or(num_workers - 1);
+                let corrupt_at_step = self.config.cheater_step.unwrap_or((self.config.num_steps / 2) as u64);
                 info!(
                     cheater_party = cheater_party,
                     corrupt_at_step = corrupt_at_step,
@@ -775,13 +820,84 @@ impl FullOrchestrator {
         self.emit(ProgressEvent::PhaseCompleted { phase: 12, elapsed_ms: phase12_elapsed });
 
         // ================================================================
+        // Phase 12.5: Mint Model NFT (feature-gated, opt-in)
+        // ================================================================
+        #[cfg(feature = "chain")]
+        let (model_nft_token_id, model_store_addr_str) = if let Some(ref store_addr) = self.config.model_store_address {
+            if job_id != 0 {
+                info!("Phase 12.5: Minting model NFT");
+                let slug = self.config.model_slug.clone().unwrap_or_else(|| {
+                    format!("helix-model-{:x}", job_id)
+                });
+                let name = self.config.model_name.clone().unwrap_or_else(|| {
+                    format!("HELIX Model (Job {})", job_id)
+                });
+                let description = self.config.model_description.clone().unwrap_or_else(|| {
+                    format!(
+                        "Trained with HELIX MPC protocol. Architecture: {}x{}x{}, {} steps, {:.1}% accuracy",
+                        d_in, d_hid, d_out, mpc_result.steps_completed, test_accuracy * 100.0
+                    )
+                });
+
+                let rpc = self.rpc_url.as_ref().ok_or_else(|| anyhow!("No RPC URL for NFT minting"))?;
+                match ModelStoreClient::new(rpc, &self.config.private_key, store_addr, None).await {
+                    Ok(store_client) => {
+                        let architecture = format!("{}x{}x{}", d_in, d_hid, d_out);
+                match store_client.create_model(&slug, &name, &description, &architecture).await {
+                            Ok(create_result) => {
+                                let token_id = create_result.token_id;
+                                info!(
+                                    token_id = token_id,
+                                    slug = %slug,
+                                    tx = %format!("{:?}", create_result.receipt.transaction_hash),
+                                    "Model NFT minted"
+                                );
+
+                                // Add version with accuracy
+                                let accuracy_scaled = (test_accuracy * 10000.0) as u64;
+                                let session_id = format!("job-{}", job_id);
+                                match store_client.add_version(
+                                    token_id, "1.0.0", "", accuracy_scaled, &session_id, false,
+                                ).await {
+                                    Ok(receipt) => {
+                                        info!(
+                                            tx = %format!("{:?}", receipt.transaction_hash),
+                                            accuracy = format!("{:.2}%", test_accuracy * 100.0),
+                                            "Version added to model NFT"
+                                        );
+                                    }
+                                    Err(e) => warn!("Failed to add version to NFT: {}", e),
+                                }
+
+                                (Some(token_id), store_addr.clone())
+                            }
+                            Err(e) => {
+                                warn!("Phase 12.5: Failed to mint model NFT: {}. Continuing.", e);
+                                (None, store_addr.clone())
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Phase 12.5: Failed to connect to ModelStore: {}. Continuing.", e);
+                        (None, store_addr.clone())
+                    }
+                }
+            } else {
+                info!("Phase 12.5: Skipping NFT minting (local mode, job_id=0)");
+                (None, store_addr.clone())
+            }
+        } else {
+            (None, String::new())
+        };
+
+        #[cfg(not(feature = "chain"))]
+        let (model_nft_token_id, model_store_addr_str): (Option<u64>, String) = (None, String::new());
+
+        // ================================================================
         // Phase 13: Print comprehensive summary
         // ================================================================
         let total_elapsed = overall_start.elapsed().as_secs_f64();
 
-        #[cfg(feature = "chain")]
-        let total_gas = chain_gas + settlement_gas + withdrawal_gas;
-        #[cfg(not(feature = "chain"))]
         let total_gas = chain_gas + settlement_gas + withdrawal_gas;
 
         let zk_proofs_generated = self
@@ -805,6 +921,8 @@ impl FullOrchestrator {
             total_gas_used: total_gas,
             zk_proofs_generated,
             zk_proofs_on_chain,
+            model_nft_token_id,
+            model_store_address: model_store_addr_str,
         };
 
         self.emit(ProgressEvent::PhaseStarted {
@@ -1055,6 +1173,8 @@ impl FullOrchestrator {
                     mac_checks_passed,
                     cheater_detected: has_cheater,
                     cheater_party,
+                    cheater_detected_at_step,
+                    mac_failure_report,
                     encrypted_final_share,
                     checkpoints,
                 } => {
@@ -1094,12 +1214,12 @@ impl FullOrchestrator {
                     }
 
                     if has_cheater {
-                        cheater_detected = Some(CheaterRecord {
-                            party_index: cheater_party.unwrap_or(usize::MAX),
-                            detected_at_step: 0,
-                            failure_report: helix_mpc::mac_verification::MACFailureReport {
+                        // Use the actual failure report from the worker if available,
+                        // falling back to a skeleton if the worker didn't send one.
+                        let failure_report = mac_failure_report.unwrap_or_else(|| {
+                            helix_mpc::mac_verification::MACFailureReport {
                                 session_id: "distributed".to_string(),
-                                step_number: 0,
+                                step_number: cheater_detected_at_step,
                                 identified_cheater: cheater_party,
                                 sigma_values: Vec::new(),
                                 commitments: Vec::new(),
@@ -1108,7 +1228,12 @@ impl FullOrchestrator {
                                     round1_sigmas: Vec::new(),
                                     round2_sigmas: Vec::new(),
                                 },
-                            },
+                            }
+                        });
+                        cheater_detected = Some(CheaterRecord {
+                            party_index: cheater_party.unwrap_or(usize::MAX),
+                            detected_at_step: cheater_detected_at_step,
+                            failure_report,
                         });
                     }
 
@@ -2933,11 +3058,22 @@ mod tests {
             use_pool_workers: false,
             #[cfg(feature = "chain")]
             pre_registered_job_id: None,
+            #[cfg(feature = "chain")]
+            model_store_address: None,
+            #[cfg(feature = "chain")]
+            model_slug: None,
+            #[cfg(feature = "chain")]
+            model_name: None,
+            #[cfg(feature = "chain")]
+            model_description: None,
             distributed: false,
             zk_proof: ZkProofConfig::default(),
             zk_mode: ZkMode::Off,
             custom_training_data: None,
             simulate_cheater: false,
+            cheater_party: None,
+            cheater_step: None,
+            worker_seeds: Vec::new(),
         };
         let orchestrator = FullOrchestrator::new(config);
         assert!(orchestrator.validate_config().is_ok());
@@ -3150,6 +3286,8 @@ mod tests {
             total_gas_used: 500_000,
             zk_proofs_generated: 0,
             zk_proofs_on_chain: 0,
+            model_nft_token_id: None,
+            model_store_address: String::new(),
         };
         let json = serde_json::to_string(&result).unwrap();
         let parsed: FullOrchestrationResult = serde_json::from_str(&json).unwrap();

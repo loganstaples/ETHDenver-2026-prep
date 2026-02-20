@@ -503,7 +503,7 @@ function ConfigForm({
   isWalletPrompting, isConfirmingPayment, walletConnected,
 }: ConfigFormProps) {
   const [numSteps, setNumSteps] = useState(200);
-  const [learningRate, setLearningRate] = useState(0.01);
+  const [learningRate, setLearningRate] = useState(0.05);
   const [checkpointFreq] = useState(50);
   const [zkMode, setZkMode] = useState<'off' | 'always' | 'risk'>('off');
   const [zkCheckpointFreq, setZkCheckpointFreq] = useState(5);

@@ -414,7 +414,7 @@ async fn test_mpc_vs_native_real_mnist() {
     for step in 0..num_steps {
         let idx = step % train_pairs.len();
         let (ref input, ref target) = train_pairs[idx];
-        let result = native.training_step_mse(input, target, step as u64);
+        let result = native.training_step_ce(input, target, step as u64);
         native_losses.push(result.loss);
     }
     let native_accuracy = native.evaluate(&test_pairs);

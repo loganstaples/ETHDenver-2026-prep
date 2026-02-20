@@ -113,6 +113,12 @@ pub struct TrainingJobRequest {
     /// Demo feature: simulate a cheater
     #[serde(default)]
     pub simulate_cheater: bool,
+    /// Which party should cheat (0-indexed, only when simulate_cheater is true)
+    #[serde(default)]
+    pub cheater_party: Option<usize>,
+    /// At which step the cheater corrupts (only when simulate_cheater is true)
+    #[serde(default)]
+    pub cheater_step: Option<u64>,
     /// Random seed
     #[serde(default = "default_seed")]
     pub seed: u64,
@@ -151,8 +157,8 @@ fn default_mac_interval() -> u64 { 0 }
 fn default_zk_mode() -> String { "off".to_string() }
 fn default_zk_checkpoint_freq() -> u64 { 5 }
 fn default_min_workers() -> usize { 2 }
-fn default_train_size() -> usize { 1000 }
-fn default_test_size() -> usize { 200 }
+fn default_train_size() -> usize { 5000 }
+fn default_test_size() -> usize { 500 }
 fn default_payment() -> f64 { 1.0 }
 fn default_stake() -> f64 { 0.1 }
 fn default_seed() -> u64 { 42 }
@@ -1309,11 +1315,21 @@ async fn start_training_handler(
         enable_withdrawal: false,
         #[cfg(feature = "chain")]
         pre_registered_job_id: req.job_id,
+        #[cfg(feature = "chain")]
+        model_store_address: None,
+        #[cfg(feature = "chain")]
+        model_slug: None,
+        #[cfg(feature = "chain")]
+        model_name: None,
+        #[cfg(feature = "chain")]
+        model_description: None,
         // Auto-detect: registered remote workers → distributed, otherwise local (single-machine)
         distributed: use_registered_workers || req.transport == "distributed",
         custom_training_data: None,
         worker_seeds,
         simulate_cheater: req.simulate_cheater,
+        cheater_party: req.cheater_party,
+        cheater_step: req.cheater_step,
     };
 
     // Set private keys: prefer TESTNET_PRIVATE_KEY env var, fall back to Anvil defaults.

@@ -917,7 +917,7 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
     ///         Only possible if the worker is not currently assigned to a job.
     function deregisterFromPool() external nonReentrant {
         if (_poolWorkerIndex[msg.sender] == 0) revert WorkerNotInPool();
-        if (poolWorkers[msg.sender].activeJobId != 0) revert WorkerBusy();
+        if (!poolWorkers[msg.sender].available) revert WorkerBusy();
 
         uint256 stake = poolWorkers[msg.sender].stakeAmount;
 

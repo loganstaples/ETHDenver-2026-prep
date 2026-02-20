@@ -316,6 +316,8 @@ pub struct MPCTrainer<T: MPCTransport> {
     auth_beaver_cursor: usize,
     /// RNG for MAC-specific randomness (separate from training RNG).
     mac_rng: ChaCha20Rng,
+    /// Last MAC failure report (stored when MAC check fails, for recovery orchestrator).
+    last_mac_failure_report: Option<MACFailureReport>,
 }
 
 impl<T: MPCTransport> MPCTrainer<T> {
@@ -352,6 +354,7 @@ impl<T: MPCTransport> MPCTrainer<T> {
             auth_beaver_triples: Vec::new(),
             auth_beaver_cursor: 0,
             mac_rng: ChaCha20Rng::seed_from_u64(mac_seed),
+            last_mac_failure_report: None,
         }
     }
 
@@ -653,6 +656,23 @@ impl<T: MPCTransport> MPCTrainer<T> {
         // Save initial checkpoint.
         if let Some(ref mut ms) = self.mac_state {
             ms.save_checkpoint(0, &self.w1, &self.b1, &self.w2, &self.b2, 0, 0);
+        }
+
+        // Exchange initial checkpoint commitments for cheater identification.
+        {
+            let weight_shares: Vec<Fr> = self.w1.iter()
+                .chain(self.b1.iter())
+                .chain(self.w2.iter())
+                .chain(self.b2.iter())
+                .cloned()
+                .collect();
+            let ms = self.mac_state.as_mut().unwrap();
+            mac_verification::exchange_checkpoint_commits(
+                &self.transport,
+                &weight_shares,
+                ms,
+                n,
+            ).await?;
         }
 
         info!(party = self.party_index, "MAC shares initialized");
@@ -2908,6 +2928,20 @@ impl<T: MPCTransport> MPCTrainer<T> {
         let x: Vec<Fr> = input.iter().map(|&v| Fr::from_f64(v)).collect();
         let target_fr: Vec<Fr> = target.iter().map(|&v| Fr::from_f64(v)).collect();
 
+        // Save pre-step weight snapshot for cheater identification.
+        // This captures the state BEFORE computation — if a party corrupted
+        // their shares between steps, this snapshot will differ from their
+        // checkpoint and reveal them as the cheater.
+        if let Some(ref mut ms) = self.mac_state {
+            let snapshot: Vec<Fr> = self.w1.iter()
+                .chain(self.b1.iter())
+                .chain(self.w2.iter())
+                .chain(self.b2.iter())
+                .cloned()
+                .collect();
+            ms.pre_step_shares = Some(snapshot);
+        }
+
         // Get MAC state references.
         let alpha_share = self.mac_state.as_ref()
             .map(|ms| ms.alpha_share)
@@ -3197,6 +3231,7 @@ impl<T: MPCTransport> MPCTrainer<T> {
                         cheater = ?report.identified_cheater,
                         "MAC check failed — halting training"
                     );
+                    self.last_mac_failure_report = Some(report.clone());
                     self.rollback_to_checkpoint();
                     return Err(MPCError::MACCheckFailed {
                         step,
@@ -3211,6 +3246,23 @@ impl<T: MPCTransport> MPCTrainer<T> {
                         &self.w1, &self.b1, &self.w2, &self.b2,
                         self.beaver_cursor, self.auth_beaver_cursor,
                     );
+                }
+
+                // Exchange checkpoint commitments for cheater identification.
+                {
+                    let weight_shares: Vec<Fr> = self.w1.iter()
+                        .chain(self.b1.iter())
+                        .chain(self.w2.iter())
+                        .chain(self.b2.iter())
+                        .cloned()
+                        .collect();
+                    let ms = self.mac_state.as_mut().unwrap();
+                    mac_verification::exchange_checkpoint_commits(
+                        &self.transport,
+                        &weight_shares,
+                        ms,
+                        self.config.num_parties,
+                    ).await?;
                 }
             }
         }
@@ -3357,9 +3409,21 @@ impl<T: MPCTransport> MPCTrainer<T> {
         self.mac_state.as_ref()
     }
 
-    /// Returns the last MAC failure report, if any.
+    /// Returns whether MAC verification is enabled.
     pub fn mac_enabled(&self) -> bool {
         self.mac_state.is_some()
+    }
+
+    /// Returns the last MAC failure report, if any.
+    /// This is populated when a MAC check fails and can be used by the
+    /// recovery orchestrator.
+    pub fn last_mac_failure_report(&self) -> Option<&MACFailureReport> {
+        self.last_mac_failure_report.as_ref()
+    }
+
+    /// Takes the last MAC failure report (consuming it).
+    pub fn take_mac_failure_report(&mut self) -> Option<MACFailureReport> {
+        self.last_mac_failure_report.take()
     }
 
     /// Corrupts this party's weight share (for testing cheater detection).

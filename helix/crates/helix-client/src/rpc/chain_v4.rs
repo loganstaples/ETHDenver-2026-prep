@@ -41,6 +41,12 @@ abigen!(
     "../../contracts/out/MockVerifier.sol/MockVerifier.json"
 );
 
+// HelixModelStore (ERC-721) binding for minting model NFTs after training completion.
+abigen!(
+    HelixModelStoreContract,
+    "../../contracts/out/HelixModelStore.sol/HelixModelStore.json"
+);
+
 // ============ Data Types ============
 
 /// V4 deployment result.
@@ -1351,6 +1357,219 @@ impl ChainClientV4 {
             self.fail().await;
         }
         result
+    }
+}
+
+// ============ Model Store Client ============
+
+/// On-chain client for HelixModelStore (ERC-721 model NFTs).
+///
+/// Used after training completion to mint a model NFT with version metadata.
+pub struct ModelStoreClient {
+    client: Arc<SignedClient>,
+    store: HelixModelStoreContract<SignedClient>,
+    store_address: Address,
+}
+
+/// Result of deploying a new HelixModelStore contract.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ModelStoreDeployResult {
+    pub address: String,
+}
+
+/// Result of creating a model NFT.
+#[derive(Debug, Clone)]
+pub struct CreateModelResult {
+    pub token_id: u64,
+    pub receipt: TransactionReceipt,
+}
+
+impl ModelStoreClient {
+    /// Connect to an existing HelixModelStore contract.
+    pub async fn new(
+        rpc_url: &str,
+        private_key: &str,
+        store_address: &str,
+        chain_id: Option<u64>,
+    ) -> Result<Self> {
+        let provider = Provider::<Http>::try_from(rpc_url)
+            .map_err(|e| anyhow!("Invalid RPC URL: {}", e))?;
+
+        let cid = match chain_id {
+            Some(id) => id,
+            None => provider
+                .get_chainid()
+                .await
+                .map_err(|e| anyhow!("Failed to get chain ID: {}", e))?
+                .as_u64(),
+        };
+
+        let pk = private_key.strip_prefix("0x").unwrap_or(private_key);
+        let wallet = LocalWallet::from_str(pk)
+            .map_err(|e| anyhow!("Invalid private key: {}", e))?
+            .with_chain_id(cid);
+
+        let client = Arc::new(SignerMiddleware::new(provider, wallet));
+        let addr = Address::from_str(store_address)
+            .map_err(|e| anyhow!("Invalid model store address: {}", e))?;
+        let store = HelixModelStoreContract::new(addr, client.clone());
+
+        Ok(Self {
+            client,
+            store,
+            store_address: addr,
+        })
+    }
+
+    /// Connect using a pre-constructed ethers client (shares provider with ChainClientV4).
+    pub fn with_client(client: Arc<SignedClient>, store_address: Address) -> Self {
+        let store = HelixModelStoreContract::new(store_address, client.clone());
+        Self {
+            client,
+            store,
+            store_address,
+        }
+    }
+
+    /// Deploy a new HelixModelStore contract.
+    pub async fn deploy(
+        rpc_url: &str,
+        private_key: &str,
+        chain_id: Option<u64>,
+    ) -> Result<(Self, ModelStoreDeployResult)> {
+        let provider = Provider::<Http>::try_from(rpc_url)
+            .map_err(|e| anyhow!("Invalid RPC URL: {}", e))?;
+
+        let cid = match chain_id {
+            Some(id) => id,
+            None => provider
+                .get_chainid()
+                .await
+                .map_err(|e| anyhow!("Failed to get chain ID: {}", e))?
+                .as_u64(),
+        };
+
+        let pk = private_key.strip_prefix("0x").unwrap_or(private_key);
+        let wallet = LocalWallet::from_str(pk)
+            .map_err(|e| anyhow!("Invalid private key: {}", e))?
+            .with_chain_id(cid);
+
+        let client = Arc::new(SignerMiddleware::new(provider, wallet));
+
+        let contract = HelixModelStoreContract::deploy(client.clone(), ())
+            .map_err(|e| anyhow!("ModelStore deploy prepare: {}", e))?
+            .send()
+            .await
+            .map_err(|e| anyhow!("ModelStore deploy send: {}", e))?;
+
+        let store_address = contract.address();
+        let result = ModelStoreDeployResult {
+            address: format!("{:?}", store_address),
+        };
+
+        Ok((
+            Self {
+                client,
+                store: contract,
+                store_address,
+            },
+            result,
+        ))
+    }
+
+    /// Returns the store contract address.
+    pub fn address(&self) -> Address {
+        self.store_address
+    }
+
+    /// Returns the underlying ethers client.
+    pub fn ethers_client(&self) -> &Arc<SignedClient> {
+        &self.client
+    }
+
+    /// Create a new model NFT with a unique slug.
+    /// Returns the token ID and transaction receipt.
+    pub async fn create_model(
+        &self,
+        slug: &str,
+        name: &str,
+        description: &str,
+        architecture: &str,
+    ) -> Result<CreateModelResult> {
+        let call = self.store.create_model(
+            slug.to_string(),
+            name.to_string(),
+            description.to_string(),
+            architecture.to_string(),
+        );
+        let pending = call
+            .send()
+            .await
+            .map_err(|e| anyhow!("create_model send: {}", e))?;
+        let receipt = pending
+            .await
+            .map_err(|e| anyhow!("create_model receipt: {}", e))?
+            .ok_or_else(|| anyhow!("create_model: tx dropped"))?;
+
+        // Parse token ID from ModelCreated event (first indexed topic after event sig)
+        let token_id = receipt
+            .logs
+            .iter()
+            .find_map(|log| {
+                if log.address == self.store_address && log.topics.len() >= 2 {
+                    Some(U256::from(log.topics[1].as_bytes()).as_u64())
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| anyhow!("ModelCreated event not found in receipt logs"))?;
+
+        Ok(CreateModelResult { token_id, receipt })
+    }
+
+    /// Add a version to an existing model NFT.
+    pub async fn add_version(
+        &self,
+        token_id: u64,
+        semver: &str,
+        root_hash: &str,
+        accuracy: u64,
+        session_id: &str,
+        weights_stored: bool,
+    ) -> Result<TransactionReceipt> {
+        let call = self.store.add_version(
+            U256::from(token_id),
+            semver.to_string(),
+            root_hash.to_string(),
+            accuracy as u128, // u96 fits in u128
+            session_id.to_string(),
+            weights_stored,
+        );
+        let pending = call
+            .send()
+            .await
+            .map_err(|e| anyhow!("add_version send: {}", e))?;
+        pending
+            .await
+            .map_err(|e| anyhow!("add_version receipt: {}", e))?
+            .ok_or_else(|| anyhow!("add_version: tx dropped"))
+    }
+
+    /// Set the model as public (accessible to all for inference).
+    pub async fn set_public(
+        &self,
+        token_id: u64,
+        is_public: bool,
+    ) -> Result<TransactionReceipt> {
+        let call = self.store.set_public(U256::from(token_id), is_public);
+        let pending = call
+            .send()
+            .await
+            .map_err(|e| anyhow!("set_public send: {}", e))?;
+        pending
+            .await
+            .map_err(|e| anyhow!("set_public receipt: {}", e))?
+            .ok_or_else(|| anyhow!("set_public: tx dropped"))
     }
 }
 

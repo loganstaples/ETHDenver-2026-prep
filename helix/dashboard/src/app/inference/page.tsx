@@ -61,7 +61,7 @@ type WeightFetchStatus = 'idle' | 'fetching' | 'decrypting' | 'uploading' | 'don
 
 const CANVAS_SIZE = 280;
 const GRID_SIZE = 28;
-const BRUSH_RADIUS = 12;
+const BRUSH_RADIUS = 10;
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
 const BASE_INFERENCE_COST = 0.001; // ADI per inference
 
@@ -145,14 +145,76 @@ function DrawingCanvas({ onPixelsReady, canvasRef }: DrawingCanvasProps) {
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
-    const tempCanvas = document.createElement('canvas');
-    tempCanvas.width = GRID_SIZE;
-    tempCanvas.height = GRID_SIZE;
-    const tempCtx = tempCanvas.getContext('2d')!;
-    tempCtx.imageSmoothingEnabled = true;
-    tempCtx.imageSmoothingQuality = 'high';
-    tempCtx.drawImage(canvas, 0, 0, GRID_SIZE, GRID_SIZE);
-    const imageData = tempCtx.getImageData(0, 0, GRID_SIZE, GRID_SIZE);
+
+    // Get the raw canvas image data at full resolution
+    const fullData = ctx.getImageData(0, 0, CANVAS_SIZE, CANVAS_SIZE);
+
+    // Find bounding box of the drawn content
+    let minX = CANVAS_SIZE, minY = CANVAS_SIZE, maxX = 0, maxY = 0;
+    for (let y = 0; y < CANVAS_SIZE; y++) {
+      for (let x = 0; x < CANVAS_SIZE; x++) {
+        if (fullData.data[(y * CANVAS_SIZE + x) * 4] > 10) {
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+        }
+      }
+    }
+
+    if (maxX <= minX || maxY <= minY) {
+      onPixelsReady([]);
+      return;
+    }
+
+    // Step 1: Scale digit to fit in 20x20, preserving aspect ratio
+    const bw = maxX - minX + 1;
+    const bh = maxY - minY + 1;
+    const targetSize = 20;
+    const scale = targetSize / Math.max(bw, bh);
+    const scaledW = Math.round(bw * scale);
+    const scaledH = Math.round(bh * scale);
+
+    // First render the scaled digit to a temp canvas (top-left)
+    const tmpCanvas = document.createElement('canvas');
+    tmpCanvas.width = scaledW;
+    tmpCanvas.height = scaledH;
+    const tmpCtx = tmpCanvas.getContext('2d')!;
+    tmpCtx.fillStyle = '#000000';
+    tmpCtx.fillRect(0, 0, scaledW, scaledH);
+    tmpCtx.imageSmoothingEnabled = true;
+    tmpCtx.imageSmoothingQuality = 'high';
+    tmpCtx.drawImage(canvas, minX, minY, bw, bh, 0, 0, scaledW, scaledH);
+
+    // Step 2: Compute center of mass of the scaled digit
+    const tmpData = tmpCtx.getImageData(0, 0, scaledW, scaledH);
+    let massX = 0, massY = 0, totalMass = 0;
+    for (let y = 0; y < scaledH; y++) {
+      for (let x = 0; x < scaledW; x++) {
+        const val = tmpData.data[(y * scaledW + x) * 4];
+        massX += x * val;
+        massY += y * val;
+        totalMass += val;
+      }
+    }
+
+    // Step 3: Place digit so center of mass lands at (14, 14) — center of 28x28
+    // This matches MNIST's preprocessing exactly
+    const comX = totalMass > 0 ? massX / totalMass : scaledW / 2;
+    const comY = totalMass > 0 ? massY / totalMass : scaledH / 2;
+    const offsetX = Math.round(14 - comX);
+    const offsetY = Math.round(14 - comY);
+
+    // Step 4: Draw into final 28x28 canvas
+    const outCanvas = document.createElement('canvas');
+    outCanvas.width = GRID_SIZE;
+    outCanvas.height = GRID_SIZE;
+    const outCtx = outCanvas.getContext('2d')!;
+    outCtx.fillStyle = '#000000';
+    outCtx.fillRect(0, 0, GRID_SIZE, GRID_SIZE);
+    outCtx.drawImage(tmpCanvas, offsetX, offsetY);
+
+    const imageData = outCtx.getImageData(0, 0, GRID_SIZE, GRID_SIZE);
     const pixels: number[] = [];
     for (let i = 0; i < GRID_SIZE * GRID_SIZE; i++) {
       pixels.push(imageData.data[i * 4] / 255);
@@ -218,18 +280,87 @@ function ImageUpload({ onPixelsReady, canvasRef }: ImageUploadProps) {
           if (!ctx) return;
           ctx.fillStyle = '#000000';
           ctx.fillRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
-          const scale = Math.min(CANVAS_SIZE / img.width, CANVAS_SIZE / img.height);
-          const w = img.width * scale;
-          const h = img.height * scale;
+          const imgScale = Math.min(CANVAS_SIZE / img.width, CANVAS_SIZE / img.height);
+          const w = img.width * imgScale;
+          const h = img.height * imgScale;
           ctx.drawImage(img, (CANVAS_SIZE - w) / 2, (CANVAS_SIZE - h) / 2, w, h);
-          const tempCanvas = document.createElement('canvas');
-          tempCanvas.width = GRID_SIZE;
-          tempCanvas.height = GRID_SIZE;
-          const tempCtx = tempCanvas.getContext('2d')!;
-          tempCtx.imageSmoothingEnabled = true;
-          tempCtx.imageSmoothingQuality = 'high';
-          tempCtx.drawImage(canvas, 0, 0, GRID_SIZE, GRID_SIZE);
-          const imageData = tempCtx.getImageData(0, 0, GRID_SIZE, GRID_SIZE);
+
+          // Convert to grayscale and find bounding box
+          const fullData = ctx.getImageData(0, 0, CANVAS_SIZE, CANVAS_SIZE);
+          let minX = CANVAS_SIZE, minY = CANVAS_SIZE, maxX = 0, maxY = 0;
+          for (let y = 0; y < CANVAS_SIZE; y++) {
+            for (let x = 0; x < CANVAS_SIZE; x++) {
+              const idx = (y * CANVAS_SIZE + x) * 4;
+              const gray = 0.299 * fullData.data[idx] + 0.587 * fullData.data[idx + 1] + 0.114 * fullData.data[idx + 2];
+              if (gray > 10) {
+                if (x < minX) minX = x;
+                if (x > maxX) maxX = x;
+                if (y < minY) minY = y;
+                if (y > maxY) maxY = y;
+              }
+            }
+          }
+
+          if (maxX > minX && maxY > minY) {
+            // Step 1: Scale digit to fit in 20x20, preserving aspect ratio
+            const bw = maxX - minX + 1;
+            const bh = maxY - minY + 1;
+            const targetSize = 20;
+            const fitScale = targetSize / Math.max(bw, bh);
+            const scaledW = Math.round(bw * fitScale);
+            const scaledH = Math.round(bh * fitScale);
+
+            // Render scaled digit to temp canvas
+            const tmpCanvas = document.createElement('canvas');
+            tmpCanvas.width = scaledW;
+            tmpCanvas.height = scaledH;
+            const tmpCtx = tmpCanvas.getContext('2d')!;
+            tmpCtx.fillStyle = '#000000';
+            tmpCtx.fillRect(0, 0, scaledW, scaledH);
+            tmpCtx.imageSmoothingEnabled = true;
+            tmpCtx.imageSmoothingQuality = 'high';
+            tmpCtx.drawImage(canvas, minX, minY, bw, bh, 0, 0, scaledW, scaledH);
+
+            // Step 2: Compute center of mass
+            const tmpData = tmpCtx.getImageData(0, 0, scaledW, scaledH);
+            let massX = 0, massY = 0, totalMass = 0;
+            for (let py = 0; py < scaledH; py++) {
+              for (let px = 0; px < scaledW; px++) {
+                const idx = (py * scaledW + px) * 4;
+                const gray = 0.299 * tmpData.data[idx] + 0.587 * tmpData.data[idx + 1] + 0.114 * tmpData.data[idx + 2];
+                massX += px * gray;
+                massY += py * gray;
+                totalMass += gray;
+              }
+            }
+
+            // Step 3: Place so center of mass is at (14, 14)
+            const comX = totalMass > 0 ? massX / totalMass : scaledW / 2;
+            const comY = totalMass > 0 ? massY / totalMass : scaledH / 2;
+            const offsetX = Math.round(14 - comX);
+            const offsetY = Math.round(14 - comY);
+
+            // Step 4: Draw into final 28x28
+            const outCanvas = document.createElement('canvas');
+            outCanvas.width = GRID_SIZE;
+            outCanvas.height = GRID_SIZE;
+            const outCtx = outCanvas.getContext('2d')!;
+            outCtx.fillStyle = '#000000';
+            outCtx.fillRect(0, 0, GRID_SIZE, GRID_SIZE);
+            outCtx.drawImage(tmpCanvas, offsetX, offsetY);
+
+            var imageData = outCtx.getImageData(0, 0, GRID_SIZE, GRID_SIZE);
+          } else {
+            const tempCanvas = document.createElement('canvas');
+            tempCanvas.width = GRID_SIZE;
+            tempCanvas.height = GRID_SIZE;
+            const tempCtx = tempCanvas.getContext('2d')!;
+            tempCtx.fillStyle = '#000000';
+            tempCtx.fillRect(0, 0, GRID_SIZE, GRID_SIZE);
+            tempCtx.drawImage(canvas, 0, 0, GRID_SIZE, GRID_SIZE);
+            var imageData = tempCtx.getImageData(0, 0, GRID_SIZE, GRID_SIZE);
+          }
+
           const pixels: number[] = [];
           for (let i = 0; i < GRID_SIZE * GRID_SIZE; i++) {
             const r = imageData.data[i * 4];
@@ -757,7 +888,23 @@ function InferencePageInner() {
 
   // Run inference (owner: direct, non-owner: after payment confirmation)
   const runInference = useCallback(async (paymentTxHash?: string) => {
-    if (!pixels.length) return;
+    console.log('[Inference] runInference called', {
+      pixelsLength: pixels.length,
+      hasDrawing: pixels.length > 0 && pixels.some(p => p > 0.01),
+      activeSessionId,
+      selectedModel: selectedModel?.tokenId ?? null,
+      weightFetchStatus,
+      backendWeightsReady,
+      isOwnerOfSelected,
+    });
+
+    if (!pixels.length) {
+      console.warn('[Inference] No pixels, aborting');
+      setError('No drawing detected — please draw a digit first');
+      setPhase('error');
+      return;
+    }
+
     setPhase('submitting');
     setError(null);
     setResult(null);
@@ -765,27 +912,31 @@ function InferencePageInner() {
     try {
       // Model-based inference (non-owner with cached weights, or owner with model selected)
       const useModelEndpoint = selectedModel && (backendWeightsReady || isOwnerOfSelected);
+      const body = useModelEndpoint ? {
+        model_token_id: selectedModel.tokenId,
+        model_version_index: selectedVersionIndex,
+        pixels,
+        num_parties: 3,
+        wallet_address: isOwnerOfSelected ? address : undefined,
+        payment_tx: paymentTxHash,
+      } : {
+        session_id: activeSessionId,
+        pixels,
+        num_parties: 3,
+      };
+      console.log('[Inference] Sending request', { useModelEndpoint, sessionId: activeSessionId, pixelsSample: pixels.slice(0, 5) });
+
       const res = await fetch('/api/inference', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(useModelEndpoint ? {
-          model_token_id: selectedModel.tokenId,
-          model_version_index: selectedVersionIndex,
-          pixels,
-          num_parties: 3,
-          wallet_address: isOwnerOfSelected ? address : undefined,
-          payment_tx: paymentTxHash,
-        } : {
-          session_id: activeSessionId,
-          pixels,
-          num_parties: 3,
-        }),
+        body: JSON.stringify(body),
       });
       if (!res.ok) {
         const errBody = await res.json().catch(() => ({}));
         throw new Error(errBody.error || `Inference HTTP ${res.status}`);
       }
       const data: MPCInferenceResult = await res.json();
+      console.log('[Inference] Success', { prediction: data.prediction, confidence: data.confidence });
       setResult(data);
       setPhase('done');
 
@@ -815,7 +966,7 @@ function InferencePageInner() {
       setError(err instanceof Error ? err.message : 'Inference failed');
       setPhase('error');
     }
-  }, [activeSessionId, pixels, selectedModel, selectedVersionIndex, backendWeightsReady, isOwnerOfSelected, address]);
+  }, [activeSessionId, pixels, selectedModel, selectedVersionIndex, backendWeightsReady, isOwnerOfSelected, address, weightFetchStatus]);
 
   // Non-owner: initiate on-chain payment then run inference
   const handlePayAndRun = useCallback(() => {
@@ -841,9 +992,11 @@ function InferencePageInner() {
   const hasDrawing = pixels.length > 0 && pixels.some((p) => p > 0.01);
   const isRunning = phase === 'submitting';
   const weightsReady = weightFetchStatus === 'done';
-  const canRunInference = isOwnerOfSelected
+  const canRunInference = !selectedModel
     ? weightsReady && hasDrawing && !isRunning && !!activeSessionId
-    : backendWeightsReady && hasDrawing && !isRunning && !isPaymentPending && !isPaymentConfirming;
+    : isOwnerOfSelected
+      ? weightsReady && hasDrawing && !isRunning && !!activeSessionId
+      : backendWeightsReady && hasDrawing && !isRunning && !isPaymentPending && !isPaymentConfirming;
 
   // Select model handler
   const handleSelectModel = useCallback((model: PublicModel) => {
@@ -1203,7 +1356,7 @@ function InferencePageInner() {
             {/* Run button */}
             <motion.button
               type="button"
-              onClick={isOwnerOfSelected ? () => runInference() : handlePayAndRun}
+              onClick={isOwnerOfSelected || !selectedModel ? () => runInference() : handlePayAndRun}
               disabled={!canRunInference}
               whileTap={canRunInference ? { scale: 0.98 } : {}}
               className={cn(
@@ -1220,7 +1373,7 @@ function InferencePageInner() {
                 <><Loader2 size={22} className="animate-spin" /> Confirming Payment...</>
               ) : isRunning ? (
                 <><Loader2 size={22} className="animate-spin" /> Running MPC Inference...</>
-              ) : isOwnerOfSelected ? (
+              ) : isOwnerOfSelected || !selectedModel ? (
                 <><Shield size={22} /> Run Inference</>
               ) : (
                 <><Coins size={22} /> Pay &amp; Run Inference</>

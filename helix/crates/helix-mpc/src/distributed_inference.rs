@@ -311,4 +311,73 @@ mod tests {
         // Verify confidence is reasonable
         assert!(results[0].confidence > 0.0 && results[0].confidence <= 1.0);
     }
+
+    /// Compare MPC distributed inference against a known-correct plaintext forward pass.
+    #[tokio::test]
+    async fn test_mpc_matches_plaintext() {
+        let num_parties = 3;
+        let d_in = 8;
+        let d_hid = 4;
+        let d_out = 3;
+
+        let mut rng = rand::thread_rng();
+        let w1: Vec<f64> = (0..d_hid * d_in).map(|_| rng.gen_range(-0.5..0.5)).collect();
+        let b1: Vec<f64> = (0..d_hid).map(|_| rng.gen_range(-0.1..0.1)).collect();
+        let w2: Vec<f64> = (0..d_out * d_hid).map(|_| rng.gen_range(-0.5..0.5)).collect();
+        let b2: Vec<f64> = (0..d_out).map(|_| rng.gen_range(-0.1..0.1)).collect();
+        let input: Vec<f64> = (0..d_in).map(|_| rng.gen_range(0.0..1.0)).collect();
+
+        // Plaintext forward pass (ground truth)
+        let mut hidden = vec![0.0f64; d_hid];
+        for h in 0..d_hid {
+            let mut sum = b1[h];
+            for j in 0..d_in {
+                sum += w1[h * d_in + j] * input[j];
+            }
+            hidden[h] = sum.max(0.0);
+        }
+        let mut logits = vec![0.0f64; d_out];
+        for o in 0..d_out {
+            let mut sum = b2[o];
+            for h in 0..d_hid {
+                sum += w2[o * d_hid + h] * hidden[h];
+            }
+            logits[o] = sum;
+        }
+        let plain_probs = softmax(&logits);
+        let plain_pred = plain_probs.iter().enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
+
+        // MPC distributed forward pass
+        let w1_shares = share_vector(&w1, num_parties);
+        let b1_shares = share_vector(&b1, num_parties);
+        let w2_shares = share_vector(&w2, num_parties);
+        let b2_shares = share_vector(&b2, num_parties);
+
+        let parties: Vec<PartyId> = (0..num_parties).map(|i| PartyId::from_index(i)).collect();
+        let transports = LocalTransport::create_mesh(&parties);
+
+        let mut handles = Vec::new();
+        for (i, transport) in transports.into_iter().enumerate() {
+            let shares = WorkerWeightShares {
+                w1: w1_shares[i].clone(),
+                b1: b1_shares[i].clone(),
+                w2: w2_shares[i].clone(),
+                b2: b2_shares[i].clone(),
+            };
+            let inp = input.clone();
+            handles.push(tokio::spawn(async move {
+                distributed_forward_pass(&transport, &shares, &inp, d_in, d_hid, d_out).await
+            }));
+        }
+
+        let mpc_result = handles.into_iter().next().unwrap().await.unwrap().unwrap();
+
+        for (i, (p, m)) in plain_probs.iter().zip(mpc_result.probabilities.iter()).enumerate() {
+            let diff = (p - m).abs();
+            assert!(diff < 0.05, "Class {} probability mismatch: plain={} mpc={}", i, p, m);
+        }
+        assert_eq!(plain_pred, mpc_result.prediction,
+            "Prediction mismatch: plaintext={} mpc={}", plain_pred, mpc_result.prediction);
+    }
 }

@@ -868,6 +868,10 @@ impl WorkerRunner {
                     mac_checks_passed: result.mac_checks_passed,
                     cheater_detected: result.cheater_detected.is_some(),
                     cheater_party: result.cheater_detected.as_ref().map(|c| c.party_index),
+                    cheater_detected_at_step: result.cheater_detected.as_ref()
+                        .map(|c| c.detected_at_step).unwrap_or(0),
+                    mac_failure_report: result.cheater_detected.as_ref()
+                        .map(|c| c.failure_report.clone()),
                     encrypted_final_share: result.encrypted_final_share.clone(),
                     checkpoints: slim_checkpoints,
                 };

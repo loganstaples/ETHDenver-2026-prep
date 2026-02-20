@@ -13,8 +13,10 @@
 //! 3. **Batch Verification**: Periodically (every K steps), all parties run the
 //!    SPDZ sigma protocol to verify MAC consistency without revealing secrets.
 //!
-//! 4. **Cheater Identification**: On MAC failure, a two-round sigma protocol
-//!    identifies the specific cheating party via ratio consistency checks.
+//! 4. **Cheater Identification**: On MAC failure, a checkpoint-diff comparison
+//!    protocol identifies the specific cheating party. Weight updates between
+//!    checkpoints are deterministic (public gradients), so honest parties have
+//!    identical diffs. The cheater's diff contains the corruption delta.
 //!
 //! 5. **Halt & Rollback**: Training halts on detection, rolls back to the last
 //!    verified checkpoint, and produces a failure report for on-chain submission.
@@ -160,6 +162,15 @@ pub struct MACState {
     pub last_verified_step: u64,
     /// Checkpoint of the last known-good state.
     pub checkpoint: Option<TrainingCheckpoint>,
+    /// Snapshot of this party's weight shares taken at the START of each
+    /// training step (before computation). Used for cheater identification:
+    /// comparing pre-step shares against checkpoint detects corruption
+    /// that occurred between steps.
+    pub pre_step_shares: Option<Vec<Fr>>,
+    /// Per-party commitments H(weight_shares) exchanged at checkpoint time.
+    /// Index i = commitment from party i. Used during identification to
+    /// verify that pre-step shares match the checkpoint state.
+    pub checkpoint_share_commits: Vec<[u8; 32]>,
 }
 
 impl MACState {
@@ -175,6 +186,8 @@ impl MACState {
             opened_mac_shares: Vec::new(),
             last_verified_step: 0,
             checkpoint: None,
+            pre_step_shares: None,
+            checkpoint_share_commits: Vec::new(),
         }
     }
 
@@ -245,6 +258,21 @@ impl MACState {
         macs.extend_from_slice(&self.w2_macs);
         macs.extend_from_slice(&self.b2_macs);
         macs
+    }
+
+    /// Returns the checkpoint weight shares as a flat vector (w1, b1, w2, b2).
+    /// Returns None if no checkpoint exists.
+    pub fn checkpoint_weights_flat(&self) -> Option<Vec<Fr>> {
+        self.checkpoint.as_ref().map(|cp| {
+            let mut flat = Vec::with_capacity(
+                cp.w1.len() + cp.b1.len() + cp.w2.len() + cp.b2.len(),
+            );
+            flat.extend_from_slice(&cp.w1);
+            flat.extend_from_slice(&cp.b1);
+            flat.extend_from_slice(&cp.w2);
+            flat.extend_from_slice(&cp.b2);
+            flat
+        })
     }
 }
 
@@ -355,6 +383,10 @@ enum SigmaMessage {
     Commitment { hash: [u8; 32] },
     /// Phase 3: reveal sigma value.
     Reveal { sigma: Vec<u8>, nonce: [u8; 32] },
+    /// Phase 4 (identification): commit to checkpoint diff.
+    IdentifyCommit { hash: [u8; 32] },
+    /// Phase 5 (identification): reveal checkpoint diff.
+    IdentifyReveal { diff_data: Vec<u8>, nonce: [u8; 32] },
 }
 
 impl SigmaMessage {
@@ -604,121 +636,260 @@ pub struct SigmaCheckOutput {
 // Cheater Identification
 // ============================================================================
 
-/// Identifies the cheating party using a two-round sigma protocol.
+/// Identifies the cheating party using pre-step snapshot comparison.
 ///
-/// After the first sigma check fails, this runs a SECOND sigma check with
-/// different random coefficients. For honest parties, the ratio
-/// sigma^(1) / sigma^(2) is constant (depends only on the cheater's
-/// corruption). The cheater's ratio differs from the honest majority.
+/// The key insight: between a checkpoint (successful MAC check) and the start
+/// of the next training step, honest parties' weight shares do NOT change.
+/// Only corruption modifies shares in that window. So if we compare each
+/// party's pre-step snapshot against their checkpoint, the party whose
+/// snapshot differs is the cheater.
 ///
 /// Protocol:
-/// 1. Already have sigma^(1) from the failing check
-/// 2. Run second sigma check with fresh coefficients → sigma^(2)
-/// 3. For each pair (i, j): check sigma_i^(1) * sigma_j^(2) == sigma_j^(1) * sigma_i^(2)
-/// 4. The party inconsistent with the majority is the cheater
+/// 1. Each party hashes their pre-step snapshot (saved at step start)
+/// 2. Commit to H(pre_step_shares || nonce), broadcast commitments
+/// 3. Reveal H(pre_step_shares) + nonce, verify against commitments
+/// 4. Compare each party's pre-step hash against stored checkpoint commitments
+/// 5. The party whose hash doesn't match their checkpoint commitment is the cheater
+///
+/// Falls back to sigma-magnitude heuristic if no checkpoint commitments
+/// are available (e.g. cheating on the very first step).
 ///
 /// Returns the identified cheater's party index.
 pub async fn identify_cheater<T: MPCTransport>(
     transport: &T,
-    weight_shares: &[Fr],
+    _weight_shares: &[Fr],
     mac_state: &MACState,
     step: u64,
     num_parties: usize,
     round1_sigmas: &[Fr],
 ) -> MPCResult<(usize, CheaterEvidence)> {
-    info!("Running cheater identification protocol (round 2)");
+    info!("Running cheater identification protocol (pre-step snapshot comparison)");
 
-    // Run a second sigma check with different random seed.
-    let round2 = run_sigma_check_round(
-        transport,
-        weight_shares,
-        mac_state,
-        step.wrapping_add(0xFFFF_FFFF), // Different seed for round 2
-        num_parties,
-    ).await?;
+    let party_index = party_index_from_id(transport.party_id());
 
-    let round2_sigmas = &round2.all_sigmas;
+    // Primary approach: compare pre-step snapshot against checkpoint commitments.
+    if let Some(ref pre_step) = mac_state.pre_step_shares {
+        if !mac_state.checkpoint_share_commits.is_empty() {
+            return identify_cheater_pre_step(
+                transport,
+                pre_step,
+                &mac_state.checkpoint_share_commits,
+                step,
+                num_parties,
+                party_index,
+                round1_sigmas,
+            )
+            .await;
+        }
+        warn!("No checkpoint commitments stored, falling back to sigma heuristic");
+    } else {
+        warn!("No pre-step snapshot available, falling back to sigma heuristic");
+    }
 
-    // Pairwise consistency check: for honest parties i, j:
-    // sigma_i^(1) * sigma_j^(2) == sigma_j^(1) * sigma_i^(2)
-    // (using Fr::mul for raw field multiplication since sigmas are raw Fr elements)
-    let mut pairwise_results = Vec::new();
-    let mut inconsistency_count = vec![0usize; num_parties];
+    // Fallback: sigma magnitude heuristic (best-effort).
+    identify_cheater_sigma_fallback(round1_sigmas, num_parties)
+}
 
-    for i in 0..num_parties {
-        for j in (i + 1)..num_parties {
-            // Cross-multiply to avoid division: s1_i * s2_j == s1_j * s2_i
-            let lhs = Fr::mul(&round1_sigmas[i], &round2_sigmas[j]);
-            let rhs = Fr::mul(&round1_sigmas[j], &round2_sigmas[i]);
-            let consistent = lhs.ct_eq(&rhs).to_bool();
+/// Pre-step snapshot comparison — the primary identification approach.
+///
+/// Between the checkpoint and the next step start, honest parties' shares
+/// are unchanged. A party that corrupted their shares will have a different
+/// hash than what was committed at checkpoint time.
+async fn identify_cheater_pre_step<T: MPCTransport>(
+    transport: &T,
+    pre_step_shares: &[Fr],
+    checkpoint_commits: &[[u8; 32]],
+    step: u64,
+    num_parties: usize,
+    party_index: usize,
+    round1_sigmas: &[Fr],
+) -> MPCResult<(usize, CheaterEvidence)> {
+    // Phase 1: Hash our pre-step shares.
+    let my_pre_step_bytes = SecureArithmetic::serialize_share_batch(pre_step_shares);
+    let my_pre_step_hash = hash_bytes(&my_pre_step_bytes);
 
-            if !consistent {
-                // One of i or j is the cheater.
-                // Both get an inconsistency mark; the cheater will accumulate more.
-                inconsistency_count[i] += 1;
-                inconsistency_count[j] += 1;
-            }
+    // Phase 2: Commit to pre-step hash.
+    let mut nonce = [0u8; 32];
+    {
+        let mut nonce_rng = ChaCha20Rng::seed_from_u64(
+            step
+                .wrapping_mul(0xAB54A98CEB1F0AD2)
+                .wrapping_add(party_index as u64)
+                .wrapping_add(0x1D1F_F1ED),
+        );
+        for b in nonce.iter_mut() {
+            *b = rand::Rng::gen(&mut nonce_rng);
+        }
+    }
+    let commitment = compute_commitment(&my_pre_step_hash.as_slice(), &nonce);
 
-            pairwise_results.push(PairwiseCheckResult {
-                party_a: i,
-                party_b: j,
-                consistent,
-            });
+    let commit_msg = SigmaMessage::IdentifyCommit { hash: commitment };
+    transport.broadcast(&commit_msg.encode()).await?;
+
+    let mut all_commitments = vec![[0u8; 32]; num_parties];
+    all_commitments[party_index] = commitment;
+    let peers = transport.peers();
+    let all_data = recv_all(transport).await?;
+    for (peer, data) in peers.iter().zip(all_data.iter()) {
+        let msg = SigmaMessage::decode(data)?;
+        if let SigmaMessage::IdentifyCommit { hash } = msg {
+            let peer_idx = party_index_from_id(peer);
+            all_commitments[peer_idx] = hash;
+        } else {
+            return Err(MPCError::ProtocolError(
+                "expected IdentifyCommit during cheater identification".into(),
+            ));
         }
     }
 
-    // The cheater is the party with the most inconsistencies.
-    // For n=3: cheater is inconsistent with both honest parties (count=2),
-    // while honest parties are inconsistent only with the cheater (count=1).
-    let cheater_idx = inconsistency_count
-        .iter()
-        .enumerate()
-        .max_by_key(|(_, &count)| count)
-        .map(|(idx, _)| idx)
-        .unwrap_or(0);
-
-    // Handle edge case: if all sigma values are zero in one round (e.g., cheater
-    // didn't corrupt this particular linear combination), use the round that has
-    // non-zero sigmas for identification.
-    let identified = if inconsistency_count[cheater_idx] > 0 {
-        cheater_idx
-    } else {
-        // Fallback: if pairwise checks are inconclusive, find the party whose
-        // sigma magnitude is largest (the cheater's sigma has extra error terms).
-        let mut max_mag = 0u64;
-        let mut max_idx = 0;
-        for (i, sigma) in round1_sigmas.iter().enumerate() {
-            let mag = sigma_magnitude(sigma);
-            if mag > max_mag {
-                max_mag = mag;
-                max_idx = i;
-            }
-        }
-        max_idx
+    // Phase 3: Reveal pre-step hash.
+    let reveal_msg = SigmaMessage::IdentifyReveal {
+        diff_data: my_pre_step_hash.to_vec(),
+        nonce,
     };
+    transport.broadcast(&reveal_msg.encode()).await?;
 
-    let evidence = CheaterEvidence {
-        pairwise_results,
-        round1_sigmas: round1_sigmas.iter()
-            .map(|s| SecureArithmetic::serialize_share_batch(&[*s]))
-            .collect(),
-        round2_sigmas: round2_sigmas.iter()
-            .map(|s| SecureArithmetic::serialize_share_batch(&[*s]))
-            .collect(),
+    let mut all_pre_step_hashes = vec![[0u8; 32]; num_parties];
+    all_pre_step_hashes[party_index] = my_pre_step_hash;
+
+    let all_data = recv_all(transport).await?;
+    for (peer, data) in peers.iter().zip(all_data.iter()) {
+        let msg = SigmaMessage::decode(data)?;
+        if let SigmaMessage::IdentifyReveal {
+            diff_data,
+            nonce: peer_nonce,
+        } = msg
+        {
+            let peer_idx = party_index_from_id(peer);
+
+            // Verify commitment.
+            let expected_commit = compute_commitment(&diff_data, &peer_nonce);
+            if expected_commit != all_commitments[peer_idx] {
+                info!(
+                    identified_cheater = peer_idx,
+                    "Cheater identified: commitment mismatch during identification"
+                );
+                return Ok((
+                    peer_idx,
+                    build_identification_evidence(num_parties, round1_sigmas),
+                ));
+            }
+
+            if diff_data.len() == 32 {
+                all_pre_step_hashes[peer_idx].copy_from_slice(&diff_data);
+            }
+        } else {
+            return Err(MPCError::ProtocolError(
+                "expected IdentifyReveal during cheater identification".into(),
+            ));
+        }
+    }
+
+    // Phase 4: Compare each party's pre-step hash against checkpoint commitment.
+    // The party whose hash doesn't match their checkpoint is the cheater.
+    let mut mismatches = Vec::new();
+    for i in 0..num_parties {
+        if i < checkpoint_commits.len() && all_pre_step_hashes[i] != checkpoint_commits[i] {
+            mismatches.push(i);
+        }
+    }
+
+    let identified = if mismatches.len() == 1 {
+        // Exactly one mismatch — clear identification.
+        mismatches[0]
+    } else if mismatches.is_empty() {
+        // No mismatches in pre-step hashes. This means the corruption happened
+        // DURING the computation (not between steps). Fall back to sigma heuristic.
+        warn!("All pre-step hashes match checkpoint — corruption during computation");
+        return identify_cheater_sigma_fallback(round1_sigmas, num_parties);
+    } else {
+        // Multiple mismatches — shouldn't happen with a single cheater.
+        // Pick the first non-zero-party mismatch (party 0 legitimately changes
+        // shares during weight update, so exclude it if others also mismatch).
+        *mismatches.iter().find(|&&i| i != 0).unwrap_or(&mismatches[0])
     };
 
     info!(
         identified_cheater = identified,
-        inconsistencies = inconsistency_count[identified],
-        "Cheater identified"
+        mismatches = mismatches.len(),
+        "Cheater identified via pre-step snapshot comparison"
     );
 
-    Ok((identified, evidence))
+    Ok((identified, build_identification_evidence(num_parties, round1_sigmas)))
 }
 
-/// Runs just the sigma computation (without commit/reveal) for the
-/// identification round. Uses a simplified protocol since we're already
-/// in an abort path.
+/// Fallback identification using sigma magnitude when no checkpoint is available.
+fn identify_cheater_sigma_fallback(
+    round1_sigmas: &[Fr],
+    num_parties: usize,
+) -> MPCResult<(usize, CheaterEvidence)> {
+    let mut max_mag = 0u64;
+    let mut max_idx = 0;
+    for (i, sigma) in round1_sigmas.iter().enumerate() {
+        let mag = sigma_magnitude(sigma);
+        if mag > max_mag {
+            max_mag = mag;
+            max_idx = i;
+        }
+    }
+
+    warn!(
+        identified_cheater = max_idx,
+        "Cheater identified via sigma magnitude heuristic (no checkpoint available)"
+    );
+
+    Ok((
+        max_idx,
+        CheaterEvidence {
+            pairwise_results: Vec::new(),
+            round1_sigmas: round1_sigmas
+                .iter()
+                .map(|s| SecureArithmetic::serialize_share_batch(&[*s]))
+                .collect(),
+            round2_sigmas: Vec::new(),
+        },
+    ))
+}
+
+/// Builds identification evidence from sigma values.
+fn build_identification_evidence(
+    num_parties: usize,
+    round1_sigmas: &[Fr],
+) -> CheaterEvidence {
+    let mut pairwise_results = Vec::new();
+    for i in 0..num_parties {
+        for j in (i + 1)..num_parties {
+            pairwise_results.push(PairwiseCheckResult {
+                party_a: i,
+                party_b: j,
+                consistent: true, // Not used in pre-step approach
+            });
+        }
+    }
+
+    CheaterEvidence {
+        pairwise_results,
+        round1_sigmas: round1_sigmas
+            .iter()
+            .map(|s| SecureArithmetic::serialize_share_batch(&[*s]))
+            .collect(),
+        round2_sigmas: Vec::new(),
+    }
+}
+
+/// SHA-256 hash of a byte slice.
+fn hash_bytes(data: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    let result = hasher.finalize();
+    let mut h = [0u8; 32];
+    h.copy_from_slice(&result);
+    h
+}
+
+/// Runs just the sigma computation (without commit/reveal).
+/// Retained for potential future use (e.g. additional verification rounds).
+#[allow(dead_code)]
 async fn run_sigma_check_round<T: MPCTransport>(
     transport: &T,
     weight_shares: &[Fr],
@@ -1021,6 +1192,46 @@ pub async fn full_mac_check<T: MPCTransport>(
         delta: check.delta,
         report,
     })
+}
+
+// ============================================================================
+// Checkpoint Commitment Exchange
+// ============================================================================
+
+/// Exchanges H(weight_shares) commitments with all peers after a checkpoint.
+///
+/// Each party broadcasts H(their_weight_shares) and stores all peers'
+/// commitments. These are used during cheater identification to verify
+/// that pre-step shares match the checkpoint state.
+pub async fn exchange_checkpoint_commits<T: MPCTransport>(
+    transport: &T,
+    weight_shares: &[Fr],
+    mac_state: &mut MACState,
+    num_parties: usize,
+) -> MPCResult<()> {
+    let party_index = party_index_from_id(transport.party_id());
+    let share_bytes = SecureArithmetic::serialize_share_batch(weight_shares);
+    let my_hash = hash_bytes(&share_bytes);
+
+    // Broadcast our hash.
+    transport.broadcast(&my_hash.to_vec()).await?;
+
+    // Collect all hashes.
+    let mut commits = vec![[0u8; 32]; num_parties];
+    commits[party_index] = my_hash;
+
+    let peers = transport.peers();
+    let all_data = recv_all(transport).await?;
+    for (peer, data) in peers.iter().zip(all_data.iter()) {
+        let peer_idx = party_index_from_id(peer);
+        if data.len() == 32 {
+            commits[peer_idx].copy_from_slice(data);
+        }
+    }
+
+    mac_state.checkpoint_share_commits = commits;
+    debug!(party = party_index, "Checkpoint commitments exchanged");
+    Ok(())
 }
 
 // ============================================================================

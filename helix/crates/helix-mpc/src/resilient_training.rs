@@ -266,6 +266,8 @@ pub struct ResilientTrainingLoop<T: MPCTransport> {
     active_parties: usize,
     /// Total parties at start.
     total_parties: usize,
+    /// Optional cheater recovery orchestrator (set to enable automatic recovery).
+    recovery_orchestrator: Option<crate::cheater_recovery::CheaterRecoveryOrchestrator>,
 }
 
 impl<T: MPCTransport> ResilientTrainingLoop<T> {
@@ -324,7 +326,20 @@ impl<T: MPCTransport> ResilientTrainingLoop<T> {
             state: TrainingState::Initializing,
             active_parties: num_parties,
             total_parties: num_parties,
+            recovery_orchestrator: None,
         }
+    }
+
+    /// Sets the optional cheater recovery orchestrator.
+    ///
+    /// When set, MAC failures trigger automatic recovery: blame report
+    /// creation, share redistribution, and training resumption.
+    /// Without this, MAC failures cause training to halt.
+    pub fn set_recovery_orchestrator(
+        &mut self,
+        orchestrator: crate::cheater_recovery::CheaterRecoveryOrchestrator,
+    ) {
+        self.recovery_orchestrator = Some(orchestrator);
     }
 
     /// Returns a reference to the shutdown coordinator (for external triggering).
@@ -602,9 +617,106 @@ impl<T: MPCTransport> ResilientTrainingLoop<T> {
                     }
 
                     // The trainer has already halted and rolled back internally.
-                    // In production, the orchestrator would coordinate blame reports
-                    // and share redistribution here. For now, we break out.
-                    break;
+                    // Attempt recovery via the orchestrator if configured.
+                    if let Some(ref orchestrator) = self.recovery_orchestrator {
+                        // Get the failure report and checkpoint from the trainer.
+                        let failure_report = match self.trainer.take_mac_failure_report() {
+                            Some(report) => report,
+                            None => {
+                                error!("MAC check failed but no failure report available");
+                                self.state = TrainingState::Failed;
+                                break;
+                            }
+                        };
+                        let checkpoint = match self.trainer.mac_state()
+                            .and_then(|ms| ms.checkpoint.as_ref())
+                        {
+                            Some(cp) => cp.clone(),
+                            None => {
+                                error!("MAC check failed but no checkpoint available for rollback");
+                                self.state = TrainingState::Failed;
+                                break;
+                            }
+                        };
+
+                        self.state = TrainingState::RecoveringRedistribution;
+                        self.events.push(TrainingEvent::RecoveryStarted {
+                            from_step: checkpoint.step,
+                        });
+
+                        match orchestrator.recover(
+                            &failure_report,
+                            &checkpoint,
+                            self.trainer.transport(),
+                            self.active_parties,
+                        ).await {
+                            Ok(crate::cheater_recovery::RecoveryOutcome::Recovered {
+                                cheater_index,
+                                blame_report: _,
+                                new_shares,
+                                resume_from_step,
+                            }) => {
+                                info!(
+                                    cheater = cheater_index,
+                                    resume_step = resume_from_step,
+                                    "Recovery successful — resuming training"
+                                );
+                                self.active_parties -= 1;
+                                self.disconnect_handler.mark_disconnected(cheater_index);
+                                self.events.push(TrainingEvent::RecoveryCompleted {
+                                    resume_step: resume_from_step,
+                                    remaining_parties: self.active_parties,
+                                });
+                                // Restore trainer from redistributed shares.
+                                self.trainer.restore_from_checkpoint(
+                                    new_shares.w1, new_shares.b1,
+                                    new_shares.w2, new_shares.b2,
+                                    resume_from_step,
+                                );
+                                self.state = TrainingState::Training;
+                                // Continue training from the recovered state.
+                                continue;
+                            }
+                            Ok(crate::cheater_recovery::RecoveryOutcome::InsufficientParties {
+                                remaining,
+                                required,
+                            }) => {
+                                warn!(
+                                    remaining = remaining,
+                                    required = required,
+                                    "Not enough parties to continue after cheater removal"
+                                );
+                                self.state = TrainingState::PausedMajorityLost;
+                                self.events.push(TrainingEvent::MajorityLost {
+                                    active_parties: remaining,
+                                    required,
+                                });
+                                break;
+                            }
+                            Ok(crate::cheater_recovery::RecoveryOutcome::CheaterUnidentified { .. }) => {
+                                warn!("Recovery failed: cheater could not be identified");
+                                self.state = TrainingState::Failed;
+                                break;
+                            }
+                            Ok(crate::cheater_recovery::RecoveryOutcome::UnknownCheaterAddress { cheater_index }) => {
+                                warn!(
+                                    cheater = cheater_index,
+                                    "Recovery failed: cheater's Ethereum address not found"
+                                );
+                                self.state = TrainingState::Failed;
+                                break;
+                            }
+                            Err(e) => {
+                                error!("Recovery orchestrator failed: {}", sanitize_error(&e));
+                                self.state = TrainingState::Failed;
+                                break;
+                            }
+                        }
+                    } else {
+                        // No recovery orchestrator configured — halt training.
+                        warn!("No recovery orchestrator configured — halting on MAC failure");
+                        break;
+                    }
                 }
                 Err(MPCError::BeaverPoolExhausted { .. }) => {
                     info!("Beaver pool exhausted during step — replenishing and retrying");

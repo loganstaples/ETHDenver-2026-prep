@@ -479,6 +479,21 @@ struct MpcTrainArgs {
     #[arg(long)]
     enable_withdrawal: bool,
 
+    /// HelixModelStore (ERC-721) contract address for minting model NFTs after training.
+    #[cfg(feature = "chain")]
+    #[arg(long)]
+    model_store: Option<String>,
+
+    /// Model slug for the NFT (globally unique identifier)
+    #[cfg(feature = "chain")]
+    #[arg(long)]
+    model_slug: Option<String>,
+
+    /// Model display name for the NFT
+    #[cfg(feature = "chain")]
+    #[arg(long)]
+    model_name: Option<String>,
+
     /// Enable optional ZK proof generation at checkpoints.
     /// When enabled, generates StateTransitionCircuit proofs for external verifiability.
     /// Default: disabled (MPC+MAC is the primary correctness mechanism).
@@ -500,6 +515,17 @@ struct MpcTrainArgs {
     /// cheater detection and slashing.
     #[arg(long)]
     simulate_cheater: bool,
+
+    /// Which worker party should cheat (0-indexed). Default: last worker.
+    /// Only used when --simulate-cheater is set.
+    #[arg(long)]
+    cheater_party: Option<usize>,
+
+    /// At which training step the cheater should corrupt weights.
+    /// Default: halfway through training (num_steps / 2).
+    /// Only used when --simulate-cheater is set.
+    #[arg(long)]
+    cheater_step: Option<u64>,
 
     /// Transport mode: "local" (default) runs all MPC parties in this process,
     /// "distributed" sends training commands to remote workers over TCP.
@@ -2887,10 +2913,20 @@ async fn cmd_mpc_train(args: &MpcTrainArgs, _cli: &Cli) -> Result<()> {
         enable_withdrawal: args.enable_withdrawal,
         #[cfg(feature = "chain")]
         pre_registered_job_id: None,
+        #[cfg(feature = "chain")]
+        model_store_address: args.model_store.clone(),
+        #[cfg(feature = "chain")]
+        model_slug: args.model_slug.clone(),
+        #[cfg(feature = "chain")]
+        model_name: args.model_name.clone(),
+        #[cfg(feature = "chain")]
+        model_description: None,
         zk_mode: parse_zk_mode(&args.zk_mode)?,
         distributed: args.transport == "distributed",
         custom_training_data: None,
         simulate_cheater: args.simulate_cheater,
+        cheater_party: args.cheater_party,
+        cheater_step: args.cheater_step,
         worker_seeds: Vec::new(), // CLI mode: seeds derived from config.seed + i
     };
 

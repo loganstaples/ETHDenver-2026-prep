@@ -37,6 +37,7 @@ pub use chain_v4::{
     V4Checkpoint, V4MACFailureReport,
     build_checkpoint_message, build_mac_failure_message, build_completion_message,
     sign_checkpoint, sign_mac_failure, sign_completion,
+    ModelStoreClient, ModelStoreDeployResult, CreateModelResult,
 };
 
 pub use client::{

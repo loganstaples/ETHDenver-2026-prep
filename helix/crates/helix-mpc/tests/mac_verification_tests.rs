@@ -54,11 +54,13 @@ async fn run_honest_training(
         &[0.03],                // b2: 1
     );
 
+    // Simple binary classification: target=1.0 when x1+x2 > 0.3, else 0.0
     let data: Vec<(Vec<f64>, Vec<f64>)> = (0..num_steps)
         .map(|i| {
             let x1 = ((i % 3) as f64 + 1.0) * 0.1;
             let x2 = ((i % 2) as f64 + 1.0) * 0.1;
-            (vec![x1, x2], vec![0.5])
+            let target = if x1 + x2 > 0.3 { 1.0 } else { 0.0 };
+            (vec![x1, x2], vec![target])
         })
         .collect();
 
@@ -141,6 +143,16 @@ async fn test_honest_training_passes_mac() {
             );
         }
     }
+
+    // Loss should decrease over the training run (average of last 3 < average of first 3).
+    let losses = &all_losses[0];
+    let early_avg: f64 = losses[..3].iter().sum::<f64>() / 3.0;
+    let late_avg: f64 = losses[num_steps - 3..].iter().sum::<f64>() / 3.0;
+    assert!(
+        late_avg < early_avg,
+        "Loss should decrease: early avg = {:.6}, late avg = {:.6}",
+        early_avg, late_avg
+    );
 }
 
 // ============================================================================
@@ -337,6 +349,193 @@ async fn test_cheater_identified() {
 }
 
 // ============================================================================
+// Test 3b: Cheater identified — party 1 (non-last party)
+// ============================================================================
+
+#[tokio::test]
+async fn test_cheater_identified_party1() {
+    // Verify that identification correctly identifies party 1 (middle party).
+    // This ensures the protocol isn't biased toward any particular party index.
+    let num_parties = 3;
+    let parties = test_parties(num_parties);
+    let transports = LocalTransport::create_mesh(&parties);
+    let config = mac_config(num_parties, 1);
+
+    let initial_weights = ModelWeights::from_f64(
+        &[0.1, 0.2, 0.3, 0.4],
+        &[0.01, 0.02],
+        &[0.5, 0.6],
+        &[0.03],
+    );
+
+    let data: Vec<(Vec<f64>, Vec<f64>)> = (0..10)
+        .map(|i| {
+            let x1 = ((i % 3) as f64 + 1.0) * 0.1;
+            let x2 = ((i % 2) as f64 + 1.0) * 0.1;
+            (vec![x1, x2], vec![0.5])
+        })
+        .collect();
+
+    let mut handles = Vec::new();
+    for (i, transport) in transports.into_iter().enumerate() {
+        let cfg = config.clone();
+        let weights = if i == 0 {
+            Some(initial_weights.clone())
+        } else {
+            None
+        };
+        let steps = data.clone();
+
+        let handle = tokio::spawn(async move {
+            let mut trainer = MPCTrainer::new(cfg, transport, i, 42);
+            trainer.share_weights(weights).await.unwrap();
+            trainer.generate_beaver_triples(256).await.unwrap();
+
+            for (step_idx, (input, target)) in steps.iter().enumerate() {
+                // Party 1 corrupts weight at step 5.
+                if i == 1 && step_idx == 5 {
+                    trainer.corrupt_weight_share(0, Fr::from_f64(999.0));
+                }
+
+                match trainer.training_step_with_mac(input, target).await {
+                    Ok(_) => {}
+                    Err(MPCError::MACCheckFailed { step, cheater }) => {
+                        return (i, Some(cheater), step);
+                    }
+                    Err(_) => {
+                        return (i, None, 0);
+                    }
+                }
+            }
+            (i, None, 0)
+        });
+        handles.push(handle);
+    }
+
+    let mut results = Vec::new();
+    for handle in handles {
+        results.push(handle.await.unwrap());
+    }
+
+    let mut identified_cheaters: Vec<Option<usize>> = Vec::new();
+    for (_party, cheater_opt, _step) in &results {
+        if let Some(cheater) = cheater_opt {
+            identified_cheaters.push(*cheater);
+        }
+    }
+
+    assert!(
+        !identified_cheaters.is_empty(),
+        "At least one party should identify a cheater. Results: {:?}",
+        results
+    );
+
+    for cheater in &identified_cheaters {
+        if let Some(idx) = cheater {
+            assert_eq!(
+                *idx, 1,
+                "Identified cheater should be party 1, got party {}",
+                idx
+            );
+        }
+    }
+}
+
+// ============================================================================
+// Test 3c: Cheater identified — party 0 (dealer)
+// ============================================================================
+
+#[tokio::test]
+async fn test_cheater_identified_party0() {
+    // Verify identification correctly identifies party 0 (the dealer).
+    // This is the hardest case since party 0 is the only one that applies
+    // weight updates, making their diffs non-zero even honestly.
+    let num_parties = 3;
+    let parties = test_parties(num_parties);
+    let transports = LocalTransport::create_mesh(&parties);
+    let config = mac_config(num_parties, 1);
+
+    let initial_weights = ModelWeights::from_f64(
+        &[0.1, 0.2, 0.3, 0.4],
+        &[0.01, 0.02],
+        &[0.5, 0.6],
+        &[0.03],
+    );
+
+    let data: Vec<(Vec<f64>, Vec<f64>)> = (0..10)
+        .map(|i| {
+            let x1 = ((i % 3) as f64 + 1.0) * 0.1;
+            let x2 = ((i % 2) as f64 + 1.0) * 0.1;
+            (vec![x1, x2], vec![0.5])
+        })
+        .collect();
+
+    let mut handles = Vec::new();
+    for (i, transport) in transports.into_iter().enumerate() {
+        let cfg = config.clone();
+        let weights = if i == 0 {
+            Some(initial_weights.clone())
+        } else {
+            None
+        };
+        let steps = data.clone();
+
+        let handle = tokio::spawn(async move {
+            let mut trainer = MPCTrainer::new(cfg, transport, i, 42);
+            trainer.share_weights(weights).await.unwrap();
+            trainer.generate_beaver_triples(256).await.unwrap();
+
+            for (step_idx, (input, target)) in steps.iter().enumerate() {
+                // Party 0 corrupts weight at step 5.
+                if i == 0 && step_idx == 5 {
+                    trainer.corrupt_weight_share(0, Fr::from_f64(999.0));
+                }
+
+                match trainer.training_step_with_mac(input, target).await {
+                    Ok(_) => {}
+                    Err(MPCError::MACCheckFailed { step, cheater }) => {
+                        return (i, Some(cheater), step);
+                    }
+                    Err(_) => {
+                        return (i, None, 0);
+                    }
+                }
+            }
+            (i, None, 0)
+        });
+        handles.push(handle);
+    }
+
+    let mut results = Vec::new();
+    for handle in handles {
+        results.push(handle.await.unwrap());
+    }
+
+    let mut identified_cheaters: Vec<Option<usize>> = Vec::new();
+    for (_party, cheater_opt, _step) in &results {
+        if let Some(cheater) = cheater_opt {
+            identified_cheaters.push(*cheater);
+        }
+    }
+
+    assert!(
+        !identified_cheaters.is_empty(),
+        "At least one party should identify a cheater. Results: {:?}",
+        results
+    );
+
+    for cheater in &identified_cheaters {
+        if let Some(idx) = cheater {
+            assert_eq!(
+                *idx, 0,
+                "Identified cheater should be party 0, got party {}",
+                idx
+            );
+        }
+    }
+}
+
+// ============================================================================
 // Test 4: Training continues after cheater removal
 // ============================================================================
 
@@ -344,8 +543,10 @@ async fn test_cheater_identified() {
 async fn test_training_continues_after_removal() {
     // 3 parties, party 2 cheats at step 3. After detection:
     // - Training halts for the corrupted set
-    // - We start a NEW session with just parties 0 and 1
-    // - Training continues successfully
+    // - We extract checkpoint weight shares from ALL parties (including cheater's
+    //   pre-corruption checkpoint), sum them to reconstruct full weights
+    // - Start a 2-party session from the reconstructed checkpoint weights
+    // - Training continues successfully with MAC verification enabled
     let num_parties_initial = 3;
     let parties_initial = test_parties(num_parties_initial);
     let transports_initial = LocalTransport::create_mesh(&parties_initial);
@@ -367,6 +568,7 @@ async fn test_training_continues_after_removal() {
         .collect();
 
     // Phase 1: Run with 3 parties, party 2 cheats at step 3.
+    // Each party returns its checkpoint weight shares (rolled back on MAC failure).
     let mut handles_phase1 = Vec::new();
     for (i, transport) in transports_initial.into_iter().enumerate() {
         let cfg = config_initial.clone();
@@ -392,18 +594,21 @@ async fn test_training_continues_after_removal() {
                     Err(_) => break,
                 }
             }
-            (i, completed)
+
+            // Return checkpoint state (rolled back to last verified step on failure).
+            let (w1, b1, w2, b2) = trainer.weight_shares();
+            (i, completed, w1.to_vec(), b1.to_vec(), w2.to_vec(), b2.to_vec())
         });
         handles_phase1.push(handle);
     }
 
-    let mut phase1_results = Vec::new();
+    let mut party_states: Vec<(usize, u64, Vec<Fr>, Vec<Fr>, Vec<Fr>, Vec<Fr>)> = Vec::new();
     for handle in handles_phase1 {
-        phase1_results.push(handle.await.unwrap());
+        party_states.push(handle.await.unwrap());
     }
 
     // Verify phase 1 halted before completing all steps.
-    for (party, completed) in &phase1_results {
+    for (party, completed, _, _, _, _) in &party_states {
         assert!(
             *completed < 8,
             "Phase 1: party {} should not complete all 8 steps (completed {})",
@@ -411,7 +616,36 @@ async fn test_training_continues_after_removal() {
         );
     }
 
-    // Phase 2: Start a new session with just 2 parties (0 and 1).
+    // Reconstruct full weights by summing ALL parties' checkpoint shares.
+    // At the rolled-back checkpoint, all shares (including party 2's) are valid
+    // because the checkpoint was taken at a MAC-verified step before corruption.
+    let w1_len = party_states[0].2.len();
+    let b1_len = party_states[0].3.len();
+    let w2_len = party_states[0].4.len();
+    let b2_len = party_states[0].5.len();
+
+    let mut full_w1 = vec![Fr::ZERO; w1_len];
+    let mut full_b1 = vec![Fr::ZERO; b1_len];
+    let mut full_w2 = vec![Fr::ZERO; w2_len];
+    let mut full_b2 = vec![Fr::ZERO; b2_len];
+
+    for (_party, _steps, w1, b1, w2, b2) in &party_states {
+        for j in 0..w1_len { full_w1[j] = Fr::add(&full_w1[j], &w1[j]); }
+        for j in 0..b1_len { full_b1[j] = Fr::add(&full_b1[j], &b1[j]); }
+        for j in 0..w2_len { full_w2[j] = Fr::add(&full_w2[j], &w2[j]); }
+        for j in 0..b2_len { full_b2[j] = Fr::add(&full_b2[j], &b2[j]); }
+    }
+
+    let checkpoint_weights = ModelWeights {
+        w1: full_w1,
+        b1: full_b1,
+        w2: full_w2,
+        b2: full_b2,
+    };
+
+    // Phase 2: Continue training from checkpoint with 2 parties (0 and 1).
+    // Uses share_weights to re-share the reconstructed checkpoint weights and
+    // re-initialize MAC verification for the new party set.
     let num_parties_reduced = 2;
     let parties_reduced = test_parties(num_parties_reduced);
     let transports_reduced = LocalTransport::create_mesh(&parties_reduced);
@@ -430,7 +664,7 @@ async fn test_training_continues_after_removal() {
     for (i, transport) in transports_reduced.into_iter().enumerate() {
         let cfg = config_reduced.clone();
         let weights = if i == 0 {
-            Some(initial_weights.clone())
+            Some(checkpoint_weights.clone())
         } else {
             None
         };
@@ -438,6 +672,7 @@ async fn test_training_continues_after_removal() {
 
         let handle = tokio::spawn(async move {
             let mut trainer = MPCTrainer::new(cfg, transport, i, 42);
+            // share_weights re-shares the checkpoint weights and initializes MAC state
             trainer.share_weights(weights).await.unwrap();
             trainer.generate_beaver_triples(256).await.unwrap();
 
@@ -456,7 +691,7 @@ async fn test_training_continues_after_removal() {
         phase2_results.push(handle.await.unwrap());
     }
 
-    // Phase 2 should complete all steps successfully with 2 parties.
+    // Phase 2 should complete all steps successfully with MAC verification.
     for (party, losses) in &phase2_results {
         assert_eq!(
             losses.len(),
@@ -471,6 +706,18 @@ async fn test_training_continues_after_removal() {
                 party, step, loss
             );
         }
+    }
+
+    // Verify both parties compute consistent losses in phase 2 (MAC-verified).
+    let phase2_losses_p0 = &phase2_results[0].1;
+    let phase2_losses_p1 = &phase2_results[1].1;
+    for step in 0..num_steps_phase2 {
+        let diff = (phase2_losses_p0[step] - phase2_losses_p1[step]).abs();
+        assert!(
+            diff < 0.01,
+            "Phase 2 step {}: party 0 loss = {}, party 1 loss = {}, diff = {}",
+            step, phase2_losses_p0[step], phase2_losses_p1[step], diff
+        );
     }
 }
 

@@ -243,8 +243,9 @@ impl ShareDistributor {
             .map(|_| Fr::random(&mut self.rng))
             .collect();
 
-        // Compute initial Pedersen commitment to the full weights
-        let initial_commitment = compute_vector_commitment(
+        // Compute initial aggregate-only Pedersen commitment to the full weights.
+        // Per-element commitments are deferred to checkpoint time for performance.
+        let initial_commitment = compute_aggregate_only(
             &weight_frs,
             &blindings,
             &self.generators,
@@ -291,7 +292,8 @@ impl ShareDistributor {
             .map(|_| Fr::random(&mut self.rng))
             .collect();
 
-        let initial_commitment = compute_vector_commitment(
+        // Aggregate-only commitment for distribution (per-element deferred to checkpoint)
+        let initial_commitment = compute_aggregate_only(
             weight_frs,
             &blindings,
             &self.generators,
@@ -537,6 +539,34 @@ impl CheckpointCommitment {
         })
     }
 
+    /// Worker computes only the aggregate commitment share (skipping per-element).
+    ///
+    /// This is dramatically faster: O(n) field additions + 1 EC scalar multiplication
+    /// vs O(n) EC scalar multiplications. Used during initial share distribution
+    /// where only the aggregate is needed for verification.
+    pub fn compute_share_aggregate_only(
+        &self,
+        weight_share: &WeightShare,
+        blindings: &[Fr],
+    ) -> MPCResult<CommitmentShare> {
+        if weight_share.data.len() != blindings.len() {
+            return Err(MPCError::ShapeMismatch {
+                expected: vec![weight_share.data.len()],
+                got: vec![blindings.len()],
+            });
+        }
+
+        let sum_v = weight_share.data.iter().fold(Fr::ZERO, |acc, v| acc + *v);
+        let sum_r = blindings.iter().fold(Fr::ZERO, |acc, r| acc + *r);
+        let aggregate = PedersenCommitment::commit(&sum_v, &sum_r, &self.generators);
+
+        Ok(CommitmentShare {
+            party: weight_share.party.clone(),
+            element_commitments: vec![],
+            aggregate,
+        })
+    }
+
     /// Combines commitment shares from all workers into a full vector commitment.
     ///
     /// Due to homomorphism, the combined commitment is equivalent to a commitment
@@ -554,29 +584,35 @@ impl CheckpointCommitment {
         }
 
         let num_elements = commitment_shares[0].element_commitments.len();
-        for cs in commitment_shares {
-            if cs.element_commitments.len() != num_elements {
-                return Err(MPCError::ShapeMismatch {
-                    expected: vec![num_elements],
-                    got: vec![cs.element_commitments.len()],
-                });
-            }
-        }
 
-        // Combine per-element commitments: C_j = C_1_j + C_2_j + ... + C_n_j
-        let mut combined_elements: Vec<PedersenCommitment> =
-            commitment_shares[0].element_commitments.clone();
-        for cs in &commitment_shares[1..] {
-            for (i, c) in cs.element_commitments.iter().enumerate() {
-                combined_elements[i] = combined_elements[i].add(c);
-            }
-        }
-
-        // Combine aggregate commitments
+        // Combine aggregate commitments (always done)
         let mut combined_aggregate = commitment_shares[0].aggregate.clone();
         for cs in &commitment_shares[1..] {
             combined_aggregate = combined_aggregate.add(&cs.aggregate);
         }
+
+        // If element commitments are present (full mode), combine them too.
+        // In aggregate-only mode (distribution phase), element_commitments is empty.
+        let combined_elements = if num_elements > 0 {
+            for cs in commitment_shares {
+                if cs.element_commitments.len() != num_elements {
+                    return Err(MPCError::ShapeMismatch {
+                        expected: vec![num_elements],
+                        got: vec![cs.element_commitments.len()],
+                    });
+                }
+            }
+            let mut elems: Vec<PedersenCommitment> =
+                commitment_shares[0].element_commitments.clone();
+            for cs in &commitment_shares[1..] {
+                for (i, c) in cs.element_commitments.iter().enumerate() {
+                    elems[i] = elems[i].add(c);
+                }
+            }
+            elems
+        } else {
+            vec![]
+        };
 
         Ok(VectorCommitment {
             element_commitments: combined_elements,
@@ -842,6 +878,25 @@ pub(crate) fn compute_vector_commitment(
 
     VectorCommitment {
         element_commitments,
+        aggregate,
+    }
+}
+
+/// Computes only the aggregate Pedersen commitment (skipping per-element commitments).
+///
+/// This is O(n) field additions + 1 EC scalar multiplication, vs O(n) EC scalar
+/// multiplications for the full `compute_vector_commitment`. Used during initial
+/// share distribution where only the aggregate is needed for verification.
+pub(crate) fn compute_aggregate_only(
+    values: &[Fr],
+    blindings: &[Fr],
+    generators: &PedersenGenerators,
+) -> VectorCommitment {
+    let sum_v = values.iter().fold(Fr::ZERO, |acc, v| acc + *v);
+    let sum_r = blindings.iter().fold(Fr::ZERO, |acc, r| acc + *r);
+    let aggregate = PedersenCommitment::commit(&sum_v, &sum_r, generators);
+    VectorCommitment {
+        element_commitments: vec![],
         aggregate,
     }
 }
@@ -1311,7 +1366,8 @@ mod tests {
             .expect("distribution of 25K params should succeed");
 
         assert_eq!(result.encrypted_shares.len(), 3);
-        assert_eq!(result.initial_commitment.element_commitments.len(), total_params);
+        // Distribution now uses aggregate-only mode (no per-element commitments)
+        assert!(result.initial_commitment.element_commitments.is_empty());
 
         // === Phase 2: Workers receive shares ===
         let mut received_shares = Vec::new();

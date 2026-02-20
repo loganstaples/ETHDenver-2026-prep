@@ -1018,6 +1018,365 @@ contract HelixCoordinatorV4Test is Test {
             jobId, 100, keccak256("w1"), 500, hex"aabb", pi
         );
     }
+
+    // ============ Worker Pool Tests ============
+
+    function test_registerInPool() public {
+        vm.prank(worker1);
+        coordinator.registerInPool{value: 0.01 ether}("192.168.1.1:9001");
+
+        assertEq(coordinator.getPoolWorkerCount(), 1);
+
+        (string memory endpoint, uint256 stakeAmount, , bool available, uint256 activeJobId) =
+            coordinator.getPoolWorkerInfo(worker1);
+        assertEq(endpoint, "192.168.1.1:9001");
+        assertEq(stakeAmount, 0.01 ether);
+        assertTrue(available);
+        assertEq(activeJobId, 0);
+    }
+
+    function test_registerInPool_rejectsInsufficientStake() public {
+        vm.prank(worker1);
+        vm.expectRevert(HelixCoordinatorV4.InsufficientStake.selector);
+        coordinator.registerInPool{value: 0.0001 ether}("192.168.1.1:9001");
+    }
+
+    function test_registerInPool_rejectsDuplicate() public {
+        vm.prank(worker1);
+        coordinator.registerInPool{value: 0.01 ether}("192.168.1.1:9001");
+
+        vm.prank(worker1);
+        vm.expectRevert(HelixCoordinatorV4.WorkerAlreadyInPool.selector);
+        coordinator.registerInPool{value: 0.01 ether}("192.168.1.1:9002");
+    }
+
+    function test_deregisterFromPool() public {
+        vm.prank(worker1);
+        coordinator.registerInPool{value: 0.01 ether}("192.168.1.1:9001");
+        assertEq(coordinator.getPoolWorkerCount(), 1);
+
+        uint256 balBefore = worker1.balance;
+
+        vm.prank(worker1);
+        coordinator.deregisterFromPool();
+
+        assertEq(coordinator.getPoolWorkerCount(), 0);
+        assertEq(worker1.balance - balBefore, 0.01 ether); // Stake returned
+    }
+
+    function test_deregisterFromPool_rejectsUnregistered() public {
+        vm.prank(worker1);
+        vm.expectRevert(HelixCoordinatorV4.WorkerNotInPool.selector);
+        coordinator.deregisterFromPool();
+    }
+
+    function test_deregisterFromPool_rejectsBusyWorker() public {
+        // Register 3 workers in pool
+        vm.prank(worker1);
+        coordinator.registerInPool{value: 0.01 ether}("192.168.1.1:9001");
+        vm.prank(worker2);
+        coordinator.registerInPool{value: 0.01 ether}("192.168.1.2:9001");
+        vm.prank(worker3);
+        coordinator.registerInPool{value: 0.01 ether}("192.168.1.3:9001");
+
+        // Create job and assign pool workers
+        vm.prank(jobOwner);
+        uint256 jobId = coordinator.registerTrainingJob{value: PAYMENT_AMOUNT}(
+            ARCH_HASH, CHECKPOINT_FREQ, NUM_ROUNDS, PAYMENT_AMOUNT, false, 0, false, 0, address(0)
+        );
+        vm.prank(jobOwner);
+        coordinator.assignPoolWorkers(jobId, 3);
+
+        // Worker1 is now busy - cannot deregister
+        vm.prank(worker1);
+        vm.expectRevert(HelixCoordinatorV4.WorkerBusy.selector);
+        coordinator.deregisterFromPool();
+    }
+
+    function test_assignPoolWorkers() public {
+        // Register 3 workers in pool
+        vm.prank(worker1);
+        coordinator.registerInPool{value: 0.01 ether}("192.168.1.1:9001");
+        vm.prank(worker2);
+        coordinator.registerInPool{value: 0.01 ether}("192.168.1.2:9001");
+        vm.prank(worker3);
+        coordinator.registerInPool{value: 0.01 ether}("192.168.1.3:9001");
+
+        assertEq(coordinator.getAvailablePoolWorkerCount(), 3);
+
+        // Create job
+        vm.prank(jobOwner);
+        uint256 jobId = coordinator.registerTrainingJob{value: PAYMENT_AMOUNT}(
+            ARCH_HASH, CHECKPOINT_FREQ, NUM_ROUNDS, PAYMENT_AMOUNT, false, 0, false, 0, address(0)
+        );
+
+        // Job owner assigns 3 workers
+        vm.prank(jobOwner);
+        coordinator.assignPoolWorkers(jobId, 3);
+
+        // All 3 workers are now in the job
+        assertEq(coordinator.getActiveWorkerCount(jobId), 3);
+        assertEq(coordinator.getAvailablePoolWorkerCount(), 0);
+
+        // Verify workers are registered for the job
+        assertTrue(coordinator.isActiveWorker(jobId, worker1));
+        assertTrue(coordinator.isActiveWorker(jobId, worker2));
+        assertTrue(coordinator.isActiveWorker(jobId, worker3));
+    }
+
+    function test_assignPoolWorkers_onlyOwnerOrOperator() public {
+        vm.prank(worker1);
+        coordinator.registerInPool{value: 0.01 ether}("192.168.1.1:9001");
+
+        vm.prank(jobOwner);
+        uint256 jobId = coordinator.registerTrainingJob{value: PAYMENT_AMOUNT}(
+            ARCH_HASH, CHECKPOINT_FREQ, NUM_ROUNDS, PAYMENT_AMOUNT, false, 0, false, 0, address(0)
+        );
+
+        // Non-owner cannot assign
+        vm.prank(outsider);
+        vm.expectRevert(HelixCoordinatorV4.OnlyOwner.selector);
+        coordinator.assignPoolWorkers(jobId, 1);
+    }
+
+    function test_assignPoolWorkers_operatorCanAssign() public {
+        vm.prank(worker1);
+        coordinator.registerInPool{value: 0.01 ether}("192.168.1.1:9001");
+
+        // Register job with operator
+        vm.prank(jobOwner);
+        uint256 jobId = coordinator.registerTrainingJob{value: PAYMENT_AMOUNT}(
+            ARCH_HASH, CHECKPOINT_FREQ, NUM_ROUNDS, PAYMENT_AMOUNT, false, 0, false, 0, outsider
+        );
+
+        // Operator can assign
+        vm.prank(outsider);
+        coordinator.assignPoolWorkers(jobId, 1);
+
+        assertEq(coordinator.getActiveWorkerCount(jobId), 1);
+    }
+
+    function test_assignPoolWorkers_rejectsNotEnough() public {
+        vm.prank(worker1);
+        coordinator.registerInPool{value: 0.01 ether}("192.168.1.1:9001");
+
+        vm.prank(jobOwner);
+        uint256 jobId = coordinator.registerTrainingJob{value: PAYMENT_AMOUNT}(
+            ARCH_HASH, CHECKPOINT_FREQ, NUM_ROUNDS, PAYMENT_AMOUNT, false, 0, false, 0, address(0)
+        );
+
+        // Try to assign 3 but only 1 available
+        vm.prank(jobOwner);
+        vm.expectRevert(HelixCoordinatorV4.NotEnoughPoolWorkers.selector);
+        coordinator.assignPoolWorkers(jobId, 3);
+    }
+
+    function test_assignPoolWorkers_fullLifecycle() public {
+        // Register pool workers
+        vm.prank(worker1);
+        coordinator.registerInPool{value: 0.01 ether}("192.168.1.1:9001");
+        vm.prank(worker2);
+        coordinator.registerInPool{value: 0.01 ether}("192.168.1.2:9001");
+        vm.prank(worker3);
+        coordinator.registerInPool{value: 0.01 ether}("192.168.1.3:9001");
+
+        // Create and assign
+        vm.prank(jobOwner);
+        uint256 jobId = coordinator.registerTrainingJob{value: PAYMENT_AMOUNT}(
+            ARCH_HASH, CHECKPOINT_FREQ, NUM_ROUNDS, PAYMENT_AMOUNT, false, 0, false, 0, address(0)
+        );
+        vm.prank(jobOwner);
+        coordinator.assignPoolWorkers(jobId, 3);
+
+        // Submit checkpoint with all pool workers signing
+        bytes32 commitment = keccak256("weights_100");
+        bytes[] memory sigs = _signCheckpoint(jobId, 100, commitment, 500);
+        coordinator.submitCheckpoint(jobId, 100, commitment, 500, sigs);
+
+        // Complete training
+        bytes32 finalCommitment = keccak256("final");
+        uint256[] memory allPKs = new uint256[](3);
+        allPKs[0] = WORKER1_PK;
+        allPKs[1] = WORKER2_PK;
+        allPKs[2] = WORKER3_PK;
+        bytes[] memory completionSigs = _signCompletion(jobId, finalCommitment, allPKs);
+        coordinator.completeTraining(jobId, finalCommitment, completionSigs);
+
+        // After completion, pool workers should be available again
+        (, , , bool avail1, ) = coordinator.getPoolWorkerInfo(worker1);
+        assertTrue(avail1);
+        assertEq(coordinator.getAvailablePoolWorkerCount(), 3);
+    }
+
+    function test_getPoolWorkers_list() public {
+        vm.prank(worker1);
+        coordinator.registerInPool{value: 0.01 ether}("192.168.1.1:9001");
+        vm.prank(worker2);
+        coordinator.registerInPool{value: 0.01 ether}("192.168.1.2:9001");
+
+        address[] memory poolList = coordinator.getPoolWorkers();
+        assertEq(poolList.length, 2);
+        assertEq(poolList[0], worker1);
+        assertEq(poolList[1], worker2);
+    }
+
+    // ============ Inference Attestation Tests ============
+
+    function test_submitInferenceResult() public {
+        // Need a completed job first
+        uint256 jobId = _setupJobWith3Workers();
+        bytes32 finalCommitment = keccak256("final");
+        uint256[] memory allPKs = new uint256[](3);
+        allPKs[0] = WORKER1_PK;
+        allPKs[1] = WORKER2_PK;
+        allPKs[2] = WORKER3_PK;
+        bytes[] memory completionSigs = _signCompletion(jobId, finalCommitment, allPKs);
+        coordinator.completeTraining(jobId, finalCommitment, completionSigs);
+
+        // Submit inference result
+        uint256 prediction = 7;
+        bytes32 inputHash = keccak256("mnist_image_42");
+        bytes32 outputHash = keccak256("output_probs");
+
+        bytes32 inferMessage = keccak256(abi.encodePacked(
+            "HELIX_INFERENCE", jobId, prediction, inputHash, outputHash
+        ));
+        bytes[] memory inferSigs = new bytes[](3);
+        inferSigs[0] = _sign(WORKER1_PK, inferMessage);
+        inferSigs[1] = _sign(WORKER2_PK, inferMessage);
+        inferSigs[2] = _sign(WORKER3_PK, inferMessage);
+
+        coordinator.submitInferenceResult(jobId, prediction, inputHash, outputHash, inferSigs);
+
+        // Verify stored result
+        (uint256 rJobId, uint256 rPrediction, bytes32 rInputHash, bytes32 rOutputHash, , uint256 rSignerCount) =
+            coordinator.getInferenceResult(1);
+        assertEq(rJobId, jobId);
+        assertEq(rPrediction, 7);
+        assertEq(rInputHash, inputHash);
+        assertEq(rOutputHash, outputHash);
+        assertEq(rSignerCount, 3);
+    }
+
+    function test_submitInferenceResult_rejectsIncompleteJob() public {
+        uint256 jobId = _setupJobWith3Workers();
+        // Job is active but not completed
+
+        bytes32 inferMessage = keccak256(abi.encodePacked(
+            "HELIX_INFERENCE", jobId, uint256(5), keccak256("in"), keccak256("out")
+        ));
+        bytes[] memory sigs = new bytes[](3);
+        sigs[0] = _sign(WORKER1_PK, inferMessage);
+        sigs[1] = _sign(WORKER2_PK, inferMessage);
+        sigs[2] = _sign(WORKER3_PK, inferMessage);
+
+        vm.expectRevert(HelixCoordinatorV4.JobNotCompleted.selector);
+        coordinator.submitInferenceResult(jobId, 5, keccak256("in"), keccak256("out"), sigs);
+    }
+
+    function test_submitInferenceResult_rejectsInsufficientSignatures() public {
+        uint256 jobId = _setupJobWith3Workers();
+        bytes32 finalCommitment = keccak256("final");
+        uint256[] memory allPKs = new uint256[](3);
+        allPKs[0] = WORKER1_PK;
+        allPKs[1] = WORKER2_PK;
+        allPKs[2] = WORKER3_PK;
+        bytes[] memory completionSigs = _signCompletion(jobId, finalCommitment, allPKs);
+        coordinator.completeTraining(jobId, finalCommitment, completionSigs);
+
+        // Only 1 signature (need MIN_WORKERS = 2)
+        bytes32 inferMessage = keccak256(abi.encodePacked(
+            "HELIX_INFERENCE", jobId, uint256(5), keccak256("in"), keccak256("out")
+        ));
+        bytes[] memory oneSig = new bytes[](1);
+        oneSig[0] = _sign(WORKER1_PK, inferMessage);
+
+        vm.expectRevert(HelixCoordinatorV4.InvalidSignatureCount.selector);
+        coordinator.submitInferenceResult(jobId, 5, keccak256("in"), keccak256("out"), oneSig);
+    }
+
+    function test_submitInferenceResult_rejectsSlashedWorkerSig() public {
+        uint256 jobId = _setupJobWith3Workers();
+
+        // Slash worker2
+        bytes memory evidence = abi.encode("evidence");
+        uint256[] memory reporterPKs = new uint256[](2);
+        reporterPKs[0] = WORKER1_PK;
+        reporterPKs[1] = WORKER3_PK;
+        bytes[] memory reportSigs = _signMACFailure(jobId, 100, worker2, evidence, reporterPKs);
+        coordinator.reportMACFailure(jobId, 100, worker2, evidence, reportSigs);
+
+        // Complete with remaining workers
+        bytes32 finalCommitment = keccak256("final");
+        uint256[] memory remainPKs = new uint256[](2);
+        remainPKs[0] = WORKER1_PK;
+        remainPKs[1] = WORKER3_PK;
+        bytes[] memory completionSigs = _signCompletion(jobId, finalCommitment, remainPKs);
+        coordinator.completeTraining(jobId, finalCommitment, completionSigs);
+
+        // Try inference with slashed worker's signature
+        bytes32 inferMessage = keccak256(abi.encodePacked(
+            "HELIX_INFERENCE", jobId, uint256(5), keccak256("in"), keccak256("out")
+        ));
+        bytes[] memory badSigs = new bytes[](2);
+        badSigs[0] = _sign(WORKER1_PK, inferMessage);
+        badSigs[1] = _sign(WORKER2_PK, inferMessage); // slashed!
+
+        vm.expectRevert(HelixCoordinatorV4.InvalidSigner.selector);
+        coordinator.submitInferenceResult(jobId, 5, keccak256("in"), keccak256("out"), badSigs);
+    }
+
+    function test_submitInferenceResult_rejectsDuplicateSigner() public {
+        uint256 jobId = _setupJobWith3Workers();
+        bytes32 finalCommitment = keccak256("final");
+        uint256[] memory allPKs = new uint256[](3);
+        allPKs[0] = WORKER1_PK;
+        allPKs[1] = WORKER2_PK;
+        allPKs[2] = WORKER3_PK;
+        bytes[] memory completionSigs = _signCompletion(jobId, finalCommitment, allPKs);
+        coordinator.completeTraining(jobId, finalCommitment, completionSigs);
+
+        bytes32 inferMessage = keccak256(abi.encodePacked(
+            "HELIX_INFERENCE", jobId, uint256(5), keccak256("in"), keccak256("out")
+        ));
+        bytes[] memory dupSigs = new bytes[](2);
+        dupSigs[0] = _sign(WORKER1_PK, inferMessage);
+        dupSigs[1] = _sign(WORKER1_PK, inferMessage); // duplicate!
+
+        vm.expectRevert(HelixCoordinatorV4.DuplicateSigner.selector);
+        coordinator.submitInferenceResult(jobId, 5, keccak256("in"), keccak256("out"), dupSigs);
+    }
+
+    // ============ Pool Worker Slashing Tests ============
+
+    function test_slashedPoolWorkerRemoved() public {
+        // Register workers in pool
+        vm.prank(worker1);
+        coordinator.registerInPool{value: 0.01 ether}("192.168.1.1:9001");
+        vm.prank(worker2);
+        coordinator.registerInPool{value: 0.01 ether}("192.168.1.2:9001");
+        vm.prank(worker3);
+        coordinator.registerInPool{value: 0.01 ether}("192.168.1.3:9001");
+
+        // Create job and assign
+        vm.prank(jobOwner);
+        uint256 jobId = coordinator.registerTrainingJob{value: PAYMENT_AMOUNT}(
+            ARCH_HASH, CHECKPOINT_FREQ, NUM_ROUNDS, PAYMENT_AMOUNT, false, 0, false, 0, address(0)
+        );
+        vm.prank(jobOwner);
+        coordinator.assignPoolWorkers(jobId, 3);
+
+        // Slash worker2 via MAC failure
+        bytes memory evidence = abi.encode("evidence");
+        uint256[] memory reporterPKs = new uint256[](2);
+        reporterPKs[0] = WORKER1_PK;
+        reporterPKs[1] = WORKER3_PK;
+        bytes[] memory reportSigs = _signMACFailure(jobId, 100, worker2, evidence, reporterPKs);
+        coordinator.reportMACFailure(jobId, 100, worker2, evidence, reportSigs);
+
+        // Worker2 should be removed from the pool entirely
+        assertEq(coordinator.getPoolWorkerCount(), 2);
+    }
 }
 
 /// @notice Mock verifier for V4 tests

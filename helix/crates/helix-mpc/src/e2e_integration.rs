@@ -242,10 +242,14 @@ pub async fn run_mpc_training(
         d_in = config.d_in,
         d_hid = config.d_hid,
         d_out = config.d_out,
+        learning_rate = config.learning_rate,
+        is_finetuning = config.initial_weights.is_some(),
         "Starting MPC integration training"
     );
 
     // Build trainer config.
+    // LR is passed through as-is — warmup, cosine decay, and plateau detection
+    // in the training loop handle schedule adjustments automatically.
     let trainer_config = MPCTrainerConfig {
         d_in: config.d_in,
         d_hid: config.d_hid,
@@ -337,6 +341,7 @@ pub async fn run_mpc_training_with_cheater(
         num_workers = num_workers,
         cheater_party = cheater_party,
         corrupt_at_step = corrupt_at_step,
+        learning_rate = config.learning_rate,
         "Starting MPC integration training with cheater injection"
     );
 
@@ -1002,10 +1007,10 @@ pub async fn run_distributed_party<T: crate::session::transport::MPCTransport + 
                         cheater = ?cheater,
                         "MAC check failed - cheater detected (distributed)"
                     );
-                    cheater_detected = Some(CheaterRecord {
-                        party_index: cheater.unwrap_or(usize::MAX),
-                        detected_at_step: fail_step,
-                        failure_report: MACFailureReport {
+                    // Retrieve the actual failure report from the trainer (populated
+                    // during the MAC check that failed).
+                    let failure_report = trainer.take_mac_failure_report()
+                        .unwrap_or_else(|| MACFailureReport {
                             session_id: "distributed-training".to_string(),
                             step_number: fail_step,
                             identified_cheater: cheater,
@@ -1016,7 +1021,11 @@ pub async fn run_distributed_party<T: crate::session::transport::MPCTransport + 
                                 round1_sigmas: Vec::new(),
                                 round2_sigmas: Vec::new(),
                             },
-                        },
+                        });
+                    cheater_detected = Some(CheaterRecord {
+                        party_index: cheater.unwrap_or(usize::MAX),
+                        detected_at_step: fail_step,
+                        failure_report,
                     });
                     break;
                 }
@@ -1208,10 +1217,17 @@ pub async fn run_party_training<T: crate::session::transport::MPCTransport + 'st
 
     let bs = config.batch_size.max(1);
     let base_lr = config.learning_rate;
+    let warmup_steps = (num_steps as f64 * 0.05).ceil() as usize; // 5% warmup
     for step in 0..num_steps {
-        // Cosine learning rate decay: starts at base_lr, smoothly decays to 0.
-        let progress = step as f64 / num_steps.max(1) as f64;
-        let decayed_lr = base_lr * 0.5 * (1.0 + (std::f64::consts::PI * progress).cos());
+        // Cosine decay with linear warmup.
+        // Warmup: linearly ramp from 0 to base_lr over first 5% of steps.
+        // Decay: cosine anneal from base_lr to ~0 over remaining steps.
+        let decayed_lr = if step < warmup_steps {
+            base_lr * (step as f64 + 1.0) / warmup_steps.max(1) as f64
+        } else {
+            let progress = (step - warmup_steps) as f64 / (num_steps - warmup_steps).max(1) as f64;
+            base_lr * 0.5 * (1.0 + (std::f64::consts::PI * progress).cos())
+        };
         trainer.set_learning_rate(decayed_lr);
 
         // Inject cheater corruption if configured.
@@ -1244,10 +1260,9 @@ pub async fn run_party_training<T: crate::session::transport::MPCTransport + 'st
                         cheater = ?cheater,
                         "MAC check failed - cheater detected"
                     );
-                    cheater_detected = Some(CheaterRecord {
-                        party_index: cheater.unwrap_or(usize::MAX),
-                        detected_at_step: fail_step,
-                        failure_report: MACFailureReport {
+                    // Retrieve the actual failure report from the trainer.
+                    let failure_report = trainer.take_mac_failure_report()
+                        .unwrap_or_else(|| MACFailureReport {
                             session_id: "e2e-integration".to_string(),
                             step_number: fail_step,
                             identified_cheater: cheater,
@@ -1258,7 +1273,11 @@ pub async fn run_party_training<T: crate::session::transport::MPCTransport + 'st
                                 round1_sigmas: Vec::new(),
                                 round2_sigmas: Vec::new(),
                             },
-                        },
+                        });
+                    cheater_detected = Some(CheaterRecord {
+                        party_index: cheater.unwrap_or(usize::MAX),
+                        detected_at_step: fail_step,
+                        failure_report,
                     });
                     if let Some(ref cb) = on_step {
                         cb(step + 1, num_steps, 0.0, 0.0, false);

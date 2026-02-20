@@ -2,15 +2,19 @@
 pragma solidity ^0.8.19;
 
 import "@openzeppelin/contracts/token/ERC721/extensions/ERC721Enumerable.sol";
+import "@openzeppelin/contracts/utils/Base64.sol";
+import "@openzeppelin/contracts/utils/Strings.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /// @title HelixModelStore
 /// @notice ERC-721 model registry. Each model is an NFT with version history
 ///         and links to encrypted weights on 0G Storage.
-contract HelixModelStore is ERC721Enumerable {
+contract HelixModelStore is ERC721Enumerable, ReentrancyGuard {
     struct Model {
         string slug;           // user-chosen identifier (globally unique)
         string name;           // display name
         string description;
+        string architecture;   // e.g. "784x32x10"
         address creator;       // original creator (immutable, survives transfer)
         uint40 createdAt;
         bool isPublic;         // when true, anyone has access (for paid inference)
@@ -64,11 +68,13 @@ contract HelixModelStore is ERC721Enumerable {
     /// @param slug   Globally unique identifier for the model
     /// @param name   Display name
     /// @param description Model description
+    /// @param architecture Model architecture string (e.g. "784x32x10"), pass "" if unknown
     /// @return tokenId The newly minted token ID
     function createModel(
         string calldata slug,
         string calldata name,
-        string calldata description
+        string calldata description,
+        string calldata architecture
     ) external returns (uint256 tokenId) {
         require(bytes(slug).length > 0, "Slug required");
         require(bytes(name).length > 0, "Name required");
@@ -82,6 +88,7 @@ contract HelixModelStore is ERC721Enumerable {
             slug: slug,
             name: name,
             description: description,
+            architecture: architecture,
             creator: msg.sender,
             createdAt: uint40(block.timestamp),
             isPublic: false,
@@ -154,6 +161,49 @@ contract HelixModelStore is ERC721Enumerable {
         emit AccessChanged(tokenId, account, false);
     }
 
+    // ─── Metadata ────────────────────────────────────────────────────
+
+    /// @notice Returns on-chain JSON metadata for the NFT (ERC-721 tokenURI).
+    function tokenURI(uint256 tokenId) public view override returns (string memory) {
+        _requireOwned(tokenId);
+        Model storage m = models[tokenId];
+
+        // Get latest version info if available
+        string memory latestVersion = "0.0.0";
+        string memory accuracy = "N/A";
+        string memory storagePointer = "";
+        if (_versions[tokenId].length > 0) {
+            Version storage v = _versions[tokenId][_versions[tokenId].length - 1];
+            latestVersion = v.semver;
+            // Zero-pad fractional part: 9505 → "95.05%", 9500 → "95.00%"
+            uint256 whole = v.accuracy / 100;
+            uint256 frac = v.accuracy % 100;
+            accuracy = string.concat(
+                Strings.toString(whole), ".",
+                frac < 10 ? "0" : "",
+                Strings.toString(frac), "%"
+            );
+            storagePointer = v.rootHash;
+        }
+
+        string memory json = string.concat(
+            '{"name":"', m.name,
+            '","description":"', m.description,
+            '","attributes":[',
+                '{"trait_type":"Slug","value":"', m.slug, '"},',
+                '{"trait_type":"Architecture","value":"', m.architecture, '"},',
+                '{"trait_type":"Creator","value":"', Strings.toHexString(m.creator), '"},',
+                '{"trait_type":"Version","value":"', latestVersion, '"},',
+                '{"trait_type":"Accuracy","value":"', accuracy, '"},',
+                '{"trait_type":"StoragePointer","value":"', storagePointer, '"},',
+                '{"trait_type":"Public","value":"', m.isPublic ? "Yes" : "No", '"},',
+                '{"trait_type":"Versions","display_type":"number","value":', Strings.toString(_versions[tokenId].length), '}',
+            ']}'
+        );
+
+        return string.concat("data:application/json;base64,", Base64.encode(bytes(json)));
+    }
+
     // ─── Marketplace ──────────────────────────────────────────────────
 
     /// @notice List or delist a model for sale
@@ -169,7 +219,7 @@ contract HelixModelStore is ERC721Enumerable {
     }
 
     /// @notice Buy a model NFT that is listed for sale
-    function buyModel(uint256 tokenId) external payable {
+    function buyModel(uint256 tokenId) external payable nonReentrant {
         require(isForSale[tokenId], "Model not for sale");
         require(salePrice[tokenId] > 0, "Sale price not set");
         require(msg.value >= salePrice[tokenId], "Insufficient payment");
@@ -192,7 +242,7 @@ contract HelixModelStore is ERC721Enumerable {
 
     /// @notice Pay for inference on a public model (non-owner only)
     /// @return nonce Unique nonce for this inference payment
-    function payForInference(uint256 tokenId) external payable returns (uint256 nonce) {
+    function payForInference(uint256 tokenId) external payable nonReentrant returns (uint256 nonce) {
         require(models[tokenId].isPublic, "Model is not public");
         require(msg.sender != ownerOf(tokenId), "Owner does not pay for inference");
         require(msg.value > 0, "Payment required");
@@ -206,7 +256,7 @@ contract HelixModelStore is ERC721Enumerable {
     }
 
     /// @notice Withdraw accrued inference fees
-    function withdrawInferenceFees(uint256 tokenId) external onlyModelOwner(tokenId) {
+    function withdrawInferenceFees(uint256 tokenId) external nonReentrant onlyModelOwner(tokenId) {
         uint256 amount = inferenceFeesAccrued[tokenId];
         require(amount > 0, "No fees to withdraw");
         inferenceFeesAccrued[tokenId] = 0;

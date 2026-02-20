@@ -785,6 +785,116 @@ impl NativeTrainer {
         }
     }
 
+    /// Single-sample training step with softmax cross-entropy loss.
+    ///
+    /// Matches the MPC `training_step_unproved` loss function for multi-class
+    /// classification (d_out > 1). Includes gradient clipping at +/-1.0 to match
+    /// the MPC trainer.
+    pub fn training_step_ce(&mut self, input: &[f64], target: &[f64], step: u64) -> NativeStepResult {
+        let d_in = self.d_in;
+        let d_hid = self.d_hid;
+        let d_out = self.d_out;
+
+        // Forward: h_pre = W1 @ x + b1
+        let mut h_pre = vec![0.0f64; d_hid];
+        for i in 0..d_hid {
+            let mut sum = 0.0;
+            for j in 0..d_in {
+                sum += self.w1[i * d_in + j] * input[j];
+            }
+            h_pre[i] = sum + self.b1[i];
+        }
+
+        // ReLU
+        let mut h = vec![0.0f64; d_hid];
+        let mut relu_mask = vec![0.0f64; d_hid];
+        for i in 0..d_hid {
+            if h_pre[i] >= 0.0 {
+                h[i] = h_pre[i];
+                relu_mask[i] = 1.0;
+            }
+        }
+
+        // y = W2 @ h + b2
+        let mut y = vec![0.0f64; d_out];
+        for i in 0..d_out {
+            let mut sum = 0.0;
+            for j in 0..d_hid {
+                sum += self.w2[i * d_hid + j] * h[j];
+            }
+            y[i] = sum + self.b2[i];
+        }
+
+        // Softmax cross-entropy loss
+        let max_y = y.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+        let exp_y: Vec<f64> = y.iter().map(|&v| (v - max_y).exp()).collect();
+        let sum_exp: f64 = exp_y.iter().sum();
+        let probs: Vec<f64> = exp_y.iter().map(|&e| e / sum_exp).collect();
+
+        let loss = -target.iter().zip(probs.iter())
+            .map(|(&t, &p)| if t > 0.5 { (p.max(1e-10)).ln() } else { 0.0 })
+            .sum::<f64>();
+
+        // dy = probs - target (softmax gradient)
+        let mut dy = vec![0.0f64; d_out];
+        for i in 0..d_out {
+            dy[i] = probs[i] - target[i];
+        }
+
+        // Backward: dW2 = outer(dy, h)
+        let mut dw2 = vec![0.0f64; d_out * d_hid];
+        for i in 0..d_out {
+            for j in 0..d_hid {
+                dw2[i * d_hid + j] = dy[i] * h[j];
+            }
+        }
+        let mut db2 = dy.clone();
+
+        // dh = W2^T @ dy
+        let mut dh = vec![0.0f64; d_hid];
+        for j in 0..d_hid {
+            let mut sum = 0.0;
+            for i in 0..d_out {
+                sum += self.w2[i * d_hid + j] * dy[i];
+            }
+            dh[j] = sum;
+        }
+
+        // dh_pre = dh * relu_mask
+        let mut dh_pre = vec![0.0f64; d_hid];
+        for i in 0..d_hid {
+            dh_pre[i] = dh[i] * relu_mask[i];
+        }
+
+        // dW1 = outer(dh_pre, x)
+        let mut dw1 = vec![0.0f64; d_hid * d_in];
+        for i in 0..d_hid {
+            for j in 0..d_in {
+                dw1[i * d_in + j] = dh_pre[i] * input[j];
+            }
+        }
+        let mut db1 = dh_pre.clone();
+
+        // Gradient clipping at +/-1.0 (matches MPC trainer)
+        let clip = 1.0;
+        for g in dw1.iter_mut() { *g = g.clamp(-clip, clip); }
+        for g in db1.iter_mut() { *g = g.clamp(-clip, clip); }
+        for g in dw2.iter_mut() { *g = g.clamp(-clip, clip); }
+        for g in db2.iter_mut() { *g = g.clamp(-clip, clip); }
+
+        // Update: W -= lr * dW
+        for i in 0..self.w1.len() { self.w1[i] -= self.learning_rate * dw1[i]; }
+        for i in 0..self.b1.len() { self.b1[i] -= self.learning_rate * db1[i]; }
+        for i in 0..self.w2.len() { self.w2[i] -= self.learning_rate * dw2[i]; }
+        for i in 0..self.b2.len() { self.b2[i] -= self.learning_rate * db2[i]; }
+
+        NativeStepResult {
+            step,
+            loss,
+            probabilities: probs,
+        }
+    }
+
     /// Runs a mini-batch training step with MSE loss.
     ///
     /// Computes the average gradient over `batch` samples and applies a single

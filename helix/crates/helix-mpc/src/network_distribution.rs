@@ -197,6 +197,10 @@ pub enum ProtocolMessage {
         /// Whether a cheater was detected (and which party).
         cheater_detected: bool,
         cheater_party: Option<usize>,
+        /// Step at which cheating was detected (if any).
+        cheater_detected_at_step: u64,
+        /// MAC failure report with evidence (if cheater detected).
+        mac_failure_report: Option<crate::mac_verification::MACFailureReport>,
         /// Encrypted final weight share for the owner.
         encrypted_final_share: Option<EncryptedShare>,
         /// Checkpoint records from training.
@@ -407,57 +411,69 @@ pub async fn distribute_shares(
 
     let generators = distributor.generators().clone();
 
-    // Connect to each worker and send distribution messages
+    // Connect to all workers in parallel and send distribution messages.
+    // This is the critical performance path: sequential TCP connections were the
+    // primary bottleneck (~50s per worker with per-element commitments).
+    let mut handles = Vec::with_capacity(n);
+
+    for (i, (party_id, addr, _)) in workers.iter().enumerate() {
+        let party_id = party_id.clone();
+        let addr = *addr;
+        let encrypted_share = result.encrypted_shares[i].clone();
+        let encrypted_blindings_i = encrypted_blinding_shares[i].clone();
+        let initial_commitment = result.initial_commitment.clone();
+        let gens = generators.clone();
+
+        handles.push(tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.map_err(|e| {
+                MPCError::CommunicationError(format!(
+                    "failed to connect to worker {} at {}: {}",
+                    party_id, addr, e
+                ))
+            })?;
+
+            let msg = ProtocolMessage::ShareDistribution {
+                encrypted_share,
+                encrypted_blindings: encrypted_blindings_i,
+                initial_commitment,
+                generators: gens,
+            };
+            send_message(&mut stream, &msg).await?;
+
+            let response = recv_message(&mut stream).await?;
+            match response {
+                ProtocolMessage::CommitmentShareResponse { commitment_share } => {
+                    Ok::<_, MPCError>((party_id, stream, commitment_share))
+                }
+                other => Err(MPCError::ProtocolError(format!(
+                    "expected CommitmentShareResponse, got {:?}",
+                    std::mem::discriminant(&other)
+                ))),
+            }
+        }));
+    }
+
+    // Await all workers in parallel
+    let results = futures::future::join_all(handles).await;
     let mut worker_streams = Vec::with_capacity(n);
     let mut commitment_shares = Vec::with_capacity(n);
 
-    for (i, (party_id, addr, _)) in workers.iter().enumerate() {
-        let mut stream = TcpStream::connect(addr).await.map_err(|e| {
-            MPCError::CommunicationError(format!(
-                "failed to connect to worker {} at {}: {}",
-                party_id, addr, e
-            ))
-        })?;
-
-        // Send distribution message
-        let msg = ProtocolMessage::ShareDistribution {
-            encrypted_share: result.encrypted_shares[i].clone(),
-            encrypted_blindings: encrypted_blinding_shares[i].clone(),
-            initial_commitment: result.initial_commitment.clone(),
-            generators: generators.clone(),
-        };
-        send_message(&mut stream, &msg).await?;
-
-        // Receive commitment share response
-        let response = recv_message(&mut stream).await?;
-        match response {
-            ProtocolMessage::CommitmentShareResponse { commitment_share } => {
-                commitment_shares.push(commitment_share);
-            }
-            other => {
-                return Err(MPCError::ProtocolError(format!(
-                    "expected CommitmentShareResponse, got {:?}",
-                    std::mem::discriminant(&other)
-                )));
-            }
-        }
-
-        worker_streams.push((party_id.clone(), stream));
+    for join_result in results {
+        let (party_id, stream, commitment_share) = join_result
+            .map_err(|e| MPCError::CommunicationError(format!("worker task panicked: {}", e)))?
+            ?;
+        worker_streams.push((party_id, stream));
+        commitment_shares.push(commitment_share);
     }
 
     // Combine commitment shares and verify against C0
     let checkpoint = CheckpointCommitment::with_generators(generators);
     let combined = checkpoint.combine_shares(&commitment_shares)?;
 
-    // Verify: combined commitment should equal the initial commitment C0.
-    // We compare the aggregate points (EC point equality).
-    let verified = combined.aggregate == result.initial_commitment.aggregate
-        && combined.element_commitments.len() == result.initial_commitment.element_commitments.len()
-        && combined
-            .element_commitments
-            .iter()
-            .zip(result.initial_commitment.element_commitments.iter())
-            .all(|(a, b)| a == b);
+    // Verify: combined aggregate commitment equals the initial aggregate C0.
+    // During distribution we use aggregate-only mode for performance; per-element
+    // commitments are computed at checkpoint time during training.
+    let verified = combined.aggregate == result.initial_commitment.aggregate;
 
     // Send verification result to all workers
     for (_, stream) in &mut worker_streams {
@@ -630,9 +646,10 @@ pub async fn worker_receive_distribution(
     // Decrypt blinding share
     let blinding_share = decrypt_blindings(&encrypted_blindings, secret_key)?;
 
-    // Compute commitment share using the owner's blinding share
+    // Compute aggregate-only commitment share (skips per-element Pedersen
+    // commitments for ~100x speedup during distribution)
     let checkpoint = CheckpointCommitment::with_generators(generators.clone());
-    let commitment_share = checkpoint.compute_share(&weight_share, &blinding_share)?;
+    let commitment_share = checkpoint.compute_share_aggregate_only(&weight_share, &blinding_share)?;
 
     // Send commitment share back
     let response = ProtocolMessage::CommitmentShareResponse { commitment_share };
