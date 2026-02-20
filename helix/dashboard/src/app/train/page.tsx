@@ -95,17 +95,6 @@ const PHASE_DESCRIPTIONS: Record<number, string> = {
 
 const TOTAL_PHASES = 13;
 
-// Per-step MPC operations — these all actually happen every training step.
-// Keyed to step number (not a timer) so they advance with real progress.
-const MPC_STEP_OPERATIONS = [
-  'Secret-shared forward pass — layer 1 matmul',
-  'Garbled-circuit ReLU activation via OT',
-  'Secret-shared forward pass — layer 2 matmul',
-  'Computing cross-entropy loss',
-  'MPC backward pass — gradient computation',
-  'Applying gradient update with LR decay',
-];
-
 type WeightFetchStatus = 'idle' | 'fetching' | 'decrypting' | 'uploading' | 'done' | 'error';
 
 // ============================================================================
@@ -235,34 +224,27 @@ function PhaseRing({ phase, totalPhases, size = 180 }: { phase: number; totalPha
 }
 
 function SubStatusTicker({ session }: { session: TrainingSessionState }) {
-  // During MPC training (phase 8), derive specific descriptions from real state
   const text = useMemo(() => {
+    // Non-training phases: show phase description
     if (session.phase !== 8 || session.current_step === 0) {
-      return session.phase_description || PHASE_DESCRIPTIONS[session.phase] || 'Processing...';
+      return session.phase_description || 'Processing...';
     }
 
-    // Show real event-driven status when notable things happen
+    // Cheater detection takes priority
     if (session.cheater_detected) {
       return `Cheater detected — worker ${session.cheater_detected.party_index} at step ${session.cheater_detected.step}`;
     }
 
-    // Cycle through per-step MPC operations keyed to step number (not a timer).
-    // These operations actually happen every step; the rotation reflects real progress.
-    const workers = session.workers_active ?? 3;
-    const opIndex = session.current_step % MPC_STEP_OPERATIONS.length;
-    const base = MPC_STEP_OPERATIONS[opIndex];
-
-    // Augment with real metrics
-    if (session.mac_checks_passed > 0 && session.current_step % 5 === 0) {
-      return `Verifying SPDZ MACs — ${session.mac_checks_passed} checks passed across ${workers} parties`;
-    }
-    if (session.checkpoints_submitted > 0 && session.current_step % 50 === 0) {
-      return `Checkpoint ${session.checkpoints_submitted} attested on-chain — Pedersen commitment`;
+    // Use real sub-step data from backend when available
+    if (session.sub_step) {
+      const workers = session.workers_active ?? 3;
+      return `${session.sub_step} — ${workers} workers`;
     }
 
-    return `${base} — ${workers} workers`;
-  }, [session.phase, session.current_step, session.phase_description, session.cheater_detected,
-      session.mac_checks_passed, session.checkpoints_submitted, session.workers_active]);
+    // Fallback to phase description
+    return session.phase_description || 'MPC training in progress...';
+  }, [session.phase, session.current_step, session.phase_description,
+      session.cheater_detected, session.sub_step, session.workers_active]);
 
   return (
     <AnimatePresence mode="wait">
