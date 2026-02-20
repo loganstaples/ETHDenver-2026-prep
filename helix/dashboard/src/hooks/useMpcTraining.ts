@@ -55,6 +55,7 @@ export interface TrainingSessionState {
   zk_activated_by_risk: boolean;
   phase: number;
   phase_description: string;
+  sub_step: string | null;
   coordinator_address: string;
   job_id: number;
   elapsed_secs: number;
@@ -269,6 +270,18 @@ export function useMpcTraining(): UseMpcTrainingReturn {
             });
 
             setLosses((prev) => [...prev, { step, loss, accuracy: accuracy ?? undefined }]);
+          }
+
+          // Handle sub-step events (real-time operation status)
+          if (evt.type === 'sub_step') {
+            const operation = evt.operation as string;
+            setSession((prev) => {
+              if (!prev) return prev;
+              return {
+                ...prev,
+                sub_step: operation,
+              };
+            });
           }
 
           // Handle phase events
@@ -516,6 +529,7 @@ export function useMpcTraining(): UseMpcTrainingReturn {
         zk_activated_by_risk: false,
         phase: 1,
         phase_description: 'Starting session...',
+        sub_step: null,
         coordinator_address: '',
         job_id: 0,
         elapsed_secs: 0,
