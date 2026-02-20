@@ -2555,9 +2555,10 @@ async fn inference_handler(
                 .map(|s| hex::encode(s))
                 .collect();
 
-            // Attempt on-chain inference attestation (best-effort, non-blocking)
-            let mut chain_tx_hash = None::<String>;
-            let mut inference_id = None::<u64>;
+            // Fire-and-forget on-chain inference attestation (non-blocking background task).
+            // Worker signatures are currently SHA-256 placeholders (not ECDSA), so the
+            // contract call will revert with ECDSAInvalidSignatureLength. We spawn this
+            // as a background task so the inference response returns immediately.
             #[cfg(feature = "chain")]
             {
                 if let Some(job_id) = session_job_id {
@@ -2565,25 +2566,29 @@ async fn inference_handler(
                         let coord_addr = state.coordinator_address.read().await.clone();
                         let rpc_url = state.eth_rpc_url.read().await.clone();
                         if let (Some(coord), Some(rpc)) = (coord_addr, rpc_url) {
-                            use crate::rpc::chain_v4::ChainClientV4;
-                            // Use TESTNET_PRIVATE_KEY (real chain) or Anvil default (local dev)
-                            let owner_key = std::env::var("TESTNET_PRIVATE_KEY")
-                                .unwrap_or_else(|_| "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".to_string());
-                            if let Ok(client) = ChainClientV4::new(&rpc, &owner_key, &coord, None).await {
-                                let sigs: Vec<ethers::types::Bytes> = inference.worker_signatures
+                            let sigs_raw = inference.worker_signatures.clone();
+                            let prediction = inference.prediction as u64;
+                            let input_hash = inference.input_hash;
+                            let output_hash = inference.output_hash;
+                            tokio::spawn(async move {
+                                use crate::rpc::chain_v4::ChainClientV4;
+                                let owner_key = std::env::var("TESTNET_PRIVATE_KEY")
+                                    .unwrap_or_else(|_| "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".to_string());
+                                let client = match ChainClientV4::new(&rpc, &owner_key, &coord, None).await {
+                                    Ok(c) => c,
+                                    Err(e) => {
+                                        debug!("On-chain inference client init failed (non-fatal): {}", e);
+                                        return;
+                                    }
+                                };
+                                let sigs: Vec<ethers::types::Bytes> = sigs_raw
                                     .iter()
                                     .map(|s| ethers::types::Bytes::from(s.clone()))
                                     .collect();
                                 match client.submit_inference_result(
-                                    job_id,
-                                    inference.prediction as u64,
-                                    inference.input_hash,
-                                    inference.output_hash,
-                                    sigs,
+                                    job_id, prediction, input_hash, output_hash, sigs,
                                 ).await {
                                     Ok((receipt, iid)) => {
-                                        chain_tx_hash = Some(format!("{:?}", receipt.transaction_hash));
-                                        inference_id = Some(iid);
                                         info!(
                                             inference_id = iid,
                                             tx_hash = ?receipt.transaction_hash,
@@ -2591,10 +2596,10 @@ async fn inference_handler(
                                         );
                                     }
                                     Err(e) => {
-                                        warn!("On-chain inference submission failed (non-fatal): {}", e);
+                                        debug!("On-chain inference submission failed (non-fatal): {}", e);
                                     }
                                 }
-                            }
+                            });
                         }
                     }
                 }
@@ -2610,8 +2615,6 @@ async fn inference_handler(
                     "input_hash": input_hash_hex,
                     "output_hash": output_hash_hex,
                     "worker_signatures": sig_hexes,
-                    "chain_tx_hash": chain_tx_hash,
-                    "inference_id": inference_id,
                 },
                 "timing": {
                     "share_generation_ms": inference.timing.share_generation_ms,
