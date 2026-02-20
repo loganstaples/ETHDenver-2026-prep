@@ -15,11 +15,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::extract::{ConnectInfo, Path, State};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::{HeaderMap, Method, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures::{SinkExt, StreamExt};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -136,6 +138,8 @@ pub struct ApiState {
     pub fault_tolerance_status: Arc<RwLock<FaultToleranceStatus>>,
     /// Active model-worker task assignments (for network graph).
     pub active_tasks: Arc<RwLock<Vec<ActiveTask>>>,
+    /// Broadcast channel for real-time dashboard events.
+    pub dashboard_event_tx: broadcast::Sender<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -306,6 +310,28 @@ pub struct ActiveTasksResponse {
     pub active_models: Vec<ActiveTask>,
 }
 
+// ---------------------------------------------------------------------------
+// Dashboard event broadcasting
+// ---------------------------------------------------------------------------
+
+/// Broadcasts a dashboard event to all connected WebSocket clients.
+pub fn broadcast_dashboard_event(
+    tx: &broadcast::Sender<String>,
+    event_type: &str,
+    data: serde_json::Value,
+) {
+    let msg = serde_json::json!({
+        "type": event_type,
+        "channel": "nodes",
+        "timestamp": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+        "data": data,
+    });
+    let _ = tx.send(msg.to_string());
+}
+
 #[derive(Serialize, Deserialize)]
 struct RoundStartResponse {
     triggered: bool,
@@ -396,7 +422,8 @@ pub async fn start_api_server(
     let public_routes = Router::new()
         .route("/health", get(health_handler))
         .route("/metrics", get(metrics_handler))
-        .route("/api/active-tasks", get(active_tasks_handler));
+        .route("/api/active-tasks", get(active_tasks_handler))
+        .route("/ws", get(ws_handler));
 
     // Authenticated routes (require Bearer token)
     let auth_routes = Router::new()
@@ -615,6 +642,51 @@ async fn download_weights_handler(
     }
 }
 
+// ---------------------------------------------------------------------------
+// WebSocket handler for dashboard live events
+// ---------------------------------------------------------------------------
+
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<ApiState>>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_ws_connection(socket, state))
+}
+
+async fn handle_ws_connection(socket: WebSocket, state: Arc<ApiState>) {
+    let (mut sender, mut receiver) = socket.split();
+    let mut event_rx = state.dashboard_event_tx.subscribe();
+
+    let send_task = tokio::spawn(async move {
+        while let Ok(msg) = event_rx.recv().await {
+            if sender.send(Message::Text(msg.into())).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let recv_task = tokio::spawn(async move {
+        while let Some(Ok(msg)) = receiver.next().await {
+            match msg {
+                Message::Text(text) => {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&*text) {
+                        if parsed.get("type").and_then(|t| t.as_str()) == Some("ping") {
+                            // Heartbeat acknowledged
+                        }
+                    }
+                }
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+    });
+
+    tokio::select! {
+        _ = send_task => {},
+        _ = recv_task => {},
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -624,6 +696,7 @@ mod tests {
 
     fn test_state(api_key: &str) -> Arc<ApiState> {
         let (tx, _rx) = broadcast::channel(16);
+        let (dashboard_event_tx, _) = broadcast::channel::<String>(256);
         let node_metrics = NodeMetrics::new();
         // Pre-populate some metrics for testing
         node_metrics.record_proof_generated(100);
@@ -685,6 +758,7 @@ mod tests {
                 system_healthy: true,
             })),
             active_tasks: Arc::new(RwLock::new(Vec::new())),
+            dashboard_event_tx,
         })
     }
 
@@ -695,7 +769,8 @@ mod tests {
         let public_routes = Router::new()
             .route("/health", get(health_handler))
             .route("/metrics", get(metrics_handler))
-            .route("/api/active-tasks", get(active_tasks_handler));
+            .route("/api/active-tasks", get(active_tasks_handler))
+            .route("/ws", get(ws_handler));
 
         let auth_routes = Router::new()
             .route("/round/start", post(round_start_handler))

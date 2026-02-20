@@ -19,7 +19,10 @@ use parking_lot::RwLock;
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 
-use crate::api::http::{ApiRateLimiter, ApiState, FaultToleranceStatus, MpcHealthStatus};
+use crate::api::http::{
+    ApiRateLimiter, ApiState, ActiveTask, FaultToleranceStatus, MpcHealthStatus,
+    broadcast_dashboard_event,
+};
 use crate::metrics::NodeMetrics;
 use crate::api::rpc::{
     MPCStatusSnapshot, NodeConfigSnapshot, ProofStatusEntry, RpcRateLimiter, RpcState,
@@ -1124,6 +1127,8 @@ impl NodeRuntime {
         self.health.write().http_api = SubsystemStatus::Starting;
         let api_key = crate::config::ApiConfig::default().api_key_or_generate();
         info!("HTTP API key: {}", api_key);
+        let (dashboard_event_tx, _) = broadcast::channel::<String>(256);
+        let active_tasks: Arc<RwLock<Vec<ActiveTask>>> = Arc::new(RwLock::new(Vec::new()));
         let api_state = Arc::new(ApiState {
             orchestrator_workers: api_snapshot.clone(),
             round_trigger_tx: round_trigger_tx.clone(),
@@ -1138,7 +1143,8 @@ impl NodeRuntime {
             mpc_health: Arc::new(RwLock::new(MpcHealthStatus::default())),
             fault_tolerance_status: fault_tolerance_status.clone(),
             node_metrics: self.node_metrics.clone(),
-            active_tasks: Arc::new(RwLock::new(Vec::new())),
+            active_tasks: active_tasks.clone(),
+            dashboard_event_tx: dashboard_event_tx.clone(),
         });
 
         let http_addr: SocketAddr = format!("0.0.0.0:{}", self.config.http_port).parse()?;
@@ -1213,6 +1219,8 @@ impl NodeRuntime {
         let snapshot_for_events = api_snapshot.clone();
         let proof_status_events = proof_status.clone();
         let fd_for_orch = failure_detector.clone();
+        let active_tasks_for_events = active_tasks.clone();
+        let dashboard_tx_for_events = dashboard_event_tx.clone();
         let (completed_round_tx, mut completed_round_rx) = tokio::sync::mpsc::channel::<u64>(16);
         let mut completed_rounds = 0u64;
         tokio::spawn(async move {
@@ -1221,10 +1229,32 @@ impl NodeRuntime {
                     OrchestratorEvent::WorkerJoined { peer_id } => {
                         info!("Worker joined: {}", peer_id);
                         fd_for_orch.register_worker(peer_id.clone());
+                        // Add worker to any existing active tasks, or note it for future rounds
+                        broadcast_dashboard_event(
+                            &dashboard_tx_for_events,
+                            "worker_assigned",
+                            serde_json::json!({
+                                "worker_id": peer_id.to_string(),
+                            }),
+                        );
                     }
                     OrchestratorEvent::WorkerLeft { peer_id } => {
                         info!("Worker left: {}", peer_id);
                         fd_for_orch.unregister_worker(peer_id);
+                        // Remove worker from active tasks
+                        {
+                            let mut tasks = active_tasks_for_events.write();
+                            for task in tasks.iter_mut() {
+                                task.worker_ids.retain(|id| id != &peer_id.to_string());
+                            }
+                        }
+                        broadcast_dashboard_event(
+                            &dashboard_tx_for_events,
+                            "worker_removed",
+                            serde_json::json!({
+                                "worker_id": peer_id.to_string(),
+                            }),
+                        );
                     }
                     OrchestratorEvent::RoundStarted { round_id, workers } => {
                         info!("Round {} started with {} workers", round_id, workers.len());
@@ -1233,6 +1263,34 @@ impl NodeRuntime {
                             status: "collecting".to_string(),
                             proofs_collected: 0,
                         });
+                        // Create an ActiveTask for this round
+                        {
+                            let now_ts = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            let worker_ids: Vec<String> = workers.iter()
+                                .map(|w| w.to_string())
+                                .collect();
+                            let model_id = format!("round-{}", round_id);
+                            active_tasks_for_events.write().push(ActiveTask {
+                                model_id: model_id.clone(),
+                                model_name: format!("Training Round {}", round_id),
+                                task_type: "training".to_string(),
+                                worker_ids: worker_ids.clone(),
+                                started_at: now_ts,
+                            });
+                            broadcast_dashboard_event(
+                                &dashboard_tx_for_events,
+                                "model_activity_changed",
+                                serde_json::json!({
+                                    "model_id": model_id,
+                                    "round_id": round_id,
+                                    "action": "started",
+                                    "worker_ids": worker_ids,
+                                }),
+                            );
+                        }
                     }
                     OrchestratorEvent::GradientReceived { round_id, peer_id } => {
                         info!("Gradient for round {} from {}", round_id, peer_id);
@@ -1250,6 +1308,21 @@ impl NodeRuntime {
                                 entry.status = "completed".to_string();
                             }
                         }
+                        // Remove the ActiveTask for this round
+                        {
+                            let round_model_id = format!("round-{}", round_id);
+                            active_tasks_for_events.write().retain(|t| t.model_id != round_model_id);
+                            broadcast_dashboard_event(
+                                &dashboard_tx_for_events,
+                                "model_activity_changed",
+                                serde_json::json!({
+                                    "model_id": round_model_id,
+                                    "round_id": round_id,
+                                    "action": "completed",
+                                    "result_hash": hex::encode(&result_hash[..8]),
+                                }),
+                            );
+                        }
                         info!("Round {} completed, result={}", round_id, hex::encode(&result_hash[..8]));
                         let _ = completed_round_tx.send(*round_id).await;
                     }
@@ -1258,6 +1331,21 @@ impl NodeRuntime {
                         let mut status = proof_status_events.write();
                         if let Some(entry) = status.iter_mut().find(|e| e.round_id == *round_id) {
                             entry.status = "failed".to_string();
+                        }
+                        // Remove the ActiveTask for this failed round
+                        {
+                            let round_model_id = format!("round-{}", round_id);
+                            active_tasks_for_events.write().retain(|t| t.model_id != round_model_id);
+                            broadcast_dashboard_event(
+                                &dashboard_tx_for_events,
+                                "model_activity_changed",
+                                serde_json::json!({
+                                    "model_id": round_model_id,
+                                    "round_id": round_id,
+                                    "action": "failed",
+                                    "reason": reason,
+                                }),
+                            );
                         }
                     }
                     _ => {}
@@ -1496,11 +1584,14 @@ impl NodeRuntime {
                             let mut job_event_rx = job_manager.subscribe_events();
                             let snapshot_for_job = api_snapshot.clone();
                             let proof_status_for_job = proof_status.clone();
+                            let active_tasks_for_job = active_tasks.clone();
+                            let dashboard_tx_for_job = dashboard_event_tx.clone();
+                            let job_round_number = round_number;
                             tokio::spawn(async move {
                                 while let Ok(event) = job_event_rx.recv().await {
                                     match &event {
                                         crate::training::job_manager::JobEvent::ProofReceived {
-                                            round_id, proofs_received, ..
+                                            round_id, proofs_received, peer_id, ..
                                         } => {
                                             let mut status = proof_status_for_job.write();
                                             if let Some(entry) = status.iter_mut().find(|e| e.round_id == *round_id) {
@@ -1512,6 +1603,26 @@ impl NodeRuntime {
                                                     proofs_collected: *proofs_received,
                                                 });
                                             }
+                                            // Add worker to active task if not already present
+                                            {
+                                                let job_model_id = format!("job-round-{}", job_round_number);
+                                                let mut tasks = active_tasks_for_job.write();
+                                                if let Some(task) = tasks.iter_mut().find(|t| t.model_id == job_model_id) {
+                                                    let wid = peer_id.to_string();
+                                                    if !task.worker_ids.contains(&wid) {
+                                                        task.worker_ids.push(wid.clone());
+                                                        broadcast_dashboard_event(
+                                                            &dashboard_tx_for_job,
+                                                            "worker_assigned",
+                                                            serde_json::json!({
+                                                                "worker_id": wid,
+                                                                "model_id": job_model_id,
+                                                                "round_id": job_round_number,
+                                                            }),
+                                                        );
+                                                    }
+                                                }
+                                            }
                                         }
                                         crate::training::job_manager::JobEvent::RoundComplete {
                                             round_id, num_contributors, ..
@@ -1522,6 +1633,20 @@ impl NodeRuntime {
                                                 entry.status = "completed".to_string();
                                                 entry.proofs_collected = *num_contributors;
                                             }
+                                            // Remove active task for this job round
+                                            {
+                                                let job_model_id = format!("job-round-{}", job_round_number);
+                                                active_tasks_for_job.write().retain(|t| t.model_id != job_model_id);
+                                                broadcast_dashboard_event(
+                                                    &dashboard_tx_for_job,
+                                                    "model_activity_changed",
+                                                    serde_json::json!({
+                                                        "model_id": job_model_id,
+                                                        "round_id": round_id,
+                                                        "action": "completed",
+                                                    }),
+                                                );
+                                            }
                                         }
                                         crate::training::job_manager::JobEvent::RoundFailed {
                                             round_id, reason, ..
@@ -1530,6 +1655,85 @@ impl NodeRuntime {
                                             if let Some(entry) = status.iter_mut().find(|e| e.round_id == *round_id) {
                                                 entry.status = format!("failed: {}", reason);
                                             }
+                                            // Remove active task for this failed job round
+                                            {
+                                                let job_model_id = format!("job-round-{}", job_round_number);
+                                                active_tasks_for_job.write().retain(|t| t.model_id != job_model_id);
+                                                broadcast_dashboard_event(
+                                                    &dashboard_tx_for_job,
+                                                    "model_activity_changed",
+                                                    serde_json::json!({
+                                                        "model_id": job_model_id,
+                                                        "round_id": round_id,
+                                                        "action": "failed",
+                                                        "reason": reason,
+                                                    }),
+                                                );
+                                            }
+                                        }
+                                        crate::training::job_manager::JobEvent::WorkerReady {
+                                            round_id, peer_id, ..
+                                        } => {
+                                            // Worker acknowledged readiness; add active task for this job if not present
+                                            {
+                                                let now_ts = std::time::SystemTime::now()
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .unwrap_or_default()
+                                                    .as_secs();
+                                                let job_model_id = format!("job-round-{}", job_round_number);
+                                                let mut tasks = active_tasks_for_job.write();
+                                                if let Some(task) = tasks.iter_mut().find(|t| t.model_id == job_model_id) {
+                                                    let wid = peer_id.to_string();
+                                                    if !task.worker_ids.contains(&wid) {
+                                                        task.worker_ids.push(wid);
+                                                    }
+                                                } else {
+                                                    tasks.push(ActiveTask {
+                                                        model_id: job_model_id.clone(),
+                                                        model_name: format!("Training Round {}", round_id),
+                                                        task_type: "training".to_string(),
+                                                        worker_ids: vec![peer_id.to_string()],
+                                                        started_at: now_ts,
+                                                    });
+                                                    broadcast_dashboard_event(
+                                                        &dashboard_tx_for_job,
+                                                        "model_activity_changed",
+                                                        serde_json::json!({
+                                                            "model_id": job_model_id,
+                                                            "round_id": round_id,
+                                                            "action": "started",
+                                                            "worker_ids": vec![peer_id.to_string()],
+                                                        }),
+                                                    );
+                                                }
+                                            }
+                                            broadcast_dashboard_event(
+                                                &dashboard_tx_for_job,
+                                                "worker_assigned",
+                                                serde_json::json!({
+                                                    "worker_id": peer_id.to_string(),
+                                                    "round_id": round_id,
+                                                }),
+                                            );
+                                        }
+                                        crate::training::job_manager::JobEvent::WorkerDropped {
+                                            peer_id, ..
+                                        } => {
+                                            // Remove worker from active task
+                                            {
+                                                let job_model_id = format!("job-round-{}", job_round_number);
+                                                let mut tasks = active_tasks_for_job.write();
+                                                if let Some(task) = tasks.iter_mut().find(|t| t.model_id == job_model_id) {
+                                                    task.worker_ids.retain(|id| id != &peer_id.to_string());
+                                                }
+                                            }
+                                            broadcast_dashboard_event(
+                                                &dashboard_tx_for_job,
+                                                "worker_removed",
+                                                serde_json::json!({
+                                                    "worker_id": peer_id.to_string(),
+                                                }),
+                                            );
                                         }
                                         _ => {}
                                     }

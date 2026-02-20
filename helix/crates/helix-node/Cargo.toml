@@ -62,7 +62,7 @@ aes-gcm = "0.10"
 argon2 = "0.5"
 
 # HTTP API
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
 subtle = "2.5"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors"] }
