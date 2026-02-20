@@ -26,6 +26,9 @@ export interface PublicModel {
   versions: OnChainVersion[];
   latestVersion: OnChainVersion | null;
   bestAccuracy: number;
+  averageRating: number; // 0-5, default 0 (no backend yet)
+  ratingCount: number; // default 0
+  inferenceCount: number; // default 0
 }
 
 export type ModelFilter = 'all' | 'others' | 'mine';
@@ -208,6 +211,9 @@ export function usePublicModels() {
         versions,
         latestVersion,
         bestAccuracy,
+        averageRating: 0,
+        ratingCount: 0,
+        inferenceCount: 0,
       });
     }
 

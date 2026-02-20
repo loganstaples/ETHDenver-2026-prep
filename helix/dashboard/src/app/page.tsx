@@ -17,6 +17,7 @@ import {
   ShoppingCart,
   DollarSign,
   Store,
+  Star,
 } from 'lucide-react';
 import { Card } from '@/components/ui/Card';
 import { Badge } from '@/components/ui/Badge';
@@ -115,12 +116,38 @@ function getModelTags(model: { name: string; description: string; slug: string }
   return tags;
 }
 
-/** Quality score from real on-chain data: accuracy (60%), versions (25%, capped 5), weights (15%). */
-function computeQualityScore(model: { bestAccuracy: number; versionCount: number; latestVersion?: { weightsStored: boolean } | null }): number {
-  const accScore = Math.min(1, model.bestAccuracy) * 60;
-  const versionScore = Math.min(model.versionCount, 5) / 5 * 25;
-  const weightsScore = model.latestVersion?.weightsStored ? 15 : 0;
-  return Math.round(accScore + versionScore + weightsScore);
+/** Quality score: accuracy (50%), versions (20%, capped 5), weights (10%), rating (20%). */
+function computeQualityScore(model: { bestAccuracy: number; versionCount: number; latestVersion?: { weightsStored: boolean } | null; averageRating?: number }): number {
+  const accScore = Math.min(1, model.bestAccuracy) * 50;
+  const versionScore = Math.min(model.versionCount, 5) / 5 * 20;
+  const weightsScore = model.latestVersion?.weightsStored ? 10 : 0;
+  const ratingScore = ((model.averageRating ?? 0) / 5) * 20;
+  return Math.round(accScore + versionScore + weightsScore + ratingScore);
+}
+
+function RatingStars({ rating, count }: { rating: number; count: number }) {
+  return (
+    <div className="flex items-center gap-1.5">
+      <div className="flex items-center gap-0.5">
+        {Array.from({ length: 5 }, (_, i) => {
+          const fill = Math.min(1, Math.max(0, rating - i));
+          return (
+            <div key={i} className="relative w-3 h-3">
+              <Star size={12} className="text-white/10 absolute inset-0" />
+              {fill > 0 && (
+                <div className="absolute inset-0 overflow-hidden" style={{ width: `${fill * 100}%` }}>
+                  <Star size={12} className="text-yellow-400 fill-yellow-400" />
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+      <span className="text-2xs text-helix-dim font-mono">
+        {count > 0 ? `${rating.toFixed(1)}` : 'N/A'}
+      </span>
+    </div>
+  );
 }
 
 function QualityBar({ score }: { score: number }) {
@@ -421,7 +448,7 @@ function InferenceModelCard({ model, isOwner }: { model: PublicModel; isOwner: b
         <QualityBar score={qualityScore} />
 
         {/* Stats */}
-        <div className="grid grid-cols-3 gap-3 mb-4">
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
           <div className="bg-helix-bg rounded-md px-3 py-2 text-center">
             <p className="text-2xs text-helix-muted">Versions</p>
             <p className="text-lg font-mono font-light text-white">{model.versionCount}</p>
@@ -435,6 +462,12 @@ function InferenceModelCard({ model, isOwner }: { model: PublicModel; isOwner: b
           <div className="bg-helix-bg rounded-md px-3 py-2 text-center">
             <p className="text-2xs text-helix-muted">Inference Fee</p>
             <p className="text-lg font-mono font-light text-white">{formatFee(model.inferenceFee)}</p>
+          </div>
+          <div className="bg-helix-bg rounded-md px-3 py-2 text-center">
+            <p className="text-2xs text-helix-muted">Rating</p>
+            <div className="flex justify-center mt-1">
+              <RatingStars rating={model.averageRating} count={model.ratingCount} />
+            </div>
           </div>
         </div>
 
@@ -543,7 +576,7 @@ function MarketplaceModelCard({
       <QualityBar score={qualityScore} />
 
       {/* Stats */}
-      <div className="grid grid-cols-3 gap-3 mb-4">
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
         <div className="bg-helix-bg rounded-md px-3 py-2 text-center">
           <p className="text-2xs text-helix-muted">Versions</p>
           <p className="text-lg font-mono font-light text-white">{model.versionCount}</p>
@@ -555,10 +588,16 @@ function MarketplaceModelCard({
           </p>
         </div>
         <div className="bg-helix-bg rounded-md px-3 py-2 text-center">
-          <p className="text-2xs text-helix-muted">Sale Price</p>
-          <p className="text-lg font-mono font-light text-green-400">
-            {isContactOwner ? 'N/A' : formatAdiPrice(model.salePrice)}
+          <p className="text-2xs text-helix-muted">Inferences</p>
+          <p className="text-lg font-mono font-light text-white">
+            {model.inferenceCount > 0 ? model.inferenceCount : '--'}
           </p>
+        </div>
+        <div className="bg-helix-bg rounded-md px-3 py-2 text-center">
+          <p className="text-2xs text-helix-muted">Rating</p>
+          <div className="flex justify-center mt-1">
+            <RatingStars rating={model.averageRating} count={model.ratingCount} />
+          </div>
         </div>
       </div>
 

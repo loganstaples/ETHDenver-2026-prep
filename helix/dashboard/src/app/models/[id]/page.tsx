@@ -164,6 +164,16 @@ function OverviewTab({ model, isOwner }: { model: NonNullable<ReturnType<typeof 
 
   return (
     <div className="space-y-6">
+      {/* Encryption notice for non-owners */}
+      {!isOwner && weightsCount > 0 && (
+        <div className="flex items-center gap-2.5 px-4 py-3 bg-white/[0.02] border border-white/[0.06] rounded-xl">
+          <Shield size={14} className="text-green-400 shrink-0" />
+          <p className="text-2xs text-helix-muted">
+            Encrypted on 0G — owner-only access. Model weights are encrypted with the owner&apos;s wallet key.
+          </p>
+        </div>
+      )}
+
       {/* Description */}
       {model.description && (
         <Card variant="default">

@@ -787,38 +787,39 @@ function InferencePageInner() {
 
     const isOwner = address && selectedModel.owner.toLowerCase() === address.toLowerCase();
 
-    // Non-owner: check if backend has cached weights for this version
-    if (!isOwner) {
-      const checkBackend = async () => {
-        try {
-          const res = await fetch(`${API_BASE}/api/models/${selectedModel.tokenId}/inference-ready?version=${selectedVersionIndex}`);
-          if (res.ok) {
-            const data = await res.json();
-            if (data.ready) {
-              setBackendWeightsReady(true);
-              setWeightFetchStatus('done');
-              return;
-            }
+    // For ALL users (owner and non-owner): first check if backend already has cached weights
+    const doFetch = async () => {
+      // Step 1: Check backend cache
+      try {
+        const res = await fetch(`${API_BASE}/api/models/${selectedModel.tokenId}/inference-ready?version=${selectedVersionIndex}`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.ready) {
+            setBackendWeightsReady(true);
+            setWeightFetchStatus('done');
+            if (data.session_id) setActiveSessionId(data.session_id);
+            return;
           }
-        } catch { /* non-fatal */ }
-        // Backend doesn't have weights cached — show message
+        }
+      } catch { /* non-fatal */ }
+
+      // Step 2: If not cached and user is NOT owner, show error
+      if (!isOwner) {
         setWeightFetchError('Weights not available for this version. The model owner must run inference first.');
         setWeightFetchStatus('error');
         fetchKeyRef.current = null;
-      };
-      checkBackend();
-      return;
-    }
+        return;
+      }
 
-    // Owner: fetch from 0G using the selected version's rootHash, decrypt, upload to backend
-    const sv = selectedVersion;
-    if (!sv || !sv.weightsStored || !sv.rootHash) {
-      setWeightFetchStatus('idle');
-      setWeightFetchError(null);
-      return;
-    }
-
-    const doFetch = async () => {
+      // Step 3: Owner — fetch from 0G, decrypt, upload to backend
+      const sv = selectedVersion;
+      if (!sv || !sv.weightsStored || !sv.rootHash) {
+        // No weights on 0G either — still allow model-based inference for owner
+        setBackendWeightsReady(false);
+        setWeightFetchStatus('done');
+        setActiveSessionId(`owner-${selectedModel.tokenId}`);
+        return;
+      }
       setWeightFetchStatus('fetching');
       setWeightFetchError(null);
 
@@ -1012,7 +1013,7 @@ function InferencePageInner() {
   const canRunInference = !selectedModel
     ? weightsReady && hasDrawing && !isRunning && !!activeSessionId
     : isOwnerOfSelected
-      ? weightsReady && hasDrawing && !isRunning && !!activeSessionId
+      ? (weightsReady || backendWeightsReady) && hasDrawing && !isRunning
       : backendWeightsReady && hasDrawing && !isRunning && !isPaymentPending && !isPaymentConfirming;
 
   // Select model handler (toggle: click again to deselect)
@@ -1257,6 +1258,16 @@ function InferencePageInner() {
 
         {/* ── RIGHT COLUMN: Fee, Input, Results ────────────────── */}
         <div className="flex flex-col gap-5">
+
+          {/* Security badge for non-owner public model */}
+          {selectedModel && !isOwnerOfSelected && (
+            <div className="flex items-center gap-2.5 px-4 py-3 bg-green-500/[0.04] border border-green-500/20 rounded-xl">
+              <Shield size={14} className="text-green-400 shrink-0" />
+              <p className="text-2xs text-green-300/70">
+                Secure MPC inference — model weights are never exposed
+              </p>
+            </div>
+          )}
 
           {/* Fee / Payment + Run button */}
           <div className="rounded-2xl bg-helix-surface border border-helix-border overflow-hidden">

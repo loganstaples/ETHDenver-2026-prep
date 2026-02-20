@@ -27,6 +27,9 @@ import {
   Search,
   X,
   MessageSquare,
+  DollarSign,
+  Save,
+  Coins,
 } from 'lucide-react';
 import { Card } from '@/components/ui/Card';
 import { Badge } from '@/components/ui/Badge';
@@ -575,6 +578,10 @@ interface ModelDetailModalProps {
   onTogglePublic: (model: ModelWithVersions) => void;
   onDownloadWeights: (model: ModelWithVersions) => void;
   onAddVersion: (model: ModelWithVersions) => void;
+  onSetInferenceFee: (params: { tokenId: number; feeBps: number }) => void;
+  onSetForSale: (params: { tokenId: number; forSale: boolean }) => void;
+  onSetSalePrice: (params: { tokenId: number; priceEth: number }) => void;
+  onWithdrawFees: (tokenId: number) => void;
   isToggling: boolean;
   isDownloading: number | null;
 }
@@ -585,10 +592,40 @@ function ModelDetailModal({
   onTogglePublic,
   onDownloadWeights,
   onAddVersion,
+  onSetInferenceFee,
+  onSetForSale,
+  onSetSalePrice,
+  onWithdrawFees,
   isToggling,
   isDownloading,
 }: ModelDetailModalProps) {
   const [copiedHash, setCopiedHash] = useState<string | null>(null);
+  const [feeInput, setFeeInput] = useState('');
+  const [feeBps, setFeeBps] = useState(0);
+  const [priceInput, setPriceInput] = useState('');
+
+  // Sync local state when model changes
+  useEffect(() => {
+    if (model) {
+      const pct = (model.inferenceFee / 100).toFixed(1);
+      setFeeInput(pct);
+      setFeeBps(model.inferenceFee);
+      setPriceInput(model.salePrice > 0 ? model.salePrice.toString() : '');
+    }
+  }, [model]);
+
+  const feeChanged = model ? feeBps !== model.inferenceFee : false;
+  const parsedPrice = parseFloat(priceInput);
+  const priceValid = !isNaN(parsedPrice) && parsedPrice > 0;
+  const priceChanged = model ? (priceValid && parsedPrice !== model.salePrice) : false;
+
+  const handleFeeInput = (v: string) => {
+    setFeeInput(v);
+    const parsed = parseFloat(v);
+    if (!isNaN(parsed) && parsed >= 0 && parsed <= 50) {
+      setFeeBps(Math.round(parsed * 100));
+    }
+  };
 
   const handleEscape = useCallback((e: KeyboardEvent) => {
     if (e.key === 'Escape') onClose();
@@ -707,18 +744,46 @@ function ModelDetailModal({
                     <p className="text-2xs text-helix-muted mt-1 uppercase tracking-wider">Versions</p>
                   </div>
                   <div className="bg-white/[0.03] rounded-xl px-4 py-3.5 text-center">
-                    <p className="text-lg font-mono font-medium text-helix-dim tracking-tight">0</p>
-                    <p className="text-2xs text-helix-muted mt-1 uppercase tracking-wider">Inferences</p>
+                    <p className="text-lg font-mono font-medium text-white tracking-tight">
+                      {(model.inferenceFee / 100).toFixed(1)}%
+                    </p>
+                    <p className="text-2xs text-helix-muted mt-1 uppercase tracking-wider">Inference Fee</p>
                   </div>
                   <div className="bg-white/[0.03] rounded-xl px-4 py-3.5 text-center">
-                    <p className="text-lg font-mono font-medium text-helix-dim tracking-tight">--</p>
-                    <p className="text-2xs text-helix-muted mt-1 uppercase tracking-wider">Downloads</p>
+                    <p className={cn(
+                      'text-lg font-mono font-medium tracking-tight',
+                      model.feesAccrued > 0 ? 'text-green-400' : 'text-helix-dim',
+                    )}>
+                      {model.feesAccrued > 0 ? `${model.feesAccrued.toFixed(4)}` : '0'}
+                    </p>
+                    <p className="text-2xs text-helix-muted mt-1 uppercase tracking-wider">Accrued Fees (ADI)</p>
                   </div>
                   <div className="bg-white/[0.03] rounded-xl px-4 py-3.5 text-center">
-                    <p className="text-lg font-mono font-medium text-helix-dim tracking-tight">$0.00</p>
-                    <p className="text-2xs text-helix-muted mt-1 uppercase tracking-wider">Revenue</p>
+                    <p className={cn(
+                      'text-lg font-mono font-medium tracking-tight',
+                      model.isPublic ? 'text-green-400' : 'text-helix-dim',
+                    )}>
+                      {model.isPublic ? 'Public' : 'Private'}
+                    </p>
+                    <p className="text-2xs text-helix-muted mt-1 uppercase tracking-wider">Status</p>
                   </div>
                 </div>
+                {model.feesAccrued > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => onWithdrawFees(model.tokenId)}
+                    disabled={isToggling}
+                    className={cn(
+                      'w-full mt-3 flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm font-medium transition-all',
+                      isToggling
+                        ? 'bg-helix-border text-helix-muted cursor-not-allowed'
+                        : 'bg-green-500/10 border border-green-500/30 text-green-400 hover:bg-green-500/20',
+                    )}
+                  >
+                    {isToggling ? <Loader2 size={14} className="animate-spin" /> : <Coins size={14} />}
+                    Withdraw {model.feesAccrued.toFixed(4)} ADI
+                  </button>
+                )}
               </div>
 
               {/* Divider */}
@@ -835,15 +900,90 @@ function ModelDetailModal({
                     </button>
                   </div>
 
-                  {/* Inference Fee */}
-                  <div className="flex items-center justify-between">
-                    <div>
-                      <p className="text-sm text-white">Inference Fee</p>
-                      <p className="text-2xs text-helix-muted mt-0.5">Commission earned per inference</p>
+                  {/* Inference Fee Editor */}
+                  <div>
+                    <div className="flex items-center justify-between mb-2">
+                      <div>
+                        <p className="text-sm text-white">Inference Fee</p>
+                        <p className="text-2xs text-helix-muted mt-0.5">Commission earned per inference (0-50%)</p>
+                      </div>
                     </div>
-                    <span className="text-sm font-mono text-helix-text2">
-                      {(model.inferenceFee / 100).toFixed(1)}%
-                    </span>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="number"
+                        value={feeInput}
+                        onChange={(e) => handleFeeInput(e.target.value)}
+                        min={0}
+                        max={50}
+                        step={0.1}
+                        className="flex-1 px-3 py-2 bg-white/[0.04] border border-white/[0.08] rounded-lg text-sm text-white font-mono focus:outline-none focus:border-white/[0.15] transition-colors"
+                        onClick={(e) => e.stopPropagation()}
+                      />
+                      <span className="text-2xs text-helix-dim font-mono whitespace-nowrap">{feeBps} bps</span>
+                      {feeChanged && (
+                        <button
+                          type="button"
+                          onClick={(e) => { e.stopPropagation(); onSetInferenceFee({ tokenId: model.tokenId, feeBps }); }}
+                          disabled={isToggling}
+                          className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-white text-black text-sm font-medium hover:bg-white/90 transition-colors"
+                        >
+                          <Save size={12} />
+                          Save
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Marketplace Section */}
+                  <div>
+                    <div className="flex items-center justify-between mb-2">
+                      <div>
+                        <p className="text-sm text-white">Marketplace</p>
+                        <p className="text-2xs text-helix-muted mt-0.5">
+                          {model.forSale ? 'Listed for sale on the marketplace' : 'Not listed for sale'}
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={(e) => { e.stopPropagation(); onSetForSale({ tokenId: model.tokenId, forSale: !model.forSale }); }}
+                        disabled={isToggling}
+                        className={cn(
+                          'flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors',
+                          model.forSale
+                            ? 'bg-white/[0.06] text-helix-text hover:bg-white/[0.1]'
+                            : 'bg-green-500/10 text-green-400 border border-green-500/30 hover:bg-green-500/20',
+                          isToggling && 'opacity-50 cursor-not-allowed',
+                        )}
+                      >
+                        {isToggling ? <Loader2 size={12} className="animate-spin" /> : model.forSale ? <XCircle size={12} /> : <DollarSign size={12} />}
+                        {model.forSale ? 'Delist' : 'List for Sale'}
+                      </button>
+                    </div>
+                    {model.forSale && (
+                      <div className="flex items-center gap-2 mt-2">
+                        <input
+                          type="number"
+                          value={priceInput}
+                          onChange={(e) => setPriceInput(e.target.value)}
+                          placeholder="Price in ADI"
+                          min={0}
+                          step={0.01}
+                          className="flex-1 px-3 py-2 bg-white/[0.04] border border-white/[0.08] rounded-lg text-sm text-white font-mono focus:outline-none focus:border-white/[0.15] transition-colors"
+                          onClick={(e) => e.stopPropagation()}
+                        />
+                        {priceChanged && (
+                          <button
+                            type="button"
+                            onClick={(e) => { e.stopPropagation(); onSetSalePrice({ tokenId: model.tokenId, priceEth: parsedPrice }); }}
+                            disabled={isToggling}
+                            className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-white text-black text-sm font-medium hover:bg-white/90 transition-colors"
+                          >
+                            <Save size={12} />
+                            Save
+                          </button>
+                        )}
+                      </div>
+                    )}
                   </div>
 
                   {/* Token ID */}
@@ -1148,78 +1288,95 @@ function ModelCard({ model, onClickCard, onTogglePublic, isToggling }: ModelCard
     (best, v) => (v.accuracy > best ? v.accuracy : best),
     0,
   );
+  const feePercent = (model.inferenceFee / 100).toFixed(1);
 
   return (
     <motion.div
       whileHover={{ y: -2 }}
       transition={{ duration: 0.2 }}
     >
-      <Card variant="glass" hover className="flex flex-col h-full cursor-pointer !rounded-2xl !p-6" onClick={() => onClickCard(model)}>
+      <Card variant="glass" hover className="flex flex-col h-full cursor-pointer !rounded-2xl !p-0" onClick={() => onClickCard(model)}>
         {/* Header */}
-        <div className="flex items-start justify-between mb-5">
-          <div className="flex items-center gap-3">
+        <div className="px-6 pt-6 pb-4">
+          <div className="flex items-start justify-between mb-4">
             <div className="w-11 h-11 rounded-xl bg-white/[0.06] flex items-center justify-center shrink-0">
               <Layers size={20} className="text-white/80" />
             </div>
-            <div>
-              <h3 className="text-lg font-semibold text-white">{model.name}</h3>
-              <p className="text-xs font-mono text-helix-muted">{model.slug}</p>
-            </div>
+            <button
+              type="button"
+              onClick={(e) => { e.stopPropagation(); onTogglePublic(model); }}
+              disabled={isToggling}
+              className={cn(
+                'p-2 rounded-lg transition-all',
+                model.isPublic
+                  ? 'bg-green-500/10 text-green-400 hover:bg-green-500/20'
+                  : 'bg-white/[0.04] text-helix-muted hover:bg-white/[0.08]',
+                isToggling && 'opacity-50 cursor-not-allowed',
+              )}
+              title={model.isPublic ? 'Public — click to make private' : 'Private — click to make public'}
+            >
+              {isToggling ? <Loader2 size={14} className="animate-spin" /> : model.isPublic ? <Globe size={14} /> : <Lock size={14} />}
+            </button>
           </div>
-          <button
-            type="button"
-            onClick={(e) => { e.stopPropagation(); onTogglePublic(model); }}
-            disabled={isToggling}
-            className={cn(
-              'p-2 rounded-lg transition-all',
-              model.isPublic
-                ? 'bg-green-500/10 text-green-400 hover:bg-green-500/20'
-                : 'bg-white/[0.04] text-helix-muted hover:bg-white/[0.08]',
-              isToggling && 'opacity-50 cursor-not-allowed',
-            )}
-            title={model.isPublic ? 'Public — click to make private' : 'Private — click to make public'}
-          >
-            {isToggling ? <Loader2 size={14} className="animate-spin" /> : model.isPublic ? <Globe size={14} /> : <Lock size={14} />}
-          </button>
+
+          <h3 className="text-lg font-semibold text-white">{model.name}</h3>
+          <p className="text-xs font-mono text-helix-muted mt-0.5">{model.slug}</p>
         </div>
 
-        {/* Hero accuracy + version count */}
-        <div className="mb-6">
+        {/* Divider */}
+        <div className="mx-6 h-px bg-white/[0.06]" />
+
+        {/* Hero accuracy */}
+        <div className="text-center py-5 px-6">
           <span className="text-3xl font-semibold tracking-tight text-white font-mono">
             {bestAccuracy > 0 ? `${(bestAccuracy * 100).toFixed(1)}%` : '--'}
           </span>
-          <div className="flex items-center gap-4 mt-1">
-            <span className="text-xs text-helix-muted">accuracy</span>
+          <p className="text-xs text-helix-muted mt-1">accuracy</p>
+
+          <div className="flex items-center justify-center gap-3 mt-3">
             <span className="text-xs text-helix-dim">{versionCount} version{versionCount !== 1 ? 's' : ''}</span>
+            <span className="text-helix-dim">&middot;</span>
+            <span className="text-xs text-helix-dim">{feePercent}% fee</span>
           </div>
+
+          {model.forSale && (
+            <span className="inline-flex items-center gap-1 mt-2 px-2 py-0.5 text-2xs rounded-full bg-green-500/10 text-green-400 border border-green-500/20">
+              For Sale
+            </span>
+          )}
         </div>
 
+        {/* Divider */}
+        <div className="mx-6 h-px bg-white/[0.06]" />
+
         {/* Action buttons */}
-        <div className="flex items-center gap-2 mt-auto" onClick={(e) => e.stopPropagation()}>
+        <div className="px-6 pb-5 pt-4 mt-auto space-y-2" onClick={(e) => e.stopPropagation()}>
           <Link
             href={`/train?model=${model.tokenId}`}
-            className="flex items-center justify-center gap-2 py-2.5 px-5 rounded-xl bg-white text-black text-sm font-medium hover:bg-white/90 transition-colors"
+            className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl bg-white text-black text-sm font-medium hover:bg-white/90 transition-colors"
           >
             <Play size={14} />
             Train
           </Link>
 
-          <Link
-            href="/inference"
-            className="flex items-center justify-center gap-2 py-2.5 px-5 rounded-xl bg-white/[0.06] text-sm text-white hover:bg-white/[0.1] transition-colors"
-          >
-            <MessageSquare size={14} />
-            Infer
-          </Link>
+          <div className="flex items-center gap-2">
+            <Link
+              href="/inference"
+              className="flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl bg-white/[0.06] text-sm text-white hover:bg-white/[0.1] transition-colors"
+            >
+              <MessageSquare size={14} />
+              Infer
+            </Link>
 
-          <button
-            type="button"
-            onClick={() => onClickCard(model)}
-            className="flex items-center justify-center gap-2 py-2.5 px-5 rounded-xl bg-white/[0.06] text-sm text-white hover:bg-white/[0.1] transition-colors"
-          >
-            <Settings size={14} />
-            Manage
-          </button>
+            <button
+              type="button"
+              onClick={() => onClickCard(model)}
+              className="flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl bg-white/[0.06] text-sm text-white hover:bg-white/[0.1] transition-colors"
+            >
+              <Settings size={14} />
+              Manage
+            </button>
+          </div>
         </div>
       </Card>
     </motion.div>
@@ -1245,40 +1402,46 @@ function TrainedModelCard({ session, onDownload, onClickCard }: {
       whileHover={{ y: -2 }}
       transition={{ duration: 0.2 }}
     >
-      <Card variant="glass" hover className="flex flex-col h-full cursor-pointer !rounded-2xl !p-6" onClick={() => onClickCard(session)}>
+      <Card variant="glass" hover className="flex flex-col h-full cursor-pointer !rounded-2xl !p-0" onClick={() => onClickCard(session)}>
         {/* Header */}
-        <div className="flex items-start justify-between mb-5">
-          <div className="flex items-center gap-3">
+        <div className="px-6 pt-6 pb-4">
+          <div className="flex items-start justify-between mb-4">
             <div className="w-11 h-11 rounded-xl bg-green-500/[0.08] flex items-center justify-center shrink-0">
               <Layers size={20} className="text-green-400" />
             </div>
-            <div>
-              <h3 className="text-lg font-semibold text-white">{name}</h3>
-              <p className="text-xs font-mono text-helix-muted">{slug}</p>
-            </div>
+            <span className="px-2.5 py-1 rounded-lg text-xs bg-green-500/10 text-green-400 border border-green-500/20 font-medium">
+              Trained
+            </span>
           </div>
-          <span className="px-2.5 py-1 rounded-lg text-xs bg-green-500/10 text-green-400 border border-green-500/20 font-medium">
-            Trained
-          </span>
+
+          <h3 className="text-lg font-semibold text-white">{name}</h3>
+          <p className="text-xs font-mono text-helix-muted mt-0.5">{slug}</p>
         </div>
 
-        {/* Hero accuracy + steps */}
-        <div className="mb-6">
+        {/* Divider */}
+        <div className="mx-6 h-px bg-white/[0.06]" />
+
+        {/* Hero accuracy */}
+        <div className="text-center py-5 px-6">
           <span className="text-3xl font-semibold tracking-tight text-white font-mono">
             {accuracy != null && accuracy > 0 ? `${(accuracy * 100).toFixed(1)}%` : '--'}
           </span>
-          <div className="flex items-center gap-4 mt-1">
-            <span className="text-xs text-helix-muted">accuracy</span>
+          <p className="text-xs text-helix-muted mt-1">accuracy</p>
+
+          <div className="flex items-center justify-center gap-3 mt-3">
             <span className="text-xs text-helix-dim">{steps} step{steps !== 1 ? 's' : ''}</span>
           </div>
         </div>
 
+        {/* Divider */}
+        <div className="mx-6 h-px bg-white/[0.06]" />
+
         {/* Action buttons */}
-        <div className="flex items-center gap-2 mt-auto" onClick={(e) => e.stopPropagation()}>
+        <div className="px-6 pb-5 pt-4 mt-auto space-y-2" onClick={(e) => e.stopPropagation()}>
           <button
             type="button"
             onClick={() => onDownload(session.session_id)}
-            className="flex items-center justify-center gap-2 py-2.5 px-5 rounded-xl bg-white text-black text-sm font-medium hover:bg-white/90 transition-colors"
+            className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl bg-white text-black text-sm font-medium hover:bg-white/90 transition-colors"
           >
             <Download size={14} />
             Download
@@ -1286,7 +1449,7 @@ function TrainedModelCard({ session, onDownload, onClickCard }: {
 
           <Link
             href="/train"
-            className="flex items-center justify-center gap-2 py-2.5 px-5 rounded-xl bg-white/[0.06] text-sm text-white hover:bg-white/[0.1] transition-colors"
+            className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl bg-white/[0.06] text-sm text-white hover:bg-white/[0.1] transition-colors"
           >
             <Play size={14} />
             Train More
@@ -1323,6 +1486,10 @@ export default function MyModelsPage() {
     createModel,
     addVersion,
     setPublic,
+    setInferenceFee,
+    setForSale,
+    setSalePrice,
+    withdrawFees,
     isWritePending,
     isConfirming,
     writeError,
@@ -1608,6 +1775,10 @@ export default function MyModelsPage() {
         onTogglePublic={(m) => setPublic({ tokenId: m.tokenId, isPublic: !m.isPublic })}
         onDownloadWeights={handleDownloadWeights}
         onAddVersion={(m) => { setDetailTokenId(null); setVersionTarget(m); }}
+        onSetInferenceFee={setInferenceFee}
+        onSetForSale={setForSale}
+        onSetSalePrice={setSalePrice}
+        onWithdrawFees={(tokenId) => withdrawFees({ tokenId })}
         isToggling={isWritePending || isConfirming}
         isDownloading={downloadingTokenId}
       />
@@ -1656,7 +1827,7 @@ export default function MyModelsPage() {
         />
       ) : (
         /* Unified Model Grid */
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
           {/* Trained models first (green accent) */}
           {filteredTrained.map((session) => (
             <TrainedModelCard

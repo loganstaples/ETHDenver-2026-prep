@@ -932,9 +932,19 @@ function VersionsTab({
   signMessageAsync: (args: { message: string }) => Promise<string>;
 }) {
   const versions = [...model.versions].reverse();
+  const hasWeights = model.versions.some((v) => v.weightsStored);
 
   return (
     <div className="space-y-4">
+      {hasWeights && (
+        <div className="flex items-center gap-2.5 px-4 py-3 bg-green-500/[0.04] border border-green-500/20 rounded-xl">
+          <Shield size={14} className="text-green-400 shrink-0" />
+          <p className="text-2xs text-green-300/70">
+            Only you (the owner) can decrypt and download these weights
+          </p>
+        </div>
+      )}
+
       <AddVersionSection
         model={model}
         addVersion={addVersion}

@@ -24,6 +24,7 @@ export interface ModelWithVersions {
   inferenceFee: number;
   forSale: boolean;
   salePrice: number; // in ADI
+  feesAccrued: number; // in ADI
   versions: OnChainVersion[];
 }
 
@@ -47,6 +48,7 @@ export interface UseModelRegistryReturn {
   setForSale: (params: { tokenId: number; forSale: boolean }) => void;
   setSalePrice: (params: { tokenId: number; priceEth: number }) => void;
   buyModel: (params: { tokenId: number; priceEth: number }) => void;
+  withdrawFees: (params: { tokenId: number }) => void;
   isWritePending: boolean;
   isConfirming: boolean;
   writeError: Error | null;
@@ -107,7 +109,7 @@ export function useModelRegistry(): UseModelRegistryReturn {
   }, [tokenIdResults]);
 
   // ── Phase 3: Get model data + versions + sale info ────────────────
-  const CALLS_PER_TOKEN = 4;
+  const CALLS_PER_TOKEN = 5;
   const modelDataCalls = useMemo(() => {
     if (tokenIds.length === 0) return [];
     const calls: {
@@ -141,6 +143,12 @@ export function useModelRegistry(): UseModelRegistryReturn {
         functionName: 'salePrice',
         args: [BigInt(tokenId)],
       });
+      calls.push({
+        address: addr,
+        abi: HELIX_MODEL_STORE_ABI,
+        functionName: 'inferenceFeesAccrued',
+        args: [BigInt(tokenId)],
+      });
     }
     return calls;
   }, [tokenIds, addr]);
@@ -165,6 +173,7 @@ export function useModelRegistry(): UseModelRegistryReturn {
       const versionsResult = modelDataResults[base + 1];
       const forSaleResult = modelDataResults[base + 2];
       const salePriceResult = modelDataResults[base + 3];
+      const feesAccruedResult = modelDataResults[base + 4];
 
       if (modelResult?.status !== 'success' || !modelResult.result) continue;
 
@@ -172,6 +181,8 @@ export function useModelRegistry(): UseModelRegistryReturn {
       const forSale = forSaleResult?.status === 'success' ? (forSaleResult.result as unknown as boolean) : false;
       const salePriceWei = salePriceResult?.status === 'success' ? (salePriceResult.result as unknown as bigint) : BigInt(0);
       const salePrice = Number(salePriceWei) / 1e18;
+      const feesAccruedWei = feesAccruedResult?.status === 'success' ? (feesAccruedResult.result as unknown as bigint) : BigInt(0);
+      const feesAccrued = Number(feesAccruedWei) / 1e18;
 
       const versions: OnChainVersion[] = [];
       if (versionsResult?.status === 'success' && versionsResult.result) {
@@ -207,6 +218,7 @@ export function useModelRegistry(): UseModelRegistryReturn {
         inferenceFee: Number(m[7]),
         forSale,
         salePrice,
+        feesAccrued,
         versions,
       });
     }
@@ -339,6 +351,19 @@ export function useModelRegistry(): UseModelRegistryReturn {
     [isConnected, isContractDeployed, addr, writeContract],
   );
 
+  const withdrawFees = useCallback(
+    (params: { tokenId: number }) => {
+      if (!isConnected || !isContractDeployed) return;
+      writeContract({
+        address: addr,
+        abi: HELIX_MODEL_STORE_ABI,
+        functionName: 'withdrawInferenceFees',
+        args: [BigInt(params.tokenId)],
+      });
+    },
+    [isConnected, isContractDeployed, addr, writeContract],
+  );
+
   const refetch = useCallback(() => {
     refetchBalance();
     refetchModelData();
@@ -357,6 +382,7 @@ export function useModelRegistry(): UseModelRegistryReturn {
     setForSale,
     setSalePrice,
     buyModel,
+    withdrawFees,
     isWritePending,
     isConfirming,
     writeError: writeError ?? null,
