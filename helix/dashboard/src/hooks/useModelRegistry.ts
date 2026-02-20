@@ -49,6 +49,8 @@ export interface UseModelRegistryReturn {
   setSalePrice: (params: { tokenId: number; priceEth: number }) => void;
   buyModel: (params: { tokenId: number; priceEth: number }) => void;
   withdrawFees: (params: { tokenId: number }) => void;
+  grantAccess: (params: { tokenId: number; account: string }) => void;
+  revokeAccess: (params: { tokenId: number; account: string }) => void;
   isWritePending: boolean;
   isConfirming: boolean;
   writeError: Error | null;
@@ -364,6 +366,32 @@ export function useModelRegistry(): UseModelRegistryReturn {
     [isConnected, isContractDeployed, addr, writeContract],
   );
 
+  const grantAccess = useCallback(
+    (params: { tokenId: number; account: string }) => {
+      if (!isConnected || !isContractDeployed) return;
+      writeContract({
+        address: addr,
+        abi: HELIX_MODEL_STORE_ABI,
+        functionName: 'grantAccess',
+        args: [BigInt(params.tokenId), params.account as `0x${string}`],
+      });
+    },
+    [isConnected, isContractDeployed, addr, writeContract],
+  );
+
+  const revokeAccess = useCallback(
+    (params: { tokenId: number; account: string }) => {
+      if (!isConnected || !isContractDeployed) return;
+      writeContract({
+        address: addr,
+        abi: HELIX_MODEL_STORE_ABI,
+        functionName: 'revokeAccess',
+        args: [BigInt(params.tokenId), params.account as `0x${string}`],
+      });
+    },
+    [isConnected, isContractDeployed, addr, writeContract],
+  );
+
   const refetch = useCallback(() => {
     refetchBalance();
     refetchModelData();
@@ -383,6 +411,8 @@ export function useModelRegistry(): UseModelRegistryReturn {
     setSalePrice,
     buyModel,
     withdrawFees,
+    grantAccess,
+    revokeAccess,
     isWritePending,
     isConfirming,
     writeError: writeError ?? null,

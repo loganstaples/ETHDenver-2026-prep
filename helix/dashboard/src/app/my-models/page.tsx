@@ -30,6 +30,9 @@ import {
   DollarSign,
   Save,
   Coins,
+  Users,
+  UserPlus,
+  Trash2,
 } from 'lucide-react';
 import { Card } from '@/components/ui/Card';
 import { Badge } from '@/components/ui/Badge';
@@ -37,7 +40,7 @@ import { EmptyState } from '@/components/ui/EmptyState';
 import { Modal } from '@/components/ui/Modal';
 import { cn } from '@/lib/utils';
 import { useModelRegistry, type ModelWithVersions } from '@/hooks/useModelRegistry';
-import { useAccount, useSignMessage, useReadContracts } from 'wagmi';
+import { useAccount, useSignMessage, useReadContracts, useReadContract } from 'wagmi';
 import { deriveModelKey, encryptWeights, decryptWeights } from '@/lib/model-encryption';
 import { fetchFrom0G } from '@/lib/0g-client';
 import { HELIX_MODEL_STORE_ABI, getContractAddress } from '@/lib/contracts';
@@ -584,8 +587,11 @@ interface ModelDetailModalProps {
   onSetForSale: (params: { tokenId: number; forSale: boolean }) => void;
   onSetSalePrice: (params: { tokenId: number; priceEth: number }) => void;
   onWithdrawFees: (tokenId: number) => void;
+  onGrantAccess: (params: { tokenId: number; account: string }) => void;
+  onRevokeAccess: (params: { tokenId: number; account: string }) => void;
   isToggling: boolean;
   isDownloading: number | null;
+  contractAddress: `0x${string}`;
 }
 
 function ModelDetailModal({
@@ -598,13 +604,86 @@ function ModelDetailModal({
   onSetForSale,
   onSetSalePrice,
   onWithdrawFees,
+  onGrantAccess,
+  onRevokeAccess,
   isToggling,
   isDownloading,
+  contractAddress,
 }: ModelDetailModalProps) {
   const [copiedHash, setCopiedHash] = useState<string | null>(null);
   const [feeInput, setFeeInput] = useState('');
   const [feeBps, setFeeBps] = useState(0);
   const [priceInput, setPriceInput] = useState('');
+
+  // Access control state
+  const [accessInput, setAccessInput] = useState('');
+  const [accessError, setAccessError] = useState<string | null>(null);
+  const [grantedAddresses, setGrantedAddresses] = useState<string[]>([]);
+  const [checkAddress, setCheckAddress] = useState('');
+  const [checkResult, setCheckResult] = useState<boolean | null>(null);
+
+  // localStorage key for persisting granted addresses per tokenId
+  const accessStorageKey = model ? `helix-access-${model.tokenId}` : '';
+
+  // Load granted addresses from localStorage
+  useEffect(() => {
+    if (!model) return;
+    try {
+      const stored = localStorage.getItem(accessStorageKey);
+      if (stored) {
+        setGrantedAddresses(JSON.parse(stored));
+      } else {
+        setGrantedAddresses([]);
+      }
+    } catch {
+      setGrantedAddresses([]);
+    }
+  }, [model, accessStorageKey]);
+
+  // On-chain check for a specific address
+  const { data: hasAccessResult, refetch: refetchAccessCheck } = useReadContract({
+    address: contractAddress,
+    abi: HELIX_MODEL_STORE_ABI,
+    functionName: 'hasModelAccess',
+    args: model && checkAddress ? [BigInt(model.tokenId), checkAddress as `0x${string}`] : undefined,
+    query: { enabled: false },
+  });
+
+  const handleCheckAccess = async () => {
+    if (!checkAddress || !model) return;
+    if (!/^0x[0-9a-fA-F]{40}$/.test(checkAddress)) {
+      setCheckResult(null);
+      return;
+    }
+    const result = await refetchAccessCheck();
+    setCheckResult(result.data as boolean ?? false);
+  };
+
+  const handleGrantAccess = () => {
+    if (!model || !accessInput) return;
+    if (!/^0x[0-9a-fA-F]{40}$/.test(accessInput)) {
+      setAccessError('Invalid Ethereum address');
+      return;
+    }
+    setAccessError(null);
+    onGrantAccess({ tokenId: model.tokenId, account: accessInput });
+
+    // Persist to localStorage
+    const updated = [...new Set([...grantedAddresses, accessInput.toLowerCase()])];
+    setGrantedAddresses(updated);
+    try { localStorage.setItem(accessStorageKey, JSON.stringify(updated)); } catch {}
+    setAccessInput('');
+  };
+
+  const handleRevokeAccess = (addr: string) => {
+    if (!model) return;
+    onRevokeAccess({ tokenId: model.tokenId, account: addr });
+
+    // Remove from localStorage
+    const updated = grantedAddresses.filter((a) => a.toLowerCase() !== addr.toLowerCase());
+    setGrantedAddresses(updated);
+    try { localStorage.setItem(accessStorageKey, JSON.stringify(updated)); } catch {}
+  };
 
   // Sync local state when model changes
   useEffect(() => {
@@ -613,6 +692,10 @@ function ModelDetailModal({
       setFeeInput(pct);
       setFeeBps(model.inferenceFee);
       setPriceInput(model.salePrice > 0 ? model.salePrice.toString() : '');
+      setAccessInput('');
+      setAccessError(null);
+      setCheckAddress('');
+      setCheckResult(null);
     }
   }, [model]);
 
@@ -986,6 +1069,117 @@ function ModelDetailModal({
                         )}
                       </div>
                     )}
+                  </div>
+
+                  {/* Access Control */}
+                  <div>
+                    <div className="flex items-center gap-2 mb-2">
+                      <Users size={14} className="text-white/70" />
+                      <div>
+                        <p className="text-sm text-white">Access Control</p>
+                        <p className="text-2xs text-helix-muted mt-0.5">
+                          Grant or revoke per-address access to this model
+                        </p>
+                      </div>
+                    </div>
+
+                    {/* Grant access input */}
+                    <div className="flex items-center gap-2 mt-3">
+                      <input
+                        type="text"
+                        value={accessInput}
+                        onChange={(e) => { setAccessInput(e.target.value); setAccessError(null); }}
+                        placeholder="0x... Ethereum address"
+                        className="flex-1 px-3 py-2 bg-white/[0.04] border border-white/[0.08] rounded-lg text-sm text-white font-mono focus:outline-none focus:border-white/[0.15] transition-colors"
+                        onClick={(e) => e.stopPropagation()}
+                      />
+                      <button
+                        type="button"
+                        onClick={(e) => { e.stopPropagation(); handleGrantAccess(); }}
+                        disabled={isToggling || !accessInput}
+                        className={cn(
+                          'flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium transition-colors whitespace-nowrap',
+                          isToggling || !accessInput
+                            ? 'bg-helix-border text-helix-muted cursor-not-allowed'
+                            : 'bg-green-500/10 border border-green-500/30 text-green-400 hover:bg-green-500/20',
+                        )}
+                      >
+                        <UserPlus size={12} />
+                        Grant
+                      </button>
+                    </div>
+                    {accessError && (
+                      <p className="text-2xs text-red-400 mt-1">{accessError}</p>
+                    )}
+
+                    {/* Granted addresses list */}
+                    {grantedAddresses.length > 0 && (
+                      <div className="mt-3 space-y-1">
+                        <p className="text-2xs text-helix-dim uppercase tracking-wider mb-1.5">Granted Addresses</p>
+                        {grantedAddresses.map((addr) => (
+                          <div
+                            key={addr}
+                            className="flex items-center justify-between gap-2 px-3 py-2 bg-white/[0.02] rounded-lg border border-white/[0.05]"
+                          >
+                            <span className="text-xs font-mono text-helix-text2 truncate">
+                              {addr}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={(e) => { e.stopPropagation(); handleRevokeAccess(addr); }}
+                              disabled={isToggling}
+                              className={cn(
+                                'flex items-center gap-1 px-2 py-1 rounded-md text-2xs font-medium transition-colors shrink-0',
+                                isToggling
+                                  ? 'text-helix-dim cursor-not-allowed'
+                                  : 'text-red-400 hover:bg-red-500/10',
+                              )}
+                            >
+                              <Trash2 size={10} />
+                              Revoke
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    {/* Check address access */}
+                    <div className="mt-3 pt-3 border-t border-white/[0.04]">
+                      <p className="text-2xs text-helix-dim mb-1.5">Verify address access on-chain</p>
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="text"
+                          value={checkAddress}
+                          onChange={(e) => { setCheckAddress(e.target.value); setCheckResult(null); }}
+                          placeholder="0x... check address"
+                          className="flex-1 px-3 py-1.5 bg-white/[0.04] border border-white/[0.08] rounded-lg text-xs text-white font-mono focus:outline-none focus:border-white/[0.15] transition-colors"
+                          onClick={(e) => e.stopPropagation()}
+                        />
+                        <button
+                          type="button"
+                          onClick={(e) => { e.stopPropagation(); handleCheckAccess(); }}
+                          disabled={!checkAddress || !/^0x[0-9a-fA-F]{40}$/.test(checkAddress)}
+                          className={cn(
+                            'flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-colors whitespace-nowrap',
+                            !checkAddress || !/^0x[0-9a-fA-F]{40}$/.test(checkAddress)
+                              ? 'bg-helix-border text-helix-muted cursor-not-allowed'
+                              : 'bg-white/[0.06] text-white hover:bg-white/[0.1]',
+                          )}
+                        >
+                          <Search size={10} />
+                          Check
+                        </button>
+                      </div>
+                      {checkResult !== null && (
+                        <div className={cn(
+                          'flex items-center gap-1.5 mt-1.5 text-2xs',
+                          checkResult ? 'text-green-400' : 'text-red-400',
+                        )}>
+                          {checkResult ? <CheckCircle size={10} /> : <XCircle size={10} />}
+                          {checkResult ? 'Address has access' : 'Address does not have access'}
+                        </div>
+                      )}
+                    </div>
                   </div>
 
                   {/* Token ID */}
@@ -1516,6 +1710,8 @@ export default function MyModelsPage() {
     setForSale,
     setSalePrice,
     withdrawFees,
+    grantAccess,
+    revokeAccess,
     isWritePending,
     isConfirming,
     writeError,
@@ -1831,8 +2027,11 @@ export default function MyModelsPage() {
         onSetForSale={setForSale}
         onSetSalePrice={setSalePrice}
         onWithdrawFees={(tokenId) => withdrawFees({ tokenId })}
+        onGrantAccess={grantAccess}
+        onRevokeAccess={revokeAccess}
         isToggling={isWritePending || isConfirming}
         isDownloading={downloadingTokenId}
+        contractAddress={modelStoreAddr as `0x${string}`}
       />
 
       <TrainedModelDetailModal
