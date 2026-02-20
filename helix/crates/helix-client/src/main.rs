@@ -3124,6 +3124,18 @@ async fn cmd_mpc_train(args: &MpcTrainArgs, _cli: &Cli) -> Result<()> {
                 );
                 println!();
             }
+            ProgressEvent::RecoveryCompleted { honest_workers, resumed_from_step, post_recovery_steps } => {
+                println!();
+                println!(
+                    "  {} {} -- {} honest workers resumed from step {}, completed {} more steps",
+                    "✓".green(),
+                    "RECOVERY COMPLETE".green().bold(),
+                    honest_workers,
+                    resumed_from_step,
+                    post_recovery_steps,
+                );
+                println!();
+            }
         }
     });
     orchestrator.set_progress_callback(progress_cb);

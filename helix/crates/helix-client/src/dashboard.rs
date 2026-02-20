@@ -935,6 +935,14 @@ fn progress_event_to_json(event: &ProgressEvent) -> serde_json::Value {
                 "min_workers": min_workers,
             })
         }
+        ProgressEvent::RecoveryCompleted { honest_workers, resumed_from_step, post_recovery_steps } => {
+            serde_json::json!({
+                "type": "recovery_completed",
+                "honest_workers": honest_workers,
+                "resumed_from_step": resumed_from_step,
+                "post_recovery_steps": post_recovery_steps,
+            })
+        }
     }
 }
 

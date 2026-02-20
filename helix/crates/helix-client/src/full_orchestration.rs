@@ -131,6 +131,8 @@ pub enum ProgressEvent {
     ZkProofSubmitted { checkpoint_index: usize, step: u64, tx_hash: String },
     /// ZK risk threshold was crossed — ZK proofs are now required.
     ZkRiskActivated { active_workers: u64, min_workers: usize },
+    /// Training recovered after cheater removal.
+    RecoveryCompleted { honest_workers: usize, resumed_from_step: usize, post_recovery_steps: usize },
 }
 
 /// A callback for receiving progress events.
@@ -720,6 +722,15 @@ impl FullOrchestrator {
             });
         }
 
+        if mpc_result.recovery_completed {
+            let resumed_from = mpc_result.steps_completed.saturating_sub(mpc_result.post_recovery_steps);
+            self.emit(ProgressEvent::RecoveryCompleted {
+                honest_workers: num_workers - 1,
+                resumed_from_step: resumed_from,
+                post_recovery_steps: mpc_result.post_recovery_steps,
+            });
+        }
+
         let phase8_elapsed = phase8_start.elapsed().as_millis();
         info!(
             steps_completed = mpc_result.steps_completed,
@@ -1293,6 +1304,9 @@ impl FullOrchestrator {
             final_weights,
             initial_commitment: Some(dist_result.distribution.initial_commitment),
             encrypted_distribution: true,
+            recovery_completed: false,
+            post_recovery_losses: Vec::new(),
+            post_recovery_steps: 0,
         })
     }
 

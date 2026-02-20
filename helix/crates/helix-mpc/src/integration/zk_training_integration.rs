@@ -251,6 +251,8 @@ pub struct IntegratedTrainingStep {
     pub proof_time_ms: u64,
     /// Whether the step was successfully verified.
     pub verified: bool,
+    /// Classification accuracy (if computable from target).
+    pub accuracy: Option<f64>,
 }
 
 /// The integrated MPC-ZK training coordinator.
@@ -663,11 +665,28 @@ impl IntegratedTrainingCoordinator {
 
         let proof_time = proof_start.elapsed();
 
-        // Extract loss and new state hash from proof
-        let (loss, new_hash, total_error) = if let Some(ref p) = proof {
-            (p.loss.to_f64(), p.new_state_hash.clone(), p.total_error.to_f64())
+        // Compute loss and accuracy from reconstructed model (proof loss may be Fr::ZERO for mock proofs).
+        let (loss, new_hash, total_error, accuracy) = if let Some(ref p) = proof {
+            let model = self.reconstruct_model()?;
+            let output = model.forward(input);
+            let mse = output.iter().zip(target.iter())
+                .map(|(y, t)| (y - t).powi(2))
+                .sum::<f64>() * 0.5;
+            // Compute classification accuracy: argmax(output) == argmax(target).
+            let acc = if target.len() > 1 {
+                let pred = output.iter().enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(i, _)| i).unwrap_or(0);
+                let label = target.iter().enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(i, _)| i).unwrap_or(0);
+                Some(if pred == label { 1.0 } else { 0.0 })
+            } else {
+                None
+            };
+            (mse, p.new_state_hash.clone(), p.total_error.to_f64(), acc)
         } else {
-            (0.0, old_hash.clone(), 0.0)
+            (0.0, old_hash.clone(), 0.0, None)
         };
 
         // Phase 4: Verify the proof
@@ -703,6 +722,7 @@ impl IntegratedTrainingCoordinator {
             compute_time_ms: compute_time.as_millis() as u64,
             proof_time_ms: proof_time.as_millis() as u64,
             verified,
+            accuracy,
         };
 
         self.history.push(step_result.clone());
@@ -748,7 +768,7 @@ impl IntegratedTrainingCoordinator {
         for i in 0..d_hid {
             let mut sum = Fr::ZERO;
             for j in 0..d_in {
-                sum = worker.arithmetic.add_shares(&sum, &Fr::mul(&w1.data[i * d_in + j], &x[j]));
+                sum = worker.arithmetic.add_shares(&sum, &w1.data[i * d_in + j].mpc_scale(&x[j]));
             }
             h_pre[i] = worker.arithmetic.add_shares(&sum, &b1.data[i]);
         }
@@ -770,7 +790,7 @@ impl IntegratedTrainingCoordinator {
         for i in 0..d_out {
             let mut sum = Fr::ZERO;
             for j in 0..d_hid {
-                sum = worker.arithmetic.add_shares(&sum, &Fr::mul(&w2.data[i * d_hid + j], &h[j]));
+                sum = worker.arithmetic.add_shares(&sum, &w2.data[i * d_hid + j].mpc_scale(&h[j]));
             }
             y[i] = worker.arithmetic.add_shares(&sum, &b2.data[i]);
         }
@@ -779,7 +799,7 @@ impl IntegratedTrainingCoordinator {
         let mut loss = Fr::ZERO;
         for i in 0..d_out {
             let diff = worker.arithmetic.sub_shares(&y[i], &t[i]);
-            loss = worker.arithmetic.add_shares(&loss, &Fr::mul(&diff, &diff));
+            loss = worker.arithmetic.add_shares(&loss, &diff.mpc_scale(&diff));
         }
         loss = worker.arithmetic.scale_share(&loss, &Fr::from_f64(0.5));
 
@@ -796,7 +816,7 @@ impl IntegratedTrainingCoordinator {
         let mut dw2 = vec![Fr::ZERO; d_out * d_hid];
         for i in 0..d_out {
             for j in 0..d_hid {
-                dw2[i * d_hid + j] = Fr::mul(&dy[i], &h[j]);
+                dw2[i * d_hid + j] = dy[i].mpc_scale(&h[j]);
             }
         }
 
@@ -808,7 +828,7 @@ impl IntegratedTrainingCoordinator {
         for j in 0..d_hid {
             let mut sum = Fr::ZERO;
             for i in 0..d_out {
-                sum = Fr::add(&sum, &Fr::mul(&w2.data[i * d_hid + j], &dy[i]));
+                sum = Fr::add(&sum, &w2.data[i * d_hid + j].mpc_scale(&dy[i]));
             }
             dh[j] = sum;
         }
@@ -816,14 +836,14 @@ impl IntegratedTrainingCoordinator {
         // dh_pre = dh * relu_mask
         let mut dh_pre = vec![Fr::ZERO; d_hid];
         for j in 0..d_hid {
-            dh_pre[j] = Fr::mul(&dh[j], &relu_mask[j]);
+            dh_pre[j] = dh[j].mpc_scale(&relu_mask[j]);
         }
 
         // dW1 = outer(dh_pre, x)
         let mut dw1 = vec![Fr::ZERO; d_hid * d_in];
         for i in 0..d_hid {
             for j in 0..d_in {
-                dw1[i * d_in + j] = Fr::mul(&dh_pre[i], &x[j]);
+                dw1[i * d_in + j] = dh_pre[i].mpc_scale(&x[j]);
             }
         }
 
@@ -894,7 +914,7 @@ impl IntegratedTrainingCoordinator {
                     gradient.layers.first().and_then(|l| l.gradients.get("w1")),
                 ) {
                     for (w, dw) in w1.data.iter_mut().zip(dw1.data.iter()) {
-                        *w = Fr::sub(w, &Fr::mul(&lr, dw));
+                        *w = Fr::sub(w, &lr.mpc_scale(dw));
                     }
                 }
 
@@ -903,7 +923,7 @@ impl IntegratedTrainingCoordinator {
                     gradient.layers.first().and_then(|l| l.gradients.get("b1")),
                 ) {
                     for (b, db) in b1.data.iter_mut().zip(db1.data.iter()) {
-                        *b = Fr::sub(b, &Fr::mul(&lr, db));
+                        *b = Fr::sub(b, &lr.mpc_scale(db));
                     }
                 }
 
@@ -912,7 +932,7 @@ impl IntegratedTrainingCoordinator {
                     gradient.layers.first().and_then(|l| l.gradients.get("w2")),
                 ) {
                     for (w, dw) in w2.data.iter_mut().zip(dw2.data.iter()) {
-                        *w = Fr::sub(w, &Fr::mul(&lr, dw));
+                        *w = Fr::sub(w, &lr.mpc_scale(dw));
                     }
                 }
 
@@ -921,7 +941,7 @@ impl IntegratedTrainingCoordinator {
                     gradient.layers.first().and_then(|l| l.gradients.get("b2")),
                 ) {
                     for (b, db) in b2.data.iter_mut().zip(db2.data.iter()) {
-                        *b = Fr::sub(b, &Fr::mul(&lr, db));
+                        *b = Fr::sub(b, &lr.mpc_scale(db));
                     }
                 }
             }
@@ -962,6 +982,18 @@ impl IntegratedTrainingCoordinator {
         let avg_proof_time = steps.iter().map(|s| s.proof_time_ms).sum::<u64>() / steps.len() as u64;
         let verification_rate = steps.iter().filter(|s| s.verified).count() as f64 / steps.len() as f64;
 
+        // Compute final accuracy: average over the last 10 steps (or all if fewer).
+        let final_accuracy = {
+            let recent: Vec<_> = steps.iter().rev().take(10)
+                .filter_map(|s| s.accuracy)
+                .collect();
+            if recent.is_empty() {
+                None
+            } else {
+                Some(recent.iter().sum::<f64>() / recent.len() as f64)
+            }
+        };
+
         let report = TrainingReport {
             steps,
             total_steps: data.len(),
@@ -970,6 +1002,7 @@ impl IntegratedTrainingCoordinator {
             avg_proof_time_ms: avg_proof_time,
             total_time_ms: total_time.as_millis() as u64,
             verification_rate,
+            final_accuracy,
         };
 
         info!(
@@ -1105,6 +1138,8 @@ pub struct TrainingReport {
     pub total_time_ms: u64,
     /// Rate of successful verifications.
     pub verification_rate: f64,
+    /// Final classification accuracy (if computable).
+    pub final_accuracy: Option<f64>,
 }
 
 #[cfg(test)]
