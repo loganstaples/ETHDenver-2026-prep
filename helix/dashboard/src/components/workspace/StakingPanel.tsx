@@ -221,6 +221,21 @@ export function StakingPanel({ modelId }: StakingPanelProps) {
         )}
       </Card>
 
+      {/* Staking Rewards */}
+      <Card variant="default" className="space-y-3">
+        <div className="flex items-center justify-between">
+          <h3 className="text-2xs font-mono uppercase tracking-wider text-helix-muted">
+            Staking Rewards
+          </h3>
+          <span className="text-2xs font-mono px-2 py-0.5 rounded-full bg-white/[0.06] text-helix-dim">
+            Coming Soon
+          </span>
+        </div>
+        <p className="text-2xs text-helix-dim py-4">
+          Earn rewards for staking on models. Reward distribution and claiming will be available in a future update.
+        </p>
+      </Card>
+
       {/* Staking History Placeholder */}
       <Card variant="default" className="space-y-3">
         <h3 className="text-2xs font-mono uppercase tracking-wider text-helix-muted">
