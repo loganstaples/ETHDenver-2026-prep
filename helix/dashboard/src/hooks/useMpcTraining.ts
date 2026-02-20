@@ -22,6 +22,10 @@ export interface TrainingJobConfig {
   payment_eth: number;
   stake_per_worker_eth: number;
   simulate_cheater: boolean;
+  /** Which worker party should cheat (0-indexed). Only used when simulate_cheater is true. */
+  cheater_party?: number;
+  /** At which training step the cheater corrupts weights. Only used when simulate_cheater is true. */
+  cheater_step?: number;
   seed: number;
   model_name?: string;
   model_slug?: string;
@@ -230,8 +234,10 @@ export function useMpcTraining(): UseMpcTrainingReturn {
               setLosses(s.losses.map((loss: number, i: number) => ({
                 step: i + 1,
                 loss,
-                // Estimate accuracy from cross-entropy loss (same formula as backend)
-                accuracy: Math.max(0, Math.min(1, 1 - loss / 2.302585)),
+                // Use real evaluated accuracy on last point if session has it
+                accuracy: (i === s.losses.length - 1 && s.accuracy != null)
+                  ? s.accuracy
+                  : Math.max(0, Math.min(1, 1 - loss / 2.302585)),
               })));
             }
             return;
@@ -324,6 +330,15 @@ export function useMpcTraining(): UseMpcTrainingReturn {
                 accuracy: accuracy ?? prev.accuracy,
               };
             });
+            // Update last loss entry with real evaluated accuracy so chart/headline match
+            if (accuracy !== undefined) {
+              setLosses((prev) => {
+                if (prev.length === 0) return prev;
+                const updated = [...prev];
+                updated[updated.length - 1] = { ...updated[updated.length - 1], accuracy };
+                return updated;
+              });
+            }
           }
 
           // Handle ZK proof events
@@ -355,6 +370,15 @@ export function useMpcTraining(): UseMpcTrainingReturn {
                 accuracy: accuracy ?? prev.accuracy,
               };
             });
+            // Update last loss entry with real evaluated accuracy so chart/headline match
+            if (accuracy !== undefined) {
+              setLosses((prev) => {
+                if (prev.length === 0) return prev;
+                const updated = [...prev];
+                updated[updated.length - 1] = { ...updated[updated.length - 1], accuracy };
+                return updated;
+              });
+            }
             fetchHistory();
           }
 
@@ -399,16 +423,36 @@ export function useMpcTraining(): UseMpcTrainingReturn {
         const res = await fetch(`${API_BASE}/api/training/sessions/${sessionId}`);
         if (res.ok) {
           const data: TrainingSessionState = await res.json();
-          setSession(data);
 
-          // Update losses from server state
-          if (data.losses && data.losses.length > 0) {
-            setLosses(data.losses.map((loss, i) => ({
-              step: i + 1,
-              loss,
-              accuracy: Math.max(0, Math.min(1, 1 - loss / 2.302585)),
-            })));
-          }
+          // Merge: only apply poll data if it's newer than what WS set
+          setSession((prev) => {
+            if (!prev) return data;
+            if (data.current_step > prev.current_step || data.status === 'complete' || data.status === 'failed') {
+              return data;
+            }
+            return {
+              ...prev,
+              coordinator_address: data.coordinator_address || prev.coordinator_address,
+              job_id: data.job_id || prev.job_id,
+              workers_active: data.workers_active ?? prev.workers_active,
+              status: prev.status,
+            };
+          });
+
+          // Only update losses if poll has more data points than WS
+          setLosses((prev) => {
+            if (data.losses && data.losses.length > prev.length) {
+              return data.losses.map((loss, i) => ({
+                step: i + 1,
+                loss,
+                // Use real evaluated accuracy on last point if session has it
+                accuracy: (i === data.losses.length - 1 && data.accuracy != null)
+                  ? data.accuracy
+                  : Math.max(0, Math.min(1, 1 - loss / 2.302585)),
+              }));
+            }
+            return prev;
+          });
 
           // Stop polling if terminal state
           if (data.status === 'complete' || data.status === 'failed') {

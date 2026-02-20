@@ -24,6 +24,7 @@ import {
   ResponsiveContainer,
 } from 'recharts';
 import { cn } from '@/lib/utils';
+import { CheaterToast } from '@/components/ui/CheaterToast';
 import { useDashboardSessions, type TrainingEvent } from '@/hooks/useDashboardSessions';
 import { useBackendApi, type BackendWorker } from '@/hooks/useBackendApi';
 import { useWorkerHealth, type WorkerHealth } from '@/hooks/useWorkerHealth';
@@ -389,29 +390,46 @@ export default function DashboardPage() {
     return () => clearInterval(interval);
   }, []);
 
-  // Chart data from losses array — downsample to ~200 points max, preserving full precision
+  // EMA-smoothed chart data — downsample to ~200 points max
   const lossData = useMemo(() => {
-    if (losses.length <= 200) return losses.map((l) => ({ step: l.step, value: l.loss }));
-    const s = Math.ceil(losses.length / 200);
-    return losses
-      .filter((_, i) => i % s === 0 || i === losses.length - 1)
-      .map((l) => ({ step: l.step, value: l.loss }));
+    if (losses.length === 0) return [];
+    const alpha = 0.35;
+    let ema = losses[0].loss;
+    const smoothed = losses.map((l) => {
+      ema = alpha * l.loss + (1 - alpha) * ema;
+      return { step: l.step, value: ema };
+    });
+    if (smoothed.length <= 200) return smoothed;
+    const s = Math.ceil(smoothed.length / 200);
+    return smoothed.filter((_, i) => i % s === 0 || i === smoothed.length - 1);
   }, [losses]);
 
-  // Accuracy chart: single point at completion or empty during training
+  // EMA-smoothed accuracy curve from per-step estimates
   const accData = useMemo(() => {
-    if (activeSession?.accuracy != null) {
-      return [{ epoch: 1, value: Number((activeSession.accuracy * 100).toFixed(1)) }];
-    }
-    return [];
-  }, [activeSession]);
+    if (losses.length === 0) return [];
+    const alpha = 0.3;
+    let ema = (losses[0].accuracy ?? 0) * 100;
+    const smoothed = losses.map((l) => {
+      const raw = (l.accuracy ?? Math.max(0, Math.min(1, 1 - l.loss / 2.302585))) * 100;
+      ema = alpha * raw + (1 - alpha) * ema;
+      return { step: l.step, value: ema };
+    });
+    if (smoothed.length <= 200) return smoothed;
+    const s = Math.ceil(smoothed.length / 200);
+    return smoothed.filter((_, i) => i % s === 0 || i === smoothed.length - 1);
+  }, [losses]);
 
-  // Current / delta values from activeSession
-  const currentLoss = activeSession?.current_loss ?? 0;
-  const currentAcc = activeSession?.accuracy ?? 0;
-  const prevLoss = losses.length > 10 ? losses[losses.length - 11].loss : currentLoss;
-  const lossDelta = currentLoss - prevLoss;
-  const accDelta = 0; // No previous accuracy to compare
+  // Headline numbers use raw (unsmoothed) values; curves use EMA
+  // Prefer real evaluated accuracy (session.accuracy) over per-step estimates
+  const lastRaw = losses.length > 0 ? losses[losses.length - 1] : null;
+  const currentLoss = lastRaw?.loss ?? (activeSession?.current_loss ?? 0);
+  const currentAcc = (activeSession?.accuracy != null ? activeSession.accuracy : null)
+    ?? lastRaw?.accuracy
+    ?? 0;
+  const prevRawLoss = losses.length > 10 ? losses[losses.length - 11].loss : currentLoss;
+  const lossDelta = currentLoss - prevRawLoss;
+  const prevRawAcc = losses.length > 10 ? (losses[losses.length - 11].accuracy ?? 0) : (losses.length > 0 ? (losses[0].accuracy ?? 0) : 0);
+  const accDelta = currentAcc - prevRawAcc;
 
   const progress = activeSession
     ? activeSession.total_steps > 0
@@ -536,6 +554,10 @@ export default function DashboardPage() {
   };
 
   return (
+    <>
+    {/* Global cheater toast notification */}
+    <CheaterToast cheater={activeSession?.cheater_detected ?? null} />
+
     <motion.div
       initial={{ opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
@@ -717,7 +739,7 @@ export default function DashboardPage() {
                       </linearGradient>
                     </defs>
                     <XAxis
-                      dataKey="epoch"
+                      dataKey="step"
                       tick={{ fill: '#63636e', fontSize: 10, fontFamily: 'var(--font-geist-mono)' }}
                       axisLine={{ stroke: '#1e1e22' }}
                       tickLine={false}
@@ -750,21 +772,26 @@ export default function DashboardPage() {
 
           {/* Progress */}
           <div className="bg-helix-surface border border-helix-border rounded-2xl p-6">
-            <div className="flex items-center justify-between mb-3">
-              <span className="text-sm text-white">
-                Step {activeSession?.current_step ?? 0} of {activeSession?.total_steps ?? 0}
-                {activeSession?.phase_description && (
-                  <><span className="text-helix-muted mx-2">&middot;</span>{activeSession.phase_description}</>
-                )}
-              </span>
+            <div className="flex items-center justify-between mb-1">
+              <div className="flex items-center gap-3">
+                <span className="text-3xl font-bold text-white tabular-nums font-mono">
+                  {activeSession?.current_step ?? 0}
+                </span>
+                <span className="text-lg text-helix-dim font-mono">/ {activeSession?.total_steps ?? 0}</span>
+                <span className="text-sm text-helix-muted">steps</span>
+              </div>
               <span className="text-sm text-helix-muted tabular-nums font-mono">{progress.toFixed(0)}%</span>
             </div>
-            <div className="h-2 bg-helix-border rounded-full overflow-hidden">
+            {activeSession?.phase_description && (
+              <p className="text-sm text-helix-muted mb-3">{activeSession.phase_description}</p>
+            )}
+            <div className="h-2.5 bg-helix-border rounded-full overflow-hidden">
               <motion.div
                 className="h-full rounded-full bg-white"
                 initial={{ width: 0 }}
                 animate={{ width: `${progress}%` }}
                 transition={{ duration: 0.5, ease: 'easeOut' }}
+                style={{ boxShadow: progress > 0 && progress < 100 ? '0 0 12px rgba(255,255,255,0.4)' : 'none' }}
               />
             </div>
             {activeSession?.status === 'complete' && (
@@ -1255,5 +1282,6 @@ export default function DashboardPage() {
         )}
       </AnimatePresence>
     </motion.div>
+    </>
   );
 }

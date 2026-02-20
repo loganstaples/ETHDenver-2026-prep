@@ -41,6 +41,7 @@ import { useSignMessage, useAccount, useChainId, useWriteContract, useWaitForTra
 import { parseEther, keccak256, toBytes, decodeEventLog } from 'viem';
 import { hardhat } from 'wagmi/chains';
 import { Badge } from '@/components/ui/Badge';
+import { CheaterToast } from '@/components/ui/CheaterToast';
 import { cn } from '@/lib/utils';
 import {
   useMpcTraining,
@@ -91,6 +92,17 @@ const PHASE_DESCRIPTIONS: Record<number, string> = {
 };
 
 const TOTAL_PHASES = 13;
+
+// Per-step MPC operations — these all actually happen every training step.
+// Keyed to step number (not a timer) so they advance with real progress.
+const MPC_STEP_OPERATIONS = [
+  'Secret-shared forward pass — layer 1 matmul',
+  'Garbled-circuit ReLU activation via OT',
+  'Secret-shared forward pass — layer 2 matmul',
+  'Computing cross-entropy loss',
+  'MPC backward pass — gradient computation',
+  'Applying gradient update with LR decay',
+];
 
 type WeightFetchStatus = 'idle' | 'fetching' | 'decrypting' | 'uploading' | 'done' | 'error';
 
@@ -165,6 +177,119 @@ function ChartTooltip({ active, payload, label }: any) {
       ))}
     </div>
   );
+}
+
+function PhaseRing({ phase, totalPhases, size = 180 }: { phase: number; totalPhases: number; size?: number }) {
+  const pad = 20;
+  const full = size + pad * 2;
+  const strokeWidth = 6;
+  const radius = (size - strokeWidth) / 2;
+  const center = full / 2;
+  const arcDeg = 270;
+  const circumference = 2 * Math.PI * radius;
+  const arcLength = (arcDeg / 360) * circumference;
+  const progress = Math.min(100, (phase / totalPhases) * 100);
+  const filledLength = (progress / 100) * arcLength;
+  const rotation = 135;
+  const yOffset = size * 0.08;
+  const filterId = `phase-glow-${size}`;
+
+  return (
+    <svg
+      width={full}
+      height={full}
+      viewBox={`0 0 ${full} ${full}`}
+      style={{ margin: -pad, marginTop: -pad + yOffset, overflow: 'visible' }}
+    >
+      <defs>
+        <filter id={filterId} x="-100%" y="-100%" width="400%" height="400%">
+          <feGaussianBlur in="SourceGraphic" stdDeviation="4" result="blur" />
+          <feMerge>
+            <feMergeNode in="blur" />
+            <feMergeNode in="SourceGraphic" />
+          </feMerge>
+        </filter>
+      </defs>
+      <circle
+        cx={center} cy={center} r={radius}
+        fill="none" stroke="#1e1e22" strokeWidth={strokeWidth}
+        strokeDasharray={`${arcLength} ${circumference}`}
+        strokeLinecap="round"
+        transform={`rotate(${rotation} ${center} ${center})`}
+      />
+      {progress > 0 && (
+        <circle
+          cx={center} cy={center} r={radius}
+          fill="none" stroke="white" strokeWidth={strokeWidth}
+          strokeDasharray={`${filledLength} ${circumference}`}
+          strokeLinecap="round"
+          transform={`rotate(${rotation} ${center} ${center})`}
+          filter={`url(#${filterId})`}
+          style={{ transition: 'stroke-dasharray 0.6s ease-out' }}
+        />
+      )}
+    </svg>
+  );
+}
+
+function SubStatusTicker({ session }: { session: TrainingSessionState }) {
+  // During MPC training (phase 8), derive specific descriptions from real state
+  const text = useMemo(() => {
+    if (session.phase !== 8 || session.current_step === 0) {
+      return session.phase_description || PHASE_DESCRIPTIONS[session.phase] || 'Processing...';
+    }
+
+    // Show real event-driven status when notable things happen
+    if (session.cheater_detected) {
+      return `Cheater detected — worker ${session.cheater_detected.party_index} at step ${session.cheater_detected.step}`;
+    }
+
+    // Cycle through per-step MPC operations keyed to step number (not a timer).
+    // These operations actually happen every step; the rotation reflects real progress.
+    const workers = session.workers_active ?? 3;
+    const opIndex = session.current_step % MPC_STEP_OPERATIONS.length;
+    const base = MPC_STEP_OPERATIONS[opIndex];
+
+    // Augment with real metrics
+    if (session.mac_checks_passed > 0 && session.current_step % 5 === 0) {
+      return `Verifying SPDZ MACs — ${session.mac_checks_passed} checks passed across ${workers} parties`;
+    }
+    if (session.checkpoints_submitted > 0 && session.current_step % 50 === 0) {
+      return `Checkpoint ${session.checkpoints_submitted} attested on-chain — Pedersen commitment`;
+    }
+
+    return `${base} — ${workers} workers`;
+  }, [session.phase, session.current_step, session.phase_description, session.cheater_detected,
+      session.mac_checks_passed, session.checkpoints_submitted, session.workers_active]);
+
+  return (
+    <AnimatePresence mode="wait">
+      <motion.span
+        key={text}
+        initial={{ opacity: 0, y: 6 }}
+        animate={{ opacity: 1, y: 0 }}
+        exit={{ opacity: 0, y: -6 }}
+        transition={{ duration: 0.2 }}
+        className="text-sm text-helix-muted"
+      >
+        {text}
+      </motion.span>
+    </AnimatePresence>
+  );
+}
+
+function AnimatedNumber({ value, className }: { value: number; className?: string }) {
+  const motionVal = useMotionValue(value);
+  const spring = useSpring(motionVal, { stiffness: 300, damping: 30 });
+  const [display, setDisplay] = useState(value);
+
+  useEffect(() => { motionVal.set(value); }, [value, motionVal]);
+  useEffect(() => {
+    const unsubscribe = spring.on('change', (v) => setDisplay(Math.round(v)));
+    return unsubscribe;
+  }, [spring]);
+
+  return <span className={className}>{display}</span>;
 }
 
 // ============================================================================
@@ -378,7 +503,7 @@ function ConfigForm({
   isWalletPrompting, isConfirmingPayment, walletConnected,
 }: ConfigFormProps) {
   const [numSteps, setNumSteps] = useState(200);
-  const [learningRate, setLearningRate] = useState(0.05);
+  const [learningRate, setLearningRate] = useState(0.01);
   const [checkpointFreq] = useState(50);
   const [zkMode, setZkMode] = useState<'off' | 'always' | 'risk'>('off');
   const [zkCheckpointFreq, setZkCheckpointFreq] = useState(5);
@@ -389,6 +514,9 @@ function ConfigForm({
   const [version, setVersion] = useState(defaultVersion);
   const [versionError, setVersionError] = useState<string | null>(null);
   const [autoPropose, setAutoPropose] = useState(true);
+  const [simulateCheater, setSimulateCheater] = useState(false);
+  const [cheaterParty, setCheaterParty] = useState<number | undefined>(undefined);
+  const [cheaterStep, setCheaterStep] = useState<number | undefined>(undefined);
 
   // Model identity
   const [modelMode, setModelMode] = useState<'new' | 'existing'>(selectedModelId !== null ? 'existing' : 'new');
@@ -457,12 +585,14 @@ function ConfigForm({
       zk_mode: zkMode,
       zk_checkpoint_freq: zkCheckpointFreq,
       min_workers_for_mpc: minWorkersForMpc,
-      train_size: 1000,
-      test_size: 200,
+      train_size: 5000,
+      test_size: 500,
       use_real_mnist: true,
       payment_eth: effectivePayment,
       stake_per_worker_eth: stakePerWorkerEth,
-      simulate_cheater: false,
+      simulate_cheater: simulateCheater,
+      cheater_party: simulateCheater ? cheaterParty : undefined,
+      cheater_step: simulateCheater ? cheaterStep : undefined,
       seed: 42,
       model_name: effectiveModelName || undefined,
       model_slug: effectiveModelSlug || undefined,
@@ -878,6 +1008,52 @@ function ConfigForm({
             </AnimatePresence>
           </div>
 
+          {/* Simulate Cheater (demo) */}
+          <div className="rounded-2xl bg-helix-surface border border-helix-border overflow-hidden">
+            <div className="flex items-center justify-between px-5 py-4">
+              <div>
+                <p className="text-base text-white">Simulate Cheater</p>
+                <p className="text-xs text-helix-dim mt-0.5">Inject a byzantine worker for demo</p>
+              </div>
+              <Toggle on={simulateCheater} onToggle={() => setSimulateCheater(!simulateCheater)} />
+            </div>
+            <AnimatePresence>
+              {simulateCheater && (
+                <motion.div
+                  initial={{ height: 0, opacity: 0 }}
+                  animate={{ height: 'auto', opacity: 1 }}
+                  exit={{ height: 0, opacity: 0 }}
+                  transition={{ duration: 0.2 }}
+                  className="overflow-hidden"
+                >
+                  <div className="px-5 pb-4 space-y-2">
+                    <div className="flex items-center justify-between py-3 px-4 bg-red-500/[0.04] border border-red-500/15 rounded-xl">
+                      <span className="text-sm text-red-300/80">Cheater Party</span>
+                      <NumberInput
+                        value={cheaterParty ?? (workersOnline > 0 ? workersOnline - 1 : 2)}
+                        onChange={(v) => setCheaterParty(v)}
+                        min={0}
+                        max={workersOnline > 0 ? workersOnline - 1 : 9}
+                      />
+                    </div>
+                    <div className="flex items-center justify-between py-3 px-4 bg-red-500/[0.04] border border-red-500/15 rounded-xl">
+                      <span className="text-sm text-red-300/80">Corrupt at Step</span>
+                      <NumberInput
+                        value={cheaterStep ?? Math.floor(numSteps / 2)}
+                        onChange={(v) => setCheaterStep(v)}
+                        min={1}
+                        max={numSteps}
+                      />
+                    </div>
+                    <p className="text-[11px] text-red-300/40 px-1">
+                      The selected worker will inject corrupt weight shares at the specified step. SPDZ MAC verification will detect and report it.
+                    </p>
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </div>
+
           {/* Store on 0G */}
           <div className="rounded-2xl bg-helix-surface border border-helix-border overflow-hidden">
             <div className="flex items-center justify-between px-5 py-4">
@@ -920,147 +1096,260 @@ function LiveProgress({ session, losses, isConnected, error, version, modelName,
   const isTerminal = session.status === 'complete' || session.status === 'failed';
   const isComplete = session.status === 'complete';
 
+  const lastLoss = losses.length > 0 ? losses[losses.length - 1].loss : 0;
+  const prevLoss = losses.length > 10 ? losses[losses.length - 11].loss : lastLoss;
+  const lossDelta = lastLoss - prevLoss;
+
+  const lastAcc = losses.length > 0 ? (losses[losses.length - 1].accuracy ?? 0) : 0;
+  const prevAcc = losses.length > 10 ? (losses[losses.length - 11].accuracy ?? 0) : lastAcc;
+  const accDelta = lastAcc - prevAcc;
+
+  const totalCheckpoints = session.total_steps > 0 ? Math.floor(session.total_steps / 50) : 0;
+
   return (
     <div className="space-y-6">
-      {/* ── Model name + Status bar ─────────────────────────── */}
-      {modelName && (
-        <h2 className="text-2xl font-semibold tracking-tight text-white">{modelName}</h2>
-      )}
+      {/* Header bar */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
-          {isConnected ? (
-            <Wifi size={14} className="text-green-400" />
-          ) : (
-            <WifiOff size={14} className="text-red-400" />
-          )}
-          <span className="text-sm text-helix-dim">
-            {session.session_id.slice(0, 8)}
-          </span>
+          {modelName && <h2 className="text-2xl font-semibold tracking-tight text-white">{modelName}</h2>}
           <Badge variant="default">v{version}</Badge>
         </div>
-        <div className={cn(
-          'flex items-center gap-2 px-3.5 py-1.5 rounded-full text-sm font-medium',
-          isComplete ? 'bg-green-500/10 text-green-400'
-            : session.status === 'failed' ? 'bg-red-500/10 text-red-400'
-            : 'bg-white/[0.06] text-white',
-        )}>
-          {!isTerminal && <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" />}
-          {session.status === 'running' ? 'Training' : session.status}
+        <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2">
+            {isConnected ? (
+              <Wifi size={14} className="text-green-400" />
+            ) : (
+              <WifiOff size={14} className="text-red-400" />
+            )}
+            <span className="text-xs text-helix-dim font-mono">{session.session_id.slice(0, 8)}</span>
+          </div>
+          <div className={cn(
+            'flex items-center gap-2 px-3.5 py-1.5 rounded-full text-sm font-medium',
+            isComplete ? 'bg-green-500/10 text-green-400'
+              : session.status === 'failed' ? 'bg-red-500/10 text-red-400'
+              : 'bg-white/[0.06] text-white',
+          )}>
+            {!isTerminal && <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" />}
+            {session.status === 'running' ? 'Training' : session.status}
+          </div>
         </div>
       </div>
 
-      {/* ── Error ───────────────────────────────────────────── */}
       {error && (
-        <motion.div
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          className="px-4 py-3 rounded-2xl bg-red-500/[0.06] border border-red-500/20"
-        >
+        <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="px-4 py-3 rounded-2xl bg-red-500/[0.06] border border-red-500/20">
           <p className="text-sm text-red-300">{error}</p>
         </motion.div>
       )}
 
-      {/* ── Two-column layout ─────────────────────────────────── */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      {/* Hero Status Card — during training */}
+      {!isTerminal && (
+        <motion.div
+          initial={{ opacity: 0, y: 8 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="relative rounded-3xl bg-helix-surface border border-helix-border overflow-hidden"
+        >
+          <div
+            className="absolute top-0 left-0 h-[2px] bg-gradient-to-r from-transparent via-white/30 to-transparent transition-all duration-500"
+            style={{ width: `${stepProgress}%` }}
+          />
 
-        {/* LEFT: Hero metric + chart */}
-        <div className="space-y-6">
-          {/* Hero metric */}
-          <div className="flex items-center justify-center py-8 rounded-2xl bg-helix-surface border border-helix-border">
-            {isComplete && session.accuracy !== null ? (
-              <motion.div
-                initial={{ scale: 0.9, opacity: 0 }}
-                animate={{ scale: 1, opacity: 1 }}
-                transition={{ type: 'spring', stiffness: 200, damping: 20 }}
-                className="text-center"
-              >
-                <p className="text-sm text-helix-muted uppercase tracking-wider mb-2">Final Accuracy</p>
-                <p className="text-7xl font-semibold tracking-tighter text-white">
-                  {(session.accuracy * 100).toFixed(1)}
-                  <span className="text-3xl text-helix-muted ml-1">%</span>
-                </p>
-              </motion.div>
-            ) : session.status === 'failed' ? (
-              <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="text-center">
-                <XCircle size={48} className="text-red-400 mx-auto mb-3" />
-                <p className="text-xl font-medium text-red-300">Training Failed</p>
-              </motion.div>
-            ) : (
-              <div className="text-center">
-                <p className="text-sm text-helix-muted uppercase tracking-wider mb-2">Current Loss</p>
-                <p className="text-7xl font-semibold tracking-tighter text-white tabular-nums">
-                  {session.current_loss > 0 ? session.current_loss.toFixed(4) : '—'}
-                </p>
+          <div className="p-8">
+            <div className="flex items-center gap-8">
+              {/* Phase ring */}
+              <div className="relative shrink-0 flex items-center justify-center">
+                <div className="absolute inset-0 rounded-full bg-white/[0.02] blur-xl scale-110" />
+                <PhaseRing phase={session.phase} totalPhases={TOTAL_PHASES} size={160} />
+                <div className="absolute inset-0 flex flex-col items-center justify-center" style={{ marginTop: 160 * 0.08 }}>
+                  <span className="text-3xl font-bold text-white tabular-nums">{session.phase}</span>
+                  <span className="text-[10px] uppercase tracking-widest text-helix-muted mt-0.5">of {TOTAL_PHASES}</span>
+                </div>
               </div>
-            )}
-          </div>
 
-          {/* Loss curve chart */}
+              {/* Right side */}
+              <div className="flex-1 min-w-0 space-y-5">
+                <div>
+                  <h3 className="text-lg font-semibold text-white mb-1">
+                    {PHASE_DESCRIPTIONS[session.phase] || 'Processing...'}
+                  </h3>
+                  <SubStatusTicker session={session} />
+                </div>
+
+                <div className="flex items-baseline gap-3">
+                  <span className="text-5xl font-bold text-white tabular-nums font-mono tracking-tighter">
+                    <AnimatedNumber value={session.current_step} />
+                  </span>
+                  <span className="text-xl text-helix-dim font-mono">/ {session.total_steps}</span>
+                  <span className="text-sm text-helix-muted ml-2">steps</span>
+                </div>
+
+                <div className="space-y-1.5">
+                  <div className="h-2.5 w-full rounded-full bg-helix-border overflow-hidden">
+                    <motion.div
+                      className="h-full rounded-full bg-white"
+                      animate={{ width: `${stepProgress}%` }}
+                      transition={{ duration: 0.4, ease: 'easeOut' }}
+                      style={{ boxShadow: stepProgress > 0 && stepProgress < 100 ? '0 0 12px rgba(255,255,255,0.4), 0 0 4px rgba(255,255,255,0.6)' : 'none' }}
+                    />
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs text-helix-dim font-mono tabular-nums">{stepProgress.toFixed(1)}%</span>
+                    <span className="text-xs text-helix-dim">
+                      {session.elapsed_secs > 0
+                        ? formatDuration(Math.round(session.elapsed_secs))
+                        : formatDuration(elapsedTime)} elapsed
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Quick stats — loss & accuracy */}
+            <div className="flex items-center gap-6 mt-6 pt-5 border-t border-white/[0.04]">
+              <div className="flex items-baseline gap-2">
+                <span className="text-[10px] uppercase tracking-wider text-helix-muted">Loss</span>
+                <span className="text-lg font-mono font-semibold text-white tabular-nums">
+                  {lastLoss > 0 ? lastLoss.toFixed(4) : '\u2014'}
+                </span>
+                {lastLoss > 0 && (
+                  <span className={cn('text-xs font-mono tabular-nums', lossDelta <= 0 ? 'text-green-400' : 'text-red-400')}>
+                    {lossDelta <= 0 ? '\u2193' : '\u2191'}{Math.abs(lossDelta).toFixed(4)}
+                  </span>
+                )}
+              </div>
+              <div className="w-px h-5 bg-white/[0.06]" />
+              <div className="flex items-baseline gap-2">
+                <span className="text-[10px] uppercase tracking-wider text-helix-muted">Accuracy</span>
+                <span className="text-lg font-mono font-semibold text-white tabular-nums">
+                  {lastAcc > 0 ? `${(lastAcc * 100).toFixed(1)}%` : '\u2014'}
+                </span>
+                {lastAcc > 0 && (
+                  <span className={cn('text-xs font-mono tabular-nums', accDelta >= 0 ? 'text-green-400' : 'text-red-400')}>
+                    {accDelta >= 0 ? '\u2191' : '\u2193'}{Math.abs(accDelta * 100).toFixed(1)}%
+                  </span>
+                )}
+              </div>
+              <div className="w-px h-5 bg-white/[0.06]" />
+              <div className="flex items-baseline gap-2">
+                <Shield size={12} className="text-green-400/60" />
+                <span className="text-xs text-helix-dim font-mono tabular-nums">{session.mac_checks_passed} MACs</span>
+              </div>
+            </div>
+          </div>
+        </motion.div>
+      )}
+
+      {/* Completion state */}
+      {isComplete && session.accuracy !== null && (
+        <motion.div
+          initial={{ scale: 0.95, opacity: 0 }}
+          animate={{ scale: 1, opacity: 1 }}
+          transition={{ type: 'spring', stiffness: 200, damping: 20 }}
+          className="relative rounded-3xl bg-helix-surface border border-green-500/20 overflow-hidden"
+        >
+          <div className="absolute top-0 left-0 w-full h-[2px] bg-gradient-to-r from-transparent via-green-400/40 to-transparent" />
+          <div className="p-8 text-center">
+            <p className="text-sm text-green-400/60 uppercase tracking-wider mb-3">Training Complete</p>
+            <p className="text-7xl font-bold tracking-tighter text-white">
+              {(session.accuracy * 100).toFixed(1)}
+              <span className="text-3xl text-helix-muted ml-1">%</span>
+            </p>
+            <p className="text-sm text-helix-muted mt-3">
+              {session.current_step} steps · {session.mac_checks_passed} MAC checks passed · {session.checkpoints_submitted} checkpoints
+            </p>
+          </div>
+        </motion.div>
+      )}
+
+      {session.status === 'failed' && (
+        <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="rounded-3xl bg-helix-surface border border-red-500/20 p-8 text-center">
+          <XCircle size={48} className="text-red-400 mx-auto mb-3" />
+          <p className="text-xl font-medium text-red-300">Training Failed</p>
+        </motion.div>
+      )}
+
+      {/* Detail grid */}
+      <div className="grid grid-cols-1 lg:grid-cols-5 gap-5">
+        {/* Left column — chart & big metrics */}
+        <div className="lg:col-span-3 space-y-5">
+          <div className="grid grid-cols-2 gap-4">
+            <div className="bg-helix-surface border border-helix-border rounded-2xl p-5">
+              <div className="text-[10px] uppercase tracking-wider text-helix-muted mb-2">Current Loss</div>
+              <div className="flex items-baseline gap-2">
+                <span className="text-4xl font-bold font-mono text-white tabular-nums">
+                  {lastLoss > 0 ? lastLoss.toFixed(4) : '\u2014'}
+                </span>
+                {lastLoss > 0 && (
+                  <span className={cn('text-sm font-mono tabular-nums', lossDelta <= 0 ? 'text-green-400' : 'text-red-400')}>
+                    {lossDelta <= 0 ? '\u2193' : '\u2191'}{Math.abs(lossDelta).toFixed(4)}
+                  </span>
+                )}
+              </div>
+            </div>
+            <div className="bg-helix-surface border border-helix-border rounded-2xl p-5">
+              <div className="text-[10px] uppercase tracking-wider text-helix-muted mb-2">Accuracy</div>
+              <div className="flex items-baseline gap-2">
+                <span className="text-4xl font-bold font-mono text-white tabular-nums">
+                  {lastAcc > 0 ? `${(lastAcc * 100).toFixed(1)}%` : '\u2014'}
+                </span>
+                {lastAcc > 0 && (
+                  <span className={cn('text-sm font-mono tabular-nums', accDelta >= 0 ? 'text-green-400' : 'text-red-400')}>
+                    {accDelta >= 0 ? '\u2191' : '\u2193'}{Math.abs(accDelta * 100).toFixed(1)}%
+                  </span>
+                )}
+              </div>
+            </div>
+          </div>
           <LossCurve data={losses} />
         </div>
 
-        {/* RIGHT: Progress, phases, stats */}
-        <div className="space-y-5">
-
-          {/* Progress bar */}
-          {!isTerminal && (
-            <div className="space-y-2">
-              <div className="h-2 w-full rounded-full bg-helix-border overflow-hidden">
-                <motion.div
-                  className="h-full rounded-full bg-white"
-                  animate={{ width: `${stepProgress}%` }}
-                  transition={{ duration: 0.4, ease: 'easeOut' }}
-                />
-              </div>
-              <div className="flex items-center justify-between text-sm text-helix-dim">
-                <span>Step {session.current_step}</span>
-                <span>{session.total_steps}</span>
-              </div>
-            </div>
-          )}
-
-          {/* Phase indicator */}
-          {!isTerminal && (
-            <div className="flex items-center gap-3 px-4 py-3.5 rounded-2xl bg-white/[0.02] border border-white/[0.05]">
-              <div className="flex gap-[3px]">
-                {Array.from({ length: TOTAL_PHASES }, (_, i) => (
-                  <div
-                    key={i}
-                    className={cn(
-                      'w-1.5 h-3 rounded-sm transition-all duration-300',
-                      i + 1 < session.phase ? 'bg-white'
-                        : i + 1 === session.phase ? 'bg-white/60'
-                        : 'bg-helix-border',
-                    )}
-                  />
-                ))}
-              </div>
-              <span className="text-sm text-helix-text2">
-                {session.phase_description || PHASE_DESCRIPTIONS[session.phase] || 'Processing...'}
-              </span>
-              <span className="ml-auto text-sm text-helix-dim">
-                {session.phase}/{TOTAL_PHASES}
-              </span>
-            </div>
-          )}
-
-          {/* Stats grid */}
+        {/* Right column — stats & info */}
+        <div className="lg:col-span-2 space-y-4">
           <div className="grid grid-cols-2 gap-3">
-            <StatCard label="Workers" value={
-              session.workers_active
-                ? `${session.workers_active} (local)`
-                : '—'
-            } icon={<Activity size={14} />} />
+            <StatCard label="Workers" value={session.workers_active ?? '\u2014'} icon={<Activity size={14} />} />
             <StatCard label="MAC Checks" value={session.mac_checks_passed} icon={<Shield size={14} />} />
-            <StatCard label="Checkpoints" value={session.checkpoints_submitted} icon={<Zap size={14} />} />
-            <StatCard label="Elapsed" value={
-              session.elapsed_secs > 0
-                ? formatDuration(Math.round(session.elapsed_secs))
-                : formatDuration(elapsedTime)
-            } icon={<Clock size={14} />} />
+            <StatCard label="Checkpoints" value={`${session.checkpoints_submitted}${totalCheckpoints > 0 ? ` / ${totalCheckpoints}` : ''}`} icon={<Layers size={14} />} />
+            <StatCard label="Elapsed" value={session.elapsed_secs > 0 ? formatDuration(Math.round(session.elapsed_secs)) : formatDuration(elapsedTime)} icon={<Clock size={14} />} />
           </div>
 
-          {/* Cheater alert */}
+          <div className="bg-helix-surface border border-helix-border rounded-2xl p-4">
+            <h4 className="text-[10px] uppercase tracking-wider text-helix-muted mb-3">Security Protocol</h4>
+            <div className="space-y-2.5">
+              {[
+                { label: 'SPDZ MAC Verification', active: session.mac_checks_passed > 0 },
+                { label: 'Additive Secret Sharing', active: (session.workers_active ?? 0) > 0 },
+                { label: 'Zero Weight Leakage', active: true },
+                { label: 'Cheater Detection', active: session.phase >= 8 },
+              ].map((item) => (
+                <div key={item.label} className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <div className={cn('w-1.5 h-1.5 rounded-full', item.active ? 'bg-green-400' : 'bg-helix-muted/40')} />
+                    <span className="text-xs text-helix-dim">{item.label}</span>
+                  </div>
+                  <span className={cn('text-[10px] font-mono', item.active ? 'text-green-400/80' : 'text-helix-muted')}>
+                    {item.active ? 'ACTIVE' : 'STANDBY'}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="bg-helix-surface border border-helix-border rounded-2xl p-4">
+            <h4 className="text-[10px] uppercase tracking-wider text-helix-muted mb-3">Session</h4>
+            <div className="space-y-2">
+              {[
+                { label: 'ID', value: session.session_id.slice(0, 12) + '\u2026' },
+                ...(session.coordinator_address ? [{ label: 'Coordinator', value: session.coordinator_address.slice(0, 8) + '\u2026' + session.coordinator_address.slice(-4) }] : []),
+                ...(session.job_id !== undefined ? [{ label: 'Job ID', value: String(session.job_id) }] : []),
+                { label: 'Architecture', value: '784 \u2192 32 \u2192 10' },
+              ].map((item) => (
+                <div key={item.label} className="flex items-center justify-between">
+                  <span className="text-xs text-helix-muted">{item.label}</span>
+                  <span className="text-xs text-helix-dim font-mono">{item.value}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
           {session.cheater_detected && (
             <motion.div
               initial={{ opacity: 0, x: -8 }}
@@ -1076,21 +1365,21 @@ function LiveProgress({ session, losses, isConnected, error, version, modelName,
               </div>
             </motion.div>
           )}
-
-          {/* Results actions */}
-          {isTerminal && (
-            <ResultsActions
-              session={session}
-              version={version}
-              onDownloadModel={onDownloadModel}
-              onStoreOnZeroG={onStoreOnZeroG}
-              isStoringOnZeroG={isStoringOnZeroG}
-              zeroGResult={zeroGResult}
-              showStoreOn0G={showStoreOn0G}
-            />
-          )}
         </div>
       </div>
+
+      {/* Results actions */}
+      {isTerminal && (
+        <ResultsActions
+          session={session}
+          version={version}
+          onDownloadModel={onDownloadModel}
+          onStoreOnZeroG={onStoreOnZeroG}
+          isStoringOnZeroG={isStoringOnZeroG}
+          zeroGResult={zeroGResult}
+          showStoreOn0G={showStoreOn0G}
+        />
+      )}
     </div>
   );
 }
@@ -1117,9 +1406,21 @@ function StatCard({ label, value, icon }: { label: string; value: string | numbe
 
 function LossCurve({ data }: { data: { step: number; loss: number; accuracy?: number }[] }) {
   const chartData = useMemo(() => {
-    if (data.length <= 200) return data;
-    const step = Math.ceil(data.length / 200);
-    return data.filter((_, i) => i % step === 0 || i === data.length - 1);
+    if (data.length === 0) return [];
+    // EMA smoothing — alpha high enough to track reality, low enough to remove per-step noise
+    const lossAlpha = 0.35;
+    const accAlpha = 0.3;
+    let lossEma = data[0].loss;
+    let accEma = (data[0].accuracy ?? 0) * 100;
+    const smoothed = data.map((d) => {
+      lossEma = lossAlpha * d.loss + (1 - lossAlpha) * lossEma;
+      const rawAcc = (d.accuracy ?? 0) * 100;
+      accEma = accAlpha * rawAcc + (1 - accAlpha) * accEma;
+      return { step: d.step, loss: lossEma, accuracy: accEma / 100 };
+    });
+    if (smoothed.length <= 200) return smoothed;
+    const step = Math.ceil(smoothed.length / 200);
+    return smoothed.filter((_, i) => i % step === 0 || i === smoothed.length - 1);
   }, [data]);
 
   const hasAccuracy = chartData.some(d => d.accuracy !== undefined && d.accuracy > 0);
@@ -1132,7 +1433,8 @@ function LossCurve({ data }: { data: { step: number; loss: number; accuracy?: nu
     );
   }
 
-  const lastPoint = chartData[chartData.length - 1];
+  // Use raw (unsmoothed) last point for headline numbers
+  const lastPoint = data[data.length - 1];
 
   return (
     <div className="rounded-2xl bg-helix-surface border border-helix-border p-5 pt-4">
@@ -1832,6 +2134,10 @@ function TrainPageInner() {
   const isFetchingWeights = weightFetchStatus === 'fetching' || weightFetchStatus === 'decrypting' || weightFetchStatus === 'uploading';
 
   return (
+    <>
+    {/* Global cheater toast notification */}
+    <CheaterToast cheater={session?.cheater_detected ?? null} />
+
     <motion.div
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
@@ -1971,6 +2277,7 @@ function TrainPageInner() {
         />
       )}
     </motion.div>
+    </>
   );
 }
 

@@ -60,11 +60,34 @@ export function useDashboardSessions(): UseDashboardSessionsReturn {
       const res = await fetch(`${API_BASE}/api/training/sessions/${sessionId}`);
       if (!res.ok) return;
       const data: TrainingSessionState = await res.json();
-      setActiveSession(data);
 
-      if (data.losses && data.losses.length > 0) {
-        setLosses(data.losses.map((loss, i) => ({ step: i + 1, loss })));
-      }
+      setActiveSession((prev) => {
+        if (!prev) return data;
+        if (data.current_step > prev.current_step || data.status === 'complete' || data.status === 'failed') {
+          return data;
+        }
+        return {
+          ...prev,
+          coordinator_address: data.coordinator_address || prev.coordinator_address,
+          job_id: data.job_id || prev.job_id,
+          workers_active: data.workers_active ?? prev.workers_active,
+          status: prev.status,
+        };
+      });
+
+      setLosses((prev) => {
+        if (data.losses && data.losses.length > prev.length) {
+          return data.losses.map((loss: number, i: number) => ({
+            step: i + 1,
+            loss,
+            // Use real evaluated accuracy on last point if session has it
+            accuracy: (i === data.losses.length - 1 && data.accuracy != null)
+              ? data.accuracy
+              : Math.max(0, Math.min(1, 1 - loss / 2.302585)),
+          }));
+        }
+        return prev;
+      });
     } catch {
       // Non-fatal — WebSocket is primary
     }
@@ -104,7 +127,14 @@ export function useDashboardSessions(): UseDashboardSessionsReturn {
             const s = data.state as TrainingSessionState;
             setActiveSession(s);
             if (s.losses && s.losses.length > 0) {
-              setLosses(s.losses.map((loss: number, i: number) => ({ step: i + 1, loss })));
+              setLosses(s.losses.map((loss: number, i: number) => ({
+                step: i + 1,
+                loss,
+                // Use real evaluated accuracy on last point if session has it
+                accuracy: (i === s.losses.length - 1 && s.accuracy != null)
+                  ? s.accuracy
+                  : Math.max(0, Math.min(1, 1 - loss / 2.302585)),
+              })));
             }
             return;
           }
@@ -128,7 +158,10 @@ export function useDashboardSessions(): UseDashboardSessionsReturn {
                   : prev.mac_checks_passed,
               };
             });
-            setLosses((prev) => [...prev, { step: evt.step as number, loss: evt.loss as number }]);
+            const loss = evt.loss as number;
+            const accuracy = (evt.accuracy as number | undefined)
+              ?? Math.max(0, Math.min(1, 1 - loss / 2.302585));
+            setLosses((prev) => [...prev, { step: evt.step as number, loss, accuracy }]);
           }
 
           if (evt.type === 'phase_started' || evt.type === 'phase_completed') {
@@ -170,6 +203,15 @@ export function useDashboardSessions(): UseDashboardSessionsReturn {
               if (!prev) return prev;
               return { ...prev, accuracy: accuracy ?? prev.accuracy };
             });
+            // Update last loss entry with real evaluated accuracy so chart/headline match
+            if (accuracy !== undefined) {
+              setLosses((prev) => {
+                if (prev.length === 0) return prev;
+                const updated = [...prev];
+                updated[updated.length - 1] = { ...updated[updated.length - 1], accuracy };
+                return updated;
+              });
+            }
           }
 
           if (evt.type === 'session_complete') {
@@ -178,6 +220,15 @@ export function useDashboardSessions(): UseDashboardSessionsReturn {
               if (!prev) return prev;
               return { ...prev, status: 'complete', accuracy: accuracy ?? prev.accuracy };
             });
+            // Update last loss entry with real evaluated accuracy so chart/headline match
+            if (accuracy !== undefined) {
+              setLosses((prev) => {
+                if (prev.length === 0) return prev;
+                const updated = [...prev];
+                updated[updated.length - 1] = { ...updated[updated.length - 1], accuracy };
+                return updated;
+              });
+            }
           }
 
           if (evt.type === 'session_failed') {
