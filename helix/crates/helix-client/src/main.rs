@@ -2127,7 +2127,9 @@ async fn cmd_dashboard(args: &DashboardArgs, _cli: &Cli, mut shutdown: broadcast
         rate_limit_per_second: 30,
     };
 
-    let state = Arc::new(dashboard::DashboardState::new(config));
+    let (state, state_update_rx) = dashboard::DashboardState::new(config);
+    let state = Arc::new(state);
+    state.spawn_state_updater(state_update_rx);
 
     // Set on-chain config from CLI args
     if let Some(ref rpc_url) = args.rpc_url {

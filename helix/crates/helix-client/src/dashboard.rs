@@ -26,7 +26,7 @@ use axum::{
 use futures::stream::StreamExt;
 use futures::SinkExt;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tower_http::cors::{CorsLayer, Any};
 use tracing::{debug, error, info, warn};
 
@@ -426,6 +426,11 @@ pub struct WorkerHeartbeatRequest {
 // Dashboard State
 // ---------------------------------------------------------------------------
 
+/// A state update message sent from the sync progress callback to the async state updater task.
+pub enum StateUpdate {
+    Progress { session_id: String, event: crate::full_orchestration::ProgressEvent },
+}
+
 /// Dashboard application state — shared between handlers and external updaters
 pub struct DashboardState {
     /// Start time for uptime calculation
@@ -448,6 +453,8 @@ pub struct DashboardState {
     pub sessions: RwLock<HashMap<String, TrainingSessionState>>,
     /// WebSocket broadcast channel for progress events
     pub ws_broadcast: broadcast::Sender<(String, serde_json::Value)>,
+    /// Channel sender for state updates from the sync progress callback
+    pub state_update_tx: mpsc::UnboundedSender<StateUpdate>,
     /// Uploaded training data (used instead of synthetic MNIST when set)
     pub uploaded_data: RwLock<Option<Vec<(Vec<f64>, Vec<f64>)>>>,
     /// Uploaded initial weights (for continue-training)
@@ -467,9 +474,13 @@ pub struct DashboardState {
 }
 
 impl DashboardState {
-    /// Create new dashboard state with the given config
-    pub fn new(config: DashboardConfig) -> Self {
+    /// Create new dashboard state with the given config.
+    ///
+    /// Returns the state and an `mpsc::UnboundedReceiver` that must be passed to
+    /// [`spawn_state_updater`] after wrapping `Self` in an `Arc`.
+    pub fn new(config: DashboardConfig) -> (Self, mpsc::UnboundedReceiver<StateUpdate>) {
         let (ws_broadcast, _) = broadcast::channel(1024);
+        let (state_update_tx, state_update_rx) = mpsc::unbounded_channel::<StateUpdate>();
 
         // Initialize training DB
         let training_db = {
@@ -502,7 +513,7 @@ impl DashboardState {
             RwLock::new(map)
         };
 
-        Self {
+        (Self {
             start_time: Instant::now(),
             network_status: RwLock::new(NetworkStatus::default()),
             training_status: RwLock::new(TrainingStatus::default()),
@@ -513,6 +524,7 @@ impl DashboardState {
             rate_limiter: RwLock::new(HashMap::new()),
             sessions,
             ws_broadcast,
+            state_update_tx,
             uploaded_data: RwLock::new(None),
             uploaded_weights: RwLock::new(None),
             registered_workers: RwLock::new(Vec::new()),
@@ -521,14 +533,15 @@ impl DashboardState {
             model_store_address: RwLock::new(None),
             model_weights_cache: RwLock::new(HashMap::new()),
             training_db,
-        }
+        }, state_update_rx)
     }
 
     /// Create state pre-populated with demo defaults (so the dashboard works standalone)
     pub fn with_defaults() -> Arc<Self> {
-        let state = Self::new(DashboardConfig::default());
+        let (state, state_update_rx) = Self::new(DashboardConfig::default());
 
         let arc = Arc::new(state);
+        arc.spawn_state_updater(state_update_rx);
         // Use try_write to populate synchronously (no contention at init time)
         *arc.nodes.try_write().expect("no contention at init") = demo_nodes();
         *arc.metrics.try_write().expect("no contention at init") = demo_metrics();
@@ -573,11 +586,83 @@ impl DashboardState {
     pub fn uptime_secs(&self) -> u64 {
         self.start_time.elapsed().as_secs()
     }
+
+    /// Spawn a background task that drains the `state_update_rx` channel and
+    /// applies each update to the session map under a proper async write lock.
+    pub fn spawn_state_updater(self: &Arc<Self>, mut rx: mpsc::UnboundedReceiver<StateUpdate>) {
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            while let Some(update) = rx.recv().await {
+                match update {
+                    StateUpdate::Progress { session_id, event } => {
+                        apply_progress_event(&state, &session_id, &event).await;
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Apply a single progress event to the session state under an async write lock.
+///
+/// This is the authoritative place where training session fields are mutated
+/// in response to progress events.  It runs inside the dedicated state-updater
+/// task spawned by [`DashboardState::spawn_state_updater`], so it never
+/// contends with the sync progress callback.
+async fn apply_progress_event(
+    state: &DashboardState,
+    session_id: &str,
+    event: &crate::full_orchestration::ProgressEvent,
+) {
+    use crate::full_orchestration::ProgressEvent;
+    let mut sessions = state.sessions.write().await;
+    if let Some(session) = sessions.get_mut(session_id) {
+        match event {
+            ProgressEvent::PhaseStarted { phase, description, .. } => {
+                session.phase = *phase;
+                session.phase_description = description.clone();
+                session.status = "running".to_string();
+            }
+            ProgressEvent::TrainingStep { step, loss, accuracy, .. } => {
+                session.current_step = *step;
+                session.current_loss = *loss;
+                session.losses.push(*loss);
+                session.accuracy = Some(*accuracy);
+                session.mac_checks_passed += 1;
+                session.phase_description = format!(
+                    "Training step {}/{} — loss: {:.4}",
+                    step, session.total_steps, loss
+                );
+            }
+            ProgressEvent::CheckpointSubmitted { .. } => {
+                session.checkpoints_submitted += 1;
+            }
+            ProgressEvent::CheaterDetected { party_index, step } => {
+                session.cheater_detected = Some(serde_json::json!({
+                    "party_index": party_index,
+                    "step": step,
+                }));
+            }
+            ProgressEvent::TrainingComplete { accuracy, .. } => {
+                session.accuracy = Some(*accuracy);
+                session.status = "complete".to_string();
+            }
+            ProgressEvent::ZkProofGenerated { .. } => {
+                session.zk_proofs_generated += 1;
+            }
+            _ => {}
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        session.elapsed_secs = now - session.started_at;
+    }
 }
 
 impl Default for DashboardState {
     fn default() -> Self {
-        Self::new(DashboardConfig::default())
+        Self::new(DashboardConfig::default()).0
     }
 }
 
@@ -761,7 +846,10 @@ async fn rate_limit_middleware(
 
 /// Create the dashboard API router with the given configuration
 pub fn create_dashboard_router(config: DashboardConfig) -> Router {
-    create_dashboard_router_with_state(Arc::new(DashboardState::new(config)))
+    let (state, state_update_rx) = DashboardState::new(config);
+    let state = Arc::new(state);
+    state.spawn_state_updater(state_update_rx);
+    create_dashboard_router_with_state(state)
 }
 
 /// Create dashboard router with a pre-built shared state (so callers can push updates)
