@@ -1540,9 +1540,10 @@ async fn run_training_session(
 
     let mut orchestrator = FullOrchestrator::new(config);
 
-    // Set up progress callback that updates session state and broadcasts to WebSocket.
-    // The callback must be Fn + Send + Sync (non-async), so we use try_write for state
-    // updates and the broadcast channel (which is sync-safe) for WebSocket fanout.
+    // Set up progress callback that broadcasts to WebSocket and sends to the state
+    // updater task. The callback must be Fn + Send + Sync (non-async), so we use
+    // the broadcast channel (sync-safe) for WebSocket fanout and the mpsc channel
+    // (also sync-safe) for state updates applied by the dedicated writer task.
     let progress_cb: ProgressCallback = Arc::new(move |event: ProgressEvent| {
         let event_json = progress_event_to_json(&event);
 
@@ -1728,7 +1729,8 @@ async fn run_training_session(
             );
             error!(session_id = %session_id, "[Dashboard] Full error chain: {:?}", e);
 
-            if let Ok(mut sessions) = state.sessions.try_write() {
+            {
+                let mut sessions = state.sessions.write().await;
                 if let Some(session) = sessions.get_mut(&session_id) {
                     session.status = "failed".to_string();
                     session.phase_description = format!("Error: {}", e);
@@ -1755,6 +1757,9 @@ async fn run_training_session(
 
     // Mark all busy workers as idle again
     if let Ok(mut workers) = state.registered_workers.try_write() {
+        // Note: try_write is acceptable here — worker status is non-critical and
+        // the function is about to return. The important session state is already
+        // persisted above via .write().await.
         let mut released = 0;
         for w in workers.iter_mut() {
             if w.status == "busy" {
