@@ -529,6 +529,11 @@ impl ChainClientV4 {
     // ============ Worker Registration ============
 
     /// Stake ETH and join a training job as a worker.
+    ///
+    /// Includes pre-flight checks for testnet compatibility:
+    /// - Verifies contract code exists at coordinator address
+    /// - Verifies sender balance covers stake + gas
+    /// - Uses explicit gas limit to avoid testnet gas-estimation quirks
     pub async fn stake_and_join(
         &self,
         job_id: u64,
@@ -536,6 +541,52 @@ impl ChainClientV4 {
     ) -> Result<TransactionReceipt> {
         self.check_cb().await?;
         let result: Result<TransactionReceipt> = async {
+            // Pre-flight: verify contract code exists at the coordinator address.
+            // Calling a function on an EOA (no code) reverts with empty data (0x).
+            let code = self
+                .client
+                .get_code(self.coordinator_address, None)
+                .await
+                .map_err(|e| anyhow!("Failed to query contract code: {}", e))?;
+            if code.is_empty() {
+                return Err(anyhow!(
+                    "No contract code at coordinator address {:?}. \
+                     Verify the contract was deployed on this chain and the address is correct.",
+                    self.coordinator_address
+                ));
+            }
+
+            // Pre-flight: verify sender has sufficient balance for stake + gas.
+            // On testnets with load-balanced RPCs, recently-funded wallets may show
+            // stale (zero) balances if the funding tx hasn't propagated yet.
+            let sender = self.client.signer().address();
+            let balance = self
+                .client
+                .get_balance(sender, None)
+                .await
+                .map_err(|e| anyhow!("Failed to check sender balance: {}", e))?;
+            // Conservative gas buffer: 300K gas at up to 100 gwei
+            let gas_buffer = U256::from(300_000u64) * U256::from(100_000_000_000u64);
+            if balance < stake_amount {
+                return Err(anyhow!(
+                    "Insufficient balance for staking. Sender {:?} has {} wei \
+                     but stake requires {} wei. The funding transaction may not \
+                     have propagated yet — try again in a few seconds.",
+                    sender, balance, stake_amount
+                ));
+            }
+            if balance < stake_amount + gas_buffer {
+                tracing::warn!(
+                    sender = ?sender,
+                    balance = %balance,
+                    stake = %stake_amount,
+                    "Worker balance is low — may not cover gas on high-fee chains"
+                );
+            }
+
+            // Let ethers estimate gas naturally — explicit gas limits can
+            // over-reserve on L2s with high gas prices, causing the max fee to
+            // exceed the worker's balance.
             let call = self
                 .coordinator
                 .stake_and_join(U256::from(job_id))
@@ -544,10 +595,22 @@ impl ChainClientV4 {
                 .send()
                 .await
                 .map_err(|e| anyhow!("stake_and_join send: {}", e))?;
-            pending
+            let receipt = pending
                 .await
                 .map_err(|e| anyhow!("stake_and_join receipt: {}", e))?
-                .ok_or_else(|| anyhow!("stake_and_join: tx dropped"))
+                .ok_or_else(|| anyhow!("stake_and_join: tx dropped"))?;
+
+            // Check on-chain execution status.
+            if receipt.status == Some(ethers::types::U64::from(0)) {
+                return Err(anyhow!(
+                    "stake_and_join reverted on-chain (tx {:?}). \
+                     Check: job {} exists and is active, worker {:?} not already registered, \
+                     stake {} >= minStake (0.001 ETH).",
+                    receipt.transaction_hash, job_id, sender, stake_amount
+                ));
+            }
+
+            Ok(receipt)
         }
         .await;
         if result.is_ok() {

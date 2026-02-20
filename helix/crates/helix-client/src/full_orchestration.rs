@@ -626,9 +626,17 @@ impl FullOrchestrator {
             let coord_addr = self.config.coordinator_address.clone().unwrap_or_default();
             (0u64, coord_addr, None, Vec::new(), 0u64)
         } else {
-            let (jid, addr, client, wallets, gas) =
-                self.run_chain_setup_phases(d_in, d_hid, d_out, num_workers).await?;
-            (jid, addr, Some(client), wallets, gas)
+            match self.run_chain_setup_phases(d_in, d_hid, d_out, num_workers).await {
+                Ok((jid, addr, client, wallets, gas)) => {
+                    (jid, addr, Some(client), wallets, gas)
+                }
+                Err(e) => {
+                    // Chain setup failed — sweep any funded worker wallets back
+                    // to the owner before propagating the error.
+                    self.sweep_worker_funds_on_failure().await;
+                    return Err(e);
+                }
+            }
         };
 
         #[cfg(not(feature = "chain"))]
@@ -915,6 +923,75 @@ impl FullOrchestrator {
 
         #[cfg(not(feature = "chain"))]
         let (model_nft_token_id, model_store_addr_str): (Option<u64>, String) = (None, String::new());
+
+        // ================================================================
+        // Phase 12.9: Sweep remaining ETH from worker wallets back to owner
+        // ================================================================
+        #[cfg(feature = "chain")]
+        if !worker_wallets.is_empty() {
+            if let Some(ref rpc_url) = self.rpc_url {
+                let owner_pk = self.config.private_key.strip_prefix("0x")
+                    .unwrap_or(&self.config.private_key);
+                if let Ok(owner_wallet) = LocalWallet::from_str(owner_pk) {
+                    let owner_addr = owner_wallet.address();
+                    info!("Sweeping remaining ETH from {} worker wallets back to owner {:?}", worker_wallets.len(), owner_addr);
+                    let mut total_swept = U256::zero();
+
+                    for (i, wallet) in worker_wallets.iter().enumerate() {
+                        if let Ok(provider) = ethers::providers::Provider::<ethers::providers::Http>::try_from(rpc_url.as_str()) {
+                            use ethers::providers::Middleware;
+                            use ethers::signers::Signer;
+                            let balance = provider.get_balance(wallet.address(), None).await.unwrap_or_default();
+                            let gas_price = provider.get_gas_price().await.unwrap_or(U256::from(1_000_000_000u64));
+                            let tx_cost = gas_price * 21_000;
+                            if balance > tx_cost {
+                                let sweep_amount = balance - tx_cost;
+                                let chain_id = provider.get_chainid().await.unwrap_or(U256::from(1u64));
+                                let nonce = provider.get_transaction_count(wallet.address(), None).await.unwrap_or_default();
+                                let tx: ethers::types::transaction::eip2718::TypedTransaction =
+                                    ethers::types::TransactionRequest::new()
+                                        .to(owner_addr)
+                                        .value(sweep_amount)
+                                        .gas(21_000u64)
+                                        .gas_price(gas_price)
+                                        .nonce(nonce)
+                                        .chain_id(chain_id.as_u64())
+                                        .into();
+                                let wallet_with_chain = wallet.clone().with_chain_id(chain_id.as_u64());
+                                match wallet_with_chain.sign_transaction(&tx).await {
+                                    Ok(signature) => {
+                                        let raw_tx = tx.rlp_signed(&signature);
+                                        match provider.send_raw_transaction(raw_tx).await {
+                                            Ok(_pending) => {
+                                                total_swept += sweep_amount;
+                                                info!(
+                                                    worker = i,
+                                                    swept_eth = %ethers::utils::format_ether(sweep_amount),
+                                                    "Swept worker funds back to owner"
+                                                );
+                                            }
+                                            Err(e) => {
+                                                warn!("Failed to sweep worker {} funds: {}", i, e);
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to sign sweep tx for worker {}: {}", i, e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if !total_swept.is_zero() {
+                        info!(
+                            total_swept_eth = %ethers::utils::format_ether(total_swept),
+                            "Worker fund sweep complete"
+                        );
+                    }
+                }
+            }
+        }
 
         // ================================================================
         // Phase 13: Print comprehensive summary
@@ -1375,7 +1452,9 @@ impl FullOrchestrator {
             // When using the on-chain pool, worker_private_keys are still needed for
             // demo-mode signing but we don't require a 1:1 match since the pool
             // dynamically assigns workers.
+            // When worker_private_keys is empty, Phase 5.5 auto-generates and funds them.
             if !self.config.use_pool_workers
+                && !self.config.worker_private_keys.is_empty()
                 && self.config.worker_private_keys.len() != self.config.worker_endpoints.len()
             {
                 return Err(anyhow!(
@@ -1517,6 +1596,96 @@ impl FullOrchestrator {
         } else {
             info!("Generating Xavier-initialized weights");
             Ok(xavier_init(d_in, d_hid, d_out, self.config.seed))
+        }
+    }
+
+    // ========================================================================
+    // Worker fund sweep (on failure)
+    // ========================================================================
+
+    /// Sweep any funded worker wallets back to the owner after a failure.
+    /// Uses worker keys stored in `self.config.worker_private_keys` by Phase 5.5.
+    #[cfg(feature = "chain")]
+    async fn sweep_worker_funds_on_failure(&self) {
+        if self.config.worker_private_keys.is_empty() {
+            return;
+        }
+        let rpc_url = match &self.rpc_url {
+            Some(url) => url.clone(),
+            None => return,
+        };
+        let owner_pk = self.config.private_key.strip_prefix("0x")
+            .unwrap_or(&self.config.private_key);
+        let owner_addr = match LocalWallet::from_str(owner_pk) {
+            Ok(w) => w.address(),
+            Err(_) => return,
+        };
+
+        info!(
+            "Sweeping funded worker wallets back to owner {:?} after failure",
+            owner_addr
+        );
+        let mut total_swept = U256::zero();
+
+        for (i, wk_key) in self.config.worker_private_keys.iter().enumerate() {
+            let pk = wk_key.strip_prefix("0x").unwrap_or(wk_key);
+            let wallet = match LocalWallet::from_str(pk) {
+                Ok(w) => w,
+                Err(_) => continue,
+            };
+            let provider = match ethers::providers::Provider::<ethers::providers::Http>::try_from(rpc_url.as_str()) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            use ethers::providers::Middleware;
+            use ethers::signers::Signer;
+            let balance = provider.get_balance(wallet.address(), None).await.unwrap_or_default();
+            let gas_price = provider.get_gas_price().await.unwrap_or(U256::from(1_000_000_000u64));
+            let tx_cost = gas_price * 21_000;
+            if balance <= tx_cost {
+                continue;
+            }
+            let sweep_amount = balance - tx_cost;
+            let chain_id = provider.get_chainid().await.unwrap_or(U256::from(1u64)).as_u64();
+            let nonce = provider.get_transaction_count(wallet.address(), None).await.unwrap_or_default();
+            let tx: ethers::types::transaction::eip2718::TypedTransaction =
+                ethers::types::TransactionRequest::new()
+                    .to(owner_addr)
+                    .value(sweep_amount)
+                    .gas(21_000u64)
+                    .gas_price(gas_price)
+                    .nonce(nonce)
+                    .chain_id(chain_id)
+                    .into();
+            let wallet_with_chain = wallet.clone().with_chain_id(chain_id);
+            match wallet_with_chain.sign_transaction(&tx).await {
+                Ok(signature) => {
+                    let raw_tx = tx.rlp_signed(&signature);
+                    match provider.send_raw_transaction(raw_tx).await {
+                        Ok(_) => {
+                            total_swept += sweep_amount;
+                            info!(
+                                worker = i,
+                                swept_eth = %ethers::utils::format_ether(sweep_amount),
+                                "Swept worker funds back to owner (failure cleanup)"
+                            );
+                        }
+                        Err(e) => {
+                            warn!("Failed to sweep worker {} funds: {}", i, e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to sign sweep tx for worker {}: {}", i, e);
+                }
+            }
+        }
+
+        if !total_swept.is_zero() {
+            info!(
+                total_swept_eth = %ethers::utils::format_ether(total_swept),
+                "Failure cleanup sweep complete"
+            );
         }
     }
 
@@ -1797,10 +1966,22 @@ impl FullOrchestrator {
                 owner_wallet.clone(),
             );
 
-            // Each worker needs stake + gas. Fund with 2x stake to cover gas.
+            // Each worker needs stake + gas. L2 chains (zk rollups, optimistic rollups)
+            // can have high gas prices (600+ gwei). Actual usage is ~0.12 ETH per
+            // worker on ADI testnet, so 0.2 ETH minimum gives comfortable headroom.
+            // Remaining funds are swept back to the owner after training.
             let stake_wei = ethers::utils::parse_ether(self.config.stake_amount_eth)
                 .context("Invalid stake amount")?;
-            let fund_amount = stake_wei * 3; // stake + generous gas buffer
+            let gas_buffer = ethers::utils::parse_ether(0.15).unwrap();
+            let min_fund = ethers::utils::parse_ether(0.2).unwrap();
+            let fund_amount = std::cmp::max(stake_wei + gas_buffer, min_fund);
+
+            info!(
+                fund_per_worker_eth = %ethers::utils::format_ether(fund_amount),
+                stake_eth = %ethers::utils::format_ether(stake_wei),
+                num_workers = num_workers,
+                "Phase 5.5: Funding worker wallets from owner"
+            );
 
             for i in 0..num_workers {
                 let worker_wallet = LocalWallet::new(&mut rand::thread_rng());
@@ -1814,9 +1995,44 @@ impl FullOrchestrator {
                 let _receipt = pending.await
                     .with_context(|| format!("Phase 5.5: Worker {} funding tx not confirmed", i))?;
 
+                // Poll balance until the funding is visible to the RPC node.
+                // On testnets with load-balanced RPCs, the receipt confirmation
+                // alone may not guarantee balance visibility on subsequent calls.
+                {
+                    use ethers::providers::Middleware;
+                    let poll_provider = ethers::providers::Provider::<ethers::providers::Http>::try_from(rpc_url.as_str())
+                        .map_err(|e| anyhow!("Invalid RPC URL: {}", e))?;
+                    let target = fund_amount;
+                    let mut attempts = 0u32;
+                    loop {
+                        let bal = poll_provider.get_balance(worker_wallet.address(), None).await.unwrap_or_default();
+                        if bal >= target {
+                            break;
+                        }
+                        attempts += 1;
+                        if attempts > 30 {
+                            return Err(anyhow!(
+                                "Phase 5.5: Worker {} balance still 0 after 30s. \
+                                 Funding tx was confirmed but balance not visible at RPC endpoint. \
+                                 The RPC may be load-balanced with stale nodes. \
+                                 Worker address: {:?}",
+                                i, worker_wallet.address()
+                            ));
+                        }
+                        if attempts == 1 {
+                            info!(
+                                worker = i,
+                                "Waiting for funded balance to propagate to RPC..."
+                            );
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                }
+
                 info!(
                     worker = i,
                     address = %worker_wallet.address(),
+                    funded_eth = %ethers::utils::format_ether(fund_amount),
                     "Funded worker wallet"
                 );
                 self.config.worker_private_keys.push(worker_key);
@@ -1890,6 +2106,44 @@ impl FullOrchestrator {
                 let wallet = LocalWallet::from_str(pk)
                     .map_err(|e| anyhow!("Invalid worker {} private key: {}", i, e))?
                     .with_chain_id(chain_id);
+
+                // Verify worker balance is sufficient before staking.
+                // On testnets, poll until balance is visible (handles RPC propagation delay).
+                {
+                    use ethers::providers::Middleware;
+                    let mut attempts = 0u32;
+                    loop {
+                        let balance = provider.get_balance(wallet.address(), None).await.unwrap_or_default();
+                        info!(
+                            worker = i,
+                            address = %wallet.address(),
+                            balance = %ethers::utils::format_ether(balance),
+                            stake = %ethers::utils::format_ether(stake_wei),
+                            job_id = job_id,
+                            chain_id = chain_id,
+                            coordinator = %coordinator_addr_str,
+                            "Phase 6: Worker pre-stake check"
+                        );
+                        if balance >= stake_wei {
+                            break;
+                        }
+                        attempts += 1;
+                        if attempts > 20 {
+                            return Err(anyhow!(
+                                "Phase 6: Worker {} has insufficient balance ({} wei) \
+                                 for stake ({} wei) after waiting 20s. \
+                                 Fund worker address {:?} on chain {} before staking.",
+                                i, balance, stake_wei, wallet.address(), chain_id
+                            ));
+                        }
+                        warn!(
+                            worker = i,
+                            attempts = attempts,
+                            "Worker balance insufficient for stake, waiting for RPC propagation..."
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                }
 
                 let worker_client = ChainClientV4::with_wallet(
                     &rpc_url,

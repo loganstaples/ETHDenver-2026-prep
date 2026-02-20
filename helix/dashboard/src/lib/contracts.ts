@@ -23,10 +23,10 @@ export const CONTRACT_ADDRESSES = {
     },
     // ADI Network Testnet
     99999: {
-        helixCoordinator: '0x45EF05ac69ea0064CD9037ef8F2A05e2D758F4A7',
-        helixVerifier: '0x9105B3cE2EaFDed8C7326ddF34025411d0951297',
-        helixToken: '0x0000000000000000000000000000000000000000',
-        helixModelStore: '0xf92116D4566435AF966428eb94F4cF850e30CBB6',
+        helixCoordinator: '0xFeE35d793277FaCDD112f07A51aFd79CDcb92cFc',
+        helixVerifier: '0x76e537b6AD41ad670E126689C7CB4488ebd0598a',
+        helixToken: '0x73E04552246D905795EBC18F3068a2528f8588a1',
+        helixModelStore: '0x163a4D4074a29Bfbe28DC98288a4f71f6778d147',
     },
 } as const;
 
@@ -978,7 +978,7 @@ export interface OnChainVersion {
 const EXPLORER_URLS: Record<number, string> = {
     1: 'https://etherscan.io',
     11155111: 'https://sepolia.etherscan.io',
-    99999: 'https://explorer.adi.network',
+    99999: 'https://explorer.ab.testnet.adifoundation.ai',
 };
 
 /** Get block explorer link for a transaction hash. Returns null for localhost / unknown chains. */

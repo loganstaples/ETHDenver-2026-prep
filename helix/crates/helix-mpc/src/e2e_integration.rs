@@ -1319,6 +1319,13 @@ pub async fn run_distributed_party<T: crate::session::transport::MPCTransport + 
         );
 
         if checkpoint_interval > 0 && (step + 1) % checkpoint_interval == 0 {
+            let checkpoint_num = (step + 1) / checkpoint_interval;
+            let total_checkpoints = num_steps / checkpoint_interval;
+            trainer.emit_sub_step(&format!(
+                "Pedersen checkpoint {}/{} — computing commitment",
+                checkpoint_num, total_checkpoints
+            ));
+
             let (w1, b1, w2, b2) = trainer.weight_shares();
             let all_weights: Vec<Fr> = w1.iter()
                 .chain(b1.iter())
@@ -1348,6 +1355,11 @@ pub async fn run_distributed_party<T: crate::session::transport::MPCTransport + 
                 loss = step_result.loss,
                 "On-chain checkpoint created (distributed)"
             );
+
+            trainer.emit_sub_step(&format!(
+                "Checkpoint {}/{} verified",
+                checkpoint_num, total_checkpoints
+            ));
 
             checkpoints.push(checkpoint);
         }
@@ -1611,6 +1623,13 @@ pub async fn run_party_training<T: crate::session::transport::MPCTransport + 'st
 
         // Pedersen checkpoint at configured intervals: exchange + combine via transport.
         if checkpoint_interval > 0 && (step + 1) % checkpoint_interval == 0 {
+            let checkpoint_num = (step + 1) / checkpoint_interval;
+            let total_checkpoints = num_steps / checkpoint_interval;
+            trainer.emit_sub_step(&format!(
+                "Pedersen checkpoint {}/{} — computing commitment",
+                checkpoint_num, total_checkpoints
+            ));
+
             let (w1, b1, w2, b2) = trainer.weight_shares();
             let all_weights: Vec<Fr> = w1.iter()
                 .chain(b1.iter())
@@ -1640,6 +1659,11 @@ pub async fn run_party_training<T: crate::session::transport::MPCTransport + 'st
                 loss = step_result.loss,
                 "On-chain checkpoint created and exchanged"
             );
+
+            trainer.emit_sub_step(&format!(
+                "Checkpoint {}/{} verified",
+                checkpoint_num, total_checkpoints
+            ));
 
             checkpoints.push(checkpoint);
         }

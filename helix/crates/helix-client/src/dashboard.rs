@@ -1224,7 +1224,9 @@ async fn events_handler(
 // ---------------------------------------------------------------------------
 
 /// GET /api/operator-address — return the backend's ETH address (for use as operator param)
-async fn operator_address_handler() -> Json<serde_json::Value> {
+async fn operator_address_handler(
+    State(state): State<Arc<DashboardState>>,
+) -> Json<serde_json::Value> {
     // Derive the backend's ETH address from its private key.
     let private_key = std::env::var("TESTNET_PRIVATE_KEY").unwrap_or_else(|_| {
         // Anvil account #0
@@ -1240,10 +1242,19 @@ async fn operator_address_handler() -> Json<serde_json::Value> {
         Err(_) => "0x0000000000000000000000000000000000000000".to_string(),
     };
 
-    let chain_id: u64 = std::env::var("CHAIN_ID")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(31337);
+    // Detect chain_id from the configured RPC URL
+    let chain_id: u64 = match &*state.eth_rpc_url.read().await {
+        Some(rpc_url) => {
+            match ethers::providers::Provider::<ethers::providers::Http>::try_from(rpc_url.as_str()) {
+                Ok(provider) => {
+                    use ethers::providers::Middleware;
+                    provider.get_chainid().await.map(|c: ethers::types::U256| c.as_u64()).unwrap_or(31337)
+                }
+                Err(_) => 31337,
+            }
+        }
+        None => 31337,
+    };
 
     Json(serde_json::json!({
         "address": address,
@@ -1447,15 +1458,33 @@ async fn start_training_handler(
         cheater_step: req.cheater_step,
     };
 
-    // Set private keys: prefer TESTNET_PRIVATE_KEY env var, fall back to Anvil defaults.
+    // Set private keys based on chain detection:
+    //   - TESTNET_PRIVATE_KEY env var → testnet mode (auto-generate + fund workers)
+    //   - Non-Anvil chain (id != 31337) without env var → error (can't use Anvil keys)
+    //   - Anvil (chain 31337) without env var → use hardcoded Anvil keys
     #[cfg(feature = "chain")]
     {
+        // Detect chain to decide key strategy
+        let detected_chain_id: u64 = match &*state.eth_rpc_url.read().await {
+            Some(rpc_url) => {
+                match ethers::providers::Provider::<ethers::providers::Http>::try_from(rpc_url.as_str()) {
+                    Ok(provider) => {
+                        use ethers::providers::Middleware;
+                        provider.get_chainid().await.map(|c| c.as_u64()).unwrap_or(31337)
+                    }
+                    Err(_) => 31337,
+                }
+            }
+            None => 31337,
+        };
+        let is_anvil = detected_chain_id == 31337;
+
         if let Ok(testnet_key) = std::env::var("TESTNET_PRIVATE_KEY") {
             // Testnet mode: owner key from env, workers auto-generated and funded
             config.private_key = testnet_key;
             config.worker_private_keys = Vec::new(); // Will be generated + funded by orchestrator
-            info!("Using TESTNET_PRIVATE_KEY for owner, workers will be auto-funded");
-        } else {
+            info!(chain_id = detected_chain_id, "Using TESTNET_PRIVATE_KEY for owner, workers will be auto-funded");
+        } else if is_anvil {
             // Local Anvil demo mode: hardcoded well-known keys
             config.private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".to_string();
             let anvil_keys = vec![
@@ -1473,6 +1502,26 @@ async fn start_training_handler(
                 .iter()
                 .map(|k| k.to_string())
                 .collect();
+            info!("Using Anvil hardcoded keys (chain_id=31337)");
+        } else {
+            // Real chain but no private key — can't proceed
+            error!(
+                chain_id = detected_chain_id,
+                "Non-Anvil chain detected but TESTNET_PRIVATE_KEY not set. \
+                 Set TESTNET_PRIVATE_KEY env var with a funded account for chain {}.",
+                detected_chain_id
+            );
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "Connected to chain {} (not local Anvil). \
+                         Set the TESTNET_PRIVATE_KEY environment variable to a funded \
+                         account private key before starting training.",
+                        detected_chain_id
+                    )
+                })),
+            ).into_response();
         }
 
         // Use pre-deployed coordinator if dashboard was started with --coordinator.

@@ -1104,7 +1104,8 @@ function LiveProgress({ session, losses, isConnected, error, version, modelName,
   const prevAcc = losses.length > 10 ? (losses[losses.length - 11].accuracy ?? 0) : lastAcc;
   const accDelta = lastAcc - prevAcc;
 
-  const totalCheckpoints = session.total_steps > 0 ? Math.floor(session.total_steps / 50) : 0;
+  const checkpointFreq = session.checkpoint_freq > 0 ? session.checkpoint_freq : 50;
+  const totalCheckpoints = session.total_steps > 0 ? Math.floor(session.total_steps / checkpointFreq) : 0;
 
   return (
     <div className="space-y-6">

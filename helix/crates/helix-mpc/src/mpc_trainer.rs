@@ -396,7 +396,7 @@ impl<T: MPCTransport> MPCTrainer<T> {
     }
 
     /// Fires a sub-step progress event if a callback is registered.
-    fn emit_sub_step(&self, operation: &str) {
+    pub fn emit_sub_step(&self, operation: &str) {
         if let Some(ref cb) = self.sub_step_callback {
             cb(self.current_step as usize + 1, 0, operation);
         }

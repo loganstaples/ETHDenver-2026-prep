@@ -56,6 +56,7 @@ export interface TrainingSessionState {
   phase: number;
   phase_description: string;
   sub_step: string | null;
+  checkpoint_freq: number;
   coordinator_address: string;
   job_id: number;
   elapsed_secs: number;
@@ -275,11 +276,16 @@ export function useMpcTraining(): UseMpcTrainingReturn {
           // Handle sub-step events (real-time operation status)
           if (evt.type === 'sub_step') {
             const operation = evt.operation as string;
+            // Detect checkpoint completion events from the MPC training loop
+            const isCheckpointComplete = operation.startsWith('Checkpoint ') && operation.includes('verified');
             setSession((prev) => {
               if (!prev) return prev;
               return {
                 ...prev,
                 sub_step: operation,
+                checkpoints_submitted: isCheckpointComplete
+                  ? prev.checkpoints_submitted + 1
+                  : prev.checkpoints_submitted,
               };
             });
           }
@@ -530,6 +536,7 @@ export function useMpcTraining(): UseMpcTrainingReturn {
         phase: 1,
         phase_description: 'Starting session...',
         sub_step: null,
+        checkpoint_freq: config.checkpoint_freq,
         coordinator_address: '',
         job_id: 0,
         elapsed_secs: 0,
