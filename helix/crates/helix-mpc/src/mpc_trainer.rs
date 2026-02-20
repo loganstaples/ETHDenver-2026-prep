@@ -48,6 +48,10 @@ use crate::session::transport::MPCTransport;
 use crate::sharing::tensor::TensorShare;
 use crate::types::{PartyId, ShareId};
 
+/// Callback for sub-step progress within a single training step.
+/// Arguments: (step_1indexed, total_steps, operation_description)
+pub type SubStepCallback = std::sync::Arc<dyn Fn(usize, usize, &str) + Send + Sync>;
+
 /// Receives messages from all peers in parallel using `try_join_all`.
 ///
 /// Instead of sequential `for peer in &peers { recv(peer).await }`, this
@@ -318,6 +322,8 @@ pub struct MPCTrainer<T: MPCTransport> {
     mac_rng: ChaCha20Rng,
     /// Last MAC failure report (stored when MAC check fails, for recovery orchestrator).
     last_mac_failure_report: Option<MACFailureReport>,
+    /// Optional callback for sub-step progress within a single training step.
+    sub_step_callback: Option<SubStepCallback>,
 }
 
 impl<T: MPCTransport> MPCTrainer<T> {
@@ -355,6 +361,7 @@ impl<T: MPCTransport> MPCTrainer<T> {
             auth_beaver_cursor: 0,
             mac_rng: ChaCha20Rng::seed_from_u64(mac_seed),
             last_mac_failure_report: None,
+            sub_step_callback: None,
         }
     }
 
@@ -381,6 +388,18 @@ impl<T: MPCTransport> MPCTrainer<T> {
     /// Returns the current authenticated Beaver triple cursor position.
     pub fn auth_beaver_cursor(&self) -> usize {
         self.auth_beaver_cursor
+    }
+
+    /// Sets the sub-step progress callback.
+    pub fn set_sub_step_callback(&mut self, cb: SubStepCallback) {
+        self.sub_step_callback = Some(cb);
+    }
+
+    /// Fires a sub-step progress event if a callback is registered.
+    fn emit_sub_step(&self, operation: &str) {
+        if let Some(ref cb) = self.sub_step_callback {
+            cb(self.current_step as usize + 1, 0, operation);
+        }
     }
 
     /// Restores trainer state from a checkpoint (for recovery after cheater removal).
@@ -1322,6 +1341,7 @@ impl<T: MPCTransport> MPCTrainer<T> {
         // RECONSTRUCT h_pre: all parties exchange shares and sum.
         // This reveals pre-activations but keeps WEIGHTS private (since h_pre is a
         // linear combination of many weight shares, it doesn't reveal individual weights).
+        self.emit_sub_step("Forward pass \u{2014} layer 1 matmul");
         let h_pre_bytes = SecureArithmetic::serialize_share_batch(&h_pre_share);
         self.transport.broadcast(&h_pre_bytes).await?;
 
@@ -1336,6 +1356,7 @@ impl<T: MPCTransport> MPCTrainer<T> {
 
         // Apply ReLU in f64 (now that h_pre is public) and convert back to aligned Fr.
         // h and relu_mask are now PUBLIC (all parties have the same values).
+        self.emit_sub_step("Garbled-circuit ReLU activation");
         let mut h_f64 = vec![0.0f64; d_hid];
         let mut relu_mask_f64 = vec![0.0f64; d_hid];
         let mut h_fr = vec![Fr::ZERO; d_hid];
@@ -1382,6 +1403,7 @@ impl<T: MPCTransport> MPCTrainer<T> {
         };
 
         // Reconstruct y for loss computation.
+        self.emit_sub_step("Forward pass \u{2014} layer 2 matmul");
         let y_bytes = SecureArithmetic::serialize_share_batch(&y_share);
         self.transport.broadcast(&y_bytes).await?;
 
@@ -1395,6 +1417,7 @@ impl<T: MPCTransport> MPCTrainer<T> {
         }
 
         // Loss + gradient computation.
+        self.emit_sub_step("Computing loss and gradients");
         let y_f64_vec: Vec<f64> = (0..d_out).map(|i| y_reconstructed[i].to_f64()).collect();
         let (loss, mut dy_f64, mut dy_fr) = if d_out > 1 {
             // Multi-class: cross-entropy with numerically stable softmax.
@@ -1467,6 +1490,7 @@ impl<T: MPCTransport> MPCTrainer<T> {
             }
         };
         // Reconstruct dh
+        self.emit_sub_step("Backward pass \u{2014} gradient computation");
         let dh_bytes = SecureArithmetic::serialize_share_batch(&dh_share);
         self.transport.broadcast(&dh_bytes).await?;
         let mut dh_recon = dh_share.clone();
@@ -1478,6 +1502,7 @@ impl<T: MPCTransport> MPCTrainer<T> {
             }
         }
 
+        self.emit_sub_step("Applying weight update");
         // dh_pre = dh * relu_mask — both now public. Compute in f64.
         let mut dh_pre_f64 = vec![0.0f64; d_hid];
         for j in 0..d_hid {
@@ -1651,6 +1676,7 @@ impl<T: MPCTransport> MPCTrainer<T> {
         };
 
         // Flatten and broadcast all h_pre as one message.
+        self.emit_sub_step("Forward pass \u{2014} layer 1 matmul");
         let flat_h_pre: Vec<Fr> = h_pre_batch.iter().flat_map(|v| v.iter().cloned()).collect();
         let h_pre_bytes = SecureArithmetic::serialize_share_batch(&flat_h_pre);
         self.transport.broadcast(&h_pre_bytes).await?;
@@ -1665,6 +1691,7 @@ impl<T: MPCTransport> MPCTrainer<T> {
         }
 
         // ReLU + Layer 2 for all samples (parallel).
+        self.emit_sub_step("Garbled-circuit ReLU activation");
         struct SampleForward {
             h_f64: Vec<f64>,
             relu_mask_f64: Vec<f64>,
@@ -1732,6 +1759,7 @@ impl<T: MPCTransport> MPCTrainer<T> {
         };
 
         // Broadcast all y_shares as one message.
+        self.emit_sub_step("Forward pass \u{2014} layer 2 matmul");
         let flat_y: Vec<Fr> = sample_forwards.iter().flat_map(|sf| sf.y_share.iter().cloned()).collect();
         let y_bytes = SecureArithmetic::serialize_share_batch(&flat_y);
         self.transport.broadcast(&y_bytes).await?;
@@ -1746,6 +1774,7 @@ impl<T: MPCTransport> MPCTrainer<T> {
         }
 
         // ---- Loss + Backward (parallel across samples) ----
+        self.emit_sub_step("Computing loss and gradients");
         struct SampleGradients {
             loss: f64,
             dw1_f64: Vec<f64>,
@@ -1877,6 +1906,7 @@ impl<T: MPCTransport> MPCTrainer<T> {
         };
 
         // Broadcast all dh_shares (need reconstruction for dW1).
+        self.emit_sub_step("Backward pass \u{2014} gradient computation");
         let flat_dh: Vec<Fr> = sample_grads.iter().flat_map(|sg| sg.dh_share.iter().cloned()).collect();
         let dh_bytes = SecureArithmetic::serialize_share_batch(&flat_dh);
         self.transport.broadcast(&dh_bytes).await?;
@@ -1891,6 +1921,7 @@ impl<T: MPCTransport> MPCTrainer<T> {
         }
 
         // Compute dW1 for all samples (parallel), then average all gradients.
+        self.emit_sub_step("Applying weight update");
         let inv_b = 1.0 / b as f64;
         let mut avg_dw1 = vec![0.0f64; d_hid * d_in];
         let mut avg_db1 = vec![0.0f64; d_hid];
@@ -2948,6 +2979,7 @@ impl<T: MPCTransport> MPCTrainer<T> {
             .unwrap_or(Fr::ZERO);
 
         // ---- Forward pass with MAC tracking ----
+        self.emit_sub_step("Forward pass \u{2014} layer 1 matmul");
         // h_pre = W1 @ x + b1 (linear in shares: scale by public x)
         let mut h_pre_share = vec![Fr::ZERO; d_hid];
         let mut h_pre_mac = vec![Fr::ZERO; d_hid];
@@ -2970,6 +3002,7 @@ impl<T: MPCTransport> MPCTrainer<T> {
         // Secure ReLU with MAC tracking.
         // Sign mask is generated by party 0. We create MAC shares for it using
         // the "public constant" pattern since party 0 knows the sign values.
+        self.emit_sub_step("Garbled-circuit ReLU activation");
         let relu_mask_share = self.secure_sign_bit_vector(&h_pre_share).await?;
         // For sign mask MACs: each party computes alpha_i * sign_value.
         // But only party 0 knows sign_value. So party 0 must distribute MAC shares.
@@ -3038,6 +3071,7 @@ impl<T: MPCTransport> MPCTrainer<T> {
         }
 
         // Layer 2: y = W2 @ h + b2 via share × public (same as unproved path).
+        self.emit_sub_step("Forward pass \u{2014} layer 2 matmul");
         let mut y_share = vec![Fr::ZERO; d_out];
         for i in 0..d_out {
             let mut sum = Fr::ZERO;
@@ -3071,6 +3105,7 @@ impl<T: MPCTransport> MPCTrainer<T> {
         }
 
         // Loss + gradient computation.
+        self.emit_sub_step("Computing loss and gradients");
         let y_f64_vec: Vec<f64> = (0..d_out).map(|i| y_reconstructed[i].to_f64()).collect();
         let (loss, mut dy_f64, mut dy_fr) = if d_out > 1 {
             // Multi-class: cross-entropy with numerically stable softmax.
@@ -3114,6 +3149,7 @@ impl<T: MPCTransport> MPCTrainer<T> {
 
         // dh = W2^T @ dy — dy is public, W2 is secret-shared.
         // This is share × public. Reconstruct dh.
+        self.emit_sub_step("Backward pass \u{2014} gradient computation");
         let mut dh_share = vec![Fr::ZERO; d_hid];
         for j in 0..d_hid {
             let mut sum = Fr::ZERO;
@@ -3135,6 +3171,7 @@ impl<T: MPCTransport> MPCTrainer<T> {
             }
         }
 
+        self.emit_sub_step("Applying weight update");
         // dh_pre = dh * relu_mask — both now public. Compute in f64.
         let mut dh_pre_f64 = vec![0.0f64; d_hid];
         for j in 0..d_hid {
@@ -3223,6 +3260,7 @@ impl<T: MPCTransport> MPCTrainer<T> {
         // ---- MAC verification check ----
         if let Some(ref mac_cfg) = self.config.mac_config {
             if mac_cfg.check_interval > 0 && self.current_step % mac_cfg.check_interval == 0 {
+                self.emit_sub_step("SPDZ MAC verification");
                 let check_result = self.run_mac_check().await?;
                 if let MACCheckResult::Failed { report, .. } = check_result {
                     // Halt: rollback to last checkpoint and return error.
@@ -3249,6 +3287,7 @@ impl<T: MPCTransport> MPCTrainer<T> {
                 }
 
                 // Exchange checkpoint commitments for cheater identification.
+                self.emit_sub_step("Checkpoint commitment exchange");
                 {
                     let weight_shares: Vec<Fr> = self.w1.iter()
                         .chain(self.b1.iter())
