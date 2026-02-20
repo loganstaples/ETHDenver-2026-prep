@@ -6,6 +6,8 @@ import { formatEther } from 'viem';
 import { Loader2, Server, ChevronRight } from 'lucide-react';
 import { useNodes, useNetworkHealth, type WorkerNode } from '@/hooks/useNodes';
 import { cn } from '@/lib/utils';
+import NetworkGraph from '@/components/network/NetworkGraph';
+import { useActiveTopology } from '@/hooks/useActiveTopology';
 
 // ============================================================================
 // Types
@@ -38,6 +40,7 @@ function formatAddr(address: string) {
 export default function NetworkPage() {
   const { filteredNodes, networkStats, isLoading, updateFilter } = useNodes();
   const { healthScore } = useNetworkHealth();
+  const { activeModels } = useActiveTopology();
   const [activeFilter, setActiveFilter] = useState<FilterType>('all');
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
@@ -106,6 +109,11 @@ export default function NetworkPage() {
             </p>
           </div>
         ))}
+      </div>
+
+      {/* ── Network Graph ─────────────────────────────────── */}
+      <div className="bg-helix-surface border border-helix-border rounded-2xl overflow-hidden" style={{ height: 400 }}>
+        <NetworkGraph activeModels={activeModels} />
       </div>
 
       {/* ── Filter tabs ────────────────────────────────────────── */}
