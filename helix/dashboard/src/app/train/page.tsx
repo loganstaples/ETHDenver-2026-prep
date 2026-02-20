@@ -634,8 +634,14 @@ function ConfigForm({
     ? selectedModel.versions[selectedModel.versions.length - 1]
     : null;
 
+  // Ownership check: only the model owner can train an existing on-chain model
+  const isNotModelOwner = modelMode === 'existing'
+    && selectedModel !== null
+    && !!userAddress
+    && selectedModel.creator.toLowerCase() !== userAddress.toLowerCase();
+
   const canStart = !isStarting && !isWalletPrompting && !isConfirmingPayment
-    && !versionError && !isFetchingWeights && walletConnected
+    && !versionError && !isFetchingWeights && walletConnected && !isNotModelOwner
     && (modelMode === 'existing'
       ? (selectedModelId !== null || selectedSessionId !== null)
       : (modelName.trim() !== '' && modelSlug.trim() !== ''));
@@ -809,6 +815,16 @@ function ConfigForm({
                       )}
                     </AnimatePresence>
                   )}
+
+                  {/* Ownership warning for existing on-chain models */}
+                  {isNotModelOwner && (
+                    <div className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-amber-500/10 border border-amber-500/20">
+                      <AlertTriangle size={14} className="text-amber-400 shrink-0" />
+                      <span className="text-xs text-amber-300/90">
+                        Only the model owner can train this model. Connect with the owner wallet to continue.
+                      </span>
+                    </div>
+                  )}
                 </motion.div>
               )}
             </AnimatePresence>
@@ -951,6 +967,8 @@ function ConfigForm({
                 <><Loader2 size={22} className="animate-spin" /> Starting...</>
               ) : isFetchingWeights ? (
                 <><Loader2 size={22} className="animate-spin" /> Loading Weights...</>
+              ) : isNotModelOwner ? (
+                <><Lock size={22} /> Not Model Owner</>
               ) : (
                 <><Play size={22} /> Start Training</>
               )}
