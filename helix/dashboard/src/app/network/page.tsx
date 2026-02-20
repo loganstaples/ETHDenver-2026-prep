@@ -153,7 +153,9 @@ export default function NetworkPage() {
           </div>
 
           {filteredNodes.map((node, i) => {
-            const status = STATUS_STYLES[node.status] ?? STATUS_STYLES.offline;
+            const status = node.slashed
+              ? { label: 'Slashed', dot: 'bg-red-400', text: 'text-red-400' }
+              : (STATUS_STYLES[node.status] ?? STATUS_STYLES.offline);
             const isExpanded = expandedId === node.id;
             const isLast = i === filteredNodes.length - 1;
 
@@ -192,12 +194,12 @@ export default function NetworkPage() {
 
                   {/* CPU */}
                   <span className="font-mono text-xs text-white tabular-nums text-right">
-                    {Math.round(node.metrics.cpu)}%
+                    {node.metrics.cpu === 0 ? '\u2014' : `${Math.round(node.metrics.cpu)}%`}
                   </span>
 
                   {/* Mem */}
                   <span className="font-mono text-xs text-helix-text2 tabular-nums text-right">
-                    {Math.round(node.metrics.memory)}%
+                    {node.metrics.memory === 0 ? '\u2014' : `${Math.round(node.metrics.memory)}%`}
                   </span>
 
                   {/* Stake */}

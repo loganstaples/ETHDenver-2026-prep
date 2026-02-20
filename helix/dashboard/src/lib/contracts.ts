@@ -383,6 +383,7 @@ export const HELIX_MODEL_STORE_ABI = [
             { name: 'slug', type: 'string' },
             { name: 'name', type: 'string' },
             { name: 'description', type: 'string' },
+            { name: 'architecture', type: 'string' },
         ],
         outputs: [{ name: 'tokenId', type: 'uint256' }],
         stateMutability: 'nonpayable',
@@ -479,6 +480,7 @@ export const HELIX_MODEL_STORE_ABI = [
             { name: 'slug', type: 'string' },
             { name: 'name', type: 'string' },
             { name: 'description', type: 'string' },
+            { name: 'architecture', type: 'string' },
             { name: 'creator', type: 'address' },
             { name: 'createdAt', type: 'uint40' },
             { name: 'isPublic', type: 'bool' },
@@ -879,6 +881,7 @@ export interface OnChainModel {
     slug: string;
     name: string;
     description: string;
+    architecture: string;
     creator: string;
     createdAt: number;
     isPublic: boolean;
@@ -892,6 +895,20 @@ export interface OnChainVersion {
     timestamp: number;
     sessionId: string;
     weightsStored: boolean;
+}
+
+// Block explorer URLs per chain
+const EXPLORER_URLS: Record<number, string> = {
+    1: 'https://etherscan.io',
+    11155111: 'https://sepolia.etherscan.io',
+    99999: 'https://explorer.adi.network',
+};
+
+/** Get block explorer link for a transaction hash. Returns null for localhost / unknown chains. */
+export function getExplorerTxUrl(chainId: number, txHash: string): string | null {
+    const base = EXPLORER_URLS[chainId];
+    if (!base) return null;
+    return `${base}/tx/${txHash}`;
 }
 
 // Helper to get contract address for current chain.

@@ -660,15 +660,6 @@ function VersionRow({ version }: { version: OnChainVersion }) {
 // Model Detail Modal
 // ============================================================================
 
-function getMockFinancials(tokenId: number, versionCount: number) {
-  const seed = ((tokenId * 2654435761) >>> 0) % 10000;
-  const trainingCost = 0.008 * Math.max(versionCount, 1) + seed / 100000;
-  const inferenceCount = Math.floor(seed / 2 + versionCount * 45);
-  const revenuePerInference = 0.001 + (seed % 50) / 50000;
-  const inferenceRevenue = inferenceCount * revenuePerInference;
-  return { trainingCost, inferenceRevenue, inferenceCount };
-}
-
 interface ModelDetailModalProps {
   model: ModelWithVersions | null;
   onClose: () => void;
@@ -708,9 +699,8 @@ function ModelDetailModal({
   const bestAccuracy = model
     ? model.versions.reduce((best, v) => (v.accuracy > best ? v.accuracy : best), 0)
     : 0;
-  const mockLoss = bestAccuracy > 0 ? ((1 - bestAccuracy) * 0.4 + 0.008) : null;
   const tags = model ? getModelTags(model) : [];
-  const financials = model ? getMockFinancials(model.tokenId, model.versions.length) : null;
+  const hasWeightsStored = model ? model.versions.some((v) => v.weightsStored) : false;
   const latestWithWeights = model
     ? [...model.versions].reverse().find((v) => v.weightsStored && v.rootHash)
     : null;
@@ -815,30 +805,23 @@ function ModelDetailModal({
                 <div className="grid grid-cols-3 gap-3">
                   <div className="bg-white/[0.03] rounded-xl px-4 py-3.5 text-center">
                     <p className="text-lg font-mono font-medium text-white tracking-tight">
-                      {mockLoss !== null ? mockLoss.toFixed(4) : '--'}
+                      {model.versions.length}
                     </p>
-                    <p className="text-2xs text-helix-muted mt-1 uppercase tracking-wider">Latest Loss</p>
+                    <p className="text-2xs text-helix-muted mt-1 uppercase tracking-wider">Versions</p>
                   </div>
                   <div className="bg-white/[0.03] rounded-xl px-4 py-3.5 text-center">
                     <p className="text-lg font-mono font-medium text-white tracking-tight">
-                      {financials ? financials.trainingCost.toFixed(3) : '--'}
-                      <span className="text-xs text-helix-muted ml-1">ETH</span>
+                      {hasWeightsStored ? 'Yes' : 'No'}
                     </p>
-                    <p className="text-2xs text-helix-muted mt-1 uppercase tracking-wider">Training Spent</p>
+                    <p className="text-2xs text-helix-muted mt-1 uppercase tracking-wider">Weights Stored</p>
                   </div>
                   <div className="bg-white/[0.03] rounded-xl px-4 py-3.5 text-center">
-                    <p className="text-lg font-mono font-medium text-green-400 tracking-tight">
-                      {financials ? financials.inferenceRevenue.toFixed(3) : '--'}
-                      <span className="text-xs text-green-400/60 ml-1">ETH</span>
+                    <p className={cn('text-lg font-mono font-medium tracking-tight', model.isPublic ? 'text-green-400' : 'text-helix-text2')}>
+                      {model.isPublic ? 'Public' : 'Private'}
                     </p>
-                    <p className="text-2xs text-helix-muted mt-1 uppercase tracking-wider">Revenue</p>
+                    <p className="text-2xs text-helix-muted mt-1 uppercase tracking-wider">Visibility</p>
                   </div>
                 </div>
-                {financials && financials.inferenceCount > 0 && (
-                  <p className="text-2xs text-helix-dim text-center mt-2.5">
-                    {financials.inferenceCount.toLocaleString()} total inferences &middot; {(model.inferenceFee / 100).toFixed(1)}% commission
-                  </p>
-                )}
               </div>
 
               {/* Divider */}
@@ -1029,16 +1012,6 @@ function formatDuration(secs: number): string {
   return rem > 0 ? `${mins}m ${rem}s` : `${mins}m`;
 }
 
-function getMockTrainedFinancials(sessionId: string) {
-  let seed = 0;
-  for (let i = 0; i < sessionId.length; i++) seed = ((seed << 5) - seed + sessionId.charCodeAt(i)) | 0;
-  seed = Math.abs(seed) % 10000;
-  const trainingCost = 0.01 + seed / 200000;
-  const inferenceCount = Math.floor(seed / 3 + 20);
-  const inferenceRevenue = inferenceCount * (0.001 + (seed % 30) / 30000);
-  return { trainingCost, inferenceRevenue, inferenceCount };
-}
-
 interface TrainedModelDetailModalProps {
   session: TrainingSessionState | null;
   onClose: () => void;
@@ -1068,7 +1041,6 @@ function TrainedModelDetailModal({ session, onClose, onDownload }: TrainedModelD
   const accuracy = session.accuracy;
   const latestLoss = session.losses.length > 0 ? session.losses[session.losses.length - 1] : session.current_loss;
   const steps = session.losses.length || session.current_step;
-  const financials = getMockTrainedFinancials(session.session_id);
   const startedAt = session.started_at > 0
     ? new Date(session.started_at * 1000).toLocaleDateString()
     : '--';
@@ -1170,24 +1142,17 @@ function TrainedModelDetailModal({ session, onClose, onDownload }: TrainedModelD
                   </div>
                   <div className="bg-white/[0.03] rounded-xl px-4 py-3.5 text-center">
                     <p className="text-lg font-mono font-medium text-white tracking-tight">
-                      {financials.trainingCost.toFixed(3)}
-                      <span className="text-xs text-helix-muted ml-1">ETH</span>
+                      {steps}
                     </p>
-                    <p className="text-2xs text-helix-muted mt-1 uppercase tracking-wider">Training Spent</p>
+                    <p className="text-2xs text-helix-muted mt-1 uppercase tracking-wider">Steps Trained</p>
                   </div>
                   <div className="bg-white/[0.03] rounded-xl px-4 py-3.5 text-center">
-                    <p className="text-lg font-mono font-medium text-green-400 tracking-tight">
-                      {financials.inferenceRevenue.toFixed(3)}
-                      <span className="text-xs text-green-400/60 ml-1">ETH</span>
+                    <p className="text-lg font-mono font-medium text-white tracking-tight">
+                      {session.checkpoints_submitted}
                     </p>
-                    <p className="text-2xs text-helix-muted mt-1 uppercase tracking-wider">Revenue</p>
+                    <p className="text-2xs text-helix-muted mt-1 uppercase tracking-wider">Checkpoints</p>
                   </div>
                 </div>
-                {financials.inferenceCount > 0 && (
-                  <p className="text-2xs text-helix-dim text-center mt-2.5">
-                    {financials.inferenceCount.toLocaleString()} total inferences
-                  </p>
-                )}
               </div>
 
               {/* Divider */}

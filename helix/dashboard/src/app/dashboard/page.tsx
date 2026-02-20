@@ -24,10 +24,12 @@ import {
   ResponsiveContainer,
 } from 'recharts';
 import { cn } from '@/lib/utils';
+import { getExplorerTxUrl } from '@/lib/contracts';
 import { CheaterToast } from '@/components/ui/CheaterToast';
 import { useDashboardSessions, type TrainingEvent } from '@/hooks/useDashboardSessions';
 import { useBackendApi, type BackendWorker } from '@/hooks/useBackendApi';
 import { useWorkerHealth, type WorkerHealth } from '@/hooks/useWorkerHealth';
+import { useChainId } from 'wagmi';
 import { formatEther } from 'viem';
 
 // ============================================================================
@@ -349,6 +351,7 @@ export default function DashboardPage() {
     selectSession,
   } = useDashboardSessions();
 
+  const chainId = useChainId();
   const { workers: healthWorkers } = useWorkerHealth();
 
   const { workers: backendWorkers, health: backendHealth, roundStatus } = useBackendApi({ refreshInterval: 5000 });
@@ -439,7 +442,7 @@ export default function DashboardPage() {
 
   // Generate activity feed from WebSocket events
   const activityFeed = useMemo(() => {
-    type FeedItem = { id: string; type: string; title: string; message: string; timestamp: number };
+    type FeedItem = { id: string; type: string; title: string; message: string; timestamp: number; txHash?: string; explorerUrl?: string };
     const items: FeedItem[] = [];
 
     events.forEach((e, i) => {
@@ -467,12 +470,16 @@ export default function DashboardPage() {
           timestamp: ts,
         });
       } else if (evt.type === 'checkpoint_submitted') {
+        const txHash = (evt.tx_hash as string) || undefined;
+        const explorerUrl = txHash ? getExplorerTxUrl(chainId, txHash) ?? undefined : undefined;
         items.push({
           id: `checkpoint-${i}`,
           type: 'success',
           title: 'Checkpoint submitted',
-          message: 'On-chain attestation',
+          message: txHash ? `tx ${txHash.slice(0, 10)}...` : 'On-chain attestation',
           timestamp: ts,
+          txHash,
+          explorerUrl,
         });
       } else if (evt.type === 'cheater_detected') {
         items.push({
@@ -502,7 +509,7 @@ export default function DashboardPage() {
     });
 
     return items.sort((a, b) => b.timestamp - a.timestamp).slice(0, 20);
-  }, [events]);
+  }, [events, chainId]);
 
   // Workers sorted: active first by earnings, then offline
   const sortedWorkers = useMemo(() => {
@@ -951,9 +958,18 @@ export default function DashboardPage() {
                     <div key={item.id} className="flex items-center gap-3 px-3 py-2.5 rounded-xl hover:bg-white/[0.02] transition-colors">
                       <Icon size={14} style={{ color: cfg.color }} className="shrink-0" />
                       <span className="text-sm text-white flex-1">{item.title}</span>
-                      {item.message && item.message !== item.title && (
+                      {item.explorerUrl ? (
+                        <a
+                          href={item.explorerUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-xs text-blue-400 hover:text-blue-300 font-mono transition-colors"
+                        >
+                          {item.message}
+                        </a>
+                      ) : item.message && item.message !== item.title ? (
                         <span className="text-xs text-helix-muted">{item.message}</span>
-                      )}
+                      ) : null}
                       <span className="text-xs text-helix-dim tabular-nums font-mono w-14 text-right">
                         {timeAgo(item.timestamp)}
                       </span>

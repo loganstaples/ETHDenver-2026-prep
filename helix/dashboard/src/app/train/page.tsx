@@ -519,9 +519,11 @@ function ConfigForm({
   isFetchingWeights, fetchedModelName,
   isWalletPrompting, isConfirmingPayment, walletConnected, userAddress,
 }: ConfigFormProps) {
+  const [hiddenSize, setHiddenSize] = useState(128);
+  const [minWorkers, setMinWorkers] = useState(workersOnline > 0 ? workersOnline : 3);
   const [numSteps, setNumSteps] = useState(200);
   const [learningRate, setLearningRate] = useState(0.05);
-  const [checkpointFreq] = useState(50);
+  const [checkpointFreq, setCheckpointFreq] = useState(50);
   const [zkMode, setZkMode] = useState<'off' | 'always' | 'risk'>('off');
   const [zkCheckpointFreq, setZkCheckpointFreq] = useState(5);
   const [minWorkersForMpc, setMinWorkersForMpc] = useState(2);
@@ -567,10 +569,9 @@ function ConfigForm({
 
   // Auto-compute recommended payment: base rate × steps × workers × ZK overhead
   const recommendedPayment = useMemo(() => {
-    const workers = workersOnline > 0 ? workersOnline : 3;
     const zkMult = zkMode === 'always' ? 1.75 : zkMode === 'risk' ? 1.25 : 1.0;
-    return parseFloat((0.0000001 * numSteps * workers * zkMult).toFixed(6));
-  }, [numSteps, workersOnline, zkMode]);
+    return parseFloat((0.0000001 * numSteps * minWorkers * zkMult).toFixed(6));
+  }, [numSteps, minWorkers, zkMode]);
 
   const effectivePayment = autoPropose ? recommendedPayment : paymentEth;
 
@@ -604,8 +605,8 @@ function ConfigForm({
       : modelSlug.trim();
 
     onStart({
-      architecture: [784, 128, 10],
-      num_workers: workersOnline > 0 ? workersOnline : 3,
+      architecture: [784, hiddenSize, 10],
+      num_workers: minWorkers,
       num_steps: numSteps,
       learning_rate: learningRate,
       checkpoint_freq: checkpointFreq,
@@ -648,7 +649,7 @@ function ConfigForm({
             New Training Run
           </h1>
           <p className="text-base text-helix-muted mt-1">
-            MNIST 784 → 128 → 10 · ~102K params · Verifiable MPC
+            MNIST 784 → {hiddenSize} → 10 · ~{Math.round((784 * hiddenSize + hiddenSize + hiddenSize * 10 + 10) / 1000)}K params · Verifiable MPC
           </p>
         </div>
         <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-white/[0.04] border border-white/[0.06]">
@@ -836,6 +837,18 @@ function ConfigForm({
               <NumberInput value={learningRate} onChange={setLearningRate} step={0.0001} min={0.00001} max={1} />
             </SettingRow>
 
+            <SettingRow label="Hidden Layer Size">
+              <NumberInput value={hiddenSize} onChange={setHiddenSize} min={16} max={512} step={16} />
+            </SettingRow>
+
+            <SettingRow label="Workers">
+              <NumberInput value={minWorkers} onChange={setMinWorkers} min={1} max={10} />
+            </SettingRow>
+
+            <SettingRow label="Checkpoint Frequency">
+              <NumberInput value={checkpointFreq} onChange={setCheckpointFreq} min={10} max={500} step={10} />
+            </SettingRow>
+
             <SettingRow label="Stake / Worker">
               <div className="flex items-center gap-1.5">
                 <NumberInput value={stakePerWorkerEth} onChange={setStakePerWorkerEth} step={0.01} min={0} />
@@ -895,7 +908,7 @@ function ConfigForm({
                   animate={{ left: autoPropose ? '50%' : 0, x: autoPropose ? '-50%' : 0 }}
                   transition={{ type: 'spring', stiffness: 400, damping: 30 }}
                 >
-                  {workersOnline > 0 ? workersOnline : 3} workers × {numSteps} steps
+                  {minWorkers} workers × {numSteps} steps
                   {zkMode !== 'off' && ` × ${zkMode === 'always' ? '1.75' : '1.25'}× ZK`}
                 </motion.span>
                 <AnimatePresence>
@@ -1327,7 +1340,7 @@ function LiveProgress({ session, losses, isConnected, error, version, modelName,
                 { label: 'ID', value: session.session_id.slice(0, 12) + '\u2026' },
                 ...(session.coordinator_address ? [{ label: 'Coordinator', value: session.coordinator_address.slice(0, 8) + '\u2026' + session.coordinator_address.slice(-4) }] : []),
                 ...(session.job_id !== undefined ? [{ label: 'Job ID', value: String(session.job_id) }] : []),
-                { label: 'Architecture', value: '784 \u2192 32 \u2192 10' },
+                { label: 'Architecture', value: `784 \u2192 128 \u2192 10` },
               ].map((item) => (
                 <div key={item.label} className="flex items-center justify-between">
                   <span className="text-xs text-helix-muted">{item.label}</span>

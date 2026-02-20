@@ -57,11 +57,12 @@ function formatAdiPrice(adi: number): string {
 
 type PageMode = 'inference' | 'marketplace';
 
-type SortOption = 'newest' | 'oldest' | 'accuracy' | 'versions' | 'name' | 'price-low' | 'price-high';
+type SortOption = 'newest' | 'oldest' | 'accuracy' | 'versions' | 'name' | 'price-low' | 'price-high' | 'quality';
 
 const INFERENCE_SORT_OPTIONS: { id: SortOption; label: string }[] = [
   { id: 'newest', label: 'Newest' },
   { id: 'oldest', label: 'Oldest' },
+  { id: 'quality', label: 'Quality' },
   { id: 'accuracy', label: 'Best Accuracy' },
   { id: 'versions', label: 'Most Versions' },
   { id: 'name', label: 'Name A-Z' },
@@ -70,6 +71,7 @@ const INFERENCE_SORT_OPTIONS: { id: SortOption; label: string }[] = [
 const MARKETPLACE_SORT_OPTIONS: { id: SortOption; label: string }[] = [
   { id: 'newest', label: 'Newest' },
   { id: 'oldest', label: 'Oldest' },
+  { id: 'quality', label: 'Quality' },
   { id: 'price-low', label: 'Price Low-High' },
   { id: 'price-high', label: 'Price High-Low' },
   { id: 'accuracy', label: 'Best Accuracy' },
@@ -77,7 +79,7 @@ const MARKETPLACE_SORT_OPTIONS: { id: SortOption; label: string }[] = [
   { id: 'name', label: 'Name A-Z' },
 ];
 
-function sortModels<T extends { createdAt: number; bestAccuracy: number; versionCount: number; name: string; salePrice: number }>(
+function sortModels<T extends { createdAt: number; bestAccuracy: number; versionCount: number; name: string; salePrice: number; latestVersion?: { weightsStored: boolean } | null }>(
   models: T[],
   sort: SortOption,
 ): T[] {
@@ -85,6 +87,7 @@ function sortModels<T extends { createdAt: number; bestAccuracy: number; version
   switch (sort) {
     case 'newest': return sorted.sort((a, b) => b.createdAt - a.createdAt);
     case 'oldest': return sorted.sort((a, b) => a.createdAt - b.createdAt);
+    case 'quality': return sorted.sort((a, b) => computeQualityScore(b) - computeQualityScore(a));
     case 'accuracy': return sorted.sort((a, b) => b.bestAccuracy - a.bestAccuracy);
     case 'versions': return sorted.sort((a, b) => b.versionCount - a.versionCount);
     case 'name': return sorted.sort((a, b) => a.name.localeCompare(b.name));
@@ -110,6 +113,30 @@ function getModelTags(model: { name: string; description: string; slug: string }
     if (rule.patterns.test(text)) tags.push(rule.tag);
   }
   return tags;
+}
+
+/** Quality score from real on-chain data: accuracy (60%), versions (25%, capped 5), weights (15%). */
+function computeQualityScore(model: { bestAccuracy: number; versionCount: number; latestVersion?: { weightsStored: boolean } | null }): number {
+  const accScore = Math.min(1, model.bestAccuracy) * 60;
+  const versionScore = Math.min(model.versionCount, 5) / 5 * 25;
+  const weightsScore = model.latestVersion?.weightsStored ? 15 : 0;
+  return Math.round(accScore + versionScore + weightsScore);
+}
+
+function QualityBar({ score }: { score: number }) {
+  const color = score >= 70 ? 'bg-green-400' : score >= 40 ? 'bg-yellow-400' : 'bg-white/40';
+  const textColor = score >= 70 ? 'text-green-400' : score >= 40 ? 'text-yellow-400' : 'text-white/60';
+  return (
+    <div className="mb-4">
+      <div className="flex items-center justify-between mb-1.5">
+        <span className="text-2xs text-helix-muted">Quality</span>
+        <span className={cn('text-2xs font-mono font-medium tabular-nums', textColor)}>{score}/100</span>
+      </div>
+      <div className="h-1.5 bg-white/[0.06] rounded-full overflow-hidden">
+        <div className={cn('h-full rounded-full transition-all', color)} style={{ width: `${score}%` }} />
+      </div>
+    </div>
+  );
 }
 
 // ============================================================================
@@ -332,6 +359,7 @@ function BuyConfirmationModal({
 
 function InferenceModelCard({ model, isOwner }: { model: PublicModel; isOwner: boolean }) {
   const tags = useMemo(() => getModelTags(model), [model]);
+  const qualityScore = useMemo(() => computeQualityScore(model), [model]);
 
   return (
     <Link href={`/models/${model.tokenId}`} className="block h-full">
@@ -389,6 +417,9 @@ function InferenceModelCard({ model, isOwner }: { model: PublicModel; isOwner: b
           )}
         </div>
 
+        {/* Quality Score */}
+        <QualityBar score={qualityScore} />
+
         {/* Stats */}
         <div className="grid grid-cols-3 gap-3 mb-4">
           <div className="bg-helix-bg rounded-md px-3 py-2 text-center">
@@ -439,6 +470,7 @@ function MarketplaceModelCard({
   onBuy: (model: PublicModel) => void;
 }) {
   const tags = useMemo(() => getModelTags(model), [model]);
+  const qualityScore = useMemo(() => computeQualityScore(model), [model]);
   const isContactOwner = model.forSale && model.salePrice === 0;
 
   return (
@@ -506,6 +538,9 @@ function MarketplaceModelCard({
           <span className="font-mono">v{model.latestVersion.semver}</span>
         )}
       </div>
+
+      {/* Quality Score */}
+      <QualityBar score={qualityScore} />
 
       {/* Stats */}
       <div className="grid grid-cols-3 gap-3 mb-4">
