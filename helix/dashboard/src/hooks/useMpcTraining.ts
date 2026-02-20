@@ -33,11 +33,17 @@ export interface TrainingJobConfig {
   job_id?: number;
   /** On-chain model token ID for weight caching */
   model_token_id?: number;
+  /** Trusted node addresses — only these workers handle plaintext weights */
+  trusted_nodes?: string[];
 }
 
 export interface CheaterInfo {
   party_index: number;
   step: number;
+  slashed: boolean;
+  slash_tx_hash: string | null;
+  recovered: boolean;
+  recovery_workers: number | null;
 }
 
 export interface TrainingSessionState {
@@ -328,14 +334,48 @@ export function useMpcTraining(): UseMpcTrainingReturn {
                 cheater_detected: {
                   party_index: evt.party_index as number,
                   step: evt.step as number,
+                  slashed: false,
+                  slash_tx_hash: null,
+                  recovered: false,
+                  recovery_workers: null,
                 },
               };
             });
           }
 
-          // Handle cheater slashed
+          // Handle cheater slashed on-chain
           if (evt.type === 'cheater_slashed') {
-            // Already captured in cheater_detected
+            setSession((prev) => {
+              if (!prev) return prev;
+              return {
+                ...prev,
+                cheater_detected: prev.cheater_detected
+                  ? {
+                      ...prev.cheater_detected,
+                      slashed: true,
+                      slash_tx_hash: (evt.tx_hash as string) || null,
+                    }
+                  : prev.cheater_detected,
+              };
+            });
+          }
+
+          // Handle recovery after cheater removal
+          if (evt.type === 'recovery_completed') {
+            setSession((prev) => {
+              if (!prev) return prev;
+              return {
+                ...prev,
+                workers_active: (evt.honest_workers as number) ?? prev.workers_active,
+                cheater_detected: prev.cheater_detected
+                  ? {
+                      ...prev.cheater_detected,
+                      recovered: true,
+                      recovery_workers: (evt.honest_workers as number) ?? null,
+                    }
+                  : prev.cheater_detected,
+              };
+            });
           }
 
           // Handle training complete
@@ -441,13 +481,32 @@ export function useMpcTraining(): UseMpcTrainingReturn {
       try {
         const res = await fetch(`${API_BASE}/api/training/sessions/${sessionId}`);
         if (res.ok) {
-          const data: TrainingSessionState = await res.json();
+          const raw = await res.json();
+          // Normalize cheater_detected from REST (which lacks slashed/recovered fields)
+          const data: TrainingSessionState = {
+            ...raw,
+            cheater_detected: raw.cheater_detected
+              ? {
+                  party_index: raw.cheater_detected.party_index,
+                  step: raw.cheater_detected.step,
+                  slashed: raw.cheater_detected.slashed ?? false,
+                  slash_tx_hash: raw.cheater_detected.slash_tx_hash ?? null,
+                  recovered: raw.cheater_detected.recovered ?? false,
+                  recovery_workers: raw.cheater_detected.recovery_workers ?? null,
+                }
+              : null,
+          };
 
-          // Merge: only apply poll data if it's newer than what WS set
+          // Merge: only apply poll data if it's newer than what WS set.
+          // Preserve richer cheater info from WS events when poll data is stale.
           setSession((prev) => {
             if (!prev) return data;
             if (data.current_step > prev.current_step || data.status === 'complete' || data.status === 'failed') {
-              return data;
+              // Keep WS-enriched cheater info if poll doesn't have it
+              const cheater = prev.cheater_detected && (!data.cheater_detected?.slashed && prev.cheater_detected.slashed)
+                ? prev.cheater_detected
+                : data.cheater_detected;
+              return { ...data, cheater_detected: cheater };
             }
             return {
               ...prev,

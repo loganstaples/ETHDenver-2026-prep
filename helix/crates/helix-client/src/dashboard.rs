@@ -146,6 +146,10 @@ pub struct TrainingJobRequest {
     /// per-version (e.g. cache key "42:0" for token 42, version index 0).
     #[serde(default)]
     pub model_version_index: Option<u64>,
+    /// Trusted node addresses. Only these workers may handle plaintext weights.
+    /// If non-empty, at least one trusted worker must be active for the job to proceed.
+    #[serde(default)]
+    pub trusted_nodes: Option<Vec<String>>,
 }
 
 fn default_architecture() -> Vec<usize> { vec![784, 128, 10] }
@@ -644,7 +648,37 @@ async fn apply_progress_event(
                 session.cheater_detected = Some(serde_json::json!({
                     "party_index": party_index,
                     "step": step,
+                    "slashed": false,
+                    "slash_tx_hash": null,
+                    "recovered": false,
+                    "recovery_workers": null,
                 }));
+            }
+            ProgressEvent::CheaterSlashed { party_index, tx_hash } => {
+                // Merge slash info into existing cheater_detected
+                if let Some(ref mut cd) = session.cheater_detected {
+                    if let Some(obj) = cd.as_object_mut() {
+                        obj.insert("slashed".to_string(), serde_json::json!(true));
+                        obj.insert("slash_tx_hash".to_string(), serde_json::json!(tx_hash));
+                    }
+                } else {
+                    session.cheater_detected = Some(serde_json::json!({
+                        "party_index": party_index,
+                        "slashed": true,
+                        "slash_tx_hash": tx_hash,
+                        "recovered": false,
+                        "recovery_workers": null,
+                    }));
+                }
+            }
+            ProgressEvent::RecoveryCompleted { honest_workers, .. } => {
+                session.workers_active = *honest_workers;
+                if let Some(ref mut cd) = session.cheater_detected {
+                    if let Some(obj) = cd.as_object_mut() {
+                        obj.insert("recovered".to_string(), serde_json::json!(true));
+                        obj.insert("recovery_workers".to_string(), serde_json::json!(honest_workers));
+                    }
+                }
             }
             ProgressEvent::TrainingComplete { accuracy, .. } => {
                 session.accuracy = Some(*accuracy);
@@ -1473,6 +1507,7 @@ async fn start_training_handler(
         simulate_cheater: req.simulate_cheater,
         cheater_party: req.cheater_party,
         cheater_step: req.cheater_step,
+        trusted_nodes: req.trusted_nodes.clone(),
     };
 
     // Set private keys based on chain detection:
@@ -2478,6 +2513,9 @@ struct InferenceRequest {
     pixels: Vec<f64>,
     #[serde(default = "default_num_parties")]
     num_parties: usize,
+    /// Trusted node addresses — only these workers handle plaintext weights during inference.
+    #[serde(default)]
+    trusted_nodes: Option<Vec<String>>,
 }
 
 fn default_num_parties() -> usize {
@@ -2489,6 +2527,17 @@ async fn inference_handler(
     State(state): State<Arc<DashboardState>>,
     Json(req): Json<InferenceRequest>,
 ) -> impl IntoResponse {
+    // Log trusted nodes if provided
+    if let Some(ref trusted) = req.trusted_nodes {
+        if !trusted.is_empty() {
+            info!(
+                trusted_count = trusted.len(),
+                "Inference request with {} trusted node(s) — only these workers handle plaintext weights",
+                trusted.len()
+            );
+        }
+    }
+
     // Validate pixels
     if req.pixels.is_empty() {
         return (
@@ -2707,6 +2756,9 @@ struct ModelInferenceRequest {
     wallet_address: Option<String>,
     /// On-chain payment tx hash (non-owner proof of payment)
     payment_tx: Option<String>,
+    /// Trusted node addresses — only these workers handle plaintext weights during inference.
+    #[serde(default)]
+    trusted_nodes: Option<Vec<String>>,
 }
 
 /// POST /api/models/inference — run inference using cached model weights

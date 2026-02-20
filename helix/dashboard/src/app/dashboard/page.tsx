@@ -489,6 +489,25 @@ export default function DashboardPage() {
           message: `Worker ${evt.party_index} at step ${evt.step}`,
           timestamp: ts,
         });
+      } else if (evt.type === 'cheater_slashed') {
+        const txHash = evt.tx_hash as string | undefined;
+        items.push({
+          id: `slashed-${i}`,
+          type: 'warning',
+          title: 'Cheater slashed on-chain',
+          message: `Worker ${evt.party_index} stake slashed`,
+          timestamp: ts,
+          txHash,
+          explorerUrl: txHash ? `https://explorer.ab.testnet.adifoundation.ai/tx/${txHash}` : undefined,
+        });
+      } else if (evt.type === 'recovery_completed') {
+        items.push({
+          id: `recovery-${i}`,
+          type: 'success',
+          title: 'Training recovered',
+          message: `${evt.honest_workers} workers continuing from step ${evt.resumed_from_step}`,
+          timestamp: ts,
+        });
       } else if (evt.type === 'session_complete' || evt.type === 'training_complete') {
         items.push({
           id: `complete-${i}`,

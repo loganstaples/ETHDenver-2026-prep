@@ -192,7 +192,47 @@ export function useDashboardSessions(): UseDashboardSessionsReturn {
               if (!prev) return prev;
               return {
                 ...prev,
-                cheater_detected: { party_index: evt.party_index as number, step: evt.step as number },
+                cheater_detected: {
+                  party_index: evt.party_index as number,
+                  step: evt.step as number,
+                  slashed: false,
+                  slash_tx_hash: null,
+                  recovered: false,
+                  recovery_workers: null,
+                },
+              };
+            });
+          }
+
+          if (evt.type === 'cheater_slashed') {
+            setActiveSession((prev) => {
+              if (!prev) return prev;
+              return {
+                ...prev,
+                cheater_detected: prev.cheater_detected
+                  ? {
+                      ...prev.cheater_detected,
+                      slashed: true,
+                      slash_tx_hash: (evt.tx_hash as string) || null,
+                    }
+                  : prev.cheater_detected,
+              };
+            });
+          }
+
+          if (evt.type === 'recovery_completed') {
+            setActiveSession((prev) => {
+              if (!prev) return prev;
+              return {
+                ...prev,
+                workers_active: (evt.honest_workers as number) ?? prev.workers_active,
+                cheater_detected: prev.cheater_detected
+                  ? {
+                      ...prev.cheater_detected,
+                      recovered: true,
+                      recovery_workers: (evt.honest_workers as number) ?? null,
+                    }
+                  : prev.cheater_detected,
               };
             });
           }

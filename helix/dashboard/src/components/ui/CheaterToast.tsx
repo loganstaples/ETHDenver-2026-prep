@@ -2,24 +2,25 @@
 
 import { useEffect, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { AlertTriangle, X, ShieldAlert } from 'lucide-react';
+import { AlertTriangle, X, ShieldAlert, ExternalLink, CheckCircle2 } from 'lucide-react';
+import type { CheaterInfo } from '@/hooks/useMpcTraining';
+
+const ADI_EXPLORER = 'https://explorer.ab.testnet.adifoundation.ai';
 
 interface CheaterToastProps {
   /** Detected cheater info — null means no cheater. Toast appears on transition to non-null. */
-  cheater: { party_index: number; step: number } | null;
+  cheater: CheaterInfo | null;
 }
 
 /**
  * Animated toast notification that appears when a cheater is detected during
- * MPC training. Slides in from the top-right and auto-dismisses after 15s.
+ * MPC training. Shows progression: detected → slashed on-chain → recovered.
+ * Slides in from the top-right and auto-dismisses after 20s.
  */
 export function CheaterToast({ cheater }: CheaterToastProps) {
   const [visible, setVisible] = useState(false);
   const [dismissed, setDismissed] = useState(false);
-  const [currentCheater, setCurrentCheater] = useState<{
-    party_index: number;
-    step: number;
-  } | null>(null);
+  const [currentCheater, setCurrentCheater] = useState<CheaterInfo | null>(null);
 
   // Show toast when cheater transitions from null to non-null
   useEffect(() => {
@@ -27,11 +28,18 @@ export function CheaterToast({ cheater }: CheaterToastProps) {
       setCurrentCheater(cheater);
       setVisible(true);
 
-      // Auto-dismiss after 15s
-      const timer = setTimeout(() => setVisible(false), 15_000);
+      // Auto-dismiss after 20s (longer to show full progression)
+      const timer = setTimeout(() => setVisible(false), 20_000);
       return () => clearTimeout(timer);
     }
   }, [cheater, dismissed]);
+
+  // Keep currentCheater updated as slash/recovery info arrives
+  useEffect(() => {
+    if (cheater) {
+      setCurrentCheater(cheater);
+    }
+  }, [cheater]);
 
   // Reset dismissed state when cheater changes (new detection)
   useEffect(() => {
@@ -44,6 +52,10 @@ export function CheaterToast({ cheater }: CheaterToastProps) {
     setVisible(false);
     setDismissed(true);
   };
+
+  const explorerUrl = currentCheater?.slash_tx_hash
+    ? `${ADI_EXPLORER}/tx/${currentCheater.slash_tx_hash}`
+    : null;
 
   return (
     <AnimatePresence>
@@ -61,7 +73,7 @@ export function CheaterToast({ cheater }: CheaterToastProps) {
               className="absolute top-0 left-0 h-1 bg-gradient-to-r from-red-500 via-orange-500 to-red-500"
               initial={{ width: '100%' }}
               animate={{ width: '0%' }}
-              transition={{ duration: 15, ease: 'linear' }}
+              transition={{ duration: 20, ease: 'linear' }}
             />
 
             <div className="p-4">
@@ -96,9 +108,40 @@ export function CheaterToast({ cheater }: CheaterToastProps) {
                     </span>
                     . SPDZ MAC verification caught the tampering.
                   </p>
-                  <p className="mt-1.5 text-xs text-red-200/50">
-                    Stake slashed &middot; Shares redistributed &middot; Training continues
-                  </p>
+
+                  {/* Progression steps */}
+                  <div className="mt-2 space-y-1">
+                    <StepIndicator done label="Cheater identified via pairwise MAC verification" />
+                    <StepIndicator
+                      done={currentCheater.slashed}
+                      label={
+                        currentCheater.slashed
+                          ? 'Stake slashed on-chain'
+                          : 'Submitting blame report on-chain...'
+                      }
+                    />
+                    {currentCheater.slashed && explorerUrl && (
+                      <a
+                        href={explorerUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="ml-5 flex items-center gap-1 text-[10px] text-orange-400/80 hover:text-orange-300 transition-colors font-mono"
+                      >
+                        {currentCheater.slash_tx_hash!.slice(0, 10)}...{currentCheater.slash_tx_hash!.slice(-6)}
+                        <ExternalLink size={10} />
+                      </a>
+                    )}
+                    <StepIndicator
+                      done={currentCheater.recovered}
+                      label={
+                        currentCheater.recovered
+                          ? `Training resumed with ${currentCheater.recovery_workers} workers`
+                          : currentCheater.slashed
+                            ? 'Redistributing shares...'
+                            : 'Awaiting slashing'
+                      }
+                    />
+                  </div>
                 </div>
 
                 {/* Dismiss */}
@@ -114,5 +157,24 @@ export function CheaterToast({ cheater }: CheaterToastProps) {
         </motion.div>
       )}
     </AnimatePresence>
+  );
+}
+
+function StepIndicator({ done, label }: { done: boolean; label: string }) {
+  return (
+    <div className="flex items-center gap-1.5">
+      {done ? (
+        <CheckCircle2 size={12} className="text-green-400 shrink-0" />
+      ) : (
+        <motion.div
+          className="w-3 h-3 rounded-full border border-red-400/60 shrink-0"
+          animate={{ opacity: [0.4, 1, 0.4] }}
+          transition={{ duration: 1.5, repeat: Infinity }}
+        />
+      )}
+      <span className={`text-[11px] ${done ? 'text-green-300/70' : 'text-red-200/50'}`}>
+        {label}
+      </span>
+    </div>
   );
 }

@@ -56,6 +56,7 @@ import {
 import { useModelRegistry, type ModelWithVersions } from '@/hooks/useModelRegistry';
 import { deriveModelKey, encryptWeights, decryptWeights } from '@/lib/model-encryption';
 import { HELIX_COORDINATOR_V4_ABI, HELIX_MODEL_STORE_ABI, getContractAddress } from '@/lib/contracts';
+import { getTrustedNodes } from '@/hooks/useTrustedNodes';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
 
@@ -251,6 +252,12 @@ function SubStatusTicker({ session }: { session: TrainingSessionState }) {
 
     // Cheater detection takes priority
     if (session.cheater_detected) {
+      if (session.cheater_detected.recovered) {
+        return `Recovered — training with ${session.cheater_detected.recovery_workers} honest workers`;
+      }
+      if (session.cheater_detected.slashed) {
+        return `Worker ${session.cheater_detected.party_index} slashed — redistributing shares...`;
+      }
       return `Cheater detected — worker ${session.cheater_detected.party_index} at step ${session.cheater_detected.step}`;
     }
 
@@ -1378,11 +1385,30 @@ function LiveProgress({ session, losses, isConnected, error, version, modelName,
               className="flex items-center gap-3 px-4 py-3.5 rounded-2xl bg-red-500/[0.08] border border-red-500/25"
             >
               <AlertTriangle size={16} className="text-red-400 shrink-0" />
-              <div>
-                <p className="text-sm font-medium text-red-300">Cheater Detected</p>
-                <p className="text-xs text-red-300/60 mt-0.5">
-                  Worker {session.cheater_detected.party_index} · Step {session.cheater_detected.step} · Stake slashed
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-medium text-red-300">
+                  {session.cheater_detected.recovered
+                    ? 'Cheater Slashed & Recovered'
+                    : session.cheater_detected.slashed
+                      ? 'Cheater Slashed On-Chain'
+                      : 'Cheater Detected'}
                 </p>
+                <p className="text-xs text-red-300/60 mt-0.5">
+                  Worker {session.cheater_detected.party_index} · Step {session.cheater_detected.step}
+                  {session.cheater_detected.slashed && ' · Stake slashed'}
+                  {session.cheater_detected.recovered && ` · ${session.cheater_detected.recovery_workers} workers continuing`}
+                </p>
+                {session.cheater_detected.slash_tx_hash && (
+                  <a
+                    href={`https://explorer.ab.testnet.adifoundation.ai/tx/${session.cheater_detected.slash_tx_hash}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1 mt-1 text-[11px] text-orange-400/70 hover:text-orange-300 transition-colors font-mono"
+                  >
+                    tx: {session.cheater_detected.slash_tx_hash.slice(0, 10)}...{session.cheater_detected.slash_tx_hash.slice(-6)}
+                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6M15 3h6v6M10 14L21 3"/></svg>
+                  </a>
+                )}
               </div>
             </motion.div>
           )}
@@ -2225,9 +2251,39 @@ function HistoryDetailModal({ session, onClose }: {
 
               {/* Cheater alert */}
               {session.cheater_detected && (
-                <div className="p-4 rounded-xl bg-red-500/10 border border-red-500/30 text-red-400 text-sm">
-                  <strong>Cheater Detected</strong>
-                  <span className="ml-2">Worker {session.cheater_detected.party_index}</span>
+                <div className="p-4 rounded-xl bg-red-500/10 border border-red-500/30 text-sm space-y-1.5">
+                  <div className="text-red-400">
+                    <strong>
+                      {session.cheater_detected.recovered
+                        ? 'Cheater Removed & Recovered'
+                        : session.cheater_detected.slashed
+                          ? 'Cheater Slashed'
+                          : 'Cheater Detected'}
+                    </strong>
+                    <span className="ml-2 text-red-300/70">Worker {session.cheater_detected.party_index} at step {session.cheater_detected.step}</span>
+                  </div>
+                  {session.cheater_detected.slashed && (
+                    <div className="text-green-400/80 text-xs flex items-center gap-1">
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M20 6L9 17l-5-5"/></svg>
+                      Stake slashed on ADI Chain
+                      {session.cheater_detected.slash_tx_hash && (
+                        <a
+                          href={`https://explorer.ab.testnet.adifoundation.ai/tx/${session.cheater_detected.slash_tx_hash}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="ml-1 text-orange-400/70 hover:text-orange-300 font-mono"
+                        >
+                          ({session.cheater_detected.slash_tx_hash.slice(0, 8)}...)
+                        </a>
+                      )}
+                    </div>
+                  )}
+                  {session.cheater_detected.recovered && (
+                    <div className="text-green-400/80 text-xs flex items-center gap-1">
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M20 6L9 17l-5-5"/></svg>
+                      Training recovered with {session.cheater_detected.recovery_workers} honest workers
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -2544,6 +2600,39 @@ function TrainPageInner() {
   const handleStart = async (config: TrainingJobConfig, opts: { storeOn0G: boolean; version: string; modelName: string; modelSlug: string }) => {
     pendingConfigRef.current = { config, opts };
     setWalletPaymentError(null);
+
+    // ── Trusted nodes gate ──────────────────────────────────────────────
+    // Only workers in the user's trusted list may handle plaintext weights.
+    // Require at least 1 trusted worker to be active before starting.
+    const trustedNodes = getTrustedNodes();
+    if (trustedNodes.length > 0) {
+      try {
+        const res = await fetch(`${API_BASE}/api/workers`);
+        if (res.ok) {
+          const data = await res.json();
+          const workers: { address?: string; status?: string }[] =
+            Array.isArray(data) ? data : (data.workers ?? []);
+          const activeAddresses = workers
+            .filter(w => w.status !== 'offline' && w.address)
+            .map(w => (w.address as string).toLowerCase());
+          const trustedActive = trustedNodes.filter(tn =>
+            activeAddresses.includes(tn.toLowerCase())
+          );
+          if (trustedActive.length === 0) {
+            setWalletPaymentError(
+              'No trusted nodes are currently active. Add trusted nodes in Settings, or wait for at least one to come online.'
+            );
+            pendingConfigRef.current = null;
+            return;
+          }
+        }
+      } catch {
+        // If we can't reach the workers API, allow the job to proceed —
+        // the backend will enforce trust at share-distribution time.
+      }
+      // Attach trusted nodes to the config so the backend knows which workers are trusted
+      config = { ...config, trusted_nodes: trustedNodes };
+    }
 
     // Track the model token ID for encrypted 0G upload after training
     setCurrentModelTokenId(config.model_token_id ?? selectedModelId);
