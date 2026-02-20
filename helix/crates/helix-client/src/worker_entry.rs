@@ -1479,6 +1479,7 @@ async fn run_distributed_training(
         Some(owner_pk),
         Some(weight_layout),
         on_step,
+        None, // no sub-step callback for distributed workers
     ).await
 }
 

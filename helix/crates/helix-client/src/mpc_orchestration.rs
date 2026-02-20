@@ -340,6 +340,7 @@ impl MPCTrainingOrchestrator {
             worker_endpoints: None,
             batch_size: self.config.batch_size.unwrap_or(32),
             on_step: None,
+            on_sub_step: None,
         }
     }
 

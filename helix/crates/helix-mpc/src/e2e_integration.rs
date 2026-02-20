@@ -87,6 +87,9 @@ pub struct MPCIntegrationConfig {
     /// Accuracy estimate is derived from cross-entropy loss (0.0-1.0).
     #[serde(skip)]
     pub on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync>>,
+    /// Optional callback for sub-step progress within each training step (party 0 only).
+    #[serde(skip)]
+    pub on_sub_step: Option<crate::mpc_trainer::SubStepCallback>,
 }
 
 impl std::fmt::Debug for MPCIntegrationConfig {
@@ -109,6 +112,7 @@ impl std::fmt::Debug for MPCIntegrationConfig {
             .field("worker_endpoints", &self.worker_endpoints)
             .field("batch_size", &self.batch_size)
             .field("on_step", &self.on_step.as_ref().map(|_| "<callback>"))
+            .field("on_sub_step", &self.on_sub_step.as_ref().map(|_| "<callback>"))
             .finish()
     }
 }
@@ -147,6 +151,7 @@ impl Default for MPCIntegrationConfig {
             worker_endpoints: None,
             batch_size: 1,
             on_step: None,
+            on_sub_step: None,
         }
     }
 }
@@ -241,6 +246,7 @@ pub async fn run_mpc_training(
     let num_steps = config.num_steps;
     let checkpoint_interval = config.checkpoint_interval;
     let on_step = config.on_step.clone();
+    let on_sub_step = config.on_sub_step.clone();
 
     info!(
         num_workers = num_workers,
@@ -298,6 +304,7 @@ pub async fn run_mpc_training(
                 num_steps, checkpoint_interval, config.seed, start,
                 config.worker_endpoints.clone(),
                 on_step.clone(),
+                on_sub_step.clone(),
             ).await
         }
         #[cfg(not(feature = "network-mpc"))]
@@ -311,12 +318,14 @@ pub async fn run_mpc_training(
             parties, trainer_config, initial_weights, training_data,
             num_steps, checkpoint_interval, config.seed, start,
             on_step.clone(),
+            on_sub_step.clone(),
         ).await
     } else {
         run_with_local_transport(
             parties, trainer_config, initial_weights, training_data,
             num_steps, checkpoint_interval, config.seed, start,
             on_step.clone(),
+            on_sub_step.clone(),
         ).await
     }
 }
@@ -335,6 +344,7 @@ pub async fn run_mpc_training_with_cheater(
     let num_steps = config.num_steps;
     let checkpoint_interval = config.checkpoint_interval;
     let on_step = config.on_step.clone();
+    let on_sub_step = config.on_sub_step.clone();
 
     if cheater_party >= num_workers {
         return Err(anyhow::anyhow!(
@@ -390,6 +400,7 @@ pub async fn run_mpc_training_with_cheater(
                 cheater_party, corrupt_at_step,
                 config.worker_endpoints.clone(),
                 on_step.clone(),
+                on_sub_step.clone(),
             ).await
         }
         #[cfg(not(feature = "network-mpc"))]
@@ -404,6 +415,7 @@ pub async fn run_mpc_training_with_cheater(
             num_steps, checkpoint_interval, config.seed, start,
             cheater_party, corrupt_at_step,
             on_step.clone(),
+            on_sub_step.clone(),
         ).await
     }
 }
@@ -494,6 +506,7 @@ async fn run_with_local_transport(
     seed: u64,
     start: Instant,
     on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync>>,
+    on_sub_step: Option<crate::mpc_trainer::SubStepCallback>,
 ) -> Result<MPCIntegrationResult, anyhow::Error> {
     let num_workers = parties.len();
     let transports = LocalTransport::create_mesh(&parties);
@@ -507,6 +520,7 @@ async fn run_with_local_transport(
         let cfg = trainer_config.clone();
         let data = training_data.clone();
         let step_cb = if i == 0 { on_step.clone() } else { None };
+        let sub_step_cb = if i == 0 { on_sub_step.clone() } else { None };
 
         // Spawn each worker on a dedicated OS thread so rayon parallelism
         // from multiple workers runs truly concurrently across all CPU cores.
@@ -521,6 +535,7 @@ async fn run_with_local_transport(
                 None, 0, // no cheater
                 Some(bundle),
                 step_cb,
+                sub_step_cb,
             ))
         });
         handles.push(handle);
@@ -539,6 +554,7 @@ async fn run_with_node_transport(
     seed: u64,
     start: Instant,
     on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync>>,
+    on_sub_step: Option<crate::mpc_trainer::SubStepCallback>,
 ) -> Result<MPCIntegrationResult, anyhow::Error> {
     let num_workers = parties.len();
     let transports = NodeTransport::create_mesh(&parties, "e2e-integration");
@@ -552,6 +568,7 @@ async fn run_with_node_transport(
         let cfg = trainer_config.clone();
         let data = training_data.clone();
         let step_cb = if i == 0 { on_step.clone() } else { None };
+        let sub_step_cb = if i == 0 { on_sub_step.clone() } else { None };
 
         let handle = tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -564,6 +581,7 @@ async fn run_with_node_transport(
                 None, 0,
                 Some(bundle),
                 step_cb,
+                sub_step_cb,
             ))
         });
         handles.push(handle);
@@ -588,6 +606,7 @@ async fn run_with_tcp_transport(
     start: Instant,
     worker_endpoints: Option<Vec<String>>,
     on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync>>,
+    on_sub_step: Option<crate::mpc_trainer::SubStepCallback>,
 ) -> Result<MPCIntegrationResult, anyhow::Error> {
     use std::collections::HashMap;
     use std::net::SocketAddr;
@@ -669,6 +688,7 @@ async fn run_with_tcp_transport(
         let cfg = trainer_config.clone();
         let data = training_data.clone();
         let step_cb = if i == 0 { on_step.clone() } else { None };
+        let sub_step_cb = if i == 0 { on_sub_step.clone() } else { None };
 
         let handle = tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -681,6 +701,7 @@ async fn run_with_tcp_transport(
                 None, 0, // no cheater
                 Some(bundle),
                 step_cb,
+                sub_step_cb,
             ))
         });
         handles.push(handle);
@@ -703,6 +724,7 @@ async fn run_with_tcp_cheater(
     corrupt_at_step: u64,
     worker_endpoints: Option<Vec<String>>,
     on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync>>,
+    on_sub_step: Option<crate::mpc_trainer::SubStepCallback>,
 ) -> Result<MPCIntegrationResult, anyhow::Error> {
     use std::collections::HashMap;
     use std::net::SocketAddr;
@@ -779,6 +801,7 @@ async fn run_with_tcp_cheater(
         let cfg = trainer_config.clone();
         let data = training_data.clone();
         let step_cb = if i == 0 { on_step.clone() } else { None };
+        let sub_step_cb = if i == 0 { on_sub_step.clone() } else { None };
 
         let cheater_info = if i == cheater_party {
             Some(cheater_party)
@@ -797,6 +820,7 @@ async fn run_with_tcp_cheater(
                 cheater_info, corrupt_at_step,
                 Some(bundle),
                 step_cb,
+                sub_step_cb,
             ))
         });
         handles.push(handle);
@@ -817,6 +841,7 @@ async fn run_with_cheater(
     cheater_party: usize,
     corrupt_at_step: u64,
     on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync>>,
+    on_sub_step: Option<crate::mpc_trainer::SubStepCallback>,
 ) -> Result<MPCIntegrationResult, anyhow::Error> {
     let num_workers = parties.len();
     let transports = LocalTransport::create_mesh(&parties);
@@ -833,6 +858,7 @@ async fn run_with_cheater(
         let cfg = trainer_config.clone();
         let data = training_data.clone();
         let step_cb = if i == 0 { on_step.clone() } else { None };
+        let sub_step_cb = if i == 0 { on_sub_step.clone() } else { None };
 
         let cheater_info = if i == cheater_party {
             Some(cheater_party)
@@ -851,6 +877,7 @@ async fn run_with_cheater(
                 cheater_info, corrupt_at_step,
                 Some(bundle),
                 step_cb,
+                sub_step_cb,
             ))
         });
         handles.push(handle);
@@ -948,6 +975,7 @@ async fn run_with_cheater(
                 let data = training_data.clone();
                 let total_steps = remaining_steps;
                 let step_cb = if i == 0 { on_step.clone() } else { None };
+                let sub_step_cb = if i == 0 { on_sub_step.clone() } else { None };
                 let offset = steps_already_done;
                 let original_total = steps_already_done + remaining_steps;
                 let wrapped_cb: Option<std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync>> =
@@ -968,6 +996,7 @@ async fn run_with_cheater(
                         None, 0, // no cheater in recovery
                         Some(bundle),
                         wrapped_cb,
+                        sub_step_cb,
                     ))
                 });
                 recovery_handles.push(handle);
@@ -1165,9 +1194,13 @@ pub async fn run_distributed_party<T: crate::session::transport::MPCTransport + 
     owner_public_key: Option<X25519PublicKey>,
     weight_layout: Option<WeightLayout>,
     on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync>>,
+    on_sub_step: Option<crate::mpc_trainer::SubStepCallback>,
 ) -> Result<PartyResult, anyhow::Error> {
     // Phase 1: Initialize with pre-decrypted shares.
     let mut trainer = MPCTrainer::new(config.clone(), transport, party_index, seed);
+    if let Some(cb) = on_sub_step {
+        trainer.set_sub_step_callback(cb);
+    }
     trainer.init_with_shares(w1_share.clone(), b1_share.clone(), w2_share.clone(), b2_share.clone()).await?;
     info!(party = party_index, "Weight shares initialized from pre-decrypted data");
 
@@ -1392,9 +1425,13 @@ pub async fn run_party_training<T: crate::session::transport::MPCTransport + 'st
     corrupt_at_step: u64,
     encrypted_bundle: Option<EncryptedShareBundle>,
     on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync>>,
+    on_sub_step: Option<crate::mpc_trainer::SubStepCallback>,
 ) -> Result<PartyResult, anyhow::Error> {
     // Phase 1: Initialize weight shares.
     let mut trainer = MPCTrainer::new(config.clone(), transport, party_index, seed);
+    if let Some(cb) = on_sub_step {
+        trainer.set_sub_step_callback(cb);
+    }
 
     if let Some(bundle) = &encrypted_bundle {
         // Encrypted path: decrypt the share from the owner, then init.
@@ -1861,6 +1898,7 @@ mod tests {
             worker_endpoints: None,
             batch_size: 1,
             on_step: None,
+            on_sub_step: None,
         };
 
         let result = run_mpc_training(config).await.expect("training should succeed");
@@ -1899,6 +1937,7 @@ mod tests {
             worker_endpoints: None,
             batch_size: 1,
             on_step: None,
+            on_sub_step: None,
         };
 
         let result = run_mpc_training(config).await.expect("training should succeed");
@@ -1940,6 +1979,7 @@ mod tests {
             worker_endpoints: None,
             batch_size: 1,
             on_step: None,
+            on_sub_step: None,
         };
 
         let result = run_mpc_training(config).await.expect("training should succeed");
@@ -1971,6 +2011,7 @@ mod tests {
             worker_endpoints: None,
             batch_size: 1,
             on_step: None,
+            on_sub_step: None,
         };
 
         let result = run_mpc_training(config).await.expect("training should succeed");
@@ -2029,6 +2070,7 @@ mod tests {
                 worker_endpoints: None,
                 batch_size: 1,
                 on_step: None,
+                on_sub_step: None,
             };
 
             let result = run_mpc_training(config).await.expect("should succeed");
@@ -2081,6 +2123,7 @@ mod tests {
             worker_endpoints: None,
             batch_size: 1,
             on_step: None,
+            on_sub_step: None,
         };
 
         let result = run_mpc_training_with_cheater(config, 2, 5).await

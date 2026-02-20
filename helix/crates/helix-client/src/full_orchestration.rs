@@ -688,6 +688,7 @@ impl FullOrchestrator {
                         cb(ProgressEvent::TrainingStep { step, total, loss, accuracy, mac_ok });
                     })
                 }),
+                on_sub_step: None,
             };
 
             if self.config.simulate_cheater {
