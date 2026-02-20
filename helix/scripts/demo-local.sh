@@ -54,7 +54,7 @@ trap cleanup EXIT
 # Start dashboard API (Anvil auto-starts during training)
 echo -e "${CYAN}Starting dashboard API on port 3001...${NC}"
 cd "$ROOT_DIR"
-"$HELIX" dashboard --port 3001 --host 0.0.0.0 &
+"$HELIX" dashboard --port 3001 --host 0.0.0.0 --cors &
 DASHBOARD_PID=$!
 sleep 1
 

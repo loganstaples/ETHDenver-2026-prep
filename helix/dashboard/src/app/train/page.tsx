@@ -22,6 +22,7 @@ import {
   ExternalLink,
   Copy,
   ChevronDown,
+  ChevronUp,
   Link2,
   Layers,
   Search,
@@ -42,6 +43,7 @@ import { parseEther, keccak256, toBytes, decodeEventLog } from 'viem';
 import { hardhat } from 'wagmi/chains';
 import { Badge } from '@/components/ui/Badge';
 import { CheaterToast } from '@/components/ui/CheaterToast';
+import { ModelCard, TrainedSessionCard } from '@/components/ModelCard';
 import { cn } from '@/lib/utils';
 import {
   useMpcTraining,
@@ -477,6 +479,16 @@ function PaymentNumber({
 // Config Form — two-column full-width layout
 // ============================================================================
 
+interface TrainedSession {
+  session_id: string;
+  model_name?: string;
+  model_slug?: string;
+  accuracy: number | null;
+  losses: number[];
+  status: string;
+  started_at: number;
+}
+
 interface ConfigFormProps {
   onStart: (config: TrainingJobConfig, opts: { storeOn0G: boolean; version: string; modelName: string; modelSlug: string }) => void;
   isStarting: boolean;
@@ -487,20 +499,25 @@ interface ConfigFormProps {
   workersOnline: number;
   defaultVersion: string;
   models: ModelWithVersions[];
+  trainedSessions: TrainedSession[];
   selectedModelId: number | null;
+  selectedSessionId: string | null;
   onSelectModel: (tokenId: number | null) => void;
+  onSelectSession: (sessionId: string | null) => void;
   isFetchingWeights: boolean;
   fetchedModelName: string | null;
   isWalletPrompting: boolean;
   isConfirmingPayment: boolean;
   walletConnected: boolean;
+  userAddress?: string;
 }
 
 function ConfigForm({
   onStart, isStarting, onUploadData, onUploadWeights,
   uploadedData, uploadedWeights, workersOnline, defaultVersion,
-  models, selectedModelId, onSelectModel, isFetchingWeights, fetchedModelName,
-  isWalletPrompting, isConfirmingPayment, walletConnected,
+  models, trainedSessions, selectedModelId, selectedSessionId, onSelectModel, onSelectSession,
+  isFetchingWeights, fetchedModelName,
+  isWalletPrompting, isConfirmingPayment, walletConnected, userAddress,
 }: ConfigFormProps) {
   const [numSteps, setNumSteps] = useState(200);
   const [learningRate, setLearningRate] = useState(0.05);
@@ -519,7 +536,8 @@ function ConfigForm({
   const [cheaterStep, setCheaterStep] = useState<number | undefined>(undefined);
 
   // Model identity
-  const [modelMode, setModelMode] = useState<'new' | 'existing'>(selectedModelId !== null ? 'existing' : 'new');
+  const hasExistingModels = models.length > 0 || trainedSessions.length > 0;
+  const [modelMode, setModelMode] = useState<'new' | 'existing'>((selectedModelId !== null || selectedSessionId !== null) ? 'existing' : 'new');
   const [modelName, setModelName] = useState('');
   const [modelSlug, setModelSlug] = useState('');
   const [modelSearch, setModelSearch] = useState('');
@@ -536,6 +554,16 @@ function ConfigForm({
       (m) => m.name.toLowerCase().includes(q) || (m.slug && m.slug.toLowerCase().includes(q)),
     );
   }, [models, modelSearch]);
+
+  const filteredSessions = useMemo(() => {
+    if (!modelSearch.trim()) return trainedSessions;
+    const q = modelSearch.toLowerCase();
+    return trainedSessions.filter((s) =>
+      (s.model_name || '').toLowerCase().includes(q) || (s.model_slug || '').toLowerCase().includes(q),
+    );
+  }, [trainedSessions, modelSearch]);
+
+  const selectedSession = trainedSessions.find((s) => s.session_id === selectedSessionId) ?? null;
 
   // Auto-compute recommended payment: base rate × steps × workers × ZK overhead
   const recommendedPayment = useMemo(() => {
@@ -568,11 +596,11 @@ function ConfigForm({
     const v = version.trim() || defaultVersion;
     if (!isValidVersion(v)) return;
 
-    const effectiveModelName = modelMode === 'existing' && selectedModel
-      ? selectedModel.name
+    const effectiveModelName = modelMode === 'existing'
+      ? (selectedModel ? selectedModel.name : (selectedSession?.model_name || 'Continued Model'))
       : modelName.trim();
-    const effectiveModelSlug = modelMode === 'existing' && selectedModel
-      ? (selectedModel.slug || '')
+    const effectiveModelSlug = modelMode === 'existing'
+      ? (selectedModel ? (selectedModel.slug || '') : (selectedSession?.model_slug || ''))
       : modelSlug.trim();
 
     onStart({
@@ -608,7 +636,7 @@ function ConfigForm({
   const canStart = !isStarting && !isWalletPrompting && !isConfirmingPayment
     && !versionError && !isFetchingWeights && walletConnected
     && (modelMode === 'existing'
-      ? selectedModelId !== null
+      ? (selectedModelId !== null || selectedSessionId !== null)
       : (modelName.trim() !== '' && modelSlug.trim() !== ''));
 
   return (
@@ -655,14 +683,14 @@ function ConfigForm({
               </button>
               <button
                 type="button"
-                onClick={() => models.length > 0 && setModelMode('existing')}
-                disabled={models.length === 0}
+                onClick={() => hasExistingModels && setModelMode('existing')}
+                disabled={!hasExistingModels}
                 className={cn(
                   'py-2.5 rounded-xl text-base font-medium transition-all',
                   modelMode === 'existing'
                     ? 'bg-white text-black shadow-lg shadow-white/5'
                     : 'bg-helix-surface border border-helix-border text-helix-muted hover:text-white hover:border-helix-border2',
-                  models.length === 0 && 'opacity-40 cursor-not-allowed',
+                  !hasExistingModels && 'opacity-40 cursor-not-allowed',
                 )}
               >
                 Continue Existing
@@ -700,126 +728,85 @@ function ConfigForm({
                   exit={{ opacity: 0, y: -4 }}
                   className="space-y-3"
                 >
-                  {selectedModel ? (
-                    <>
-                      {/* Selected model — locked display */}
-                      <div className="flex items-center gap-3 px-4 py-3.5 rounded-2xl bg-white/[0.03] border border-white/[0.08]">
-                        <Lock size={14} className="text-helix-muted shrink-0" />
-                        <div className="flex-1 min-w-0">
-                          <p className="text-base text-white font-medium truncate">{selectedModel.name}</p>
-                          <p className="text-xs text-helix-dim truncate">
-                            {selectedModel.slug}
-                            {latestVersion && <span className="ml-1.5">· v{latestVersion.semver}</span>}
-                          </p>
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => onSelectModel(null)}
-                          className="text-xs text-helix-dim hover:text-white transition-colors shrink-0"
+                  {/* Search input (hidden when a model is selected) */}
+                  {!selectedModel && !selectedSession && (
+                    <div className="relative">
+                      <Search size={14} className="absolute left-4 top-1/2 -translate-y-1/2 text-helix-muted pointer-events-none" />
+                      <input
+                        type="text"
+                        value={modelSearch}
+                        onChange={(e) => setModelSearch(e.target.value)}
+                        placeholder="Search your models..."
+                        className="w-full pl-10 pr-4 py-3.5 bg-helix-surface border border-helix-border rounded-2xl text-base text-white placeholder:text-helix-dim focus:outline-none focus:border-helix-border2 transition-colors"
+                      />
+                    </div>
+                  )}
+
+                  {/* Model / session cards */}
+                  <div className="max-h-64 overflow-y-auto space-y-2">
+                    {/* Trained sessions */}
+                    {filteredSessions.length > 0 && !selectedModel && (
+                      filteredSessions.map((s) => {
+                        const isSelected = selectedSessionId === s.session_id;
+                        if (selectedSession && !isSelected) return null;
+                        return (
+                          <TrainedSessionCard
+                            key={s.session_id}
+                            sessionId={s.session_id}
+                            name={s.model_name || 'Trained Model'}
+                            accuracy={s.accuracy}
+                            isSelected={isSelected}
+                            onSelect={() => onSelectSession(isSelected ? null : s.session_id)}
+                          />
+                        );
+                      })
+                    )}
+
+                    {/* On-chain models */}
+                    {filteredModels.length > 0 && !selectedSession && (
+                      filteredModels.map((m) => {
+                        const isSelected = selectedModelId === m.tokenId;
+                        const latest = m.versions.length ? m.versions[m.versions.length - 1] : null;
+                        if (selectedModel && !isSelected) return null;
+                        return (
+                          <ModelCard
+                            key={m.tokenId}
+                            id={String(m.tokenId)}
+                            name={m.name}
+                            accuracy={latest?.accuracy ?? 0}
+                            isSelected={isSelected}
+                            onSelect={() => onSelectModel(isSelected ? null : m.tokenId)}
+                            versions={m.versions}
+                            selectedVersionIndex={m.versions.length > 0 ? m.versions.length - 1 : 0}
+                            ownerAddress={m.creator}
+                            userAddress={userAddress}
+                            tokenId={m.tokenId}
+                          />
+                        );
+                      })
+                    )}
+
+                    {filteredModels.length === 0 && filteredSessions.length === 0 && (
+                      <p className="text-sm text-helix-dim text-center py-4">No models found</p>
+                    )}
+                  </div>
+
+                  {/* Weight fetch status — only errors and loading */}
+                  {(selectedModel || selectedSession) && (
+                    <AnimatePresence mode="wait">
+                      {isFetchingWeights && (
+                        <motion.div
+                          key="loading"
+                          initial={{ opacity: 0, y: -4 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          exit={{ opacity: 0, y: -4 }}
+                          className="flex items-center gap-3 px-4 py-2.5 rounded-2xl bg-white/[0.03] border border-white/[0.06]"
                         >
-                          Change
-                        </button>
-                      </div>
-
-                      {/* Weight fetch status */}
-                      <AnimatePresence mode="wait">
-                        {isFetchingWeights && (
-                          <motion.div
-                            key="fetching"
-                            initial={{ opacity: 0, y: -4 }}
-                            animate={{ opacity: 1, y: 0 }}
-                            exit={{ opacity: 0, y: -4 }}
-                            className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-white/[0.03] border border-white/[0.06]"
-                          >
-                            <Loader2 size={14} className="animate-spin text-white" />
-                            <span className="text-sm text-helix-text2">Fetching weights from 0G...</span>
-                          </motion.div>
-                        )}
-                        {!isFetchingWeights && fetchedModelName && uploadedWeights && (
-                          <motion.div
-                            key="loaded"
-                            initial={{ opacity: 0, y: -4 }}
-                            animate={{ opacity: 1, y: 0 }}
-                            exit={{ opacity: 0, y: -4 }}
-                            className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-green-500/[0.06] border border-green-500/20"
-                          >
-                            <CheckCircle size={14} className="text-green-400" />
-                            <span className="text-sm text-green-300">
-                              <span className="font-medium">{fetchedModelName}</span>
-                              <span className="text-green-400/60 ml-1.5">
-                                {uploadedWeights.totalParams.toLocaleString()} params
-                              </span>
-                            </span>
-                          </motion.div>
-                        )}
-                        {selectedModel && latestVersion && !latestVersion.weightsStored && !isFetchingWeights && (
-                          <motion.div
-                            key="no-weights"
-                            initial={{ opacity: 0, y: -4 }}
-                            animate={{ opacity: 1, y: 0 }}
-                            exit={{ opacity: 0, y: -4 }}
-                            className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-yellow-500/[0.06] border border-yellow-500/20"
-                          >
-                            <AlertTriangle size={14} className="text-yellow-400" />
-                            <span className="text-sm text-yellow-300/80">No stored weights — upload manually or start fresh</span>
-                          </motion.div>
-                        )}
-                        {selectedModel && !latestVersion && !isFetchingWeights && (
-                          <motion.div
-                            key="no-versions"
-                            initial={{ opacity: 0, y: -4 }}
-                            animate={{ opacity: 1, y: 0 }}
-                            exit={{ opacity: 0, y: -4 }}
-                            className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-yellow-500/[0.06] border border-yellow-500/20"
-                          >
-                            <AlertTriangle size={14} className="text-yellow-400" />
-                            <span className="text-sm text-yellow-300/80">No versions yet — upload weights or start fresh</span>
-                          </motion.div>
-                        )}
-                      </AnimatePresence>
-                    </>
-                  ) : (
-                    <>
-                      {/* Search input */}
-                      <div className="relative">
-                        <Search size={14} className="absolute left-4 top-1/2 -translate-y-1/2 text-helix-muted pointer-events-none" />
-                        <input
-                          type="text"
-                          value={modelSearch}
-                          onChange={(e) => setModelSearch(e.target.value)}
-                          placeholder="Search your models..."
-                          className="w-full pl-10 pr-4 py-3.5 bg-helix-surface border border-helix-border rounded-2xl text-base text-white placeholder:text-helix-dim focus:outline-none focus:border-helix-border2 transition-colors"
-                        />
-                      </div>
-
-                      {/* Model list */}
-                      <div className="max-h-48 overflow-y-auto space-y-1.5 rounded-2xl">
-                        {filteredModels.map((m) => {
-                          const latest = m.versions.length ? m.versions[m.versions.length - 1] : null;
-                          return (
-                            <button
-                              key={m.tokenId}
-                              type="button"
-                              onClick={() => onSelectModel(m.tokenId)}
-                              className="w-full flex items-center gap-3 px-4 py-3 rounded-xl bg-helix-surface border border-helix-border hover:border-helix-border2 transition-colors text-left"
-                            >
-                              <Layers size={14} className="text-helix-muted shrink-0" />
-                              <div className="flex-1 min-w-0">
-                                <p className="text-base text-white truncate">{m.name}</p>
-                                <p className="text-xs text-helix-dim truncate">
-                                  {m.slug}
-                                  {latest && <span className="ml-1.5">· v{latest.semver}</span>}
-                                </p>
-                              </div>
-                              <ChevronDown size={12} className="text-helix-dim -rotate-90 shrink-0" />
-                            </button>
-                          );
-                        })}
-                        {filteredModels.length === 0 && (
-                          <p className="text-sm text-helix-dim text-center py-4">No models found</p>
-                        )}
-                      </div>
-                    </>
+                          <Loader2 size={12} className="animate-spin text-white/60" />
+                          <span className="text-xs text-white/50">Fetching weights...</span>
+                        </motion.div>
+                      )}
+                    </AnimatePresence>
                   )}
                 </motion.div>
               )}
@@ -1660,6 +1647,73 @@ function ResultsActions({ session, version, onDownloadModel, onStoreOnZeroG, isS
 // History Card Grid — responsive grid of past training sessions
 // ============================================================================
 
+function AccuracyRing({ accuracy, id }: { accuracy: number | null; id: string }) {
+  const r = 46;
+  const stroke = 5;
+  const size = 2 * (r + stroke + 2);
+  const c = 2 * Math.PI * r;
+  const pct = accuracy != null ? accuracy : 0;
+  const offset = c * (1 - pct);
+  const gradId = `ring-${id}`;
+  const glowId = `glow-${id}`;
+
+  return (
+    <div className="relative">
+      {/* Subtle glow behind the ring */}
+      {accuracy != null && accuracy > 0.5 && (
+        <div
+          className="absolute inset-0 rounded-full blur-2xl opacity-20"
+          style={{
+            background: `radial-gradient(circle, ${accuracy > 0.9 ? '#34d399' : accuracy > 0.7 ? '#fbbf24' : '#60a5fa'} 0%, transparent 70%)`,
+          }}
+        />
+      )}
+      <svg width={size} height={size} className="-rotate-90">
+        <defs>
+          <linearGradient id={gradId} x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stopColor={pct > 0.9 ? '#34d399' : pct > 0.7 ? '#fbbf24' : '#60a5fa'} />
+            <stop offset="100%" stopColor="rgba(255,255,255,0.9)" />
+          </linearGradient>
+          <filter id={glowId}>
+            <feGaussianBlur stdDeviation="2" result="blur" />
+            <feMerge>
+              <feMergeNode in="blur" />
+              <feMergeNode in="SourceGraphic" />
+            </feMerge>
+          </filter>
+        </defs>
+        <circle cx={size / 2} cy={size / 2} r={r} fill="none" stroke="rgba(255,255,255,0.05)" strokeWidth={stroke} />
+        {accuracy != null && (
+          <circle
+            cx={size / 2} cy={size / 2} r={r}
+            fill="none"
+            stroke={`url(#${gradId})`}
+            strokeWidth={stroke}
+            strokeLinecap="round"
+            strokeDasharray={c}
+            strokeDashoffset={offset}
+            filter={`url(#${glowId})`}
+            className="transition-all duration-700"
+          />
+        )}
+      </svg>
+      <div className="absolute inset-0 flex items-center justify-center">
+        {accuracy != null ? (
+          <div className="text-center">
+            <p className="text-[28px] font-bold text-white tabular-nums tracking-tighter leading-none">
+              {(accuracy * 100).toFixed(1)}
+              <span className="text-sm text-white/40 font-medium">%</span>
+            </p>
+            <p className="text-[10px] text-white/30 mt-1 uppercase tracking-widest">Accuracy</p>
+          </div>
+        ) : (
+          <p className="text-xl font-bold text-white/20">—</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function HistoryCardGrid({ sessions, onSelect }: {
   sessions: TrainingSessionState[];
   onSelect: (s: TrainingSessionState) => void;
@@ -1674,50 +1728,99 @@ function HistoryCardGrid({ sessions, onSelect }: {
   }
 
   return (
-    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-      {sessions.map((s) => (
-        <button
-          key={s.session_id}
-          type="button"
-          onClick={() => onSelect(s)}
-          className="text-left p-5 rounded-2xl bg-helix-surface border border-helix-border hover:border-white/20 transition-all group"
-        >
-          <div className="flex items-center justify-between mb-3">
-            <span className="text-sm font-medium text-white truncate max-w-[60%]">
-              {s.model_name || 'Unnamed Model'}
-            </span>
-            <span className={cn(
-              'text-xs px-2 py-0.5 rounded-full',
-              s.status === 'complete' ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'
-            )}>
-              {s.status}
-            </span>
-          </div>
+    <div className="grid grid-cols-2 md:grid-cols-3 gap-5">
+      {sessions.map((s) => {
+        const finalAcc = s.accuracy != null ? s.accuracy : null;
+        const finalLoss = s.losses.length > 0 ? s.losses[s.losses.length - 1] : s.current_loss;
+        const date = new Date(s.started_at * 1000);
+        const completion = s.total_steps > 0 ? s.current_step / s.total_steps : 0;
+        const isComplete = completion >= 1;
 
-          {/* Mini sparkline */}
-          {s.losses.length > 1 && (
-            <div className="h-12 mb-3 opacity-60 group-hover:opacity-100 transition-opacity">
-              <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={s.losses.slice(-50).map((l, i) => ({ i, l }))}>
-                  <Area type="monotone" dataKey="l" stroke="#ffffff40" fill="#ffffff10" strokeWidth={1} dot={false} />
-                </AreaChart>
-              </ResponsiveContainer>
+        return (
+          <button
+            key={s.session_id}
+            type="button"
+            onClick={() => onSelect(s)}
+            className="group text-left flex flex-col rounded-3xl bg-helix-surface border border-helix-border hover:border-white/20 hover:bg-white/[0.03] transition-all duration-300 p-7 min-h-[380px]"
+          >
+            {/* Header */}
+            <div className="flex items-start justify-between gap-3 mb-2">
+              <p className="text-base font-semibold text-white truncate tracking-tight leading-tight">
+                {s.model_name || 'Unnamed Model'}
+              </p>
+              <span className="text-[11px] text-white/25 shrink-0 mt-0.5 tabular-nums">
+                {date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+              </span>
             </div>
-          )}
 
-          <div className="flex items-center gap-3 text-sm text-helix-dim">
-            {s.accuracy !== null && s.accuracy !== undefined && (
-              <span className="text-white font-medium">{(s.accuracy * 100).toFixed(1)}%</span>
-            )}
-            <span>{s.current_step}/{s.total_steps} steps</span>
-            <span className="ml-auto">{formatDuration(Math.round(s.elapsed_secs))}</span>
-          </div>
+            {/* Status pill */}
+            <div className="mb-1">
+              <span className={`inline-flex items-center gap-1.5 text-[11px] font-medium px-2.5 py-1 rounded-full ${
+                isComplete
+                  ? 'bg-emerald-500/10 text-emerald-400/90'
+                  : 'bg-amber-500/10 text-amber-400/80'
+              }`}>
+                <span className={`w-1.5 h-1.5 rounded-full ${isComplete ? 'bg-emerald-400' : 'bg-amber-400 animate-pulse'}`} />
+                {isComplete ? 'Complete' : 'In Progress'}
+              </span>
+            </div>
 
-          <div className="text-xs text-helix-dim mt-2">
-            {new Date(s.started_at * 1000).toLocaleDateString()} {new Date(s.started_at * 1000).toLocaleTimeString()}
-          </div>
-        </button>
-      ))}
+            {/* Accuracy Ring — centered hero */}
+            <div className="flex-1 flex items-center justify-center py-3">
+              <AccuracyRing accuracy={finalAcc} id={s.session_id} />
+            </div>
+
+            {/* Training progress bar */}
+            <div className="mb-5">
+              <div className="flex justify-between mb-1.5">
+                <span className="text-[11px] text-white/35 uppercase tracking-wider font-medium">Progress</span>
+                <span className="text-[11px] text-white/50 tabular-nums font-medium">{s.current_step}/{s.total_steps}</span>
+              </div>
+              <div className="h-1.5 rounded-full bg-white/[0.06] overflow-hidden">
+                <div
+                  className="h-full rounded-full transition-all duration-500"
+                  style={{
+                    width: `${Math.min(completion * 100, 100)}%`,
+                    background: isComplete
+                      ? 'linear-gradient(90deg, #34d399, #6ee7b7)'
+                      : 'linear-gradient(90deg, rgba(255,255,255,0.3), rgba(255,255,255,0.6))',
+                  }}
+                />
+              </div>
+            </div>
+
+            {/* Stats grid */}
+            <div className="grid grid-cols-2 gap-x-4 gap-y-2.5 pt-4 border-t border-white/[0.06]">
+              <div>
+                <p className="text-[11px] text-white/30 uppercase tracking-wider mb-0.5">Loss</p>
+                <p className="text-[13px] text-white font-medium tabular-nums">{finalLoss.toFixed(4)}</p>
+              </div>
+              <div>
+                <p className="text-[11px] text-white/30 uppercase tracking-wider mb-0.5">Duration</p>
+                <p className="text-[13px] text-white font-medium">{formatDuration(Math.round(s.elapsed_secs))}</p>
+              </div>
+              {(s.workers_active ?? 0) > 0 && (
+                <div>
+                  <p className="text-[11px] text-white/30 uppercase tracking-wider mb-0.5">Workers</p>
+                  <p className="text-[13px] text-white font-medium tabular-nums">{s.workers_active}</p>
+                </div>
+              )}
+              {(s.mac_checks_passed ?? 0) > 0 && (
+                <div>
+                  <p className="text-[11px] text-white/30 uppercase tracking-wider mb-0.5">Verified</p>
+                  <p className="text-[13px] text-emerald-400/80 font-medium tabular-nums">{s.mac_checks_passed} MAC</p>
+                </div>
+              )}
+              {(s.checkpoints_submitted ?? 0) > 0 && (
+                <div>
+                  <p className="text-[11px] text-white/30 uppercase tracking-wider mb-0.5">Checkpts</p>
+                  <p className="text-[13px] text-white font-medium tabular-nums">{s.checkpoints_submitted}</p>
+                </div>
+              )}
+            </div>
+          </button>
+        );
+      })}
     </div>
   );
 }
@@ -1977,11 +2080,26 @@ function TrainPageInner() {
   const [currentModelName, setCurrentModelName] = useState('');
 
   const [selectedModelId, setSelectedModelId] = useState<number | null>(null);
+  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
+  const [trainedSessions, setTrainedSessions] = useState<TrainedSession[]>([]);
   const [weightFetchStatus, setWeightFetchStatus] = useState<WeightFetchStatus>('idle');
   const [weightFetchError, setWeightFetchError] = useState<string | null>(null);
   const [fetchedModelName, setFetchedModelName] = useState<string | null>(null);
   const fetchingForRef = useRef<number | null>(null);
   const autoSelectAppliedRef = useRef(false);
+
+  // Fetch completed training sessions for "Continue Existing"
+  useEffect(() => {
+    const fetchSessions = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/training/sessions`);
+        if (!res.ok) return;
+        const sessions: TrainedSession[] = await res.json();
+        setTrainedSessions(sessions.filter(s => s.status === 'complete'));
+      } catch { /* non-fatal */ }
+    };
+    fetchSessions();
+  }, []);
 
   // Auto-select from query param
   useEffect(() => {
@@ -2073,7 +2191,52 @@ function TrainPageInner() {
   const handleSelectModel = useCallback((tokenId: number | null) => {
     fetchingForRef.current = null;
     setSelectedModelId(tokenId);
+    setSelectedSessionId(null); // Clear session selection
   }, []);
+
+  // When a trained session is selected, fetch its weights from the backend
+  const sessionFetchRef = useRef<string | null>(null);
+  const handleSelectSession = useCallback((sessionId: string | null) => {
+    setSelectedSessionId(sessionId);
+    setSelectedModelId(null); // Clear model selection
+    fetchingForRef.current = null;
+
+    if (!sessionId) {
+      setWeightFetchStatus('idle');
+      setFetchedModelName(null);
+      sessionFetchRef.current = null;
+      return;
+    }
+
+    if (sessionFetchRef.current === sessionId) return;
+    sessionFetchRef.current = sessionId;
+
+    const doFetch = async () => {
+      setWeightFetchStatus('fetching');
+      setFetchedModelName(null);
+
+      try {
+        const res = await fetch(`${API_BASE}/api/training/sessions/${sessionId}/model`);
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}`);
+        }
+        const weightsData = await res.json();
+        const weightsJson = JSON.stringify(weightsData);
+        const blob = new Blob([weightsJson], { type: 'application/json' });
+        const syntheticFile = new File([blob], `weights-from-session.json`, { type: 'application/json' });
+        await uploadWeights(syntheticFile);
+
+        const session = trainedSessions.find(s => s.session_id === sessionId);
+        setFetchedModelName(session?.model_name || 'Trained Model');
+        setWeightFetchStatus('done');
+      } catch {
+        setWeightFetchStatus('error');
+        sessionFetchRef.current = null;
+      }
+    };
+
+    doFetch();
+  }, [trainedSessions, uploadWeights]);
 
   const handleStart = async (config: TrainingJobConfig, opts: { storeOn0G: boolean; version: string; modelName: string; modelSlug: string }) => {
     pendingConfigRef.current = { config, opts };
@@ -2237,13 +2400,17 @@ function TrainPageInner() {
               workersOnline={workersOnline}
               defaultVersion={defaultVersion}
               models={models}
+              trainedSessions={trainedSessions}
               selectedModelId={selectedModelId}
+              selectedSessionId={selectedSessionId}
               onSelectModel={handleSelectModel}
+              onSelectSession={handleSelectSession}
               isFetchingWeights={isFetchingWeights}
               fetchedModelName={fetchedModelName}
               isWalletPrompting={isWalletPrompting}
               isConfirmingPayment={isConfirmingPayment}
               walletConnected={!!address}
+              userAddress={address}
             />
           ) : (
             <LiveProgress

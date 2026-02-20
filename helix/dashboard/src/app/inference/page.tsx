@@ -15,14 +15,13 @@ import {
   Clock,
   Users,
   Search,
-  HardDrive,
   X,
   Coins,
-  ExternalLink,
 } from 'lucide-react';
 import { useAccount, useSignMessage, useWriteContract, useWaitForTransactionReceipt, useChainId } from 'wagmi';
 import { parseEther } from 'viem';
 import { Badge } from '@/components/ui/Badge';
+import { ModelCard, TrainedSessionCard } from '@/components/ModelCard';
 import { cn } from '@/lib/utils';
 import { usePublicModels, type PublicModel } from '@/hooks/usePublicModels';
 import { useModelRegistry } from '@/hooks/useModelRegistry';
@@ -679,24 +678,25 @@ function InferencePageInner() {
   const [error, setError] = useState<string | null>(null);
   const [inputMode, setInputMode] = useState<InputMode>('draw');
 
-  // Auto-discover latest completed training session when no on-chain models
+  // Trained sessions from backend
+  const [trainedSessions, setTrainedSessions] = useState<{ session_id: string; model_name?: string; model_slug?: string; accuracy: number | null; status: string; losses: number[] }[]>([]);
+  const [isLoadingTrained, setIsLoadingTrained] = useState(true);
+
   useEffect(() => {
-    if (activeSessionId || allModels.length > 0) return;
-    const discover = async () => {
+    const fetchSessions = async () => {
       try {
         const res = await fetch(`${API_BASE}/api/training/sessions`);
         if (!res.ok) return;
         const sessions = await res.json();
         const completed = (Array.isArray(sessions) ? sessions : [])
-          .filter((s: { status: string }) => s.status === 'complete')
-          .pop();
-        if (completed) {
-          setActiveSessionId(completed.session_id);
-          setWeightFetchStatus('done');
-        }
+          .filter((s: { status: string }) => s.status === 'complete');
+        setTrainedSessions(completed);
+
+        // Don't auto-select — let user pick
       } catch { /* non-fatal */ }
+      finally { setIsLoadingTrained(false); }
     };
-    discover();
+    fetchSessions();
   }, [activeSessionId, allModels.length]);
 
   // Filtered models
@@ -721,6 +721,23 @@ function InferencePageInner() {
     }
     return models;
   }, [allModels, filter, search, address]);
+
+  // Filtered trained sessions (apply search + filter)
+  const filteredSessions = useMemo(() => {
+    let sessions = trainedSessions;
+    // "others" hides trained sessions (they're always yours)
+    if (filter === 'others') return [];
+    if (search.trim()) {
+      const q = search.toLowerCase();
+      sessions = sessions.filter((s) =>
+        (s.model_name ?? '').toLowerCase().includes(q),
+      );
+    }
+    return sessions;
+  }, [trainedSessions, filter, search]);
+
+  // Whether any item is currently selected (model or session)
+  const hasSelection = selectedModel !== null || (activeSessionId !== null && weightFetchStatus === 'done' && !selectedModel);
 
   // Fee calculation
   const ownerFeeBps = selectedModel?.inferenceFee ?? 0;
@@ -998,11 +1015,21 @@ function InferencePageInner() {
       ? weightsReady && hasDrawing && !isRunning && !!activeSessionId
       : backendWeightsReady && hasDrawing && !isRunning && !isPaymentPending && !isPaymentConfirming;
 
-  // Select model handler
+  // Select model handler (toggle: click again to deselect)
   const handleSelectModel = useCallback((model: PublicModel) => {
+    if (selectedModel?.tokenId === model.tokenId) {
+      // Deselect
+      fetchKeyRef.current = null;
+      setSelectedModel(null);
+      setSelectedVersionIndex(0);
+      setWeightFetchStatus('idle');
+      setWeightFetchError(null);
+      setActiveSessionId(null);
+      setBackendWeightsReady(false);
+      return;
+    }
     fetchKeyRef.current = null;
     setSelectedModel(model);
-    // Default to latest version
     setSelectedVersionIndex(model.versions.length > 0 ? model.versions.length - 1 : 0);
     setResult(null);
     setPhase('idle');
@@ -1011,7 +1038,28 @@ function InferencePageInner() {
     setWeightFetchError(null);
     setActiveSessionId(null);
     setBackendWeightsReady(false);
-  }, []);
+  }, [selectedModel]);
+
+  // Select trained session handler (toggle: click again to deselect)
+  const handleSelectSession = useCallback((session: { session_id: string; model_name?: string }) => {
+    if (!selectedModel && activeSessionId === session.session_id) {
+      // Deselect
+      fetchKeyRef.current = null;
+      setActiveSessionId(null);
+      setWeightFetchStatus('idle');
+      setWeightFetchError(null);
+      return;
+    }
+    fetchKeyRef.current = null;
+    setSelectedModel(null);
+    setActiveSessionId(session.session_id);
+    setWeightFetchStatus('done');
+    setWeightFetchError(null);
+    setBackendWeightsReady(false);
+    setResult(null);
+    setPhase('idle');
+    setError(null);
+  }, [selectedModel, activeSessionId]);
 
   return (
     <motion.div
@@ -1084,103 +1132,79 @@ function InferencePageInner() {
 
           {/* Model cards */}
           <div className="space-y-2 max-h-[420px] overflow-y-auto pr-1">
-            {isLoadingPublic ? (
+            {isLoadingPublic && isLoadingTrained ? (
               <div className="flex items-center justify-center py-12">
                 <Loader2 size={20} className="animate-spin text-helix-muted" />
               </div>
-            ) : filteredModels.length === 0 ? (
+            ) : filteredModels.length === 0 && filteredSessions.length === 0 ? (
               <div className="flex flex-col items-center justify-center py-12 rounded-2xl bg-helix-surface border border-helix-border">
                 <Search size={20} className="text-helix-dim mb-2" />
-                <p className="text-base text-helix-text2">
+                <p className="text-sm text-helix-text2">
                   {filter === 'mine' && !address ? 'Connect wallet to see your models' : 'No models found'}
                 </p>
-                {search && (
-                  <p className="text-sm text-helix-muted mt-1">Try a different search term</p>
-                )}
               </div>
             ) : (
-              filteredModels.map((model) => {
-                const isSelected = selectedModel?.tokenId === model.tokenId;
-                const lv = model.latestVersion;
-                return (
-                  <button
-                    key={model.tokenId}
-                    type="button"
-                    onClick={() => handleSelectModel(model)}
-                    className={cn(
-                      'w-full text-left px-4 py-3.5 rounded-2xl border transition-all',
-                      isSelected
-                        ? 'bg-white/[0.06] border-white/30'
-                        : 'bg-helix-surface border-helix-border hover:border-helix-border2',
-                    )}
-                  >
-                    <div className="flex items-center justify-between mb-1.5">
-                      <div className="flex items-center gap-2 min-w-0">
-                        <span className="text-base font-medium text-white truncate">{model.name}</span>
-                        {lv?.weightsStored && (
-                          <HardDrive size={12} className="text-green-400 shrink-0" />
-                        )}
-                      </div>
-                      {model.bestAccuracy > 0 && (
-                        <span className="text-sm font-mono text-green-400 shrink-0">
-                          {(model.bestAccuracy * 100).toFixed(1)}%
-                        </span>
-                      )}
-                    </div>
-                    <div className="flex items-center gap-3 text-sm text-helix-muted">
-                      {model.inferenceFee > 0 && (
-                        <span className="flex items-center gap-1">
-                          <Coins size={10} />
-                          {(model.inferenceFee / 100).toFixed(1)}% fee
-                        </span>
-                      )}
-                      {lv && (
-                        <span className="font-mono">v{lv.semver}</span>
-                      )}
-                      <span className="font-mono truncate ml-auto">
-                        {model.owner.slice(0, 6)}...{model.owner.slice(-4)}
-                      </span>
-                    </div>
-                  </button>
-                );
-              })
-            )}
-          </div>
+              <>
+                {/* Trained sessions */}
+                {filteredSessions.length > 0 && !selectedModel && (
+                  filteredSessions.map((session) => {
+                    const isSelected = !selectedModel && activeSessionId === session.session_id;
+                    if (activeSessionId && !selectedModel && !isSelected) return null;
+                    return (
+                      <TrainedSessionCard
+                        key={session.session_id}
+                        sessionId={session.session_id}
+                        name={session.model_name || 'Trained Model'}
+                        accuracy={session.accuracy}
+                        isSelected={isSelected}
+                        onSelect={() => handleSelectSession(session)}
+                      />
+                    );
+                  })
+                )}
 
-          {/* Divider */}
-          <div className="flex items-center gap-3 py-1">
-            <div className="flex-1 border-t border-helix-border" />
-            <span className="text-sm text-helix-dim">or</span>
-            <div className="flex-1 border-t border-helix-border" />
+                {/* On-chain models */}
+                {filteredModels.length > 0 && !(activeSessionId && !selectedModel) && (
+                  filteredModels.map((model) => {
+                    const isSelected = selectedModel?.tokenId === model.tokenId;
+                    if (selectedModel && !isSelected) return null;
+                    return (
+                      <ModelCard
+                        key={model.tokenId}
+                        id={String(model.tokenId)}
+                        name={model.name}
+                        accuracy={model.bestAccuracy}
+                        isSelected={isSelected}
+                        onSelect={() => handleSelectModel(model)}
+                        versions={model.versions}
+                        selectedVersionIndex={selectedVersionIndex}
+                        onVersionChange={(idx) => {
+                          setSelectedVersionIndex(idx);
+                          fetchKeyRef.current = null;
+                          setWeightFetchStatus('idle');
+                          setWeightFetchError(null);
+                          setBackendWeightsReady(false);
+                          setActiveSessionId(null);
+                        }}
+                        ownerAddress={model.owner}
+                        userAddress={address}
+                        tokenId={model.tokenId}
+                      />
+                    );
+                  })
+                )}
+              </>
+            )}
           </div>
 
           {/* Manual weight upload */}
-          <div
-            className={cn(
-              'flex items-center justify-between px-5 py-3.5 rounded-2xl border transition-colors',
-              weightFetchStatus === 'done' && !selectedModel
-                ? 'bg-green-500/[0.04] border-green-500/15'
-                : 'bg-helix-surface border-helix-border',
-            )}
-          >
+          <div className="flex items-center justify-between px-5 py-3 rounded-2xl bg-helix-surface border border-helix-border">
             <div className="flex items-center gap-3 min-w-0">
-              {weightFetchStatus === 'done' && !selectedModel ? (
-                <CheckCircle size={16} className="text-green-400 shrink-0" />
-              ) : (
-                <Upload size={16} className="text-helix-muted shrink-0" />
-              )}
-              <div className="min-w-0">
-                <p className={cn(
-                  'text-base truncate',
-                  weightFetchStatus === 'done' && !selectedModel ? 'text-green-300' : 'text-helix-text2',
-                )}>
-                  Upload Weights
-                  <span className="text-helix-dim ml-1.5">.json</span>
-                </p>
-              </div>
+              <Upload size={14} className="text-helix-muted shrink-0" />
+              <span className="text-sm text-helix-text2">Upload weights</span>
             </div>
-            <label className="shrink-0 px-3.5 py-1.5 rounded-xl bg-white/[0.06] text-xs text-helix-text2 hover:text-white hover:bg-white/[0.1] transition-colors cursor-pointer">
-              Upload
+            <label className="shrink-0 h-7 px-3 inline-flex items-center rounded-lg bg-white/[0.06] text-xs text-helix-text2 hover:text-white hover:bg-white/[0.1] transition-colors cursor-pointer">
+              Browse
               <input
                 ref={weightsFileRef}
                 type="file"
@@ -1198,57 +1222,21 @@ function InferencePageInner() {
             </label>
           </div>
 
-          {/* Weight fetch status */}
+          {/* Weight status — only errors and loading */}
           <AnimatePresence mode="wait">
-            {weightFetchStatus === 'fetching' && (
+            {(weightFetchStatus === 'fetching' || weightFetchStatus === 'decrypting' || weightFetchStatus === 'uploading') && (
               <motion.div
-                key="fetching"
+                key="loading"
                 initial={{ opacity: 0, y: -4 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: -4 }}
-                className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-white/[0.03] border border-white/[0.06]"
+                className="flex items-center gap-3 px-4 py-2.5 rounded-2xl bg-white/[0.03] border border-white/[0.06]"
               >
-                <Loader2 size={14} className="animate-spin text-white" />
-                <span className="text-sm text-helix-text2">Fetching weights from 0G...</span>
-              </motion.div>
-            )}
-            {weightFetchStatus === 'decrypting' && (
-              <motion.div
-                key="decrypting"
-                initial={{ opacity: 0, y: -4 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -4 }}
-                className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-white/[0.03] border border-white/[0.06]"
-              >
-                <Loader2 size={14} className="animate-spin text-white" />
-                <span className="text-sm text-helix-text2">Decrypting weights (sign wallet prompt)...</span>
-              </motion.div>
-            )}
-            {weightFetchStatus === 'uploading' && (
-              <motion.div
-                key="uploading"
-                initial={{ opacity: 0, y: -4 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -4 }}
-                className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-white/[0.03] border border-white/[0.06]"
-              >
-                <Loader2 size={14} className="animate-spin text-white" />
-                <span className="text-sm text-helix-text2">Uploading to MPC workers...</span>
-              </motion.div>
-            )}
-            {weightFetchStatus === 'done' && selectedModel && (
-              <motion.div
-                key="done"
-                initial={{ opacity: 0, y: -4 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -4 }}
-                className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-green-500/[0.06] border border-green-500/20"
-              >
-                <CheckCircle size={14} className="text-green-400" />
-                <span className="text-sm text-green-300">
-                  <span className="font-medium">{selectedModel.name}</span>
-                  {selectedVersion && <span className="text-green-400/60 ml-1"> {selectedVersion.semver || `v${selectedVersionIndex + 1}`}</span>}
-                  <span className="text-green-400/60 ml-1.5">weights loaded</span>
+                <Loader2 size={12} className="animate-spin text-white/60" />
+                <span className="text-xs text-white/50">
+                  {weightFetchStatus === 'fetching' ? 'Fetching weights...'
+                    : weightFetchStatus === 'decrypting' ? 'Decrypting...'
+                    : 'Uploading to workers...'}
                 </span>
               </motion.div>
             )}
@@ -1258,53 +1246,13 @@ function InferencePageInner() {
                 initial={{ opacity: 0, y: -4 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: -4 }}
-                className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-red-500/[0.06] border border-red-500/20"
+                className="flex items-center gap-3 px-4 py-2.5 rounded-2xl bg-red-500/[0.06] border border-red-500/20"
               >
-                <AlertTriangle size={14} className="text-red-400" />
-                <span className="text-sm text-red-300 truncate">{weightFetchError}</span>
-              </motion.div>
-            )}
-            {selectedModel && selectedVersion && !selectedVersion.weightsStored && weightFetchStatus === 'idle' && (
-              <motion.div
-                key="no-weights"
-                initial={{ opacity: 0, y: -4 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -4 }}
-                className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-yellow-500/[0.06] border border-yellow-500/20"
-              >
-                <AlertTriangle size={14} className="text-yellow-400" />
-                <span className="text-sm text-yellow-300/80">No stored weights — upload manually below</span>
+                <AlertTriangle size={12} className="text-red-400" />
+                <span className="text-xs text-red-300 truncate">{weightFetchError}</span>
               </motion.div>
             )}
           </AnimatePresence>
-
-          {/* Version selector (only show when model has multiple versions) */}
-          {selectedModel && selectedModel.versions.length > 1 && (
-            <div className="rounded-2xl bg-helix-surface border border-helix-border p-4">
-              <label className="text-xs text-helix-muted block mb-2">Version</label>
-              <select
-                value={selectedVersionIndex}
-                onChange={(e) => {
-                  const idx = Number(e.target.value);
-                  setSelectedVersionIndex(idx);
-                  // Reset weight fetch so it re-triggers for the new version
-                  fetchKeyRef.current = null;
-                  setWeightFetchStatus('idle');
-                  setWeightFetchError(null);
-                  setBackendWeightsReady(false);
-                  setActiveSessionId(null);
-                }}
-                className="w-full px-3 py-2.5 bg-helix-bg border border-helix-border rounded-xl text-sm text-white focus:outline-none focus:border-helix-border2 transition-colors"
-              >
-                {selectedModel.versions.map((v, i) => (
-                  <option key={i} value={i}>
-                    {v.semver || `v${i + 1}`} — {(v.accuracy * 100).toFixed(1)}% accuracy
-                    {i === selectedModel.versions.length - 1 ? ' (latest)' : ''}
-                  </option>
-                ))}
-              </select>
-            </div>
-          )}
         </div>
 
         {/* ── RIGHT COLUMN: Fee, Input, Results ────────────────── */}

@@ -2,6 +2,7 @@
 
 import Sidebar from './Sidebar';
 import Header from './Header';
+import { TrainingWidget } from '@/components/ui/TrainingWidget';
 
 interface AppShellProps {
   children: React.ReactNode;
@@ -17,6 +18,7 @@ export default function AppShell({ children }: AppShellProps) {
           {children}
         </main>
       </div>
+      <TrainingWidget />
     </div>
   );
 }

@@ -657,19 +657,636 @@ function VersionRow({ version }: { version: OnChainVersion }) {
 }
 
 // ============================================================================
+// Model Detail Modal
+// ============================================================================
+
+function getMockFinancials(tokenId: number, versionCount: number) {
+  const seed = ((tokenId * 2654435761) >>> 0) % 10000;
+  const trainingCost = 0.008 * Math.max(versionCount, 1) + seed / 100000;
+  const inferenceCount = Math.floor(seed / 2 + versionCount * 45);
+  const revenuePerInference = 0.001 + (seed % 50) / 50000;
+  const inferenceRevenue = inferenceCount * revenuePerInference;
+  return { trainingCost, inferenceRevenue, inferenceCount };
+}
+
+interface ModelDetailModalProps {
+  model: ModelWithVersions | null;
+  onClose: () => void;
+  onTogglePublic: (model: ModelWithVersions) => void;
+  onDownloadWeights: (model: ModelWithVersions) => void;
+  onAddVersion: (model: ModelWithVersions) => void;
+  isToggling: boolean;
+  isDownloading: number | null;
+}
+
+function ModelDetailModal({
+  model,
+  onClose,
+  onTogglePublic,
+  onDownloadWeights,
+  onAddVersion,
+  isToggling,
+  isDownloading,
+}: ModelDetailModalProps) {
+  const [copiedHash, setCopiedHash] = useState<string | null>(null);
+
+  const handleEscape = useCallback((e: KeyboardEvent) => {
+    if (e.key === 'Escape') onClose();
+  }, [onClose]);
+
+  useEffect(() => {
+    if (model) {
+      document.addEventListener('keydown', handleEscape);
+      document.body.style.overflow = 'hidden';
+    }
+    return () => {
+      document.removeEventListener('keydown', handleEscape);
+      document.body.style.overflow = '';
+    };
+  }, [model, handleEscape]);
+
+  const bestAccuracy = model
+    ? model.versions.reduce((best, v) => (v.accuracy > best ? v.accuracy : best), 0)
+    : 0;
+  const mockLoss = bestAccuracy > 0 ? ((1 - bestAccuracy) * 0.4 + 0.008) : null;
+  const tags = model ? getModelTags(model) : [];
+  const financials = model ? getMockFinancials(model.tokenId, model.versions.length) : null;
+  const latestWithWeights = model
+    ? [...model.versions].reverse().find((v) => v.weightsStored && v.rootHash)
+    : null;
+  const isThisDownloading = model ? isDownloading === model.tokenId : false;
+  const reversedVersions = model ? [...model.versions].reverse() : [];
+
+  const copyHash = (hash: string) => {
+    navigator.clipboard.writeText(hash);
+    setCopiedHash(hash);
+    setTimeout(() => setCopiedHash(null), 2000);
+  };
+
+  return (
+    <AnimatePresence>
+      {model && (
+        <motion.div
+          key="detail-backdrop"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.2 }}
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-[6px]"
+          onClick={onClose}
+        >
+          <motion.div
+            key="detail-panel"
+            initial={{ opacity: 0, scale: 0.96, y: 10 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.96, y: 10 }}
+            transition={{ type: 'spring', damping: 26, stiffness: 300 }}
+            className="bg-[#111113] border border-white/[0.08] rounded-2xl max-w-[700px] w-full mx-4 max-h-[88vh] overflow-hidden flex flex-col relative shadow-2xl shadow-black/40"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Top gradient line */}
+            <div className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-white/15 to-transparent rounded-t-2xl z-10" />
+
+            {/* Close */}
+            <button
+              type="button"
+              onClick={onClose}
+              className="absolute top-5 right-5 z-10 p-1.5 rounded-full bg-white/[0.06] hover:bg-white/[0.1] text-helix-muted hover:text-white transition-all"
+            >
+              <X size={16} />
+            </button>
+
+            {/* Scrollable content */}
+            <div className="overflow-y-auto flex-1">
+              {/* Header */}
+              <div className="px-8 pt-8 pb-2">
+                <div className="flex items-start gap-4">
+                  <div className="w-12 h-12 rounded-xl bg-white/[0.06] flex items-center justify-center shrink-0">
+                    <Layers size={22} className="text-white/80" />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <h2 className="text-xl font-semibold text-white tracking-tight">{model.name}</h2>
+                    <div className="flex items-center gap-2 mt-1">
+                      <span className="text-sm font-mono text-helix-muted">{model.slug}</span>
+                      <span className="text-helix-dim">&middot;</span>
+                      <span className="text-sm text-helix-muted">#{model.tokenId}</span>
+                    </div>
+                  </div>
+                </div>
+
+                {model.description && (
+                  <p className="text-sm text-helix-text2 mt-3 leading-relaxed">{model.description}</p>
+                )}
+
+                <div className="flex items-center gap-2 mt-3 flex-wrap">
+                  {tags.map((tag) => (
+                    <span key={tag} className="px-2.5 py-0.5 text-2xs rounded-full bg-white/[0.04] text-helix-text2 border border-white/[0.06]">
+                      {tag}
+                    </span>
+                  ))}
+                  <span className="text-2xs text-helix-dim">
+                    Created {formatDate(model.createdAt)}
+                  </span>
+                </div>
+              </div>
+
+              {/* Hero Accuracy */}
+              <div className="text-center py-8 px-8">
+                <div className="inline-flex flex-col items-center">
+                  {bestAccuracy > 0 ? (
+                    <>
+                      <span className="text-[56px] font-semibold tracking-tighter text-white font-mono leading-none">
+                        {(bestAccuracy * 100).toFixed(1)}
+                        <span className="text-[28px] text-helix-text2 font-normal ml-0.5">%</span>
+                      </span>
+                      <span className="text-sm text-helix-muted mt-2">Best Accuracy</span>
+                    </>
+                  ) : (
+                    <>
+                      <span className="text-[56px] font-semibold tracking-tighter text-helix-dim font-mono leading-none">--</span>
+                      <span className="text-sm text-helix-muted mt-2">No accuracy data yet</span>
+                    </>
+                  )}
+                </div>
+              </div>
+
+              {/* Stats Row */}
+              <div className="px-8 pb-6">
+                <div className="grid grid-cols-3 gap-3">
+                  <div className="bg-white/[0.03] rounded-xl px-4 py-3.5 text-center">
+                    <p className="text-lg font-mono font-medium text-white tracking-tight">
+                      {mockLoss !== null ? mockLoss.toFixed(4) : '--'}
+                    </p>
+                    <p className="text-2xs text-helix-muted mt-1 uppercase tracking-wider">Latest Loss</p>
+                  </div>
+                  <div className="bg-white/[0.03] rounded-xl px-4 py-3.5 text-center">
+                    <p className="text-lg font-mono font-medium text-white tracking-tight">
+                      {financials ? financials.trainingCost.toFixed(3) : '--'}
+                      <span className="text-xs text-helix-muted ml-1">ETH</span>
+                    </p>
+                    <p className="text-2xs text-helix-muted mt-1 uppercase tracking-wider">Training Spent</p>
+                  </div>
+                  <div className="bg-white/[0.03] rounded-xl px-4 py-3.5 text-center">
+                    <p className="text-lg font-mono font-medium text-green-400 tracking-tight">
+                      {financials ? financials.inferenceRevenue.toFixed(3) : '--'}
+                      <span className="text-xs text-green-400/60 ml-1">ETH</span>
+                    </p>
+                    <p className="text-2xs text-helix-muted mt-1 uppercase tracking-wider">Revenue</p>
+                  </div>
+                </div>
+                {financials && financials.inferenceCount > 0 && (
+                  <p className="text-2xs text-helix-dim text-center mt-2.5">
+                    {financials.inferenceCount.toLocaleString()} total inferences &middot; {(model.inferenceFee / 100).toFixed(1)}% commission
+                  </p>
+                )}
+              </div>
+
+              {/* Divider */}
+              <div className="mx-8 h-px bg-white/[0.06]" />
+
+              {/* Version History */}
+              <div className="px-8 py-6">
+                <h3 className="text-sm font-medium text-white mb-4">
+                  Version History
+                  <span className="text-helix-dim ml-2 font-normal">{model.versions.length}</span>
+                </h3>
+
+                {reversedVersions.length === 0 ? (
+                  <p className="text-sm text-helix-dim py-3">No versions registered yet</p>
+                ) : (
+                  <div className="space-y-1">
+                    {reversedVersions.map((v, i) => {
+                      const barWidth = bestAccuracy > 0 ? (v.accuracy / bestAccuracy) * 100 : 0;
+                      const isLatest = i === 0;
+                      return (
+                        <div
+                          key={`${v.semver}-${i}`}
+                          className={cn(
+                            'flex items-center gap-3 py-2.5 px-3 rounded-lg transition-colors',
+                            isLatest ? 'bg-white/[0.03]' : 'hover:bg-white/[0.02]',
+                          )}
+                        >
+                          <span className={cn(
+                            'text-xs font-mono w-14 shrink-0',
+                            isLatest ? 'text-white' : 'text-helix-text2',
+                          )}>
+                            v{v.semver}
+                          </span>
+
+                          <div className="flex-1 h-1 bg-white/[0.04] rounded-full overflow-hidden">
+                            <motion.div
+                              initial={{ width: 0 }}
+                              animate={{ width: `${barWidth}%` }}
+                              transition={{ duration: 0.6, delay: i * 0.08, ease: [0.25, 0.1, 0.25, 1] }}
+                              className={cn(
+                                'h-full rounded-full',
+                                isLatest ? 'bg-white/40' : 'bg-white/20',
+                              )}
+                            />
+                          </div>
+
+                          <span className={cn(
+                            'text-sm font-mono w-14 text-right shrink-0',
+                            isLatest ? 'text-white' : 'text-helix-text2',
+                          )}>
+                            {v.accuracy > 0 ? `${(v.accuracy * 100).toFixed(1)}%` : '--'}
+                          </span>
+
+                          {v.weightsStored && (
+                            <span className="flex items-center gap-1 text-green-400/70 text-2xs shrink-0">
+                              <HardDrive size={9} />
+                              0G
+                            </span>
+                          )}
+
+                          <span className="text-2xs text-helix-dim w-20 text-right shrink-0">
+                            {formatDate(v.timestamp)}
+                          </span>
+
+                          {v.rootHash && (
+                            <button
+                              type="button"
+                              onClick={() => copyHash(v.rootHash)}
+                              className="p-1 rounded text-helix-dim hover:text-white transition-colors shrink-0"
+                              title={copiedHash === v.rootHash ? 'Copied!' : 'Copy hash'}
+                            >
+                              {copiedHash === v.rootHash ? <CheckCircle size={12} className="text-green-400" /> : <Copy size={12} />}
+                            </button>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              {/* Divider */}
+              <div className="mx-8 h-px bg-white/[0.06]" />
+
+              {/* Settings */}
+              <div className="px-8 py-6">
+                <h3 className="text-sm font-medium text-white mb-4">Settings</h3>
+
+                <div className="space-y-5">
+                  {/* Visibility toggle */}
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <p className="text-sm text-white">Visibility</p>
+                      <p className="text-2xs text-helix-muted mt-0.5">
+                        {model.isPublic ? 'Anyone can use this model for inference' : 'Only you can access this model'}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => onTogglePublic(model)}
+                      disabled={isToggling}
+                      className={cn(
+                        'relative inline-flex h-7 w-12 items-center rounded-full transition-colors duration-300 focus:outline-none',
+                        model.isPublic ? 'bg-green-500' : 'bg-white/[0.1]',
+                        isToggling && 'opacity-50 cursor-not-allowed',
+                      )}
+                    >
+                      <span
+                        className={cn(
+                          'inline-block h-5 w-5 rounded-full bg-white shadow-sm transition-transform duration-200',
+                          model.isPublic ? 'translate-x-6' : 'translate-x-1',
+                        )}
+                      />
+                    </button>
+                  </div>
+
+                  {/* Inference Fee */}
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <p className="text-sm text-white">Inference Fee</p>
+                      <p className="text-2xs text-helix-muted mt-0.5">Commission earned per inference</p>
+                    </div>
+                    <span className="text-sm font-mono text-helix-text2">
+                      {(model.inferenceFee / 100).toFixed(1)}%
+                    </span>
+                  </div>
+
+                  {/* Token ID */}
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <p className="text-sm text-white">Token ID</p>
+                      <p className="text-2xs text-helix-muted mt-0.5">ERC-721 on-chain identifier</p>
+                    </div>
+                    <span className="text-sm font-mono text-helix-text2">#{model.tokenId}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Sticky Action Bar */}
+            <div className="px-8 py-5 border-t border-white/[0.06] bg-[#111113] flex items-center gap-3">
+              <Link
+                href={`/train?model=${model.tokenId}`}
+                className="flex-1 flex items-center justify-center gap-2 py-3 rounded-xl bg-white text-black text-sm font-medium hover:bg-white/90 transition-colors"
+              >
+                <Play size={15} />
+                Train
+              </Link>
+
+              <button
+                type="button"
+                onClick={() => { onClose(); onAddVersion(model); }}
+                className="flex-1 flex items-center justify-center gap-2 py-3 rounded-xl bg-white/[0.06] border border-white/[0.08] text-sm text-white hover:bg-white/[0.1] transition-colors"
+              >
+                <Plus size={15} />
+                Add Version
+              </button>
+
+              {latestWithWeights && (
+                <button
+                  type="button"
+                  onClick={() => onDownloadWeights(model)}
+                  disabled={isThisDownloading}
+                  className={cn(
+                    'flex items-center justify-center gap-2 px-5 py-3 rounded-xl bg-white/[0.06] border border-white/[0.08] text-sm text-white hover:bg-white/[0.1] transition-colors',
+                    isThisDownloading && 'opacity-50 cursor-not-allowed',
+                  )}
+                >
+                  {isThisDownloading ? <Loader2 size={15} className="animate-spin" /> : <Download size={15} />}
+                </button>
+              )}
+            </div>
+          </motion.div>
+        </motion.div>
+      )}
+    </AnimatePresence>
+  );
+}
+
+// ============================================================================
+// Trained Model Detail Modal
+// ============================================================================
+
+function formatDuration(secs: number): string {
+  if (secs < 60) return `${Math.round(secs)}s`;
+  const mins = Math.floor(secs / 60);
+  const rem = Math.round(secs % 60);
+  return rem > 0 ? `${mins}m ${rem}s` : `${mins}m`;
+}
+
+function getMockTrainedFinancials(sessionId: string) {
+  let seed = 0;
+  for (let i = 0; i < sessionId.length; i++) seed = ((seed << 5) - seed + sessionId.charCodeAt(i)) | 0;
+  seed = Math.abs(seed) % 10000;
+  const trainingCost = 0.01 + seed / 200000;
+  const inferenceCount = Math.floor(seed / 3 + 20);
+  const inferenceRevenue = inferenceCount * (0.001 + (seed % 30) / 30000);
+  return { trainingCost, inferenceRevenue, inferenceCount };
+}
+
+interface TrainedModelDetailModalProps {
+  session: TrainingSessionState | null;
+  onClose: () => void;
+  onDownload: (sessionId: string) => void;
+}
+
+function TrainedModelDetailModal({ session, onClose, onDownload }: TrainedModelDetailModalProps) {
+  const handleEscape = useCallback((e: KeyboardEvent) => {
+    if (e.key === 'Escape') onClose();
+  }, [onClose]);
+
+  useEffect(() => {
+    if (session) {
+      document.addEventListener('keydown', handleEscape);
+      document.body.style.overflow = 'hidden';
+    }
+    return () => {
+      document.removeEventListener('keydown', handleEscape);
+      document.body.style.overflow = '';
+    };
+  }, [session, handleEscape]);
+
+  if (!session) return null;
+
+  const name = session.model_name || 'Unnamed Model';
+  const slug = session.model_slug || session.session_id.slice(0, 8);
+  const accuracy = session.accuracy;
+  const latestLoss = session.losses.length > 0 ? session.losses[session.losses.length - 1] : session.current_loss;
+  const steps = session.losses.length || session.current_step;
+  const financials = getMockTrainedFinancials(session.session_id);
+  const startedAt = session.started_at > 0
+    ? new Date(session.started_at * 1000).toLocaleDateString()
+    : '--';
+
+  return (
+    <AnimatePresence>
+      {session && (
+        <motion.div
+          key="trained-detail-backdrop"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.2 }}
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-[6px]"
+          onClick={onClose}
+        >
+          <motion.div
+            key="trained-detail-panel"
+            initial={{ opacity: 0, scale: 0.96, y: 10 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.96, y: 10 }}
+            transition={{ type: 'spring', damping: 26, stiffness: 300 }}
+            className="bg-[#111113] border border-white/[0.08] rounded-2xl max-w-[700px] w-full mx-4 max-h-[88vh] overflow-hidden flex flex-col relative shadow-2xl shadow-black/40"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Top gradient line */}
+            <div className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-green-400/20 to-transparent rounded-t-2xl z-10" />
+
+            {/* Close */}
+            <button
+              type="button"
+              onClick={onClose}
+              className="absolute top-5 right-5 z-10 p-1.5 rounded-full bg-white/[0.06] hover:bg-white/[0.1] text-helix-muted hover:text-white transition-all"
+            >
+              <X size={16} />
+            </button>
+
+            {/* Scrollable content */}
+            <div className="overflow-y-auto flex-1">
+              {/* Header */}
+              <div className="px-8 pt-8 pb-2">
+                <div className="flex items-start gap-4">
+                  <div className="w-12 h-12 rounded-xl bg-green-500/[0.08] flex items-center justify-center shrink-0">
+                    <Layers size={22} className="text-green-400" />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <h2 className="text-xl font-semibold text-white tracking-tight">{name}</h2>
+                    <div className="flex items-center gap-2 mt-1">
+                      <span className="text-sm font-mono text-helix-muted">{slug}</span>
+                      <span className="text-helix-dim">&middot;</span>
+                      <span className="text-2xs px-2 py-0.5 rounded-full bg-green-500/10 text-green-400 border border-green-500/20">Trained</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2 mt-3 flex-wrap">
+                  <span className="text-2xs text-helix-dim">
+                    Trained {startedAt}
+                  </span>
+                  {session.elapsed_secs > 0 && (
+                    <>
+                      <span className="text-helix-dim">&middot;</span>
+                      <span className="text-2xs text-helix-dim">
+                        {formatDuration(session.elapsed_secs)} elapsed
+                      </span>
+                    </>
+                  )}
+                </div>
+              </div>
+
+              {/* Hero Accuracy */}
+              <div className="text-center py-8 px-8">
+                <div className="inline-flex flex-col items-center">
+                  {accuracy != null && accuracy > 0 ? (
+                    <>
+                      <span className="text-[56px] font-semibold tracking-tighter text-white font-mono leading-none">
+                        {(accuracy * 100).toFixed(1)}
+                        <span className="text-[28px] text-helix-text2 font-normal ml-0.5">%</span>
+                      </span>
+                      <span className="text-sm text-helix-muted mt-2">Accuracy</span>
+                    </>
+                  ) : (
+                    <>
+                      <span className="text-[56px] font-semibold tracking-tighter text-helix-dim font-mono leading-none">--</span>
+                      <span className="text-sm text-helix-muted mt-2">No accuracy data yet</span>
+                    </>
+                  )}
+                </div>
+              </div>
+
+              {/* Stats Row */}
+              <div className="px-8 pb-6">
+                <div className="grid grid-cols-3 gap-3">
+                  <div className="bg-white/[0.03] rounded-xl px-4 py-3.5 text-center">
+                    <p className="text-lg font-mono font-medium text-white tracking-tight">
+                      {latestLoss != null ? latestLoss.toFixed(4) : '--'}
+                    </p>
+                    <p className="text-2xs text-helix-muted mt-1 uppercase tracking-wider">Latest Loss</p>
+                  </div>
+                  <div className="bg-white/[0.03] rounded-xl px-4 py-3.5 text-center">
+                    <p className="text-lg font-mono font-medium text-white tracking-tight">
+                      {financials.trainingCost.toFixed(3)}
+                      <span className="text-xs text-helix-muted ml-1">ETH</span>
+                    </p>
+                    <p className="text-2xs text-helix-muted mt-1 uppercase tracking-wider">Training Spent</p>
+                  </div>
+                  <div className="bg-white/[0.03] rounded-xl px-4 py-3.5 text-center">
+                    <p className="text-lg font-mono font-medium text-green-400 tracking-tight">
+                      {financials.inferenceRevenue.toFixed(3)}
+                      <span className="text-xs text-green-400/60 ml-1">ETH</span>
+                    </p>
+                    <p className="text-2xs text-helix-muted mt-1 uppercase tracking-wider">Revenue</p>
+                  </div>
+                </div>
+                {financials.inferenceCount > 0 && (
+                  <p className="text-2xs text-helix-dim text-center mt-2.5">
+                    {financials.inferenceCount.toLocaleString()} total inferences
+                  </p>
+                )}
+              </div>
+
+              {/* Divider */}
+              <div className="mx-8 h-px bg-white/[0.06]" />
+
+              {/* Training Details */}
+              <div className="px-8 py-6">
+                <h3 className="text-sm font-medium text-white mb-4">Training Details</h3>
+
+                <div className="space-y-3.5">
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm text-helix-text2">Steps Completed</span>
+                    <span className="text-sm font-mono text-white">{steps}</span>
+                  </div>
+
+                  {session.workers_active != null && session.workers_active > 0 && (
+                    <div className="flex items-center justify-between">
+                      <span className="text-sm text-helix-text2">Workers</span>
+                      <span className="text-sm font-mono text-white">{session.workers_active}</span>
+                    </div>
+                  )}
+
+                  {session.mac_checks_passed > 0 && (
+                    <div className="flex items-center justify-between">
+                      <span className="text-sm text-helix-text2">MAC Checks Passed</span>
+                      <span className="text-sm font-mono text-green-400">{session.mac_checks_passed}</span>
+                    </div>
+                  )}
+
+                  {session.checkpoints_submitted > 0 && (
+                    <div className="flex items-center justify-between">
+                      <span className="text-sm text-helix-text2">Checkpoints</span>
+                      <span className="text-sm font-mono text-white">{session.checkpoints_submitted}</span>
+                    </div>
+                  )}
+
+                  {session.zk_proofs_generated > 0 && (
+                    <div className="flex items-center justify-between">
+                      <span className="text-sm text-helix-text2">ZK Proofs</span>
+                      <span className="text-sm font-mono text-white">{session.zk_proofs_generated}</span>
+                    </div>
+                  )}
+
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm text-helix-text2">Session</span>
+                    <span className="text-xs font-mono text-helix-muted">{session.session_id.slice(0, 16)}...</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Sticky Action Bar */}
+            <div className="px-8 py-5 border-t border-white/[0.06] bg-[#111113] flex items-center gap-3">
+              <button
+                type="button"
+                onClick={() => onDownload(session.session_id)}
+                className="flex-1 flex items-center justify-center gap-2 py-3 rounded-xl bg-white text-black text-sm font-medium hover:bg-white/90 transition-colors"
+              >
+                <Download size={15} />
+                Download Weights
+              </button>
+
+              <Link
+                href="/train"
+                className="flex-1 flex items-center justify-center gap-2 py-3 rounded-xl bg-white/[0.06] border border-white/[0.08] text-sm text-white hover:bg-white/[0.1] transition-colors"
+              >
+                <Play size={15} />
+                Train More
+              </Link>
+
+              <Link
+                href="/inference"
+                className="flex items-center justify-center gap-2 px-5 py-3 rounded-xl bg-white/[0.06] border border-white/[0.08] text-sm text-white hover:bg-white/[0.1] transition-colors"
+              >
+                <Shield size={15} />
+              </Link>
+            </div>
+          </motion.div>
+        </motion.div>
+      )}
+    </AnimatePresence>
+  );
+}
+
+// ============================================================================
 // Model Card
 // ============================================================================
 
 interface ModelCardProps {
   model: ModelWithVersions;
+  onClickCard: (model: ModelWithVersions) => void;
   onAddVersion: (model: ModelWithVersions) => void;
   onTogglePublic: (model: ModelWithVersions) => void;
   onDownloadWeights: (model: ModelWithVersions) => void;
   isToggling: boolean;
-  isDownloading: number | null; // tokenId being downloaded
+  isDownloading: number | null;
 }
 
-function ModelCard({ model, onAddVersion, onTogglePublic, onDownloadWeights, isToggling, isDownloading }: ModelCardProps) {
+function ModelCard({ model, onClickCard, onAddVersion, onTogglePublic, onDownloadWeights, isToggling, isDownloading }: ModelCardProps) {
   const [expanded, setExpanded] = useState(false);
   const tags = useMemo(() => getModelTags(model), [model]);
 
@@ -683,7 +1300,7 @@ function ModelCard({ model, onAddVersion, onTogglePublic, onDownloadWeights, isT
   const isThisDownloading = isDownloading === model.tokenId;
 
   return (
-    <Card variant="glass" hover className="flex flex-col h-full">
+    <Card variant="glass" hover className="flex flex-col h-full cursor-pointer" onClick={() => onClickCard(model)}>
       {/* Header */}
       <div className="flex items-start justify-between mb-4">
         <div className="flex items-center gap-3">
@@ -758,7 +1375,7 @@ function ModelCard({ model, onAddVersion, onTogglePublic, onDownloadWeights, isT
 
       {/* Version History Toggle */}
       {versionCount > 0 && (
-        <div className="mb-3">
+        <div className="mb-3" onClick={(e) => e.stopPropagation()}>
           <button
             type="button"
             onClick={() => setExpanded(!expanded)}
@@ -790,7 +1407,7 @@ function ModelCard({ model, onAddVersion, onTogglePublic, onDownloadWeights, isT
       )}
 
       {/* Actions - pinned to bottom */}
-      <div className="flex items-center gap-2 flex-wrap pt-3 border-t border-helix-border/50 mt-auto">
+      <div className="flex items-center gap-2 flex-wrap pt-3 border-t border-helix-border/50 mt-auto" onClick={(e) => e.stopPropagation()}>
         <Link
           href={`/my-models/${model.tokenId}`}
           className="flex items-center gap-2 px-4 py-2 rounded-lg bg-white text-black text-sm font-medium hover:bg-white/90 transition-colors"
@@ -861,9 +1478,10 @@ function ModelCard({ model, onAddVersion, onTogglePublic, onDownloadWeights, isT
 // Trained Model Card (from backend sessions)
 // ============================================================================
 
-function TrainedModelCard({ session, onDownload }: {
+function TrainedModelCard({ session, onDownload, onClickCard }: {
   session: TrainingSessionState;
   onDownload: (sessionId: string) => void;
+  onClickCard: (session: TrainingSessionState) => void;
 }) {
   const name = session.model_name || 'Unnamed Model';
   const slug = session.model_slug || session.session_id.slice(0, 8);
@@ -874,7 +1492,7 @@ function TrainedModelCard({ session, onDownload }: {
     : '--';
 
   return (
-    <Card variant="glass" hover className="flex flex-col h-full">
+    <Card variant="glass" hover className="flex flex-col h-full cursor-pointer" onClick={() => onClickCard(session)}>
       {/* Header */}
       <div className="flex items-start justify-between mb-4">
         <div className="flex items-center gap-3">
@@ -916,7 +1534,7 @@ function TrainedModelCard({ session, onDownload }: {
       </div>
 
       {/* Actions */}
-      <div className="flex items-center gap-2 flex-wrap pt-3 border-t border-helix-border/50 mt-auto">
+      <div className="flex items-center gap-2 flex-wrap pt-3 border-t border-helix-border/50 mt-auto" onClick={(e) => e.stopPropagation()}>
         <button
           type="button"
           onClick={() => onDownload(session.session_id)}
@@ -958,6 +1576,8 @@ export default function MyModelsPage() {
   const [sort, setSort] = useState<SortOption>('newest');
   const [categoryFilter, setCategoryFilter] = useState<string | null>(null);
   const [downloadingTokenId, setDownloadingTokenId] = useState<number | null>(null);
+  const [detailTokenId, setDetailTokenId] = useState<number | null>(null);
+  const [detailSession, setDetailSession] = useState<TrainingSessionState | null>(null);
   const [trainedModels, setTrainedModels] = useState<TrainingSessionState[]>([]);
   const [isLoadingTrained, setIsLoadingTrained] = useState(true);
 
@@ -977,6 +1597,10 @@ export default function MyModelsPage() {
     isSuccess,
     refetch,
   } = useModelRegistry();
+
+  const detailModel = detailTokenId !== null
+    ? models.find(m => m.tokenId === detailTokenId) ?? null
+    : null;
 
   // Fetch completed training sessions from backend
   const fetchTrainedModels = useCallback(async () => {
@@ -1246,6 +1870,22 @@ export default function MyModelsPage() {
         isConnected={isConnected}
       />
 
+      <ModelDetailModal
+        model={detailModel}
+        onClose={() => setDetailTokenId(null)}
+        onTogglePublic={(m) => setPublic({ tokenId: m.tokenId, isPublic: !m.isPublic })}
+        onDownloadWeights={handleDownloadWeights}
+        onAddVersion={(m) => { setDetailTokenId(null); setVersionTarget(m); }}
+        isToggling={isWritePending || isConfirming}
+        isDownloading={downloadingTokenId}
+      />
+
+      <TrainedModelDetailModal
+        session={detailSession}
+        onClose={() => setDetailSession(null)}
+        onDownload={handleDownloadTrainedWeights}
+      />
+
       {/* Content */}
       {isLoading && isLoadingTrained ? (
         <div className="flex flex-col items-center py-16 gap-4">
@@ -1303,6 +1943,7 @@ export default function MyModelsPage() {
                     key={session.session_id}
                     session={session}
                     onDownload={handleDownloadTrainedWeights}
+                    onClickCard={(s) => setDetailSession(s)}
                   />
                 ))}
               </div>
@@ -1397,6 +2038,7 @@ export default function MyModelsPage() {
                     <ModelCard
                       key={model.tokenId}
                       model={model}
+                      onClickCard={(m) => setDetailTokenId(m.tokenId)}
                       onAddVersion={(m) => setVersionTarget(m)}
                       onTogglePublic={(m) => setPublic({ tokenId: m.tokenId, isPublic: !m.isPublic })}
                       onDownloadWeights={handleDownloadWeights}

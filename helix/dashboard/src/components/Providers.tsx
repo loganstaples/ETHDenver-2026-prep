@@ -73,8 +73,8 @@ const config = getDefaultConfig({
     transports: {
         [mainnet.id]: http(),
         [sepolia.id]: http(),
-        [hardhat.id]: http('http://127.0.0.1:8545'),
-        [localhost.id]: http('http://127.0.0.1:8545'),
+        [hardhat.id]: http(process.env.NEXT_PUBLIC_ETH_RPC_URL || 'http://127.0.0.1:8545'),
+        [localhost.id]: http(process.env.NEXT_PUBLIC_ETH_RPC_URL || 'http://127.0.0.1:8545'),
         [adiTestnet.id]: http('https://rpc.ab.testnet.adifoundation.ai'),
     },
     ssr: true,

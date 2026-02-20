@@ -27,7 +27,7 @@ function getChainName(chainId: number): string {
 const RPC_ENDPOINTS: Record<number, string> = {
   1: 'https://eth-mainnet.g.alchemy.com/v2/***',
   11155111: 'https://eth-sepolia.g.alchemy.com/v2/***',
-  31337: 'http://127.0.0.1:8545',
+  31337: process.env.NEXT_PUBLIC_ETH_RPC_URL || 'http://127.0.0.1:8545',
   99999: 'https://rpc.ab.testnet.adifoundation.ai',
 };
 
