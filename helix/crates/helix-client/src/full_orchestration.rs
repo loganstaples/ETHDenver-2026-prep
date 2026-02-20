@@ -668,6 +668,7 @@ impl FullOrchestrator {
             // Local mode: all MPC parties run in this process using LocalTransport.
             // Clone the progress callback so live per-step events fire during training.
             let progress_for_step = self.progress.clone();
+            let progress_for_sub_step = self.progress.clone();
             let mpc_config = MPCIntegrationConfig {
                 d_in,
                 d_hid,
@@ -690,7 +691,15 @@ impl FullOrchestrator {
                         cb(ProgressEvent::TrainingStep { step, total, loss, accuracy, mac_ok });
                     })
                 }),
-                on_sub_step: None,
+                on_sub_step: progress_for_sub_step.map(|cb| -> std::sync::Arc<dyn Fn(usize, usize, &str) + Send + Sync> {
+                    std::sync::Arc::new(move |step, total, operation| {
+                        cb(ProgressEvent::SubStep {
+                            step,
+                            total,
+                            operation: operation.to_string(),
+                        });
+                    })
+                }),
             };
 
             if self.config.simulate_cheater {
