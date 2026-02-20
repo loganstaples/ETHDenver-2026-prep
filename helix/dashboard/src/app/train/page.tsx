@@ -54,8 +54,8 @@ import {
   type TrainingSessionState,
 } from '@/hooks/useMpcTraining';
 import { useModelRegistry, type ModelWithVersions } from '@/hooks/useModelRegistry';
-import { deriveModelKey, decryptWeights } from '@/lib/model-encryption';
-import { HELIX_COORDINATOR_V4_ABI, getContractAddress } from '@/lib/contracts';
+import { deriveModelKey, encryptWeights, decryptWeights } from '@/lib/model-encryption';
+import { HELIX_COORDINATOR_V4_ABI, HELIX_MODEL_STORE_ABI, getContractAddress } from '@/lib/contracts';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
 
@@ -2092,6 +2092,13 @@ function TrainPageInner() {
   const [currentVersion, setCurrentVersion] = useState('1.0.0');
   const [currentModelName, setCurrentModelName] = useState('');
 
+  const [currentModelTokenId, setCurrentModelTokenId] = useState<number | null>(null);
+
+  // Local state for encrypted 0G upload (overrides hook's storeOnZeroG flow)
+  const [encryptedStoringOn0G, setEncryptedStoringOn0G] = useState(false);
+  const [encryptedZeroGResult, setEncryptedZeroGResult] = useState<ZeroGStorageResult | null>(null);
+  const [encrypted0GError, setEncrypted0GError] = useState<string | null>(null);
+
   const [selectedModelId, setSelectedModelId] = useState<number | null>(null);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [trainedSessions, setTrainedSessions] = useState<TrainedSession[]>([]);
@@ -2255,6 +2262,9 @@ function TrainPageInner() {
     pendingConfigRef.current = { config, opts };
     setWalletPaymentError(null);
 
+    // Track the model token ID for encrypted 0G upload after training
+    setCurrentModelTokenId(config.model_token_id ?? selectedModelId);
+
     // On local Anvil (31337), skip the on-chain payment and go straight to backend.
     // The contract call is expensive in gas and MetaMask prices local ETH at real USD rates.
     const isLocalChain = expectedChainId === 31337;
@@ -2302,6 +2312,89 @@ function TrainPageInner() {
       value: paymentWei,
     });
   };
+
+  // ========================================================================
+  // Encrypted 0G upload handler — replaces the hook's plain storeOnZeroG
+  // ========================================================================
+
+  const modelStoreAddress = getContractAddress(expectedChainId, 'helixModelStore') as `0x${string}`;
+
+  const handleStoreEncryptedOn0G = useCallback(async (sessionId: string, version?: string) => {
+    if (!session || !signMessageAsync) return;
+    setEncryptedStoringOn0G(true);
+    setEncrypted0GError(null);
+    try {
+      // 1. Download model weights from backend
+      const res = await fetch(`${API_BASE}/api/training/sessions/${sessionId}/model`);
+      if (!res.ok) throw new Error('Failed to download model weights');
+      const modelData = await res.json();
+
+      // 2. Derive encryption key — if we have a model token ID, use it for
+      //    deterministic key derivation. Otherwise fall back to session-based key.
+      const tokenIdForKey = currentModelTokenId ?? 0;
+      const key = await deriveModelKey(
+        async (msg: string) => await signMessageAsync({ message: msg }),
+        tokenIdForKey,
+      );
+
+      // 3. Encrypt weights client-side
+      const weightsJson = JSON.stringify(modelData);
+      const encrypted = await encryptWeights(key, weightsJson);
+
+      // 4. Convert to base64 and upload to 0G
+      let binary = '';
+      for (let i = 0; i < encrypted.length; i++) {
+        binary += String.fromCharCode(encrypted[i]);
+      }
+      const encryptedPayload = btoa(binary);
+
+      const nextVersion = version || currentVersion;
+      const storeRes = await fetch('/api/store-on-0g', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: sessionId,
+          encrypted: true,
+          encryptedPayload,
+          accuracy: session.accuracy,
+          version: nextVersion,
+        }),
+      });
+      if (!storeRes.ok) {
+        const errBody = await storeRes.json().catch(() => ({}));
+        throw new Error(errBody.error || '0G upload failed');
+      }
+      const storeResult = await storeRes.json();
+
+      // 5. Register on-chain version if we have a model token ID
+      if (currentModelTokenId != null) {
+        writeContract({
+          address: modelStoreAddress,
+          abi: HELIX_MODEL_STORE_ABI,
+          functionName: 'addVersion',
+          args: [
+            BigInt(currentModelTokenId),
+            nextVersion,
+            storeResult.root_hash,
+            BigInt(Math.round((session.accuracy || 0) * 100)),
+            sessionId,
+            true, // weightsStored
+          ],
+        });
+      }
+
+      setEncryptedZeroGResult({
+        rootHash: storeResult.root_hash,
+        txHash: storeResult.tx_hash,
+        explorerUrl: storeResult.explorer_url,
+      });
+    } catch (err) {
+      console.error('Encrypted 0G store failed:', err);
+      setEncrypted0GError(err instanceof Error ? err.message : 'Failed to store on 0G');
+    } finally {
+      setEncryptedStoringOn0G(false);
+    }
+  }, [session, signMessageAsync, currentModelTokenId, currentVersion, modelStoreAddress, writeContract]);
 
   const defaultVersion = useMemo(() => {
     if (history.length === 0) return '1.0.0';
@@ -2430,13 +2523,13 @@ function TrainPageInner() {
               session={session}
               losses={losses}
               isConnected={isConnected}
-              error={trainingError}
+              error={encrypted0GError || trainingError}
               version={currentVersion}
               modelName={currentModelName}
               onDownloadModel={downloadModel}
-              onStoreOnZeroG={storeOnZeroG}
-              isStoringOnZeroG={isStoringOnZeroG}
-              zeroGResult={zeroGResult}
+              onStoreOnZeroG={wantsStoreOn0G ? handleStoreEncryptedOn0G : storeOnZeroG}
+              isStoringOnZeroG={encryptedStoringOn0G || isStoringOnZeroG}
+              zeroGResult={encryptedZeroGResult || zeroGResult}
               showStoreOn0G={wantsStoreOn0G}
               elapsedTime={elapsedTime}
             />
