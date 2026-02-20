@@ -3,6 +3,7 @@
 import { useMemo } from 'react';
 import {
   useAccount,
+  useChainId,
   useReadContract,
   useReadContracts,
 } from 'wagmi';
@@ -26,10 +27,10 @@ export interface ModelDetail {
 }
 
 export function useModelDetail(tokenId: number) {
-  const { address, isConnected, chainId } = useAccount();
+  const { address, isConnected } = useAccount();
+  const chainId = useChainId();
 
   const contractAddress = useMemo(() => {
-    if (!chainId) return ZERO_ADDR;
     return getContractAddress(chainId, 'helixModelStore');
   }, [chainId]);
 

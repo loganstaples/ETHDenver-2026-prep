@@ -40,7 +40,7 @@ import { EmptyState } from '@/components/ui/EmptyState';
 import { Modal } from '@/components/ui/Modal';
 import { cn } from '@/lib/utils';
 import { useModelRegistry, type ModelWithVersions } from '@/hooks/useModelRegistry';
-import { useAccount, useSignMessage, useReadContracts, useReadContract } from 'wagmi';
+import { useAccount, useChainId, useSignMessage, useReadContracts, useReadContract } from 'wagmi';
 import { deriveModelKey, encryptWeights, decryptWeights } from '@/lib/model-encryption';
 import { fetchFrom0G } from '@/lib/0g-client';
 import { HELIX_MODEL_STORE_ABI, getContractAddress } from '@/lib/contracts';
@@ -1696,7 +1696,7 @@ export default function MyModelsPage() {
   const [isLoadingTrained, setIsLoadingTrained] = useState(true);
 
   const { signMessageAsync } = useSignMessage();
-  const { chainId } = useAccount();
+  const chainId = useChainId();
 
   const {
     isConnected,
@@ -1721,7 +1721,6 @@ export default function MyModelsPage() {
 
   // ── Pending transfer reads ─────────────────────────────────────────
   const modelStoreAddr = useMemo(() => {
-    if (!chainId) return '0x0000000000000000000000000000000000000000';
     return getContractAddress(chainId, 'helixModelStore');
   }, [chainId]);
 

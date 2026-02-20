@@ -32,6 +32,7 @@ import { cn } from '@/lib/utils';
 import { useModelDetail } from '@/hooks/useModelDetail';
 import {
   useAccount,
+  useChainId,
   useReadContract,
   useWriteContract,
   useSignMessage,
@@ -630,7 +631,8 @@ export default function ModelDetailPage() {
   const tokenId = Number(params.id);
   const [activeTab, setActiveTab] = useState<TabId>('overview');
 
-  const { address, chainId } = useAccount();
+  const { address } = useAccount();
+  const chainId = useChainId();
   const { signMessageAsync } = useSignMessage();
 
   const {
@@ -644,7 +646,6 @@ export default function ModelDetailPage() {
 
   // ── Contract address ────────────────────────────────────────────────
   const contractAddress = useMemo(() => {
-    if (!chainId) return ZERO_ADDR;
     return getContractAddress(chainId, 'helixModelStore');
   }, [chainId]);
   const addr = contractAddress as `0x${string}`;

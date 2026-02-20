@@ -3,6 +3,7 @@
 import { useCallback, useMemo } from 'react';
 import {
   useAccount,
+  useChainId,
   useReadContract,
   useReadContracts,
   useWriteContract,
@@ -59,10 +60,10 @@ export interface UseModelRegistryReturn {
 }
 
 export function useModelRegistry(): UseModelRegistryReturn {
-  const { address, isConnected, chainId } = useAccount();
+  const { address, isConnected } = useAccount();
+  const chainId = useChainId();
 
   const contractAddress = useMemo(() => {
-    if (!chainId) return ZERO_ADDR;
     return getContractAddress(chainId, 'helixModelStore');
   }, [chainId]);
 

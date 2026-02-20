@@ -1,0 +1,17 @@
+# Screenshots and debug images
+*.png
+
+# Playwright MCP logs
+.playwright-mcp/
+
+# MNIST dataset
+mnist-dataset/
+
+# Test artifacts
+test-weights.json
+
+# Logs
+helix/logs/
+
+# OS
+.DS_Store

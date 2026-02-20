@@ -3,11 +3,12 @@
 import * as React from 'react';
 import {
     RainbowKitProvider,
-    getDefaultWallets,
     getDefaultConfig,
     darkTheme,
 } from '@rainbow-me/rainbowkit';
 import {
+    metaMaskWallet,
+    coinbaseWallet,
     argentWallet,
     trustWallet,
     ledgerWallet,
@@ -37,45 +38,43 @@ const adiTestnet = defineChain({
     testnet: true,
 });
 
-const { wallets } = getDefaultWallets();
-
-// WalletConnect requires a non-empty projectId even during SSR/build.
-// Use a placeholder to avoid build failures; real connections need a valid ID.
+// WalletConnect requires a valid projectId. With a placeholder, only injected wallets work.
 const projectId = process.env.NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID || 'PLACEHOLDER_PROJECT_ID';
-if (projectId === 'PLACEHOLDER_PROJECT_ID' && typeof window !== 'undefined') {
+const hasRealProjectId = projectId !== 'PLACEHOLDER_PROJECT_ID' && projectId !== 'placeholder';
+
+if (!hasRealProjectId && typeof window !== 'undefined') {
     console.warn(
         '[HELIX] Missing NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID. ' +
-        'Wallet connection will not work. See .env.example for setup.'
+        'Only injected wallets (MetaMask, Coinbase) will work. See .env.example for setup.'
     );
 }
 
-const chains = [
-    mainnet,
-    sepolia,
-    ...(process.env.NEXT_PUBLIC_ENABLE_TESTNETS === 'true' ? [hardhat, localhost, adiTestnet] : []),
-] as const;
+// ADI testnet first so it's the default chain for public reads (even without wallet)
+const enableTestnets = process.env.NEXT_PUBLIC_ENABLE_TESTNETS === 'true';
+const chains = enableTestnets
+    ? ([adiTestnet, hardhat, localhost, mainnet, sepolia] as const)
+    : ([mainnet, sepolia] as const);
 
 const config = getDefaultConfig({
     appName: 'Helix Dashboard',
     projectId,
     wallets: [
-        ...wallets,
+        {
+            groupName: 'Popular',
+            wallets: [metaMaskWallet, coinbaseWallet],
+        },
         {
             groupName: 'Other',
-            wallets: [
-                argentWallet,
-                trustWallet,
-                ledgerWallet,
-            ],
+            wallets: [argentWallet, trustWallet, ledgerWallet],
         },
     ],
     chains,
     transports: {
         [mainnet.id]: http(),
         [sepolia.id]: http(),
-        [hardhat.id]: http(process.env.NEXT_PUBLIC_ETH_RPC_URL || 'http://127.0.0.1:8545'),
-        [localhost.id]: http(process.env.NEXT_PUBLIC_ETH_RPC_URL || 'http://127.0.0.1:8545'),
-        [adiTestnet.id]: http('https://rpc.ab.testnet.adifoundation.ai'),
+        [hardhat.id]: http(process.env.NEXT_PUBLIC_ETH_RPC_URL || 'http://127.0.0.1:8545', { timeout: 10_000 }),
+        [localhost.id]: http(process.env.NEXT_PUBLIC_ETH_RPC_URL || 'http://127.0.0.1:8545', { timeout: 10_000 }),
+        [adiTestnet.id]: http('https://rpc.ab.testnet.adifoundation.ai', { timeout: 15_000 }),
     },
     ssr: true,
 });
@@ -84,8 +83,11 @@ const queryClient = new QueryClient({
     defaultOptions: {
         queries: {
             staleTime: 30_000,
-            retry: 2,
+            retry: 1,
+            retryDelay: 2_000,
             refetchOnWindowFocus: false,
+            // Prevent infinite loading: fail after 15s
+            networkMode: 'online',
         },
     },
 });
@@ -96,11 +98,14 @@ export function Providers({ children }: { children: React.ReactNode }) {
     return (
         <WagmiProvider config={config}>
             <QueryClientProvider client={queryClient}>
-                <RainbowKitProvider theme={darkTheme({
-                    accentColor: '#ffffff',
-                    accentColorForeground: 'black',
-                    borderRadius: 'medium',
-                })}>
+                <RainbowKitProvider
+                    initialChain={adiTestnet}
+                    theme={darkTheme({
+                        accentColor: '#ffffff',
+                        accentColorForeground: 'black',
+                        borderRadius: 'medium',
+                    })}
+                >
                     {mounted && children}
                 </RainbowKitProvider>
             </QueryClientProvider>

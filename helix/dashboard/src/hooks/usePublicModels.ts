@@ -3,6 +3,7 @@
 import { useMemo, useState, useEffect, useCallback } from 'react';
 import {
   useAccount,
+  useChainId,
   useReadContract,
   useReadContracts,
 } from 'wagmi';
@@ -34,10 +35,10 @@ export interface PublicModel {
 export type ModelFilter = 'all' | 'others' | 'mine';
 
 export function usePublicModels() {
-  const { address, isConnected, chainId } = useAccount();
+  const { address, isConnected } = useAccount();
+  const chainId = useChainId();
 
   const contractAddress = useMemo(() => {
-    if (!chainId) return ZERO_ADDR;
     return getContractAddress(chainId, 'helixModelStore');
   }, [chainId]);
 
