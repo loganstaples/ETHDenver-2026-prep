@@ -45,3 +45,6 @@ Thumbs.db
 
 # Vercel
 .vercel
+
+# Runtime data (stats, training DB)
+helix-data/

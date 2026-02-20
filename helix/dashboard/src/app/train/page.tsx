@@ -23,12 +23,12 @@ import {
   Copy,
   ChevronDown,
   ChevronUp,
-  Link2,
   Layers,
   Search,
   Lock,
   History,
   Clock,
+  Sparkles,
 } from 'lucide-react';
 import {
   ResponsiveContainer,
@@ -38,7 +38,7 @@ import {
   YAxis,
   Tooltip as RechartsTooltip,
 } from 'recharts';
-import { useSignMessage, useAccount, useChainId, useWriteContract, useWaitForTransactionReceipt, useSwitchChain } from 'wagmi';
+import { useSignMessage, useAccount, useChainId, useWriteContract, useWaitForTransactionReceipt, useSwitchChain, useWalletClient, usePublicClient } from 'wagmi';
 import { parseEther, keccak256, toBytes, decodeEventLog } from 'viem';
 import { hardhat } from 'wagmi/chains';
 import { Badge } from '@/components/ui/Badge';
@@ -96,6 +96,25 @@ const PHASE_DESCRIPTIONS: Record<number, string> = {
 const TOTAL_PHASES = 13;
 
 type WeightFetchStatus = 'idle' | 'fetching' | 'decrypting' | 'uploading' | 'done' | 'error';
+
+type MintStep = 'idle' | 'downloading' | 'encrypting' | 'uploading' | 'creating-nft' | 'adding-version' | 'success' | 'error';
+
+const MINT_STEPS: { key: MintStep; label: string }[] = [
+  { key: 'downloading', label: 'Download Weights' },
+  { key: 'encrypting', label: 'Encrypt' },
+  { key: 'uploading', label: 'Upload to 0G' },
+  { key: 'creating-nft', label: 'Create NFT' },
+  { key: 'adding-version', label: 'Add Version' },
+];
+
+function uint8ArrayToBase64(bytes: Uint8Array): string {
+  const CHUNK = 0x8000;
+  const parts: string[] = [];
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    parts.push(String.fromCharCode(...bytes.subarray(i, i + CHUNK)));
+  }
+  return btoa(parts.join(''));
+}
 
 // ============================================================================
 // Version & Training History
@@ -1087,9 +1106,10 @@ interface LiveProgressProps {
   zeroGResult: ZeroGStorageResult | null;
   showStoreOn0G: boolean;
   elapsedTime: number;
+  onMintNft: () => void;
 }
 
-function LiveProgress({ session, losses, isConnected, error, version, modelName, onDownloadModel, onStoreOnZeroG, isStoringOnZeroG, zeroGResult, showStoreOn0G, elapsedTime }: LiveProgressProps) {
+function LiveProgress({ session, losses, isConnected, error, version, modelName, onDownloadModel, onStoreOnZeroG, isStoringOnZeroG, zeroGResult, showStoreOn0G, elapsedTime, onMintNft }: LiveProgressProps) {
   const stepProgress = session.total_steps > 0
     ? (session.current_step / session.total_steps) * 100
     : 0;
@@ -1379,6 +1399,7 @@ function LiveProgress({ session, losses, isConnected, error, version, modelName,
           isStoringOnZeroG={isStoringOnZeroG}
           zeroGResult={zeroGResult}
           showStoreOn0G={showStoreOn0G}
+          onMintNft={onMintNft}
         />
       )}
     </div>
@@ -1532,10 +1553,249 @@ function LossCurve({ data }: { data: { step: number; loss: number; accuracy?: nu
 }
 
 // ============================================================================
+// Mint Modal — auto-mint NFT on training completion
+// ============================================================================
+
+function MintModal({
+  show,
+  onClose,
+  mintStep,
+  mintError,
+  mintTokenId,
+  mintForm,
+  onMintFormChange,
+  onMint,
+  accuracy,
+}: {
+  show: boolean;
+  onClose: () => void;
+  mintStep: MintStep;
+  mintError: string | null;
+  mintTokenId: number | null;
+  mintForm: { name: string; slug: string; description: string; version: string; architecture: string };
+  onMintFormChange: (form: { name: string; slug: string; description: string; version: string; architecture: string }) => void;
+  onMint: () => void;
+  accuracy: number | null;
+}) {
+  useEffect(() => {
+    if (!show) return;
+    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [show, onClose]);
+
+  if (!show) return null;
+
+  const isInProgress = mintStep !== 'idle' && mintStep !== 'success' && mintStep !== 'error';
+  const isIdle = mintStep === 'idle';
+  const isSuccess = mintStep === 'success';
+  const isError = mintStep === 'error';
+
+  const stepIndex = MINT_STEPS.findIndex((s) => s.key === mintStep);
+
+  return (
+    <AnimatePresence>
+      <motion.div
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        className="fixed inset-0 z-50 flex items-center justify-center p-4"
+        onClick={onClose}
+      >
+        <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" />
+
+        <motion.div
+          initial={{ scale: 0.95, opacity: 0 }}
+          animate={{ scale: 1, opacity: 1 }}
+          exit={{ scale: 0.95, opacity: 0 }}
+          transition={{ duration: 0.2 }}
+          className="relative w-full max-w-lg rounded-3xl bg-[#0a0a0a] border border-helix-border p-6 space-y-5"
+          onClick={(e) => e.stopPropagation()}
+        >
+          {/* Header */}
+          <div className="flex items-center justify-between">
+            <h2 className="text-lg font-semibold text-white flex items-center gap-2">
+              <Sparkles size={18} className="text-purple-400" />
+              Mint Model NFT
+            </h2>
+            <button
+              type="button"
+              onClick={onClose}
+              className="p-1.5 rounded-xl text-helix-dim hover:text-white hover:bg-helix-surface transition-colors"
+            >
+              <XCircle size={18} />
+            </button>
+          </div>
+
+          {/* Success state */}
+          {isSuccess && mintTokenId !== null && (
+            <motion.div
+              initial={{ opacity: 0, y: 4 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="rounded-2xl bg-green-500/[0.06] border border-green-500/20 p-5 text-center space-y-3"
+            >
+              <CheckCircle size={36} className="text-green-400 mx-auto" />
+              <p className="text-lg font-semibold text-green-300">NFT Minted Successfully</p>
+              <p className="text-sm text-green-400/60">Token ID: {mintTokenId}</p>
+              <Link
+                href={`/models/${mintTokenId}`}
+                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-green-500/10 text-green-300 text-sm font-medium hover:bg-green-500/20 transition-colors"
+              >
+                View Model <ExternalLink size={12} />
+              </Link>
+            </motion.div>
+          )}
+
+          {/* Form fields */}
+          {!isSuccess && (
+            <div className="space-y-3">
+              <div className="grid grid-cols-2 gap-2">
+                <div className="space-y-1">
+                  <label className="text-[11px] text-helix-dim uppercase tracking-wider">Name</label>
+                  <input
+                    type="text"
+                    value={mintForm.name}
+                    onChange={(e) => onMintFormChange({ ...mintForm, name: e.target.value, slug: toSlug(e.target.value) })}
+                    disabled={isInProgress}
+                    className="w-full px-3 py-2.5 bg-helix-surface border border-helix-border rounded-xl text-sm text-white placeholder:text-helix-dim focus:outline-none focus:border-helix-border2 disabled:opacity-50 transition-colors"
+                  />
+                </div>
+                <div className="space-y-1">
+                  <label className="text-[11px] text-helix-dim uppercase tracking-wider">Slug</label>
+                  <div className="px-3 py-2.5 bg-black border border-white/20 rounded-xl text-sm text-helix-muted truncate">
+                    {mintForm.slug || '\u00A0'}
+                  </div>
+                </div>
+              </div>
+
+              <div className="space-y-1">
+                <label className="text-[11px] text-helix-dim uppercase tracking-wider">Description</label>
+                <input
+                  type="text"
+                  value={mintForm.description}
+                  onChange={(e) => onMintFormChange({ ...mintForm, description: e.target.value })}
+                  disabled={isInProgress}
+                  className="w-full px-3 py-2.5 bg-helix-surface border border-helix-border rounded-xl text-sm text-white placeholder:text-helix-dim focus:outline-none focus:border-helix-border2 disabled:opacity-50 transition-colors"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                <div className="space-y-1">
+                  <label className="text-[11px] text-helix-dim uppercase tracking-wider">Version</label>
+                  <input
+                    type="text"
+                    value={mintForm.version}
+                    onChange={(e) => onMintFormChange({ ...mintForm, version: e.target.value })}
+                    disabled={isInProgress}
+                    className="w-full px-3 py-2.5 bg-helix-surface border border-helix-border rounded-xl text-sm text-white placeholder:text-helix-dim focus:outline-none focus:border-helix-border2 disabled:opacity-50 transition-colors"
+                  />
+                </div>
+                <div className="space-y-1">
+                  <label className="text-[11px] text-helix-dim uppercase tracking-wider">Architecture</label>
+                  <input
+                    type="text"
+                    value={mintForm.architecture}
+                    onChange={(e) => onMintFormChange({ ...mintForm, architecture: e.target.value })}
+                    disabled={isInProgress}
+                    className="w-full px-3 py-2.5 bg-helix-surface border border-helix-border rounded-xl text-sm text-white placeholder:text-helix-dim focus:outline-none focus:border-helix-border2 disabled:opacity-50 transition-colors"
+                  />
+                </div>
+              </div>
+
+              {accuracy !== null && (
+                <div className="flex items-center gap-2 px-3 py-2 rounded-xl bg-green-500/[0.04] border border-green-500/10">
+                  <span className="text-xs text-helix-dim">Accuracy</span>
+                  <span className="text-sm font-semibold text-green-400">{(accuracy * 100).toFixed(1)}%</span>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Progress indicator */}
+          {!isIdle && !isSuccess && (
+            <div className="flex items-center gap-1">
+              {MINT_STEPS.map((step, i) => {
+                const isDone = isSuccess || (stepIndex > i) || (isError && stepIndex > i);
+                const isActive = stepIndex === i && !isError;
+                const isFailed = isError && stepIndex === i;
+
+                return (
+                  <div key={step.key} className="flex-1 flex flex-col items-center gap-1.5">
+                    <div className={cn(
+                      'w-6 h-6 rounded-full flex items-center justify-center text-xs transition-all',
+                      isDone ? 'bg-green-500/20 text-green-400' :
+                      isActive ? 'bg-white/10 text-white' :
+                      isFailed ? 'bg-red-500/20 text-red-400' :
+                      'bg-helix-surface text-helix-dim',
+                    )}>
+                      {isDone ? (
+                        <CheckCircle size={12} />
+                      ) : isActive ? (
+                        <Loader2 size={12} className="animate-spin" />
+                      ) : isFailed ? (
+                        <XCircle size={12} />
+                      ) : (
+                        <span className="w-1.5 h-1.5 rounded-full bg-current" />
+                      )}
+                    </div>
+                    <span className={cn(
+                      'text-[10px] text-center leading-tight',
+                      isDone ? 'text-green-400/70' :
+                      isActive ? 'text-white/70' :
+                      isFailed ? 'text-red-400/70' :
+                      'text-helix-dim',
+                    )}>
+                      {step.label}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {/* Error message */}
+          {isError && mintError && (
+            <div className="flex items-center gap-2 px-3 py-2 rounded-xl bg-red-500/[0.06] border border-red-500/20">
+              <XCircle size={14} className="text-red-400 shrink-0" />
+              <p className="text-xs text-red-300">{mintError}</p>
+            </div>
+          )}
+
+          {/* Action button */}
+          {!isSuccess && (
+            <button
+              type="button"
+              onClick={onMint}
+              disabled={isInProgress || !mintForm.name.trim() || !mintForm.slug.trim()}
+              className={cn(
+                'w-full py-3.5 rounded-2xl text-sm font-semibold transition-all flex items-center justify-center gap-2',
+                isInProgress
+                  ? 'bg-helix-border text-helix-muted cursor-wait'
+                  : isError
+                    ? 'bg-red-500/10 text-red-300 border border-red-500/20 hover:bg-red-500/20'
+                    : 'bg-gradient-to-r from-purple-500 to-blue-500 text-white hover:from-purple-400 hover:to-blue-400',
+              )}
+            >
+              {isInProgress ? (
+                <><Loader2 size={16} className="animate-spin" /> Minting...</>
+              ) : isError ? (
+                'Retry'
+              ) : (
+                <><Sparkles size={16} /> Mint Model NFT</>
+              )}
+            </button>
+          )}
+        </motion.div>
+      </motion.div>
+    </AnimatePresence>
+  );
+}
+
+// ============================================================================
 // Results Actions — post-training buttons
 // ============================================================================
 
-function ResultsActions({ session, version, onDownloadModel, onStoreOnZeroG, isStoringOnZeroG, zeroGResult, showStoreOn0G }: {
+function ResultsActions({ session, version, onDownloadModel, onStoreOnZeroG, isStoringOnZeroG, zeroGResult, showStoreOn0G, onMintNft }: {
   session: LiveProgressProps['session'];
   version: string;
   onDownloadModel: (sessionId: string) => Promise<void>;
@@ -1543,6 +1803,7 @@ function ResultsActions({ session, version, onDownloadModel, onStoreOnZeroG, isS
   isStoringOnZeroG: boolean;
   zeroGResult: ZeroGStorageResult | null;
   showStoreOn0G: boolean;
+  onMintNft: () => void;
 }) {
   const isSuccess = session.status === 'complete';
   const [copied, setCopied] = useState(false);
@@ -1606,6 +1867,15 @@ function ResultsActions({ session, version, onDownloadModel, onStoreOnZeroG, isS
             )}
           </button>
         )}
+
+        <button
+          type="button"
+          onClick={onMintNft}
+          className="flex-1 flex items-center justify-center gap-2 py-3.5 rounded-2xl bg-gradient-to-r from-purple-500 to-blue-500 text-white text-sm font-semibold hover:from-purple-400 hover:to-blue-400 transition-all"
+        >
+          <Sparkles size={16} />
+          Mint Model NFT
+        </button>
       </div>
 
       {/* 0G result */}
@@ -1643,12 +1913,13 @@ function ResultsActions({ session, version, onDownloadModel, onStoreOnZeroG, isS
               View on Explorer <ExternalLink size={10} />
             </a>
 
-            <Link
-              href={`/my-models?action=add-version&session=${session.session_id}&hash=${zeroGResult.rootHash}&version=${version}&accuracy=${session.accuracy !== null ? session.accuracy * 100 : ''}`}
-              className="text-xs text-green-400/60 hover:text-green-400 transition-colors flex items-center gap-1"
+            <button
+              type="button"
+              onClick={onMintNft}
+              className="text-xs text-purple-400/60 hover:text-purple-400 transition-colors flex items-center gap-1"
             >
-              Save to Registry <Link2 size={10} />
-            </Link>
+              Mint as NFT <Sparkles size={10} />
+            </button>
           </div>
         </motion.div>
       )}
@@ -2011,6 +2282,8 @@ function TrainPageInner() {
 
   const { models, isLoading: isLoadingModels } = useModelRegistry();
   const { signMessageAsync } = useSignMessage();
+  const { data: walletClient } = useWalletClient();
+  const publicClient = usePublicClient();
 
   // Wallet payment flow
   const { address } = useAccount();
@@ -2099,6 +2372,15 @@ function TrainPageInner() {
   const [encryptedStoringOn0G, setEncryptedStoringOn0G] = useState(false);
   const [encryptedZeroGResult, setEncryptedZeroGResult] = useState<ZeroGStorageResult | null>(null);
   const [encrypted0GError, setEncrypted0GError] = useState<string | null>(null);
+
+  // Mint modal state
+  const [showMintModal, setShowMintModal] = useState(false);
+  const [mintStep, setMintStep] = useState<MintStep>('idle');
+  const [mintError, setMintError] = useState<string | null>(null);
+  const [mintTokenId, setMintTokenId] = useState<number | null>(null);
+  const [mintRootHash, setMintRootHash] = useState<string | null>(null);
+  const [mintForm, setMintForm] = useState({ name: '', slug: '', description: '', version: '1.0.0', architecture: '784-32-10' });
+  const mintAutoShownRef = useRef(false);
 
   const [selectedModelId, setSelectedModelId] = useState<number | null>(null);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
@@ -2397,6 +2679,143 @@ function TrainPageInner() {
     }
   }, [session, signMessageAsync, currentModelTokenId, currentVersion, modelStoreAddress, writeContract]);
 
+  // ========================================================================
+  // Mint NFT handler — full pipeline
+  // ========================================================================
+
+  const handleOpenMintModal = useCallback(() => {
+    if (!session) return;
+    setMintStep('idle');
+    setMintError(null);
+    setMintTokenId(null);
+    setMintRootHash(null);
+    setMintForm({
+      name: currentModelName || 'HELIX Model',
+      slug: toSlug(currentModelName || 'HELIX Model'),
+      description: `Trained via HELIX MPC — ${session.accuracy !== null ? (session.accuracy * 100).toFixed(1) : '?'}% accuracy`,
+      version: currentVersion || '1.0.0',
+      architecture: '784-32-10',
+    });
+    setShowMintModal(true);
+  }, [session, currentModelName, currentVersion]);
+
+  const handleMintNft = useCallback(async () => {
+    if (!session || !walletClient || !publicClient || !signMessageAsync) return;
+
+    try {
+      // Step 1: Download weights
+      setMintStep('downloading');
+      setMintError(null);
+      const res = await fetch(`${API_BASE}/api/training/sessions/${session.session_id}/model`);
+      if (!res.ok) throw new Error('Failed to download model weights');
+      const modelData = await res.json();
+
+      // Step 2: Encrypt
+      setMintStep('encrypting');
+      const tokenIdForKey = mintTokenId ?? currentModelTokenId ?? 0;
+      const key = await deriveModelKey(
+        async (msg: string) => await signMessageAsync({ message: msg }),
+        tokenIdForKey,
+      );
+      const weightsJson = JSON.stringify(modelData);
+      const encrypted = await encryptWeights(key, weightsJson);
+
+      // Step 3: Upload to 0G
+      setMintStep('uploading');
+      const encryptedPayload = uint8ArrayToBase64(encrypted);
+      const storeRes = await fetch('/api/store-on-0g', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: session.session_id,
+          encrypted: true,
+          encryptedPayload,
+          accuracy: session.accuracy,
+          version: mintForm.version,
+        }),
+      });
+      if (!storeRes.ok) {
+        const errBody = await storeRes.json().catch(() => ({}));
+        throw new Error(errBody.error || '0G upload failed');
+      }
+      const storeResult = await storeRes.json();
+      const rootHash = storeResult.root_hash;
+      setMintRootHash(rootHash);
+
+      // Step 4: Create NFT (or find existing by slug)
+      setMintStep('creating-nft');
+      let tokenId: number | null = null;
+
+      try {
+        const existingTokenId = await publicClient.readContract({
+          address: modelStoreAddress,
+          abi: HELIX_MODEL_STORE_ABI,
+          functionName: 'getModelBySlug',
+          args: [mintForm.slug],
+        });
+        tokenId = Number(existingTokenId);
+      } catch {
+        // Slug not found — create new model
+        const createHash = await walletClient.writeContract({
+          address: modelStoreAddress,
+          abi: HELIX_MODEL_STORE_ABI,
+          functionName: 'createModel',
+          args: [mintForm.slug, mintForm.name, mintForm.description, mintForm.architecture],
+        });
+        const createReceipt = await publicClient.waitForTransactionReceipt({ hash: createHash });
+
+        for (const log of createReceipt.logs) {
+          try {
+            const decoded = decodeEventLog({
+              abi: HELIX_MODEL_STORE_ABI,
+              data: log.data,
+              topics: log.topics,
+            });
+            if (decoded.eventName === 'ModelCreated') {
+              tokenId = Number((decoded.args as { tokenId: bigint }).tokenId);
+              break;
+            }
+          } catch {
+            // Not our event
+          }
+        }
+
+        if (tokenId === null) throw new Error('Could not extract token ID from ModelCreated event');
+      }
+
+      setMintTokenId(tokenId);
+
+      // Step 5: Add version
+      setMintStep('adding-version');
+      const scaledAccuracy = BigInt(Math.round((session.accuracy || 0) * 100));
+      const addVersionHash = await walletClient.writeContract({
+        address: modelStoreAddress,
+        abi: HELIX_MODEL_STORE_ABI,
+        functionName: 'addVersion',
+        args: [BigInt(tokenId), mintForm.version, rootHash, scaledAccuracy, session.session_id, true],
+      });
+      await publicClient.waitForTransactionReceipt({ hash: addVersionHash });
+
+      setMintStep('success');
+    } catch (err) {
+      console.error('Mint NFT failed:', err);
+      setMintError(err instanceof Error ? err.message : 'Minting failed');
+      setMintStep('error');
+    }
+  }, [session, walletClient, publicClient, signMessageAsync, mintForm, mintTokenId, currentModelTokenId, modelStoreAddress]);
+
+  // Auto-show mint modal on training completion (if 0G was requested)
+  useEffect(() => {
+    if (
+      session?.status === 'complete' &&
+      wantsStoreOn0G &&
+      !mintAutoShownRef.current
+    ) {
+      mintAutoShownRef.current = true;
+      handleOpenMintModal();
+    }
+  }, [session?.status, wantsStoreOn0G, handleOpenMintModal]);
+
   const defaultVersion = useMemo(() => {
     if (history.length === 0) return '1.0.0';
     return `${history.length + 1}.0.0`;
@@ -2533,6 +2952,7 @@ function TrainPageInner() {
               zeroGResult={encryptedZeroGResult || zeroGResult}
               showStoreOn0G={wantsStoreOn0G}
               elapsedTime={elapsedTime}
+              onMintNft={handleOpenMintModal}
             />
           )}
         </>
@@ -2551,6 +2971,19 @@ function TrainPageInner() {
         />
       )}
     </motion.div>
+
+    {/* Mint Modal */}
+    <MintModal
+      show={showMintModal}
+      onClose={() => setShowMintModal(false)}
+      mintStep={mintStep}
+      mintError={mintError}
+      mintTokenId={mintTokenId}
+      mintForm={mintForm}
+      onMintFormChange={setMintForm}
+      onMint={handleMintNft}
+      accuracy={session?.accuracy ?? null}
+    />
     </>
   );
 }
