@@ -151,17 +151,68 @@ else
     echo -e "${GREEN}Halo2Verifier:      $VERIFIER_ADDR${NC}"
 fi
 
+# Deploy HelixModelStore (ERC-721, no constructor args)
+echo -e "\n${CYAN}Deploying HelixModelStore...${NC}"
+MODEL_STORE_OUT=$(forge create src/core/HelixModelStore.sol:HelixModelStore \
+    --rpc-url "$RPC_URL" \
+    --private-key "$PRIVATE_KEY" \
+    --chain-id "$CHAIN_ID" \
+    --legacy 2>&1 || true)
+
+MODEL_STORE_ADDR=$(echo "$MODEL_STORE_OUT" | grep "Deployed to:" | awk '{print $3}')
+
+if [[ -z "$MODEL_STORE_ADDR" ]]; then
+    echo -e "${YELLOW}HelixModelStore deployment failed (non-critical):${NC}"
+    echo "$MODEL_STORE_OUT" | tail -5
+    MODEL_STORE_ADDR="0x0000000000000000000000000000000000000000"
+else
+    echo -e "${GREEN}HelixModelStore deployed: $MODEL_STORE_ADDR${NC}"
+fi
+
+# Deploy HelixToken (ERC-20, constructor arg: treasury = owner)
+echo -e "${CYAN}Deploying HelixToken...${NC}"
+TOKEN_OUT=$(forge create src/token/HelixToken.sol:HelixToken \
+    --rpc-url "$RPC_URL" \
+    --private-key "$PRIVATE_KEY" \
+    --chain-id "$CHAIN_ID" \
+    --legacy \
+    --constructor-args "$OWNER_ADDR" 2>&1 || true)
+
+TOKEN_ADDR=$(echo "$TOKEN_OUT" | grep "Deployed to:" | awk '{print $3}')
+
+if [[ -z "$TOKEN_ADDR" ]]; then
+    echo -e "${YELLOW}HelixToken deployment failed (non-critical):${NC}"
+    echo "$TOKEN_OUT" | tail -5
+    TOKEN_ADDR="0x0000000000000000000000000000000000000000"
+else
+    echo -e "${GREEN}HelixToken deployed: $TOKEN_ADDR${NC}"
+fi
+
 # Update .env.adi with deployed addresses
 cd "$ROOT_DIR"
 sed -i '' "s|^COORDINATOR_ADDRESS=.*|COORDINATOR_ADDRESS=$COORD_ADDR|" "$ENV_FILE"
 sed -i '' "s|^VERIFIER_ADDRESS=.*|VERIFIER_ADDRESS=$VERIFIER_ADDR|" "$ENV_FILE"
+# Add or update MODEL_STORE_ADDRESS
+if grep -q "^MODEL_STORE_ADDRESS=" "$ENV_FILE"; then
+    sed -i '' "s|^MODEL_STORE_ADDRESS=.*|MODEL_STORE_ADDRESS=$MODEL_STORE_ADDR|" "$ENV_FILE"
+else
+    echo "MODEL_STORE_ADDRESS=$MODEL_STORE_ADDR" >> "$ENV_FILE"
+fi
+# Add or update TOKEN_ADDRESS
+if grep -q "^TOKEN_ADDRESS=" "$ENV_FILE"; then
+    sed -i '' "s|^TOKEN_ADDRESS=.*|TOKEN_ADDRESS=$TOKEN_ADDR|" "$ENV_FILE"
+else
+    echo "TOKEN_ADDRESS=$TOKEN_ADDR" >> "$ENV_FILE"
+fi
 
 echo -e "\n${GREEN}═══════════════════════════════════════════${NC}"
 echo -e "${GREEN}Deployment complete!${NC}"
 echo -e "${GREEN}═══════════════════════════════════════════${NC}"
-echo -e "  Coordinator: ${CYAN}$COORD_ADDR${NC}"
-echo -e "  Verifier:    ${CYAN}$VERIFIER_ADDR${NC}"
-echo -e "  Explorer:    ${CYAN}https://explorer.ab.testnet.adifoundation.ai/address/$COORD_ADDR${NC}"
-echo -e "  Config:      ${CYAN}$ENV_FILE${NC}"
+echo -e "  Coordinator:  ${CYAN}$COORD_ADDR${NC}"
+echo -e "  Verifier:     ${CYAN}$VERIFIER_ADDR${NC}"
+echo -e "  ModelStore:   ${CYAN}$MODEL_STORE_ADDR${NC}"
+echo -e "  Token:        ${CYAN}$TOKEN_ADDR${NC}"
+echo -e "  Explorer:     ${CYAN}https://explorer.ab.testnet.adifoundation.ai/address/$COORD_ADDR${NC}"
+echo -e "  Config:       ${CYAN}$ENV_FILE${NC}"
 echo ""
 echo -e "Next: run ${YELLOW}./scripts/demo-adi.sh${NC} to start the demo"

@@ -793,6 +793,10 @@ struct DashboardArgs {
     /// V4 coordinator contract address (for on-chain worker pool)
     #[arg(long)]
     coordinator: Option<String>,
+
+    /// HelixModelStore contract address (for NFT minting after training)
+    #[arg(long)]
+    model_store: Option<String>,
 }
 
 #[derive(Args)]
@@ -2131,6 +2135,9 @@ async fn cmd_dashboard(args: &DashboardArgs, _cli: &Cli, mut shutdown: broadcast
     }
     if let Some(ref coordinator) = args.coordinator {
         *state.coordinator_address.write().await = Some(coordinator.clone());
+    }
+    if let Some(ref model_store) = args.model_store {
+        *state.model_store_address.write().await = Some(model_store.clone());
     }
 
     let app = dashboard::create_dashboard_router_with_state(state);

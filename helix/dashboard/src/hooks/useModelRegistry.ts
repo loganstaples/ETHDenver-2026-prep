@@ -17,6 +17,7 @@ export interface ModelWithVersions {
   slug: string;
   name: string;
   description: string;
+  architecture: string;
   creator: string;
   createdAt: number;
   isPublic: boolean;
@@ -32,7 +33,7 @@ export interface UseModelRegistryReturn {
   isContractDeployed: boolean;
   models: ModelWithVersions[];
   isLoading: boolean;
-  createModel: (params: { slug: string; name: string; description: string }) => void;
+  createModel: (params: { slug: string; name: string; description: string; architecture?: string }) => void;
   addVersion: (params: {
     tokenId: number;
     semver: string;
@@ -167,7 +168,7 @@ export function useModelRegistry(): UseModelRegistryReturn {
 
       if (modelResult?.status !== 'success' || !modelResult.result) continue;
 
-      const m = modelResult.result as unknown as readonly [string, string, string, string, bigint, boolean, number];
+      const m = modelResult.result as unknown as readonly [string, string, string, string, string, bigint, boolean, number];
       const forSale = forSaleResult?.status === 'success' ? (forSaleResult.result as unknown as boolean) : false;
       const salePriceWei = salePriceResult?.status === 'success' ? (salePriceResult.result as unknown as bigint) : BigInt(0);
       const salePrice = Number(salePriceWei) / 1e18;
@@ -199,10 +200,11 @@ export function useModelRegistry(): UseModelRegistryReturn {
         slug: m[0],
         name: m[1],
         description: m[2],
-        creator: m[3],
-        createdAt: Number(m[4]),
-        isPublic: m[5],
-        inferenceFee: Number(m[6]),
+        architecture: m[3],
+        creator: m[4],
+        createdAt: Number(m[5]),
+        isPublic: m[6],
+        inferenceFee: Number(m[7]),
         forSale,
         salePrice,
         versions,
@@ -228,13 +230,13 @@ export function useModelRegistry(): UseModelRegistryReturn {
   });
 
   const createModel = useCallback(
-    (params: { slug: string; name: string; description: string }) => {
+    (params: { slug: string; name: string; description: string; architecture?: string }) => {
       if (!isConnected || !isContractDeployed) return;
       writeContract({
         address: addr,
         abi: HELIX_MODEL_STORE_ABI,
         functionName: 'createModel',
-        args: [params.slug, params.name, params.description],
+        args: [params.slug, params.name, params.description, params.architecture || ''],
       });
     },
     [isConnected, isContractDeployed, addr, writeContract],

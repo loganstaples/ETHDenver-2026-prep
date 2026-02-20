@@ -59,6 +59,10 @@ contract Rewards is ReentrancyGuard {
     /// @dev Unified tracker: prevents double-claim across claimRewards() and claimRoundRewards()
     mapping(uint256 => mapping(uint256 => mapping(address => bool))) public roundClaimed;
 
+    /// @notice Whether a participant has already been registered for a specific round
+    /// @dev Prevents duplicate registration that would inflate reward shares
+    mapping(uint256 => mapping(uint256 => mapping(address => bool))) public roundParticipantRegistered;
+
     /// @notice Participants in each round
     mapping(uint256 => mapping(uint256 => address[])) public roundParticipants;
 
@@ -159,6 +163,9 @@ contract Rewards is ReentrancyGuard {
         uint256 roundId,
         address participant
     ) external onlyCoordinator {
+        require(!roundParticipantRegistered[modelId][roundId][participant], "Already registered");
+        roundParticipantRegistered[modelId][roundId][participant] = true;
+
         roundParticipants[modelId][roundId].push(participant);
         claimInfo[participant].roundsParticipated++;
 
@@ -179,6 +186,9 @@ contract Rewards is ReentrancyGuard {
         uint40 roundStartTime,
         uint40 roundDeadline
     ) external onlyCoordinator {
+        require(!roundParticipantRegistered[modelId][roundId][participant], "Already registered");
+        roundParticipantRegistered[modelId][roundId][participant] = true;
+
         roundParticipants[modelId][roundId].push(participant);
         claimInfo[participant].roundsParticipated++;
 

@@ -458,6 +458,8 @@ pub struct DashboardState {
     pub coordinator_address: RwLock<Option<String>>,
     /// Ethereum RPC URL for reading on-chain state
     pub eth_rpc_url: RwLock<Option<String>>,
+    /// HelixModelStore contract address (for NFT minting after training)
+    pub model_store_address: RwLock<Option<String>>,
     /// Model weights cache: keyed by on-chain token ID string for non-owner inference
     pub model_weights_cache: RwLock<HashMap<String, serde_json::Value>>,
     /// SQLite persistence for training session history
@@ -516,6 +518,7 @@ impl DashboardState {
             registered_workers: RwLock::new(Vec::new()),
             coordinator_address: RwLock::new(None),
             eth_rpc_url: RwLock::new(None),
+            model_store_address: RwLock::new(None),
             model_weights_cache: RwLock::new(HashMap::new()),
             training_db,
         }
@@ -1316,11 +1319,11 @@ async fn start_training_handler(
         #[cfg(feature = "chain")]
         pre_registered_job_id: req.job_id,
         #[cfg(feature = "chain")]
-        model_store_address: None,
+        model_store_address: None, // Set below from dashboard state
         #[cfg(feature = "chain")]
-        model_slug: None,
+        model_slug: req.model_slug.clone(),
         #[cfg(feature = "chain")]
-        model_name: None,
+        model_name: req.model_name.clone(),
         #[cfg(feature = "chain")]
         model_description: None,
         // Auto-detect: registered remote workers → distributed, otherwise local (single-machine)
@@ -1370,6 +1373,10 @@ async fn start_training_handler(
         }
         if let Some(ref rpc_url) = *state.eth_rpc_url.read().await {
             config.eth_rpc_url = Some(rpc_url.clone());
+        }
+        if let Some(ref store_addr) = *state.model_store_address.read().await {
+            config.model_store_address = Some(store_addr.clone());
+            info!(model_store = %store_addr, "Using pre-deployed HelixModelStore for NFT minting");
         }
     }
 

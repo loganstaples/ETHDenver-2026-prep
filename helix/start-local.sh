@@ -195,6 +195,7 @@ echo "▸ Starting dashboard backend (port 3001)..."
     --cors \
     --rpc-url "$RPC_URL" \
     --coordinator "$COORDINATOR_ADDRESS" \
+    --model-store "$MODEL_STORE_ADDRESS" \
     > "$LOGS_DIR/dashboard.log" 2>&1 &
 DASHBOARD_PID=$!
 echo "$DASHBOARD_PID dashboard" >> "$PID_FILE"
