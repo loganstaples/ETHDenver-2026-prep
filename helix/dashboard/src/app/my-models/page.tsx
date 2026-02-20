@@ -41,6 +41,9 @@ import { useModelRegistry, type ModelWithVersions } from '@/hooks/useModelRegist
 import { useSignMessage } from 'wagmi';
 import { deriveModelKey, encryptWeights, decryptWeights } from '@/lib/model-encryption';
 import type { OnChainVersion } from '@/lib/contracts';
+import type { TrainingSessionState } from '@/hooks/useMpcTraining';
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
 
 // ============================================================================
 // Constants
@@ -855,6 +858,95 @@ function ModelCard({ model, onAddVersion, onTogglePublic, onDownloadWeights, isT
 }
 
 // ============================================================================
+// Trained Model Card (from backend sessions)
+// ============================================================================
+
+function TrainedModelCard({ session, onDownload }: {
+  session: TrainingSessionState;
+  onDownload: (sessionId: string) => void;
+}) {
+  const name = session.model_name || 'Unnamed Model';
+  const slug = session.model_slug || session.session_id.slice(0, 8);
+  const accuracy = session.accuracy;
+  const steps = session.losses.length || session.current_step;
+  const startedAt = session.started_at > 0
+    ? new Date(session.started_at * 1000).toLocaleDateString()
+    : '--';
+
+  return (
+    <Card variant="glass" hover className="flex flex-col h-full">
+      {/* Header */}
+      <div className="flex items-start justify-between mb-4">
+        <div className="flex items-center gap-3">
+          <div className="w-10 h-10 rounded-lg bg-green-500/[0.08] flex items-center justify-center shrink-0">
+            <Layers size={20} className="text-green-400" />
+          </div>
+          <div>
+            <h3 className="text-base font-medium text-white">{name}</h3>
+            <p className="text-2xs font-mono text-helix-muted">{slug}</p>
+          </div>
+        </div>
+        <Badge variant="default" className="text-green-400 text-2xs flex items-center gap-1">
+          <CheckCircle size={10} />
+          Trained
+        </Badge>
+      </div>
+
+      {/* Stats Row */}
+      <div className="grid grid-cols-3 gap-3 mb-4">
+        <div className="bg-helix-bg rounded-md px-3 py-2 text-center">
+          <p className="text-2xs text-helix-muted">Accuracy</p>
+          <p className="text-lg font-mono font-light text-white">
+            {accuracy != null ? `${(accuracy * 100).toFixed(1)}%` : '--'}
+          </p>
+        </div>
+        <div className="bg-helix-bg rounded-md px-3 py-2 text-center">
+          <p className="text-2xs text-helix-muted">Steps</p>
+          <p className="text-lg font-mono font-light text-white">{steps}</p>
+        </div>
+        <div className="bg-helix-bg rounded-md px-3 py-2 text-center">
+          <p className="text-2xs text-helix-muted">Trained</p>
+          <p className="text-sm font-mono font-light text-white">{startedAt}</p>
+        </div>
+      </div>
+
+      {/* Session ID */}
+      <div className="text-2xs text-helix-dim mb-4">
+        Session: <code className="font-mono">{session.session_id.slice(0, 12)}...</code>
+      </div>
+
+      {/* Actions */}
+      <div className="flex items-center gap-2 flex-wrap pt-3 border-t border-helix-border/50 mt-auto">
+        <button
+          type="button"
+          onClick={() => onDownload(session.session_id)}
+          className="flex items-center gap-2 px-4 py-2 rounded-lg bg-white text-black text-sm font-medium hover:bg-white/90 transition-colors"
+        >
+          <Download size={14} />
+          Download Weights
+        </button>
+
+        <Link
+          href={`/train`}
+          className="flex items-center gap-2 px-4 py-2 rounded-lg bg-helix-surface border border-helix-border text-sm text-helix-text hover:border-helix-border2 hover:text-white transition-colors"
+        >
+          <Play size={14} />
+          Train More
+        </Link>
+
+        <Link
+          href={`/inference`}
+          className="flex items-center gap-2 px-4 py-2 rounded-lg bg-helix-surface border border-helix-border text-sm text-helix-text hover:border-helix-border2 hover:text-white transition-colors"
+        >
+          <Shield size={14} />
+          Inference
+        </Link>
+      </div>
+    </Card>
+  );
+}
+
+// ============================================================================
 // Main Page
 // ============================================================================
 
@@ -866,6 +958,8 @@ export default function MyModelsPage() {
   const [sort, setSort] = useState<SortOption>('newest');
   const [categoryFilter, setCategoryFilter] = useState<string | null>(null);
   const [downloadingTokenId, setDownloadingTokenId] = useState<number | null>(null);
+  const [trainedModels, setTrainedModels] = useState<TrainingSessionState[]>([]);
+  const [isLoadingTrained, setIsLoadingTrained] = useState(true);
 
   const { signMessageAsync } = useSignMessage();
 
@@ -883,6 +977,50 @@ export default function MyModelsPage() {
     isSuccess,
     refetch,
   } = useModelRegistry();
+
+  // Fetch completed training sessions from backend
+  const fetchTrainedModels = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/training/sessions`);
+      if (!res.ok) return;
+      const sessions: TrainingSessionState[] = await res.json();
+      setTrainedModels(sessions.filter(s => s.status === 'complete'));
+    } catch {
+      // Non-fatal
+    } finally {
+      setIsLoadingTrained(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchTrainedModels();
+    const interval = setInterval(fetchTrainedModels, 10000);
+    return () => clearInterval(interval);
+  }, [fetchTrainedModels]);
+
+  // Download weights from a trained session
+  const handleDownloadTrainedWeights = useCallback(async (sessionId: string) => {
+    try {
+      const res = await fetch(`${API_BASE}/api/training/sessions/${sessionId}/model`);
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || `Download failed: HTTP ${res.status}`);
+      }
+      const weights = await res.json();
+      const blob = new Blob([JSON.stringify(weights, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `helix-model-${sessionId.slice(0, 8)}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error('Download failed:', err);
+      alert(`Download failed: ${err instanceof Error ? err.message : 'Unknown error'}`);
+    }
+  }, []);
 
   // Download weights from 0G with decryption
   const handleDownloadWeights = useCallback(async (model: ModelWithVersions) => {
@@ -982,16 +1120,21 @@ export default function MyModelsPage() {
     return sortMyModels(result, sort);
   }, [models, search, sort, categoryFilter]);
 
-  // Aggregate stats
-  const totalVersions = models.reduce((sum, m) => sum + m.versions.length, 0);
-  const bestAccuracy = models.reduce((best, m) => {
+  // Aggregate stats (on-chain + trained)
+  const totalOnChainVersions = models.reduce((sum, m) => sum + m.versions.length, 0);
+  const totalModels = models.length + trainedModels.length;
+  const bestOnChainAccuracy = models.reduce((best, m) => {
     const modelBest = m.versions.reduce((b, v) => (v.accuracy > b ? v.accuracy : b), 0);
     return modelBest > best ? modelBest : best;
   }, 0);
+  const bestTrainedAccuracy = trainedModels.reduce((best, s) => {
+    return (s.accuracy ?? 0) > best ? (s.accuracy ?? 0) : best;
+  }, 0);
+  const bestAccuracy = Math.max(bestOnChainAccuracy, bestTrainedAccuracy);
   const totalWeights = models.reduce(
     (sum, m) => sum + m.versions.filter((v) => v.weightsStored).length,
     0,
-  );
+  ) + trainedModels.length;
 
   return (
     <motion.div
@@ -1004,8 +1147,8 @@ export default function MyModelsPage() {
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
           <h1 className="page-title">My Models</h1>
-          {models.length > 0 && (
-            <Badge variant="default">{models.length} model{models.length !== 1 ? 's' : ''}</Badge>
+          {totalModels > 0 && (
+            <Badge variant="default">{totalModels} model{totalModels !== 1 ? 's' : ''}</Badge>
           )}
         </div>
         <div className="flex items-center gap-3">
@@ -1104,31 +1247,24 @@ export default function MyModelsPage() {
       />
 
       {/* Content */}
-      {isLoading ? (
+      {isLoading && isLoadingTrained ? (
         <div className="flex flex-col items-center py-16 gap-4">
           <Loader2 size={24} className="animate-spin text-helix-muted" />
-          <p className="text-sm text-helix-muted">Loading models from chain...</p>
+          <p className="text-sm text-helix-muted">Loading models...</p>
         </div>
-      ) : models.length === 0 ? (
+      ) : totalModels === 0 ? (
         <EmptyState
           icon={<Layers size={32} />}
           title="No models yet"
-          description={
-            isConnected && isContractDeployed
-              ? 'Create your first model to get started. Each model is an ERC-721 NFT with versioned weights.'
-              : 'Connect your wallet and ensure the contract is deployed to manage models.'
-          }
+          description="Train a model to get started, or create one on-chain via the ERC-721 registry."
           action={
-            isConnected && isContractDeployed ? (
-              <button
-                type="button"
-                onClick={() => setCreateOpen(true)}
-                className="flex items-center gap-2 px-4 py-2 rounded-lg bg-white text-black text-sm font-medium hover:bg-white/90 transition-colors"
-              >
-                <Plus size={14} />
-                Create Model
-              </button>
-            ) : undefined
+            <Link
+              href="/train"
+              className="flex items-center gap-2 px-4 py-2 rounded-lg bg-white text-black text-sm font-medium hover:bg-white/90 transition-colors"
+            >
+              <Play size={14} />
+              Start Training
+            </Link>
           }
         />
       ) : (
@@ -1137,13 +1273,13 @@ export default function MyModelsPage() {
           <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
             <StatCard
               label="Models"
-              value={models.length}
+              value={totalModels}
               icon={<Layers size={14} />}
             />
             <StatCard
-              label="Total Versions"
-              value={totalVersions}
-              icon={<Tag size={14} />}
+              label="Trained"
+              value={trainedModels.length}
+              icon={<CheckCircle size={14} />}
             />
             <StatCard
               label="Best Accuracy"
@@ -1151,99 +1287,125 @@ export default function MyModelsPage() {
               icon={<Trophy size={14} />}
             />
             <StatCard
-              label="Weights on 0G"
+              label="Weights Available"
               value={totalWeights}
               icon={<HardDrive size={14} />}
             />
           </div>
 
-          {/* Search + Sort + Category */}
-          {models.length > 1 && (
+          {/* Trained Models Section */}
+          {trainedModels.length > 0 && (
             <div className="space-y-3">
-              <div className="flex flex-col sm:flex-row items-start sm:items-center gap-3">
-                <div className="relative flex-1 max-w-xs">
-                  <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-helix-muted" />
-                  <input
-                    type="text"
-                    value={search}
-                    onChange={(e) => setSearch(e.target.value)}
-                    placeholder="Search your models..."
-                    className="w-full pl-9 pr-3 py-2 bg-helix-bg border border-helix-border rounded-lg text-sm text-helix-text placeholder:text-helix-dim focus:outline-none focus:border-helix-border2 transition-colors"
+              <h2 className="text-lg font-medium text-white">Trained Models</h2>
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                {trainedModels.map((session) => (
+                  <TrainedModelCard
+                    key={session.session_id}
+                    session={session}
+                    onDownload={handleDownloadTrainedWeights}
                   />
-                </div>
-                <div className="relative">
-                  <ArrowUpDown size={12} className="absolute left-3 top-1/2 -translate-y-1/2 text-helix-muted pointer-events-none" />
-                  <select
-                    value={sort}
-                    onChange={(e) => setSort(e.target.value as SortOption)}
-                    className="appearance-none pl-8 pr-8 py-2 bg-helix-bg border border-helix-border rounded-lg text-sm text-helix-text focus:outline-none focus:border-helix-border2 transition-colors cursor-pointer"
-                  >
-                    {SORT_OPTIONS.map((o) => (
-                      <option key={o.id} value={o.id}>{o.label}</option>
-                    ))}
-                  </select>
-                </div>
+                ))}
               </div>
-
-              {availableCategories.length > 0 && (
-                <div className="flex items-center gap-2 flex-wrap">
-                  <span className="text-2xs text-helix-dim">Type:</span>
-                  {availableCategories.map(({ tag, count }) => (
-                    <button
-                      key={tag}
-                      type="button"
-                      onClick={() => setCategoryFilter(categoryFilter === tag ? null : tag)}
-                      className={cn(
-                        'flex items-center gap-1.5 px-2.5 py-1 rounded-full text-2xs transition-colors',
-                        categoryFilter === tag
-                          ? 'bg-white text-black'
-                          : 'bg-white/[0.04] text-helix-text2 border border-white/[0.06] hover:border-white/[0.12]',
-                      )}
-                    >
-                      {tag}
-                      <span className={cn(
-                        'font-mono',
-                        categoryFilter === tag ? 'text-black/50' : 'text-helix-dim',
-                      )}>
-                        {count}
-                      </span>
-                      {categoryFilter === tag && <X size={10} />}
-                    </button>
-                  ))}
-                </div>
-              )}
             </div>
           )}
 
-          {/* Model Cards Grid */}
-          {filteredModels.length === 0 ? (
-            <EmptyState
-              icon={<Search size={32} />}
-              title="No models match your filters"
-              description="Try a different search term or clear the filters."
-              action={
-                <button
-                  type="button"
-                  onClick={() => { setSearch(''); setCategoryFilter(null); }}
-                  className="px-4 py-2 rounded-lg bg-helix-surface border border-helix-border text-sm text-helix-text hover:text-white transition-colors"
-                >
-                  Clear Filters
-                </button>
-              }
-            />
-          ) : (
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-              {filteredModels.map((model) => (
-                <ModelCard
-                  key={model.tokenId}
-                  model={model}
-                  onAddVersion={(m) => setVersionTarget(m)}
-                  onTogglePublic={(m) => setPublic({ tokenId: m.tokenId, isPublic: !m.isPublic })}
-                  onDownloadWeights={handleDownloadWeights}
-                  isToggling={isWritePending || isConfirming}
-                  isDownloading={downloadingTokenId}
+          {/* On-Chain Models Section */}
+          {models.length > 0 && (
+            <div className="space-y-3">
+              <h2 className="text-lg font-medium text-white flex items-center gap-2">
+                On-Chain Registry
+                <Badge variant="default" className="text-2xs">{models.length}</Badge>
+              </h2>
+
+              {/* Search + Sort + Category */}
+              {models.length > 1 && (
+                <div className="space-y-3">
+                  <div className="flex flex-col sm:flex-row items-start sm:items-center gap-3">
+                    <div className="relative flex-1 max-w-xs">
+                      <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-helix-muted" />
+                      <input
+                        type="text"
+                        value={search}
+                        onChange={(e) => setSearch(e.target.value)}
+                        placeholder="Search your models..."
+                        className="w-full pl-9 pr-3 py-2 bg-helix-bg border border-helix-border rounded-lg text-sm text-helix-text placeholder:text-helix-dim focus:outline-none focus:border-helix-border2 transition-colors"
+                      />
+                    </div>
+                    <div className="relative">
+                      <ArrowUpDown size={12} className="absolute left-3 top-1/2 -translate-y-1/2 text-helix-muted pointer-events-none" />
+                      <select
+                        value={sort}
+                        onChange={(e) => setSort(e.target.value as SortOption)}
+                        className="appearance-none pl-8 pr-8 py-2 bg-helix-bg border border-helix-border rounded-lg text-sm text-helix-text focus:outline-none focus:border-helix-border2 transition-colors cursor-pointer"
+                      >
+                        {SORT_OPTIONS.map((o) => (
+                          <option key={o.id} value={o.id}>{o.label}</option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+
+                  {availableCategories.length > 0 && (
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-2xs text-helix-dim">Type:</span>
+                      {availableCategories.map(({ tag, count }) => (
+                        <button
+                          key={tag}
+                          type="button"
+                          onClick={() => setCategoryFilter(categoryFilter === tag ? null : tag)}
+                          className={cn(
+                            'flex items-center gap-1.5 px-2.5 py-1 rounded-full text-2xs transition-colors',
+                            categoryFilter === tag
+                              ? 'bg-white text-black'
+                              : 'bg-white/[0.04] text-helix-text2 border border-white/[0.06] hover:border-white/[0.12]',
+                          )}
+                        >
+                          {tag}
+                          <span className={cn(
+                            'font-mono',
+                            categoryFilter === tag ? 'text-black/50' : 'text-helix-dim',
+                          )}>
+                            {count}
+                          </span>
+                          {categoryFilter === tag && <X size={10} />}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Model Cards Grid */}
+              {filteredModels.length === 0 ? (
+                <EmptyState
+                  icon={<Search size={32} />}
+                  title="No models match your filters"
+                  description="Try a different search term or clear the filters."
+                  action={
+                    <button
+                      type="button"
+                      onClick={() => { setSearch(''); setCategoryFilter(null); }}
+                      className="px-4 py-2 rounded-lg bg-helix-surface border border-helix-border text-sm text-helix-text hover:text-white transition-colors"
+                    >
+                      Clear Filters
+                    </button>
+                  }
                 />
-              ))}
+              ) : (
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                  {filteredModels.map((model) => (
+                    <ModelCard
+                      key={model.tokenId}
+                      model={model}
+                      onAddVersion={(m) => setVersionTarget(m)}
+                      onTogglePublic={(m) => setPublic({ tokenId: m.tokenId, isPublic: !m.isPublic })}
+                      onDownloadWeights={handleDownloadWeights}
+                      isToggling={isWritePending || isConfirming}
+                      isDownloading={downloadingTokenId}
+                    />
+                  ))}
+                </div>
+              )}
             </div>
           )}
         </>
