@@ -667,6 +667,10 @@ function InferencePageInner() {
     : false;
   const [backendWeightsReady, setBackendWeightsReady] = useState(false);
 
+  // Non-owner public inference state
+  const [inferenceReady, setInferenceReady] = useState(false);
+  const [inferenceSessionId, setInferenceSessionId] = useState<string | null>(null);
+
   // Inference payment (non-owner flow)
   const { writeContract, data: inferenceTxHash, isPending: isPaymentPending } = useWriteContract();
   const { isSuccess: paymentConfirmed, isLoading: isPaymentConfirming } = useWaitForTransactionReceipt({ hash: inferenceTxHash });
@@ -769,6 +773,94 @@ function InferencePageInner() {
     return result.session_id ?? null;
   }, []);
 
+  // Check if a public model has inference enabled (non-owner flow)
+  const checkInferenceReady = useCallback(async () => {
+    if (!selectedModel) return;
+    try {
+      const res = await fetch(
+        `${API_BASE}/api/models/${selectedModel.tokenId}/inference-ready?version=${selectedVersionIndex}`
+      );
+      if (!res.ok) {
+        setInferenceReady(false);
+        setInferenceSessionId(null);
+        return;
+      }
+      const data = await res.json();
+      setInferenceReady(data.ready);
+      if (data.sessionId) setInferenceSessionId(data.sessionId);
+      else setInferenceSessionId(null);
+    } catch {
+      setInferenceReady(false);
+      setInferenceSessionId(null);
+    }
+  }, [selectedModel, selectedVersionIndex]);
+
+  // Non-owner public inference: submit input to server-side forward pass (no MPC, no payment)
+  const handlePublicInference = useCallback(async (pixelData: number[]) => {
+    if (!selectedModel) return;
+    setPhase('submitting');
+    setError(null);
+    setResult(null);
+
+    try {
+      const res = await fetch(`${API_BASE}/api/models/${selectedModel.tokenId}/infer`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          input: pixelData,
+          version: selectedVersionIndex,
+        }),
+      });
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => ({}));
+        throw new Error(errBody.error || 'Inference failed');
+      }
+      const data = await res.json();
+      // Map the public inference response into the MPCInferenceResult shape
+      const mappedResult: MPCInferenceResult = {
+        prediction: data.prediction,
+        confidence: data.confidence,
+        probabilities: data.probabilities,
+        num_parties: 1,
+        distributed: false,
+        timing: {
+          share_generation_ms: 0,
+          forward_pass_ms: 0,
+          signing_ms: 0,
+          total_ms: 0,
+        },
+      };
+      setResult(mappedResult);
+      setPhase('done');
+
+      // Persist to localStorage for Dashboard inference tab
+      try {
+        const entry = {
+          id: `inf-${Date.now()}`,
+          model: selectedModel.name,
+          status: 'completed' as const,
+          progress: 100,
+          phase: 'done',
+          workers: 1,
+          created: Date.now(),
+          inputLabel: 'Digit prediction',
+          result: String(data.prediction),
+          confidence: data.confidence,
+          duration: 0,
+        };
+        const raw = localStorage.getItem('helix-inference-history');
+        const history = raw ? JSON.parse(raw) : [];
+        history.unshift(entry);
+        localStorage.setItem('helix-inference-history', JSON.stringify(history.slice(0, 50)));
+      } catch {
+        // Non-critical
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Inference failed');
+      setPhase('error');
+    }
+  }, [selectedModel, selectedVersionIndex]);
+
   // Fetch weights from 0G (owner) or check backend cache (non-owner)
   // Re-triggers when model or version selection changes
   const fetchKeyRef = useRef<string | null>(null);
@@ -778,6 +870,8 @@ function InferencePageInner() {
       setWeightFetchStatus('idle');
       setWeightFetchError(null);
       setBackendWeightsReady(false);
+      setInferenceReady(false);
+      setInferenceSessionId(null);
       return;
     }
 
@@ -789,23 +883,29 @@ function InferencePageInner() {
 
     // For ALL users (owner and non-owner): first check if backend already has cached weights
     const doFetch = async () => {
-      // Step 1: Check backend cache
+      // Step 1: Check backend cache (inference-ready endpoint)
       try {
         const res = await fetch(`${API_BASE}/api/models/${selectedModel.tokenId}/inference-ready?version=${selectedVersionIndex}`);
         if (res.ok) {
           const data = await res.json();
           if (data.ready) {
             setBackendWeightsReady(true);
+            setInferenceReady(true);
             setWeightFetchStatus('done');
-            if (data.session_id) setActiveSessionId(data.session_id);
+            if (data.sessionId) {
+              setActiveSessionId(data.sessionId);
+              setInferenceSessionId(data.sessionId);
+            }
             return;
           }
         }
       } catch { /* non-fatal */ }
 
-      // Step 2: If not cached and user is NOT owner, show error
+      // Step 2: If not cached and user is NOT owner, mark inference not ready
       if (!isOwner) {
-        setWeightFetchError('Weights not available for this version. The model owner must run inference first.');
+        setInferenceReady(false);
+        setInferenceSessionId(null);
+        setWeightFetchError('Model owner hasn\u2019t enabled inference yet');
         setWeightFetchStatus('error');
         fetchKeyRef.current = null;
         return;
@@ -928,8 +1028,10 @@ function InferencePageInner() {
     setResult(null);
 
     try {
-      // Model-based inference (non-owner with cached weights, or owner with model selected)
-      const useModelEndpoint = selectedModel && (backendWeightsReady || isOwnerOfSelected);
+      // Model-based inference only when backend has confirmed cached weights.
+      // Otherwise fall back to session-based endpoint which has robust fallback chain
+      // (uploaded_weights → latest completed session).
+      const useModelEndpoint = selectedModel && backendWeightsReady;
       const body = useModelEndpoint ? {
         model_token_id: selectedModel.tokenId,
         model_version_index: selectedVersionIndex,
@@ -1010,11 +1112,13 @@ function InferencePageInner() {
   const hasDrawing = pixels.length > 0 && pixels.some((p) => p > 0.01);
   const isRunning = phase === 'submitting';
   const weightsReady = weightFetchStatus === 'done';
+  // Non-owner public inference: use inferenceReady (server-side forward pass, no MPC/payment)
+  // Owner inference or session-based: use existing MPC flow
   const canRunInference = !selectedModel
     ? weightsReady && hasDrawing && !isRunning && !!activeSessionId
     : isOwnerOfSelected
       ? (weightsReady || backendWeightsReady) && hasDrawing && !isRunning
-      : backendWeightsReady && hasDrawing && !isRunning && !isPaymentPending && !isPaymentConfirming;
+      : inferenceReady && hasDrawing && !isRunning;
 
   // Select model handler (toggle: click again to deselect)
   const handleSelectModel = useCallback((model: PublicModel) => {
@@ -1027,6 +1131,8 @@ function InferencePageInner() {
       setWeightFetchError(null);
       setActiveSessionId(null);
       setBackendWeightsReady(false);
+      setInferenceReady(false);
+      setInferenceSessionId(null);
       return;
     }
     fetchKeyRef.current = null;
@@ -1039,6 +1145,8 @@ function InferencePageInner() {
     setWeightFetchError(null);
     setActiveSessionId(null);
     setBackendWeightsReady(false);
+    setInferenceReady(false);
+    setInferenceSessionId(null);
   }, [selectedModel]);
 
   // Select trained session handler (toggle: click again to deselect)
@@ -1260,11 +1368,21 @@ function InferencePageInner() {
         <div className="flex flex-col gap-5">
 
           {/* Security badge for non-owner public model */}
-          {selectedModel && !isOwnerOfSelected && (
+          {selectedModel && !isOwnerOfSelected && inferenceReady && (
             <div className="flex items-center gap-2.5 px-4 py-3 bg-green-500/[0.04] border border-green-500/20 rounded-xl">
               <Shield size={14} className="text-green-400 shrink-0" />
               <p className="text-2xs text-green-300/70">
-                Secure MPC inference — model weights are never exposed
+                Public inference enabled — model weights are never exposed to you
+              </p>
+            </div>
+          )}
+
+          {/* Non-owner: model not inference-ready */}
+          {selectedModel && !isOwnerOfSelected && !inferenceReady && weightFetchStatus === 'error' && (
+            <div className="flex items-center gap-2.5 px-4 py-3 bg-amber-500/[0.06] border border-amber-500/20 rounded-xl">
+              <AlertTriangle size={14} className="text-amber-400 shrink-0" />
+              <p className="text-2xs text-amber-300/70">
+                Model owner hasn&apos;t enabled inference yet. Check back later.
               </p>
             </div>
           )}
@@ -1278,6 +1396,10 @@ function InferencePageInner() {
                   <Badge variant="default" className="text-green-400">
                     <CheckCircle size={10} /> Free (you own this model)
                   </Badge>
+                ) : selectedModel && !isOwnerOfSelected && inferenceReady ? (
+                  <Badge variant="default" className="text-green-400">
+                    <CheckCircle size={10} /> Free (public inference)
+                  </Badge>
                 ) : selectedModel && ownerFeeBps > 0 ? (
                   <Badge variant="default" className="text-helix-text2">
                     <Coins size={10} />
@@ -1289,7 +1411,7 @@ function InferencePageInner() {
               {/* Big fee number */}
               <div className="flex items-baseline justify-center gap-4 py-2">
                 <span className="text-5xl font-bold tracking-tighter tabular-nums text-white">
-                  {isOwnerOfSelected ? '0.000000' : totalFee.toFixed(6)}
+                  {(isOwnerOfSelected || (!isOwnerOfSelected && inferenceReady)) ? '0.000000' : totalFee.toFixed(6)}
                 </span>
                 <span className="text-xl font-semibold text-helix-text2">ADI</span>
               </div>
@@ -1298,6 +1420,8 @@ function InferencePageInner() {
               <div className="flex items-center justify-center gap-4 mt-3 text-sm text-helix-dim">
                 {isOwnerOfSelected ? (
                   <span>Owner inference is always free</span>
+                ) : !isOwnerOfSelected && inferenceReady ? (
+                  <span>Public inference — server-side forward pass</span>
                 ) : (
                   <>
                     <span>Workers: {BASE_INFERENCE_COST.toFixed(4)} ADI</span>
@@ -1315,7 +1439,13 @@ function InferencePageInner() {
             {/* Run button */}
             <motion.button
               type="button"
-              onClick={isOwnerOfSelected || !selectedModel ? () => runInference() : handlePayAndRun}
+              onClick={
+                isOwnerOfSelected || !selectedModel
+                  ? () => runInference()
+                  : inferenceReady
+                    ? () => handlePublicInference(pixels)
+                    : handlePayAndRun
+              }
               disabled={!canRunInference}
               whileTap={canRunInference ? { scale: 0.98 } : {}}
               className={cn(
@@ -1331,9 +1461,11 @@ function InferencePageInner() {
               ) : isPaymentConfirming ? (
                 <><Loader2 size={22} className="animate-spin" /> Confirming Payment...</>
               ) : isRunning ? (
-                <><Loader2 size={22} className="animate-spin" /> Running MPC Inference...</>
+                <><Loader2 size={22} className="animate-spin" /> Running Inference...</>
               ) : isOwnerOfSelected || !selectedModel ? (
                 <><Shield size={22} /> Run Inference</>
+              ) : inferenceReady ? (
+                <><Shield size={22} /> Run Public Inference</>
               ) : (
                 <><Coins size={22} /> Pay &amp; Run Inference</>
               )}
@@ -1409,9 +1541,15 @@ function InferencePageInner() {
                 <div className="flex items-center gap-3">
                   <Loader2 size={16} className="animate-spin text-white" />
                   <div>
-                    <p className="text-base text-white">Running distributed MPC inference...</p>
+                    <p className="text-base text-white">
+                      {selectedModel && !isOwnerOfSelected && inferenceReady
+                        ? 'Running public inference...'
+                        : 'Running distributed MPC inference...'}
+                    </p>
                     <p className="text-sm text-helix-muted mt-0.5">
-                      Secret-sharing across 3 workers, running forward pass via transport
+                      {selectedModel && !isOwnerOfSelected && inferenceReady
+                        ? 'Server-side forward pass on cached model weights'
+                        : 'Secret-sharing across 3 workers, running forward pass via transport'}
                     </p>
                   </div>
                 </div>
@@ -1455,14 +1593,18 @@ function InferencePageInner() {
                 <div className="flex flex-col items-center justify-center py-8">
                   <Shield size={24} className="text-helix-dim mb-3" />
                   <p className="text-base text-helix-text2">
-                    {!weightsReady
-                      ? 'Select a model to get started'
-                      : !hasDrawing
-                        ? 'Draw a digit and click Run Inference'
-                        : 'Ready to classify'}
+                    {selectedModel && !isOwnerOfSelected && !inferenceReady
+                      ? 'Inference not available for this model'
+                      : !weightsReady && !inferenceReady
+                        ? 'Select a model to get started'
+                        : !hasDrawing
+                          ? 'Draw a digit and click Run Inference'
+                          : 'Ready to classify'}
                   </p>
                   <p className="text-sm text-helix-muted mt-1">
-                    Secure multi-party computation across independent workers
+                    {selectedModel && !isOwnerOfSelected && inferenceReady
+                      ? 'Public inference — prediction without weight access'
+                      : 'Secure multi-party computation across independent workers'}
                   </p>
                 </div>
               </div>
