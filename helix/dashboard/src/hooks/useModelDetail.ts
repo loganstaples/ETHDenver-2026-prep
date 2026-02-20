@@ -16,6 +16,7 @@ export interface ModelDetail {
   slug: string;
   name: string;
   description: string;
+  architecture: string;
   creator: string;
   owner: string;
   createdAt: number;
@@ -108,7 +109,7 @@ export function useModelDetail(tokenId: number) {
     if (modelResult?.status !== 'success' || !modelResult.result) return null;
     if (ownerResult?.status !== 'success' || !ownerResult.result) return null;
 
-    const m = modelResult.result as unknown as readonly [string, string, string, string, bigint, boolean, number];
+    const m = modelResult.result as unknown as readonly [string, string, string, string, string, bigint, boolean, number];
     const owner = ownerResult.result as unknown as string;
     const forSale = forSaleResult?.status === 'success' ? (forSaleResult.result as unknown as boolean) : false;
     const salePriceWei = salePriceResult?.status === 'success' ? (salePriceResult.result as unknown as bigint) : BigInt(0);
@@ -141,11 +142,12 @@ export function useModelDetail(tokenId: number) {
       slug: m[0],
       name: m[1],
       description: m[2],
-      creator: m[3],
+      architecture: m[3],
+      creator: m[4],
       owner,
-      createdAt: Number(m[4]),
-      isPublic: m[5],
-      inferenceFee: Number(m[6]),
+      createdAt: Number(m[5]),
+      isPublic: m[6],
+      inferenceFee: Number(m[7]),
       forSale,
       salePrice,
       versions,
