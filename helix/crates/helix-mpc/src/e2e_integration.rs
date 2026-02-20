@@ -914,42 +914,10 @@ async fn run_with_cheater(
                 "Starting Phase 2: recovery training with honest parties"
             );
 
-            // Reconstruct model from honest parties' checkpoint shares only.
-            // Each honest party saved their weight shares at the last good checkpoint.
-            let honest_results: Vec<&PartyResult> = phase1_party_results.iter()
-                .filter(|pr| pr.party_index != detected_cheater)
-                .collect();
-
-            let w1_len = honest_results[0].checkpoint_w1.len();
-            let b1_len = honest_results[0].checkpoint_b1.len();
-            let w2_len = honest_results[0].checkpoint_w2.len();
-            let b2_len = honest_results[0].checkpoint_b2.len();
-
-            // Sum honest checkpoint shares to reconstruct approximate model.
-            let mut w1_sum = vec![Fr::ZERO; w1_len];
-            let mut b1_sum = vec![Fr::ZERO; b1_len];
-            let mut w2_sum = vec![Fr::ZERO; w2_len];
-            let mut b2_sum = vec![Fr::ZERO; b2_len];
-
-            for pr in &honest_results {
-                for i in 0..w1_len { w1_sum[i] = Fr::add(&w1_sum[i], &pr.checkpoint_w1[i]); }
-                for i in 0..b1_len { b1_sum[i] = Fr::add(&b1_sum[i], &pr.checkpoint_b1[i]); }
-                for i in 0..w2_len { w2_sum[i] = Fr::add(&w2_sum[i], &pr.checkpoint_w2[i]); }
-                for i in 0..b2_len { b2_sum[i] = Fr::add(&b2_sum[i], &pr.checkpoint_b2[i]); }
-            }
-
-            let w1_f64: Vec<f64> = w1_sum.iter().map(|fr| fr.to_f64()).collect();
-            let b1_f64: Vec<f64> = b1_sum.iter().map(|fr| fr.to_f64()).collect();
-            let w2_f64: Vec<f64> = w2_sum.iter().map(|fr| fr.to_f64()).collect();
-            let b2_f64: Vec<f64> = b2_sum.iter().map(|fr| fr.to_f64()).collect();
-            let recovery_weights = ModelWeights::from_f64(&w1_f64, &b1_f64, &w2_f64, &b2_f64);
-
-            info!(
-                honest_parties = honest_results.len(),
-                "Reconstructed checkpoint weights from honest parties"
-            );
-
-            // Create fresh N-1 party mesh and re-share the reconstructed weights.
+            // Fresh He init for recovery. Summing only honest parties' additive
+            // shares gives w_real - missing_share (a random ~254-bit field
+            // element) which produces catastrophically wrong f64 weights.
+            // The correct approach: restart from fresh init with honest workers.
             let honest_count = num_workers - 1;
             let honest_parties: Vec<PartyId> = (0..honest_count).map(PartyId::from_index).collect();
             let recovery_transports = LocalTransport::create_mesh(&honest_parties);
@@ -959,10 +927,15 @@ async fn run_with_cheater(
                 ..trainer_config.clone()
             };
 
+            info!(
+                honest_parties = honest_count,
+                "Recovery: fresh He init (partial share reconstruction is mathematically unsound)"
+            );
+
             let (recovery_owner_secret, _recovery_commitment, recovery_bundles) =
                 prepare_encrypted_shares(
                     &recovery_config,
-                    &Some(recovery_weights),
+                    &None, // Fresh He init — cannot reconstruct from partial shares
                     &honest_parties,
                     seed.wrapping_add(0xBEC0_BEC0),
                 )?;
