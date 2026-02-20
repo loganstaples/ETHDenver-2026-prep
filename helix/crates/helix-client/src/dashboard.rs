@@ -209,6 +209,9 @@ pub struct TrainingSessionState {
     /// On-chain model version index (for per-version weight caching)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_version_index: Option<u64>,
+    /// Current sub-step operation within a training step (e.g. "Forward pass")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sub_step: Option<String>,
 }
 
 /// Request body for uploading training data.
@@ -650,6 +653,9 @@ async fn apply_progress_event(
             ProgressEvent::ZkProofGenerated { .. } => {
                 session.zk_proofs_generated += 1;
             }
+            ProgressEvent::SubStep { operation, .. } => {
+                session.sub_step = Some(operation.clone());
+            }
             _ => {}
         }
         let now = std::time::SystemTime::now()
@@ -693,6 +699,7 @@ impl Default for TrainingSessionState {
             model_slug: None,
             model_token_id: None,
             model_version_index: None,
+            sub_step: None,
         }
     }
 }
@@ -941,6 +948,14 @@ fn progress_event_to_json(event: &ProgressEvent) -> serde_json::Value {
                 "loss": loss,
                 "accuracy": accuracy,
                 "mac_ok": mac_ok,
+            })
+        }
+        ProgressEvent::SubStep { step, total, operation } => {
+            serde_json::json!({
+                "type": "sub_step",
+                "step": step,
+                "total": total,
+                "operation": operation,
             })
         }
         ProgressEvent::CheckpointSubmitted { index, total, step, tx_hash } => {
@@ -1357,6 +1372,7 @@ async fn start_training_handler(
         model_slug: req.model_slug.clone(),
         model_token_id: req.model_token_id,
         model_version_index: req.model_version_index,
+        sub_step: None,
     };
 
     // Store session

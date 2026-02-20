@@ -234,6 +234,7 @@ impl TrainingDb {
                 model_slug,
                 model_token_id: None,       // Not stored in DB
                 model_version_index: None,  // Not stored in DB
+                sub_step: None,             // Transient, not stored in DB
             })
         });
 

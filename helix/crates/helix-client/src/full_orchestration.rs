@@ -111,6 +111,8 @@ pub enum ProgressEvent {
     PhaseCompleted { phase: u32, elapsed_ms: u128 },
     /// Training step progress. Fields: (step, total_steps, loss, accuracy_estimate, mac_ok).
     TrainingStep { step: usize, total: usize, loss: f64, accuracy: f64, mac_ok: bool },
+    /// Sub-step progress within a single training step (e.g. forward pass, backward pass).
+    SubStep { step: usize, total: usize, operation: String },
     /// A checkpoint was submitted on-chain.
     CheckpointSubmitted { index: usize, total: usize, step: u64, tx_hash: String },
     /// A cheater was detected.

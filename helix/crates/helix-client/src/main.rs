@@ -3138,6 +3138,15 @@ async fn cmd_mpc_train(args: &MpcTrainArgs, _cli: &Cli) -> Result<()> {
                 );
                 println!();
             }
+            ProgressEvent::SubStep { step, total, operation } => {
+                println!(
+                    "    {} {}/{}: {}",
+                    "·".dimmed(),
+                    step,
+                    total,
+                    operation.dimmed(),
+                );
+            }
         }
     });
     orchestrator.set_progress_callback(progress_cb);
