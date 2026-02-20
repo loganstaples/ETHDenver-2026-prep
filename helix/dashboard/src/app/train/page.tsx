@@ -56,7 +56,7 @@ import {
 import { useModelRegistry, type ModelWithVersions } from '@/hooks/useModelRegistry';
 import { deriveModelKey, encryptWeights, decryptWeights } from '@/lib/model-encryption';
 import { HELIX_COORDINATOR_V4_ABI, HELIX_MODEL_STORE_ABI, getContractAddress } from '@/lib/contracts';
-import { getTrustedNodes } from '@/hooks/useTrustedNodes';
+import { getTrustedNodes, checkTrustedWorkersActive } from '@/hooks/useTrustedNodes';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
 
@@ -2606,31 +2606,15 @@ function TrainPageInner() {
     // Require at least 1 trusted worker to be active before starting.
     const trustedNodes = getTrustedNodes();
     if (trustedNodes.length > 0) {
-      try {
-        const res = await fetch(`${API_BASE}/api/workers`);
-        if (res.ok) {
-          const data = await res.json();
-          const workers: { address?: string; status?: string }[] =
-            Array.isArray(data) ? data : (data.workers ?? []);
-          const activeAddresses = workers
-            .filter(w => w.status !== 'offline' && w.address)
-            .map(w => (w.address as string).toLowerCase());
-          const trustedActive = trustedNodes.filter(tn =>
-            activeAddresses.includes(tn.toLowerCase())
-          );
-          if (trustedActive.length === 0) {
-            setWalletPaymentError(
-              'No trusted nodes are currently active. Add trusted nodes in Settings, or wait for at least one to come online.'
-            );
-            pendingConfigRef.current = null;
-            return;
-          }
-        }
-      } catch {
-        // If we can't reach the workers API, allow the job to proceed —
-        // the backend will enforce trust at share-distribution time.
+      const check = await checkTrustedWorkersActive(API_BASE, trustedNodes);
+      if (!check.ok) {
+        setWalletPaymentError(check.error ?? 'Trusted node check failed');
+        pendingConfigRef.current = null;
+        return;
       }
-      // Attach trusted nodes to the config so the backend knows which workers are trusted
+      if (check.warning) {
+        console.warn('[Train] Trusted node check:', check.warning);
+      }
       config = { ...config, trusted_nodes: trustedNodes };
     }
 

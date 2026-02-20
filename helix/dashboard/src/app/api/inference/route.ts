@@ -11,7 +11,7 @@ const BACKEND_TIMEOUT_MS = 30_000;
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { session_id, model_token_id, model_version_index, pixels, num_parties, wallet_address, payment_tx } = body;
+    const { session_id, model_token_id, model_version_index, pixels, num_parties, wallet_address, payment_tx, trusted_nodes } = body;
 
     if (!pixels || !Array.isArray(pixels) || pixels.length !== 784) {
       return NextResponse.json(
@@ -42,11 +42,13 @@ export async function POST(req: NextRequest) {
           num_parties: num_parties || 3,
           wallet_address,
           payment_tx,
+          trusted_nodes,
         }
       : {
           session_id,
           pixels,
           num_parties: num_parties || 3,
+          trusted_nodes,
         };
 
     // Forward to Rust backend

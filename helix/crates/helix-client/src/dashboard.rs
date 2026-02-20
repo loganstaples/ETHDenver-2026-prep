@@ -2766,6 +2766,17 @@ async fn model_inference_handler(
     State(state): State<Arc<DashboardState>>,
     Json(req): Json<ModelInferenceRequest>,
 ) -> impl IntoResponse {
+    // Log trusted nodes if provided
+    if let Some(ref trusted) = req.trusted_nodes {
+        if !trusted.is_empty() {
+            info!(
+                trusted_count = trusted.len(),
+                "Model inference request with {} trusted node(s)",
+                trusted.len()
+            );
+        }
+    }
+
     if req.pixels.is_empty() {
         return (
             StatusCode::BAD_REQUEST,

@@ -27,6 +27,7 @@ import { usePublicModels, type PublicModel } from '@/hooks/usePublicModels';
 import { useModelRegistry } from '@/hooks/useModelRegistry';
 import { deriveModelKey, decryptWeights } from '@/lib/model-encryption';
 import { HELIX_MODEL_STORE_ABI, getContractAddress } from '@/lib/contracts';
+import { getTrustedNodes, checkTrustedWorkersActive } from '@/hooks/useTrustedNodes';
 
 // ============================================================================
 // Types & Constants
@@ -1024,6 +1025,20 @@ function InferencePageInner() {
       return;
     }
 
+    // ── Trusted nodes gate ────────────────────────────────────────────
+    const trustedNodes = getTrustedNodes();
+    if (trustedNodes.length > 0) {
+      const check = await checkTrustedWorkersActive(API_BASE, trustedNodes);
+      if (!check.ok) {
+        setError(check.error ?? 'Trusted node check failed');
+        setPhase('error');
+        return;
+      }
+      if (check.warning) {
+        console.warn('[Inference] Trusted node check:', check.warning);
+      }
+    }
+
     setPhase('submitting');
     setError(null);
     setResult(null);
@@ -1040,10 +1055,12 @@ function InferencePageInner() {
         num_parties: 3,
         wallet_address: isOwnerOfSelected ? address : undefined,
         payment_tx: paymentTxHash,
+        trusted_nodes: trustedNodes.length > 0 ? trustedNodes : undefined,
       } : {
         session_id: activeSessionId,
         pixels,
         num_parties: 3,
+        trusted_nodes: trustedNodes.length > 0 ? trustedNodes : undefined,
       };
       console.log('[Inference] Sending request', { useModelEndpoint, sessionId: activeSessionId, pixelsSample: pixels.slice(0, 5) });
 

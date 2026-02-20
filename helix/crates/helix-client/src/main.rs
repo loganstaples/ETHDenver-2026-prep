@@ -2937,6 +2937,7 @@ async fn cmd_mpc_train(args: &MpcTrainArgs, _cli: &Cli) -> Result<()> {
         cheater_party: args.cheater_party,
         cheater_step: args.cheater_step,
         worker_seeds: Vec::new(), // CLI mode: seeds derived from config.seed + i
+        trusted_nodes: None, // CLI: trusted nodes are configured via the dashboard
     };
 
     // Load custom training data from --data flag if provided

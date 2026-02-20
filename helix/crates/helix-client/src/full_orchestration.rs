@@ -313,6 +313,15 @@ pub struct FullOrchestrationConfig {
     /// Only used when simulate_cheater is true.
     #[serde(default)]
     pub cheater_step: Option<u64>,
+
+    // -- Trusted Nodes --
+    /// Ethereum addresses of nodes the model owner trusts to handle plaintext weights.
+    /// When non-empty, only these workers will receive weight shares. At least one
+    /// trusted worker must be active for the job to proceed. With even a single honest
+    /// trusted node, no coalition of other participants can reconstruct the model
+    /// (additive secret sharing requires ALL shares).
+    #[serde(default)]
+    pub trusted_nodes: Option<Vec<String>>,
 }
 
 impl Default for FullOrchestrationConfig {
@@ -370,6 +379,7 @@ impl Default for FullOrchestrationConfig {
             simulate_cheater: false,
             cheater_party: None,
             cheater_step: None,
+            trusted_nodes: None,
         }
     }
 }
@@ -527,6 +537,17 @@ impl FullOrchestrator {
         let d_hid = arch[1];
         let d_out = arch[2];
         let num_workers = self.config.worker_endpoints.len();
+
+        // Log trusted nodes configuration
+        if let Some(ref trusted) = self.config.trusted_nodes {
+            if !trusted.is_empty() {
+                info!(
+                    trusted_count = trusted.len(),
+                    trusted_addresses = %trusted.join(", "),
+                    "Trusted nodes configured — only these workers will handle plaintext weights"
+                );
+            }
+        }
 
         info!(
             architecture = %format!("{}x{}x{}", d_in, d_hid, d_out),
@@ -3363,6 +3384,7 @@ mod tests {
             cheater_party: None,
             cheater_step: None,
             worker_seeds: Vec::new(),
+            trusted_nodes: None,
         };
         let orchestrator = FullOrchestrator::new(config);
         assert!(orchestrator.validate_config().is_ok());

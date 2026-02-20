@@ -1,13 +1,14 @@
 'use client';
 
 import { useState } from 'react';
-import { motion } from 'framer-motion';
-import { Wallet, Globe, SlidersHorizontal, WalletCards, FileCode2 } from 'lucide-react';
+import { motion, AnimatePresence } from 'framer-motion';
+import { Wallet, Globe, SlidersHorizontal, WalletCards, FileCode2, Shield, Plus, X, AlertCircle } from 'lucide-react';
 import { useAccount, useChainId } from 'wagmi';
 import { Card } from '@/components/ui/Card';
 import { Badge } from '@/components/ui/Badge';
 import { AddressDisplay } from '@/components/ui/AddressDisplay';
 import { useContract } from '@/hooks/useContract';
+import { useTrustedNodes } from '@/hooks/useTrustedNodes';
 
 // ---------------------------------------------------------------------------
 // Chain metadata
@@ -103,6 +104,27 @@ export default function SettingsPage() {
 
   const [autoRefresh, setAutoRefresh] = useState(true);
 
+  // Trusted nodes
+  const { trustedNodes, addNode, removeNode } = useTrustedNodes();
+  const [newAddress, setNewAddress] = useState('');
+  const [trustedError, setTrustedError] = useState<string | null>(null);
+
+  const handleAddTrustedNode = () => {
+    setTrustedError(null);
+    const result = addNode(newAddress);
+    if (result.ok) {
+      setNewAddress('');
+    } else {
+      setTrustedError(result.error ?? 'Failed to add address');
+    }
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter') {
+      handleAddTrustedNode();
+    }
+  };
+
   return (
     <motion.div
       initial={{ opacity: 0, y: 6 }}
@@ -155,7 +177,103 @@ export default function SettingsPage() {
       </Card>
 
       {/* ----------------------------------------------------------------- */}
-      {/* 2. Network                                                        */}
+      {/* 2. Trusted Nodes                                                  */}
+      {/* ----------------------------------------------------------------- */}
+      <Card>
+        <SectionHeader icon={Shield} label="Trusted Nodes" />
+
+        <p className="text-[11px] text-[#555] mb-4">
+          Restrict which workers can handle your model weights during training or
+          inference. At least one trusted node must be active for a job to start.
+          In HELIX&apos;s additive secret sharing, each worker holds only a fragment
+          of your model &mdash; as long as even one share holder is honest, no
+          coalition of other participants can reconstruct the full weights.
+        </p>
+
+        {/* Add address input */}
+        <div className="flex gap-2 mb-3">
+          <input
+            type="text"
+            value={newAddress}
+            onChange={(e) => { setNewAddress(e.target.value); setTrustedError(null); }}
+            onKeyDown={handleKeyDown}
+            placeholder="0x..."
+            className="flex-1 bg-white/[0.04] border border-helix-border rounded px-3 py-1.5
+                       text-[13px] text-white placeholder-[#444] font-mono
+                       focus:outline-none focus:border-[#555] transition-colors"
+          />
+          <button
+            type="button"
+            onClick={handleAddTrustedNode}
+            disabled={!newAddress.trim()}
+            className="flex items-center gap-1 px-3 py-1.5 rounded border border-helix-border
+                       text-[12px] text-[#aaa] hover:text-white hover:border-[#555]
+                       disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+          >
+            <Plus size={12} />
+            Add
+          </button>
+        </div>
+
+        {/* Error message */}
+        <AnimatePresence>
+          {trustedError && (
+            <motion.div
+              initial={{ opacity: 0, height: 0 }}
+              animate={{ opacity: 1, height: 'auto' }}
+              exit={{ opacity: 0, height: 0 }}
+              className="flex items-center gap-1.5 mb-3 text-[11px] text-red-400"
+            >
+              <AlertCircle size={11} />
+              {trustedError}
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Trusted nodes list */}
+        {trustedNodes.length === 0 ? (
+          <div className="py-4 text-center border border-dashed border-helix-border rounded">
+            <Shield size={20} className="mx-auto mb-1.5 text-[#333]" />
+            <p className="text-[11px] text-[#555]">No trusted nodes configured</p>
+            <p className="text-[10px] text-[#444] mt-0.5">
+              Add Ethereum addresses of nodes you trust to handle your model weights.
+            </p>
+          </div>
+        ) : (
+          <div className="space-y-0 divide-y divide-helix-border">
+            {trustedNodes.map((addr) => (
+              <div
+                key={addr}
+                className="flex items-center justify-between py-2 group"
+              >
+                <span className="font-mono text-[12px] text-[#aaa]">
+                  {addr}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => removeNode(addr)}
+                  className="p-1 rounded text-[#444] hover:text-red-400 hover:bg-white/[0.04]
+                             opacity-0 group-hover:opacity-100 transition-all"
+                  title="Remove trusted node"
+                >
+                  <X size={12} />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {trustedNodes.length > 0 && (
+          <div className="mt-3 pt-3 border-t border-helix-border">
+            <span className="text-[11px] text-[#555]">
+              {trustedNodes.length} trusted node{trustedNodes.length !== 1 ? 's' : ''} configured
+            </span>
+          </div>
+        )}
+      </Card>
+
+      {/* ----------------------------------------------------------------- */}
+      {/* 3. Network                                                        */}
       {/* ----------------------------------------------------------------- */}
       <Card>
         <SectionHeader icon={Globe} label="Network" />
@@ -182,7 +300,7 @@ export default function SettingsPage() {
       </Card>
 
       {/* ----------------------------------------------------------------- */}
-      {/* 3. Preferences                                                    */}
+      {/* 4. Preferences                                                    */}
       {/* ----------------------------------------------------------------- */}
       <Card>
         <SectionHeader icon={SlidersHorizontal} label="Preferences" />

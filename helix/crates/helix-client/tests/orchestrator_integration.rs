@@ -70,6 +70,7 @@ async fn test_full_owner_flow() {
         zk_mode: helix_client::ZkMode::Off,
         custom_training_data: None,
         simulate_cheater: false,
+        ..Default::default()
     };
 
     let mut orchestrator = FullOrchestrator::new(config);
@@ -346,6 +347,7 @@ async fn test_progress_output() {
         zk_mode: helix_client::ZkMode::Off,
         custom_training_data: None,
         simulate_cheater: false,
+        ..Default::default()
     };
 
     let mut orchestrator = FullOrchestrator::new(config);
@@ -515,6 +517,7 @@ async fn test_error_recovery() {
             zk_mode: helix_client::ZkMode::Off,
             custom_training_data: None,
             simulate_cheater: false,
+            ..Default::default()
         }
     };
 
