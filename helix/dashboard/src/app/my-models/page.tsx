@@ -5,16 +5,12 @@ import { motion, AnimatePresence } from 'framer-motion';
 import Link from 'next/link';
 import {
   Layers,
-  Tag,
   CheckCircle,
   XCircle,
   HardDrive,
   Copy,
   ExternalLink,
-  ChevronDown,
-  ChevronRight,
   Clock,
-  Trophy,
   Upload,
   Download,
   Loader2,
@@ -30,10 +26,10 @@ import {
   ArrowUpDown,
   Search,
   X,
+  MessageSquare,
 } from 'lucide-react';
 import { Card } from '@/components/ui/Card';
 import { Badge } from '@/components/ui/Badge';
-import { StatCard } from '@/components/ui/StatCard';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { Modal } from '@/components/ui/Modal';
 import { cn } from '@/lib/utils';
@@ -54,16 +50,15 @@ const SLUG_REGEX = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 const LEGACY_HISTORY_KEY = 'helix-training-history';
 
 // ============================================================================
-// Sort & Category
+// Sort
 // ============================================================================
 
-type SortOption = 'newest' | 'oldest' | 'accuracy' | 'versions' | 'name';
+type SortOption = 'newest' | 'oldest' | 'accuracy' | 'name';
 
 const SORT_OPTIONS: { id: SortOption; label: string }[] = [
   { id: 'newest', label: 'Newest' },
   { id: 'oldest', label: 'Oldest' },
   { id: 'accuracy', label: 'Best Accuracy' },
-  { id: 'versions', label: 'Most Versions' },
   { id: 'name', label: 'Name A-Z' },
 ];
 
@@ -77,38 +72,14 @@ function sortMyModels(models: ModelWithVersions[], sort: SortOption): ModelWithV
       const bBest = b.versions.reduce((best, v) => (v.accuracy > best ? v.accuracy : best), 0);
       return bBest - aBest;
     });
-    case 'versions': return sorted.sort((a, b) => b.versions.length - a.versions.length);
     case 'name': return sorted.sort((a, b) => a.name.localeCompare(b.name));
     default: return sorted;
   }
 }
 
-const CATEGORY_RULES: { tag: string; patterns: RegExp }[] = [
-  { tag: 'Classifier', patterns: /classif|detector|detection/i },
-  { tag: 'Image', patterns: /image|mnist|cifar|resnet|vision|x-ray|imaging/i },
-  { tag: 'NLP', patterns: /sentiment|bert|text|language|nlp|embedding/i },
-  { tag: 'Autoencoder', patterns: /autoencoder|denoising|vae/i },
-  { tag: 'Generative', patterns: /generative|gan|diffusion/i },
-  { tag: 'Finance', patterns: /fraud|finance|transaction|trading/i },
-];
-
-function getModelTags(model: { name: string; description: string; slug: string }): string[] {
-  const text = `${model.name} ${model.description} ${model.slug}`;
-  const tags: string[] = [];
-  for (const rule of CATEGORY_RULES) {
-    if (rule.patterns.test(text)) tags.push(rule.tag);
-  }
-  return tags;
-}
-
 // ============================================================================
 // Helpers
 // ============================================================================
-
-function truncateAddress(addr: string): string {
-  if (addr.length <= 12) return addr;
-  return `${addr.slice(0, 6)}...${addr.slice(-4)}`;
-}
 
 function truncateHash(hash: string): string {
   if (!hash || hash.length <= 16) return hash || '--';
@@ -129,6 +100,13 @@ function hasLegacyHistory(): boolean {
   } catch {
     return false;
   }
+}
+
+function formatDuration(secs: number): string {
+  if (secs < 60) return `${Math.round(secs)}s`;
+  const mins = Math.floor(secs / 60);
+  const rem = Math.round(secs % 60);
+  return rem > 0 ? `${mins}m ${rem}s` : `${mins}m`;
 }
 
 // ============================================================================
@@ -233,7 +211,7 @@ function CreateModelModal({ isOpen, onClose, onCreate, isPending }: CreateModelM
               onClick={handleSubmit}
               disabled={!canSubmit}
               className={cn(
-                'w-full flex items-center justify-center gap-2 py-3 rounded-lg font-medium text-sm transition-all',
+                'w-full flex items-center justify-center gap-2 py-3 rounded-xl font-medium text-sm transition-all',
                 !canSubmit
                   ? 'bg-helix-border text-helix-muted cursor-not-allowed'
                   : 'bg-white text-black hover:bg-white/90',
@@ -324,7 +302,6 @@ function AddVersionModal({
 
     try {
       if (file) {
-        // --- With weights file: validate -> encrypt -> upload -> register ---
         setPhase('validating');
         const text = await file.text();
         const data = JSON.parse(text);
@@ -336,7 +313,6 @@ function AddVersionModal({
         let rootHash = '';
 
         if (isConnected) {
-          // Encrypt weights using wallet-derived key
           setPhase('encrypting');
           const key = await deriveModelKey(
             (message: string) => signMessageAsync({ message }),
@@ -345,7 +321,6 @@ function AddVersionModal({
           const encrypted = await encryptWeights(key, JSON.stringify(weights));
           const encryptedBase64 = btoa(String.fromCharCode(...encrypted));
 
-          // Upload encrypted to 0G
           setPhase('uploading');
           const res = await fetch('/api/store-on-0g', {
             method: 'POST',
@@ -368,7 +343,6 @@ function AddVersionModal({
           rootHash = result.root_hash;
           setResultHash(rootHash);
         } else {
-          // Not connected: upload unencrypted
           setPhase('uploading');
           const res = await fetch('/api/store-on-0g', {
             method: 'POST',
@@ -391,7 +365,6 @@ function AddVersionModal({
           setResultHash(rootHash);
         }
 
-        // Register on-chain
         setPhase('registering');
         addVersion({
           tokenId: targetModel.tokenId,
@@ -404,7 +377,6 @@ function AddVersionModal({
 
         setPhase('done');
       } else {
-        // --- No weights file: just register version on-chain ---
         setPhase('registering');
         addVersion({
           tokenId: targetModel.tokenId,
@@ -456,7 +428,7 @@ function AddVersionModal({
               <div
                 onClick={() => fileRef.current?.click()}
                 className={cn(
-                  'flex flex-col items-center justify-center gap-2 p-6 rounded-lg border-2 border-dashed cursor-pointer transition-colors',
+                  'flex flex-col items-center justify-center gap-2 p-6 rounded-xl border-2 border-dashed cursor-pointer transition-colors',
                   file
                     ? 'border-green-500/30 bg-green-500/5'
                     : 'border-helix-border hover:border-helix-border2 bg-helix-bg',
@@ -515,7 +487,7 @@ function AddVersionModal({
               onClick={handleSubmit}
               disabled={!canSubmit}
               className={cn(
-                'w-full flex items-center justify-center gap-2 py-3 rounded-lg font-medium text-sm transition-all',
+                'w-full flex items-center justify-center gap-2 py-3 rounded-xl font-medium text-sm transition-all',
                 !canSubmit
                   ? 'bg-helix-border text-helix-muted cursor-not-allowed'
                   : 'bg-white text-black hover:bg-white/90',
@@ -537,7 +509,6 @@ function AddVersionModal({
               {phase === 'uploading' && 'Uploading to 0G decentralized storage...'}
               {phase === 'registering' && 'Registering on-chain (confirm in wallet)...'}
             </p>
-            {/* Step indicator */}
             <div className="flex items-center gap-2">
               {(['validating', 'encrypting', 'uploading', 'registering'] as const).map((s, i) => (
                 <div
@@ -569,7 +540,7 @@ function AddVersionModal({
             <button
               type="button"
               onClick={handleClose}
-              className="mt-2 px-6 py-2 rounded-lg bg-white text-black text-sm font-medium hover:bg-white/90 transition-colors"
+              className="mt-2 px-6 py-2 rounded-xl bg-white text-black text-sm font-medium hover:bg-white/90 transition-colors"
             >
               Done
             </button>
@@ -583,7 +554,7 @@ function AddVersionModal({
             <button
               type="button"
               onClick={() => setPhase('idle')}
-              className="mt-2 px-6 py-2 rounded-lg bg-helix-surface border border-helix-border text-sm text-helix-text hover:text-white transition-colors"
+              className="mt-2 px-6 py-2 rounded-xl bg-helix-surface border border-helix-border text-sm text-helix-text hover:text-white transition-colors"
             >
               Try Again
             </button>
@@ -595,69 +566,7 @@ function AddVersionModal({
 }
 
 // ============================================================================
-// Version Row
-// ============================================================================
-
-function VersionRow({ version }: { version: OnChainVersion }) {
-  const [copied, setCopied] = useState(false);
-
-  const copyHash = (hash: string) => {
-    navigator.clipboard.writeText(hash);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-  };
-
-  return (
-    <div className="flex items-center gap-3 px-3 py-2.5 bg-helix-bg rounded-md border border-helix-border/50">
-      <Badge variant="default" className="font-mono text-2xs shrink-0">v{version.semver}</Badge>
-
-      {version.accuracy > 0 && (
-        <span className="text-sm font-mono text-white">
-          {(version.accuracy * 100).toFixed(1)}%
-        </span>
-      )}
-
-      {version.weightsStored ? (
-        <Badge variant="default" className="text-green-400">
-          <HardDrive size={10} />
-          0G
-        </Badge>
-      ) : (
-        <span className="text-2xs text-helix-dim">No weights</span>
-      )}
-
-      <span className="text-2xs text-helix-dim ml-auto shrink-0">
-        {formatDate(version.timestamp)}
-      </span>
-
-      {version.rootHash && (
-        <div className="flex items-center gap-1 shrink-0">
-          <code className="text-2xs font-mono text-helix-muted">
-            {truncateHash(version.rootHash)}
-          </code>
-          <button
-            type="button"
-            onClick={() => copyHash(version.rootHash)}
-            className="p-1 rounded text-helix-dim hover:text-white transition-colors"
-          >
-            {copied ? <CheckCircle size={12} /> : <Copy size={12} />}
-          </button>
-          <a
-            href={`https://storagescan-galileo.0g.ai/file/${version.rootHash}`}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="p-1 rounded text-helix-dim hover:text-white transition-colors"
-          >
-            <ExternalLink size={12} />
-          </a>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ============================================================================
-// Model Detail Modal
+// Model Detail Modal (On-Chain)
 // ============================================================================
 
 interface ModelDetailModalProps {
@@ -699,7 +608,6 @@ function ModelDetailModal({
   const bestAccuracy = model
     ? model.versions.reduce((best, v) => (v.accuracy > best ? v.accuracy : best), 0)
     : 0;
-  const tags = model ? getModelTags(model) : [];
   const hasWeightsStored = model ? model.versions.some((v) => v.weightsStored) : false;
   const latestWithWeights = model
     ? [...model.versions].reverse().find((v) => v.weightsStored && v.rootHash)
@@ -767,17 +675,6 @@ function ModelDetailModal({
                 {model.description && (
                   <p className="text-sm text-helix-text2 mt-3 leading-relaxed">{model.description}</p>
                 )}
-
-                <div className="flex items-center gap-2 mt-3 flex-wrap">
-                  {tags.map((tag) => (
-                    <span key={tag} className="px-2.5 py-0.5 text-2xs rounded-full bg-white/[0.04] text-helix-text2 border border-white/[0.06]">
-                      {tag}
-                    </span>
-                  ))}
-                  <span className="text-2xs text-helix-dim">
-                    Created {formatDate(model.createdAt)}
-                  </span>
-                </div>
               </div>
 
               {/* Hero Accuracy */}
@@ -800,9 +697,9 @@ function ModelDetailModal({
                 </div>
               </div>
 
-              {/* Stats Row */}
+              {/* Key Metrics 2x2 */}
               <div className="px-8 pb-6">
-                <div className="grid grid-cols-3 gap-3">
+                <div className="grid grid-cols-2 gap-3">
                   <div className="bg-white/[0.03] rounded-xl px-4 py-3.5 text-center">
                     <p className="text-lg font-mono font-medium text-white tracking-tight">
                       {model.versions.length}
@@ -810,16 +707,16 @@ function ModelDetailModal({
                     <p className="text-2xs text-helix-muted mt-1 uppercase tracking-wider">Versions</p>
                   </div>
                   <div className="bg-white/[0.03] rounded-xl px-4 py-3.5 text-center">
-                    <p className="text-lg font-mono font-medium text-white tracking-tight">
-                      {hasWeightsStored ? 'Yes' : 'No'}
-                    </p>
-                    <p className="text-2xs text-helix-muted mt-1 uppercase tracking-wider">Weights Stored</p>
+                    <p className="text-lg font-mono font-medium text-helix-dim tracking-tight">0</p>
+                    <p className="text-2xs text-helix-muted mt-1 uppercase tracking-wider">Inferences</p>
                   </div>
                   <div className="bg-white/[0.03] rounded-xl px-4 py-3.5 text-center">
-                    <p className={cn('text-lg font-mono font-medium tracking-tight', model.isPublic ? 'text-green-400' : 'text-helix-text2')}>
-                      {model.isPublic ? 'Public' : 'Private'}
-                    </p>
-                    <p className="text-2xs text-helix-muted mt-1 uppercase tracking-wider">Visibility</p>
+                    <p className="text-lg font-mono font-medium text-helix-dim tracking-tight">--</p>
+                    <p className="text-2xs text-helix-muted mt-1 uppercase tracking-wider">Downloads</p>
+                  </div>
+                  <div className="bg-white/[0.03] rounded-xl px-4 py-3.5 text-center">
+                    <p className="text-lg font-mono font-medium text-helix-dim tracking-tight">$0.00</p>
+                    <p className="text-2xs text-helix-muted mt-1 uppercase tracking-wider">Revenue</p>
                   </div>
                 </div>
               </div>
@@ -1005,13 +902,6 @@ function ModelDetailModal({
 // Trained Model Detail Modal
 // ============================================================================
 
-function formatDuration(secs: number): string {
-  if (secs < 60) return `${Math.round(secs)}s`;
-  const mins = Math.floor(secs / 60);
-  const rem = Math.round(secs % 60);
-  return rem > 0 ? `${mins}m ${rem}s` : `${mins}m`;
-}
-
 interface TrainedModelDetailModalProps {
   session: TrainingSessionState | null;
   onClose: () => void;
@@ -1131,9 +1021,9 @@ function TrainedModelDetailModal({ session, onClose, onDownload }: TrainedModelD
                 </div>
               </div>
 
-              {/* Stats Row */}
+              {/* Key Metrics 2x2 */}
               <div className="px-8 pb-6">
-                <div className="grid grid-cols-3 gap-3">
+                <div className="grid grid-cols-2 gap-3">
                   <div className="bg-white/[0.03] rounded-xl px-4 py-3.5 text-center">
                     <p className="text-lg font-mono font-medium text-white tracking-tight">
                       {latestLoss != null ? latestLoss.toFixed(4) : '--'}
@@ -1151,6 +1041,10 @@ function TrainedModelDetailModal({ session, onClose, onDownload }: TrainedModelD
                       {session.checkpoints_submitted}
                     </p>
                     <p className="text-2xs text-helix-muted mt-1 uppercase tracking-wider">Checkpoints</p>
+                  </div>
+                  <div className="bg-white/[0.03] rounded-xl px-4 py-3.5 text-center">
+                    <p className="text-lg font-mono font-medium text-helix-dim tracking-tight">--</p>
+                    <p className="text-2xs text-helix-muted mt-1 uppercase tracking-wider">Compute Cost</p>
                   </div>
                 </div>
               </div>
@@ -1227,7 +1121,7 @@ function TrainedModelDetailModal({ session, onClose, onDownload }: TrainedModelD
                 href="/inference"
                 className="flex items-center justify-center gap-2 px-5 py-3 rounded-xl bg-white/[0.06] border border-white/[0.08] text-sm text-white hover:bg-white/[0.1] transition-colors"
               >
-                <Shield size={15} />
+                <MessageSquare size={15} />
               </Link>
             </div>
           </motion.div>
@@ -1238,209 +1132,102 @@ function TrainedModelDetailModal({ session, onClose, onDownload }: TrainedModelD
 }
 
 // ============================================================================
-// Model Card
+// Model Card (On-Chain) — Redesigned
 // ============================================================================
 
 interface ModelCardProps {
   model: ModelWithVersions;
   onClickCard: (model: ModelWithVersions) => void;
-  onAddVersion: (model: ModelWithVersions) => void;
   onTogglePublic: (model: ModelWithVersions) => void;
-  onDownloadWeights: (model: ModelWithVersions) => void;
   isToggling: boolean;
-  isDownloading: number | null;
 }
 
-function ModelCard({ model, onClickCard, onAddVersion, onTogglePublic, onDownloadWeights, isToggling, isDownloading }: ModelCardProps) {
-  const [expanded, setExpanded] = useState(false);
-  const tags = useMemo(() => getModelTags(model), [model]);
-
+function ModelCard({ model, onClickCard, onTogglePublic, isToggling }: ModelCardProps) {
   const versionCount = model.versions.length;
   const bestAccuracy = model.versions.reduce(
     (best, v) => (v.accuracy > best ? v.accuracy : best),
     0,
   );
-  const weightsCount = model.versions.filter((v) => v.weightsStored).length;
-  const latestWithWeights = [...model.versions].reverse().find((v) => v.weightsStored && v.rootHash);
-  const isThisDownloading = isDownloading === model.tokenId;
 
   return (
-    <Card variant="glass" hover className="flex flex-col h-full cursor-pointer" onClick={() => onClickCard(model)}>
-      {/* Header */}
-      <div className="flex items-start justify-between mb-4">
-        <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-lg bg-white/[0.06] flex items-center justify-center shrink-0">
-            <Layers size={20} className="text-white" />
+    <motion.div
+      whileHover={{ y: -2 }}
+      transition={{ duration: 0.2 }}
+    >
+      <Card variant="glass" hover className="flex flex-col h-full cursor-pointer !rounded-2xl !p-6" onClick={() => onClickCard(model)}>
+        {/* Header */}
+        <div className="flex items-start justify-between mb-5">
+          <div className="flex items-center gap-3">
+            <div className="w-11 h-11 rounded-xl bg-white/[0.06] flex items-center justify-center shrink-0">
+              <Layers size={20} className="text-white/80" />
+            </div>
+            <div>
+              <h3 className="text-lg font-semibold text-white">{model.name}</h3>
+              <p className="text-xs font-mono text-helix-muted">{model.slug}</p>
+            </div>
           </div>
-          <div>
-            <h3 className="text-base font-medium text-white">{model.name}</h3>
-            <p className="text-2xs font-mono text-helix-muted">{model.slug}</p>
-          </div>
-        </div>
-        <div className="flex items-center gap-2 shrink-0">
-          {model.isPublic ? (
-            <Badge variant="default" className="text-green-400 text-2xs flex items-center gap-1">
-              <Globe size={10} />
-              Public
-            </Badge>
-          ) : (
-            <Badge variant="default" className="text-helix-muted text-2xs flex items-center gap-1">
-              <Lock size={10} />
-              Private
-            </Badge>
-          )}
-          {model.versions.length > 0 && (
-            <Badge variant="default" className="font-mono">
-              v{model.versions[model.versions.length - 1]?.semver}
-            </Badge>
-          )}
-          <Badge variant="default">#{model.tokenId}</Badge>
-        </div>
-      </div>
-
-      {/* Tags */}
-      {tags.length > 0 && (
-        <div className="flex items-center gap-1.5 mb-3">
-          {tags.map((tag) => (
-            <span key={tag} className="px-2 py-0.5 text-2xs rounded-full bg-white/[0.04] text-helix-text2 border border-white/[0.06]">
-              {tag}
-            </span>
-          ))}
-        </div>
-      )}
-
-      {/* Description - clamped for consistent height */}
-      {model.description && (
-        <p className="text-2xs text-helix-muted mb-4 line-clamp-2">{model.description}</p>
-      )}
-
-      {/* Creator / Date */}
-      <div className="flex items-center gap-4 text-2xs text-helix-dim mb-4">
-        <span>Creator: {truncateAddress(model.creator)}</span>
-        <span>Created: {formatDate(model.createdAt)}</span>
-      </div>
-
-      {/* Stats Row */}
-      <div className="grid grid-cols-3 gap-3 mb-4">
-        <div className="bg-helix-bg rounded-md px-3 py-2 text-center">
-          <p className="text-2xs text-helix-muted">Versions</p>
-          <p className="text-lg font-mono font-light text-white">{versionCount}</p>
-        </div>
-        <div className="bg-helix-bg rounded-md px-3 py-2 text-center">
-          <p className="text-2xs text-helix-muted">Best Accuracy</p>
-          <p className="text-lg font-mono font-light text-white">
-            {bestAccuracy > 0 ? `${(bestAccuracy * 100).toFixed(1)}%` : '--'}
-          </p>
-        </div>
-        <div className="bg-helix-bg rounded-md px-3 py-2 text-center">
-          <p className="text-2xs text-helix-muted">On 0G</p>
-          <p className="text-lg font-mono font-light text-white">{weightsCount}</p>
-        </div>
-      </div>
-
-      {/* Version History Toggle */}
-      {versionCount > 0 && (
-        <div className="mb-3" onClick={(e) => e.stopPropagation()}>
           <button
             type="button"
-            onClick={() => setExpanded(!expanded)}
-            className="flex items-center gap-2 text-sm text-helix-text2 hover:text-white transition-colors"
-          >
-            {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-            <Clock size={14} />
-            Version History ({versionCount})
-          </button>
-
-          <AnimatePresence>
-            {expanded && (
-              <motion.div
-                initial={{ height: 0, opacity: 0 }}
-                animate={{ height: 'auto', opacity: 1 }}
-                exit={{ height: 0, opacity: 0 }}
-                transition={{ duration: 0.2 }}
-                className="overflow-hidden"
-              >
-                <div className="space-y-2 mt-3">
-                  {model.versions.slice().reverse().map((v, i) => (
-                    <VersionRow key={`${v.semver}-${i}`} version={v} />
-                  ))}
-                </div>
-              </motion.div>
-            )}
-          </AnimatePresence>
-        </div>
-      )}
-
-      {/* Actions - pinned to bottom */}
-      <div className="flex items-center gap-2 flex-wrap pt-3 border-t border-helix-border/50 mt-auto" onClick={(e) => e.stopPropagation()}>
-        <Link
-          href={`/my-models/${model.tokenId}`}
-          className="flex items-center gap-2 px-4 py-2 rounded-lg bg-white text-black text-sm font-medium hover:bg-white/90 transition-colors"
-        >
-          <Settings size={14} />
-          Manage
-        </Link>
-
-        <Link
-          href={`/train?model=${model.tokenId}`}
-          className="flex items-center gap-2 px-4 py-2 rounded-lg bg-helix-surface border border-helix-border text-sm text-helix-text hover:border-helix-border2 hover:text-white transition-colors"
-        >
-          <Play size={14} />
-          Train
-        </Link>
-
-        {latestWithWeights && (
-          <button
-            type="button"
-            onClick={() => onDownloadWeights(model)}
-            disabled={isThisDownloading}
+            onClick={(e) => { e.stopPropagation(); onTogglePublic(model); }}
+            disabled={isToggling}
             className={cn(
-              'flex items-center gap-2 px-4 py-2 rounded-lg bg-helix-surface border border-helix-border text-sm text-helix-text hover:border-helix-border2 hover:text-white transition-colors',
-              isThisDownloading && 'opacity-50 cursor-not-allowed',
+              'p-2 rounded-lg transition-all',
+              model.isPublic
+                ? 'bg-green-500/10 text-green-400 hover:bg-green-500/20'
+                : 'bg-white/[0.04] text-helix-muted hover:bg-white/[0.08]',
+              isToggling && 'opacity-50 cursor-not-allowed',
             )}
+            title={model.isPublic ? 'Public — click to make private' : 'Private — click to make public'}
           >
-            {isThisDownloading ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
-            Download
+            {isToggling ? <Loader2 size={14} className="animate-spin" /> : model.isPublic ? <Globe size={14} /> : <Lock size={14} />}
           </button>
-        )}
+        </div>
 
-        <button
-          type="button"
-          onClick={() => onAddVersion(model)}
-          className="flex items-center gap-2 px-4 py-2 rounded-lg bg-helix-surface border border-helix-border text-sm text-helix-text hover:border-helix-border2 hover:text-white transition-colors"
-        >
-          <Plus size={14} />
-          Add Version
-        </button>
+        {/* Hero accuracy + version count */}
+        <div className="mb-6">
+          <span className="text-3xl font-semibold tracking-tight text-white font-mono">
+            {bestAccuracy > 0 ? `${(bestAccuracy * 100).toFixed(1)}%` : '--'}
+          </span>
+          <div className="flex items-center gap-4 mt-1">
+            <span className="text-xs text-helix-muted">accuracy</span>
+            <span className="text-xs text-helix-dim">{versionCount} version{versionCount !== 1 ? 's' : ''}</span>
+          </div>
+        </div>
 
-        <button
-          type="button"
-          onClick={() => onTogglePublic(model)}
-          disabled={isToggling}
-          className={cn(
-            'flex items-center gap-2 px-4 py-2 rounded-lg border text-sm transition-colors',
-            model.isPublic
-              ? 'bg-helix-surface border-helix-border text-helix-text hover:border-helix-border2 hover:text-white'
-              : 'bg-green-500/10 border-green-500/30 text-green-400 hover:bg-green-500/20',
-            isToggling && 'opacity-50 cursor-not-allowed',
-          )}
-        >
-          {isToggling ? (
-            <Loader2 size={14} className="animate-spin" />
-          ) : model.isPublic ? (
-            <Lock size={14} />
-          ) : (
-            <Globe size={14} />
-          )}
-          {model.isPublic ? 'Make Private' : 'Make Public'}
-        </button>
-      </div>
-    </Card>
+        {/* Action buttons */}
+        <div className="flex items-center gap-2 mt-auto" onClick={(e) => e.stopPropagation()}>
+          <Link
+            href={`/train?model=${model.tokenId}`}
+            className="flex items-center justify-center gap-2 py-2.5 px-5 rounded-xl bg-white text-black text-sm font-medium hover:bg-white/90 transition-colors"
+          >
+            <Play size={14} />
+            Train
+          </Link>
+
+          <Link
+            href="/inference"
+            className="flex items-center justify-center gap-2 py-2.5 px-5 rounded-xl bg-white/[0.06] text-sm text-white hover:bg-white/[0.1] transition-colors"
+          >
+            <MessageSquare size={14} />
+            Infer
+          </Link>
+
+          <button
+            type="button"
+            onClick={() => onClickCard(model)}
+            className="flex items-center justify-center gap-2 py-2.5 px-5 rounded-xl bg-white/[0.06] text-sm text-white hover:bg-white/[0.1] transition-colors"
+          >
+            <Settings size={14} />
+            Manage
+          </button>
+        </div>
+      </Card>
+    </motion.div>
   );
 }
 
 // ============================================================================
-// Trained Model Card (from backend sessions)
+// Trained Model Card — Redesigned
 // ============================================================================
 
 function TrainedModelCard({ session, onDownload, onClickCard }: {
@@ -1452,80 +1239,61 @@ function TrainedModelCard({ session, onDownload, onClickCard }: {
   const slug = session.model_slug || session.session_id.slice(0, 8);
   const accuracy = session.accuracy;
   const steps = session.losses.length || session.current_step;
-  const startedAt = session.started_at > 0
-    ? new Date(session.started_at * 1000).toLocaleDateString()
-    : '--';
 
   return (
-    <Card variant="glass" hover className="flex flex-col h-full cursor-pointer" onClick={() => onClickCard(session)}>
-      {/* Header */}
-      <div className="flex items-start justify-between mb-4">
-        <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-lg bg-green-500/[0.08] flex items-center justify-center shrink-0">
-            <Layers size={20} className="text-green-400" />
+    <motion.div
+      whileHover={{ y: -2 }}
+      transition={{ duration: 0.2 }}
+    >
+      <Card variant="glass" hover className="flex flex-col h-full cursor-pointer !rounded-2xl !p-6" onClick={() => onClickCard(session)}>
+        {/* Header */}
+        <div className="flex items-start justify-between mb-5">
+          <div className="flex items-center gap-3">
+            <div className="w-11 h-11 rounded-xl bg-green-500/[0.08] flex items-center justify-center shrink-0">
+              <Layers size={20} className="text-green-400" />
+            </div>
+            <div>
+              <h3 className="text-lg font-semibold text-white">{name}</h3>
+              <p className="text-xs font-mono text-helix-muted">{slug}</p>
+            </div>
           </div>
-          <div>
-            <h3 className="text-base font-medium text-white">{name}</h3>
-            <p className="text-2xs font-mono text-helix-muted">{slug}</p>
+          <span className="px-2.5 py-1 rounded-lg text-xs bg-green-500/10 text-green-400 border border-green-500/20 font-medium">
+            Trained
+          </span>
+        </div>
+
+        {/* Hero accuracy + steps */}
+        <div className="mb-6">
+          <span className="text-3xl font-semibold tracking-tight text-white font-mono">
+            {accuracy != null && accuracy > 0 ? `${(accuracy * 100).toFixed(1)}%` : '--'}
+          </span>
+          <div className="flex items-center gap-4 mt-1">
+            <span className="text-xs text-helix-muted">accuracy</span>
+            <span className="text-xs text-helix-dim">{steps} step{steps !== 1 ? 's' : ''}</span>
           </div>
         </div>
-        <Badge variant="default" className="text-green-400 text-2xs flex items-center gap-1">
-          <CheckCircle size={10} />
-          Trained
-        </Badge>
-      </div>
 
-      {/* Stats Row */}
-      <div className="grid grid-cols-3 gap-3 mb-4">
-        <div className="bg-helix-bg rounded-md px-3 py-2 text-center">
-          <p className="text-2xs text-helix-muted">Accuracy</p>
-          <p className="text-lg font-mono font-light text-white">
-            {accuracy != null ? `${(accuracy * 100).toFixed(1)}%` : '--'}
-          </p>
+        {/* Action buttons */}
+        <div className="flex items-center gap-2 mt-auto" onClick={(e) => e.stopPropagation()}>
+          <button
+            type="button"
+            onClick={() => onDownload(session.session_id)}
+            className="flex items-center justify-center gap-2 py-2.5 px-5 rounded-xl bg-white text-black text-sm font-medium hover:bg-white/90 transition-colors"
+          >
+            <Download size={14} />
+            Download
+          </button>
+
+          <Link
+            href="/train"
+            className="flex items-center justify-center gap-2 py-2.5 px-5 rounded-xl bg-white/[0.06] text-sm text-white hover:bg-white/[0.1] transition-colors"
+          >
+            <Play size={14} />
+            Train More
+          </Link>
         </div>
-        <div className="bg-helix-bg rounded-md px-3 py-2 text-center">
-          <p className="text-2xs text-helix-muted">Steps</p>
-          <p className="text-lg font-mono font-light text-white">{steps}</p>
-        </div>
-        <div className="bg-helix-bg rounded-md px-3 py-2 text-center">
-          <p className="text-2xs text-helix-muted">Trained</p>
-          <p className="text-sm font-mono font-light text-white">{startedAt}</p>
-        </div>
-      </div>
-
-      {/* Session ID */}
-      <div className="text-2xs text-helix-dim mb-4">
-        Session: <code className="font-mono">{session.session_id.slice(0, 12)}...</code>
-      </div>
-
-      {/* Actions */}
-      <div className="flex items-center gap-2 flex-wrap pt-3 border-t border-helix-border/50 mt-auto" onClick={(e) => e.stopPropagation()}>
-        <button
-          type="button"
-          onClick={() => onDownload(session.session_id)}
-          className="flex items-center gap-2 px-4 py-2 rounded-lg bg-white text-black text-sm font-medium hover:bg-white/90 transition-colors"
-        >
-          <Download size={14} />
-          Download Weights
-        </button>
-
-        <Link
-          href={`/train`}
-          className="flex items-center gap-2 px-4 py-2 rounded-lg bg-helix-surface border border-helix-border text-sm text-helix-text hover:border-helix-border2 hover:text-white transition-colors"
-        >
-          <Play size={14} />
-          Train More
-        </Link>
-
-        <Link
-          href={`/inference`}
-          className="flex items-center gap-2 px-4 py-2 rounded-lg bg-helix-surface border border-helix-border text-sm text-helix-text hover:border-helix-border2 hover:text-white transition-colors"
-        >
-          <Shield size={14} />
-          Inference
-        </Link>
-      </div>
-    </Card>
+      </Card>
+    </motion.div>
   );
 }
 
@@ -1539,7 +1307,6 @@ export default function MyModelsPage() {
   const [showLegacyNotice, setShowLegacyNotice] = useState(false);
   const [search, setSearch] = useState('');
   const [sort, setSort] = useState<SortOption>('newest');
-  const [categoryFilter, setCategoryFilter] = useState<string | null>(null);
   const [downloadingTokenId, setDownloadingTokenId] = useState<number | null>(null);
   const [detailTokenId, setDetailTokenId] = useState<number | null>(null);
   const [detailSession, setDetailSession] = useState<TrainingSessionState | null>(null);
@@ -1631,7 +1398,6 @@ export default function MyModelsPage() {
 
       let weightsJson: string;
       if (result.encoding === 'base64') {
-        // Encrypted — decrypt with wallet key
         const key = await deriveModelKey(
           (message: string) => signMessageAsync({ message }),
           model.tokenId,
@@ -1642,7 +1408,6 @@ export default function MyModelsPage() {
         weightsJson = JSON.stringify(result.data?.weights || result.data, null, 2);
       }
 
-      // Trigger browser download
       const blob = new Blob([weightsJson], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -1669,32 +1434,17 @@ export default function MyModelsPage() {
   useEffect(() => {
     if (isSuccess) {
       refetch();
-      // Close modals after success
       setCreateOpen(false);
       setVersionTarget(null);
     }
   }, [isSuccess, refetch]);
 
-  // Derive categories from user's models
-  const availableCategories = useMemo(() => {
-    const tagCounts = new Map<string, number>();
-    for (const m of models) {
-      for (const tag of getModelTags(m)) {
-        tagCounts.set(tag, (tagCounts.get(tag) ?? 0) + 1);
-      }
-    }
-    return Array.from(tagCounts.entries())
-      .sort((a, b) => b[1] - a[1])
-      .map(([tag, count]) => ({ tag, count }));
-  }, [models]);
+  // Unified count
+  const totalModels = models.length + trainedModels.length;
 
-  // Apply search + category + sort
+  // Apply search + sort to on-chain models
   const filteredModels = useMemo(() => {
     let result = models;
-
-    if (categoryFilter) {
-      result = result.filter((m) => getModelTags(m).includes(categoryFilter));
-    }
 
     if (search.trim()) {
       const q = search.trim().toLowerCase();
@@ -1707,23 +1457,21 @@ export default function MyModelsPage() {
     }
 
     return sortMyModels(result, sort);
-  }, [models, search, sort, categoryFilter]);
+  }, [models, search, sort]);
 
-  // Aggregate stats (on-chain + trained)
-  const totalOnChainVersions = models.reduce((sum, m) => sum + m.versions.length, 0);
-  const totalModels = models.length + trainedModels.length;
-  const bestOnChainAccuracy = models.reduce((best, m) => {
-    const modelBest = m.versions.reduce((b, v) => (v.accuracy > b ? v.accuracy : b), 0);
-    return modelBest > best ? modelBest : best;
-  }, 0);
-  const bestTrainedAccuracy = trainedModels.reduce((best, s) => {
-    return (s.accuracy ?? 0) > best ? (s.accuracy ?? 0) : best;
-  }, 0);
-  const bestAccuracy = Math.max(bestOnChainAccuracy, bestTrainedAccuracy);
-  const totalWeights = models.reduce(
-    (sum, m) => sum + m.versions.filter((v) => v.weightsStored).length,
-    0,
-  ) + trainedModels.length;
+  // Filter trained models by search
+  const filteredTrained = useMemo(() => {
+    if (!search.trim()) return trainedModels;
+    const q = search.trim().toLowerCase();
+    return trainedModels.filter(
+      (s) =>
+        (s.model_name || '').toLowerCase().includes(q) ||
+        (s.model_slug || '').toLowerCase().includes(q) ||
+        s.session_id.toLowerCase().includes(q),
+    );
+  }, [trainedModels, search]);
+
+  const totalFiltered = filteredModels.length + filteredTrained.length;
 
   return (
     <motion.div
@@ -1734,30 +1482,49 @@ export default function MyModelsPage() {
     >
       {/* Header */}
       <div className="flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <h1 className="page-title">My Models</h1>
+        <h1 className="text-2xl font-semibold text-white tracking-tight">
+          My Models
           {totalModels > 0 && (
-            <Badge variant="default">{totalModels} model{totalModels !== 1 ? 's' : ''}</Badge>
+            <span className="text-helix-muted font-normal ml-2">&middot; {totalModels}</span>
           )}
-        </div>
+        </h1>
         <div className="flex items-center gap-3">
-          {/* Wallet status */}
-          <div className={cn(
-            'flex items-center gap-1.5 px-3 py-1.5 rounded-md text-2xs font-mono',
-            isConnected
-              ? 'bg-green-500/10 text-green-400 border border-green-500/20'
-              : 'bg-helix-bg text-helix-muted border border-helix-border',
-          )}>
-            <Wallet size={12} />
-            {isConnected ? 'Wallet Connected' : 'No Wallet'}
-          </div>
+          {/* Search — inline in header */}
+          {totalModels > 1 && (
+            <div className="relative">
+              <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-helix-muted" />
+              <input
+                type="text"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="Search models..."
+                className="w-48 pl-9 pr-3 py-2 bg-white/[0.04] border border-white/[0.06] rounded-xl text-sm text-helix-text placeholder:text-helix-dim focus:outline-none focus:border-white/[0.12] transition-colors"
+              />
+            </div>
+          )}
+
+          {/* Sort — pill style */}
+          {totalModels > 1 && (
+            <div className="relative">
+              <ArrowUpDown size={12} className="absolute left-3 top-1/2 -translate-y-1/2 text-helix-muted pointer-events-none" />
+              <select
+                value={sort}
+                onChange={(e) => setSort(e.target.value as SortOption)}
+                className="appearance-none pl-8 pr-8 py-2 bg-white/[0.04] border border-white/[0.06] rounded-xl text-sm text-helix-text focus:outline-none focus:border-white/[0.12] transition-colors cursor-pointer"
+              >
+                {SORT_OPTIONS.map((o) => (
+                  <option key={o.id} value={o.id}>{o.label}</option>
+                ))}
+              </select>
+            </div>
+          )}
 
           <button
             type="button"
             onClick={() => setCreateOpen(true)}
             disabled={!isConnected || !isContractDeployed}
             className={cn(
-              'flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all',
+              'flex items-center gap-2 px-5 py-2.5 rounded-xl text-sm font-medium transition-all',
               (!isConnected || !isContractDeployed)
                 ? 'bg-helix-border text-helix-muted cursor-not-allowed'
                 : 'bg-white text-black hover:bg-white/90',
@@ -1771,7 +1538,7 @@ export default function MyModelsPage() {
 
       {/* Legacy localStorage notice */}
       {showLegacyNotice && (
-        <div className="flex items-start gap-3 px-4 py-3 bg-yellow-500/5 border border-yellow-500/20 rounded-lg">
+        <div className="flex items-start gap-3 px-4 py-3 bg-yellow-500/5 border border-yellow-500/20 rounded-xl">
           <AlertTriangle size={16} className="text-yellow-400 shrink-0 mt-0.5" />
           <div>
             <p className="text-sm text-yellow-300/90 font-medium">Legacy training data found</p>
@@ -1792,7 +1559,7 @@ export default function MyModelsPage() {
 
       {/* Wallet/contract notices */}
       {!isConnected && (
-        <div className="flex items-center gap-3 px-4 py-3 bg-helix-bg border border-helix-border rounded-lg">
+        <div className="flex items-center gap-3 px-4 py-3 bg-white/[0.02] border border-white/[0.06] rounded-xl">
           <Wallet size={16} className="text-helix-muted shrink-0" />
           <p className="text-2xs text-helix-muted">
             Connect your wallet to manage models. All data is stored on-chain via the ERC-721 model registry.
@@ -1800,7 +1567,7 @@ export default function MyModelsPage() {
         </div>
       )}
       {isConnected && !isContractDeployed && (
-        <div className="flex items-center gap-3 px-4 py-3 bg-yellow-500/5 border border-yellow-500/20 rounded-lg">
+        <div className="flex items-center gap-3 px-4 py-3 bg-yellow-500/5 border border-yellow-500/20 rounded-xl">
           <Link2 size={16} className="text-yellow-400 shrink-0" />
           <p className="text-2xs text-yellow-300/70">
             HelixModelStore contract not deployed on this chain. Deploy it with: <code className="font-mono">forge script script/DeployModelStore.s.sol --broadcast</code>
@@ -1810,7 +1577,7 @@ export default function MyModelsPage() {
 
       {/* Write error notice */}
       {writeError && (
-        <div className="flex items-center gap-3 px-4 py-3 bg-red-500/5 border border-red-500/20 rounded-lg">
+        <div className="flex items-center gap-3 px-4 py-3 bg-red-500/5 border border-red-500/20 rounded-xl">
           <XCircle size={16} className="text-red-400 shrink-0" />
           <p className="text-2xs text-red-300/70">
             Transaction failed: {writeError.message.slice(0, 120)}
@@ -1865,157 +1632,52 @@ export default function MyModelsPage() {
           action={
             <Link
               href="/train"
-              className="flex items-center gap-2 px-4 py-2 rounded-lg bg-white text-black text-sm font-medium hover:bg-white/90 transition-colors"
+              className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-white text-black text-sm font-medium hover:bg-white/90 transition-colors"
             >
               <Play size={14} />
               Start Training
             </Link>
           }
         />
+      ) : totalFiltered === 0 && search.trim() ? (
+        <EmptyState
+          icon={<Search size={32} />}
+          title="No models match your search"
+          description="Try a different search term."
+          action={
+            <button
+              type="button"
+              onClick={() => setSearch('')}
+              className="px-5 py-2.5 rounded-xl bg-white/[0.06] text-sm text-white hover:bg-white/[0.1] transition-colors"
+            >
+              Clear Search
+            </button>
+          }
+        />
       ) : (
-        <>
-          {/* Aggregate Stats */}
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-            <StatCard
-              label="Models"
-              value={totalModels}
-              icon={<Layers size={14} />}
+        /* Unified Model Grid */
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          {/* Trained models first (green accent) */}
+          {filteredTrained.map((session) => (
+            <TrainedModelCard
+              key={session.session_id}
+              session={session}
+              onDownload={handleDownloadTrainedWeights}
+              onClickCard={(s) => setDetailSession(s)}
             />
-            <StatCard
-              label="Trained"
-              value={trainedModels.length}
-              icon={<CheckCircle size={14} />}
+          ))}
+
+          {/* On-chain models */}
+          {filteredModels.map((model) => (
+            <ModelCard
+              key={model.tokenId}
+              model={model}
+              onClickCard={(m) => setDetailTokenId(m.tokenId)}
+              onTogglePublic={(m) => setPublic({ tokenId: m.tokenId, isPublic: !m.isPublic })}
+              isToggling={isWritePending || isConfirming}
             />
-            <StatCard
-              label="Best Accuracy"
-              value={bestAccuracy > 0 ? `${(bestAccuracy * 100).toFixed(1)}%` : '--'}
-              icon={<Trophy size={14} />}
-            />
-            <StatCard
-              label="Weights Available"
-              value={totalWeights}
-              icon={<HardDrive size={14} />}
-            />
-          </div>
-
-          {/* Trained Models Section */}
-          {trainedModels.length > 0 && (
-            <div className="space-y-3">
-              <h2 className="text-lg font-medium text-white">Trained Models</h2>
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-                {trainedModels.map((session) => (
-                  <TrainedModelCard
-                    key={session.session_id}
-                    session={session}
-                    onDownload={handleDownloadTrainedWeights}
-                    onClickCard={(s) => setDetailSession(s)}
-                  />
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* On-Chain Models Section */}
-          {models.length > 0 && (
-            <div className="space-y-3">
-              <h2 className="text-lg font-medium text-white flex items-center gap-2">
-                On-Chain Registry
-                <Badge variant="default" className="text-2xs">{models.length}</Badge>
-              </h2>
-
-              {/* Search + Sort + Category */}
-              {models.length > 1 && (
-                <div className="space-y-3">
-                  <div className="flex flex-col sm:flex-row items-start sm:items-center gap-3">
-                    <div className="relative flex-1 max-w-xs">
-                      <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-helix-muted" />
-                      <input
-                        type="text"
-                        value={search}
-                        onChange={(e) => setSearch(e.target.value)}
-                        placeholder="Search your models..."
-                        className="w-full pl-9 pr-3 py-2 bg-helix-bg border border-helix-border rounded-lg text-sm text-helix-text placeholder:text-helix-dim focus:outline-none focus:border-helix-border2 transition-colors"
-                      />
-                    </div>
-                    <div className="relative">
-                      <ArrowUpDown size={12} className="absolute left-3 top-1/2 -translate-y-1/2 text-helix-muted pointer-events-none" />
-                      <select
-                        value={sort}
-                        onChange={(e) => setSort(e.target.value as SortOption)}
-                        className="appearance-none pl-8 pr-8 py-2 bg-helix-bg border border-helix-border rounded-lg text-sm text-helix-text focus:outline-none focus:border-helix-border2 transition-colors cursor-pointer"
-                      >
-                        {SORT_OPTIONS.map((o) => (
-                          <option key={o.id} value={o.id}>{o.label}</option>
-                        ))}
-                      </select>
-                    </div>
-                  </div>
-
-                  {availableCategories.length > 0 && (
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <span className="text-2xs text-helix-dim">Type:</span>
-                      {availableCategories.map(({ tag, count }) => (
-                        <button
-                          key={tag}
-                          type="button"
-                          onClick={() => setCategoryFilter(categoryFilter === tag ? null : tag)}
-                          className={cn(
-                            'flex items-center gap-1.5 px-2.5 py-1 rounded-full text-2xs transition-colors',
-                            categoryFilter === tag
-                              ? 'bg-white text-black'
-                              : 'bg-white/[0.04] text-helix-text2 border border-white/[0.06] hover:border-white/[0.12]',
-                          )}
-                        >
-                          {tag}
-                          <span className={cn(
-                            'font-mono',
-                            categoryFilter === tag ? 'text-black/50' : 'text-helix-dim',
-                          )}>
-                            {count}
-                          </span>
-                          {categoryFilter === tag && <X size={10} />}
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {/* Model Cards Grid */}
-              {filteredModels.length === 0 ? (
-                <EmptyState
-                  icon={<Search size={32} />}
-                  title="No models match your filters"
-                  description="Try a different search term or clear the filters."
-                  action={
-                    <button
-                      type="button"
-                      onClick={() => { setSearch(''); setCategoryFilter(null); }}
-                      className="px-4 py-2 rounded-lg bg-helix-surface border border-helix-border text-sm text-helix-text hover:text-white transition-colors"
-                    >
-                      Clear Filters
-                    </button>
-                  }
-                />
-              ) : (
-                <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-                  {filteredModels.map((model) => (
-                    <ModelCard
-                      key={model.tokenId}
-                      model={model}
-                      onClickCard={(m) => setDetailTokenId(m.tokenId)}
-                      onAddVersion={(m) => setVersionTarget(m)}
-                      onTogglePublic={(m) => setPublic({ tokenId: m.tokenId, isPublic: !m.isPublic })}
-                      onDownloadWeights={handleDownloadWeights}
-                      isToggling={isWritePending || isConfirming}
-                      isDownloading={downloadingTokenId}
-                    />
-                  ))}
-                </div>
-              )}
-            </div>
-          )}
-        </>
+          ))}
+        </div>
       )}
     </motion.div>
   );
