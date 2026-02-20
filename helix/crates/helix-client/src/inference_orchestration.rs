@@ -29,6 +29,10 @@ pub struct InferenceConfig {
     pub num_parties: usize,
     /// Optional job ID for on-chain attestation.
     pub job_id: Option<u64>,
+    /// Worker private keys (hex) for real ECDSA signing. When provided and the
+    /// `chain` feature is enabled, signatures will be valid on-chain.
+    #[serde(default)]
+    pub worker_private_keys: Vec<String>,
 }
 
 impl Default for InferenceConfig {
@@ -36,6 +40,7 @@ impl Default for InferenceConfig {
         Self {
             num_parties: 3,
             job_id: None,
+            worker_private_keys: Vec::new(),
         }
     }
 }
@@ -171,23 +176,16 @@ pub async fn run_inference_orchestration(
 
     // ── Phase 3: Generate attestation signatures ────────────────────────
     let sign_start = Instant::now();
-
-    let mut worker_signatures = Vec::with_capacity(num_parties);
     let job_id = config.job_id.unwrap_or(0);
 
-    for i in 0..num_parties {
-        // Off-chain signature: SHA-256 of domain tag + fields
-        // In chain mode, this would be ECDSA via worker wallets
-        let mut data = Vec::with_capacity(80);
-        data.extend_from_slice(b"HELIX_INFERENCE");
-        data.extend_from_slice(&job_id.to_le_bytes());
-        data.extend_from_slice(&(prediction as u64).to_le_bytes());
-        data.extend_from_slice(&input_hash);
-        data.extend_from_slice(&output_hash);
-        data.extend_from_slice(&(i as u32).to_le_bytes()); // party index
-        let sig = sha256_hash(&data);
-        worker_signatures.push(sig.to_vec());
-    }
+    let worker_signatures = sign_inference_attestations(
+        &config.worker_private_keys,
+        num_parties,
+        job_id,
+        prediction,
+        input_hash,
+        output_hash,
+    ).await;
 
     let signing_ms = sign_start.elapsed().as_millis() as u64;
     let total_ms = total_start.elapsed().as_millis() as u64;
@@ -231,6 +229,74 @@ fn share_vector(values: &[f64], num_parties: usize) -> Vec<Vec<Fr>> {
     shares
 }
 
+/// Generate inference attestation signatures. Uses real ECDSA when worker keys
+/// are provided and the `chain` feature is enabled; falls back to SHA-256 hashes.
+async fn sign_inference_attestations(
+    worker_keys: &[String],
+    num_parties: usize,
+    job_id: u64,
+    prediction: usize,
+    input_hash: [u8; 32],
+    output_hash: [u8; 32],
+) -> Vec<Vec<u8>> {
+    // Try real ECDSA signing when keys are available
+    #[cfg(feature = "chain")]
+    if !worker_keys.is_empty() {
+        use std::str::FromStr;
+        use ethers::signers::LocalWallet;
+        use ethers::types::U256;
+        use crate::rpc::chain_v4::sign_inference;
+
+        let job_id_u256 = U256::from(job_id);
+        let prediction_u256 = U256::from(prediction as u64);
+
+        let mut sigs = Vec::with_capacity(num_parties);
+        for (i, key) in worker_keys.iter().take(num_parties).enumerate() {
+            let pk = key.strip_prefix("0x").unwrap_or(key);
+            let wallet = match LocalWallet::from_str(pk) {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::warn!(worker = i, error = %e, "ECDSA sign failed, falling back to SHA-256");
+                    sigs.push(sha256_placeholder(i, job_id, prediction, &input_hash, &output_hash));
+                    continue;
+                }
+            };
+            match sign_inference(&wallet, job_id_u256, prediction_u256, input_hash, output_hash).await {
+                Ok(sig) => sigs.push(sig.to_vec()),
+                Err(e) => {
+                    tracing::warn!(worker = i, error = %e, "ECDSA sign failed, falling back to SHA-256");
+                    sigs.push(sha256_placeholder(i, job_id, prediction, &input_hash, &output_hash));
+                }
+            }
+        }
+        return sigs;
+    }
+
+    // Fallback: SHA-256 hashes (off-chain only, will not verify on-chain)
+    let _ = worker_keys; // suppress unused warning when chain feature is off
+    (0..num_parties)
+        .map(|i| sha256_placeholder(i, job_id, prediction, &input_hash, &output_hash))
+        .collect()
+}
+
+/// SHA-256 placeholder signature (for off-chain / no-key scenarios).
+fn sha256_placeholder(
+    party: usize,
+    job_id: u64,
+    prediction: usize,
+    input_hash: &[u8; 32],
+    output_hash: &[u8; 32],
+) -> Vec<u8> {
+    let mut data = Vec::with_capacity(80);
+    data.extend_from_slice(b"HELIX_INFERENCE");
+    data.extend_from_slice(&job_id.to_le_bytes());
+    data.extend_from_slice(&(prediction as u64).to_le_bytes());
+    data.extend_from_slice(input_hash);
+    data.extend_from_slice(output_hash);
+    data.extend_from_slice(&(party as u32).to_le_bytes());
+    sha256_hash(&data).to_vec()
+}
+
 fn sha256_hash(data: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(data);
@@ -262,6 +328,7 @@ mod tests {
         let config = InferenceConfig {
             num_parties: 3,
             job_id: Some(1),
+            ..Default::default()
         };
 
         let result = run_inference_orchestration(&weights, &pixels, &config)

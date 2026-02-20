@@ -2090,84 +2090,85 @@ impl FullOrchestrator {
                 worker_wallets.push(wallet);
             }
         } else {
-            // ── Legacy per-worker staking ──
+            // ── Per-worker staking (parallel) ──
             let stake_wei = ethers::utils::parse_ether(self.config.stake_amount_eth)
                 .context("Phase 6: Invalid stake amount")?;
 
+            let provider = ethers::providers::Provider::<ethers::providers::Http>::try_from(&rpc_url)
+                .map_err(|e| anyhow!("Invalid RPC URL: {}", e))?;
+            let chain_id = provider
+                .get_chainid()
+                .await
+                .map_err(|e| anyhow!("Failed to get chain ID: {}", e))?
+                .as_u64();
+
+            // Parse all worker wallets first
+            let mut parsed_wallets = Vec::with_capacity(self.config.worker_private_keys.len());
             for (i, wk_key) in self.config.worker_private_keys.iter().enumerate() {
                 let pk = wk_key.strip_prefix("0x").unwrap_or(wk_key);
-                let provider = ethers::providers::Provider::<ethers::providers::Http>::try_from(&rpc_url)
-                    .map_err(|e| anyhow!("Invalid RPC URL: {}", e))?;
-                let chain_id = provider
-                    .get_chainid()
-                    .await
-                    .map_err(|e| anyhow!("Failed to get chain ID: {}", e))?
-                    .as_u64();
                 let wallet = LocalWallet::from_str(pk)
                     .map_err(|e| anyhow!("Invalid worker {} private key: {}", i, e))?
                     .with_chain_id(chain_id);
+                parsed_wallets.push(wallet);
+            }
 
-                // Verify worker balance is sufficient before staking.
-                // On testnets, poll until balance is visible (handles RPC propagation delay).
-                {
-                    use ethers::providers::Middleware;
-                    let mut attempts = 0u32;
-                    loop {
-                        let balance = provider.get_balance(wallet.address(), None).await.unwrap_or_default();
-                        info!(
-                            worker = i,
-                            address = %wallet.address(),
-                            balance = %ethers::utils::format_ether(balance),
-                            stake = %ethers::utils::format_ether(stake_wei),
-                            job_id = job_id,
-                            chain_id = chain_id,
-                            coordinator = %coordinator_addr_str,
-                            "Phase 6: Worker pre-stake check"
-                        );
-                        if balance >= stake_wei {
-                            break;
+            // Stake all workers in parallel — each worker uses its own wallet so no nonce conflicts
+            let stake_futures: Vec<_> = parsed_wallets.iter().enumerate().map(|(i, wallet)| {
+                let rpc = rpc_url.clone();
+                let coord = coordinator_addr_str.clone();
+                let wallet = wallet.clone();
+                let stake = stake_wei;
+                async move {
+                    // Quick balance check (no long polling — workers should be pre-funded)
+                    {
+                        use ethers::providers::Middleware;
+                        let prov = ethers::providers::Provider::<ethers::providers::Http>::try_from(rpc.as_str())
+                            .map_err(|e| anyhow!("Invalid RPC URL: {}", e))?;
+                        let mut attempts = 0u32;
+                        loop {
+                            let balance = prov.get_balance(wallet.address(), None).await.unwrap_or_default();
+                            if balance >= stake {
+                                break;
+                            }
+                            attempts += 1;
+                            if attempts > 10 {
+                                return Err(anyhow!(
+                                    "Phase 6: Worker {} has insufficient balance for stake. \
+                                     Fund worker address {:?} before staking.",
+                                    i, wallet.address()
+                                ));
+                            }
+                            if attempts == 1 {
+                                info!(worker = i, "Waiting for worker balance to propagate...");
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         }
-                        attempts += 1;
-                        if attempts > 20 {
-                            return Err(anyhow!(
-                                "Phase 6: Worker {} has insufficient balance ({} wei) \
-                                 for stake ({} wei) after waiting 20s. \
-                                 Fund worker address {:?} on chain {} before staking.",
-                                i, balance, stake_wei, wallet.address(), chain_id
-                            ));
-                        }
-                        warn!(
-                            worker = i,
-                            attempts = attempts,
-                            "Worker balance insufficient for stake, waiting for RPC propagation..."
-                        );
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     }
+
+                    let worker_client = ChainClientV4::with_wallet(&rpc, wallet.clone(), &coord)
+                        .await
+                        .with_context(|| format!("Phase 6: Failed to create worker {} client", i))?;
+
+                    let stake_receipt = worker_client
+                        .stake_and_join(job_id, stake)
+                        .await
+                        .with_context(|| format!("Phase 6: Worker {} stake_and_join failed", i))?;
+
+                    let gas = stake_receipt.gas_used.map(|g| g.as_u64()).unwrap_or(0);
+                    info!(
+                        worker = i,
+                        address = %wallet.address(),
+                        gas_used = gas,
+                        "Worker staked and joined"
+                    );
+                    Ok::<(LocalWallet, u64), anyhow::Error>((wallet, gas))
                 }
+            }).collect();
 
-                let worker_client = ChainClientV4::with_wallet(
-                    &rpc_url,
-                    wallet.clone(),
-                    &coordinator_addr_str,
-                )
-                .await
-                .with_context(|| format!("Phase 6: Failed to create worker {} client", i))?;
-
-                let stake_receipt = worker_client
-                    .stake_and_join(job_id, stake_wei)
-                    .await
-                    .with_context(|| format!("Phase 6: Worker {} stake_and_join failed", i))?;
-
-                let stake_gas = stake_receipt.gas_used.map(|g| g.as_u64()).unwrap_or(0);
-                total_gas += stake_gas;
-
-                info!(
-                    worker = i,
-                    address = %wallet.address(),
-                    gas_used = stake_gas,
-                    "Worker staked and joined"
-                );
-
+            let results = futures::future::join_all(stake_futures).await;
+            for result in results {
+                let (wallet, gas) = result?;
+                total_gas += gas;
                 worker_wallets.push(wallet);
             }
         }

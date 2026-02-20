@@ -474,6 +474,8 @@ pub struct DashboardState {
     pub model_weights_cache: RwLock<HashMap<String, serde_json::Value>>,
     /// SQLite persistence for training session history
     pub training_db: Option<std::sync::Arc<crate::training_db::TrainingDb>>,
+    /// Pre-provisioned worker private keys (funded at startup for fast testnet training)
+    pub worker_private_keys: RwLock<Vec<String>>,
 }
 
 impl DashboardState {
@@ -536,6 +538,7 @@ impl DashboardState {
             model_store_address: RwLock::new(None),
             model_weights_cache: RwLock::new(HashMap::new()),
             training_db,
+            worker_private_keys: RwLock::new(Vec::new()),
         }, state_update_rx)
     }
 
@@ -550,6 +553,139 @@ impl DashboardState {
         *arc.metrics.try_write().expect("no contention at init") = demo_metrics();
         *arc.events.try_write().expect("no contention at init") = demo_events();
         arc
+    }
+
+    /// Pre-provision worker wallets for fast testnet training.
+    ///
+    /// Derives deterministic worker keys from the owner's TESTNET_PRIVATE_KEY so
+    /// the same wallets are reused across dashboard restarts (and stay funded).
+    /// Funds any workers whose balance is below the minimum threshold.
+    #[cfg(feature = "chain")]
+    pub async fn provision_workers(&self, num_workers: usize) {
+        use ethers::prelude::*;
+        use sha2::{Digest, Sha256};
+        use std::str::FromStr;
+
+        let rpc_url = match self.eth_rpc_url.read().await.clone() {
+            Some(url) => url,
+            None => return,
+        };
+        let owner_key = match std::env::var("TESTNET_PRIVATE_KEY") {
+            Ok(k) => k,
+            Err(_) => return, // No testnet key — nothing to provision
+        };
+
+        let provider = match Provider::<Http>::try_from(rpc_url.as_str()) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("Worker provisioning: bad RPC URL: {}", e);
+                return;
+            }
+        };
+        let chain_id = match provider.get_chainid().await {
+            Ok(id) => id.as_u64(),
+            Err(e) => {
+                warn!("Worker provisioning: failed to get chain ID: {}", e);
+                return;
+            }
+        };
+
+        // Don't provision on Anvil — hardcoded keys are used there
+        if chain_id == 31337 {
+            return;
+        }
+
+        info!(
+            num_workers = num_workers,
+            chain_id = chain_id,
+            "Provisioning worker wallets for fast testnet training..."
+        );
+
+        // Derive deterministic worker keys from owner key
+        let mut keys = Vec::with_capacity(num_workers);
+        let mut wallets = Vec::with_capacity(num_workers);
+        for i in 0..num_workers {
+            let mut hasher = Sha256::new();
+            hasher.update(owner_key.as_bytes());
+            hasher.update(format!("helix-worker-{}", i).as_bytes());
+            let hash = hasher.finalize();
+            let key_hex = format!("0x{}", hex::encode(&hash[..]));
+            let pk = hex::encode(&hash[..]);
+            let wallet = match LocalWallet::from_str(&pk) {
+                Ok(w) => w.with_chain_id(chain_id),
+                Err(e) => {
+                    warn!("Worker provisioning: bad derived key for worker {}: {}", i, e);
+                    return;
+                }
+            };
+            info!(
+                worker = i,
+                address = %wallet.address(),
+                "Derived worker wallet"
+            );
+            wallets.push(wallet);
+            keys.push(key_hex);
+        }
+
+        // Check balances and fund underfunded workers
+        let owner_pk = owner_key.strip_prefix("0x").unwrap_or(&owner_key);
+        let owner_wallet = match LocalWallet::from_str(owner_pk) {
+            Ok(w) => w.with_chain_id(chain_id),
+            Err(e) => {
+                warn!("Worker provisioning: invalid owner key: {}", e);
+                return;
+            }
+        };
+        let signer = SignerMiddleware::new(provider.clone(), owner_wallet);
+        let min_balance = ethers::utils::parse_ether(0.15).unwrap();
+        let fund_amount = ethers::utils::parse_ether(0.25).unwrap();
+
+        for (i, wallet) in wallets.iter().enumerate() {
+            let balance = provider
+                .get_balance(wallet.address(), None)
+                .await
+                .unwrap_or_default();
+
+            if balance >= min_balance {
+                info!(
+                    worker = i,
+                    address = %wallet.address(),
+                    balance_eth = %ethers::utils::format_ether(balance),
+                    "Worker already funded"
+                );
+                continue;
+            }
+
+            info!(
+                worker = i,
+                address = %wallet.address(),
+                balance_eth = %ethers::utils::format_ether(balance),
+                fund_eth = %ethers::utils::format_ether(fund_amount),
+                "Funding worker..."
+            );
+            let tx = TransactionRequest::new()
+                .to(wallet.address())
+                .value(fund_amount);
+            match signer.send_transaction(tx, None).await {
+                Ok(pending) => {
+                    match pending.await {
+                        Ok(Some(receipt)) => {
+                            info!(
+                                worker = i,
+                                tx_hash = ?receipt.transaction_hash,
+                                "Worker funded successfully"
+                            );
+                        }
+                        Ok(None) => warn!("Worker {} funding tx dropped", i),
+                        Err(e) => warn!("Worker {} funding tx failed: {}", i, e),
+                    }
+                }
+                Err(e) => warn!("Worker {} funding send failed: {}", i, e),
+            }
+        }
+
+        *self.worker_private_keys.write().await = keys;
+        info!("Worker provisioning complete — {} workers ready", num_workers);
     }
 
     // -- Update methods for external callers --
@@ -1480,10 +1616,21 @@ async fn start_training_handler(
         let is_anvil = detected_chain_id == 31337;
 
         if let Ok(testnet_key) = std::env::var("TESTNET_PRIVATE_KEY") {
-            // Testnet mode: owner key from env, workers auto-generated and funded
+            // Testnet mode: owner key from env, use pre-provisioned worker wallets
             config.private_key = testnet_key;
-            config.worker_private_keys = Vec::new(); // Will be generated + funded by orchestrator
-            info!(chain_id = detected_chain_id, "Using TESTNET_PRIVATE_KEY for owner, workers will be auto-funded");
+            let provisioned = state.worker_private_keys.read().await;
+            if provisioned.is_empty() {
+                config.worker_private_keys = Vec::new(); // Will be generated + funded by orchestrator
+                info!(chain_id = detected_chain_id, "Using TESTNET_PRIVATE_KEY, workers will be auto-funded (not pre-provisioned)");
+            } else {
+                config.worker_private_keys = provisioned[..num_workers.min(provisioned.len())]
+                    .to_vec();
+                info!(
+                    chain_id = detected_chain_id,
+                    num_keys = config.worker_private_keys.len(),
+                    "Using pre-provisioned worker wallets (already funded)"
+                );
+            }
         } else if is_anvil {
             // Local Anvil demo mode: hardcoded well-known keys
             config.private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".to_string();
@@ -2533,9 +2680,11 @@ async fn inference_handler(
     // Run distributed MPC inference (each worker only sees its share)
     let pixels = req.pixels;
     let num_parties = req.num_parties;
+    let worker_keys = state.worker_private_keys.read().await.clone();
     let config = crate::inference_orchestration::InferenceConfig {
         num_parties,
         job_id: session_job_id,
+        worker_private_keys: worker_keys,
     };
 
     let result = crate::inference_orchestration::run_inference_orchestration(
@@ -2556,9 +2705,9 @@ async fn inference_handler(
                 .collect();
 
             // Fire-and-forget on-chain inference attestation (non-blocking background task).
-            // Worker signatures are currently SHA-256 placeholders (not ECDSA), so the
-            // contract call will revert with ECDSAInvalidSignatureLength. We spawn this
-            // as a background task so the inference response returns immediately.
+            // When worker keys are provisioned, signatures are real ECDSA and the
+            // contract call will succeed. We spawn in the background so the inference
+            // response returns immediately.
             #[cfg(feature = "chain")]
             {
                 if let Some(job_id) = session_job_id {
@@ -2727,9 +2876,11 @@ async fn model_inference_handler(
     };
 
     // Run distributed MPC inference
+    let worker_keys = state.worker_private_keys.read().await.clone();
     let config = crate::inference_orchestration::InferenceConfig {
         num_parties: req.num_parties,
         job_id: None,
+        worker_private_keys: worker_keys,
     };
 
     let result = crate::inference_orchestration::run_inference_orchestration(
