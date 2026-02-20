@@ -300,6 +300,7 @@ function ImageUpload({ onPixelsReady, canvasRef }: ImageUploadProps) {
             }
           }
 
+          let imageData: ImageData;
           if (maxX > minX && maxY > minY) {
             // Step 1: Scale digit to fit in 20x20, preserving aspect ratio
             const bw = maxX - minX + 1;
@@ -348,7 +349,7 @@ function ImageUpload({ onPixelsReady, canvasRef }: ImageUploadProps) {
             outCtx.fillRect(0, 0, GRID_SIZE, GRID_SIZE);
             outCtx.drawImage(tmpCanvas, offsetX, offsetY);
 
-            var imageData = outCtx.getImageData(0, 0, GRID_SIZE, GRID_SIZE);
+            imageData = outCtx.getImageData(0, 0, GRID_SIZE, GRID_SIZE);
           } else {
             const tempCanvas = document.createElement('canvas');
             tempCanvas.width = GRID_SIZE;
@@ -357,7 +358,7 @@ function ImageUpload({ onPixelsReady, canvasRef }: ImageUploadProps) {
             tempCtx.fillStyle = '#000000';
             tempCtx.fillRect(0, 0, GRID_SIZE, GRID_SIZE);
             tempCtx.drawImage(canvas, 0, 0, GRID_SIZE, GRID_SIZE);
-            var imageData = tempCtx.getImageData(0, 0, GRID_SIZE, GRID_SIZE);
+            imageData = tempCtx.getImageData(0, 0, GRID_SIZE, GRID_SIZE);
           }
 
           const pixels: number[] = [];
