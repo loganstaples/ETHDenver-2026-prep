@@ -1611,69 +1611,13 @@ async fn run_training_session(
         // Broadcast to WebSocket subscribers (send is sync-safe on broadcast::Sender)
         let _ = state_for_cb.ws_broadcast.send((sid_for_cb.clone(), event_json));
 
-        // Update session state synchronously with retry.
-        // try_write() can fail when polling handlers hold a read lock, causing
-        // dropped updates that desync the frontend. Retry up to 3 times with
-        // a short sleep to handle transient contention.
-        let sessions_guard = {
-            let mut guard = state_for_cb.sessions.try_write();
-            for _ in 0..3 {
-                if guard.is_ok() { break; }
-                std::thread::sleep(std::time::Duration::from_millis(1));
-                guard = state_for_cb.sessions.try_write();
-            }
-            guard
-        };
-        if let Ok(mut sessions) = sessions_guard {
-            if let Some(session) = sessions.get_mut(&sid_for_cb) {
-                match &event {
-                    ProgressEvent::PhaseStarted { phase, description, .. } => {
-                        session.phase = *phase;
-                        session.phase_description = description.clone();
-                        session.status = "running".to_string();
-                        // Phase 8 = MPC training — emit worker count
-                        if *phase == 8 {
-                            // workers_active is already set from the job request
-                        }
-                    }
-                    ProgressEvent::TrainingStep { step, loss, accuracy, .. } => {
-                        session.current_step = *step;
-                        session.current_loss = *loss;
-                        session.losses.push(*loss);
-                        session.accuracy = Some(*accuracy);
-                        session.mac_checks_passed += 1;
-                        // Dynamically update phase description during training
-                        session.phase_description = format!(
-                            "Training step {}/{} — loss: {:.4}",
-                            step, session.total_steps, loss
-                        );
-                    }
-                    ProgressEvent::CheckpointSubmitted { .. } => {
-                        session.checkpoints_submitted += 1;
-                    }
-                    ProgressEvent::CheaterDetected { party_index, step } => {
-                        session.cheater_detected = Some(serde_json::json!({
-                            "party_index": party_index,
-                            "step": step,
-                        }));
-                    }
-                    ProgressEvent::TrainingComplete { accuracy, .. } => {
-                        session.accuracy = Some(*accuracy);
-                        session.status = "complete".to_string();
-                    }
-                    ProgressEvent::ZkProofGenerated { .. } => {
-                        session.zk_proofs_generated += 1;
-                    }
-                    _ => {}
-                }
-
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs_f64();
-                session.elapsed_secs = now - session.started_at;
-            }
-        }
+        // Send to the dedicated state updater task via mpsc channel.
+        // This replaces the old try_write() retry loop which silently dropped
+        // updates when polling handlers held a read lock.
+        let _ = state_for_cb.state_update_tx.send(StateUpdate::Progress {
+            session_id: sid_for_cb.clone(),
+            event,
+        });
     });
 
     orchestrator.set_progress_callback(progress_cb);
