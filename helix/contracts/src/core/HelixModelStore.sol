@@ -46,6 +46,17 @@ contract HelixModelStore is ERC721Enumerable, ReentrancyGuard {
     mapping(uint256 => uint256) public inferenceFeesAccrued;
     uint256 private _inferenceNonce;
 
+    // Escrow transfer state
+    uint40 public constant TRANSFER_DEADLINE_DURATION = 24 hours;
+
+    struct PendingTransfer {
+        address buyer;
+        uint256 payment;
+        uint40 deadline;
+    }
+
+    mapping(uint256 => PendingTransfer) public pendingTransfers;
+
     // Events
     event ModelCreated(uint256 indexed tokenId, address indexed creator, string slug, string name);
     event VersionAdded(uint256 indexed tokenId, uint256 indexed versionIndex, string semver, string rootHash);
@@ -56,6 +67,9 @@ contract HelixModelStore is ERC721Enumerable, ReentrancyGuard {
     event SalePriceChanged(uint256 indexed tokenId, uint256 price);
     event ModelSold(uint256 indexed tokenId, address indexed seller, address indexed buyer, uint256 price);
     event InferencePaid(uint256 indexed tokenId, address indexed payer, uint256 nonce, uint256 amount, uint256 ownerShare);
+    event TransferInitiated(uint256 indexed tokenId, address indexed seller, address indexed buyer, uint256 price, uint40 deadline);
+    event TransferCompleted(uint256 indexed tokenId, address indexed seller, address indexed buyer, string newRootHash);
+    event TransferCancelled(uint256 indexed tokenId, address indexed cancelledBy);
 
     modifier onlyModelOwner(uint256 tokenId) {
         require(ownerOf(tokenId) == msg.sender, "Not model owner");
@@ -218,26 +232,91 @@ contract HelixModelStore is ERC721Enumerable, ReentrancyGuard {
         emit SalePriceChanged(tokenId, price);
     }
 
-    /// @notice Buy a model NFT that is listed for sale
+    /// @notice Initiate purchase of a model NFT — payment is escrowed until seller completes transfer
     function buyModel(uint256 tokenId) external payable nonReentrant {
         require(isForSale[tokenId], "Model not for sale");
         require(salePrice[tokenId] > 0, "Sale price not set");
         require(msg.value >= salePrice[tokenId], "Insufficient payment");
         address seller = ownerOf(tokenId);
         require(msg.sender != seller, "Cannot buy own model");
+        require(pendingTransfers[tokenId].buyer == address(0), "Transfer already pending");
 
-        // Clear listing
+        uint40 deadline = uint40(block.timestamp) + TRANSFER_DEADLINE_DURATION;
+        pendingTransfers[tokenId] = PendingTransfer({
+            buyer: msg.sender,
+            payment: msg.value,
+            deadline: deadline
+        });
+
+        // Delist while transfer is pending
         isForSale[tokenId] = false;
+
+        emit TransferInitiated(tokenId, seller, msg.sender, msg.value, deadline);
+    }
+
+    /// @notice Seller completes transfer by providing re-encrypted rootHash for buyer
+    /// @param tokenId The model token ID
+    /// @param newRootHash The new 0G root hash (weights re-encrypted for buyer)
+    function completeTransfer(uint256 tokenId, string calldata newRootHash) external nonReentrant {
+        PendingTransfer memory pt = pendingTransfers[tokenId];
+        require(pt.buyer != address(0), "No pending transfer");
+        address seller = ownerOf(tokenId);
+        require(msg.sender == seller, "Only seller can complete");
+
+        // Update the latest version's rootHash to the re-encrypted one
+        uint256 versionCount = _versions[tokenId].length;
+        if (versionCount > 0) {
+            _versions[tokenId][versionCount - 1].rootHash = newRootHash;
+        }
+
+        // Clear pending transfer
+        delete pendingTransfers[tokenId];
         salePrice[tokenId] = 0;
 
-        // Transfer NFT
-        _transfer(seller, msg.sender, tokenId);
+        // Transfer NFT to buyer
+        _transfer(seller, pt.buyer, tokenId);
 
-        // Pay seller
-        (bool sent, ) = payable(seller).call{value: msg.value}("");
+        // Release payment to seller
+        (bool sent, ) = payable(seller).call{value: pt.payment}("");
         require(sent, "Payment failed");
 
-        emit ModelSold(tokenId, seller, msg.sender, msg.value);
+        emit TransferCompleted(tokenId, seller, pt.buyer, newRootHash);
+    }
+
+    /// @notice Cancel a pending transfer — buyer gets refunded
+    /// @dev Seller can cancel anytime. Buyer can cancel after deadline.
+    function cancelSale(uint256 tokenId) external nonReentrant {
+        PendingTransfer memory pt = pendingTransfers[tokenId];
+        require(pt.buyer != address(0), "No pending transfer");
+
+        address seller = ownerOf(tokenId);
+        bool isSeller = msg.sender == seller;
+        bool isBuyerAfterDeadline = msg.sender == pt.buyer && block.timestamp >= pt.deadline;
+        require(isSeller || isBuyerAfterDeadline, "Not authorized to cancel");
+
+        // Clear pending transfer
+        delete pendingTransfers[tokenId];
+
+        // Refund buyer
+        (bool sent, ) = payable(pt.buyer).call{value: pt.payment}("");
+        require(sent, "Refund failed");
+
+        emit TransferCancelled(tokenId, msg.sender);
+    }
+
+    /// @notice Update the rootHash of a specific version (for re-encryption after training)
+    /// @param tokenId The model token ID
+    /// @param versionIndex The version to update
+    /// @param newRootHash The new 0G root hash
+    function updateVersionRootHash(
+        uint256 tokenId,
+        uint256 versionIndex,
+        string calldata newRootHash
+    ) external onlyModelOwner(tokenId) {
+        require(versionIndex < _versions[tokenId].length, "Invalid version");
+        _versions[tokenId][versionIndex].rootHash = newRootHash;
+        _versions[tokenId][versionIndex].weightsStored = bytes(newRootHash).length > 0;
+        emit VersionAdded(tokenId, versionIndex, _versions[tokenId][versionIndex].semver, newRootHash);
     }
 
     /// @notice Pay for inference on a public model (non-owner only)
