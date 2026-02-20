@@ -1862,10 +1862,15 @@ async fn handle_websocket(socket: WebSocket, state: Arc<DashboardState>) {
                                 info!(subscription = %sub, "WebSocket client subscribed");
                                 subscriptions.push(sub.to_string());
 
-                                // Send current state for this session if it exists
+                                // Send current state for this session if it exists.
+                                // Clone the snapshot before the async send so the
+                                // read lock is not held across the await point.
                                 if let Some(session_id) = sub.strip_prefix("training:") {
-                                    let sessions = state.sessions.read().await;
-                                    if let Some(session) = sessions.get(session_id) {
+                                    let snapshot = {
+                                        let sessions = state.sessions.read().await;
+                                        sessions.get(session_id).cloned()
+                                    };
+                                    if let Some(session) = snapshot {
                                         let state_msg = serde_json::json!({
                                             "type": "session_state",
                                             "session_id": session_id,
