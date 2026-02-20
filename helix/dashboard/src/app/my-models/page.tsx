@@ -37,8 +37,10 @@ import { EmptyState } from '@/components/ui/EmptyState';
 import { Modal } from '@/components/ui/Modal';
 import { cn } from '@/lib/utils';
 import { useModelRegistry, type ModelWithVersions } from '@/hooks/useModelRegistry';
-import { useSignMessage } from 'wagmi';
+import { useAccount, useSignMessage, useReadContracts } from 'wagmi';
 import { deriveModelKey, encryptWeights, decryptWeights } from '@/lib/model-encryption';
+import { fetchFrom0G } from '@/lib/0g-client';
+import { HELIX_MODEL_STORE_ABI, getContractAddress } from '@/lib/contracts';
 import type { OnChainVersion } from '@/lib/contracts';
 import type { TrainingSessionState } from '@/hooks/useMpcTraining';
 
@@ -1279,10 +1281,13 @@ interface ModelCardProps {
   model: ModelWithVersions;
   onClickCard: (model: ModelWithVersions) => void;
   onTogglePublic: (model: ModelWithVersions) => void;
+  onDownloadWeights: (model: ModelWithVersions) => void;
   isToggling: boolean;
+  hasPendingTransfer: boolean;
+  isDownloading: boolean;
 }
 
-function ModelCard({ model, onClickCard, onTogglePublic, isToggling }: ModelCardProps) {
+function ModelCard({ model, onClickCard, onTogglePublic, onDownloadWeights, isToggling, hasPendingTransfer, isDownloading }: ModelCardProps) {
   const versionCount = model.versions.length;
   const bestAccuracy = model.versions.reduce(
     (best, v) => (v.accuracy > best ? v.accuracy : best),
@@ -1295,7 +1300,12 @@ function ModelCard({ model, onClickCard, onTogglePublic, isToggling }: ModelCard
       whileHover={{ y: -2 }}
       transition={{ duration: 0.2 }}
     >
-      <Card variant="glass" hover className="flex flex-col h-full cursor-pointer !rounded-2xl !p-0" onClick={() => onClickCard(model)}>
+      <Card variant="glass" hover className="flex flex-col h-full cursor-pointer !rounded-2xl !p-0 relative" onClick={() => onClickCard(model)}>
+        {hasPendingTransfer && (
+          <span className="absolute top-3 right-3 px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-400 text-[10px] font-semibold z-10">
+            Transfer Pending
+          </span>
+        )}
         {/* Header */}
         <div className="px-6 pt-6 pb-4">
           <div className="flex items-start justify-between mb-4">
@@ -1376,6 +1386,21 @@ function ModelCard({ model, onClickCard, onTogglePublic, isToggling }: ModelCard
               <Settings size={14} />
               Manage
             </button>
+
+            {model.versions.some((v) => v.weightsStored && v.rootHash) && (
+              <button
+                type="button"
+                onClick={() => onDownloadWeights(model)}
+                disabled={isDownloading}
+                className={cn(
+                  'flex items-center justify-center gap-2 px-3 py-2.5 rounded-xl bg-white/[0.06] text-sm text-white hover:bg-white/[0.1] transition-colors',
+                  isDownloading && 'opacity-50 cursor-not-allowed',
+                )}
+                title="Download weights"
+              >
+                {isDownloading ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
+              </button>
+            )}
           </div>
         </div>
       </Card>
@@ -1477,6 +1502,7 @@ export default function MyModelsPage() {
   const [isLoadingTrained, setIsLoadingTrained] = useState(true);
 
   const { signMessageAsync } = useSignMessage();
+  const { chainId } = useAccount();
 
   const {
     isConnected,
@@ -1496,6 +1522,40 @@ export default function MyModelsPage() {
     isSuccess,
     refetch,
   } = useModelRegistry();
+
+  // ── Pending transfer reads ─────────────────────────────────────────
+  const modelStoreAddr = useMemo(() => {
+    if (!chainId) return '0x0000000000000000000000000000000000000000';
+    return getContractAddress(chainId, 'helixModelStore');
+  }, [chainId]);
+
+  const pendingTransferCalls = useMemo(() => {
+    if (models.length === 0 || modelStoreAddr === '0x0000000000000000000000000000000000000000') return [];
+    return models.map((m) => ({
+      address: modelStoreAddr as `0x${string}`,
+      abi: HELIX_MODEL_STORE_ABI,
+      functionName: 'pendingTransfers' as const,
+      args: [BigInt(m.tokenId)],
+    }));
+  }, [models, modelStoreAddr]);
+
+  const { data: pendingTransferResults } = useReadContracts({
+    contracts: pendingTransferCalls,
+    query: { enabled: pendingTransferCalls.length > 0 },
+  });
+
+  const pendingTransferMap = useMemo(() => {
+    const map = new Map<number, boolean>();
+    if (!pendingTransferResults || models.length === 0) return map;
+    for (let i = 0; i < models.length; i++) {
+      const result = pendingTransferResults[i];
+      if (result?.status === 'success' && result.result) {
+        const [buyer] = result.result as unknown as [string, bigint, bigint];
+        map.set(models[i].tokenId, buyer !== '0x0000000000000000000000000000000000000000');
+      }
+    }
+    return map;
+  }, [pendingTransferResults, models]);
 
   const detailModel = detailTokenId !== null
     ? models.find(m => m.tokenId === detailTokenId) ?? null
@@ -1547,42 +1607,34 @@ export default function MyModelsPage() {
 
   // Download weights from 0G with decryption
   const handleDownloadWeights = useCallback(async (model: ModelWithVersions) => {
-    const latest = [...model.versions].reverse().find((v) => v.weightsStored && v.rootHash);
-    if (!latest) return;
+    const latestVersion = model.versions[model.versions.length - 1];
+    if (!latestVersion?.rootHash) return;
 
     setDownloadingTokenId(model.tokenId);
     try {
-      const res = await fetch('/api/fetch-from-0g', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ rootHash: latest.rootHash }),
-      });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.error || `Fetch failed: HTTP ${res.status}`);
-      }
-      const result = await res.json();
+      const result = await fetchFrom0G(latestVersion.rootHash);
+      const key = await deriveModelKey(
+        async (msg: string) => await signMessageAsync({ message: msg }),
+        model.tokenId,
+      );
 
       let weightsJson: string;
       if (result.encoding === 'base64') {
-        const key = await deriveModelKey(
-          (message: string) => signMessageAsync({ message }),
-          model.tokenId,
-        );
-        const binary = Uint8Array.from(atob(result.data), (c) => c.charCodeAt(0));
-        weightsJson = await decryptWeights(key, binary);
+        const bin = atob(result.data as string);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        weightsJson = await decryptWeights(key, bytes);
       } else {
-        weightsJson = JSON.stringify(result.data?.weights || result.data, null, 2);
+        weightsJson = JSON.stringify(result.data, null, 2);
       }
 
+      // Trigger browser download
       const blob = new Blob([weightsJson], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `${model.slug}-v${latest.semver}-weights.json`;
-      document.body.appendChild(a);
+      a.download = `${model.slug}-v${latestVersion.semver}-weights.json`;
       a.click();
-      document.body.removeChild(a);
       URL.revokeObjectURL(url);
     } catch (err) {
       console.error('Download failed:', err);
@@ -1845,7 +1897,10 @@ export default function MyModelsPage() {
               model={model}
               onClickCard={(m) => setDetailTokenId(m.tokenId)}
               onTogglePublic={(m) => setPublic({ tokenId: m.tokenId, isPublic: !m.isPublic })}
+              onDownloadWeights={handleDownloadWeights}
               isToggling={isWritePending || isConfirming}
+              hasPendingTransfer={pendingTransferMap.get(model.tokenId) ?? false}
+              isDownloading={downloadingTokenId === model.tokenId}
             />
           ))}
         </div>
