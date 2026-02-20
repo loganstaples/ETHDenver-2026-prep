@@ -1138,6 +1138,7 @@ impl NodeRuntime {
             mpc_health: Arc::new(RwLock::new(MpcHealthStatus::default())),
             fault_tolerance_status: fault_tolerance_status.clone(),
             node_metrics: self.node_metrics.clone(),
+            active_tasks: Arc::new(RwLock::new(Vec::new())),
         });
 
         let http_addr: SocketAddr = format!("0.0.0.0:{}", self.config.http_port).parse()?;

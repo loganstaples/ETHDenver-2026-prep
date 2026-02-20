@@ -3,6 +3,7 @@
 //! Endpoints:
 //! - `GET /health` — public, no auth required
 //! - `GET /metrics` — public, no auth required
+//! - `GET /api/active-tasks` — public, no auth required
 //! - `POST /round/start` — requires Bearer token
 //! - `GET /round/status` — requires Bearer token
 //! - `GET /workers` — requires Bearer token
@@ -133,6 +134,8 @@ pub struct ApiState {
     pub mpc_health: Arc<RwLock<MpcHealthStatus>>,
     /// Fault tolerance status (updated by main loop).
     pub fault_tolerance_status: Arc<RwLock<FaultToleranceStatus>>,
+    /// Active model-worker task assignments (for network graph).
+    pub active_tasks: Arc<RwLock<Vec<ActiveTask>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -287,6 +290,22 @@ pub struct FaultToleranceStatus {
     pub system_healthy: bool,
 }
 
+/// An active model-worker assignment (for the network graph).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveTask {
+    pub model_id: String,
+    pub model_name: String,
+    pub task_type: String, // "training" or "inference"
+    pub worker_ids: Vec<String>,
+    pub started_at: u64,
+}
+
+/// Response for GET /api/active-tasks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveTasksResponse {
+    pub active_models: Vec<ActiveTask>,
+}
+
 #[derive(Serialize, Deserialize)]
 struct RoundStartResponse {
     triggered: bool,
@@ -376,7 +395,8 @@ pub async fn start_api_server(
     // Public routes (no auth)
     let public_routes = Router::new()
         .route("/health", get(health_handler))
-        .route("/metrics", get(metrics_handler));
+        .route("/metrics", get(metrics_handler))
+        .route("/api/active-tasks", get(active_tasks_handler));
 
     // Authenticated routes (require Bearer token)
     let auth_routes = Router::new()
@@ -535,6 +555,13 @@ async fn peers_handler(State(state): State<Arc<ApiState>>) -> Json<PeerSnapshot>
     Json(snapshot)
 }
 
+async fn active_tasks_handler(State(state): State<Arc<ApiState>>) -> Json<ActiveTasksResponse> {
+    let tasks = state.active_tasks.read().clone();
+    Json(ActiveTasksResponse {
+        active_models: tasks,
+    })
+}
+
 async fn metrics_handler(State(state): State<Arc<ApiState>>) -> Response {
     let body = state.node_metrics.to_prometheus();
     (
@@ -657,6 +684,7 @@ mod tests {
                 failed_workers: 0,
                 system_healthy: true,
             })),
+            active_tasks: Arc::new(RwLock::new(Vec::new())),
         })
     }
 
@@ -666,7 +694,8 @@ mod tests {
         // We test rate limiting separately.
         let public_routes = Router::new()
             .route("/health", get(health_handler))
-            .route("/metrics", get(metrics_handler));
+            .route("/metrics", get(metrics_handler))
+            .route("/api/active-tasks", get(active_tasks_handler));
 
         let auth_routes = Router::new()
             .route("/round/start", post(round_start_handler))
