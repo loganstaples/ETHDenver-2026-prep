@@ -239,7 +239,7 @@ export default function NetworkGraph({ activeModels }: NetworkGraphProps) {
 
         const render = () => {
             pulse += 0.012;
-            dashOffsetRef.current += 0.5;
+            dashOffsetRef.current = (dashOffsetRef.current + 0.5) % 10000;
 
             const { width: w, height: h } = sizeRef.current;
             const dpr = window.devicePixelRatio || 1;

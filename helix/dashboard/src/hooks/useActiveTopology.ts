@@ -16,7 +16,7 @@ export interface ActiveModel {
 }
 
 interface ActiveTasksResponse {
-    tasks: Array<{
+    active_models: Array<{
         model_id: string;
         model_name: string;
         task_type: 'training' | 'inference';
@@ -44,7 +44,9 @@ interface ModelActivityChangedData {
     task_type?: 'training' | 'inference';
     worker_ids?: string[];
     started_at?: number;
-    action: 'add' | 'update' | 'remove';
+    // Backend sends "started"/"completed"/"failed"; treat completed/failed as remove
+    action?: string;
+    active?: boolean;
 }
 
 // ============================================================================
@@ -79,7 +81,7 @@ export function useActiveTopology(): {
             const data: ActiveTasksResponse = await res.json();
             const newModels = new Map<string, ActiveModel>();
 
-            for (const task of data.tasks) {
+            for (const task of data.active_models) {
                 newModels.set(task.model_id, {
                     modelId: task.model_id,
                     modelName: task.model_name,
@@ -104,7 +106,7 @@ export function useActiveTopology(): {
             await apiClient.connectWebSocket();
             setIsConnected(true);
 
-            apiClient.subscribeToChannel('topology');
+            apiClient.subscribeToChannel('nodes');
 
             // worker_assigned: add worker to model's workerIds
             const unsubAssigned = apiClient.onWebSocketMessage<WorkerAssignedData>(
@@ -179,31 +181,27 @@ export function useActiveTopology(): {
                     setModels((prev) => {
                         const next = new Map(prev);
 
-                        if (d.action === 'remove') {
+                        // Determine if this is a removal: action=completed/failed/remove or active=false
+                        const isRemove =
+                            d.active === false ||
+                            d.action === 'completed' ||
+                            d.action === 'failed' ||
+                            d.action === 'remove';
+
+                        if (isRemove) {
                             next.delete(d.model_id);
                             return next;
                         }
 
+                        // Add or update
                         const existing = next.get(d.model_id);
-
-                        if (d.action === 'add' || !existing) {
-                            next.set(d.model_id, {
-                                modelId: d.model_id,
-                                modelName: d.model_name ?? existing?.modelName ?? `Model ${d.model_id}`,
-                                taskType: d.task_type ?? existing?.taskType ?? 'training',
-                                workerIds: d.worker_ids ?? existing?.workerIds ?? [],
-                                startedAt: d.started_at ?? existing?.startedAt ?? Date.now(),
-                            });
-                        } else {
-                            // update
-                            next.set(d.model_id, {
-                                ...existing,
-                                modelName: d.model_name ?? existing.modelName,
-                                taskType: d.task_type ?? existing.taskType,
-                                workerIds: d.worker_ids ?? existing.workerIds,
-                                startedAt: d.started_at ?? existing.startedAt,
-                            });
-                        }
+                        next.set(d.model_id, {
+                            modelId: d.model_id,
+                            modelName: d.model_name ?? existing?.modelName ?? `Model ${d.model_id}`,
+                            taskType: d.task_type ?? existing?.taskType ?? 'training',
+                            workerIds: d.worker_ids ?? existing?.workerIds ?? [],
+                            startedAt: d.started_at ?? existing?.startedAt ?? Date.now(),
+                        });
 
                         return next;
                     });
@@ -235,6 +233,29 @@ export function useActiveTopology(): {
     }, [fetchActiveTasks, setupWebSocket]);
 
     // ========================================================================
+    // Re-render timer for inference 5s filter
+    // ========================================================================
+
+    const [tick, setTick] = useState(0);
+
+    useEffect(() => {
+        // Check if any inference tasks are pending the 5s threshold
+        const now = Date.now();
+        let hasWaiting = false;
+        models.forEach((model) => {
+            if (model.taskType === 'inference' && now - model.startedAt < INFERENCE_MIN_ACTIVE_MS) {
+                hasWaiting = true;
+            }
+        });
+
+        if (!hasWaiting) return;
+
+        // Re-trigger filter every second until all pending tasks cross threshold
+        const timer = setInterval(() => setTick((t) => t + 1), 1000);
+        return () => clearInterval(timer);
+    }, [models]);
+
+    // ========================================================================
     // Filter out inference tasks active < 5 seconds
     // ========================================================================
 
@@ -253,7 +274,8 @@ export function useActiveTopology(): {
         });
 
         return result;
-    }, [models]);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [models, tick]);
 
     return { activeModels, isConnected };
 }

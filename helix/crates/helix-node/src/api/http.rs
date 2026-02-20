@@ -657,21 +657,53 @@ async fn handle_ws_connection(socket: WebSocket, state: Arc<ApiState>) {
     let (mut sender, mut receiver) = socket.split();
     let mut event_rx = state.dashboard_event_tx.subscribe();
 
+    // Channel for sending messages back to the client (pong responses, etc.)
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel::<String>(32);
+
+    // Send task: forwards both broadcast events and reply messages to the client
     let send_task = tokio::spawn(async move {
-        while let Ok(msg) = event_rx.recv().await {
-            if sender.send(Message::Text(msg.into())).await.is_err() {
-                break;
+        loop {
+            tokio::select! {
+                event = event_rx.recv() => {
+                    match event {
+                        Ok(msg) => {
+                            if sender.send(Message::Text(msg.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                reply = reply_rx.recv() => {
+                    match reply {
+                        Some(msg) => {
+                            if sender.send(Message::Text(msg.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
             }
         }
     });
 
+    // Receive task: handles incoming messages from the client
     let recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = receiver.next().await {
             match msg {
                 Message::Text(text) => {
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&*text) {
                         if parsed.get("type").and_then(|t| t.as_str()) == Some("ping") {
-                            // Heartbeat acknowledged
+                            let pong = serde_json::json!({
+                                "type": "pong",
+                                "timestamp": std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_millis() as u64,
+                                "data": {},
+                            });
+                            let _ = reply_tx.send(pong.to_string()).await;
                         }
                     }
                 }
