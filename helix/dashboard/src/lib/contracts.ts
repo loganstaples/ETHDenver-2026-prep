@@ -453,6 +453,36 @@ export const HELIX_MODEL_STORE_ABI = [
     },
     {
         type: 'function',
+        name: 'completeTransfer',
+        inputs: [
+            { name: 'tokenId', type: 'uint256' },
+            { name: 'newRootHash', type: 'string' },
+        ],
+        outputs: [],
+        stateMutability: 'nonpayable',
+    },
+    {
+        type: 'function',
+        name: 'cancelSale',
+        inputs: [
+            { name: 'tokenId', type: 'uint256' },
+        ],
+        outputs: [],
+        stateMutability: 'nonpayable',
+    },
+    {
+        type: 'function',
+        name: 'updateVersionRootHash',
+        inputs: [
+            { name: 'tokenId', type: 'uint256' },
+            { name: 'versionIndex', type: 'uint256' },
+            { name: 'newRootHash', type: 'string' },
+        ],
+        outputs: [],
+        stateMutability: 'nonpayable',
+    },
+    {
+        type: 'function',
         name: 'grantAccess',
         inputs: [
             { name: 'tokenId', type: 'uint256' },
@@ -601,6 +631,24 @@ export const HELIX_MODEL_STORE_ABI = [
         outputs: [{ name: '', type: 'uint256' }],
         stateMutability: 'view',
     },
+    {
+        type: 'function',
+        name: 'pendingTransfers',
+        inputs: [{ name: 'tokenId', type: 'uint256' }],
+        outputs: [
+            { name: 'buyer', type: 'address' },
+            { name: 'payment', type: 'uint256' },
+            { name: 'deadline', type: 'uint40' },
+        ],
+        stateMutability: 'view',
+    },
+    {
+        type: 'function',
+        name: 'TRANSFER_DEADLINE_DURATION',
+        inputs: [],
+        outputs: [{ name: '', type: 'uint40' }],
+        stateMutability: 'view',
+    },
     // ── ERC721Enumerable ─────────────────────────────────────────────
     {
         type: 'function',
@@ -735,6 +783,35 @@ export const HELIX_MODEL_STORE_ABI = [
             { name: 'nonce', type: 'uint256', indexed: false },
             { name: 'amount', type: 'uint256', indexed: false },
             { name: 'ownerShare', type: 'uint256', indexed: false },
+        ],
+    },
+    {
+        type: 'event',
+        name: 'TransferInitiated',
+        inputs: [
+            { name: 'tokenId', type: 'uint256', indexed: true },
+            { name: 'seller', type: 'address', indexed: true },
+            { name: 'buyer', type: 'address', indexed: true },
+            { name: 'price', type: 'uint256', indexed: false },
+            { name: 'deadline', type: 'uint40', indexed: false },
+        ],
+    },
+    {
+        type: 'event',
+        name: 'TransferCompleted',
+        inputs: [
+            { name: 'tokenId', type: 'uint256', indexed: true },
+            { name: 'seller', type: 'address', indexed: true },
+            { name: 'buyer', type: 'address', indexed: true },
+            { name: 'newRootHash', type: 'string', indexed: false },
+        ],
+    },
+    {
+        type: 'event',
+        name: 'TransferCancelled',
+        inputs: [
+            { name: 'tokenId', type: 'uint256', indexed: true },
+            { name: 'cancelledBy', type: 'address', indexed: true },
         ],
     },
     {
