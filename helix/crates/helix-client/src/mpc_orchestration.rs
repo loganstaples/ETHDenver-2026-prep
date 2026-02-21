@@ -341,6 +341,7 @@ impl MPCTrainingOrchestrator {
             batch_size: self.config.batch_size.unwrap_or(32),
             on_step: None,
             on_sub_step: None,
+            capture_checkpoint_weights: false,
         }
     }
 

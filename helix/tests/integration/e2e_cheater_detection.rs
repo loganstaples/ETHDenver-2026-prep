@@ -66,6 +66,7 @@ async fn test_cheater_detection_worker2_step10() {
         batch_size: 1,
         on_step: None,
         on_sub_step: None,
+        capture_checkpoint_weights: false,
     };
 
     let cheater_party = 2;
@@ -159,6 +160,7 @@ async fn test_honest_execution_passes_all_mac_checks() {
         batch_size: 1,
         on_step: None,
         on_sub_step: None,
+        capture_checkpoint_weights: false,
     };
 
     let result = run_mpc_training(config).await
@@ -219,6 +221,7 @@ async fn test_cheater_detection_early_corruption() {
         batch_size: 1,
         on_step: None,
         on_sub_step: None,
+        capture_checkpoint_weights: false,
     };
 
     // Worker 1 corrupts at step 2.
@@ -282,6 +285,7 @@ async fn test_cheater_detection_dealer_cheats() {
         batch_size: 1,
         on_step: None,
         on_sub_step: None,
+        capture_checkpoint_weights: false,
     };
 
     // Party 0 (the dealer) corrupts at step 8.

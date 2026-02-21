@@ -2,31 +2,34 @@
 //!
 //! The `DemoRunner` coordinates the full demo lifecycle:
 //! 1. MNIST dataset generation
-//! 2. MPC transport mesh creation
-//! 3. Weight distribution across parties
-//! 4. MAC initialization for SPDZ verification
-//! 5. Beaver triple pre-generation
-//! 6. Training loop with MAC-verified gradient steps
-//! 7. Cheater simulation and detection
-//! 8. Accuracy evaluation
-//! 9. Summary display
+//! 2. MPC training via `run_mpc_training` (SPDZ MACs, Beaver triples, Pedersen checkpoints)
+//! 3. Weight reconstruction and accuracy evaluation
+//! 4. Native baseline comparison
+//! 5. On-chain checkpoint settlement (optional, via `--on-chain`)
+//! 6. Summary display
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use helix_mpc::field::Fr;
-use helix_mpc::mac_verification::MACVerificationConfig;
+use helix_mpc::e2e_integration::{
+    MPCIntegrationConfig, MPCIntegrationResult, run_mpc_training, run_mpc_training_with_cheater,
+};
 use helix_mpc::mnist::{MnistDataset, NativeTrainer};
-use helix_mpc::mpc_trainer::{MPCTrainer, MPCTrainerConfig, ModelWeights};
-use helix_mpc::session::transport::LocalTransport;
-use helix_mpc::types::PartyId;
-use helix_mpc::MPCError;
-use rand::SeedableRng;
-use rand_chacha::ChaCha20Rng;
 
-use crate::display;
+#[cfg(feature = "chain")]
+use ethers::signers::{LocalWallet, Signer};
+#[cfg(feature = "chain")]
+use ethers::types::{Address, U256};
+#[cfg(feature = "chain")]
+use ethers::utils::Anvil;
+#[cfg(feature = "chain")]
+use helix_client::checkpoint_submitter::{submit_all_checkpoints, CheckpointData};
+#[cfg(feature = "chain")]
+use helix_client::rpc::chain_v4::{sign_completion, ChainClientV4};
+
+use crate::display::{self, ChainStats};
 use crate::evaluator;
-use crate::zk_prover::LazyZkProver;
 use crate::Args;
 
 /// MNIST network dimensions.
@@ -60,6 +63,10 @@ impl DemoRunner {
         if self.args.simulate_cheater {
             display::warn("Cheater simulation ENABLED: Party 2 will be corrupted mid-training");
         }
+        #[cfg(feature = "chain")]
+        if self.args.skip_chain {
+            display::info("On-chain settlement SKIPPED (--skip-chain)");
+        }
         println!();
 
         // ================================================================
@@ -75,7 +82,8 @@ impl DemoRunner {
                 self.args.test_size,
                 self.args.seed,
                 cache_dir,
-            ).context("Failed to load real MNIST data")?;
+            )
+            .context("Failed to load real MNIST data")?;
             display::success(&format!(
                 "Loaded {} training + {} test real MNIST samples ({:.1}ms)",
                 full.train.len(),
@@ -102,368 +110,133 @@ impl DemoRunner {
             "Architecture: {} -> {} (ReLU) -> {} (argmax)",
             D_IN, D_HID, D_OUT,
         ));
+        let total_params = D_HID * D_IN + D_HID + D_OUT * D_HID + D_OUT;
         display::info(&format!(
             "Total parameters: {} (W1: {}, b1: {}, W2: {}, b2: {})",
-            D_HID * D_IN + D_HID + D_OUT * D_HID + D_OUT,
+            total_params,
             D_HID * D_IN,
             D_HID,
             D_OUT * D_HID,
             D_OUT,
         ));
 
-        // Convert to training pairs
         let train_pairs = MnistDataset::as_training_pairs(&dataset.train);
         let test_pairs = MnistDataset::as_training_pairs(&dataset.test);
 
         // ================================================================
-        // Phase 2: Create MPC Transport Mesh
+        // Phase 2: MPC Training with SPDZ MAC Verification
         // ================================================================
-        display::phase("Phase 2: MPC Transport Mesh Setup");
-
-        let num_parties = self.args.workers;
-        let party_ids: Vec<PartyId> = (0..num_parties)
-            .map(PartyId::from_index)
-            .collect();
-        let transports = LocalTransport::create_mesh(&party_ids);
-        display::success(&format!(
-            "{} parties connected via in-memory transport mesh ({} bidirectional channels)",
-            num_parties,
-            num_parties * (num_parties - 1),
+        display::phase("Phase 2: MPC Training with SPDZ MAC Verification");
+        display::info(&format!(
+            "Setting up {} MPC workers, distributing weights, generating Beaver triples...",
+            self.args.workers,
         ));
 
-        // ================================================================
-        // Phase 3: Initialize Weights and Distribute Shares
-        // ================================================================
-        display::phase("Phase 3: Weight Initialization and Secret Sharing");
+        let phase2_start = Instant::now();
+        let num_workers = self.args.workers;
+        let checkpoint_freq = self.args.checkpoint_freq;
 
-        let phase3_start = Instant::now();
+        // on_step callback for live display during training.
+        // Fires on party 0 after each step: (step_1indexed, total, loss, acc_est, mac_ok).
+        let on_step: Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync> = Arc::new(
+            move |step: usize, total: usize, loss: f64, _acc_est: f64, mac_ok: bool| {
+                display::step_update(step, total, loss, num_workers, mac_ok);
+                if checkpoint_freq > 0 && step as u64 % checkpoint_freq == 0 {
+                    display::step_update_finish();
+                    display::mac_verified(step as u64);
+                }
+            },
+        );
 
-        // Create initial weights using Xavier initialization
-        let mut init_rng = ChaCha20Rng::seed_from_u64(self.args.seed);
-        let initial_weights = ModelWeights::random(D_IN, D_HID, D_OUT, &mut init_rng);
-        display::info("Xavier-initialized random weights created");
-
-        // MPC trainer config with MAC verification
-        let mac_config = MACVerificationConfig {
-            check_interval: self.args.checkpoint_freq,
-            enable_cheater_identification: true,
-            mac_seed: self.args.seed + 1000,
-        };
-
-        let trainer_config = MPCTrainerConfig {
+        let config = MPCIntegrationConfig {
             d_in: D_IN,
             d_hid: D_HID,
             d_out: D_OUT,
+            num_workers: self.args.workers,
+            num_steps: self.args.steps,
             learning_rate: self.args.lr,
-            num_parties,
-            reshare_interval: 0, // Disable re-sharing for demo speed
+            checkpoint_interval: checkpoint_freq as usize,
+            mac_check_interval: checkpoint_freq,
             beaver_batch_size: 10000,
-            generate_proofs: false,
-            base_error: 1e-6,
-            checkpoint_interval: 1,
-            mac_config: Some(mac_config),
+            initial_weights: None,
+            training_data: train_pairs.clone(),
+            seed: self.args.seed,
+            use_node_transport: false,
+            use_tcp_transport: false,
+            worker_endpoints: None,
             batch_size: 1,
+            on_step: Some(on_step),
+            on_sub_step: None,
+            capture_checkpoint_weights: false,
         };
 
-        // Spawn each party's trainer in its own tokio task for weight sharing.
-        // Each party owns its trainer; they communicate via transport channels.
-        let mut party_handles = Vec::with_capacity(num_parties);
-
-        for (party_idx, transport) in transports.into_iter().enumerate() {
-            let config = trainer_config.clone();
-            let weights = if party_idx == 0 {
-                Some(initial_weights.clone())
-            } else {
-                None
-            };
-            let seed = self.args.seed;
-
-            let handle = tokio::spawn(async move {
-                let mut trainer = MPCTrainer::new(config, transport, party_idx, seed);
-                trainer.share_weights(weights).await?;
-                Ok::<_, MPCError>(trainer)
-            });
-            party_handles.push(handle);
-        }
-
-        // Collect all trainers back after weight sharing
-        let mut trainers: Vec<MPCTrainer<LocalTransport>> = Vec::with_capacity(num_parties);
-        for handle in party_handles {
-            let trainer = handle
+        let result = if self.args.simulate_cheater && self.args.workers > 2 {
+            let cheater_step = (self.args.steps / 2) as u64;
+            display::info(&format!(
+                "Party 2 will be corrupted at step {}",
+                cheater_step,
+            ));
+            run_mpc_training_with_cheater(config, 2, cheater_step)
                 .await
-                .context("Party task panicked during weight sharing")?
-                .context("Weight sharing failed")?;
-            trainers.push(trainer);
-        }
-
-        display::success(&format!(
-            "Additive secret shares distributed to {} parties ({:.1}ms)",
-            num_parties,
-            phase3_start.elapsed().as_secs_f64() * 1000.0,
-        ));
-        display::success("SPDZ MAC shares initialized (information-theoretic integrity)");
-
-        // ================================================================
-        // Phase 4: Generate Beaver Triples
-        // ================================================================
-        display::phase("Phase 4: Distributed Beaver Triple Generation");
-
-        let phase4_start = Instant::now();
-
-        // Compute how many triples we need.
-        // For training_step_with_mac: uses authenticated Beaver triples for
-        // h_pre * relu_mask (d_hid) + W2 * h matmul (d_out * d_hid) + dh * relu_mask (d_hid) + overhead.
-        // But training_step_unproved doesn't need Beaver triples (it reconstructs activations).
-        // We generate triples anyway to show the Beaver generation protocol.
-        let triples_per_step = helix_mpc::mnist::triples_per_step(D_HID, D_OUT);
-        let total_triples = triples_per_step * self.args.steps;
-
-        display::info(&format!(
-            "Need {} triples/step x {} steps = {} total Beaver triples",
-            triples_per_step, self.args.steps, total_triples,
-        ));
-
-        let pb = display::triple_progress_bar(total_triples as u64);
-
-        // Generate triples in batches across all parties concurrently.
-        // We batch to keep messages manageable and show progress.
-        let batch_size = 5000.min(total_triples);
-        let mut remaining = total_triples;
-
-        while remaining > 0 {
-            let this_batch = remaining.min(batch_size);
-
-            // Extract trainers into tasks for concurrent triple generation
-            let mut triple_handles = Vec::with_capacity(num_parties);
-            for trainer in trainers.drain(..) {
-                let count = this_batch;
-                let handle = tokio::spawn(async move {
-                    let mut t = trainer;
-                    t.generate_beaver_triples(count).await?;
-                    Ok::<_, MPCError>(t)
-                });
-                triple_handles.push(handle);
-            }
-
-            for handle in triple_handles {
-                let trainer = handle
-                    .await
-                    .context("Party task panicked during triple generation")?
-                    .context("Beaver triple generation failed")?;
-                trainers.push(trainer);
-            }
-
-            remaining -= this_batch;
-            pb.set_position((total_triples - remaining) as u64);
-        }
-
-        pb.finish_and_clear();
-        display::success(&format!(
-            "{} Beaver triples generated distributedly in {:.1}s ({:.0} triples/sec)",
-            total_triples,
-            phase4_start.elapsed().as_secs_f64(),
-            total_triples as f64 / phase4_start.elapsed().as_secs_f64(),
-        ));
-
-        // ================================================================
-        // Phase 5: MPC Training Loop
-        // ================================================================
-        display::phase("Phase 5: MPC Training with SPDZ MAC Verification");
-
-        // Optional ZK prover: only created when --zk-proofs is set.
-        // All expensive operations (SRS, keygen) are deferred until first use.
-        let mut zk_prover = if self.args.zk_proofs {
-            Some(LazyZkProver::new(D_IN, D_HID, D_OUT))
+                .context("MPC training with cheater failed")?
         } else {
-            None
+            run_mpc_training(config)
+                .await
+                .context("MPC training failed")?
         };
-
-        let phase5_start = Instant::now();
-        let mut all_losses: Vec<f64> = Vec::with_capacity(self.args.steps);
-        let mut mac_checks_passed = 0u64;
-        let mut cheater_detected = false;
-        let mut cheater_party: Option<usize> = None;
-        let cheater_step = self.args.steps / 2;
-        let mut training_halted = false;
-
-        for step in 0..self.args.steps {
-            if training_halted {
-                break;
-            }
-
-            let sample_idx = step % train_pairs.len();
-            let (ref input, ref target) = train_pairs[sample_idx];
-
-            // Optionally corrupt party 2's shares at the midpoint
-            if self.args.simulate_cheater && step == cheater_step && num_parties > 2 {
-                display::cheater_simulated(2, step);
-                // Corrupt several weight elements in party 2
-                for idx in 0..10.min(trainers[2].weight_shares().0.len()) {
-                    trainers[2].corrupt_weight_share(idx, Fr::from_f64(100.0));
-                }
-            }
-
-            // Run all parties concurrently for this training step.
-            // Each party runs training_step_with_mac on the same (input, target).
-            let mut step_handles = Vec::with_capacity(trainers.len());
-            for trainer in trainers.drain(..) {
-                let inp = input.clone();
-                let tgt = target.clone();
-                let handle = tokio::spawn(async move {
-                    let mut t = trainer;
-                    let result = t.training_step_with_mac(&inp, &tgt).await;
-                    (t, result)
-                });
-                step_handles.push(handle);
-            }
-
-            let mut step_loss = 0.0_f64;
-            let mut mac_failed_this_step = false;
-            let mut mac_ok = true;
-
-            for handle in step_handles {
-                let (trainer, result) = handle
-                    .await
-                    .context("Party task panicked during training step")?;
-
-                match result {
-                    Ok(step_result) => {
-                        // Use party 0's loss as canonical
-                        if trainer.party_index() == 0 {
-                            step_loss = step_result.loss;
-                        }
-                        trainers.push(trainer);
-                    }
-                    Err(MPCError::MACCheckFailed { step: s, cheater: c }) => {
-                        mac_failed_this_step = true;
-                        mac_ok = false;
-                        if let Some(c_idx) = c {
-                            cheater_detected = true;
-                            cheater_party = Some(c_idx);
-                            display::cheater_detected(c_idx, s);
-                        } else {
-                            display::alert(&format!(
-                                "MAC check failed at step {} but cheater not identified",
-                                s,
-                            ));
-                        }
-                        trainers.push(trainer);
-                    }
-                    Err(e) => {
-                        // Other MPC errors - push trainer back and note failure
-                        display::warn(&format!(
-                            "Party {} step {} error: {}",
-                            trainer.party_index(), step, e,
-                        ));
-                        trainers.push(trainer);
-                        mac_ok = false;
-                    }
-                }
-            }
-
-            // Sort trainers back by party index
-            trainers.sort_by_key(|t| t.party_index());
-
-            if mac_failed_this_step {
-                display::info("Training halted due to MAC failure. Rolling back to checkpoint.");
-                training_halted = true;
-            }
-
-            all_losses.push(step_loss);
-
-            // Update display
-            display::step_update(step + 1, self.args.steps, step_loss, trainers.len(), mac_ok);
-
-            // Check if this was a MAC verification checkpoint
-            if !mac_failed_this_step
-                && self.args.checkpoint_freq > 0
-                && (step + 1) as u64 % self.args.checkpoint_freq == 0
-            {
-                display::step_update_finish();
-                mac_checks_passed += 1;
-                display::mac_verified((step + 1) as u64);
-
-                // Compute commitment from weight shares (using party 0's shares as proxy
-                // for the Pedersen commitment display - in production, each party would
-                // contribute their commitment share).
-                let (w1_shares, _, _, _) = trainers[0].weight_shares();
-                let commitment_bytes: Vec<u8> = w1_shares.iter()
-                    .take(4)
-                    .flat_map(|f| f.to_bytes_le().to_vec())
-                    .collect();
-                let commitment_hex = hex_encode(&commitment_bytes);
-                display::checkpoint((step + 1) as u64, &commitment_hex);
-
-                // Optional ZK proof generation at this checkpoint.
-                // The ZK proof proves the weight transition from the previous
-                // checkpoint to this one is valid via StateTransitionCircuit.
-                if let Some(ref mut prover) = zk_prover {
-                    let is_zk_checkpoint = mac_checks_passed % self.args.zk_checkpoint_freq == 0;
-                    if is_zk_checkpoint {
-                        let current_loss = all_losses.last().copied().unwrap_or(0.0);
-                        match prover.generate_proof(
-                            (step + 1) as u64,
-                            &trainers,
-                            current_loss,
-                        ) {
-                            Ok(Some(_result)) => {
-                                // Proof generated and displayed by zk_prover
-                            }
-                            Ok(None) => {
-                                // First checkpoint: baseline weights recorded, no proof yet
-                                display::info("ZK baseline weights recorded (proof starts at next ZK checkpoint)");
-                            }
-                            Err(e) => {
-                                // ZK proof failure is non-fatal: MPC+MAC is the primary mechanism
-                                display::warn(&format!(
-                                    "ZK proof generation failed (non-fatal): {}",
-                                    e,
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-        }
 
         display::step_update_finish();
 
-        let training_time = phase5_start.elapsed();
-        let actual_steps = all_losses.len();
+        let training_time = phase2_start.elapsed();
         display::success(&format!(
             "Training complete: {} steps in {:.1}s ({:.1} steps/sec)",
-            actual_steps,
+            result.steps_completed,
             training_time.as_secs_f64(),
-            actual_steps as f64 / training_time.as_secs_f64(),
+            result.steps_completed as f64 / training_time.as_secs_f64(),
         ));
-
-        // ================================================================
-        // Phase 6: Weight Reconstruction and Accuracy Evaluation
-        // ================================================================
-        display::phase("Phase 6: Weight Reconstruction and Evaluation");
-
-        let phase6_start = Instant::now();
-
-        // Reconstruct weights by summing shares across all parties
-        let (w1_f64, b1_f64, w2_f64, b2_f64) = reconstruct_weights(&trainers);
-
         display::success(&format!(
-            "Weights reconstructed by summing {} party shares ({:.1}ms)",
-            trainers.len(),
-            phase6_start.elapsed().as_secs_f64() * 1000.0,
+            "MAC checks passed: {} (information-theoretic integrity)",
+            result.mac_checks_passed,
         ));
 
-        // Weight statistics
-        let w1_norm: f64 = w1_f64.iter().map(|w| w * w).sum::<f64>().sqrt();
-        let w2_norm: f64 = w2_f64.iter().map(|w| w * w).sum::<f64>().sqrt();
+        // Display checkpoint commitments
+        if !result.checkpoints.is_empty() {
+            display::subphase(&format!(
+                "{} Pedersen checkpoints computed (joint commitment, no weight reconstruction):",
+                result.checkpoints.len(),
+            ));
+            for cp in &result.checkpoints {
+                let commitment_hex = hex::encode(cp.commitment_bytes32);
+                display::checkpoint(cp.step as u64, &commitment_hex);
+                display::info(&format!("  Loss at checkpoint: {:.6}", cp.loss));
+            }
+        }
+
+        if let Some(ref cheater) = result.cheater_detected {
+            display::cheater_detected(cheater.party_index, cheater.detected_at_step);
+            if result.recovery_completed {
+                display::success(&format!(
+                    "Recovery completed: {} additional steps after cheater removal",
+                    result.post_recovery_steps,
+                ));
+            }
+        }
+
+        // ================================================================
+        // Phase 3: Weight Reconstruction and Accuracy Evaluation
+        // ================================================================
+        display::phase("Phase 3: Weight Reconstruction and Evaluation");
+
+        let w = &result.final_weights;
+        display::success("Weights reconstructed by summing party shares");
+
+        let w1_norm: f64 = w.w1.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let w2_norm: f64 = w.w2.iter().map(|v| v * v).sum::<f64>().sqrt();
         display::metric("||W1|| (Frobenius)", &format!("{:.6}", w1_norm));
         display::metric("||W2|| (Frobenius)", &format!("{:.6}", w2_norm));
 
-        // Evaluate accuracy
         let (overall_accuracy, per_class_acc) = evaluator::evaluate_per_class(
-            &w1_f64, &b1_f64, &w2_f64, &b2_f64,
-            D_IN, D_HID, D_OUT,
-            &test_pairs,
+            &w.w1, &w.b1, &w.w2, &w.b2, D_IN, D_HID, D_OUT, &test_pairs,
         );
 
         display::success(&format!(
@@ -473,7 +246,6 @@ impl DemoRunner {
             test_pairs.len(),
         ));
 
-        // Per-class breakdown
         display::subphase("Per-class accuracy:");
         for (digit, acc) in per_class_acc.iter().enumerate() {
             let bar_len = (*acc * 20.0) as usize;
@@ -482,31 +254,36 @@ impl DemoRunner {
                 "#".repeat(bar_len),
                 "-".repeat(20 - bar_len),
             );
-            println!(
-                "    Digit {}: {} {:.1}%",
-                digit, bar, acc * 100.0,
-            );
+            println!("    Digit {}: {} {:.1}%", digit, bar, acc * 100.0);
         }
 
         // ================================================================
-        // Phase 7: Native Comparison (optional detail)
+        // Phase 4: Native Baseline Comparison
         // ================================================================
-        display::phase("Phase 7: Native Baseline Comparison");
+        display::phase("Phase 4: Native Baseline Comparison");
 
-        let mut native_trainer = NativeTrainer::new(D_IN, D_HID, D_OUT, self.args.lr, self.args.seed);
+        let actual_steps = result.steps_completed;
+        let mut native_trainer =
+            NativeTrainer::new(D_IN, D_HID, D_OUT, self.args.lr, self.args.seed);
         let native_steps = actual_steps.min(self.args.steps);
         let mut native_losses = Vec::with_capacity(native_steps);
 
         for step in 0..native_steps {
             let idx = step % train_pairs.len();
             let (ref input, ref target) = train_pairs[idx];
-            let result = native_trainer.training_step_mse(input, target, step as u64);
-            native_losses.push(result.loss);
+            let r = native_trainer.training_step_mse(input, target, step as u64);
+            native_losses.push(r.loss);
         }
 
         let native_accuracy = native_trainer.evaluate(&test_pairs);
-        display::metric("Native (no MPC) accuracy", &format!("{:.1}%", native_accuracy * 100.0));
-        display::metric("MPC accuracy", &format!("{:.1}%", overall_accuracy * 100.0));
+        display::metric(
+            "Native (no MPC) accuracy",
+            &format!("{:.1}%", native_accuracy * 100.0),
+        );
+        display::metric(
+            "MPC accuracy",
+            &format!("{:.1}%", overall_accuracy * 100.0),
+        );
 
         let accuracy_gap = (native_accuracy - overall_accuracy).abs() * 100.0;
         if accuracy_gap < 10.0 {
@@ -522,25 +299,34 @@ impl DemoRunner {
         }
 
         // ================================================================
-        // Phase 8: Loss Curves and Summary
+        // Phase 5: On-Chain Checkpoint Settlement (optional)
         // ================================================================
-        display::phase("Phase 8: Training Results");
+        #[cfg(feature = "chain")]
+        let chain_stats = if !self.args.skip_chain {
+            Some(self.run_onchain_settlement(&result).await?)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "chain"))]
+        let chain_stats: Option<ChainStats> = None;
+
+        // ================================================================
+        // Phase 6: Loss Curves and Summary
+        // ================================================================
+        display::phase("Phase 6: Training Results");
 
         display::subphase("MPC Training Loss:");
-        display::loss_curve(&all_losses);
+        display::loss_curve(&result.losses);
 
         display::subphase("Native Training Loss (comparison):");
         display::loss_curve(&native_losses);
 
-        // Final summary
-        let loss_start = all_losses.first().copied().unwrap_or(0.0);
-        let loss_end = all_losses.last().copied().unwrap_or(0.0);
+        // Estimate triples generated (run_mpc_training doesn't expose this directly)
+        let triples_per_step = helix_mpc::mnist::triples_per_step(D_HID, D_OUT);
+        let triples_generated = triples_per_step * actual_steps;
 
-        // Collect ZK proof stats
-        let (zk_generated, zk_verified, zk_time_ms) = match &zk_prover {
-            Some(p) => (p.proofs_generated(), p.proofs_verified(), p.total_proving_time_ms()),
-            None => (0, 0, 0),
-        };
+        let loss_start = result.losses.first().copied().unwrap_or(0.0);
+        let loss_end = result.losses.last().copied().unwrap_or(0.0);
 
         display::summary(&display::DemoSummary {
             total_time: demo_start.elapsed(),
@@ -549,59 +335,202 @@ impl DemoRunner {
             loss_start,
             loss_end,
             final_accuracy: overall_accuracy,
-            triples_generated: total_triples,
-            mac_checks_passed: mac_checks_passed as usize,
-            cheater_detected,
-            cheater_party,
-            zk_proofs_generated: zk_generated,
-            zk_proofs_verified: zk_verified,
-            zk_total_proving_time_ms: zk_time_ms,
+            triples_generated,
+            mac_checks_passed: result.mac_checks_passed,
+            cheater_detected: result.cheater_detected.is_some(),
+            cheater_party: result.cheater_detected.as_ref().map(|c| c.party_index),
+            zk_proofs_generated: 0,
+            zk_proofs_verified: 0,
+            zk_total_proving_time_ms: 0,
+            chain_stats,
         });
 
         Ok(())
     }
-}
 
-// ============================================================================
-// Helpers
-// ============================================================================
+    /// Run on-chain settlement: deploy V4, register job, stake workers, submit checkpoints.
+    #[cfg(feature = "chain")]
+    async fn run_onchain_settlement(
+        &self,
+        result: &MPCIntegrationResult,
+    ) -> Result<ChainStats> {
+        display::phase("Phase 5: On-Chain Checkpoint Settlement");
+        display::info("Booting local Anvil node...");
 
-/// Reconstructs plaintext weights from all party shares by summing.
-fn reconstruct_weights(
-    trainers: &[MPCTrainer<LocalTransport>],
-) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
-    let (first_w1, first_b1, first_w2, first_b2) = trainers[0].weight_shares();
+        let anvil = Anvil::new().spawn();
+        let rpc_url = anvil.endpoint();
+        let chain_id = anvil.chain_id();
 
-    let mut w1_sum = first_w1.to_vec();
-    let mut b1_sum = first_b1.to_vec();
-    let mut w2_sum = first_w2.to_vec();
-    let mut b2_sum = first_b2.to_vec();
+        display::success(&format!(
+            "Anvil running at {} (chain_id={})",
+            rpc_url, chain_id,
+        ));
 
-    for trainer in trainers.iter().skip(1) {
-        let (w1, b1, w2, b2) = trainer.weight_shares();
-        for (i, s) in w1.iter().enumerate() {
-            w1_sum[i] = Fr::add(&w1_sum[i], s);
+        // Account 0 = deployer/owner, Accounts 1..N = workers
+        let owner_wallet: LocalWallet = anvil.keys()[0].clone().into();
+        let owner_wallet = owner_wallet.with_chain_id(chain_id);
+        let owner_pk = hex::encode(anvil.keys()[0].to_bytes());
+
+        let mut worker_wallets: Vec<LocalWallet> = Vec::new();
+        let mut worker_pks: Vec<String> = Vec::new();
+        for i in 1..=self.args.workers {
+            let wallet: LocalWallet = anvil.keys()[i].clone().into();
+            let wallet = wallet.with_chain_id(chain_id);
+            worker_pks.push(hex::encode(anvil.keys()[i].to_bytes()));
+            worker_wallets.push(wallet);
         }
-        for (i, s) in b1.iter().enumerate() {
-            b1_sum[i] = Fr::add(&b1_sum[i], s);
+
+        display::info(&format!(
+            "Owner: {:?}, {} workers configured",
+            owner_wallet.address(),
+            worker_wallets.len(),
+        ));
+
+        // Deploy V4 coordinator
+        display::info("Deploying HelixCoordinatorV4...");
+        let (owner_client, deploy_result) = ChainClientV4::deploy(
+            &rpc_url,
+            &owner_pk,
+            owner_wallet.address(),
+            Address::zero(), // no ZK verifier needed
+            Some(chain_id),
+        )
+        .await
+        .context("V4 contract deployment failed")?;
+
+        let coordinator_addr = deploy_result.coordinator.clone();
+        display::success(&format!(
+            "HelixCoordinatorV4 deployed at {}",
+            coordinator_addr,
+        ));
+
+        // Register training job
+        let architecture_hash = [0x42u8; 32];
+        let payment = U256::from(1_000_000_000_000_000_000u128); // 1 ETH
+        let (_receipt, job_id) = owner_client
+            .register_training_job(
+                architecture_hash,
+                self.args.checkpoint_freq,
+                self.args.steps as u64,
+                payment,
+            )
+            .await
+            .context("register_training_job failed")?;
+
+        display::success(&format!("Training job registered (job_id={})", job_id));
+
+        // Workers stake and join
+        let stake = U256::from(100_000_000_000_000_000u128); // 0.1 ETH
+        for (i, pk) in worker_pks.iter().enumerate() {
+            let worker_client = ChainClientV4::new(
+                &rpc_url,
+                pk,
+                &coordinator_addr,
+                Some(chain_id),
+            )
+            .await
+            .context("worker client creation failed")?;
+
+            worker_client
+                .stake_and_join(job_id, stake)
+                .await
+                .context("stake_and_join failed")?;
+
+            display::success(&format!(
+                "Worker {} staked 0.1 ETH and joined (addr: {:?})",
+                i + 1,
+                worker_wallets[i].address(),
+            ));
         }
-        for (i, s) in w2.iter().enumerate() {
-            w2_sum[i] = Fr::add(&w2_sum[i], s);
+
+        // Submit checkpoints on-chain
+        if result.checkpoints.is_empty() {
+            display::warn("No checkpoints to submit (training may have been too short)");
+            return Ok(ChainStats {
+                checkpoints_submitted: 0,
+                total_gas: 0,
+                contract_address: coordinator_addr,
+                job_completed: false,
+            });
         }
-        for (i, s) in b2.iter().enumerate() {
-            b2_sum[i] = Fr::add(&b2_sum[i], s);
+
+        let checkpoint_data: Vec<CheckpointData> = result
+            .checkpoints
+            .iter()
+            .map(|cp| CheckpointData {
+                step: cp.step as u64,
+                commitment_bytes32: cp.commitment_bytes32,
+                loss: cp.loss,
+            })
+            .collect();
+
+        display::info(&format!(
+            "Signing and submitting {} checkpoints on-chain ({} worker signatures each)...",
+            checkpoint_data.len(),
+            worker_wallets.len(),
+        ));
+
+        let submissions = submit_all_checkpoints(
+            &owner_client,
+            job_id,
+            &checkpoint_data,
+            &worker_wallets,
+        )
+        .await
+        .context("checkpoint submission failed")?;
+
+        let mut total_gas = 0u64;
+        for sub in &submissions {
+            let gas = sub.receipt.gas_used.map(|g| g.as_u64()).unwrap_or(0);
+            total_gas += gas;
+            display::chain_checkpoint_submitted(
+                sub.step,
+                &format!("{:?}", sub.receipt.transaction_hash),
+                gas,
+                sub.signer_count,
+            );
         }
+
+        // Verify on-chain state
+        let onchain_count = owner_client
+            .get_checkpoint_count(job_id)
+            .await
+            .context("get_checkpoint_count failed")?;
+
+        display::success(&format!(
+            "{} checkpoints verified on-chain (total gas: {})",
+            onchain_count, total_gas,
+        ));
+
+        // Complete training with final commitment signed by all workers
+        let final_commitment = checkpoint_data
+            .last()
+            .map(|cp| cp.commitment_bytes32)
+            .unwrap_or([0u8; 32]);
+
+        let mut completion_sigs = Vec::new();
+        for wallet in &worker_wallets {
+            let sig = sign_completion(wallet, U256::from(job_id), final_commitment)
+                .await
+                .context("sign_completion failed")?;
+            completion_sigs.push(sig);
+        }
+
+        owner_client
+            .complete_training(job_id, final_commitment, completion_sigs)
+            .await
+            .context("complete_training failed")?;
+
+        display::success("Training completed and finalized on-chain");
+
+        // Keep anvil alive until function returns (it's owned by this scope)
+        let _ = &anvil;
+
+        Ok(ChainStats {
+            checkpoints_submitted: submissions.len(),
+            total_gas,
+            contract_address: coordinator_addr,
+            job_completed: true,
+        })
     }
-
-    (
-        w1_sum.iter().map(|f| f.to_f64()).collect(),
-        b1_sum.iter().map(|f| f.to_f64()).collect(),
-        w2_sum.iter().map(|f| f.to_f64()).collect(),
-        b2_sum.iter().map(|f| f.to_f64()).collect(),
-    )
-}
-
-/// Simple hex encoding for commitment display.
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }

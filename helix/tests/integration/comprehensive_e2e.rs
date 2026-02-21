@@ -501,6 +501,7 @@ async fn run_training(
         batch_size: 1,
         on_step: None,
         on_sub_step: None,
+        capture_checkpoint_weights: false,
     };
 
     helix_mpc::e2e_integration::run_mpc_training(config)
@@ -538,6 +539,7 @@ async fn run_training_with_cheater(
         batch_size: 1,
         on_step: None,
         on_sub_step: None,
+        capture_checkpoint_weights: false,
     };
 
     helix_mpc::e2e_integration::run_mpc_training_with_cheater(config, cheater_party, corrupt_at_step)
@@ -573,6 +575,7 @@ async fn run_training_2_workers(
         batch_size: 1,
         on_step: None,
         on_sub_step: None,
+        capture_checkpoint_weights: false,
     };
 
     helix_mpc::e2e_integration::run_mpc_training(config)
@@ -1373,6 +1376,7 @@ async fn test_e2e_full_mnist_scale() -> Result<()> {
         batch_size: 1,
         on_step: None,
         on_sub_step: None,
+        capture_checkpoint_weights: false,
     };
 
     let mpc_result = helix_mpc::e2e_integration::run_mpc_training(config)

@@ -322,6 +322,8 @@ async fn test_chain_recovery_full_e2e() -> anyhow::Result<()> {
         worker_endpoints: None,
         batch_size: 1,
         on_step: None,
+        on_sub_step: None,
+        capture_checkpoint_weights: false,
     };
 
     let result = run_mpc_training_with_cheater(mpc_config, cheater_party, corrupt_at_step).await?;
@@ -504,6 +506,8 @@ async fn test_chain_recovery_full_e2e() -> anyhow::Result<()> {
         worker_endpoints: None,
         batch_size: 1,
         on_step: None,
+        on_sub_step: None,
+        capture_checkpoint_weights: false,
     };
 
     let recovery_result = run_mpc_training(recovery_config).await?;

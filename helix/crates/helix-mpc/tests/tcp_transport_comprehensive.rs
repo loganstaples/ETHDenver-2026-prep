@@ -164,6 +164,8 @@ async fn test_tcp_mpc_training() {
         worker_endpoints: None,
         batch_size: 1,
         on_step: None,
+        on_sub_step: None,
+        capture_checkpoint_weights: false,
     };
 
     let result = run_mpc_training(config).await.expect("TCP 20-step training should succeed");
@@ -351,6 +353,8 @@ async fn test_transport_equivalence() {
         worker_endpoints: None,
         batch_size: 1,
         on_step: None,
+        on_sub_step: None,
+        capture_checkpoint_weights: false,
     };
 
     let local_result = run_mpc_training(local_config)
@@ -376,6 +380,8 @@ async fn test_transport_equivalence() {
         worker_endpoints: None,
         batch_size: 1,
         on_step: None,
+        on_sub_step: None,
+        capture_checkpoint_weights: false,
     };
 
     let tcp_result = run_mpc_training(tcp_config)
@@ -456,6 +462,8 @@ async fn test_tcp_mpc_training_with_mac() {
         worker_endpoints: None,
         batch_size: 1,
         on_step: None,
+        on_sub_step: None,
+        capture_checkpoint_weights: false,
     };
 
     let result = run_mpc_training(config).await.expect("TCP MAC training should succeed");
@@ -652,6 +660,8 @@ async fn test_tcp_checkpoint_exchange() {
         worker_endpoints: None,
         batch_size: 1,
         on_step: None,
+        on_sub_step: None,
+        capture_checkpoint_weights: false,
     };
 
     let result = run_mpc_training(config).await.expect("TCP checkpoint training should succeed");
@@ -699,6 +709,8 @@ async fn test_tcp_share_distribution_and_reconstruction() {
         worker_endpoints: None,
         batch_size: 1,
         on_step: None,
+        on_sub_step: None,
+        capture_checkpoint_weights: false,
     };
 
     let result = run_mpc_training(config).await.expect("TCP share distribution should succeed");
@@ -806,6 +818,8 @@ async fn test_tcp_node_transport_equivalence() {
         worker_endpoints: None,
         batch_size: 1,
         on_step: None,
+        on_sub_step: None,
+        capture_checkpoint_weights: false,
     };
 
     let local_result = run_mpc_training(local_config)
@@ -831,6 +845,8 @@ async fn test_tcp_node_transport_equivalence() {
         worker_endpoints: None,
         batch_size: 1,
         on_step: None,
+        on_sub_step: None,
+        capture_checkpoint_weights: false,
     };
 
     let node_result = run_mpc_training(node_config)

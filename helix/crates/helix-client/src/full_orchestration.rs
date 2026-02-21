@@ -729,6 +729,7 @@ impl FullOrchestrator {
                         });
                     })
                 }),
+                capture_checkpoint_weights: false,
             };
 
             if self.config.simulate_cheater {
@@ -1338,6 +1339,7 @@ impl FullOrchestrator {
                                 step: cp.step,
                                 commitment_bytes32: cp.commitment_bytes32,
                                 loss: cp.loss,
+                                weight_snapshot: None,
                             }
                         }).collect();
                     }

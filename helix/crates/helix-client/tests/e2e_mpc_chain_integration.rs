@@ -223,6 +223,8 @@ fn test_mpc_config(num_steps: usize, checkpoint_interval: usize) -> MPCIntegrati
         worker_endpoints: None,
         batch_size: 1,
         on_step: None,
+        on_sub_step: None,
+        capture_checkpoint_weights: false,
     }
 }
 

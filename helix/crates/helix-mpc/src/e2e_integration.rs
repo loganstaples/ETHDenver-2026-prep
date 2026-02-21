@@ -82,6 +82,11 @@ pub struct MPCIntegrationConfig {
     /// Higher values (e.g. 32) improve CPU utilization by amortizing
     /// communication overhead across more parallel compute per step.
     pub batch_size: usize,
+    /// Whether to capture weight share snapshots at each Pedersen checkpoint.
+    /// When enabled, each party stores its additive shares at checkpoint time
+    /// so that ZK proofs can be generated after training completes.
+    /// Default: false (no overhead unless explicitly requested).
+    pub capture_checkpoint_weights: bool,
     /// Optional callback invoked after each training step on party 0.
     /// Arguments: (step_1indexed, total_steps, loss, accuracy_estimate, mac_ok).
     /// Accuracy estimate is derived from cross-entropy loss (0.0-1.0).
@@ -111,6 +116,7 @@ impl std::fmt::Debug for MPCIntegrationConfig {
             .field("use_tcp_transport", &self.use_tcp_transport)
             .field("worker_endpoints", &self.worker_endpoints)
             .field("batch_size", &self.batch_size)
+            .field("capture_checkpoint_weights", &self.capture_checkpoint_weights)
             .field("on_step", &self.on_step.as_ref().map(|_| "<callback>"))
             .field("on_sub_step", &self.on_sub_step.as_ref().map(|_| "<callback>"))
             .finish()
@@ -150,6 +156,7 @@ impl Default for MPCIntegrationConfig {
             use_tcp_transport: false,
             worker_endpoints: None,
             batch_size: 1,
+            capture_checkpoint_weights: false,
             on_step: None,
             on_sub_step: None,
         }
@@ -209,6 +216,9 @@ pub struct CheckpointRecord {
     pub commitment_bytes32: [u8; 32],
     /// Loss at this checkpoint.
     pub loss: f64,
+    /// Reconstructed weights at this checkpoint (trusted operator only).
+    /// Sum of all parties' additive shares.
+    pub weight_snapshot: Option<Vec<Fr>>,
 }
 
 /// Record of a detected cheater.
@@ -245,6 +255,7 @@ pub async fn run_mpc_training(
     let num_workers = config.num_workers;
     let num_steps = config.num_steps;
     let checkpoint_interval = config.checkpoint_interval;
+    let capture_checkpoint_weights = config.capture_checkpoint_weights;
     let on_step = config.on_step.clone();
     let on_sub_step = config.on_sub_step.clone();
 
@@ -303,6 +314,7 @@ pub async fn run_mpc_training(
                 parties, trainer_config, initial_weights, training_data,
                 num_steps, checkpoint_interval, config.seed, start,
                 config.worker_endpoints.clone(),
+                capture_checkpoint_weights,
                 on_step.clone(),
                 on_sub_step.clone(),
             ).await
@@ -317,6 +329,7 @@ pub async fn run_mpc_training(
         run_with_node_transport(
             parties, trainer_config, initial_weights, training_data,
             num_steps, checkpoint_interval, config.seed, start,
+            capture_checkpoint_weights,
             on_step.clone(),
             on_sub_step.clone(),
         ).await
@@ -324,6 +337,7 @@ pub async fn run_mpc_training(
         run_with_local_transport(
             parties, trainer_config, initial_weights, training_data,
             num_steps, checkpoint_interval, config.seed, start,
+            capture_checkpoint_weights,
             on_step.clone(),
             on_sub_step.clone(),
         ).await
@@ -343,6 +357,7 @@ pub async fn run_mpc_training_with_cheater(
     let num_workers = config.num_workers;
     let num_steps = config.num_steps;
     let checkpoint_interval = config.checkpoint_interval;
+    let capture_checkpoint_weights = config.capture_checkpoint_weights;
     let on_step = config.on_step.clone();
     let on_sub_step = config.on_sub_step.clone();
 
@@ -399,6 +414,7 @@ pub async fn run_mpc_training_with_cheater(
                 num_steps, checkpoint_interval, config.seed, start,
                 cheater_party, corrupt_at_step,
                 config.worker_endpoints.clone(),
+                capture_checkpoint_weights,
                 on_step.clone(),
                 on_sub_step.clone(),
             ).await
@@ -414,6 +430,7 @@ pub async fn run_mpc_training_with_cheater(
             parties, trainer_config, initial_weights, training_data,
             num_steps, checkpoint_interval, config.seed, start,
             cheater_party, corrupt_at_step,
+            capture_checkpoint_weights,
             on_step.clone(),
             on_sub_step.clone(),
         ).await
@@ -505,6 +522,7 @@ async fn run_with_local_transport(
     checkpoint_interval: usize,
     seed: u64,
     start: Instant,
+    capture_checkpoint_weights: bool,
     on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync>>,
     on_sub_step: Option<crate::mpc_trainer::SubStepCallback>,
 ) -> Result<MPCIntegrationResult, anyhow::Error> {
@@ -534,6 +552,7 @@ async fn run_with_local_transport(
                 num_steps, checkpoint_interval, seed,
                 None, 0, // no cheater
                 Some(bundle),
+                capture_checkpoint_weights,
                 step_cb,
                 sub_step_cb,
             ))
@@ -553,6 +572,7 @@ async fn run_with_node_transport(
     checkpoint_interval: usize,
     seed: u64,
     start: Instant,
+    capture_checkpoint_weights: bool,
     on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync>>,
     on_sub_step: Option<crate::mpc_trainer::SubStepCallback>,
 ) -> Result<MPCIntegrationResult, anyhow::Error> {
@@ -580,6 +600,7 @@ async fn run_with_node_transport(
                 num_steps, checkpoint_interval, seed,
                 None, 0,
                 Some(bundle),
+                capture_checkpoint_weights,
                 step_cb,
                 sub_step_cb,
             ))
@@ -605,6 +626,7 @@ async fn run_with_tcp_transport(
     seed: u64,
     start: Instant,
     worker_endpoints: Option<Vec<String>>,
+    capture_checkpoint_weights: bool,
     on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync>>,
     on_sub_step: Option<crate::mpc_trainer::SubStepCallback>,
 ) -> Result<MPCIntegrationResult, anyhow::Error> {
@@ -700,6 +722,7 @@ async fn run_with_tcp_transport(
                 num_steps, checkpoint_interval, seed,
                 None, 0, // no cheater
                 Some(bundle),
+                capture_checkpoint_weights,
                 step_cb,
                 sub_step_cb,
             ))
@@ -723,6 +746,7 @@ async fn run_with_tcp_cheater(
     cheater_party: usize,
     corrupt_at_step: u64,
     worker_endpoints: Option<Vec<String>>,
+    capture_checkpoint_weights: bool,
     on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync>>,
     on_sub_step: Option<crate::mpc_trainer::SubStepCallback>,
 ) -> Result<MPCIntegrationResult, anyhow::Error> {
@@ -819,6 +843,7 @@ async fn run_with_tcp_cheater(
                 num_steps, checkpoint_interval, seed,
                 cheater_info, corrupt_at_step,
                 Some(bundle),
+                capture_checkpoint_weights,
                 step_cb,
                 sub_step_cb,
             ))
@@ -840,6 +865,7 @@ async fn run_with_cheater(
     start: Instant,
     cheater_party: usize,
     corrupt_at_step: u64,
+    capture_checkpoint_weights: bool,
     on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync>>,
     on_sub_step: Option<crate::mpc_trainer::SubStepCallback>,
 ) -> Result<MPCIntegrationResult, anyhow::Error> {
@@ -876,6 +902,7 @@ async fn run_with_cheater(
                 num_steps, checkpoint_interval, seed,
                 cheater_info, corrupt_at_step,
                 Some(bundle),
+                capture_checkpoint_weights,
                 step_cb,
                 sub_step_cb,
             ))
@@ -968,6 +995,7 @@ async fn run_with_cheater(
                         total_steps, checkpoint_interval, seed.wrapping_add(0xBEC0_BEC0),
                         None, 0, // no cheater in recovery
                         Some(bundle),
+                        capture_checkpoint_weights,
                         wrapped_cb,
                         sub_step_cb,
                     ))
@@ -1046,6 +1074,7 @@ async fn run_with_cheater(
             step: cp.step,
             commitment_bytes32: cp.commitment_bytes32,
             loss: cp.loss,
+            weight_snapshot: None,
         })
         .collect();
 
@@ -1093,6 +1122,10 @@ pub struct PartyResult {
     pub checkpoint_b2: Vec<Fr>,
     /// Step number at last good checkpoint before cheater detection.
     pub checkpoint_step: u64,
+    /// Per-checkpoint weight share snapshots (step, flat_shares) for ZK proof generation.
+    /// Each entry contains THIS party's additive shares — must be summed across parties
+    /// to reconstruct full weights.
+    pub checkpoint_weight_snapshots: Vec<(usize, Vec<Fr>)>,
 }
 
 /// Encrypted share material for a party, distributed before training.
@@ -1390,6 +1423,7 @@ pub async fn run_distributed_party<T: crate::session::transport::MPCTransport + 
         checkpoint_w2: Vec::new(),
         checkpoint_b2: Vec::new(),
         checkpoint_step: 0,
+        checkpoint_weight_snapshots: Vec::new(),
     })
 }
 
@@ -1409,6 +1443,7 @@ pub async fn run_party_training<T: crate::session::transport::MPCTransport + 'st
     cheater_info: Option<usize>,
     corrupt_at_step: u64,
     encrypted_bundle: Option<EncryptedShareBundle>,
+    capture_checkpoint_weights: bool,
     on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync>>,
     on_sub_step: Option<crate::mpc_trainer::SubStepCallback>,
 ) -> Result<PartyResult, anyhow::Error> {
@@ -1476,6 +1511,7 @@ pub async fn run_party_training<T: crate::session::transport::MPCTransport + 'st
     };
     let attestation_manager = CheckpointAttestationManager::new(attestation_config);
     let mut checkpoints: Vec<OnChainCheckpoint> = Vec::new();
+    let mut weight_snapshots: Vec<(usize, Vec<Fr>)> = Vec::new();
     let mut rng = ChaCha20Rng::seed_from_u64(seed.wrapping_add(party_index as u64 * 1000));
 
     let bs = config.batch_size.max(1);
@@ -1611,6 +1647,10 @@ pub async fn run_party_training<T: crate::session::transport::MPCTransport + 'st
                 .cloned()
                 .collect();
 
+            if capture_checkpoint_weights {
+                weight_snapshots.push((step + 1, all_weights.clone()));
+            }
+
             let blindings: Vec<Fr> = (0..all_weights.len())
                 .map(|_| Fr::random(&mut rng))
                 .collect();
@@ -1695,6 +1735,7 @@ pub async fn run_party_training<T: crate::session::transport::MPCTransport + 'st
         checkpoint_w2,
         checkpoint_b2,
         checkpoint_step,
+        checkpoint_weight_snapshots: weight_snapshots,
     })
 }
 
@@ -1723,13 +1764,36 @@ pub async fn collect_results(
 
     // Checkpoints were already exchanged and combined during training.
     // All parties should agree on the same commitments — take party 0's records.
+    // If weight snapshots were captured, reconstruct full weights by summing
+    // all parties' additive shares (trusted operator only).
+    let has_weight_snapshots = !party_results[0].checkpoint_weight_snapshots.is_empty()
+        && party_results[0].checkpoint_weight_snapshots.len() == party_results[0].checkpoints.len();
+
     let checkpoints: Vec<CheckpointRecord> = party_results[0]
         .checkpoints
         .iter()
-        .map(|cp| CheckpointRecord {
-            step: cp.step,
-            commitment_bytes32: cp.commitment_bytes32,
-            loss: cp.loss,
+        .enumerate()
+        .map(|(i, cp)| {
+            let weight_snapshot = if has_weight_snapshots {
+                let num_weights = party_results[0].checkpoint_weight_snapshots[i].1.len();
+                let mut summed = vec![Fr::ZERO; num_weights];
+                for pr in &party_results {
+                    if i < pr.checkpoint_weight_snapshots.len() {
+                        for (j, share) in pr.checkpoint_weight_snapshots[i].1.iter().enumerate() {
+                            summed[j] = Fr::add(&summed[j], share);
+                        }
+                    }
+                }
+                Some(summed)
+            } else {
+                None
+            };
+            CheckpointRecord {
+                step: cp.step,
+                commitment_bytes32: cp.commitment_bytes32,
+                loss: cp.loss,
+                weight_snapshot,
+            }
         })
         .collect();
 
@@ -1896,6 +1960,7 @@ mod tests {
             batch_size: 1,
             on_step: None,
             on_sub_step: None,
+            capture_checkpoint_weights: false,
         };
 
         let result = run_mpc_training(config).await.expect("training should succeed");
@@ -1935,6 +2000,7 @@ mod tests {
             batch_size: 1,
             on_step: None,
             on_sub_step: None,
+            capture_checkpoint_weights: false,
         };
 
         let result = run_mpc_training(config).await.expect("training should succeed");
@@ -1977,6 +2043,7 @@ mod tests {
             batch_size: 1,
             on_step: None,
             on_sub_step: None,
+            capture_checkpoint_weights: false,
         };
 
         let result = run_mpc_training(config).await.expect("training should succeed");
@@ -2009,6 +2076,7 @@ mod tests {
             batch_size: 1,
             on_step: None,
             on_sub_step: None,
+            capture_checkpoint_weights: false,
         };
 
         let result = run_mpc_training(config).await.expect("training should succeed");
@@ -2068,6 +2136,7 @@ mod tests {
                 batch_size: 1,
                 on_step: None,
                 on_sub_step: None,
+                capture_checkpoint_weights: false,
             };
 
             let result = run_mpc_training(config).await.expect("should succeed");
@@ -2121,6 +2190,7 @@ mod tests {
             batch_size: 1,
             on_step: None,
             on_sub_step: None,
+            capture_checkpoint_weights: false,
         };
 
         let result = run_mpc_training_with_cheater(config, 2, 5).await
