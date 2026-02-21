@@ -1634,6 +1634,84 @@ impl ModelStoreClient {
             .map_err(|e| anyhow!("set_public receipt: {}", e))?
             .ok_or_else(|| anyhow!("set_public: tx dropped"))
     }
+
+    /// Check if an account has access to a model (view call, no gas).
+    ///
+    /// Returns `true` if the account is the NFT owner, the model is public,
+    /// or the account has been explicitly granted access via `grantAccess`.
+    pub async fn has_model_access(
+        &self,
+        token_id: u64,
+        account: &str,
+    ) -> Result<bool> {
+        let addr = Address::from_str(account)
+            .map_err(|e| anyhow!("Invalid account address: {}", e))?;
+        let result = self
+            .store
+            .has_model_access(U256::from(token_id), addr)
+            .call()
+            .await
+            .map_err(|e| anyhow!("has_model_access call failed: {}", e))?;
+        Ok(result)
+    }
+
+    /// Verify that a transaction hash is a valid `payForInference` payment for a given model.
+    ///
+    /// Checks:
+    /// 1. Transaction receipt exists and succeeded (status = 1)
+    /// 2. Transaction was sent to this HelixModelStore contract
+    /// 3. Receipt contains an `InferencePaid` event log for the expected `tokenId`
+    pub async fn verify_inference_payment(
+        &self,
+        tx_hash: &str,
+        expected_token_id: u64,
+    ) -> Result<bool> {
+        use ethers::providers::Middleware;
+
+        let hash_str = tx_hash.strip_prefix("0x").unwrap_or(tx_hash);
+        let hash = hash_str
+            .parse::<ethers::types::H256>()
+            .map_err(|e| anyhow!("Invalid tx hash: {}", e))?;
+
+        let receipt = self
+            .client
+            .get_transaction_receipt(hash)
+            .await
+            .map_err(|e| anyhow!("Failed to fetch tx receipt: {}", e))?;
+
+        let receipt = match receipt {
+            Some(r) => r,
+            None => return Ok(false), // tx not found or not yet mined
+        };
+
+        // Check tx succeeded
+        if receipt.status != Some(ethers::types::U64::from(1)) {
+            return Ok(false);
+        }
+
+        // Check tx was sent to the HelixModelStore contract
+        if receipt.to != Some(self.store_address) {
+            return Ok(false);
+        }
+
+        // Check for InferencePaid event: topic[0] = keccak256("InferencePaid(uint256,address,uint256,uint256,uint256)")
+        // topic[1] = indexed tokenId
+        let event_sig = keccak256(b"InferencePaid(uint256,address,uint256,uint256,uint256)");
+        let expected_token_topic = {
+            let mut buf = [0u8; 32];
+            U256::from(expected_token_id).to_big_endian(&mut buf);
+            ethers::types::H256::from(buf)
+        };
+
+        let has_matching_event = receipt.logs.iter().any(|log| {
+            log.address == self.store_address
+                && log.topics.len() >= 2
+                && log.topics[0] == ethers::types::H256::from(event_sig)
+                && log.topics[1] == expected_token_topic
+        });
+
+        Ok(has_matching_event)
+    }
 }
 
 #[cfg(test)]

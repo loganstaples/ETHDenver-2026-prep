@@ -383,6 +383,11 @@ pub struct RegisteredWorker {
     /// Worker seed for x25519 key derivation (seed + party_index).
     #[serde(default = "default_worker_seed")]
     pub seed: u64,
+    /// Ethereum address of this worker (lowercase hex, e.g. "0x70997970c51812dc3a010c7d01b50e0d17dc79c8").
+    /// Used for trusted-node matching: when a user specifies trusted node addresses,
+    /// only workers whose address appears in the trusted list are eligible.
+    #[serde(default)]
+    pub address: Option<String>,
 }
 
 /// Worker capabilities for the dashboard JSON API.
@@ -419,6 +424,10 @@ pub struct WorkerRegisterRequest {
     /// If omitted, defaults to 42 (the spawn-workers default).
     #[serde(default = "default_worker_seed")]
     pub seed: u64,
+    /// Ethereum address of this worker (lowercase hex).
+    /// Workers that provide an address can be matched against the user's trusted-node list.
+    #[serde(default)]
+    pub address: Option<String>,
 }
 
 fn default_worker_seed() -> u64 { 42 }
@@ -1343,21 +1352,26 @@ async fn start_training_handler(
         ).into_response();
     }
 
-    // Determine workers: check off-chain registry, then fall back to num_workers
+    // Determine workers: check off-chain registry, then fall back to num_workers.
+    // When trusted_nodes is configured, enforce that at least one selected worker
+    // has an address in the trusted list (additive secret sharing: 1 honest node =
+    // full security since ALL shares are needed to reconstruct weights).
     let now_ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64();
+
+    // Normalize trusted node addresses for comparison.
+    let trusted_addrs: Vec<String> = req.trusted_nodes.as_ref()
+        .map(|tn| tn.iter().map(|a| a.to_lowercase()).collect())
+        .unwrap_or_default();
+
     let registered: Vec<RegisteredWorker> = {
         let workers = state.registered_workers.read().await;
-        let mut filtered: Vec<RegisteredWorker> = workers.iter()
+        let filtered: Vec<RegisteredWorker> = workers.iter()
             .filter(|w| w.status == "idle" && (now_ts - w.last_heartbeat) <= 30.0)
             .cloned()
             .collect();
-        // Sort by party_index so position[i] in the endpoint list = party-i.
-        // The orchestrator assumes this mapping when distributing shares and
-        // deriving per-worker x25519 keys.
-        filtered.sort_by_key(|w| w.party_index);
         filtered
     };
 
@@ -1366,22 +1380,98 @@ async fn start_training_handler(
     // is just for endpoint discovery so the orchestrator knows where to connect.
     let use_registered_workers = !registered.is_empty();
     let (num_workers, worker_endpoints, worker_seeds) = if use_registered_workers {
-        let count = registered.len().min(10); // cap at 10 (Anvil key limit)
+        // ── Trusted-node enforcement ──
+        // When trusted nodes are configured, partition workers and guarantee at
+        // least one trusted worker is included in the selection.
+        let selected = if !trusted_addrs.is_empty() {
+            let (trusted, untrusted): (Vec<_>, Vec<_>) = registered.iter().partition(|w| {
+                w.address.as_ref().map_or(false, |a| trusted_addrs.contains(&a.to_lowercase()))
+            });
+
+            if trusted.is_empty() {
+                let available_addrs: Vec<String> = registered.iter()
+                    .filter_map(|w| w.address.clone())
+                    .collect();
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!(
+                            "No trusted workers are currently online. Trusted list: [{}]. Available worker addresses: [{}]. \
+                             Configure trusted nodes in Settings, or wait for at least one to come online.",
+                            trusted_addrs.join(", "),
+                            available_addrs.join(", "),
+                        )
+                    })),
+                ).into_response();
+            }
+
+            info!(
+                trusted_count = trusted.len(),
+                untrusted_count = untrusted.len(),
+                "Trusted-node enforcement: {} trusted, {} untrusted idle workers",
+                trusted.len(), untrusted.len()
+            );
+
+            // Select 1 trusted worker (first by party_index), then fill remaining
+            // slots from all idle workers (trusted or not), up to cap of 10.
+            let mut selected: Vec<RegisteredWorker> = Vec::new();
+            // Add one trusted worker first.
+            let mut sorted_trusted = trusted;
+            sorted_trusted.sort_by_key(|w| w.party_index);
+            selected.push(sorted_trusted[0].clone());
+
+            // Fill remaining from untrusted (and any extra trusted workers).
+            let selected_id = selected[0].id.clone();
+            let mut remaining: Vec<&RegisteredWorker> = registered.iter()
+                .filter(|w| w.id != selected_id)
+                .collect();
+            remaining.sort_by_key(|w| w.party_index);
+            for w in remaining {
+                if selected.len() >= 10 { break; }
+                selected.push(w.clone());
+            }
+
+            // Re-sort by party_index for deterministic share distribution.
+            selected.sort_by_key(|w| w.party_index);
+            selected
+        } else {
+            // No trusted-node enforcement: use all idle workers, sorted by party_index.
+            let mut all = registered.clone();
+            all.sort_by_key(|w| w.party_index);
+            all.into_iter().take(10).collect()
+        };
+
+        let count = selected.len();
         if count < 2 {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({ "error": "Need at least 2 online workers to start training" })),
             ).into_response();
         }
-        let endpoints: Vec<String> = registered[..count].iter().map(|w| w.endpoint.clone()).collect();
-        let seeds: Vec<u64> = registered[..count].iter().map(|w| w.seed).collect();
-        info!(count, "Using {} registered workers (on-chain pool assignment at job creation)", count);
+        let endpoints: Vec<String> = selected.iter().map(|w| w.endpoint.clone()).collect();
+        let seeds: Vec<u64> = selected.iter().map(|w| w.seed).collect();
+
+        // Log which workers are trusted.
+        if !trusted_addrs.is_empty() {
+            let trusted_selected: Vec<String> = selected.iter()
+                .filter(|w| w.address.as_ref().map_or(false, |a| trusted_addrs.contains(&a.to_lowercase())))
+                .map(|w| format!("party_{} ({})", w.party_index, w.address.as_deref().unwrap_or("?")))
+                .collect();
+            info!(
+                count,
+                trusted = %trusted_selected.join(", "),
+                "Using {} workers with trusted-node guarantee: [{}]",
+                count, trusted_selected.join(", ")
+            );
+        } else {
+            info!(count, "Using {} registered workers (on-chain pool assignment at job creation)", count);
+        }
 
         // Mark workers as busy
         {
             let mut workers = state.registered_workers.write().await;
             for w in workers.iter_mut() {
-                if registered[..count].iter().any(|r| r.id == w.id) {
+                if selected.iter().any(|r| r.id == w.id) {
                     w.status = "busy".to_string();
                 }
             }
@@ -2208,6 +2298,9 @@ async fn register_worker_handler(
 
     let worker_id = uuid::Uuid::new_v4().to_string();
 
+    // Normalize ETH address to lowercase for consistent comparison with trusted-node list.
+    let address = req.address.as_ref().map(|a| a.to_lowercase());
+
     let worker = RegisteredWorker {
         id: worker_id.clone(),
         endpoint: req.endpoint.clone(),
@@ -2224,6 +2317,7 @@ async fn register_worker_handler(
         earnings_wei: 0,
         capabilities: WorkerCapabilitiesJson::default(),
         seed: req.seed,
+        address,
     };
 
     let mut workers = state.registered_workers.write().await;
@@ -2234,14 +2328,16 @@ async fn register_worker_handler(
     let count = workers.len();
     drop(workers);
 
+    let addr_display = req.address.as_deref().unwrap_or("none");
     info!(
         worker_id = %worker_id,
         endpoint = %req.endpoint,
         party_index = req.party_index,
         seed = req.seed,
+        address = %addr_display,
         total_workers = count,
-        "[Dashboard] Worker registered: party_index={} endpoint={} id={} (total: {}/{})",
-        req.party_index, req.endpoint, &worker_id[..8.min(worker_id.len())], count, count
+        "[Dashboard] Worker registered: party_index={} endpoint={} addr={} id={} (total: {}/{})",
+        req.party_index, req.endpoint, addr_display, &worker_id[..8.min(worker_id.len())], count, count
     );
 
     // Broadcast worker count update to WebSocket clients
@@ -2389,6 +2485,7 @@ async fn list_workers_handler(
             "id": w.id,
             "endpoint": w.endpoint,
             "party_index": w.party_index,
+            "address": w.address,
             "status": effective_status,
             "registered_at": w.registered_at,
             "last_heartbeat": w.last_heartbeat,
@@ -2761,6 +2858,175 @@ struct ModelInferenceRequest {
     trusted_nodes: Option<Vec<String>>,
 }
 
+/// Off-chain fallback for model inference access control when chain is unavailable.
+/// Returns `Some(response)` to reject, or `None` to allow.
+fn handle_model_inference_offchain_fallback(
+    req: &ModelInferenceRequest,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    // Without chain verification, require a non-empty wallet_address or payment_tx.
+    let has_wallet = req.wallet_address.as_deref().is_some_and(|s| !s.trim().is_empty());
+    let has_payment = req.payment_tx.as_deref().is_some_and(|s| !s.trim().is_empty());
+    if !has_wallet && !has_payment {
+        return Some((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "Access denied: provide wallet_address or payment_tx (chain verification unavailable)"
+            })),
+        ));
+    }
+    None
+}
+
+/// Verify that the caller has on-chain permission for model inference.
+///
+/// Returns `Ok(())` if access is granted, or `Err(response)` with the appropriate
+/// HTTP error to return to the client.
+///
+/// When the `chain` feature is enabled and both `model_store_address` and `eth_rpc_url`
+/// are configured, this performs real on-chain verification:
+///   - If `wallet_address` is provided: calls `hasModelAccess(tokenId, wallet)` on-chain
+///   - If that fails and `payment_tx` is provided: verifies the payment receipt on-chain
+///   - If `payment_tx` only (no wallet): verifies the payment receipt on-chain
+///   - If neither: rejects
+///
+/// Falls back to off-chain heuristics when chain is unavailable.
+async fn verify_model_inference_access(
+    state: &Arc<DashboardState>,
+    req: &ModelInferenceRequest,
+) -> Result<(), axum::response::Response> {
+    #[cfg(feature = "chain")]
+    {
+        let store_addr = state.model_store_address.read().await.clone();
+        let rpc_url = state.eth_rpc_url.read().await.clone();
+
+        if let (Some(store), Some(rpc)) = (store_addr, rpc_url) {
+            use crate::rpc::chain_v4::ModelStoreClient;
+
+            let reader_key = std::env::var("TESTNET_PRIVATE_KEY")
+                .unwrap_or_else(|_| "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".to_string());
+
+            let store_client = match ModelStoreClient::new(&rpc, &reader_key, &store, None).await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("Failed to connect to ModelStore for access check: {}", e);
+                    // Chain unreachable — apply off-chain fallback
+                    if let Some(resp) = handle_model_inference_offchain_fallback(req) {
+                        return Err(resp.into_response());
+                    }
+                    return Ok(());
+                }
+            };
+
+            // Path 1: Caller provides a wallet address — verify on-chain access
+            if let Some(ref wallet) = req.wallet_address {
+                if wallet.trim().is_empty() {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": "wallet_address must be a valid Ethereum address"
+                        })),
+                    ).into_response());
+                }
+                match store_client.has_model_access(req.model_token_id, wallet).await {
+                    Ok(true) => {
+                        info!(
+                            token_id = req.model_token_id,
+                            wallet = %wallet,
+                            "On-chain access verified for model inference"
+                        );
+                        return Ok(());
+                    }
+                    Ok(false) => {
+                        // No direct access — check if they also submitted a payment
+                        if let Some(ref tx_hash) = req.payment_tx {
+                            return verify_payment_tx(&store_client, tx_hash, req.model_token_id).await;
+                        }
+                        return Err((
+                            StatusCode::FORBIDDEN,
+                            Json(serde_json::json!({
+                                "error": "Access denied: wallet does not have permission for this model"
+                            })),
+                        ).into_response());
+                    }
+                    Err(e) => {
+                        warn!("On-chain access check failed: {}", e);
+                        return Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": format!("Failed to verify model access: {e}")
+                            })),
+                        ).into_response());
+                    }
+                }
+            }
+            // Path 2: No wallet but has payment tx — verify payment on-chain
+            else if let Some(ref tx_hash) = req.payment_tx {
+                if tx_hash.trim().is_empty() {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": "payment_tx must be a valid transaction hash"
+                        })),
+                    ).into_response());
+                }
+                return verify_payment_tx(&store_client, tx_hash, req.model_token_id).await;
+            }
+            // Path 3: No wallet and no payment
+            else {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "error": "Access denied: provide wallet_address or payment_tx"
+                    })),
+                ).into_response());
+            }
+        }
+        // Chain config not set — fall through to off-chain fallback
+    }
+
+    // Off-chain fallback (chain feature disabled or chain config not set)
+    if let Some(resp) = handle_model_inference_offchain_fallback(req) {
+        return Err(resp.into_response());
+    }
+    Ok(())
+}
+
+/// Verify an on-chain inference payment transaction.
+#[cfg(feature = "chain")]
+async fn verify_payment_tx(
+    store_client: &crate::rpc::chain_v4::ModelStoreClient,
+    tx_hash: &str,
+    token_id: u64,
+) -> Result<(), axum::response::Response> {
+    match store_client.verify_inference_payment(tx_hash, token_id).await {
+        Ok(true) => {
+            info!(
+                token_id = token_id,
+                tx = %tx_hash,
+                "On-chain inference payment verified"
+            );
+            Ok(())
+        }
+        Ok(false) => {
+            Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "Payment transaction is invalid or not for this model"
+                })),
+            ).into_response())
+        }
+        Err(e) => {
+            warn!("Payment verification failed: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("Failed to verify payment: {e}")
+                })),
+            ).into_response())
+        }
+    }
+}
+
 /// POST /api/models/inference — run inference using cached model weights
 async fn model_inference_handler(
     State(state): State<Arc<DashboardState>>,
@@ -2784,6 +3050,12 @@ async fn model_inference_handler(
         ).into_response();
     }
 
+    // Access control: verify on-chain permission or payment proof (before cache lookup
+    // to avoid leaking whether weights exist for a given model to unauthorized callers)
+    if let Err(resp) = verify_model_inference_access(&state, &req).await {
+        return resp;
+    }
+
     let token_key = format!("{}:{}", req.model_token_id, req.model_version_index);
 
     // Look up cached weights
@@ -2797,17 +3069,6 @@ async fn model_inference_handler(
             ).into_response(),
         }
     };
-
-    // Access control: owner (free) or non-owner with payment proof
-    let is_owner = req.wallet_address.is_some(); // Simplified: trust wallet_address claim for hackathon
-    let has_payment = req.payment_tx.is_some();
-
-    if !is_owner && !has_payment {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({ "error": "Payment required for non-owner inference" })),
-        ).into_response();
-    }
 
     // Parse weights
     let model_weights: ModelWeights = match serde_json::from_value(weights) {
