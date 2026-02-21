@@ -14,11 +14,32 @@
 
 mod display;
 mod evaluator;
+mod risk;
 mod runner;
 mod zk_prover;
 
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
+
+/// ZK proof generation mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZkMode {
+    /// No ZK proofs.
+    Off,
+    /// ZK proof at every checkpoint.
+    Always,
+    /// ZK proofs activate automatically when risk is detected.
+    Risk,
+}
+
+fn parse_zk_mode(s: &str) -> Result<ZkMode, String> {
+    match s.to_lowercase().as_str() {
+        "off" => Ok(ZkMode::Off),
+        "always" => Ok(ZkMode::Always),
+        "risk" => Ok(ZkMode::Risk),
+        _ => Err(format!("invalid ZK mode '{}': expected off, always, or risk", s)),
+    }
+}
 
 /// HELIX MPC Training Demo - ETHDenver 2026
 ///
@@ -49,16 +70,13 @@ pub struct Args {
     #[arg(long)]
     pub simulate_cheater: bool,
 
-    /// Enable optional ZK proof generation at checkpoints.
-    /// When enabled, the model owner generates a StateTransitionCircuit proof
-    /// at each ZK checkpoint, proving the weight transition is valid.
-    #[arg(long)]
-    pub zk_proofs: bool,
+    /// ZK proof mode: off (no ZK), always (every checkpoint), risk (auto-activate on threat).
+    #[arg(long, default_value = "off", value_parser = parse_zk_mode)]
+    pub zk_mode: ZkMode,
 
-    /// ZK proof checkpoint frequency (generate a proof every N checkpoints).
-    /// Defaults to 1 (every checkpoint). Only used when --zk-proofs is enabled.
-    #[arg(long, default_value = "1")]
-    pub zk_checkpoint_freq: u64,
+    /// Minimum worker count before risk-based ZK activates (only for --zk-mode risk).
+    #[arg(long, default_value = "2")]
+    pub min_workers_for_mpc: usize,
 
     /// Verbose logging output
     #[arg(short, long)]
@@ -87,6 +105,22 @@ pub struct Args {
     /// Custom directory for MNIST data cache
     #[arg(long)]
     pub mnist_cache_dir: Option<String>,
+
+    /// Skip on-chain checkpoint settlement phase.
+    /// By default, the demo deploys HelixCoordinatorV4 to a local Anvil node,
+    /// registers workers, and submits multi-party signed checkpoint attestations.
+    /// Pass this flag to run MPC training only without on-chain submission.
+    #[arg(long)]
+    pub skip_chain: bool,
+}
+
+impl Args {
+    /// Input dimension (MNIST = 784).
+    pub fn d_in(&self) -> usize { 784 }
+    /// Hidden dimension.
+    pub fn d_hid(&self) -> usize { 32 }
+    /// Output dimension (MNIST = 10 classes).
+    pub fn d_out(&self) -> usize { 10 }
 }
 
 #[tokio::main]
@@ -104,12 +138,19 @@ async fn main() -> anyhow::Result<()> {
         .with_target(false)
         .init();
 
-    if args.zk_proofs {
-        display::info(&format!(
-            "ZK proofs ENABLED: StateTransitionCircuit proof every {} checkpoint(s)",
-            args.zk_checkpoint_freq,
-        ));
-        println!();
+    match args.zk_mode {
+        ZkMode::Off => {}
+        ZkMode::Always => {
+            display::info("ZK proofs ENABLED: StateTransitionCircuit proof at every checkpoint");
+            println!();
+        }
+        ZkMode::Risk => {
+            display::info(&format!(
+                "ZK proofs in RISK mode: auto-activate when workers < {} or cheater detected",
+                args.min_workers_for_mpc,
+            ));
+            println!();
+        }
     }
 
     let demo = runner::DemoRunner::new(args);
