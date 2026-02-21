@@ -251,6 +251,8 @@ async fn test_mpc_training_with_onchain_checkpoints() {
             step: cp.step as u64,
             commitment_bytes32: cp.commitment_bytes32,
             loss: cp.loss,
+            proof: None,
+            public_inputs: None,
         })
         .collect();
 

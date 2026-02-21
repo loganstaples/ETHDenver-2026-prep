@@ -387,7 +387,7 @@ impl DemoRunner {
         // ================================================================
         #[cfg(feature = "chain")]
         let chain_stats = if !self.args.skip_chain {
-            Some(self.run_onchain_settlement(&result).await?)
+            Some(self.run_onchain_settlement(&result, &zk_proofs).await?)
         } else {
             None
         };
@@ -437,6 +437,7 @@ impl DemoRunner {
     async fn run_onchain_settlement(
         &self,
         result: &MPCIntegrationResult,
+        zk_proofs: &[crate::zk_prover::ZkCheckpointResult],
     ) -> Result<ChainStats> {
         display::phase("Phase 5: On-Chain Checkpoint Settlement");
         display::info("Booting local Anvil node...");
@@ -488,18 +489,68 @@ impl DemoRunner {
             coordinator_addr,
         ));
 
+        // Deploy Halo2Verifier when ZK mode is enabled
+        if self.args.zk_mode != ZkMode::Off {
+            display::subphase("Deploying Halo2Verifier (real BN254 pairing verifier)...");
+            let verifier_addr = owner_client
+                .deploy_halo2_verifier()
+                .await
+                .context("Halo2Verifier deployment failed")?;
+            owner_client
+                .set_verifier(verifier_addr)
+                .await
+                .context("set_verifier failed")?;
+            display::info(&format!("  Halo2Verifier deployed at {:#x}", verifier_addr));
+        }
+
         // Register training job
         let architecture_hash = [0x42u8; 32];
         let payment = U256::from(1_000_000_000_000_000_000u128); // 1 ETH
-        let (_receipt, job_id) = owner_client
-            .register_training_job(
-                architecture_hash,
-                self.args.checkpoint_freq,
-                self.args.steps as u64,
-                payment,
-            )
-            .await
-            .context("register_training_job failed")?;
+        let (_receipt, job_id) = match self.args.zk_mode {
+            ZkMode::Off => {
+                owner_client
+                    .register_training_job(
+                        architecture_hash,
+                        self.args.checkpoint_freq,
+                        self.args.steps as u64,
+                        payment,
+                    )
+                    .await
+                    .context("register_training_job failed")?
+            }
+            ZkMode::Always => {
+                owner_client
+                    .register_training_job_with_zk(
+                        architecture_hash,
+                        self.args.checkpoint_freq,
+                        self.args.steps as u64,
+                        payment,
+                        true,  // zkEnabled
+                        1,     // zkCheckpointFreq = every checkpoint
+                        false, // riskZkEnabled
+                        0,     // minWorkersForMpc (not used in always mode)
+                        Address::zero(),
+                    )
+                    .await
+                    .context("register_training_job_with_zk failed")?
+            }
+            ZkMode::Risk => {
+                owner_client
+                    .register_training_job_with_zk(
+                        architecture_hash,
+                        self.args.checkpoint_freq,
+                        self.args.steps as u64,
+                        payment,
+                        false, // zkEnabled
+                        1,     // zkCheckpointFreq = every checkpoint
+                        true,  // riskZkEnabled
+                        self.args.min_workers_for_mpc as u64,
+                        Address::zero(),
+                    )
+                    .await
+                    .context("register_training_job_with_zk failed")?
+            }
+        };
 
         display::success(&format!("Training job registered (job_id={})", job_id));
 
@@ -541,10 +592,31 @@ impl DemoRunner {
         let checkpoint_data: Vec<CheckpointData> = result
             .checkpoints
             .iter()
-            .map(|cp| CheckpointData {
-                step: cp.step as u64,
-                commitment_bytes32: cp.commitment_bytes32,
-                loss: cp.loss,
+            .map(|cp| {
+                // Find matching ZK proof for this checkpoint
+                let zk_proof = zk_proofs.iter().find(|p| p.step == cp.step as u64);
+                let (proof_bytes, pub_inputs) = if let Some(zk) = zk_proof {
+                    use helix_prover::halo2curves::ff::PrimeField;
+                    let pub_inputs_u256: Vec<U256> = zk
+                        .proof
+                        .public_inputs
+                        .iter()
+                        .map(|fr| {
+                            let repr = fr.to_repr();
+                            U256::from_little_endian(repr.as_ref())
+                        })
+                        .collect();
+                    (Some(zk.proof.proof_bytes.clone()), Some(pub_inputs_u256))
+                } else {
+                    (None, None)
+                };
+                CheckpointData {
+                    step: cp.step as u64,
+                    commitment_bytes32: cp.commitment_bytes32,
+                    loss: cp.loss,
+                    proof: proof_bytes,
+                    public_inputs: pub_inputs,
+                }
             })
             .collect();
 

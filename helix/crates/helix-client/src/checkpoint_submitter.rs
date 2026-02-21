@@ -50,6 +50,10 @@ pub struct CheckpointData {
     pub commitment_bytes32: [u8; 32],
     /// Loss value (will be scaled to 1e18 for on-chain representation).
     pub loss: f64,
+    /// Optional ZK proof bytes (serialized Halo2 SHPLONK proof).
+    pub proof: Option<Vec<u8>>,
+    /// Optional public inputs for the ZK proof (6 elements for StateTransitionCircuit).
+    pub public_inputs: Option<Vec<U256>>,
 }
 
 /// Sign a checkpoint attestation message with all worker wallets and submit to the V4 contract.
@@ -64,52 +68,86 @@ pub async fn sign_and_submit_checkpoint(
     checkpoint: &CheckpointData,
     worker_wallets: &[LocalWallet],
 ) -> Result<CheckpointSubmission> {
-    let job_id_u256 = U256::from(job_id);
-    let step_u256 = U256::from(checkpoint.step);
     let loss_u256 = loss_to_u256(checkpoint.loss);
 
-    // Sign with all worker wallets.
-    let mut signatures: Vec<Bytes> = Vec::with_capacity(worker_wallets.len());
-    for wallet in worker_wallets {
-        let sig = sign_checkpoint(
-            wallet,
-            job_id_u256,
-            step_u256,
-            checkpoint.commitment_bytes32,
-            loss_u256,
-        )
-        .await
-        .map_err(|e| anyhow!("worker {} sign failed: {}", wallet.address(), e))?;
-        signatures.push(sig);
-    }
+    let (receipt, signer_count) = if let (Some(proof), Some(pub_inputs)) =
+        (&checkpoint.proof, &checkpoint.public_inputs)
+    {
+        // Submit with ZK proof — the proof is the attestation, no signatures needed.
+        info!(
+            job_id = job_id,
+            step = checkpoint.step,
+            proof_size = proof.len(),
+            pub_inputs = pub_inputs.len(),
+            "Submitting checkpoint on-chain with ZK proof"
+        );
 
-    let signer_count = signatures.len();
-
-    info!(
-        job_id = job_id,
-        step = checkpoint.step,
-        signers = signer_count,
-        "Submitting checkpoint on-chain"
-    );
-
-    // Submit to V4 contract.
-    let receipt = chain_client
-        .submit_checkpoint(
-            job_id,
-            checkpoint.step,
-            checkpoint.commitment_bytes32,
-            loss_u256,
-            signatures,
-        )
-        .await
-        .map_err(|e| {
-            anyhow!(
-                "submit_checkpoint on-chain failed (job={}, step={}): {}",
+        let r = chain_client
+            .submit_checkpoint_with_proof(
                 job_id,
                 checkpoint.step,
-                e
+                checkpoint.commitment_bytes32,
+                loss_u256,
+                proof.clone(),
+                pub_inputs.clone(),
             )
-        })?;
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "submit_checkpoint_with_proof on-chain failed (job={}, step={}): {}",
+                    job_id,
+                    checkpoint.step,
+                    e
+                )
+            })?;
+        (r, 0usize) // No signers when using ZK proof
+    } else {
+        // Submit with multi-party signatures.
+        let job_id_u256 = U256::from(job_id);
+        let step_u256 = U256::from(checkpoint.step);
+
+        let mut signatures: Vec<Bytes> = Vec::with_capacity(worker_wallets.len());
+        for wallet in worker_wallets {
+            let sig = sign_checkpoint(
+                wallet,
+                job_id_u256,
+                step_u256,
+                checkpoint.commitment_bytes32,
+                loss_u256,
+            )
+            .await
+            .map_err(|e| anyhow!("worker {} sign failed: {}", wallet.address(), e))?;
+            signatures.push(sig);
+        }
+
+        let count = signatures.len();
+
+        info!(
+            job_id = job_id,
+            step = checkpoint.step,
+            signers = count,
+            "Submitting checkpoint on-chain with signatures"
+        );
+
+        let r = chain_client
+            .submit_checkpoint(
+                job_id,
+                checkpoint.step,
+                checkpoint.commitment_bytes32,
+                loss_u256,
+                signatures,
+            )
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "submit_checkpoint on-chain failed (job={}, step={}): {}",
+                    job_id,
+                    checkpoint.step,
+                    e
+                )
+            })?;
+        (r, count)
+    };
 
     info!(
         job_id = job_id,
@@ -199,6 +237,8 @@ mod tests {
             step: 25,
             commitment_bytes32: [0xAB; 32],
             loss: 0.42,
+            proof: None,
+            public_inputs: None,
         };
         assert_eq!(data.step, 25);
         assert_eq!(data.commitment_bytes32, [0xAB; 32]);
