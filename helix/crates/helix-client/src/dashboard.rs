@@ -102,7 +102,7 @@ pub struct TrainingJobRequest {
     #[serde(default = "default_test_size")]
     pub test_size: usize,
     /// Use real MNIST data (requires network)
-    #[serde(default)]
+    #[serde(default = "default_use_real_mnist")]
     pub use_real_mnist: bool,
     /// ETH payment for training job
     #[serde(default = "default_payment")]
@@ -155,16 +155,17 @@ pub struct TrainingJobRequest {
 fn default_architecture() -> Vec<usize> { vec![784, 128, 10] }
 fn default_num_workers() -> usize { 3 }
 fn default_num_steps() -> usize { 200 }
-fn default_learning_rate() -> f64 { 0.01 }
+fn default_learning_rate() -> f64 { 0.05 }
 fn default_checkpoint_freq() -> usize { 50 }
-fn default_mac_interval() -> u64 { 0 }
+fn default_mac_interval() -> u64 { 5 }
 fn default_zk_mode() -> String { "off".to_string() }
 fn default_zk_checkpoint_freq() -> u64 { 5 }
-fn default_min_workers() -> usize { 2 }
+fn default_min_workers() -> usize { 3 }
 fn default_train_size() -> usize { 5000 }
 fn default_test_size() -> usize { 500 }
-fn default_payment() -> f64 { 1.0 }
-fn default_stake() -> f64 { 0.1 }
+fn default_payment() -> f64 { 0.005 }
+fn default_stake() -> f64 { 0.0001 }
+fn default_use_real_mnist() -> bool { true }
 fn default_seed() -> u64 { 42 }
 fn default_transport() -> String { "local".to_string() }
 
@@ -216,6 +217,9 @@ pub struct TrainingSessionState {
     /// Current sub-step operation within a training step (e.g. "Forward pass")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sub_step: Option<String>,
+    /// Checkpoint frequency (every N steps)
+    #[serde(default)]
+    pub checkpoint_freq: usize,
 }
 
 /// Request body for uploading training data.
@@ -343,6 +347,17 @@ pub fn populate_demo_network(status: &mut NetworkStatus) {
     status.peer_count = 4;
     status.block_height = 12_345_678;
     status.chain_id = 0; // Will be set to actual chain ID when connected
+}
+
+// ---------------------------------------------------------------------------
+// Model Weights Cache
+// ---------------------------------------------------------------------------
+
+/// Cached model weights entry with optional owner address for access control.
+#[derive(Clone, Debug)]
+pub struct CachedModelEntry {
+    pub weights: serde_json::Value,
+    pub owner_address: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -484,7 +499,7 @@ pub struct DashboardState {
     /// HelixModelStore contract address (for NFT minting after training)
     pub model_store_address: RwLock<Option<String>>,
     /// Model weights cache: keyed by on-chain token ID string for non-owner inference
-    pub model_weights_cache: RwLock<HashMap<String, serde_json::Value>>,
+    pub model_weights_cache: RwLock<HashMap<String, CachedModelEntry>>,
     /// SQLite persistence for training session history
     pub training_db: Option<std::sync::Arc<crate::training_db::TrainingDb>>,
 }
@@ -639,12 +654,14 @@ async fn apply_progress_event(
                 session.phase_description = description.clone();
                 session.status = "running".to_string();
             }
-            ProgressEvent::TrainingStep { step, loss, accuracy, .. } => {
+            ProgressEvent::TrainingStep { step, loss, accuracy, mac_ok, .. } => {
                 session.current_step = *step;
                 session.current_loss = *loss;
                 session.losses.push(*loss);
                 session.accuracy = Some(*accuracy);
-                session.mac_checks_passed += 1;
+                if *mac_ok {
+                    session.mac_checks_passed += 1;
+                }
                 session.phase_description = format!(
                     "Training step {}/{} — loss: {:.4}",
                     step, session.total_steps, loss
@@ -743,6 +760,7 @@ impl Default for TrainingSessionState {
             model_token_id: None,
             model_version_index: None,
             sub_step: None,
+            checkpoint_freq: 0,
         }
     }
 }
@@ -953,6 +971,7 @@ pub fn create_dashboard_router_with_state(state: Arc<DashboardState>) -> Router 
         .route("/api/workers", get(list_workers_handler))
         .route("/api/workers/register", post(register_worker_handler))
         .route("/api/workers/heartbeat", post(heartbeat_worker_handler))
+        .route("/api/workers/:id/reputation", get(worker_reputation_handler))
         // WebSocket endpoint
         .route("/ws", get(websocket_handler))
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024)) // 50 MB for weight uploads
@@ -1104,6 +1123,29 @@ fn progress_event_to_json(event: &ProgressEvent) -> serde_json::Value {
                 "honest_workers": honest_workers,
                 "resumed_from_step": resumed_from_step,
                 "post_recovery_steps": post_recovery_steps,
+            })
+        }
+        ProgressEvent::CostUpdate { gas_spent_wei, worker_fees_accrued, deposit_amount } => {
+            serde_json::json!({
+                "type": "cost_update",
+                "gas_spent_wei": gas_spent_wei.to_string(),
+                "worker_fees_accrued": worker_fees_accrued,
+                "deposit_amount": deposit_amount,
+            })
+        }
+        ProgressEvent::TrainingPaused { step, checkpoint_commitment } => {
+            serde_json::json!({
+                "type": "training_paused",
+                "step": step,
+                "checkpoint_commitment": checkpoint_commitment,
+            })
+        }
+        ProgressEvent::TrainingStopped { step, checkpoint_commitment, refund_amount } => {
+            serde_json::json!({
+                "type": "training_stopped",
+                "step": step,
+                "checkpoint_commitment": checkpoint_commitment,
+                "refund_amount": refund_amount,
             })
         }
     }
@@ -1351,6 +1393,42 @@ async fn start_training_handler(
             Json(serde_json::json!({ "error": "architecture must have exactly 3 elements [input, hidden, output]" })),
         ).into_response();
     }
+    if req.architecture.iter().any(|&d| d == 0) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "architecture dimensions must all be > 0" })),
+        ).into_response();
+    }
+    if req.num_steps == 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "num_steps must be > 0" })),
+        ).into_response();
+    }
+    if req.checkpoint_freq == 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "checkpoint_freq must be > 0" })),
+        ).into_response();
+    }
+    if req.learning_rate <= 0.0 || req.learning_rate > 1.0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "learning_rate must be between 0 (exclusive) and 1 (inclusive)" })),
+        ).into_response();
+    }
+    if req.payment_eth < 0.0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "payment_eth must not be negative" })),
+        ).into_response();
+    }
+    if !matches!(req.zk_mode.as_str(), "off" | "always" | "risk") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("zk_mode must be 'off', 'always', or 'risk', got '{}'", req.zk_mode) })),
+        ).into_response();
+    }
 
     // Determine workers: check off-chain registry, then fall back to num_workers.
     // When trusted_nodes is configured, enforce that at least one selected worker
@@ -1525,6 +1603,7 @@ async fn start_training_handler(
         model_token_id: req.model_token_id,
         model_version_index: req.model_version_index,
         sub_step: None,
+        checkpoint_freq: req.checkpoint_freq,
     };
 
     // Store session
@@ -1573,7 +1652,7 @@ async fn start_training_handler(
         #[cfg(feature = "chain")]
         payment_amount_eth: req.payment_eth,
         #[cfg(feature = "chain")]
-        stake_amount_eth: req.stake_per_worker_eth.max(0.001), // Contract minStake is 0.001 ETH
+        stake_amount_eth: req.stake_per_worker_eth.max(0.0001), // Lowered for testnet
         #[cfg(feature = "chain")]
         coordinator_address: None, // Will be set below from dashboard state if available
         #[cfg(feature = "chain")]
@@ -1598,6 +1677,7 @@ async fn start_training_handler(
         cheater_party: req.cheater_party,
         cheater_step: req.cheater_step,
         trusted_nodes: req.trusted_nodes.clone(),
+        signal_tx: None,
     };
 
     // Set private keys based on chain detection:
@@ -1674,12 +1754,12 @@ async fn start_training_handler(
         }
 
         // Use pre-deployed coordinator if dashboard was started with --coordinator.
-        // use_pool_workers stays false — the orchestrator auto-generates + funds worker
-        // wallets and stakes them per-job (Phase 5.5 + Phase 6 legacy path). This avoids
-        // requiring workers to call registerInPool() on-chain before training.
+        // When workers are already registered in the on-chain pool (via spawn-workers),
+        // enable pool mode so the orchestrator assigns them instead of re-staking per job.
         if let Some(ref coord_addr) = *state.coordinator_address.read().await {
             config.coordinator_address = Some(coord_addr.clone());
-            info!(coordinator = %coord_addr, "Using pre-deployed V4 coordinator (per-job worker staking)");
+            config.use_pool_workers = true;
+            info!(coordinator = %coord_addr, "Using pre-deployed V4 coordinator (pool worker assignment)");
         }
         if let Some(ref rpc_url) = *state.eth_rpc_url.read().await {
             config.eth_rpc_url = Some(rpc_url.clone());
@@ -1876,6 +1956,24 @@ async fn run_training_session(
                     session.final_weights = weights_json;
                 }
 
+                // Update reputation for all workers on successful training completion
+                let mut workers = state.registered_workers.write().await;
+                for w in workers.iter_mut() {
+                    if w.status != "offline" {
+                        w.rounds_completed += 1;
+                        w.rounds_participated += 1;
+                        // Recompute reputation: base 0.5 + completion bonus + success rate
+                        let completion_bonus = (w.rounds_completed as f64 / 100.0).min(0.3);
+                        let success_rate = if w.rounds_participated > 0 {
+                            w.rounds_completed as f64 / w.rounds_participated as f64
+                        } else {
+                            0.0
+                        };
+                        w.success_rate = success_rate;
+                        w.reputation_score = (0.5 + completion_bonus + success_rate * 0.2).clamp(0.0, 1.0);
+                    }
+                }
+
                 // Persist completed session to SQLite
                 if let Some(ref db) = state.training_db {
                     if let Some(session) = sessions.get(&session_id) {
@@ -1891,7 +1989,10 @@ async fn run_training_session(
                     if let (Some(token_id), Some(ref weights)) = (session.model_token_id, &session.final_weights) {
                         let vi = session.model_version_index.unwrap_or(0);
                         let key = format!("{}:{}", token_id, vi);
-                        state.model_weights_cache.write().await.insert(key.clone(), weights.clone());
+                        state.model_weights_cache.write().await.insert(key.clone(), CachedModelEntry {
+                            weights: weights.clone(),
+                            owner_address: None, // Owner not known from training session context
+                        });
                         info!(token_id, version_index = vi, "Cached final weights for model {}:{}", token_id, vi);
                     }
                 }
@@ -1953,11 +2054,11 @@ async fn run_training_session(
     // Clean up orchestrator
     orchestrator.shutdown();
 
-    // Mark all busy workers as idle again
-    if let Ok(mut workers) = state.registered_workers.try_write() {
-        // Note: try_write is acceptable here — worker status is non-critical and
-        // the function is about to return. The important session state is already
-        // persisted above via .write().await.
+    // Mark all busy workers as idle again — MUST use .write().await, not try_write(),
+    // because try_write() silently fails if a reader holds the lock, leaving workers
+    // permanently stuck as "busy" and blocking all future training sessions.
+    {
+        let mut workers = state.registered_workers.write().await;
         let mut released = 0;
         for w in workers.iter_mut() {
             if w.status == "busy" {
@@ -1975,9 +2076,8 @@ async fn run_training_session(
     }
 
     // Broadcast worker status update
-    let idle_count = state.registered_workers.try_read()
-        .map(|w| w.iter().filter(|w| w.status == "idle").count())
-        .unwrap_or(0);
+    let idle_count = state.registered_workers.read().await
+        .iter().filter(|w| w.status == "idle").count();
     let _ = state.ws_broadcast.send(("__system__".to_string(), serde_json::json!({
         "type": "workers_updated",
         "count": idle_count,
@@ -2053,7 +2153,15 @@ async fn handle_websocket(socket: WebSocket, state: Arc<DashboardState>) {
     let (tx, mut forward_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(256);
 
     let forward_task = tokio::spawn(async move {
-        while let Ok((session_id, event)) = rx.recv().await {
+        loop {
+            let (session_id, event) = match rx.recv().await {
+                Ok(val) => val,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(dropped = n, "WebSocket client lagged, dropped events");
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
             // Send to the mpsc channel; the main loop will check subscriptions
             // Include the event's "type" at the top level so the frontend
             // WebSocket client can dispatch on `message.type` directly.
@@ -2509,11 +2617,38 @@ async fn list_workers_handler(
 
     let online_count = workers.iter().filter(|w| now - w.last_heartbeat <= 30.0).count();
 
-    // Merge on-chain + off-chain workers
+    // Merge on-chain + off-chain workers, deduplicating by address.
+    // Off-chain entries have richer data (heartbeat, capabilities), so when a
+    // worker appears in both lists we keep the off-chain entry and enrich it
+    // with on-chain fields (stake, on-chain source).
     let mut all_workers = worker_list;
     #[cfg(feature = "chain")]
     {
-        all_workers.extend(chain_worker_list);
+        // Build a set of addresses already present from off-chain registrations.
+        let existing_addrs: std::collections::HashSet<String> = all_workers
+            .iter()
+            .filter_map(|w| w.get("address").and_then(|a| a.as_str()).map(|s| s.to_lowercase()))
+            .collect();
+
+        for cw in &chain_worker_list {
+            let addr = cw.get("address").and_then(|a| a.as_str()).unwrap_or_default().to_lowercase();
+            if existing_addrs.contains(&addr) {
+                // Enrich the existing off-chain entry with on-chain stake info.
+                if let Some(entry) = all_workers.iter_mut().find(|w| {
+                    w.get("address").and_then(|a| a.as_str()).map(|s| s.to_lowercase()) == Some(addr.clone())
+                }) {
+                    if let Some(obj) = entry.as_object_mut() {
+                        if let Some(stake) = cw.get("stake_eth") {
+                            obj.insert("stake_eth".to_string(), stake.clone());
+                        }
+                        obj.insert("source".to_string(), serde_json::json!("merged"));
+                    }
+                }
+            } else {
+                // On-chain only worker — include as-is.
+                all_workers.push(cw.clone());
+            }
+        }
     }
     let total = all_workers.len();
 
@@ -2523,6 +2658,50 @@ async fn list_workers_handler(
         "online": online_count,
         "source": "merged",
     }))
+}
+
+/// GET /api/workers/:id/reputation — get detailed reputation for a specific worker
+async fn worker_reputation_handler(
+    State(state): State<Arc<DashboardState>>,
+    axum::extract::Path(worker_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let workers = state.registered_workers.read().await;
+    let worker = workers.iter().find(|w| w.id == worker_id);
+
+    match worker {
+        Some(w) => {
+            let overall = w.reputation_score;
+            let success_rate = w.success_rate;
+            // Derive sub-scores from available data
+            let validity = if w.rounds_completed > 0 { success_rate } else { 0.5 };
+            let responsiveness = if w.status == "offline" { 0.0 } else { 0.8 };
+            let uptime = if w.status == "offline" { 0.0 } else { 0.9 };
+            let bandwidth = 0.8; // Default — not tracked in off-chain registry
+
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "worker_id": w.id,
+                    "overall_score": overall,
+                    "success_rate": success_rate,
+                    "responsiveness": responsiveness,
+                    "validity": validity,
+                    "bandwidth": bandwidth,
+                    "uptime": uptime,
+                    "total_interactions": w.rounds_participated + w.rounds_completed,
+                    "rounds_participated": w.rounds_participated,
+                    "rounds_succeeded": w.rounds_completed,
+                    "is_banned": false,
+                })),
+            ).into_response()
+        }
+        None => {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "Worker not found" })),
+            ).into_response()
+        }
+    }
 }
 
 /// Query pool workers directly from the V4 contract on-chain.
@@ -2825,7 +3004,7 @@ async fn model_inference_ready_handler(
 }
 
 /// POST /api/models/:id/cache-weights — owner uploads weights for non-owner inference
-/// Query param: ?version=<index> (defaults to 0)
+/// Query params: ?version=<index> (defaults to 0) &owner=<address> (optional)
 async fn model_cache_weights_handler(
     State(state): State<Arc<DashboardState>>,
     Path(id): Path<String>,
@@ -2833,9 +3012,13 @@ async fn model_cache_weights_handler(
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let version = params.get("version").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let owner_address = params.get("owner").cloned();
     let key = format!("{}:{}", id, version);
-    state.model_weights_cache.write().await.insert(key.clone(), body);
-    info!(token_id = %id, version = version, "Cached weights for model (owner upload)");
+    state.model_weights_cache.write().await.insert(key.clone(), CachedModelEntry {
+        weights: body,
+        owner_address: owner_address.clone(),
+    });
+    info!(token_id = %id, version = version, owner = ?owner_address, "Cached weights for model (owner upload)");
     Json(serde_json::json!({ "cached": true, "token_id": id, "version": version }))
 }
 
@@ -2860,13 +3043,39 @@ struct ModelInferenceRequest {
 
 /// Off-chain fallback for model inference access control when chain is unavailable.
 /// Returns `Some(response)` to reject, or `None` to allow.
+///
+/// When `cached_owner` is available, we verify the caller's wallet matches the
+/// cached owner address (case-insensitive). Otherwise we require at least a
+/// non-empty wallet_address or payment_tx.
 fn handle_model_inference_offchain_fallback(
     req: &ModelInferenceRequest,
+    cached_owner: Option<&str>,
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
-    // Without chain verification, require a non-empty wallet_address or payment_tx.
-    let has_wallet = req.wallet_address.as_deref().is_some_and(|s| !s.trim().is_empty());
+    let caller_wallet = req.wallet_address.as_deref()
+        .filter(|s| !s.trim().is_empty());
     let has_payment = req.payment_tx.as_deref().is_some_and(|s| !s.trim().is_empty());
-    if !has_wallet && !has_payment {
+
+    // If we know the owner, check if the caller is the owner (case-insensitive)
+    if let Some(owner) = cached_owner {
+        if let Some(wallet) = caller_wallet {
+            if wallet.eq_ignore_ascii_case(owner) {
+                return None; // Owner — allow
+            }
+        }
+        // Not the owner — require payment
+        if !has_payment {
+            return Some((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "Access denied: non-owner inference requires payment_tx (chain verification unavailable)"
+                })),
+            ));
+        }
+        return None;
+    }
+
+    // No cached owner — require at least wallet_address or payment_tx
+    if caller_wallet.is_none() && !has_payment {
         return Some((
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -2894,6 +3103,13 @@ async fn verify_model_inference_access(
     state: &Arc<DashboardState>,
     req: &ModelInferenceRequest,
 ) -> Result<(), axum::response::Response> {
+    // Look up cached owner address for off-chain fallback verification
+    let cached_owner = {
+        let token_key = format!("{}:{}", req.model_token_id, req.model_version_index);
+        let cache = state.model_weights_cache.read().await;
+        cache.get(&token_key).and_then(|e| e.owner_address.clone())
+    };
+
     #[cfg(feature = "chain")]
     {
         let store_addr = state.model_store_address.read().await.clone();
@@ -2910,7 +3126,7 @@ async fn verify_model_inference_access(
                 Err(e) => {
                     warn!("Failed to connect to ModelStore for access check: {}", e);
                     // Chain unreachable — apply off-chain fallback
-                    if let Some(resp) = handle_model_inference_offchain_fallback(req) {
+                    if let Some(resp) = handle_model_inference_offchain_fallback(req, cached_owner.as_deref()) {
                         return Err(resp.into_response());
                     }
                     return Ok(());
@@ -2985,7 +3201,7 @@ async fn verify_model_inference_access(
     }
 
     // Off-chain fallback (chain feature disabled or chain config not set)
-    if let Some(resp) = handle_model_inference_offchain_fallback(req) {
+    if let Some(resp) = handle_model_inference_offchain_fallback(req, cached_owner.as_deref()) {
         return Err(resp.into_response());
     }
     Ok(())
@@ -3059,10 +3275,10 @@ async fn model_inference_handler(
     let token_key = format!("{}:{}", req.model_token_id, req.model_version_index);
 
     // Look up cached weights
-    let weights = {
+    let weights_json = {
         let cache = state.model_weights_cache.read().await;
         match cache.get(&token_key) {
-            Some(w) => w.clone(),
+            Some(entry) => entry.weights.clone(),
             None => return (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({ "error": "Weights not cached for this model version. Owner must run inference first or cache weights." })),
@@ -3071,7 +3287,7 @@ async fn model_inference_handler(
     };
 
     // Parse weights
-    let model_weights: ModelWeights = match serde_json::from_value(weights) {
+    let model_weights: ModelWeights = match serde_json::from_value(weights_json) {
         Ok(w) => w,
         Err(e) => return (
             StatusCode::INTERNAL_SERVER_ERROR,

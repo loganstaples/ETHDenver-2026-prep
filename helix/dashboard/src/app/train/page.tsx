@@ -37,13 +37,14 @@ import {
   XAxis,
   YAxis,
   Tooltip as RechartsTooltip,
+  ReferenceLine,
 } from 'recharts';
 import { useSignMessage, useAccount, useChainId, useWriteContract, useWaitForTransactionReceipt, useSwitchChain, useWalletClient, usePublicClient } from 'wagmi';
 import { parseEther, keccak256, toBytes, decodeEventLog } from 'viem';
 import { hardhat } from 'wagmi/chains';
 import { Badge } from '@/components/ui/Badge';
 import { CheaterToast } from '@/components/ui/CheaterToast';
-import { ModelCard, TrainedSessionCard } from '@/components/ModelCard';
+import { ModelCard } from '@/components/ModelCard';
 import { cn } from '@/lib/utils';
 import {
   useMpcTraining,
@@ -57,6 +58,7 @@ import { useModelRegistry, type ModelWithVersions } from '@/hooks/useModelRegist
 import { deriveModelKey, encryptWeights, decryptWeights } from '@/lib/model-encryption';
 import { HELIX_COORDINATOR_V4_ABI, HELIX_MODEL_STORE_ABI, getContractAddress } from '@/lib/contracts';
 import { getTrustedNodes, checkTrustedWorkersActive } from '@/hooks/useTrustedNodes';
+import { useWeightStorage } from '@/hooks/useWeightStorage';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
 
@@ -101,8 +103,8 @@ const TOTAL_PHASES = 13;
 // ============================================================================
 
 const COST = {
-  /** Base compute fee per step per worker (ADI) — reflects MPC overhead */
-  PER_STEP_FEE: 0.0000001,
+  /** Base compute fee per step per worker (ADI) — testing: slashed 100x */
+  PER_STEP_FEE: 0.00001,
   /** Gas units for a checkpoint submission tx (~80K on ADI testnet) */
   CHECKPOINT_GAS: 80_000,
   /** Gas units for job registration tx */
@@ -111,21 +113,21 @@ const COST = {
   STAKE_GAS: 120_000,
   /** Flat protocol fee per training job (ADI). Currently 0 — no protocol cut. */
   PROTOCOL_FEE: 0,
-  /** Default gas price in gwei when network query fails */
-  DEFAULT_GAS_GWEI: 1,
+  /** Default gas price in gwei when network query fails (ADI testnet ~550 gwei) */
+  DEFAULT_GAS_GWEI: 550,
   /** Safety cap to prevent display/payment overflow */
   MAX_COST: 1_000_000,
 } as const;
 
 type WeightFetchStatus = 'idle' | 'fetching' | 'decrypting' | 'uploading' | 'done' | 'error';
 
-type MintStep = 'idle' | 'downloading' | 'encrypting' | 'uploading' | 'creating-nft' | 'adding-version' | 'success' | 'error';
+type MintStep = 'idle' | 'downloading' | 'creating-nft' | 'encrypting' | 'uploading' | 'adding-version' | 'success' | 'error';
 
 const MINT_STEPS: { key: MintStep; label: string }[] = [
   { key: 'downloading', label: 'Download Weights' },
+  { key: 'creating-nft', label: 'Create NFT' },
   { key: 'encrypting', label: 'Encrypt' },
   { key: 'uploading', label: 'Upload to 0G' },
-  { key: 'creating-nft', label: 'Create NFT' },
   { key: 'adding-version', label: 'Add Version' },
 ];
 
@@ -622,33 +624,29 @@ function CostBreakdownPanel({
   }
 
   return (
-    <div className="space-y-1.5 mt-4">
+    <div className="space-y-1">
       {rows.map((row) => (
-        <div key={row.label} className="flex items-center justify-between px-1 py-[3px]">
-          <div className="flex items-baseline gap-1.5 min-w-0">
-            <span className={cn('text-[11px]', row.color)}>{row.label}</span>
-            <span className="text-[10px] text-helix-dim truncate">{row.detail}</span>
-          </div>
-          <span className="text-[11px] text-helix-dim tabular-nums font-mono shrink-0 ml-3">
+        <div key={row.label} className="flex items-center gap-3 px-1 py-[3px]">
+          <span className={cn('text-xs min-w-0 truncate', row.color)}>{row.label}</span>
+          <span className="text-xs text-helix-dim truncate">{row.detail}</span>
+          <span className="text-xs text-helix-dim tabular-nums font-mono shrink-0 ml-auto">
             {formatVal(row.value)}
           </span>
         </div>
       ))}
 
-      <div className="border-t border-white/[0.06] pt-1.5 flex items-center justify-between px-1">
-        <span className="text-[11px] font-medium text-white">Estimated total</span>
-        <span className="text-[11px] font-semibold text-white tabular-nums font-mono">
+      <div className="border-t border-white/[0.06] pt-1.5 mt-1 flex items-center gap-3 px-1">
+        <span className="text-xs font-medium text-white">Estimated total</span>
+        <span className="text-xs font-semibold text-white tabular-nums font-mono ml-auto">
           {estimate.totalCost.toFixed(6)} ADI
         </span>
       </div>
 
       {estimate.stakeDeposit > 0 && (
-        <div className="flex items-center justify-between px-1">
-          <div className="flex items-baseline gap-1">
-            <span className="text-[10px] text-helix-dim">+ Stake deposit</span>
-            <span className="text-[9px] text-helix-dim/60">(refundable after 7d)</span>
-          </div>
-          <span className="text-[10px] text-helix-dim tabular-nums font-mono">
+        <div className="flex items-center gap-2 px-1">
+          <span className="text-xs text-helix-dim">+ Stake deposit</span>
+          <span className="text-[9px] text-helix-dim/60">(refundable after 7d)</span>
+          <span className="text-xs text-helix-dim tabular-nums font-mono ml-auto">
             {estimate.stakeDeposit.toFixed(4)} ADI
           </span>
         </div>
@@ -659,7 +657,7 @@ function CostBreakdownPanel({
           'w-1.5 h-1.5 rounded-full shrink-0',
           isLiveGas ? 'bg-green-400' : 'bg-helix-dim',
         )} />
-        <span className="text-[10px] text-helix-dim">
+        <span className="text-xs text-helix-dim">
           Gas price: {gasPriceGwei} gwei {isLiveGas ? '(live)' : '(est.)'}
         </span>
       </div>
@@ -671,16 +669,6 @@ function CostBreakdownPanel({
 // Config Form — two-column full-width layout
 // ============================================================================
 
-interface TrainedSession {
-  session_id: string;
-  model_name?: string;
-  model_slug?: string;
-  accuracy: number | null;
-  losses: number[];
-  status: string;
-  started_at: number;
-}
-
 interface ConfigFormProps {
   onStart: (config: TrainingJobConfig, opts: { storeOn0G: boolean; version: string; modelName: string; modelSlug: string }) => void;
   isStarting: boolean;
@@ -691,11 +679,8 @@ interface ConfigFormProps {
   workersOnline: number;
   defaultVersion: string;
   models: ModelWithVersions[];
-  trainedSessions: TrainedSession[];
   selectedModelId: number | null;
-  selectedSessionId: string | null;
   onSelectModel: (tokenId: number | null) => void;
-  onSelectSession: (sessionId: string | null) => void;
   isFetchingWeights: boolean;
   fetchedModelName: string | null;
   isWalletPrompting: boolean;
@@ -709,7 +694,7 @@ interface ConfigFormProps {
 function ConfigForm({
   onStart, isStarting, onUploadData, onUploadWeights,
   uploadedData, uploadedWeights, workersOnline, defaultVersion,
-  models, trainedSessions, selectedModelId, selectedSessionId, onSelectModel, onSelectSession,
+  models, selectedModelId, onSelectModel,
   isFetchingWeights, fetchedModelName,
   isWalletPrompting, isConfirmingPayment, walletConnected, userAddress,
   gasPriceGwei, isLiveGas,
@@ -722,27 +707,28 @@ function ConfigForm({
   const [zkMode, setZkMode] = useState<'off' | 'always' | 'risk'>('off');
 
   const [minWorkersForMpc, setMinWorkersForMpc] = useState(2);
-  const [paymentEth, setPaymentEth] = useState(0.0001);
-  const [stakePerWorkerEth, setStakePerWorkerEth] = useState(0.001);
-  const [storeOn0G, setStoreOn0G] = useState(false);
+  const [paymentEth, setPaymentEth] = useState(0.005);
+  const [stakePerWorkerEth, setStakePerWorkerEth] = useState(0.0001);
   const [version, setVersion] = useState(defaultVersion);
   const [versionError, setVersionError] = useState<string | null>(null);
   const [autoPropose, setAutoPropose] = useState(true);
   const [simulateCheater, setSimulateCheater] = useState(false);
+  const [showCostBreakdown, setShowCostBreakdown] = useState(false);
   const [cheaterParty, setCheaterParty] = useState<number | undefined>(undefined);
   const [cheaterStep, setCheaterStep] = useState<number | undefined>(undefined);
 
   // Model identity
-  const hasExistingModels = models.length > 0 || trainedSessions.length > 0;
-  const [modelMode, setModelMode] = useState<'new' | 'existing'>((selectedModelId !== null || selectedSessionId !== null) ? 'existing' : 'new');
+  const hasExistingModels = models.length > 0;
+  const [modelMode, setModelMode] = useState<'new' | 'existing'>(selectedModelId !== null ? 'existing' : 'new');
   const [modelName, setModelName] = useState('');
 
-  // Sync modelMode when parent auto-selects a model/session via query param
+  // Sync modelMode when parent auto-selects a model via query param
   useEffect(() => {
-    if (selectedModelId !== null || selectedSessionId !== null) setModelMode('existing');
-  }, [selectedModelId, selectedSessionId]);
+    if (selectedModelId !== null) setModelMode('existing');
+  }, [selectedModelId]);
   const [modelSlug, setModelSlug] = useState('');
   const [modelSearch, setModelSearch] = useState('');
+  const [modelVersionIndices, setModelVersionIndices] = useState<Record<number, number>>({});
 
   const handleModelNameChange = (name: string) => {
     setModelName(name);
@@ -757,18 +743,8 @@ function ConfigForm({
     );
   }, [models, modelSearch]);
 
-  const filteredSessions = useMemo(() => {
-    if (!modelSearch.trim()) return trainedSessions;
-    const q = modelSearch.toLowerCase();
-    return trainedSessions.filter((s) =>
-      (s.model_name || '').toLowerCase().includes(q) || (s.model_slug || '').toLowerCase().includes(q),
-    );
-  }, [trainedSessions, modelSearch]);
-
-  const selectedSession = trainedSessions.find((s) => s.session_id === selectedSessionId) ?? null;
-
   const handleToggleAutoPropose = () => {
-    if (autoPropose) setPaymentEth(recommendedPayment);
+    if (autoPropose) setPaymentEth(costEstimate.totalCost);
     setAutoPropose(!autoPropose);
   };
 
@@ -781,11 +757,11 @@ function ConfigForm({
     const v = version.trim() || defaultVersion;
     if (!isValidVersion(v)) return;
 
-    const effectiveModelName = modelMode === 'existing'
-      ? (selectedModel ? selectedModel.name : (selectedSession?.model_name || 'Continued Model'))
+    const effectiveModelName = modelMode === 'existing' && selectedModel
+      ? selectedModel.name
       : modelName.trim();
-    const effectiveModelSlug = modelMode === 'existing'
-      ? (selectedModel ? (selectedModel.slug || '') : (selectedSession?.model_slug || ''))
+    const effectiveModelSlug = modelMode === 'existing' && selectedModel
+      ? (selectedModel.slug || '')
       : modelSlug.trim();
 
     onStart({
@@ -794,7 +770,7 @@ function ConfigForm({
       num_steps: numSteps,
       learning_rate: learningRate,
       checkpoint_freq: checkpointFreq,
-      mac_interval: 0,
+      mac_interval: 5,
       zk_mode: zkMode,
       zk_checkpoint_freq: 1,
       min_workers_for_mpc: minWorkersForMpc,
@@ -810,7 +786,7 @@ function ConfigForm({
       model_name: effectiveModelName || undefined,
       model_slug: effectiveModelSlug || undefined,
       model_token_id: modelMode === 'existing' && selectedModelId !== null ? selectedModelId : undefined,
-    }, { storeOn0G, version: v, modelName: effectiveModelName, modelSlug: effectiveModelSlug });
+    }, { storeOn0G: false, version: v, modelName: effectiveModelName, modelSlug: effectiveModelSlug });
   };
 
   const selectedModel = models.find((m) => m.tokenId === selectedModelId) ?? null;
@@ -838,12 +814,12 @@ function ConfigForm({
     [minWorkers, numSteps, checkpointFreq, zkMode, gasPriceGwei, selectedModelFeeBps, stakePerWorkerEth],
   );
 
-  const recommendedPayment = costEstimate.recommendedPayment;
-  const effectivePayment = autoPropose ? recommendedPayment : paymentEth;
+  const effectivePayment = autoPropose ? costEstimate.totalCost : paymentEth;
 
   const paymentColor = (() => {
-    if (recommendedPayment <= 0) return 'green' as const;
-    const ratio = effectivePayment / recommendedPayment;
+    if (costEstimate.totalCost <= 0) return 'green' as const;
+    if (autoPropose) return 'green' as const;
+    const ratio = paymentEth / costEstimate.totalCost;
     if (ratio >= 0.9) return 'green' as const;
     if (ratio >= 0.6) return 'yellow' as const;
     return 'red' as const;
@@ -852,29 +828,11 @@ function ConfigForm({
   const canStart = !isStarting && !isWalletPrompting && !isConfirmingPayment
     && !versionError && !isFetchingWeights && walletConnected && !isNotModelOwner
     && (modelMode === 'existing'
-      ? (selectedModelId !== null || selectedSessionId !== null)
+      ? (selectedModelId !== null)
       : (modelName.trim() !== '' && modelSlug.trim() !== ''));
 
   return (
     <div className="space-y-6">
-      {/* ── Header ────────────────────────────────────────────── */}
-      <div className="flex items-end justify-between">
-        <div>
-          <h1 className="text-4xl font-semibold tracking-tight text-white">
-            New Training Run
-          </h1>
-          <p className="text-base text-helix-muted mt-1">
-            MNIST 784 → {hiddenSize} → 10 · ~{Math.round((784 * hiddenSize + hiddenSize + hiddenSize * 10 + 10) / 1000)}K params · Verifiable MPC
-          </p>
-        </div>
-        <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-white/[0.04] border border-white/[0.06]">
-          <span className={cn('w-2 h-2 rounded-full', workersOnline >= 2 ? 'bg-green-400 animate-pulse' : 'bg-helix-dim')} />
-          <span className="text-sm text-helix-text2">
-            {workersOnline} worker{workersOnline !== 1 ? 's' : ''}
-          </span>
-        </div>
-      </div>
-
       {/* ── Two-column grid ──────────────────────────────────── */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
 
@@ -932,7 +890,7 @@ function ConfigForm({
                       className="min-w-0 px-4 py-3.5 bg-helix-surface border border-helix-border rounded-2xl text-base text-white placeholder:text-helix-dim focus:outline-none focus:border-helix-border2 transition-colors"
                     />
                     <div className="min-w-0 px-4 py-3.5 bg-black border border-white/20 rounded-2xl text-base text-helix-muted select-none truncate">
-                      {modelSlug || '\u00A0'}
+                      {modelSlug || 'model-id'}
                     </div>
                   </div>
                 </motion.div>
@@ -945,7 +903,7 @@ function ConfigForm({
                   className="space-y-3"
                 >
                   {/* Search input (hidden when a model is selected) */}
-                  {!selectedModel && !selectedSession && (
+                  {!selectedModel && (
                     <div className="relative">
                       <Search size={14} className="absolute left-4 top-1/2 -translate-y-1/2 text-helix-muted pointer-events-none" />
                       <input
@@ -958,57 +916,40 @@ function ConfigForm({
                     </div>
                   )}
 
-                  {/* Model / session cards */}
-                  <div className="max-h-64 overflow-y-auto space-y-2">
-                    {/* Trained sessions */}
-                    {filteredSessions.length > 0 && !selectedModel && (
-                      filteredSessions.map((s) => {
-                        const isSelected = selectedSessionId === s.session_id;
-                        if (selectedSession && !isSelected) return null;
-                        return (
-                          <TrainedSessionCard
-                            key={s.session_id}
-                            sessionId={s.session_id}
-                            name={s.model_name || 'Trained Model'}
-                            accuracy={s.accuracy}
-                            isSelected={isSelected}
-                            onSelect={() => onSelectSession(isSelected ? null : s.session_id)}
-                          />
-                        );
-                      })
-                    )}
-
-                    {/* On-chain models */}
-                    {filteredModels.length > 0 && !selectedSession && (
+                  {/* Model cards */}
+                  <div className="max-h-[400px] overflow-y-auto space-y-3 pr-1">
+                    {filteredModels.length > 0 && (
                       filteredModels.map((m) => {
                         const isSelected = selectedModelId === m.tokenId;
-                        const latest = m.versions.length ? m.versions[m.versions.length - 1] : null;
                         if (selectedModel && !isSelected) return null;
                         return (
                           <ModelCard
                             key={m.tokenId}
                             id={String(m.tokenId)}
                             name={m.name}
-                            accuracy={latest?.accuracy ?? 0}
+                            accuracy={m.versions.length > 0 ? m.versions[m.versions.length - 1].accuracy : 0}
                             isSelected={isSelected}
                             onSelect={() => onSelectModel(isSelected ? null : m.tokenId)}
                             versions={m.versions}
-                            selectedVersionIndex={m.versions.length > 0 ? m.versions.length - 1 : 0}
+                            selectedVersionIndex={modelVersionIndices[m.tokenId] ?? (m.versions.length > 0 ? m.versions.length - 1 : 0)}
+                            onVersionChange={(i) => setModelVersionIndices(prev => ({ ...prev, [m.tokenId]: i }))}
                             ownerAddress={m.creator}
                             userAddress={userAddress}
                             tokenId={m.tokenId}
+                            architecture={m.architecture}
+                            showFee={false}
                           />
                         );
                       })
                     )}
 
-                    {filteredModels.length === 0 && filteredSessions.length === 0 && (
+                    {filteredModels.length === 0 && (
                       <p className="text-sm text-helix-dim text-center py-4">No models found</p>
                     )}
                   </div>
 
                   {/* Weight fetch status — only errors and loading */}
-                  {(selectedModel || selectedSession) && (
+                  {selectedModel && (
                     <AnimatePresence mode="wait">
                       {isFetchingWeights && (
                         <motion.div
@@ -1105,8 +1046,8 @@ function ConfigForm({
         <div className="flex flex-col gap-5">
 
           {/* Cost Estimator + Start — Cash App style, connected */}
-          <div className="rounded-2xl bg-helix-surface border border-helix-border overflow-hidden">
-            <div className="p-6">
+          <div className="rounded-2xl bg-helix-surface border border-helix-border overflow-hidden flex flex-col">
+            <div className="p-6 flex-1">
               {/* Header with auto toggle */}
               <div className="flex items-center justify-between mb-5">
                 <span className="text-base font-medium text-helix-text2">Cost Estimator</span>
@@ -1119,7 +1060,7 @@ function ConfigForm({
               {/* Big number — same component for both modes */}
               <div className="py-3">
                 <PaymentNumber
-                  value={autoPropose ? recommendedPayment : paymentEth}
+                  value={autoPropose ? costEstimate.totalCost : paymentEth}
                   color={paymentColor}
                   editable={!autoPropose}
                   onChange={setPaymentEth}
@@ -1146,18 +1087,52 @@ function ConfigForm({
                       transition={{ duration: 0.2 }}
                       className="absolute top-0 right-0 text-sm text-helix-dim whitespace-nowrap"
                     >
-                      Recommended: {recommendedPayment.toFixed(4)} ADI
+                      Recommended: {costEstimate.totalCost.toFixed(4)} ADI
                     </motion.span>
                   )}
                 </AnimatePresence>
               </div>
 
-              {/* Detailed cost breakdown */}
-              <CostBreakdownPanel
-                estimate={costEstimate}
-                gasPriceGwei={gasPriceGwei}
-                isLiveGas={isLiveGas}
-              />
+              {/* Detailed cost breakdown — collapsible card */}
+              <div className={cn(
+                'mt-4 rounded-xl border transition-colors duration-200 overflow-hidden',
+                showCostBreakdown
+                  ? 'bg-white/[0.03] border-white/[0.08]'
+                  : 'bg-white/[0.03] border-white/[0.06] hover:border-white/[0.1]',
+              )}>
+                <button
+                  type="button"
+                  onClick={() => setShowCostBreakdown(!showCostBreakdown)}
+                  className="flex items-center justify-between w-full px-4 py-2.5 text-sm text-helix-text2 hover:text-white transition-colors"
+                >
+                  <span className="font-medium">Cost Breakdown</span>
+                  <motion.div
+                    animate={{ rotate: showCostBreakdown ? 180 : 0 }}
+                    transition={{ duration: 0.2 }}
+                  >
+                    <ChevronDown size={16} />
+                  </motion.div>
+                </button>
+                <AnimatePresence>
+                  {showCostBreakdown && (
+                    <motion.div
+                      initial={{ height: 0, opacity: 0 }}
+                      animate={{ height: 'auto', opacity: 1 }}
+                      exit={{ height: 0, opacity: 0 }}
+                      transition={{ duration: 0.2 }}
+                      className="overflow-hidden"
+                    >
+                      <div className="px-4 pb-3 pt-1 border-t border-white/[0.05]">
+                        <CostBreakdownPanel
+                          estimate={costEstimate}
+                          gasPriceGwei={gasPriceGwei}
+                          isLiveGas={isLiveGas}
+                        />
+                      </div>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </div>
             </div>
 
             {/* Start button — attached to payment card */}
@@ -1167,7 +1142,7 @@ function ConfigForm({
               disabled={!canStart}
               whileTap={canStart ? { scale: 0.98 } : {}}
               className={cn(
-                'w-full py-5 text-xl font-bold tracking-tight transition-all',
+                'w-full py-5 text-xl font-bold tracking-tight transition-all mt-auto',
                 'flex items-center justify-center gap-3 border-t',
                 canStart
                   ? 'bg-zinc-200 text-black border-zinc-200 hover:bg-zinc-300 active:bg-zinc-400'
@@ -1278,7 +1253,7 @@ function ConfigForm({
                         max={numSteps}
                       />
                     </div>
-                    <p className="text-[11px] text-red-300/40 px-1">
+                    <p className="text-xs text-red-300/40 px-1">
                       The selected worker will inject corrupt weight shares at the specified step. SPDZ MAC verification will detect and report it.
                     </p>
                   </div>
@@ -1287,16 +1262,6 @@ function ConfigForm({
             </AnimatePresence>
           </div>
 
-          {/* Store on 0G */}
-          <div className="rounded-2xl bg-helix-surface border border-helix-border overflow-hidden">
-            <div className="flex items-center justify-between px-5 py-4">
-              <div>
-                <p className="text-base text-white">Store on 0G</p>
-                <p className="text-xs text-helix-dim mt-0.5">Save model to decentralized storage</p>
-              </div>
-              <Toggle on={storeOn0G} onToggle={() => setStoreOn0G(!storeOn0G)} />
-            </div>
-          </div>
         </div>
       </div>
     </div>
@@ -1321,13 +1286,18 @@ interface LiveProgressProps {
   showStoreOn0G: boolean;
   elapsedTime: number;
   onMintNft: () => void;
+  onPause: () => void;
+  onStop: () => void;
+  onResume: () => void;
 }
 
-function LiveProgress({ session, losses, isConnected, error, version, modelName, onDownloadModel, onStoreOnZeroG, isStoringOnZeroG, zeroGResult, showStoreOn0G, elapsedTime, onMintNft }: LiveProgressProps) {
+function LiveProgress({ session, losses, isConnected, error, version, modelName, onDownloadModel, onStoreOnZeroG, isStoringOnZeroG, zeroGResult, showStoreOn0G, elapsedTime, onMintNft, onPause, onStop, onResume }: LiveProgressProps) {
+  const [showStopConfirm, setShowStopConfirm] = useState(false);
+
   const stepProgress = session.total_steps > 0
     ? (session.current_step / session.total_steps) * 100
     : 0;
-  const isTerminal = session.status === 'complete' || session.status === 'failed';
+  const isTerminal = session.status === 'complete' || session.status === 'failed' || session.status === 'stopped';
   const isComplete = session.status === 'complete';
 
   const lastLoss = losses.length > 0 ? losses[losses.length - 1].loss : 0;
@@ -1362,10 +1332,15 @@ function LiveProgress({ session, losses, isConnected, error, version, modelName,
             'flex items-center gap-2 px-3.5 py-1.5 rounded-full text-sm font-medium',
             isComplete ? 'bg-green-500/10 text-green-400'
               : session.status === 'failed' ? 'bg-red-500/10 text-red-400'
+              : session.status === 'paused' ? 'bg-yellow-500/10 text-yellow-400'
+              : session.status === 'stopped' ? 'bg-zinc-500/10 text-zinc-400'
               : 'bg-white/[0.06] text-white',
           )}>
-            {!isTerminal && <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" />}
-            {session.status === 'running' ? 'Training' : session.status}
+            {!isTerminal && session.status !== 'paused' && <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" />}
+            {session.status === 'running' ? 'Training'
+              : session.status === 'paused' ? 'Paused'
+              : session.status === 'stopped' ? 'Stopped'
+              : session.status}
           </div>
         </div>
       </div>
@@ -1396,7 +1371,7 @@ function LiveProgress({ session, losses, isConnected, error, version, modelName,
                 <PhaseRing phase={session.phase} totalPhases={TOTAL_PHASES} size={160} />
                 <div className="absolute inset-0 flex flex-col items-center justify-center" style={{ marginTop: 160 * 0.08 }}>
                   <span className="text-3xl font-bold text-white tabular-nums">{session.phase}</span>
-                  <span className="text-[10px] uppercase tracking-widest text-helix-muted mt-0.5">of {TOTAL_PHASES}</span>
+                  <span className="text-xs uppercase tracking-widest text-helix-muted mt-0.5">of {TOTAL_PHASES}</span>
                 </div>
               </div>
 
@@ -1418,12 +1393,26 @@ function LiveProgress({ session, losses, isConnected, error, version, modelName,
                 </div>
 
                 <div className="space-y-1.5">
-                  <div className="h-2.5 w-full rounded-full bg-helix-border overflow-hidden">
+                  <div className={`h-2.5 w-full rounded-full overflow-hidden transition-colors duration-500 ${
+                    session.cheater_detected && !session.cheater_detected.recovered
+                      ? 'bg-red-950/40'
+                      : 'bg-helix-border'
+                  }`}>
                     <motion.div
-                      className="h-full rounded-full bg-white"
+                      className={`h-full rounded-full transition-colors duration-500 ${
+                        session.cheater_detected && !session.cheater_detected.recovered
+                          ? 'bg-red-500'
+                          : 'bg-white'
+                      }`}
                       animate={{ width: `${stepProgress}%` }}
                       transition={{ duration: 0.4, ease: 'easeOut' }}
-                      style={{ boxShadow: stepProgress > 0 && stepProgress < 100 ? '0 0 12px rgba(255,255,255,0.4), 0 0 4px rgba(255,255,255,0.6)' : 'none' }}
+                      style={{
+                        boxShadow: session.cheater_detected && !session.cheater_detected.recovered
+                          ? '0 0 12px rgba(239,68,68,0.5), 0 0 4px rgba(239,68,68,0.7)'
+                          : stepProgress > 0 && stepProgress < 100
+                            ? '0 0 12px rgba(255,255,255,0.4), 0 0 4px rgba(255,255,255,0.6)'
+                            : 'none',
+                      }}
                     />
                   </div>
                   <div className="flex items-center justify-between">
@@ -1441,7 +1430,7 @@ function LiveProgress({ session, losses, isConnected, error, version, modelName,
             {/* Quick stats — loss & accuracy */}
             <div className="flex items-center gap-6 mt-6 pt-5 border-t border-white/[0.04]">
               <div className="flex items-baseline gap-2">
-                <span className="text-[10px] uppercase tracking-wider text-helix-muted">Loss</span>
+                <span className="text-xs text-helix-muted">Loss</span>
                 <span className="text-lg font-mono font-semibold text-white tabular-nums">
                   {lastLoss > 0 ? lastLoss.toFixed(4) : '\u2014'}
                 </span>
@@ -1453,7 +1442,7 @@ function LiveProgress({ session, losses, isConnected, error, version, modelName,
               </div>
               <div className="w-px h-5 bg-white/[0.06]" />
               <div className="flex items-baseline gap-2">
-                <span className="text-[10px] uppercase tracking-wider text-helix-muted">Accuracy</span>
+                <span className="text-xs text-helix-muted">Accuracy</span>
                 <span className="text-lg font-mono font-semibold text-white tabular-nums">
                   {lastAcc > 0 ? `${(lastAcc * 100).toFixed(1)}%` : '\u2014'}
                 </span>
@@ -1469,8 +1458,130 @@ function LiveProgress({ session, losses, isConnected, error, version, modelName,
                 <span className="text-xs text-helix-dim font-mono tabular-nums">{session.mac_checks_passed} MACs</span>
               </div>
             </div>
+
+            {/* Pause/Stop Controls */}
+            {session.status === 'running' && session.phase >= 8 && (
+              <div className="flex gap-3 mt-5 pt-5 border-t border-white/[0.04]">
+                <button
+                  onClick={onPause}
+                  className="px-4 py-2 rounded-lg bg-yellow-500/20 text-yellow-400 border border-yellow-500/30 hover:bg-yellow-500/30 transition-colors text-sm font-medium"
+                >
+                  Pause Training
+                </button>
+                <button
+                  onClick={() => setShowStopConfirm(true)}
+                  className="px-4 py-2 rounded-lg bg-red-500/20 text-red-400 border border-red-500/30 hover:bg-red-500/30 transition-colors text-sm font-medium"
+                >
+                  Stop Training
+                </button>
+              </div>
+            )}
           </div>
         </motion.div>
+      )}
+
+      {/* Live Cost Panel */}
+      {session.status === 'running' && session.phase >= 8 && (
+        <div className="bg-helix-surface border border-helix-border rounded-2xl p-4">
+          <h4 className="text-xs text-helix-muted mb-3">Costs So Far</h4>
+          <div className="space-y-2 text-sm">
+            <div className="flex justify-between">
+              <span className="text-helix-dim">Worker compute</span>
+              <span className="text-zinc-300">{(session.cost_worker_fees_adi ?? 0).toFixed(6)} ADI</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-helix-dim">Gas spent</span>
+              <span className="text-zinc-300">{((session.cost_gas_spent_wei ?? 0) / 1e18).toFixed(6)} ETH</span>
+            </div>
+            <div className="border-t border-helix-border pt-2 flex justify-between font-medium">
+              <span className="text-helix-muted">Deposit remaining</span>
+              <span className="text-green-400">
+                {((session.cost_deposit_adi ?? 0) - (session.cost_worker_fees_adi ?? 0)).toFixed(4)} ADI
+              </span>
+            </div>
+            {(session.cost_deposit_adi ?? 0) > 0 && (
+              <div className="w-full bg-helix-border rounded-full h-1.5 mt-2">
+                <div
+                  className="bg-green-500 h-1.5 rounded-full transition-all"
+                  style={{ width: `${Math.min(100, ((session.cost_worker_fees_adi ?? 0) / (session.cost_deposit_adi ?? 1)) * 100)}%` }}
+                />
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Paused State UI */}
+      {session.status === 'paused' && (
+        <motion.div
+          initial={{ opacity: 0, y: 8 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="bg-yellow-500/10 border border-yellow-500/20 rounded-2xl p-6"
+        >
+          <div className="flex items-center gap-2 mb-3">
+            <span className="text-yellow-400 text-lg">&#9208;</span>
+            <h3 className="text-yellow-400 font-semibold">Training Paused at Step {session.current_step}</h3>
+          </div>
+          <p className="text-helix-dim text-sm mb-4">
+            Workers have been released. You can resume training with new workers
+            or stop permanently.
+          </p>
+          <div className="flex gap-3">
+            <button onClick={onResume}
+              className="px-4 py-2 rounded-lg bg-green-600 text-white hover:bg-green-700 transition-colors text-sm font-medium">
+              Resume Training
+            </button>
+            <button onClick={() => setShowStopConfirm(true)}
+              className="px-4 py-2 rounded-lg bg-red-500/20 text-red-400 border border-red-500/30 hover:bg-red-500/30 transition-colors text-sm font-medium">
+              Stop Training
+            </button>
+          </div>
+        </motion.div>
+      )}
+
+      {/* Stopped State UI */}
+      {session.status === 'stopped' && (
+        <motion.div
+          initial={{ opacity: 0, y: 8 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="rounded-3xl bg-helix-surface border border-zinc-600/30 p-8 text-center"
+        >
+          <p className="text-sm text-zinc-400 mb-3">Training Stopped</p>
+          <p className="text-xl font-medium text-zinc-300">
+            Saved at step {session.current_step} / {session.total_steps}
+          </p>
+          <p className="text-sm text-helix-muted mt-3">
+            {session.mac_checks_passed} MAC checks passed · {session.checkpoints_submitted} checkpoints
+          </p>
+        </motion.div>
+      )}
+
+      {/* Stop Confirmation Dialog */}
+      {showStopConfirm && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
+          <motion.div
+            initial={{ scale: 0.95, opacity: 0 }}
+            animate={{ scale: 1, opacity: 1 }}
+            className="bg-helix-surface border border-helix-border rounded-2xl p-6 max-w-md"
+          >
+            <h3 className="text-lg font-semibold text-white mb-2">Stop Training?</h3>
+            <p className="text-helix-dim text-sm mb-4">
+              This cannot be undone. The model will be saved at the last checkpoint
+              and treated as a finished model. Workers will be paid proportionally
+              and your remaining deposit will be refunded.
+            </p>
+            <div className="flex gap-3 justify-end">
+              <button onClick={() => setShowStopConfirm(false)}
+                className="px-4 py-2 rounded-lg bg-helix-border text-helix-dim hover:bg-zinc-700 transition-colors text-sm font-medium">
+                Cancel
+              </button>
+              <button onClick={() => { onStop(); setShowStopConfirm(false); }}
+                className="px-4 py-2 rounded-lg bg-red-600 text-white hover:bg-red-700 transition-colors text-sm font-medium">
+                Stop Training
+              </button>
+            </div>
+          </motion.div>
+        </div>
       )}
 
       {/* Completion state */}
@@ -1483,7 +1594,7 @@ function LiveProgress({ session, losses, isConnected, error, version, modelName,
         >
           <div className="absolute top-0 left-0 w-full h-[2px] bg-gradient-to-r from-transparent via-green-400/40 to-transparent" />
           <div className="p-8 text-center">
-            <p className="text-sm text-green-400/60 uppercase tracking-wider mb-3">Training Complete</p>
+            <p className="text-sm text-green-400/60 mb-3">Training Complete</p>
             <p className="text-7xl font-bold tracking-tighter text-white">
               {(session.accuracy * 100).toFixed(1)}
               <span className="text-3xl text-helix-muted ml-1">%</span>
@@ -1508,7 +1619,7 @@ function LiveProgress({ session, losses, isConnected, error, version, modelName,
         <div className="lg:col-span-3 space-y-5">
           <div className="grid grid-cols-2 gap-4">
             <div className="bg-helix-surface border border-helix-border rounded-2xl p-5">
-              <div className="text-[10px] uppercase tracking-wider text-helix-muted mb-2">Current Loss</div>
+              <div className="text-xs text-helix-muted mb-2">Current Loss</div>
               <div className="flex items-baseline gap-2">
                 <span className="text-4xl font-bold font-mono text-white tabular-nums">
                   {lastLoss > 0 ? lastLoss.toFixed(4) : '\u2014'}
@@ -1521,7 +1632,7 @@ function LiveProgress({ session, losses, isConnected, error, version, modelName,
               </div>
             </div>
             <div className="bg-helix-surface border border-helix-border rounded-2xl p-5">
-              <div className="text-[10px] uppercase tracking-wider text-helix-muted mb-2">Accuracy</div>
+              <div className="text-xs text-helix-muted mb-2">Accuracy</div>
               <div className="flex items-baseline gap-2">
                 <span className="text-4xl font-bold font-mono text-white tabular-nums">
                   {lastAcc > 0 ? `${(lastAcc * 100).toFixed(1)}%` : '\u2014'}
@@ -1534,7 +1645,7 @@ function LiveProgress({ session, losses, isConnected, error, version, modelName,
               </div>
             </div>
           </div>
-          <LossCurve data={losses} />
+          <LossCurve data={losses} cheaterStep={session.cheater_detected?.step} />
         </div>
 
         {/* Right column — stats & info */}
@@ -1547,7 +1658,7 @@ function LiveProgress({ session, losses, isConnected, error, version, modelName,
           </div>
 
           <div className="bg-helix-surface border border-helix-border rounded-2xl p-4">
-            <h4 className="text-[10px] uppercase tracking-wider text-helix-muted mb-3">Security Protocol</h4>
+            <h4 className="text-xs text-helix-muted mb-3">Security Protocol</h4>
             <div className="space-y-2.5">
               {[
                 { label: 'SPDZ MAC Verification', active: session.mac_checks_passed > 0 },
@@ -1560,7 +1671,7 @@ function LiveProgress({ session, losses, isConnected, error, version, modelName,
                     <div className={cn('w-1.5 h-1.5 rounded-full', item.active ? 'bg-green-400' : 'bg-helix-muted/40')} />
                     <span className="text-xs text-helix-dim">{item.label}</span>
                   </div>
-                  <span className={cn('text-[10px] font-mono', item.active ? 'text-green-400/80' : 'text-helix-muted')}>
+                  <span className={cn('text-xs font-mono', item.active ? 'text-green-400/80' : 'text-helix-muted')}>
                     {item.active ? 'ACTIVE' : 'STANDBY'}
                   </span>
                 </div>
@@ -1569,7 +1680,7 @@ function LiveProgress({ session, losses, isConnected, error, version, modelName,
           </div>
 
           <div className="bg-helix-surface border border-helix-border rounded-2xl p-4">
-            <h4 className="text-[10px] uppercase tracking-wider text-helix-muted mb-3">Session</h4>
+            <h4 className="text-xs text-helix-muted mb-3">Session</h4>
             <div className="space-y-2">
               {[
                 { label: 'ID', value: session.session_id.slice(0, 12) + '\u2026' },
@@ -1610,7 +1721,7 @@ function LiveProgress({ session, losses, isConnected, error, version, modelName,
                     href={`https://explorer.ab.testnet.adifoundation.ai/tx/${session.cheater_detected.slash_tx_hash}`}
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="inline-flex items-center gap-1 mt-1 text-[11px] text-orange-400/70 hover:text-orange-300 transition-colors font-mono"
+                    className="inline-flex items-center gap-1 mt-1 text-xs text-orange-400/70 hover:text-orange-300 transition-colors font-mono"
                   >
                     tx: {session.cheater_detected.slash_tx_hash.slice(0, 10)}...{session.cheater_detected.slash_tx_hash.slice(-6)}
                     <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6M15 3h6v6M10 14L21 3"/></svg>
@@ -1648,7 +1759,7 @@ function StatCard({ label, value, icon }: { label: string; value: string | numbe
     <div className="bg-helix-surface border border-helix-border rounded-2xl px-4 py-3.5">
       <div className="flex items-center gap-1.5 mb-1.5">
         {icon && <span className="text-helix-dim">{icon}</span>}
-        <span className="text-xs text-helix-dim uppercase tracking-wider">{label}</span>
+        <span className="text-xs text-helix-dim">{label}</span>
       </div>
       <p className="text-2xl font-semibold text-white tabular-nums">{value}</p>
     </div>
@@ -1659,12 +1770,12 @@ function StatCard({ label, value, icon }: { label: string; value: string | numbe
 // Loss Curve — area chart
 // ============================================================================
 
-function LossCurve({ data }: { data: { step: number; loss: number; accuracy?: number }[] }) {
+function LossCurve({ data, cheaterStep }: { data: { step: number; loss: number; accuracy?: number }[]; cheaterStep?: number }) {
   const chartData = useMemo(() => {
     if (data.length === 0) return [];
-    // EMA smoothing — alpha high enough to track reality, low enough to remove per-step noise
-    const lossAlpha = 0.35;
-    const accAlpha = 0.3;
+    // EMA smoothing — alpha low enough to produce smooth curves, high enough to track trends
+    const lossAlpha = 0.15;
+    const accAlpha = 0.12;
     let lossEma = data[0].loss;
     let accEma = (data[0].accuracy ?? 0) * 100;
     const smoothed = data.map((d) => {
@@ -1753,6 +1864,16 @@ function LossCurve({ data }: { data: { step: number; loss: number; accuracy?: nu
             />
           )}
           <RechartsTooltip content={<ChartTooltip />} cursor={{ stroke: '#2a2a2e', strokeWidth: 1 }} />
+          {cheaterStep !== undefined && cheaterStep > 0 && (
+            <ReferenceLine
+              x={cheaterStep}
+              yAxisId="loss"
+              stroke="#ef4444"
+              strokeWidth={1}
+              strokeDasharray="4 3"
+              label={{ value: 'rollback', position: 'top', fill: '#ef4444', fontSize: 9, fontFamily: 'monospace' }}
+            />
+          )}
           <Area
             yAxisId="loss"
             type="monotone"
@@ -1870,6 +1991,11 @@ function MintModal({
               <CheckCircle size={36} className="text-green-400 mx-auto" />
               <p className="text-lg font-semibold text-green-300">NFT Minted Successfully</p>
               <p className="text-sm text-green-400/60">Token ID: {mintTokenId}</p>
+              {mintError && (
+                <p className="text-xs text-amber-400/80 bg-amber-500/[0.06] border border-amber-500/15 rounded-xl px-3 py-2">
+                  {mintError}
+                </p>
+              )}
               <Link
                 href={`/models/${mintTokenId}`}
                 className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-green-500/10 text-green-300 text-sm font-medium hover:bg-green-500/20 transition-colors"
@@ -1884,7 +2010,7 @@ function MintModal({
             <div className="space-y-3">
               <div className="grid grid-cols-2 gap-2">
                 <div className="space-y-1">
-                  <label className="text-[11px] text-helix-dim uppercase tracking-wider">Name</label>
+                  <label className="text-xs text-helix-dim">Name</label>
                   <input
                     type="text"
                     value={mintForm.name}
@@ -1894,7 +2020,7 @@ function MintModal({
                   />
                 </div>
                 <div className="space-y-1">
-                  <label className="text-[11px] text-helix-dim uppercase tracking-wider">Slug</label>
+                  <label className="text-xs text-helix-dim">Slug</label>
                   <div className="px-3 py-2.5 bg-black border border-white/20 rounded-xl text-sm text-helix-muted truncate">
                     {mintForm.slug || '\u00A0'}
                   </div>
@@ -1902,7 +2028,7 @@ function MintModal({
               </div>
 
               <div className="space-y-1">
-                <label className="text-[11px] text-helix-dim uppercase tracking-wider">Description</label>
+                <label className="text-xs text-helix-dim">Description</label>
                 <input
                   type="text"
                   value={mintForm.description}
@@ -1914,7 +2040,7 @@ function MintModal({
 
               <div className="grid grid-cols-2 gap-2">
                 <div className="space-y-1">
-                  <label className="text-[11px] text-helix-dim uppercase tracking-wider">Version</label>
+                  <label className="text-xs text-helix-dim">Version</label>
                   <input
                     type="text"
                     value={mintForm.version}
@@ -1924,7 +2050,7 @@ function MintModal({
                   />
                 </div>
                 <div className="space-y-1">
-                  <label className="text-[11px] text-helix-dim uppercase tracking-wider">Architecture</label>
+                  <label className="text-xs text-helix-dim">Architecture</label>
                   <input
                     type="text"
                     value={mintForm.architecture}
@@ -1972,7 +2098,7 @@ function MintModal({
                       )}
                     </div>
                     <span className={cn(
-                      'text-[10px] text-center leading-tight',
+                      'text-xs text-center leading-tight',
                       isDone ? 'text-green-400/70' :
                       isActive ? 'text-white/70' :
                       isFailed ? 'text-red-400/70' :
@@ -2290,7 +2416,7 @@ function HistoryView({ sessions, isLoading }: {
                   {isSelected && (
                     <div className="mt-3 flex items-center gap-3 flex-wrap">
                       <span className={cn(
-                        'inline-flex items-center gap-1.5 text-[11px] font-medium px-2.5 py-1 rounded-full',
+                        'inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1 rounded-full',
                         isComplete ? 'bg-emerald-500/10 text-emerald-400/90' : 'bg-red-500/10 text-red-400/80',
                       )}>
                         <span className={cn('w-1.5 h-1.5 rounded-full', isComplete ? 'bg-emerald-400' : 'bg-red-400')} />
@@ -2309,16 +2435,16 @@ function HistoryView({ sessions, isLoading }: {
                   {!isSelected && (
                     <div className="flex items-center gap-3 mt-1.5">
                       <span className={cn(
-                        'inline-flex items-center gap-1 text-[10px] font-medium px-2 py-0.5 rounded-full',
+                        'inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full',
                         isComplete ? 'bg-emerald-500/10 text-emerald-400/80' : 'bg-red-500/10 text-red-400/70',
                       )}>
                         <span className={cn('w-1 h-1 rounded-full', isComplete ? 'bg-emerald-400' : 'bg-red-400')} />
                         {s.status === 'complete' ? 'Complete' : 'Failed'}
                       </span>
-                      <span className="text-[11px] text-helix-dim tabular-nums">
+                      <span className="text-xs text-helix-dim tabular-nums">
                         {date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
                       </span>
-                      <span className="text-[11px] text-helix-dim tabular-nums ml-auto">
+                      <span className="text-xs text-helix-dim tabular-nums ml-auto">
                         {s.current_step}/{s.total_steps} steps
                       </span>
                     </div>
@@ -2378,7 +2504,7 @@ function HistoryDetailPanel({ session }: { session: TrainingSessionState }) {
             </div>
             <div className="flex items-center gap-2">
               <span className={cn(
-                'inline-flex items-center gap-1.5 text-[11px] font-medium px-2.5 py-1 rounded-full',
+                'inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1 rounded-full',
                 session.status === 'complete'
                   ? 'bg-emerald-500/10 text-emerald-400/90'
                   : 'bg-red-500/10 text-red-400/80',
@@ -2441,7 +2567,7 @@ function HistoryDetailPanel({ session }: { session: TrainingSessionState }) {
 
       {/* Loss curve */}
       {lossData.length > 1 && (
-        <LossCurve data={lossData} />
+        <LossCurve data={lossData} cheaterStep={session.cheater_detected?.step} />
       )}
 
       {/* Stats grid */}
@@ -2535,16 +2661,16 @@ function HistoryDetailPanel({ session }: { session: TrainingSessionState }) {
 function TrainPageInner() {
   const searchParams = useSearchParams();
   const queryModelId = searchParams.get('model');
-  const querySessionId = searchParams.get('session');
 
   const {
-    startTraining, uploadData, uploadWeights, downloadModel, storeOnZeroG,
+    startTraining, uploadData, uploadWeights, downloadModel, storeOnZeroG, sendCommand,
     session, losses, isConnected, isStarting, error: trainingError,
     uploadedData, uploadedWeights, workersOnline, zeroGResult, isStoringOnZeroG,
     elapsedTime, history, fetchHistory, isLoadingHistory,
   } = useMpcTraining();
 
   const { models, isLoading: isLoadingModels } = useModelRegistry();
+  const { saveWeights, downloadWeights } = useWeightStorage();
   const { signMessageAsync } = useSignMessage();
   const { data: walletClient } = useWalletClient();
   const publicClient = usePublicClient();
@@ -2670,26 +2796,12 @@ function TrainPageInner() {
   const mintAutoShownRef = useRef(false);
 
   const [selectedModelId, setSelectedModelId] = useState<number | null>(null);
-  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
-  const [trainedSessions, setTrainedSessions] = useState<TrainedSession[]>([]);
   const [weightFetchStatus, setWeightFetchStatus] = useState<WeightFetchStatus>('idle');
   const [weightFetchError, setWeightFetchError] = useState<string | null>(null);
   const [fetchedModelName, setFetchedModelName] = useState<string | null>(null);
   const fetchingForRef = useRef<number | null>(null);
   const autoSelectAppliedRef = useRef(false);
 
-  // Fetch completed training sessions for "Continue Existing"
-  useEffect(() => {
-    const fetchSessions = async () => {
-      try {
-        const res = await fetch(`${API_BASE}/api/training/sessions`);
-        if (!res.ok) return;
-        const sessions: TrainedSession[] = await res.json();
-        setTrainedSessions(sessions.filter(s => s.status === 'complete'));
-      } catch { /* non-fatal */ }
-    };
-    fetchSessions();
-  }, []);
 
   // Auto-select from query param
   useEffect(() => {
@@ -2781,63 +2893,7 @@ function TrainPageInner() {
   const handleSelectModel = useCallback((tokenId: number | null) => {
     fetchingForRef.current = null;
     setSelectedModelId(tokenId);
-    setSelectedSessionId(null); // Clear session selection
   }, []);
-
-  // When a trained session is selected, fetch its weights from the backend
-  const sessionFetchRef = useRef<string | null>(null);
-  const handleSelectSession = useCallback((sessionId: string | null) => {
-    setSelectedSessionId(sessionId);
-    setSelectedModelId(null); // Clear model selection
-    fetchingForRef.current = null;
-
-    if (!sessionId) {
-      setWeightFetchStatus('idle');
-      setFetchedModelName(null);
-      sessionFetchRef.current = null;
-      return;
-    }
-
-    if (sessionFetchRef.current === sessionId) return;
-    sessionFetchRef.current = sessionId;
-
-    const doFetch = async () => {
-      setWeightFetchStatus('fetching');
-      setFetchedModelName(null);
-
-      try {
-        const res = await fetch(`${API_BASE}/api/training/sessions/${sessionId}/model`);
-        if (!res.ok) {
-          throw new Error(`HTTP ${res.status}`);
-        }
-        const weightsData = await res.json();
-        const weightsJson = JSON.stringify(weightsData);
-        const blob = new Blob([weightsJson], { type: 'application/json' });
-        const syntheticFile = new File([blob], `weights-from-session.json`, { type: 'application/json' });
-        await uploadWeights(syntheticFile);
-
-        const session = trainedSessions.find(s => s.session_id === sessionId);
-        setFetchedModelName(session?.model_name || 'Trained Model');
-        setWeightFetchStatus('done');
-      } catch {
-        setWeightFetchStatus('error');
-        sessionFetchRef.current = null;
-      }
-    };
-
-    doFetch();
-  }, [trainedSessions, uploadWeights]);
-
-  // Auto-select session from query param
-  useEffect(() => {
-    if (autoSelectAppliedRef.current) return;
-    if (!querySessionId || trainedSessions.length === 0) return;
-    const found = trainedSessions.find((s) => s.session_id === querySessionId);
-    if (found) {
-      autoSelectAppliedRef.current = true;
-      handleSelectSession(querySessionId);
-    }
-  }, [querySessionId, trainedSessions, handleSelectSession]);
 
   const handleStart = async (config: TrainingJobConfig, opts: { storeOn0G: boolean; version: string; modelName: string; modelSlug: string }) => {
     pendingConfigRef.current = { config, opts };
@@ -3025,39 +3081,12 @@ function TrainPageInner() {
       if (!res.ok) throw new Error('Failed to download model weights');
       const modelData = await res.json();
 
-      // Step 2: Encrypt
-      setMintStep('encrypting');
-      const tokenIdForKey = mintTokenId ?? currentModelTokenId ?? 0;
-      const key = await deriveModelKey(
-        async (msg: string) => await signMessageAsync({ message: msg }),
-        tokenIdForKey,
+      // Trim float precision to reduce payload size (~40% smaller)
+      const weightsJson = JSON.stringify(modelData, (_k, v) =>
+        typeof v === 'number' ? parseFloat(v.toFixed(6)) : v,
       );
-      const weightsJson = JSON.stringify(modelData);
-      const encrypted = await encryptWeights(key, weightsJson);
 
-      // Step 3: Upload to 0G
-      setMintStep('uploading');
-      const encryptedPayload = uint8ArrayToBase64(encrypted);
-      const storeRes = await fetch('/api/store-on-0g', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          session_id: session.session_id,
-          encrypted: true,
-          encryptedPayload,
-          accuracy: session.accuracy,
-          version: mintForm.version,
-        }),
-      });
-      if (!storeRes.ok) {
-        const errBody = await storeRes.json().catch(() => ({}));
-        throw new Error(errBody.error || '0G upload failed');
-      }
-      const storeResult = await storeRes.json();
-      const rootHash = storeResult.root_hash;
-      setMintRootHash(rootHash);
-
-      // Step 4: Create NFT (or find existing by slug)
+      // Step 2: Create NFT FIRST (so we have the real tokenId for encryption)
       setMintStep('creating-nft');
       let tokenId: number | null = null;
 
@@ -3100,6 +3129,67 @@ function TrainPageInner() {
 
       setMintTokenId(tokenId);
 
+      // Step 3: Encrypt with the ACTUAL tokenId (not 0)
+      setMintStep('encrypting');
+      const key = await deriveModelKey(
+        async (msg: string) => await signMessageAsync({ message: msg }),
+        tokenId,
+      );
+      const encrypted = await encryptWeights(key, weightsJson);
+
+      // Step 4: Upload to 0G (non-fatal — NFT minting continues even if 0G fails)
+      setMintStep('uploading');
+      let rootHash = '';
+      let weightsStored = false;
+      let zgWarning: string | null = null;
+
+      try {
+        const encryptedPayload = uint8ArrayToBase64(encrypted);
+        const storeRes = await fetch('/api/store-on-0g', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            session_id: session.session_id,
+            encrypted: true,
+            encryptedPayload,
+            accuracy: session.accuracy,
+            version: mintForm.version,
+          }),
+        });
+        if (storeRes.ok) {
+          const storeResult = await storeRes.json();
+          rootHash = storeResult.root_hash;
+          weightsStored = true;
+        } else {
+          const errBody = await storeRes.json().catch(() => ({}));
+          zgWarning = errBody.error || '0G upload failed';
+          console.warn('[Mint] 0G upload failed (non-fatal), continuing with NFT mint:', zgWarning);
+        }
+      } catch (zgErr) {
+        zgWarning = zgErr instanceof Error ? zgErr.message : '0G upload error';
+        console.warn('[Mint] 0G upload error (non-fatal), continuing with NFT mint:', zgErr);
+      }
+
+      setMintRootHash(rootHash || null);
+
+      // Save weights locally to IndexedDB (so they can be downloaded from model page)
+      try {
+        const encoder = new TextEncoder();
+        const weightsBuffer = encoder.encode(weightsJson).buffer;
+        await saveWeights({
+          jobId: tokenId,
+          step: 0,
+          commitment: rootHash || session.session_id,
+          weights: weightsBuffer,
+          timestamp: Date.now(),
+          status: 'completed',
+          modelName: mintForm.name || mintForm.slug,
+        });
+        console.log('[Mint] Saved weights locally for token', tokenId);
+      } catch (saveErr) {
+        console.warn('[Mint] Failed to save weights locally (non-fatal):', saveErr);
+      }
+
       // Step 5: Add version
       setMintStep('adding-version');
       const scaledAccuracy = BigInt(Math.round((session.accuracy || 0) * 10000));
@@ -3107,17 +3197,21 @@ function TrainPageInner() {
         address: modelStoreAddress,
         abi: HELIX_MODEL_STORE_ABI,
         functionName: 'addVersion',
-        args: [BigInt(tokenId), mintForm.version, rootHash, scaledAccuracy, session.session_id, true],
+        args: [BigInt(tokenId), mintForm.version, rootHash, scaledAccuracy, session.session_id, weightsStored],
       });
       await publicClient.waitForTransactionReceipt({ hash: addVersionHash });
 
+      // Show success, with warning if 0G failed
+      if (zgWarning) {
+        setMintError(`NFT minted! Weights not stored on 0G (${zgWarning}). You can upload weights later from the model page.`);
+      }
       setMintStep('success');
     } catch (err) {
       console.error('Mint NFT failed:', err);
       setMintError(err instanceof Error ? err.message : 'Minting failed');
       setMintStep('error');
     }
-  }, [session, walletClient, publicClient, signMessageAsync, mintForm, mintTokenId, currentModelTokenId, modelStoreAddress]);
+  }, [session, walletClient, publicClient, signMessageAsync, mintForm, mintTokenId, currentModelTokenId, modelStoreAddress, saveWeights]);
 
   // Auto-show mint modal on training completion (if 0G was requested)
   useEffect(() => {
@@ -3136,6 +3230,25 @@ function TrainPageInner() {
     return `${history.length + 1}.0.0`;
   }, [history]);
   const isFetchingWeights = weightFetchStatus === 'fetching' || weightFetchStatus === 'decrypting' || weightFetchStatus === 'uploading';
+
+  // ========================================================================
+  // Pause / Stop / Resume handlers
+  // ========================================================================
+
+  const handlePause = useCallback(() => {
+    if (!session) return;
+    sendCommand({ type: 'pause_training', jobId: session.job_id });
+  }, [session, sendCommand]);
+
+  const handleStop = useCallback(() => {
+    if (!session) return;
+    sendCommand({ type: 'stop_training', jobId: session.job_id });
+  }, [session, sendCommand]);
+
+  const handleResume = useCallback(() => {
+    if (!session) return;
+    sendCommand({ type: 'resume_training', jobId: session.job_id });
+  }, [session, sendCommand]);
 
   return (
     <>
@@ -3204,28 +3317,52 @@ function TrainPageInner() {
         </motion.div>
       )}
 
-      {/* View mode toggle */}
-      <div className="flex items-center gap-1 p-1 rounded-xl bg-helix-surface border border-helix-border w-fit">
-        <button
-          type="button"
-          onClick={() => setViewMode('live')}
-          className={cn(
-            'px-4 py-1.5 rounded-lg text-sm font-medium transition-all',
-            viewMode === 'live' ? 'bg-white text-black' : 'text-helix-dim hover:text-helix-text2'
+      {/* Unified header row — title + view mode toggle */}
+      <div className="flex items-center justify-between mb-4">
+        <div>
+          {viewMode === 'live' && !hasSession && (
+            <>
+              <h1 className="text-4xl font-semibold tracking-tight text-white">Launch Training</h1>
+              <div className="flex items-center gap-3 mt-1">
+                <p className="text-base text-helix-muted">Verifiable MPC · MNIST</p>
+                <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-white/[0.04] border border-white/[0.06]">
+                  <span className={cn('w-1.5 h-1.5 rounded-full', workersOnline >= 2 ? 'bg-green-400' : 'bg-helix-dim')} />
+                  <span className="text-xs text-helix-text2">
+                    {workersOnline} worker{workersOnline !== 1 ? 's' : ''}
+                  </span>
+                </div>
+              </div>
+            </>
           )}
-        >
-          Live
-        </button>
-        <button
-          type="button"
-          onClick={() => { setViewMode('history'); fetchHistory(); }}
-          className={cn(
-            'px-4 py-1.5 rounded-lg text-sm font-medium transition-all',
-            viewMode === 'history' ? 'bg-white text-black' : 'text-helix-dim hover:text-helix-text2'
+          {viewMode === 'history' && (
+            <>
+              <h1 className="text-4xl font-semibold tracking-tight text-white">Training Ledger</h1>
+              <p className="text-base text-helix-muted mt-1">Session archive & past experiments</p>
+            </>
           )}
-        >
-          History
-        </button>
+        </div>
+        <div className="flex items-center gap-1 p-1 rounded-xl bg-helix-surface border border-helix-border shrink-0">
+          <button
+            type="button"
+            onClick={() => setViewMode('live')}
+            className={cn(
+              'px-4 py-1.5 rounded-lg text-sm font-medium transition-all',
+              viewMode === 'live' ? 'bg-white text-black' : 'text-helix-dim hover:text-helix-text2'
+            )}
+          >
+            Live
+          </button>
+          <button
+            type="button"
+            onClick={() => { setViewMode('history'); fetchHistory(); }}
+            className={cn(
+              'px-4 py-1.5 rounded-lg text-sm font-medium transition-all',
+              viewMode === 'history' ? 'bg-white text-black' : 'text-helix-dim hover:text-helix-text2'
+            )}
+          >
+            History
+          </button>
+        </div>
       </div>
 
       {viewMode === 'live' ? (
@@ -3241,11 +3378,8 @@ function TrainPageInner() {
               workersOnline={workersOnline}
               defaultVersion={defaultVersion}
               models={models}
-              trainedSessions={trainedSessions}
               selectedModelId={selectedModelId}
-              selectedSessionId={selectedSessionId}
               onSelectModel={handleSelectModel}
-              onSelectSession={handleSelectSession}
               isFetchingWeights={isFetchingWeights}
               fetchedModelName={fetchedModelName}
               isWalletPrompting={isWalletPrompting}
@@ -3270,6 +3404,9 @@ function TrainPageInner() {
               showStoreOn0G={wantsStoreOn0G}
               elapsedTime={elapsedTime}
               onMintNft={handleOpenMintModal}
+              onPause={handlePause}
+              onStop={handleStop}
+              onResume={handleResume}
             />
           )}
         </>

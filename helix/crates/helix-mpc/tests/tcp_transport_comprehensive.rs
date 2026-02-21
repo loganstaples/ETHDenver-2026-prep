@@ -165,7 +165,11 @@ async fn test_tcp_mpc_training() {
         batch_size: 1,
         on_step: None,
         on_sub_step: None,
+        on_cheater_detected: None,
+        on_recovery_completed: None,
         capture_checkpoint_weights: false,
+        signal_rx: None,
+        starting_step: 0,
     };
 
     let result = run_mpc_training(config).await.expect("TCP 20-step training should succeed");
@@ -354,7 +358,11 @@ async fn test_transport_equivalence() {
         batch_size: 1,
         on_step: None,
         on_sub_step: None,
+        on_cheater_detected: None,
+        on_recovery_completed: None,
         capture_checkpoint_weights: false,
+        signal_rx: None,
+        starting_step: 0,
     };
 
     let local_result = run_mpc_training(local_config)
@@ -381,7 +389,11 @@ async fn test_transport_equivalence() {
         batch_size: 1,
         on_step: None,
         on_sub_step: None,
+        on_cheater_detected: None,
+        on_recovery_completed: None,
         capture_checkpoint_weights: false,
+        signal_rx: None,
+        starting_step: 0,
     };
 
     let tcp_result = run_mpc_training(tcp_config)
@@ -463,7 +475,11 @@ async fn test_tcp_mpc_training_with_mac() {
         batch_size: 1,
         on_step: None,
         on_sub_step: None,
+        on_cheater_detected: None,
+        on_recovery_completed: None,
         capture_checkpoint_weights: false,
+        signal_rx: None,
+        starting_step: 0,
     };
 
     let result = run_mpc_training(config).await.expect("TCP MAC training should succeed");
@@ -661,7 +677,11 @@ async fn test_tcp_checkpoint_exchange() {
         batch_size: 1,
         on_step: None,
         on_sub_step: None,
+        on_cheater_detected: None,
+        on_recovery_completed: None,
         capture_checkpoint_weights: false,
+        signal_rx: None,
+        starting_step: 0,
     };
 
     let result = run_mpc_training(config).await.expect("TCP checkpoint training should succeed");
@@ -710,7 +730,11 @@ async fn test_tcp_share_distribution_and_reconstruction() {
         batch_size: 1,
         on_step: None,
         on_sub_step: None,
+        on_cheater_detected: None,
+        on_recovery_completed: None,
         capture_checkpoint_weights: false,
+        signal_rx: None,
+        starting_step: 0,
     };
 
     let result = run_mpc_training(config).await.expect("TCP share distribution should succeed");
@@ -819,7 +843,11 @@ async fn test_tcp_node_transport_equivalence() {
         batch_size: 1,
         on_step: None,
         on_sub_step: None,
+        on_cheater_detected: None,
+        on_recovery_completed: None,
         capture_checkpoint_weights: false,
+        signal_rx: None,
+        starting_step: 0,
     };
 
     let local_result = run_mpc_training(local_config)
@@ -846,7 +874,11 @@ async fn test_tcp_node_transport_equivalence() {
         batch_size: 1,
         on_step: None,
         on_sub_step: None,
+        on_cheater_detected: None,
+        on_recovery_completed: None,
         capture_checkpoint_weights: false,
+        signal_rx: None,
+        starting_step: 0,
     };
 
     let node_result = run_mpc_training(node_config)

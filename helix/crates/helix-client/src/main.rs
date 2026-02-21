@@ -582,6 +582,11 @@ struct MpcWorkerArgs {
     #[arg(long)]
     api_url: Option<String>,
 
+    /// Ethereum address of this worker (lowercase hex, e.g. "0x70997970...").
+    /// Passed by spawn-workers so trusted-node matching can identify this worker.
+    #[arg(long)]
+    address: Option<String>,
+
     /// Loop mode: restart worker after each job completes (used by spawn-workers)
     #[arg(long)]
     r#loop: bool,
@@ -2938,6 +2943,7 @@ async fn cmd_mpc_train(args: &MpcTrainArgs, _cli: &Cli) -> Result<()> {
         cheater_step: args.cheater_step,
         worker_seeds: Vec::new(), // CLI mode: seeds derived from config.seed + i
         trusted_nodes: None, // CLI: trusted nodes are configured via the dashboard
+        signal_tx: None, // CLI: no pause/stop signals (could add Ctrl+C handler later)
     };
 
     // Load custom training data from --data flag if provided
@@ -3148,6 +3154,32 @@ async fn cmd_mpc_train(args: &MpcTrainArgs, _cli: &Cli) -> Result<()> {
                     operation.dimmed(),
                 );
             }
+            ProgressEvent::CostUpdate { gas_spent_wei, worker_fees_accrued, deposit_amount } => {
+                println!(
+                    "  {} Gas: {} wei | Worker fees: {:.6} ADI / {:.6} ADI deposit",
+                    "$".dimmed(),
+                    gas_spent_wei,
+                    worker_fees_accrued,
+                    deposit_amount,
+                );
+            }
+            ProgressEvent::TrainingPaused { step, .. } => {
+                println!();
+                println!(
+                    "  {} Training paused at step {}",
+                    "⏸".yellow(),
+                    step,
+                );
+            }
+            ProgressEvent::TrainingStopped { step, refund_amount, .. } => {
+                println!();
+                println!(
+                    "  {} Training stopped at step {} (refund: {:.6} ADI)",
+                    "⏹".red(),
+                    step,
+                    refund_amount,
+                );
+            }
         }
     });
     orchestrator.set_progress_callback(progress_cb);
@@ -3217,6 +3249,9 @@ async fn cmd_mpc_worker(args: &MpcWorkerArgs, _cli: &Cli) -> Result<()> {
     if let Some(ref url) = args.api_url {
         println!("  API URL:         {}", url);
     }
+    if let Some(ref addr) = args.address {
+        println!("  ETH Address:     {}", addr);
+    }
     println!("  Loop Mode:       {}", if args.r#loop { "enabled" } else { "disabled" });
     #[cfg(feature = "chain")]
     {
@@ -3237,13 +3272,18 @@ async fn cmd_mpc_worker(args: &MpcWorkerArgs, _cli: &Cli) -> Result<()> {
     let http_client = reqwest::Client::new();
     let worker_id: Option<String> = if let Some(ref api_url) = args.api_url {
         let public_addr = format!("127.0.0.1:{}", data_addr.port());
+        let mut reg_body = serde_json::json!({
+            "endpoint": public_addr,
+            "party_index": args.party_index,
+            "seed": args.seed,
+        });
+        // Include ETH address if provided (for trusted-node matching).
+        if let Some(ref addr) = args.address {
+            reg_body["address"] = serde_json::Value::String(addr.to_lowercase());
+        }
         let resp = http_client
             .post(format!("{}/api/workers/register", api_url))
-            .json(&serde_json::json!({
-                "endpoint": public_addr,
-                "party_index": args.party_index,
-                "seed": args.seed,
-            }))
+            .json(&reg_body)
             .send()
             .await;
 
@@ -3497,7 +3537,7 @@ async fn cmd_spawn_workers(args: &SpawnWorkersArgs, _cli: &Cli) -> Result<()> {
     }
     println!();
 
-    // ── On-chain pool registration (still done by parent for staking) ──
+    // ── On-chain pool registration (owner pays for all workers) ──
     #[cfg(feature = "chain")]
     {
         use crate::rpc::chain_v4::ChainClientV4;
@@ -3506,66 +3546,108 @@ async fn cmd_spawn_workers(args: &SpawnWorkersArgs, _cli: &Cli) -> Result<()> {
 
         if let (Some(ref rpc_url), Some(ref coordinator)) = (&args.rpc_url, &args.coordinator) {
             let public_host = &_public_host;
-            println!("{}", "Registering workers in on-chain pool...".yellow().bold());
+            println!("{}", "Registering workers in on-chain pool (owner pays)...".yellow().bold());
 
-            let keys: Vec<String> = if let Some(ref pk_csv) = args.private_keys {
-                pk_csv.split(',').map(|s| s.trim().to_string()).collect()
+            // Owner wallet pays all gas + stake — workers need ZERO balance.
+            let owner_pk = std::env::var("TESTNET_PRIVATE_KEY")
+                .unwrap_or_default();
+            if owner_pk.is_empty() {
+                eprintln!("  {} TESTNET_PRIVATE_KEY not set — skipping on-chain registration", "✗".red());
             } else {
-                let anvil = vec![
-                    "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
-                    "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a",
-                    "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6",
-                    "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a",
-                    "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba",
-                    "0x92db14e403b83dfe3df233f83dfa3a0d7096f21ca9b0d6d6b8d88b2b4ec1564e",
-                    "0x4bbbf85ce3377467afe5d46f804f221813b2bb87f24d81f60f1fcdbf7cbf4356",
-                    "0xdbda1821b80551c9d65939329250298aa3472ba22feea921c0cf5d620ea67b97",
-                    "0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6",
-                ];
-                anvil[..args.count.min(anvil.len())]
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect()
-            };
-
-            let stake_wei = ethers::utils::parse_ether(args.stake_eth)
-                .unwrap_or(ethers::types::U256::from(100_000_000_000_000_000u64));
-
-            for (i, key) in keys.iter().enumerate().take(args.count) {
-                let pk = key.strip_prefix("0x").unwrap_or(key);
-                let wallet = match LocalWallet::from_str(pk) {
-                    Ok(w) => w,
-                    Err(e) => {
-                        eprintln!("  {} [worker-{}] invalid private key: {}", "✗".red(), i, e);
-                        continue;
-                    }
+                // Derive worker addresses from their private keys (for pool registration).
+                let worker_keys: Vec<String> = if let Some(ref pk_csv) = args.private_keys {
+                    pk_csv.split(',').map(|s| s.trim().to_string()).collect()
+                } else {
+                    // Pre-funded ADI testnet worker keys (same as TESTNET_WORKER_KEYS in dashboard.rs)
+                    let testnet = vec![
+                        "0x8d684f8cf3b6a00d8a4deba9c06176132056facc7a66f7d2fa8cd31127b09806",
+                        "0x23944b2afce56b6332c0fc74a1d11ca3508ea7a9f4b821f7a710a5f95eb6f772",
+                        "0x67fe620ca54f907b42a2585753d2aa2a902e1933a3152d8e30255e6a9f1dacd4",
+                        "0x880a8a9b8424533bfdaa5c03dacad0ab8f32a69d6f233b9a8301bcb2741f9867",
+                        "0xb26bf4ed563907b04f6738e33e1c5fb9b61a5097ad63859f9d4537dae3cb6012",
+                        "0x9c1b1d65d0bb28cb85acc34215a21a94c74171952e33c3b5749d4abb186f34a4",
+                    ];
+                    testnet[..args.count.min(testnet.len())]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect()
                 };
-                let addr = wallet.address();
-                let worker_pub_addr = format!("{}:{}", public_host, args.base_port + (i as u16) * 3);
 
-                match ChainClientV4::with_wallet(rpc_url, wallet, coordinator).await {
-                    Ok(client) => {
-                        match client.register_in_pool(&worker_pub_addr, stake_wei).await {
-                            Ok(receipt) => {
-                                let gas = receipt.gas_used.map(|g| g.as_u64()).unwrap_or(0);
-                                println!(
-                                    "  {} [worker-{}] registered on-chain (addr: {:#x}, gas: {})",
-                                    "✓".green(), i, addr, gas
-                                );
-                            }
-                            Err(e) => {
-                                eprintln!("  {} [worker-{}] on-chain registration failed: {}", "✗".red(), i, e);
+                let stake_wei = ethers::utils::parse_ether(args.stake_eth)
+                    .unwrap_or(ethers::types::U256::from(1_000_000_000_000_000u64)); // 0.001 ETH
+
+                // Create ONE ChainClient using the OWNER wallet.
+                let owner_pk_clean = owner_pk.strip_prefix("0x").unwrap_or(&owner_pk);
+                match ChainClientV4::new(rpc_url, owner_pk_clean, coordinator, None).await {
+                    Ok(owner_client) => {
+                        println!("  Owner wallet: {:#x}", owner_client.signer_address());
+
+                        for (i, key) in worker_keys.iter().enumerate().take(args.count) {
+                            let pk = key.strip_prefix("0x").unwrap_or(key);
+                            let worker_addr = match LocalWallet::from_str(pk) {
+                                Ok(w) => w.address(),
+                                Err(e) => {
+                                    eprintln!("  {} [worker-{}] invalid private key: {}", "✗".red(), i, e);
+                                    continue;
+                                }
+                            };
+                            let worker_pub_addr = format!("{}:{}", public_host, args.base_port + (i as u16) * 3);
+
+                            match owner_client.register_worker_in_pool_for(worker_addr, &worker_pub_addr, stake_wei).await {
+                                Ok(receipt) => {
+                                    let gas = receipt.gas_used.map(|g| g.as_u64()).unwrap_or(0);
+                                    println!(
+                                        "  {} [worker-{}] registered on-chain (addr: {:#x}, gas: {})",
+                                        "✓".green(), i, worker_addr, gas
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!("  {} [worker-{}] on-chain registration failed: {}", "✗".red(), i, e);
+                                }
                             }
                         }
                     }
                     Err(e) => {
-                        eprintln!("  {} [worker-{}] chain client error: {}", "✗".red(), i, e);
+                        eprintln!("  {} Owner chain client error: {}", "✗".red(), e);
                     }
                 }
+                println!();
             }
-            println!();
         }
     }
+
+    // Derive ETH addresses for each worker from Anvil private keys so child
+    // processes can register with their address (enables trusted-node matching).
+    #[cfg(feature = "chain")]
+    let worker_eth_addresses: Vec<Option<String>> = {
+        use ethers::signers::{LocalWallet, Signer};
+        use std::str::FromStr;
+
+        // Pre-funded ADI testnet worker keys (same as TESTNET_WORKER_KEYS in dashboard.rs)
+        let testnet_keys = [
+            "8d684f8cf3b6a00d8a4deba9c06176132056facc7a66f7d2fa8cd31127b09806",
+            "23944b2afce56b6332c0fc74a1d11ca3508ea7a9f4b821f7a710a5f95eb6f772",
+            "67fe620ca54f907b42a2585753d2aa2a902e1933a3152d8e30255e6a9f1dacd4",
+            "880a8a9b8424533bfdaa5c03dacad0ab8f32a69d6f233b9a8301bcb2741f9867",
+            "b26bf4ed563907b04f6738e33e1c5fb9b61a5097ad63859f9d4537dae3cb6012",
+            "9c1b1d65d0bb28cb85acc34215a21a94c74171952e33c3b5749d4abb186f34a4",
+        ];
+
+        // Use custom private keys if provided, otherwise testnet defaults.
+        let keys: Vec<&str> = if let Some(ref pk_csv) = args.private_keys {
+            pk_csv.split(',').map(|s| s.trim().trim_start_matches("0x")).collect()
+        } else {
+            testnet_keys[..args.count.min(testnet_keys.len())].to_vec()
+        };
+
+        (0..args.count).map(|i| {
+            keys.get(i).and_then(|pk| {
+                LocalWallet::from_str(pk).ok().map(|w| format!("{:#x}", w.address()))
+            })
+        }).collect()
+    };
+    #[cfg(not(feature = "chain"))]
+    let worker_eth_addresses: Vec<Option<String>> = vec![None; args.count];
 
     // Spawn each worker as a separate OS process.
     // Each child process runs `helix mpc-worker --loop --api-url ...` and self-registers.
@@ -3596,6 +3678,11 @@ async fn cmd_spawn_workers(args: &SpawnWorkersArgs, _cli: &Cli) -> Result<()> {
         // Pass --api-url so each child self-registers and heartbeats.
         if let Some(ref api_url) = args.api_url {
             cmd.arg("--api-url").arg(api_url);
+        }
+
+        // Pass --address so child registers with its ETH address (for trusted-node matching).
+        if let Some(ref addr) = worker_eth_addresses[i] {
+            cmd.arg("--address").arg(addr);
         }
 
         let child = cmd.spawn()

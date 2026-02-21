@@ -17,6 +17,8 @@ import {
   Search,
   X,
   Coins,
+  History,
+  Star,
 } from 'lucide-react';
 import { useAccount, useSignMessage, useWriteContract, useWaitForTransactionReceipt, useChainId } from 'wagmi';
 import { parseEther } from 'viem';
@@ -407,7 +409,7 @@ function ImageUpload({ onPixelsReady, canvasRef }: ImageUploadProps) {
         >
           <Upload size={24} className="text-helix-muted" />
           <p className="text-sm text-helix-text2">Drop an image or click to upload</p>
-          <p className="text-xs text-helix-muted">PNG, JPG, or any image of a digit</p>
+          <p className="text-sm text-helix-muted">PNG, JPG, or any image of a digit</p>
         </div>
       )}
       {fileName && (
@@ -425,7 +427,7 @@ function ImageUpload({ onPixelsReady, canvasRef }: ImageUploadProps) {
                 if (ctx) { ctx.fillStyle = '#000000'; ctx.fillRect(0, 0, CANVAS_SIZE, CANVAS_SIZE); }
               }
             }}
-            className="text-xs text-helix-muted hover:text-white ml-auto"
+            className="text-sm text-helix-muted hover:text-white ml-auto"
           >
             Remove
           </button>
@@ -462,7 +464,7 @@ function ProbabilityBars({ probabilities, prediction }: { probabilities: number[
               className={cn('h-full rounded-sm', digit === prediction ? 'bg-white' : 'bg-white/20')}
             />
           </div>
-          <span className={cn('w-14 text-right text-xs font-mono', digit === prediction ? 'text-white' : 'text-helix-muted')}>
+          <span className={cn('w-14 text-right text-sm font-mono', digit === prediction ? 'text-white' : 'text-helix-muted')}>
             {(prob * 100).toFixed(1)}%
           </span>
         </div>
@@ -487,7 +489,7 @@ function TimingBreakdown({ timing }: { timing: MPCInferenceResult['timing'] }) {
         <div key={p.label} className="flex items-center gap-3">
           <div className={cn('w-2 h-2 rounded-full shrink-0', p.color)} />
           <span className="text-xs text-helix-text flex-1">{p.label}</span>
-          <span className="text-xs text-helix-muted font-mono">{p.ms}ms</span>
+          <span className="text-sm text-helix-muted font-mono">{p.ms}ms</span>
         </div>
       ))}
       <div className="flex items-center gap-3 pt-1 border-t border-helix-border">
@@ -538,7 +540,7 @@ function MPCResultCard({ result }: { result: MPCInferenceResult }) {
             <p className="text-2xl font-mono font-light text-white">
               {(result.confidence * 100).toFixed(1)}%
             </p>
-            <p className="text-xs text-helix-muted mt-0.5">confidence</p>
+            <p className="text-sm text-helix-muted mt-0.5">confidence</p>
           </div>
           <div className="ml-auto">
             <CheckCircle size={24} className="text-green-400" />
@@ -552,23 +554,23 @@ function MPCResultCard({ result }: { result: MPCInferenceResult }) {
           <div className="mt-4 pt-3 border-t border-helix-border">
             <div className="flex items-center gap-2 mb-2">
               <Shield size={12} className="text-green-400" />
-              <span className="text-xs font-medium text-white">On-chain Attestation</span>
+              <span className="text-sm font-medium text-white">On-chain Attestation</span>
             </div>
             <div className="space-y-1.5">
               <div className="flex items-center gap-2">
-                <span className="text-xs text-helix-muted w-20">Input hash</span>
+                <span className="text-sm text-helix-muted w-20">Input hash</span>
                 <span className="text-xs text-helix-text font-mono truncate">
                   {result.attestation.input_hash.slice(0, 16)}...
                 </span>
               </div>
               <div className="flex items-center gap-2">
-                <span className="text-xs text-helix-muted w-20">Output hash</span>
+                <span className="text-sm text-helix-muted w-20">Output hash</span>
                 <span className="text-xs text-helix-text font-mono truncate">
                   {result.attestation.output_hash.slice(0, 16)}...
                 </span>
               </div>
               <div className="flex items-center gap-2">
-                <span className="text-xs text-helix-muted w-20">Signatures</span>
+                <span className="text-sm text-helix-muted w-20">Signatures</span>
                 <div className="flex items-center gap-1">
                   {result.attestation.worker_signatures.map((sig, i) => (
                     <div
@@ -586,12 +588,12 @@ function MPCResultCard({ result }: { result: MPCInferenceResult }) {
               </div>
               {result.attestation.chain_tx_hash && (
                 <div className="flex items-center gap-2 mt-1">
-                  <span className="text-xs text-helix-muted w-20">On-chain TX</span>
+                  <span className="text-sm text-helix-muted w-20">On-chain TX</span>
                   <span className="text-xs text-green-400 font-mono truncate">
                     {result.attestation.chain_tx_hash.slice(0, 18)}...
                   </span>
                   {result.attestation.inference_id != null && (
-                    <span className="text-xs text-helix-muted">(ID: {result.attestation.inference_id})</span>
+                    <span className="text-sm text-helix-muted">(ID: {result.attestation.inference_id})</span>
                   )}
                 </div>
               )}
@@ -604,7 +606,7 @@ function MPCResultCard({ result }: { result: MPCInferenceResult }) {
           <button
             type="button"
             onClick={() => setShowDetails(!showDetails)}
-            className="text-xs text-helix-muted hover:text-white transition-colors flex items-center gap-1"
+            className="text-sm text-helix-muted hover:text-white transition-colors flex items-center gap-1"
           >
             <Clock size={10} />
             {showDetails ? 'Hide' : 'Show'} timing breakdown
@@ -630,6 +632,364 @@ function MPCResultCard({ result }: { result: MPCInferenceResult }) {
 }
 
 // ============================================================================
+// Inference History Types & View
+// ============================================================================
+
+interface InferenceHistoryEntry {
+  id: string;
+  model: string;
+  status: string;
+  progress: number;
+  phase: string;
+  workers: number;
+  created: number;
+  inputLabel: string;
+  result: string;
+  confidence: number;
+  duration: number;
+}
+
+function InferenceHistoryView() {
+  const [entries, setEntries] = useState<InferenceHistoryEntry[]>([]);
+  const [historySearch, setHistorySearch] = useState('');
+  const [selectedEntry, setSelectedEntry] = useState<InferenceHistoryEntry | null>(null);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem('helix-inference-history');
+      setEntries(raw ? JSON.parse(raw) : []);
+    } catch {
+      setEntries([]);
+    }
+  }, []);
+
+  const filteredEntries = useMemo(() => {
+    if (!historySearch.trim()) return entries;
+    const q = historySearch.toLowerCase();
+    return entries.filter((e) =>
+      e.model.toLowerCase().includes(q) ||
+      e.result.includes(q),
+    );
+  }, [entries, historySearch]);
+
+  return (
+    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+
+      {/* ── LEFT COLUMN: Inference List ──────────────────────── */}
+      <div className="flex flex-col gap-5">
+
+        {/* Search bar */}
+        <div className="relative">
+          <Search size={16} className="absolute left-4 top-1/2 -translate-y-1/2 text-helix-muted pointer-events-none" />
+          <input
+            type="text"
+            value={historySearch}
+            onChange={(e) => setHistorySearch(e.target.value)}
+            placeholder="Search inferences..."
+            className="w-full pl-11 pr-4 py-3.5 bg-helix-surface border border-helix-border rounded-2xl text-base text-white placeholder:text-helix-dim focus:outline-none focus:border-helix-border2 transition-colors"
+          />
+          {historySearch && (
+            <button
+              type="button"
+              onClick={() => setHistorySearch('')}
+              className="absolute right-4 top-1/2 -translate-y-1/2 text-helix-muted hover:text-white"
+            >
+              <X size={14} />
+            </button>
+          )}
+        </div>
+
+        {/* Entry list */}
+        <div className="space-y-2 max-h-[520px] overflow-y-auto pr-1">
+          {entries.length === 0 ? (
+            <div className="flex flex-col items-center justify-center py-12 rounded-2xl bg-helix-surface border border-helix-border">
+              <History size={20} className="text-helix-dim mb-2" />
+              <p className="text-sm text-helix-text2">No inference history yet</p>
+              <p className="text-sm text-helix-muted mt-1">Run an inference to see it here</p>
+            </div>
+          ) : filteredEntries.length === 0 ? (
+            <div className="flex flex-col items-center justify-center py-12 rounded-2xl bg-helix-surface border border-helix-border">
+              <Search size={20} className="text-helix-dim mb-2" />
+              <p className="text-sm text-helix-text2">No inferences match your search</p>
+            </div>
+          ) : (
+            filteredEntries.map((entry) => {
+              const isSelected = selectedEntry?.id === entry.id;
+              const date = new Date(entry.created);
+
+              return (
+                <button
+                  key={entry.id}
+                  type="button"
+                  onClick={() => setSelectedEntry(isSelected ? null : entry)}
+                  className={cn(
+                    'w-full text-left rounded-2xl transition-all',
+                    isSelected
+                      ? 'bg-white/[0.07] ring-1 ring-white/20 px-6 py-5'
+                      : 'bg-helix-surface border border-helix-border hover:border-helix-border2 px-5 py-4',
+                  )}
+                >
+                  <div className="flex items-baseline justify-between gap-4">
+                    <h3 className={cn(
+                      'font-semibold text-white truncate tracking-tight',
+                      isSelected ? 'text-xl' : 'text-[15px]',
+                    )}>
+                      {entry.model}
+                    </h3>
+                    <span className={cn(
+                      'font-mono tabular-nums shrink-0',
+                      isSelected ? 'text-xl font-semibold text-white' : 'text-sm font-medium text-white/60',
+                    )}>
+                      Predicted: {entry.result}
+                    </span>
+                  </div>
+
+                  {/* Expanded details when selected */}
+                  {isSelected && (
+                    <div className="mt-3 flex items-center gap-3 flex-wrap">
+                      <span className="inline-flex items-center gap-1.5 text-sm font-medium px-2.5 py-1 rounded-full bg-green-500/10 text-green-400/90">
+                        <span className="w-1.5 h-1.5 rounded-full bg-green-400" />
+                        {entry.workers} Worker{entry.workers !== 1 ? 's' : ''}
+                      </span>
+                      <span className="text-sm text-helix-dim">
+                        {date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}
+                        {' '}
+                        {date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}
+                      </span>
+                      {entry.duration > 0 && (
+                        <span className="text-sm text-helix-dim font-mono">{entry.duration}ms</span>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Compact info when not selected */}
+                  {!isSelected && (
+                    <div className="flex items-center gap-3 mt-1.5">
+                      <span className="text-sm text-helix-dim tabular-nums">
+                        {date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+                      </span>
+                      <span className="text-sm text-helix-dim tabular-nums ml-auto">
+                        {(entry.confidence * 100).toFixed(1)}% conf
+                      </span>
+                    </div>
+                  )}
+                </button>
+              );
+            })
+          )}
+        </div>
+      </div>
+
+      {/* ── RIGHT COLUMN: Entry Details ────────────────────────── */}
+      <div className="flex flex-col gap-5">
+        {selectedEntry ? (
+          <InferenceHistoryDetailPanel entry={selectedEntry} />
+        ) : (
+          <div className="rounded-2xl bg-helix-surface border border-helix-border p-5">
+            <div className="flex flex-col items-center justify-center py-16">
+              <History size={24} className="text-helix-dim mb-3" />
+              <p className="text-base text-helix-text2">Select an inference to view details</p>
+              <p className="text-sm text-helix-muted mt-1">
+                {entries.length} inference{entries.length !== 1 ? 's' : ''} recorded
+              </p>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// Inference History Detail Panel
+// ============================================================================
+
+function InferenceHistoryDetailPanel({ entry }: { entry: InferenceHistoryEntry }) {
+  const date = new Date(entry.created);
+
+  return (
+    <motion.div
+      key={entry.id}
+      initial={{ opacity: 0, y: 8 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.25 }}
+      className="flex flex-col gap-5"
+    >
+      {/* Hero result card */}
+      <div className="rounded-2xl bg-helix-surface border border-helix-border overflow-hidden">
+        <div className="p-6">
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center gap-2">
+              <Shield size={14} className="text-green-400" />
+              <h3 className="text-base font-medium text-white">{entry.model}</h3>
+            </div>
+            <div className="flex items-center gap-2">
+              <Badge variant="default" className="text-green-400">
+                <Shield size={10} /> MPC
+              </Badge>
+              <Badge variant="default" className="text-blue-400">
+                <Users size={10} /> {entry.workers} worker{entry.workers !== 1 ? 's' : ''}
+              </Badge>
+              {entry.duration > 0 && (
+                <Badge variant="default" className="text-helix-text2">
+                  <Clock size={10} /> {entry.duration}ms
+                </Badge>
+              )}
+            </div>
+          </div>
+
+          {/* Big prediction */}
+          <div className="flex items-center gap-6 mb-2">
+            <div className="w-20 h-20 rounded-xl bg-white/[0.06] flex items-center justify-center">
+              <span className="text-4xl font-light text-white font-mono">{entry.result}</span>
+            </div>
+            <div>
+              <p className="text-2xl font-mono font-light text-white">
+                {(entry.confidence * 100).toFixed(1)}%
+              </p>
+              <p className="text-sm text-helix-muted mt-0.5">confidence</p>
+            </div>
+            <div className="ml-auto">
+              <CheckCircle size={24} className="text-green-400" />
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Details card */}
+      <div className="p-4 rounded-xl bg-helix-surface border border-helix-border space-y-2 text-sm">
+        <div className="flex justify-between">
+          <span className="text-helix-dim">Model</span>
+          <span className="text-helix-text2">{entry.model}</span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-helix-dim">Prediction</span>
+          <span className="text-helix-text2 font-mono">{entry.result}</span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-helix-dim">Confidence</span>
+          <span className="text-helix-text2 font-mono">{(entry.confidence * 100).toFixed(1)}%</span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-helix-dim">Workers</span>
+          <span className="text-helix-text2">{entry.workers}</span>
+        </div>
+        {entry.duration > 0 && (
+          <div className="flex justify-between">
+            <span className="text-helix-dim">Duration</span>
+            <span className="text-helix-text2 font-mono">{entry.duration}ms</span>
+          </div>
+        )}
+        <div className="flex justify-between">
+          <span className="text-helix-dim">Timestamp</span>
+          <span className="text-helix-text2">
+            {date.toLocaleString()}
+          </span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-helix-dim">ID</span>
+          <span className="text-helix-text2 font-mono">{entry.id}</span>
+        </div>
+      </div>
+    </motion.div>
+  );
+}
+
+// ============================================================================
+// Inference Rating Prompt
+// ============================================================================
+
+function InferenceRatingPrompt({
+  tokenId,
+  walletAddress,
+  onRated,
+}: {
+  tokenId: number;
+  walletAddress: string;
+  onRated: () => void;
+}) {
+  const [hoverRating, setHoverRating] = useState(0);
+  const [selectedRating, setSelectedRating] = useState(0);
+  const [avgRating, setAvgRating] = useState(0);
+  const [count, setCount] = useState(0);
+  const [submitted, setSubmitted] = useState(false);
+
+  useEffect(() => {
+    fetch(`/api/models/${tokenId}/rate?wallet=${encodeURIComponent(walletAddress)}`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (data) {
+          setAvgRating(data.averageRating ?? 0);
+          setCount(data.ratingCount ?? 0);
+          if (data.userRating) setSelectedRating(data.userRating);
+        }
+      })
+      .catch(() => {});
+  }, [tokenId, walletAddress]);
+
+  const handleRate = async (rating: number) => {
+    setSelectedRating(rating);
+    try {
+      const res = await fetch(`/api/models/${tokenId}/rate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ wallet: walletAddress, rating }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setAvgRating(data.averageRating ?? avgRating);
+        setCount(data.ratingCount ?? count);
+        setSubmitted(true);
+        onRated();
+      }
+    } catch { /* best-effort */ }
+  };
+
+  const displayRating = hoverRating || selectedRating;
+
+  return (
+    <div className="rounded-2xl bg-helix-surface border border-helix-border p-5">
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="text-base font-semibold text-white">Rate this model</h3>
+        {count > 0 && (
+          <span className="text-sm text-helix-muted font-mono tabular-nums">
+            {avgRating.toFixed(1)} avg · {count} rating{count !== 1 ? 's' : ''}
+          </span>
+        )}
+      </div>
+      <div className="flex items-center gap-0.5">
+        {[1, 2, 3, 4, 5].map((star) => (
+          <button
+            key={star}
+            type="button"
+            onMouseEnter={() => setHoverRating(star)}
+            onMouseLeave={() => setHoverRating(0)}
+            onClick={() => handleRate(star)}
+            className="p-1 transition-transform hover:scale-110"
+          >
+            <Star
+              size={24}
+              className={cn(
+                'transition-colors',
+                star <= displayRating
+                  ? 'text-yellow-400 fill-yellow-400'
+                  : 'text-white/[0.08]',
+              )}
+            />
+          </button>
+        ))}
+        {submitted && (
+          <span className="text-sm text-green-400 ml-3">Rated!</span>
+        )}
+        {selectedRating > 0 && !submitted && (
+          <span className="text-sm text-helix-dim ml-3">Your rating: {selectedRating}/5</span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
 // Inner Page
 // ============================================================================
 
@@ -642,7 +1002,7 @@ function InferencePageInner() {
   const chainId = useChainId();
 
   // Model discovery
-  const { allModels, isLoading: isLoadingPublic } = usePublicModels();
+  const { allModels, isLoading: isLoadingPublic, refetch: refetchPublicModels } = usePublicModels();
   const { models: myModels, isLoading: isLoadingMine } = useModelRegistry();
 
   const [filter, setFilter] = useState<ModelFilter>('all');
@@ -683,6 +1043,7 @@ function InferencePageInner() {
   const [phase, setPhase] = useState<InferencePhase>('idle');
   const [error, setError] = useState<string | null>(null);
   const [inputMode, setInputMode] = useState<InputMode>('draw');
+  const [viewMode, setViewMode] = useState<'live' | 'history'>('live');
 
   // Trained sessions from backend
   const [trainedSessions, setTrainedSessions] = useState<{ session_id: string; model_name?: string; model_slug?: string; accuracy: number | null; status: string; losses: number[] }[]>([]);
@@ -697,8 +1058,6 @@ function InferencePageInner() {
         const completed = (Array.isArray(sessions) ? sessions : [])
           .filter((s: { status: string }) => s.status === 'complete');
         setTrainedSessions(completed);
-
-        // Don't auto-select — let user pick
       } catch { /* non-fatal */ }
       finally { setIsLoadingTrained(false); }
     };
@@ -731,7 +1090,6 @@ function InferencePageInner() {
   // Filtered trained sessions (apply search + filter)
   const filteredSessions = useMemo(() => {
     let sessions = trainedSessions;
-    // "others" hides trained sessions (they're always yours)
     if (filter === 'others') return [];
     if (search.trim()) {
       const q = search.toLowerCase();
@@ -742,8 +1100,8 @@ function InferencePageInner() {
     return sessions;
   }, [trainedSessions, filter, search]);
 
-  // Whether any item is currently selected (model or session)
-  const hasSelection = selectedModel !== null || (activeSessionId !== null && weightFetchStatus === 'done' && !selectedModel);
+  // Whether a model is currently selected
+  const hasSelection = selectedModel !== null;
 
   // Fee calculation
   const ownerFeeBps = selectedModel?.inferenceFee ?? 0;
@@ -805,7 +1163,7 @@ function InferencePageInner() {
     setResult(null);
 
     try {
-      const res = await fetch(`${API_BASE}/api/models/${selectedModel.tokenId}/infer`, {
+      const res = await fetch(`/api/models/${selectedModel.tokenId}/infer`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -885,26 +1243,39 @@ function InferencePageInner() {
 
     // For ALL users (owner and non-owner): first check if backend already has cached weights
     const doFetch = async () => {
-      // Step 1: Check backend cache (inference-ready endpoint)
+      // Step 1: Check Rust backend cache (for owner MPC inference)
       try {
         const res = await fetch(`${API_BASE}/api/models/${selectedModel.tokenId}/inference-ready?version=${selectedVersionIndex}`);
         if (res.ok) {
           const data = await res.json();
           if (data.ready) {
             setBackendWeightsReady(true);
-            setInferenceReady(true);
-            setWeightFetchStatus('done');
-            if (data.sessionId) {
-              setActiveSessionId(data.sessionId);
-              setInferenceSessionId(data.sessionId);
+            if (data.sessionId) setActiveSessionId(data.sessionId);
+            // Owner can use MPC inference directly via Rust backend
+            if (isOwner) {
+              setInferenceReady(true);
+              if (data.sessionId) setInferenceSessionId(data.sessionId);
+              setWeightFetchStatus('done');
+              return;
             }
-            return;
           }
         }
       } catch { /* non-fatal */ }
 
-      // Step 2: If not cached and user is NOT owner, mark inference not ready
+      // Step 2: For non-owner, check Next.js cache (used by public inference JS forward pass)
       if (!isOwner) {
+        try {
+          const res = await fetch(`/api/models/${selectedModel.tokenId}/inference-ready?version=${selectedVersionIndex}`);
+          if (res.ok) {
+            const data = await res.json();
+            if (data.ready) {
+              setInferenceReady(true);
+              if (data.sessionId) setInferenceSessionId(data.sessionId);
+              setWeightFetchStatus('done');
+              return;
+            }
+          }
+        } catch { /* non-fatal */ }
         setInferenceReady(false);
         setInferenceSessionId(null);
         setWeightFetchError('Model owner hasn\u2019t enabled inference yet');
@@ -958,10 +1329,19 @@ function InferencePageInner() {
 
         // Also cache weights by token ID + version for future non-owner inference
         try {
-          await fetch(`${API_BASE}/api/models/${selectedModel.tokenId}/cache-weights?version=${selectedVersionIndex}`, {
+          await fetch(`${API_BASE}/api/models/${selectedModel.tokenId}/cache-weights?version=${selectedVersionIndex}&owner=${encodeURIComponent(address ?? '')}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(weightsData),
+          });
+        } catch { /* non-fatal */ }
+
+        // Cache to Next.js for non-owner public inference (JS forward pass)
+        try {
+          await fetch(`/api/models/${selectedModel.tokenId}/enable-inference`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ weights: weightsData, version: selectedVersionIndex, ownerAddress: address }),
           });
         } catch { /* non-fatal */ }
       } catch (err) {
@@ -1044,25 +1424,21 @@ function InferencePageInner() {
     setResult(null);
 
     try {
-      // Model-based inference only when backend has confirmed cached weights.
-      // Otherwise fall back to session-based endpoint which has robust fallback chain
-      // (uploaded_weights → latest completed session).
-      const useModelEndpoint = selectedModel && backendWeightsReady;
-      const body = useModelEndpoint ? {
+      if (!selectedModel) {
+        setError('No model selected');
+        setPhase('error');
+        return;
+      }
+      const body = {
         model_token_id: selectedModel.tokenId,
         model_version_index: selectedVersionIndex,
         pixels,
         num_parties: 3,
-        wallet_address: isOwnerOfSelected ? address : undefined,
+        wallet_address: address || undefined,
         payment_tx: paymentTxHash,
         trusted_nodes: trustedNodes.length > 0 ? trustedNodes : undefined,
-      } : {
-        session_id: activeSessionId,
-        pixels,
-        num_parties: 3,
-        trusted_nodes: trustedNodes.length > 0 ? trustedNodes : undefined,
       };
-      console.log('[Inference] Sending request', { useModelEndpoint, sessionId: activeSessionId, pixelsSample: pixels.slice(0, 5) });
+      console.log('[Inference] Sending request', { modelId: selectedModel.tokenId, pixelsSample: pixels.slice(0, 5) });
 
       const res = await fetch('/api/inference', {
         method: 'POST',
@@ -1082,7 +1458,7 @@ function InferencePageInner() {
       try {
         const entry = {
           id: `inf-${Date.now()}`,
-          model: selectedModel?.name ?? 'Unknown',
+          model: selectedModel?.name ?? 'Unknown Model',
           status: 'completed' as const,
           progress: 100,
           phase: 'done',
@@ -1130,13 +1506,10 @@ function InferencePageInner() {
   const hasDrawing = pixels.length > 0 && pixels.some((p) => p > 0.01);
   const isRunning = phase === 'submitting';
   const weightsReady = weightFetchStatus === 'done';
-  // Non-owner public inference: use inferenceReady (server-side forward pass, no MPC/payment)
-  // Owner inference or session-based: use existing MPC flow
+  // All inference (owner and non-owner) routes through MPC backend
   const canRunInference = !selectedModel
     ? weightsReady && hasDrawing && !isRunning && !!activeSessionId
-    : isOwnerOfSelected
-      ? (weightsReady || backendWeightsReady) && hasDrawing && !isRunning
-      : inferenceReady && hasDrawing && !isRunning;
+    : (weightsReady || backendWeightsReady || inferenceReady) && hasDrawing && !isRunning;
 
   // Select model handler (toggle: click again to deselect)
   const handleSelectModel = useCallback((model: PublicModel) => {
@@ -1203,15 +1576,41 @@ function InferencePageInner() {
             MNIST 784 → 128 → 10 · ~102K params · Secure MPC
           </p>
         </div>
-        <div className="flex items-center gap-2">
-          <Badge variant="default">MNIST</Badge>
-          <Badge variant="default" className="text-green-400">
-            <Shield size={10} /> MPC
-          </Badge>
+        <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2">
+            <Badge variant="default">MNIST</Badge>
+            <Badge variant="default" className="text-green-400">
+              <Shield size={10} /> MPC
+            </Badge>
+          </div>
+          <div className="flex items-center gap-1 p-1 rounded-xl bg-helix-surface border border-helix-border">
+            <button
+              type="button"
+              onClick={() => setViewMode('live')}
+              className={cn(
+                'px-4 py-1.5 rounded-lg text-sm font-medium transition-all',
+                viewMode === 'live' ? 'bg-white text-black' : 'text-helix-dim hover:text-helix-text2'
+              )}
+            >
+              Live
+            </button>
+            <button
+              type="button"
+              onClick={() => setViewMode('history')}
+              className={cn(
+                'px-4 py-1.5 rounded-lg text-sm font-medium transition-all',
+                viewMode === 'history' ? 'bg-white text-black' : 'text-helix-dim hover:text-helix-text2'
+              )}
+            >
+              History
+            </button>
+          </div>
         </div>
       </div>
 
-      {/* Two-column grid */}
+      {viewMode === 'live' ? (
+      <>
+      {/* ── TOP ROW: Model Discovery + Fee Card ─────────────── */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
 
         {/* ── LEFT COLUMN: Model Discovery ──────────────────────── */}
@@ -1258,7 +1657,7 @@ function InferencePageInner() {
           </div>
 
           {/* Model cards */}
-          <div className="space-y-2 max-h-[420px] overflow-y-auto pr-1">
+          <div className="space-y-3 max-h-[400px] overflow-y-auto pr-1">
             {isLoadingPublic && isLoadingTrained ? (
               <div className="flex items-center justify-center py-12">
                 <Loader2 size={20} className="animate-spin text-helix-muted" />
@@ -1285,6 +1684,7 @@ function InferencePageInner() {
                         accuracy={session.accuracy}
                         isSelected={isSelected}
                         onSelect={() => handleSelectSession(session)}
+                        showFee={false}
                       />
                     );
                   })
@@ -1316,6 +1716,11 @@ function InferencePageInner() {
                         ownerAddress={model.owner}
                         userAddress={address}
                         tokenId={model.tokenId}
+                        inferenceFee={model.inferenceFee}
+                        architecture={model.architecture}
+                        inferenceCount={model.inferenceCount}
+                        averageRating={model.averageRating}
+                        ratingCount={model.ratingCount}
                       />
                     );
                   })
@@ -1382,9 +1787,8 @@ function InferencePageInner() {
           </AnimatePresence>
         </div>
 
-        {/* ── RIGHT COLUMN: Fee, Input, Results ────────────────── */}
+        {/* ── RIGHT COLUMN: Fee Card (stretches to match left) ── */}
         <div className="flex flex-col gap-5">
-
           {/* Security badge for non-owner public model */}
           {selectedModel && !isOwnerOfSelected && inferenceReady && (
             <div className="flex items-center gap-2.5 px-4 py-3 bg-green-500/[0.04] border border-green-500/20 rounded-xl">
@@ -1406,52 +1810,52 @@ function InferencePageInner() {
           )}
 
           {/* Fee / Payment + Run button */}
-          <div className="rounded-2xl bg-helix-surface border border-helix-border overflow-hidden">
-            <div className="p-6">
-              <div className="flex items-center justify-between mb-4">
-                <span className="text-base font-medium text-helix-text2">Inference Fee</span>
+          <div className="rounded-2xl bg-helix-surface border border-helix-border overflow-hidden flex flex-col">
+            <div className="px-5 pt-5 pb-4">
+              {/* Title row — bold white, Apple/Cash App style */}
+              <div className="flex items-start justify-between">
+                <h3 className="text-2xl font-bold tracking-tight text-white">Inference Fee</h3>
                 {isOwnerOfSelected ? (
                   <Badge variant="default" className="text-green-400">
-                    <CheckCircle size={10} /> Free (you own this model)
+                    <CheckCircle size={10} /> Free
                   </Badge>
                 ) : selectedModel && !isOwnerOfSelected && inferenceReady ? (
                   <Badge variant="default" className="text-green-400">
-                    <CheckCircle size={10} /> Free (public inference)
+                    <CheckCircle size={10} /> Free
                   </Badge>
                 ) : selectedModel && ownerFeeBps > 0 ? (
                   <Badge variant="default" className="text-helix-text2">
                     <Coins size={10} />
-                    {(ownerFeeBps / 100).toFixed(1)}% owner fee
+                    {(ownerFeeBps / 100).toFixed(1)}% fee
                   </Badge>
                 ) : null}
               </div>
 
-              {/* Big fee number */}
-              <div className="flex items-baseline justify-center gap-4 py-2">
-                <span className="text-5xl font-bold tracking-tighter tabular-nums text-white">
+              {/* Fee amount */}
+              <div className="flex items-baseline gap-2 mt-3">
+                <span className="text-4xl font-bold tracking-tighter tabular-nums text-white">
                   {(isOwnerOfSelected || (!isOwnerOfSelected && inferenceReady)) ? '0.000000' : totalFee.toFixed(6)}
                 </span>
-                <span className="text-xl font-semibold text-helix-text2">ADI</span>
+                <span className="text-lg font-semibold text-helix-text2">ADI</span>
               </div>
 
-              {/* Fee breakdown */}
-              <div className="flex items-center justify-center gap-4 mt-3 text-sm text-helix-dim">
+              {/* Fee breakdown — single line */}
+              <p className="text-sm text-helix-dim mt-1.5">
                 {isOwnerOfSelected ? (
-                  <span>Owner inference is always free</span>
-                ) : !isOwnerOfSelected && inferenceReady ? (
-                  <span>Public inference — server-side forward pass</span>
+                  'Owner inference is always free'
+                ) : !isOwnerOfSelected && (inferenceReady || backendWeightsReady) ? (
+                  'Public inference — MPC distributed'
+                ) : ownerFeeBps > 0 ? (
+                  `Workers ${BASE_INFERENCE_COST.toFixed(4)} + Owner ${(ownerFeeBps / 100).toFixed(1)}%`
                 ) : (
-                  <>
-                    <span>Workers: {BASE_INFERENCE_COST.toFixed(4)} ADI</span>
-                    {ownerFeeBps > 0 && (
-                      <>
-                        <span>+</span>
-                        <span>Owner: {(ownerFeeBps / 100).toFixed(1)}%</span>
-                      </>
-                    )}
-                  </>
+                  `Workers ${BASE_INFERENCE_COST.toFixed(4)} ADI`
                 )}
-              </div>
+                {!isOwnerOfSelected && !inferenceReady && !backendWeightsReady && (
+                  <span className="ml-2 text-helix-dim/60 border-b border-dotted border-helix-border cursor-help group relative">
+                    · deposit refundable
+                  </span>
+                )}
+              </p>
             </div>
 
             {/* Run button */}
@@ -1460,8 +1864,8 @@ function InferencePageInner() {
               onClick={
                 isOwnerOfSelected || !selectedModel
                   ? () => runInference()
-                  : inferenceReady
-                    ? () => handlePublicInference(pixels)
+                  : (inferenceReady || backendWeightsReady)
+                    ? () => runInference()
                     : handlePayAndRun
               }
               disabled={!canRunInference}
@@ -1482,154 +1886,178 @@ function InferencePageInner() {
                 <><Loader2 size={22} className="animate-spin" /> Running Inference...</>
               ) : isOwnerOfSelected || !selectedModel ? (
                 <><Shield size={22} /> Run Inference</>
-              ) : inferenceReady ? (
-                <><Shield size={22} /> Run Public Inference</>
+              ) : (inferenceReady || backendWeightsReady) ? (
+                <><Shield size={22} /> Run MPC Inference</>
               ) : (
                 <><Coins size={22} /> Pay &amp; Run Inference</>
               )}
             </motion.button>
           </div>
+        </div>
+      </div>
 
-          {/* Input card */}
-          <div className="rounded-2xl bg-helix-surface border border-helix-border overflow-hidden p-5">
-            <div className="flex items-center justify-between mb-4">
-              <div className="flex items-center gap-1 p-0.5 rounded-xl bg-helix-bg border border-helix-border">
-                <button
-                  type="button"
-                  onClick={() => { setInputMode('draw'); clearCanvas(); }}
-                  className={cn(
-                    'flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-all',
-                    inputMode === 'draw'
-                      ? 'bg-white/[0.08] text-white'
-                      : 'text-helix-muted hover:text-helix-text',
-                  )}
-                >
-                  <Pencil size={12} /> Draw
-                </button>
-                <button
-                  type="button"
-                  onClick={() => { setInputMode('upload'); clearCanvas(); }}
-                  className={cn(
-                    'flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-all',
-                    inputMode === 'upload'
-                      ? 'bg-white/[0.08] text-white'
-                      : 'text-helix-muted hover:text-helix-text',
-                  )}
-                >
-                  <Upload size={12} /> Upload
-                </button>
-              </div>
-              {inputMode === 'draw' && (
-                <button
-                  type="button"
-                  onClick={clearCanvas}
-                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm text-helix-muted bg-helix-bg border border-helix-border hover:text-white hover:border-helix-border2 transition-colors"
-                >
-                  <Eraser size={12} /> Clear
-                </button>
-              )}
+      {/* ── BOTTOM ROW: Input + Results side by side ────────── */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+
+        {/* ── LEFT: Drawing / Upload Input ──────────────────── */}
+        <div className="rounded-2xl bg-helix-surface border border-helix-border overflow-hidden p-5">
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center gap-1 p-0.5 rounded-xl bg-helix-bg border border-helix-border">
+              <button
+                type="button"
+                onClick={() => { setInputMode('draw'); clearCanvas(); }}
+                className={cn(
+                  'flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-all',
+                  inputMode === 'draw'
+                    ? 'bg-white/[0.08] text-white'
+                    : 'text-helix-muted hover:text-helix-text',
+                )}
+              >
+                <Pencil size={12} /> Draw
+              </button>
+              <button
+                type="button"
+                onClick={() => { setInputMode('upload'); clearCanvas(); }}
+                className={cn(
+                  'flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-all',
+                  inputMode === 'upload'
+                    ? 'bg-white/[0.08] text-white'
+                    : 'text-helix-muted hover:text-helix-text',
+                )}
+              >
+                <Upload size={12} /> Upload
+              </button>
             </div>
-
-            <div className="flex justify-center mb-3">
-              {inputMode === 'draw' ? (
-                <div className="relative">
-                  <DrawingCanvas canvasRef={canvasRef} onPixelsReady={setPixels} />
-                  <div
-                    className="absolute inset-0 pointer-events-none rounded-xl opacity-[0.03]"
-                    style={{
-                      backgroundImage: `linear-gradient(rgba(255,255,255,0.5) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.5) 1px, transparent 1px)`,
-                      backgroundSize: `${CANVAS_SIZE / GRID_SIZE}px ${CANVAS_SIZE / GRID_SIZE}px`,
-                    }}
-                  />
-                </div>
-              ) : (
-                <ImageUpload canvasRef={canvasRef} onPixelsReady={setPixels} />
-              )}
-            </div>
-
-            <p className="text-sm text-helix-dim text-center">
-              {inputMode === 'draw' ? 'Draw a digit (0-9)' : 'Upload an image of a handwritten digit'}
-            </p>
+            {inputMode === 'draw' && (
+              <button
+                type="button"
+                onClick={clearCanvas}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm text-helix-muted bg-helix-bg border border-helix-border hover:text-white hover:border-helix-border2 transition-colors"
+              >
+                <Eraser size={12} /> Clear
+              </button>
+            )}
           </div>
 
-          {/* Results */}
-          <div className="space-y-4">
-            {isRunning && (
-              <div className="rounded-2xl bg-helix-surface border border-helix-border p-5">
-                <div className="flex items-center gap-3">
-                  <Loader2 size={16} className="animate-spin text-white" />
-                  <div>
-                    <p className="text-base text-white">
-                      {selectedModel && !isOwnerOfSelected && inferenceReady
-                        ? 'Running public inference...'
-                        : 'Running distributed MPC inference...'}
-                    </p>
-                    <p className="text-sm text-helix-muted mt-0.5">
-                      {selectedModel && !isOwnerOfSelected && inferenceReady
-                        ? 'Server-side forward pass on cached model weights'
-                        : 'Secret-sharing across 3 workers, running forward pass via transport'}
-                    </p>
-                  </div>
+          <div className="flex justify-center mb-3">
+            {inputMode === 'draw' ? (
+              <div className="relative">
+                <DrawingCanvas canvasRef={canvasRef} onPixelsReady={setPixels} />
+                <div
+                  className="absolute inset-0 pointer-events-none rounded-xl opacity-[0.03]"
+                  style={{
+                    backgroundImage: `linear-gradient(rgba(255,255,255,0.5) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.5) 1px, transparent 1px)`,
+                    backgroundSize: `${CANVAS_SIZE / GRID_SIZE}px ${CANVAS_SIZE / GRID_SIZE}px`,
+                  }}
+                />
+              </div>
+            ) : (
+              <ImageUpload canvasRef={canvasRef} onPixelsReady={setPixels} />
+            )}
+          </div>
+
+          <p className="text-sm text-helix-dim text-center">
+            {inputMode === 'draw' ? 'Draw a digit (0-9)' : 'Upload an image of a handwritten digit'}
+          </p>
+        </div>
+
+        {/* ── RIGHT: Prediction / Results ───────────────────── */}
+        <div className="flex flex-col gap-4">
+          {isRunning && (
+            <div className="rounded-2xl bg-helix-surface border border-helix-border p-5 flex-1 flex items-center">
+              <div className="flex items-center gap-3">
+                <Loader2 size={16} className="animate-spin text-white" />
+                <div>
+                  <p className="text-base text-white">
+                    {selectedModel && !isOwnerOfSelected && inferenceReady
+                      ? 'Running public inference...'
+                      : 'Running distributed MPC inference...'}
+                  </p>
+                  <p className="text-sm text-helix-muted mt-0.5">
+                    {selectedModel && !isOwnerOfSelected && inferenceReady
+                      ? 'Server-side forward pass on cached model weights'
+                      : 'Secret-sharing across 3 workers, running forward pass via transport'}
+                  </p>
                 </div>
               </div>
-            )}
+            </div>
+          )}
 
-            {error && (
-              <motion.div
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                className="bg-red-500/10 border border-red-500/30 rounded-2xl px-5 py-4"
-              >
-                <div className="flex items-start gap-2">
-                  <AlertTriangle size={14} className="text-red-400 shrink-0 mt-0.5" />
-                  <div>
-                    <p className="text-sm text-red-300">{error}</p>
-                    <button
-                      type="button"
-                      onClick={() => { setError(null); setPhase('idle'); }}
-                      className="text-xs text-red-400 hover:text-red-300 mt-1 underline"
-                    >
-                      Dismiss
-                    </button>
-                  </div>
+          {error && (
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              className="bg-red-500/10 border border-red-500/30 rounded-2xl px-5 py-4"
+            >
+              <div className="flex items-start gap-2">
+                <AlertTriangle size={14} className="text-red-400 shrink-0 mt-0.5" />
+                <div>
+                  <p className="text-sm text-red-300">{error}</p>
+                  <button
+                    type="button"
+                    onClick={() => { setError(null); setPhase('idle'); }}
+                    className="text-xs text-red-400 hover:text-red-300 mt-1 underline"
+                  >
+                    Dismiss
+                  </button>
                 </div>
-              </motion.div>
-            )}
+              </div>
+            </motion.div>
+          )}
 
-            {phase === 'done' && result && (
+          {phase === 'done' && result && (
+            <>
               <motion.div
                 initial={{ opacity: 0, y: 8 }}
                 animate={{ opacity: 1, y: 0 }}
                 transition={{ duration: 0.3 }}
+                className="flex-1"
               >
                 <MPCResultCard result={result} />
               </motion.div>
-            )}
+              {selectedModel && address && (
+                <motion.div
+                  initial={{ opacity: 0, y: 8 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  transition={{ duration: 0.3, delay: 0.15 }}
+                >
+                  <InferenceRatingPrompt
+                    tokenId={selectedModel.tokenId}
+                    walletAddress={address}
+                    onRated={refetchPublicModels}
+                  />
+                </motion.div>
+              )}
+            </>
+          )}
 
-            {!isRunning && !error && phase === 'idle' && (
-              <div className="rounded-2xl bg-helix-surface border border-helix-border p-5">
-                <div className="flex flex-col items-center justify-center py-8">
-                  <Shield size={24} className="text-helix-dim mb-3" />
-                  <p className="text-base text-helix-text2">
-                    {selectedModel && !isOwnerOfSelected && !inferenceReady
-                      ? 'Inference not available for this model'
-                      : !weightsReady && !inferenceReady
-                        ? 'Select a model to get started'
-                        : !hasDrawing
-                          ? 'Draw a digit and click Run Inference'
-                          : 'Ready to classify'}
-                  </p>
-                  <p className="text-sm text-helix-muted mt-1">
-                    {selectedModel && !isOwnerOfSelected && inferenceReady
-                      ? 'Public inference — prediction without weight access'
-                      : 'Secure multi-party computation across independent workers'}
-                  </p>
-                </div>
+          {!isRunning && !error && phase === 'idle' && (
+            <div className="rounded-2xl bg-helix-surface border border-helix-border p-5 flex-1 flex items-center justify-center">
+              <div className="flex flex-col items-center justify-center py-8">
+                <Shield size={24} className="text-helix-dim mb-3" />
+                <p className="text-base text-helix-text2">
+                  {selectedModel && !isOwnerOfSelected && !inferenceReady
+                    ? 'Inference not available for this model'
+                    : !weightsReady && !inferenceReady
+                      ? 'Select a model to get started'
+                      : !hasDrawing
+                        ? 'Draw a digit and click Run Inference'
+                        : 'Ready to classify'}
+                </p>
+                <p className="text-sm text-helix-muted mt-1">
+                  {selectedModel && !isOwnerOfSelected && inferenceReady
+                    ? 'Public inference — prediction without weight access'
+                    : 'Secure multi-party computation across independent workers'}
+                </p>
               </div>
-            )}
-          </div>
+            </div>
+          )}
         </div>
       </div>
+      </>
+      ) : (
+        <InferenceHistoryView />
+      )}
     </motion.div>
   );
 }

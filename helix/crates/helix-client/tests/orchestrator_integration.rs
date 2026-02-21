@@ -744,6 +744,8 @@ fn test_orchestration_result_roundtrip() {
         total_gas_used: 1_200_000,
         zk_proofs_generated: 0,
         zk_proofs_on_chain: 0,
+        model_nft_token_id: None,
+        model_store_address: String::new(),
     };
 
     let json = serde_json::to_string_pretty(&result).unwrap();
@@ -788,6 +790,7 @@ fn test_progress_event_variants() {
             step: 1,
             total: 100,
             loss: 2.3,
+            accuracy: 0.0,
             mac_ok: true,
         },
         ProgressEvent::CheckpointSubmitted {

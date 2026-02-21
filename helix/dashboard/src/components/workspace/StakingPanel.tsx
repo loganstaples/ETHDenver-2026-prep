@@ -48,14 +48,14 @@ export function StakingPanel({ modelId }: StakingPanelProps) {
     setActionError(null);
     const trimmed = amount.trim();
     if (!trimmed || isNaN(Number(trimmed)) || Number(trimmed) <= 0) {
-      setActionError('Enter a valid amount');
+      setActionError('Please enter a valid staking amount');
       return;
     }
     try {
       await stakeTokens(trimmed);
       setAmount('');
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : 'Staking failed');
+      setActionError(err instanceof Error ? err.message : 'Stake transaction failed. Please check your wallet and try again.');
     }
   }, [amount, stakeTokens]);
 
@@ -64,7 +64,7 @@ export function StakingPanel({ modelId }: StakingPanelProps) {
     try {
       await unstakeTokens();
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : 'Unstaking failed');
+      setActionError(err instanceof Error ? err.message : 'Unstake transaction failed. Please check your wallet and try again.');
     }
   }, [unstakeTokens]);
 
@@ -86,14 +86,14 @@ export function StakingPanel({ modelId }: StakingPanelProps) {
     <div className="space-y-6">
       {/* Stake Summary */}
       <Card variant="glass" className="space-y-4">
-        <h3 className="text-2xs font-mono uppercase tracking-wider text-helix-muted">
+        <h3 className="text-sm text-helix-muted">
           Stake Summary
         </h3>
 
         <div className="grid grid-cols-3 gap-6">
           {/* Current Stake */}
           <div className="space-y-1">
-            <p className="text-2xs text-helix-muted uppercase tracking-wider">
+            <p className="text-sm text-helix-muted">
               Current Stake
             </p>
             <p className="text-2xl font-light tracking-tight text-helix-text">
@@ -104,7 +104,7 @@ export function StakingPanel({ modelId }: StakingPanelProps) {
 
           {/* Lock Status */}
           <div className="space-y-1">
-            <p className="text-2xs text-helix-muted uppercase tracking-wider">
+            <p className="text-sm text-helix-muted">
               Lock Status
             </p>
             <div className="flex items-center gap-2 mt-1">
@@ -129,7 +129,7 @@ export function StakingPanel({ modelId }: StakingPanelProps) {
 
           {/* Slashed Status */}
           <div className="space-y-1">
-            <p className="text-2xs text-helix-muted uppercase tracking-wider">
+            <p className="text-sm text-helix-muted">
               Slashed
             </p>
             {stake?.slashed ? (
@@ -148,7 +148,7 @@ export function StakingPanel({ modelId }: StakingPanelProps) {
 
       {/* Stake/Unstake Actions */}
       <Card variant="default" className="space-y-4">
-        <h3 className="text-2xs font-mono uppercase tracking-wider text-helix-muted">
+        <h3 className="text-sm text-helix-muted">
           Manage Stake
         </h3>
 
@@ -156,7 +156,7 @@ export function StakingPanel({ modelId }: StakingPanelProps) {
         <div className="space-y-2">
           <label
             htmlFor="stake-amount"
-            className="text-2xs text-helix-muted uppercase tracking-wider"
+            className="text-sm text-helix-muted"
           >
             Amount (ADI)
           </label>
@@ -224,25 +224,25 @@ export function StakingPanel({ modelId }: StakingPanelProps) {
       {/* Staking Rewards */}
       <Card variant="default" className="space-y-3">
         <div className="flex items-center justify-between">
-          <h3 className="text-2xs font-mono uppercase tracking-wider text-helix-muted">
+          <h3 className="text-sm text-helix-muted">
             Staking Rewards
           </h3>
           <span className="text-2xs font-mono px-2 py-0.5 rounded-full bg-white/[0.06] text-helix-dim">
-            Coming Soon
+            Planned
           </span>
         </div>
         <p className="text-2xs text-helix-dim py-4">
-          Earn rewards for staking on models. Reward distribution and claiming will be available in a future update.
+          Earn rewards for staking on models. Reward distribution and claiming will be available in a future release.
         </p>
       </Card>
 
-      {/* Staking History Placeholder */}
+      {/* Staking History */}
       <Card variant="default" className="space-y-3">
-        <h3 className="text-2xs font-mono uppercase tracking-wider text-helix-muted">
+        <h3 className="text-sm text-helix-muted">
           Staking History
         </h3>
         <p className="text-2xs text-helix-dim py-4">
-          Transaction history coming soon
+          Transaction history will be available in a future release.
         </p>
       </Card>
     </div>

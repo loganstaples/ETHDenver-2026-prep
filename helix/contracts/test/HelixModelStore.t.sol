@@ -23,6 +23,7 @@ contract HelixModelStoreTest is Test {
     event TransferInitiated(uint256 indexed tokenId, address indexed seller, address indexed buyer, uint256 price, uint40 deadline);
     event TransferCompleted(uint256 indexed tokenId, address indexed seller, address indexed buyer, string newRootHash);
     event TransferCancelled(uint256 indexed tokenId, address indexed cancelledBy);
+    event ModelDeleted(uint256 indexed tokenId, address indexed owner, string slug);
 
     function setUp() public {
         store = new HelixModelStore();
@@ -1121,5 +1122,138 @@ contract HelixModelStoreTest is Test {
         HelixModelStore.Version memory v = store.getVersion(tokenId, 0);
         assertEq(v.rootHash, "");
         assertFalse(v.weightsStored);
+    }
+
+    // -------------------------------------------------------
+    // deleteModel
+    // -------------------------------------------------------
+
+    function test_deleteModel_burnsNFTAndCleansUp() public {
+        vm.startPrank(alice);
+        uint256 tokenId = store.createModel("del-1", "Delete Me", "desc", "784x32x10");
+        store.addVersion(tokenId, "1.0.0", "0xhash", 9500, "s1", true);
+        vm.stopPrank();
+
+        assertEq(store.totalSupply(), 1);
+        assertEq(store.balanceOf(alice), 1);
+
+        vm.prank(alice);
+        store.deleteModel(tokenId);
+
+        // NFT burned
+        assertEq(store.totalSupply(), 0);
+        assertEq(store.balanceOf(alice), 0);
+
+        // ownerOf should revert for burned token
+        vm.expectRevert();
+        store.ownerOf(tokenId);
+    }
+
+    function test_deleteModel_releasesSlug() public {
+        vm.startPrank(alice);
+        uint256 tokenId = store.createModel("reuse-slug", "Reusable", "", "");
+        store.deleteModel(tokenId);
+        vm.stopPrank();
+
+        // Slug should be available again
+        vm.prank(bob);
+        uint256 newTokenId = store.createModel("reuse-slug", "Reused Model", "", "");
+        assertEq(store.ownerOf(newTokenId), bob);
+    }
+
+    function test_deleteModel_nonOwnerReverts() public {
+        vm.prank(alice);
+        uint256 tokenId = store.createModel("del-auth", "Auth", "", "");
+
+        vm.prank(bob);
+        vm.expectRevert("Not model owner");
+        store.deleteModel(tokenId);
+    }
+
+    function test_deleteModel_revertsWithPendingTransfer() public {
+        vm.startPrank(alice);
+        uint256 tokenId = store.createModel("del-pend", "Pending", "", "");
+        store.setForSale(tokenId, true);
+        store.setSalePrice(tokenId, 1 ether);
+        vm.stopPrank();
+
+        vm.prank(bob);
+        store.buyModel{value: 1 ether}(tokenId);
+
+        vm.prank(alice);
+        vm.expectRevert("Cannot delete with pending transfer");
+        store.deleteModel(tokenId);
+    }
+
+    function test_deleteModel_withdrawsAccruedFees() public {
+        vm.startPrank(alice);
+        uint256 tokenId = store.createModel("del-fees", "Fees", "", "");
+        store.setPublic(tokenId, true);
+        store.setInferenceFee(tokenId, 1000); // 10%
+        vm.stopPrank();
+
+        vm.prank(bob);
+        store.payForInference{value: 1 ether}(tokenId);
+        // ownerShare = 0.1 ether
+
+        uint256 aliceBalBefore = alice.balance;
+
+        vm.prank(alice);
+        store.deleteModel(tokenId);
+
+        // Alice should have received the 0.1 ether in accrued fees
+        assertEq(alice.balance, aliceBalBefore + 0.1 ether);
+        assertEq(store.inferenceFeesAccrued(tokenId), 0);
+    }
+
+    function test_deleteModel_emitsEvent() public {
+        vm.startPrank(alice);
+        uint256 tokenId = store.createModel("del-evt", "Delete Event", "", "");
+
+        vm.expectEmit(true, true, false, true);
+        emit ModelDeleted(tokenId, alice, "del-evt");
+        store.deleteModel(tokenId);
+        vm.stopPrank();
+    }
+
+    function test_deleteModel_clearsMarketplaceState() public {
+        vm.startPrank(alice);
+        uint256 tokenId = store.createModel("del-mkt", "Market", "", "");
+        store.setForSale(tokenId, true);
+        store.setSalePrice(tokenId, 2 ether);
+        store.deleteModel(tokenId);
+        vm.stopPrank();
+
+        assertFalse(store.isForSale(tokenId));
+        assertEq(store.salePrice(tokenId), 0);
+    }
+
+    function test_deleteModel_clearsVersions() public {
+        vm.startPrank(alice);
+        uint256 tokenId = store.createModel("del-ver", "Versions", "", "");
+        store.addVersion(tokenId, "1.0.0", "hash1", 9000, "s1", true);
+        store.addVersion(tokenId, "2.0.0", "hash2", 9500, "s2", true);
+        assertEq(store.getVersionCount(tokenId), 2);
+
+        store.deleteModel(tokenId);
+        vm.stopPrank();
+
+        assertEq(store.getVersionCount(tokenId), 0);
+    }
+
+    function test_deleteModel_multipleModels_onlyDeletesTarget() public {
+        vm.startPrank(alice);
+        uint256 id0 = store.createModel("keep-1", "Keep 1", "", "");
+        uint256 id1 = store.createModel("del-target", "Delete Target", "", "");
+        uint256 id2 = store.createModel("keep-2", "Keep 2", "", "");
+
+        store.deleteModel(id1);
+        vm.stopPrank();
+
+        // Other models still exist
+        assertEq(store.ownerOf(id0), alice);
+        assertEq(store.ownerOf(id2), alice);
+        assertEq(store.balanceOf(alice), 2);
+        assertEq(store.totalSupply(), 2);
     }
 }

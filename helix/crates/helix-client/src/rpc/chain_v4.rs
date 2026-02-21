@@ -64,7 +64,11 @@ pub struct V4JobSummary {
     pub num_rounds: u64,
     pub payment_amount: U256,
     pub active_worker_count: u64,
+    /// JobStatus enum from contract: 0=Active, 1=Paused, 2=Stopped, 3=Completed.
+    pub status: u8,
+    /// Derived: status == Active (0) or status == Paused (1).
     pub active: bool,
+    /// Derived: status == Completed (3).
     pub completed: bool,
     pub zk_enabled: bool,
     pub zk_activated_by_risk: bool,
@@ -738,6 +742,33 @@ impl ChainClientV4 {
         result
     }
 
+    // ============ Stop / Cancel Training ============
+
+    /// Stop an active or paused training job.
+    /// The contract refunds the owner proportionally: workers get paid for
+    /// steps completed, the remainder is sent back to `job.owner`.
+    pub async fn stop_training(&self, job_id: u64) -> Result<TransactionReceipt> {
+        self.check_cb().await?;
+        let result: Result<TransactionReceipt> = async {
+            let call = self.coordinator.stop_training(U256::from(job_id));
+            let pending = call
+                .send()
+                .await
+                .map_err(|e| anyhow!("stop_training send: {}", e))?;
+            pending
+                .await
+                .map_err(|e| anyhow!("stop_training receipt: {}", e))?
+                .ok_or_else(|| anyhow!("stop_training: tx dropped"))
+        }
+        .await;
+        if result.is_ok() {
+            self.ok().await;
+        } else {
+            self.fail().await;
+        }
+        result
+    }
+
     // ============ Stake Withdrawal ============
 
     /// Withdraw stake after job completion and 7-day cooldown.
@@ -970,16 +1001,18 @@ impl ChainClientV4 {
                 .call()
                 .await
                 .map_err(|e| anyhow!("get_job_summary: {}", e))?;
+            let status = resp.5;
             Ok(V4JobSummary {
                 owner: resp.0,
                 current_step: resp.1.as_u64(),
                 num_rounds: resp.2.as_u64(),
                 payment_amount: resp.3,
                 active_worker_count: resp.4.as_u64(),
-                active: resp.5,
-                completed: resp.6,
-                zk_enabled: resp.7,
-                zk_activated_by_risk: resp.8,
+                status,
+                active: status == 0 || status == 1, // Active or Paused
+                completed: status == 3, // Completed
+                zk_enabled: resp.6,
+                zk_activated_by_risk: resp.7,
             })
         }
         .await;
@@ -1200,6 +1233,32 @@ impl ChainClientV4 {
             .await
             .map_err(|e| anyhow!("register_in_pool receipt: {}", e))?
             .ok_or_else(|| anyhow!("register_in_pool: no receipt"));
+        if result.is_ok() {
+            self.ok().await;
+        } else {
+            self.fail().await;
+        }
+        result
+    }
+
+    /// Register a worker in the global pool on their behalf (caller pays stake).
+    pub async fn register_worker_in_pool_for(
+        &self,
+        worker: Address,
+        endpoint: &str,
+        stake: U256,
+    ) -> Result<TransactionReceipt> {
+        self.check_cb().await?;
+        let result = self
+            .coordinator
+            .register_worker_in_pool_for(worker, endpoint.to_string())
+            .value(stake)
+            .send()
+            .await
+            .map_err(|e| anyhow!("register_worker_in_pool_for send: {}", e))?
+            .await
+            .map_err(|e| anyhow!("register_worker_in_pool_for receipt: {}", e))?
+            .ok_or_else(|| anyhow!("register_worker_in_pool_for: no receipt"));
         if result.is_ok() {
             self.ok().await;
         } else {

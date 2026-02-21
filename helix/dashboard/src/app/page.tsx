@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useMemo, useCallback } from 'react';
+import { useState, useMemo, useCallback, useRef, useEffect } from 'react';
 import Link from 'next/link';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
@@ -20,6 +20,7 @@ import {
   Star,
   Copy,
   CheckCircle,
+  ChevronDown,
 } from 'lucide-react';
 import { useAccount } from 'wagmi';
 import { Card } from '@/components/ui/Card';
@@ -61,12 +62,11 @@ function formatAdiPrice(adi: number): string {
 
 type PageMode = 'inference' | 'marketplace';
 
-type SortOption = 'newest' | 'oldest' | 'accuracy' | 'versions' | 'name' | 'price-low' | 'price-high' | 'quality';
+type SortOption = 'newest' | 'oldest' | 'accuracy' | 'versions' | 'name' | 'price-low' | 'price-high';
 
 const INFERENCE_SORT_OPTIONS: { id: SortOption; label: string }[] = [
   { id: 'newest', label: 'Newest' },
   { id: 'oldest', label: 'Oldest' },
-  { id: 'quality', label: 'Quality' },
   { id: 'accuracy', label: 'Best Accuracy' },
   { id: 'versions', label: 'Most Versions' },
   { id: 'name', label: 'Name A-Z' },
@@ -75,7 +75,6 @@ const INFERENCE_SORT_OPTIONS: { id: SortOption; label: string }[] = [
 const MARKETPLACE_SORT_OPTIONS: { id: SortOption; label: string }[] = [
   { id: 'newest', label: 'Newest' },
   { id: 'oldest', label: 'Oldest' },
-  { id: 'quality', label: 'Quality' },
   { id: 'price-low', label: 'Price Low-High' },
   { id: 'price-high', label: 'Price High-Low' },
   { id: 'accuracy', label: 'Best Accuracy' },
@@ -83,7 +82,7 @@ const MARKETPLACE_SORT_OPTIONS: { id: SortOption; label: string }[] = [
   { id: 'name', label: 'Name A-Z' },
 ];
 
-function sortModels<T extends { createdAt: number; bestAccuracy: number; versionCount: number; name: string; salePrice: number; latestVersion?: { weightsStored: boolean } | null }>(
+function sortModels<T extends { createdAt: number; bestAccuracy: number; versionCount: number; name: string; salePrice: number }>(
   models: T[],
   sort: SortOption,
 ): T[] {
@@ -91,7 +90,6 @@ function sortModels<T extends { createdAt: number; bestAccuracy: number; version
   switch (sort) {
     case 'newest': return sorted.sort((a, b) => b.createdAt - a.createdAt);
     case 'oldest': return sorted.sort((a, b) => a.createdAt - b.createdAt);
-    case 'quality': return sorted.sort((a, b) => computeQualityScore(b) - computeQualityScore(a));
     case 'accuracy': return sorted.sort((a, b) => b.bestAccuracy - a.bestAccuracy);
     case 'versions': return sorted.sort((a, b) => b.versionCount - a.versionCount);
     case 'name': return sorted.sort((a, b) => a.name.localeCompare(b.name));
@@ -101,70 +99,33 @@ function sortModels<T extends { createdAt: number; bestAccuracy: number; version
   }
 }
 
-const CATEGORY_RULES: { tag: string; patterns: RegExp }[] = [
-  { tag: 'Classifier', patterns: /classif|detector|detection/i },
-  { tag: 'Image', patterns: /image|mnist|cifar|resnet|vision|x-ray|imaging/i },
-  { tag: 'NLP', patterns: /sentiment|bert|text|language|nlp|embedding/i },
-  { tag: 'Autoencoder', patterns: /autoencoder|denoising|vae/i },
-  { tag: 'Generative', patterns: /generative|gan|diffusion/i },
-  { tag: 'Finance', patterns: /fraud|finance|transaction|trading/i },
-];
-
 function getModelTags(model: { name: string; description: string; slug: string }): string[] {
-  const text = `${model.name} ${model.description} ${model.slug}`;
-  const tags: string[] = [];
-  for (const rule of CATEGORY_RULES) {
-    if (rule.patterns.test(text)) tags.push(rule.tag);
-  }
-  return tags;
-}
-
-/** Quality score: accuracy (50%), versions (20%, capped 5), weights (10%), rating (20%). */
-function computeQualityScore(model: { bestAccuracy: number; versionCount: number; latestVersion?: { weightsStored: boolean } | null; averageRating?: number }): number {
-  const accScore = Math.min(1, model.bestAccuracy) * 50;
-  const versionScore = Math.min(model.versionCount, 5) / 5 * 20;
-  const weightsScore = model.latestVersion?.weightsStored ? 10 : 0;
-  const ratingScore = ((model.averageRating ?? 0) / 5) * 20;
-  return Math.round(accScore + versionScore + weightsScore + ratingScore);
+  const text = `${model.name} ${model.description} ${model.slug}`.toLowerCase();
+  if (/mnist|digit|784/.test(text)) return ['MNIST'];
+  return [];
 }
 
 function RatingStars({ rating, count }: { rating: number; count: number }) {
   return (
-    <div className="flex items-center gap-1.5">
+    <div className="flex items-center gap-2">
       <div className="flex items-center gap-0.5">
         {Array.from({ length: 5 }, (_, i) => {
           const fill = Math.min(1, Math.max(0, rating - i));
           return (
-            <div key={i} className="relative w-3 h-3">
-              <Star size={12} className="text-white/10 absolute inset-0" />
+            <div key={i} className="relative w-4 h-4">
+              <Star size={16} className="text-white/10 absolute inset-0" />
               {fill > 0 && (
                 <div className="absolute inset-0 overflow-hidden" style={{ width: `${fill * 100}%` }}>
-                  <Star size={12} className="text-yellow-400 fill-yellow-400" />
+                  <Star size={16} className="text-white fill-white" />
                 </div>
               )}
             </div>
           );
         })}
       </div>
-      <span className="text-2xs text-helix-dim font-mono">
+      <span className="text-sm text-helix-dim font-mono tabular-nums">
         {count > 0 ? `${rating.toFixed(1)}` : 'N/A'}
       </span>
-    </div>
-  );
-}
-
-function QualityBar({ score }: { score: number }) {
-  const color = score >= 70 ? 'bg-green-400' : score >= 40 ? 'bg-yellow-400' : 'bg-white/40';
-  const textColor = score >= 70 ? 'text-green-400' : score >= 40 ? 'text-yellow-400' : 'text-white/60';
-  return (
-    <div className="mb-4">
-      <div className="flex items-center justify-between mb-1.5">
-        <span className="text-2xs text-helix-muted">Quality</span>
-        <span className={cn('text-2xs font-mono font-medium tabular-nums', textColor)}>{score}/100</span>
-      </div>
-      <div className="h-1.5 bg-white/[0.06] rounded-full overflow-hidden">
-        <div className={cn('h-full rounded-full transition-all', color)} style={{ width: `${score}%` }} />
-      </div>
     </div>
   );
 }
@@ -181,12 +142,12 @@ function ModeToggle({
   onChange: (m: PageMode) => void;
 }) {
   return (
-    <div className="flex items-center gap-1 p-1 bg-helix-bg rounded-lg border border-helix-border">
+    <div className="flex items-center gap-1 p-1.5 bg-helix-bg rounded-xl border border-helix-border">
       <button
         type="button"
         onClick={() => onChange('inference')}
         className={cn(
-          'relative flex items-center gap-2 px-3 py-1.5 rounded-md text-sm transition-all',
+          'relative flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all',
           mode === 'inference'
             ? 'text-white'
             : 'text-helix-muted hover:text-helix-text2',
@@ -195,18 +156,18 @@ function ModeToggle({
         {mode === 'inference' && (
           <motion.div
             layoutId="mode-toggle-bg"
-            className="absolute inset-0 bg-helix-surface border border-helix-border rounded-md"
+            className="absolute inset-0 bg-helix-surface border border-helix-border rounded-lg"
             transition={{ type: 'spring', stiffness: 500, damping: 35 }}
           />
         )}
-        <Sparkles size={14} className="relative z-10" />
+        <Sparkles size={16} className="relative z-10" />
         <span className="relative z-10">Inference</span>
       </button>
       <button
         type="button"
         onClick={() => onChange('marketplace')}
         className={cn(
-          'relative flex items-center gap-2 px-3 py-1.5 rounded-md text-sm transition-all',
+          'relative flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all',
           mode === 'marketplace'
             ? 'text-white'
             : 'text-helix-muted hover:text-helix-text2',
@@ -215,11 +176,11 @@ function ModeToggle({
         {mode === 'marketplace' && (
           <motion.div
             layoutId="mode-toggle-bg"
-            className="absolute inset-0 bg-helix-surface border border-helix-border rounded-md"
+            className="absolute inset-0 bg-helix-surface border border-helix-border rounded-lg"
             transition={{ type: 'spring', stiffness: 500, damping: 35 }}
           />
         )}
-        <Store size={14} className="relative z-10" />
+        <Store size={16} className="relative z-10" />
         <span className="relative z-10">Marketplace</span>
       </button>
     </div>
@@ -254,14 +215,14 @@ function FilterTabs({
   filters: { id: ModelFilter; label: string; description: string }[];
 }) {
   return (
-    <div className="flex items-center gap-1 p-1 bg-helix-bg rounded-lg border border-helix-border">
+    <div className="flex items-center gap-1 p-1.5 bg-helix-bg rounded-xl border border-helix-border">
       {filters.map((f) => (
         <button
           key={f.id}
           type="button"
           onClick={() => onChange(f.id)}
           className={cn(
-            'relative flex items-center gap-2 px-3 py-1.5 rounded-md text-sm transition-all',
+            'relative flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all',
             active === f.id
               ? 'text-white'
               : 'text-helix-muted hover:text-helix-text2',
@@ -270,13 +231,13 @@ function FilterTabs({
           {active === f.id && (
             <motion.div
               layoutId="filter-tab-bg"
-              className="absolute inset-0 bg-helix-surface border border-helix-border rounded-md"
+              className="absolute inset-0 bg-helix-surface border border-helix-border rounded-lg"
               transition={{ type: 'spring', stiffness: 500, damping: 35 }}
             />
           )}
           <span className="relative z-10">{f.label}</span>
           <span className={cn(
-            'relative z-10 text-2xs font-mono px-1.5 py-0.5 rounded-full',
+            'relative z-10 text-sm font-mono px-2 py-0.5 rounded-full',
             active === f.id ? 'bg-white/10 text-white' : 'bg-helix-border text-helix-muted',
           )}>
             {counts[f.id]}
@@ -318,19 +279,19 @@ function BuyConfirmationModal({
         initial={{ scale: 0.95, opacity: 0 }}
         animate={{ scale: 1, opacity: 1 }}
         exit={{ scale: 0.95, opacity: 0 }}
-        className="bg-helix-card border border-helix-border rounded-xl p-6 max-w-md w-full mx-4 shadow-2xl"
+        className="bg-helix-surface border border-helix-border rounded-2xl p-7 max-w-md w-full mx-4 shadow-2xl"
       >
-        <div className="flex items-center gap-3 mb-4">
-          <div className="w-10 h-10 rounded-lg bg-green-500/10 flex items-center justify-center">
-            <ShoppingCart size={20} className="text-green-400" />
+        <div className="flex items-center gap-4 mb-5">
+          <div className="w-12 h-12 rounded-xl bg-green-500/10 flex items-center justify-center">
+            <ShoppingCart size={22} className="text-green-400" />
           </div>
           <div>
-            <h3 className="text-lg font-medium text-white">Confirm Purchase</h3>
-            <p className="text-2xs text-helix-muted">This action is irreversible</p>
+            <h3 className="text-xl font-semibold text-white">Confirm Purchase</h3>
+            <p className="text-sm text-helix-muted">This action is irreversible</p>
           </div>
         </div>
 
-        <div className="bg-helix-bg rounded-lg p-4 mb-4 space-y-2">
+        <div className="bg-helix-bg rounded-xl p-5 mb-5 space-y-3">
           <div className="flex items-center justify-between">
             <span className="text-sm text-helix-muted">Model</span>
             <span className="text-sm text-white font-medium">{model.name}</span>
@@ -420,15 +381,15 @@ function RatingModal({
         initial={{ scale: 0.95, opacity: 0 }}
         animate={{ scale: 1, opacity: 1 }}
         exit={{ scale: 0.95, opacity: 0 }}
-        className="bg-helix-card border border-helix-border rounded-xl p-6 max-w-sm w-full mx-4 shadow-2xl"
+        className="bg-helix-surface border border-helix-border rounded-2xl p-7 max-w-sm w-full mx-4 shadow-2xl"
       >
-        <div className="flex items-center gap-3 mb-4">
-          <div className="w-10 h-10 rounded-lg bg-yellow-500/10 flex items-center justify-center">
-            <Star size={20} className="text-yellow-400" />
+        <div className="flex items-center gap-4 mb-5">
+          <div className="w-12 h-12 rounded-xl bg-white/[0.06] flex items-center justify-center">
+            <Star size={22} className="text-white" />
           </div>
           <div>
-            <h3 className="text-lg font-medium text-white">Rate Model</h3>
-            <p className="text-2xs text-helix-muted">{model.name}</p>
+            <h3 className="text-xl font-semibold text-white">Rate Model</h3>
+            <p className="text-sm text-helix-muted">{model.name}</p>
           </div>
         </div>
 
@@ -449,7 +410,7 @@ function RatingModal({
                   size={32}
                   className={cn(
                     'transition-colors',
-                    isFilled ? 'text-yellow-400 fill-yellow-400' : 'text-white/20',
+                    isFilled ? 'text-white fill-white' : 'text-white/20',
                   )}
                 />
               </button>
@@ -474,7 +435,7 @@ function RatingModal({
             type="button"
             onClick={handleSubmit}
             disabled={selectedStar === 0 || isSubmitting}
-            className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg bg-yellow-600 hover:bg-yellow-500 text-white text-sm font-medium transition-colors disabled:opacity-50"
+            className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg bg-white hover:bg-white/90 text-black text-sm font-medium transition-colors disabled:opacity-50"
           >
             {isSubmitting ? (
               <Loader2 size={14} className="animate-spin" />
@@ -495,30 +456,29 @@ function RatingModal({
 
 function InferenceModelCard({ model, isOwner, onRate }: { model: PublicModel; isOwner: boolean; onRate: (model: PublicModel) => void }) {
   const tags = useMemo(() => getModelTags(model), [model]);
-  const qualityScore = useMemo(() => computeQualityScore(model), [model]);
 
   return (
     <Link href={`/models/${model.tokenId}`} className="block h-full">
       <Card variant="glass" hover className="cursor-pointer flex flex-col h-full">
         {/* Header */}
-        <div className="flex items-start justify-between mb-3">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-lg bg-white/[0.06] flex items-center justify-center shrink-0">
-              <Layers size={20} className="text-white" />
+        <div className="flex items-start justify-between mb-4">
+          <div className="flex items-center gap-4">
+            <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-white/[0.08] to-white/[0.02] flex items-center justify-center shrink-0 border border-white/[0.06]">
+              <Layers size={22} className="text-white/80" />
             </div>
             <div>
-              <h3 className="text-base font-medium text-white">{model.name}</h3>
-              <p className="text-2xs font-mono text-helix-muted">{model.slug}</p>
+              <h3 className="text-lg font-semibold text-white leading-tight">{model.name}</h3>
+              <p className="text-sm font-mono text-helix-muted mt-0.5">{model.slug}</p>
             </div>
           </div>
           <div className="flex items-center gap-2 shrink-0">
             {model.inferenceFee > 0 && (
-              <Badge variant="default" className="text-2xs">
+              <Badge variant="default" className="text-sm">
                 {formatFee(model.inferenceFee)} fee
               </Badge>
             )}
             {isOwner && (
-              <Badge variant="outline" className="text-2xs text-green-400 border-green-500/30">
+              <Badge variant="outline" className="text-sm text-green-400 border-green-500/30">
                 Yours
               </Badge>
             )}
@@ -527,9 +487,9 @@ function InferenceModelCard({ model, isOwner, onRate }: { model: PublicModel; is
 
         {/* Tags */}
         {tags.length > 0 && (
-          <div className="flex items-center gap-1.5 mb-3">
+          <div className="flex items-center gap-2 mb-4">
             {tags.map((tag) => (
-              <span key={tag} className="px-2 py-0.5 text-2xs rounded-full bg-white/[0.04] text-helix-text2 border border-white/[0.06]">
+              <span key={tag} className="px-3 py-1 text-sm rounded-full bg-white/[0.05] text-helix-text2 border border-white/[0.08]">
                 {tag}
               </span>
             ))}
@@ -538,13 +498,13 @@ function InferenceModelCard({ model, isOwner, onRate }: { model: PublicModel; is
 
         {/* Description */}
         {model.description && (
-          <p className="text-2xs text-helix-muted mb-3 line-clamp-2">{model.description}</p>
+          <p className="text-sm text-helix-muted mb-4 line-clamp-2 leading-relaxed">{model.description}</p>
         )}
 
         {/* Meta row */}
-        <div className="flex items-center gap-4 text-2xs text-helix-dim mb-4">
-          <span className="flex items-center gap-1">
-            <User size={10} />
+        <div className="flex items-center gap-4 text-sm text-helix-dim mb-5">
+          <span className="flex items-center gap-1.5">
+            <User size={12} />
             {truncateAddress(model.creator)}
           </span>
           <span>{formatDate(model.createdAt)}</span>
@@ -553,30 +513,27 @@ function InferenceModelCard({ model, isOwner, onRate }: { model: PublicModel; is
           )}
         </div>
 
-        {/* Quality Score */}
-        <QualityBar score={qualityScore} />
-
         {/* Stats */}
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
-          <div className="bg-helix-bg rounded-md px-3 py-2 text-center">
-            <p className="text-2xs text-helix-muted">Versions</p>
-            <p className="text-lg font-mono font-light text-white">{model.versionCount}</p>
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-5">
+          <div className="bg-white/[0.03] rounded-lg px-4 py-3 text-center border border-white/[0.04]">
+            <p className="text-sm text-helix-muted mb-1">Versions</p>
+            <p className="text-xl font-mono font-medium text-white tabular-nums">{model.versionCount}</p>
           </div>
-          <div className="bg-helix-bg rounded-md px-3 py-2 text-center">
-            <p className="text-2xs text-helix-muted">Best Accuracy</p>
-            <p className="text-lg font-mono font-light text-white">
+          <div className="bg-white/[0.03] rounded-lg px-4 py-3 text-center border border-white/[0.04]">
+            <p className="text-sm text-helix-muted mb-1">Accuracy</p>
+            <p className="text-xl font-mono font-medium text-white tabular-nums">
               {model.bestAccuracy > 0 ? `${(model.bestAccuracy * 100).toFixed(1)}%` : '--'}
             </p>
           </div>
-          <div className="bg-helix-bg rounded-md px-3 py-2 text-center">
-            <p className="text-2xs text-helix-muted">Inference Fee</p>
-            <p className="text-lg font-mono font-light text-white">{formatFee(model.inferenceFee)}</p>
+          <div className="bg-white/[0.03] rounded-lg px-4 py-3 text-center border border-white/[0.04]">
+            <p className="text-sm text-helix-muted mb-1">Fee</p>
+            <p className="text-xl font-mono font-medium text-white tabular-nums">{formatFee(model.inferenceFee)}</p>
           </div>
           <div
-            className="bg-helix-bg rounded-md px-3 py-2 text-center cursor-pointer hover:bg-white/[0.06] transition-colors"
+            className="bg-white/[0.03] rounded-lg px-4 py-3 text-center border border-white/[0.04] cursor-pointer hover:bg-white/[0.06] hover:border-white/[0.08] transition-all"
             onClick={(e) => { e.preventDefault(); e.stopPropagation(); onRate(model); }}
           >
-            <p className="text-2xs text-helix-muted">Rating</p>
+            <p className="text-sm text-helix-muted mb-1">Rating</p>
             <div className="flex justify-center mt-1">
               <RatingStars rating={model.averageRating} count={model.ratingCount} />
             </div>
@@ -584,14 +541,14 @@ function InferenceModelCard({ model, isOwner, onRate }: { model: PublicModel; is
         </div>
 
         {/* Actions - pinned to bottom */}
-        <div className="flex items-center gap-3 pt-3 border-t border-helix-border/50 mt-auto">
-          <span className="flex items-center gap-2 px-4 py-2 rounded-lg bg-white text-black text-sm font-medium">
-            <Sparkles size={14} />
+        <div className="flex items-center gap-3 pt-4 border-t border-white/[0.06] mt-auto">
+          <span className="flex items-center gap-2 px-5 py-2.5 rounded-lg bg-white text-black text-sm font-semibold">
+            <Sparkles size={15} />
             View Model
           </span>
           {isOwner && (
-            <span className="flex items-center gap-2 px-4 py-2 rounded-lg bg-helix-surface border border-helix-border text-sm text-helix-text">
-              <Layers size={14} />
+            <span className="flex items-center gap-2 px-5 py-2.5 rounded-lg bg-helix-surface border border-helix-border text-sm text-helix-text2">
+              <Layers size={15} />
               Yours
             </span>
           )}
@@ -618,7 +575,7 @@ function ContactOwnerButton({ ownerAddress }: { ownerAddress: string }) {
     <button
       type="button"
       onClick={handleCopy}
-      className="flex items-center gap-2 px-4 py-2 rounded-lg bg-helix-surface border border-helix-border text-sm text-helix-text hover:text-white hover:border-helix-border2 transition-colors"
+      className="flex items-center gap-2 px-5 py-2.5 rounded-lg bg-helix-surface border border-helix-border text-sm font-medium text-helix-text hover:text-white hover:border-helix-border2 transition-all"
     >
       {copied ? (
         <>
@@ -651,28 +608,27 @@ function MarketplaceModelCard({
   onRate: (model: PublicModel) => void;
 }) {
   const tags = useMemo(() => getModelTags(model), [model]);
-  const qualityScore = useMemo(() => computeQualityScore(model), [model]);
   const isContactOwner = model.forSale && model.salePrice === 0;
 
   return (
     <Card variant="glass" hover className="flex flex-col h-full">
       {/* Header */}
-      <div className="flex items-start justify-between mb-3">
-        <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-lg bg-green-500/10 flex items-center justify-center shrink-0">
-            <Store size={20} className="text-green-400" />
+      <div className="flex items-start justify-between mb-4">
+        <div className="flex items-center gap-4">
+          <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-green-500/15 to-green-500/[0.03] flex items-center justify-center shrink-0 border border-green-500/20">
+            <Store size={22} className="text-green-400" />
           </div>
           <div>
-            <h3 className="text-base font-medium text-white">{model.name}</h3>
-            <p className="text-2xs font-mono text-helix-muted">{model.slug}</p>
+            <h3 className="text-lg font-semibold text-white leading-tight">{model.name}</h3>
+            <p className="text-sm font-mono text-helix-muted mt-0.5">{model.slug}</p>
           </div>
         </div>
         <div className="flex items-center gap-2 shrink-0">
-          <Badge variant="outline" className="text-2xs text-green-400 border-green-500/30">
+          <Badge variant="outline" className="text-sm text-green-400 border-green-500/30">
             For Sale
           </Badge>
           {isOwner && (
-            <Badge variant="outline" className="text-2xs text-blue-400 border-blue-500/30">
+            <Badge variant="outline" className="text-sm text-blue-400 border-blue-500/30">
               Yours
             </Badge>
           )}
@@ -680,13 +636,13 @@ function MarketplaceModelCard({
       </div>
 
       {/* Sale Price - prominent display */}
-      <div className="bg-green-500/5 border border-green-500/20 rounded-lg px-4 py-3 mb-3">
+      <div className="bg-gradient-to-r from-green-500/[0.08] to-green-500/[0.02] border border-green-500/20 rounded-xl px-5 py-4 mb-4">
         <div className="flex items-center justify-between">
-          <span className="text-sm text-green-300/70 flex items-center gap-1.5">
-            <DollarSign size={14} />
+          <span className="text-sm text-green-300/70 flex items-center gap-2">
+            <DollarSign size={16} />
             Sale Price
           </span>
-          <span className="text-xl font-mono font-medium text-green-400">
+          <span className="text-2xl font-mono font-semibold text-green-400">
             {isContactOwner ? 'Contact Owner' : formatAdiPrice(model.salePrice)}
           </span>
         </div>
@@ -694,9 +650,9 @@ function MarketplaceModelCard({
 
       {/* Tags */}
       {tags.length > 0 && (
-        <div className="flex items-center gap-1.5 mb-3">
+        <div className="flex items-center gap-2 mb-4">
           {tags.map((tag) => (
-            <span key={tag} className="px-2 py-0.5 text-2xs rounded-full bg-white/[0.04] text-helix-text2 border border-white/[0.06]">
+            <span key={tag} className="px-3 py-1 text-sm rounded-full bg-white/[0.05] text-helix-text2 border border-white/[0.08]">
               {tag}
             </span>
           ))}
@@ -705,13 +661,13 @@ function MarketplaceModelCard({
 
       {/* Description */}
       {model.description && (
-        <p className="text-2xs text-helix-muted mb-3 line-clamp-2">{model.description}</p>
+        <p className="text-sm text-helix-muted mb-4 line-clamp-2 leading-relaxed">{model.description}</p>
       )}
 
       {/* Meta row */}
-      <div className="flex items-center gap-4 text-2xs text-helix-dim mb-4">
-        <span className="flex items-center gap-1">
-          <User size={10} />
+      <div className="flex items-center gap-4 text-sm text-helix-dim mb-5">
+        <span className="flex items-center gap-1.5">
+          <User size={12} />
           {truncateAddress(model.creator)}
         </span>
         <span>{formatDate(model.createdAt)}</span>
@@ -720,32 +676,29 @@ function MarketplaceModelCard({
         )}
       </div>
 
-      {/* Quality Score */}
-      <QualityBar score={qualityScore} />
-
       {/* Stats */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
-        <div className="bg-helix-bg rounded-md px-3 py-2 text-center">
-          <p className="text-2xs text-helix-muted">Versions</p>
-          <p className="text-lg font-mono font-light text-white">{model.versionCount}</p>
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-5">
+        <div className="bg-white/[0.03] rounded-lg px-4 py-3 text-center border border-white/[0.04]">
+          <p className="text-sm text-helix-muted mb-1">Versions</p>
+          <p className="text-xl font-mono font-medium text-white tabular-nums">{model.versionCount}</p>
         </div>
-        <div className="bg-helix-bg rounded-md px-3 py-2 text-center">
-          <p className="text-2xs text-helix-muted">Best Accuracy</p>
-          <p className="text-lg font-mono font-light text-white">
+        <div className="bg-white/[0.03] rounded-lg px-4 py-3 text-center border border-white/[0.04]">
+          <p className="text-sm text-helix-muted mb-1">Accuracy</p>
+          <p className="text-xl font-mono font-medium text-white tabular-nums">
             {model.bestAccuracy > 0 ? `${(model.bestAccuracy * 100).toFixed(1)}%` : '--'}
           </p>
         </div>
-        <div className="bg-helix-bg rounded-md px-3 py-2 text-center">
-          <p className="text-2xs text-helix-muted">Inferences</p>
-          <p className="text-lg font-mono font-light text-white">
+        <div className="bg-white/[0.03] rounded-lg px-4 py-3 text-center border border-white/[0.04]">
+          <p className="text-sm text-helix-muted mb-1">Inferences</p>
+          <p className="text-xl font-mono font-medium text-white tabular-nums">
             {model.inferenceCount > 0 ? model.inferenceCount : '--'}
           </p>
         </div>
         <div
-          className="bg-helix-bg rounded-md px-3 py-2 text-center cursor-pointer hover:bg-white/[0.06] transition-colors"
+          className="bg-white/[0.03] rounded-lg px-4 py-3 text-center border border-white/[0.04] cursor-pointer hover:bg-white/[0.06] hover:border-white/[0.08] transition-all"
           onClick={() => onRate(model)}
         >
-          <p className="text-2xs text-helix-muted">Rating</p>
+          <p className="text-sm text-helix-muted mb-1">Rating</p>
           <div className="flex justify-center mt-1">
             <RatingStars rating={model.averageRating} count={model.ratingCount} />
           </div>
@@ -753,7 +706,7 @@ function MarketplaceModelCard({
       </div>
 
       {/* Actions - pinned to bottom */}
-      <div className="flex items-center gap-3 pt-3 border-t border-helix-border/50 mt-auto">
+      <div className="flex items-center gap-3 pt-4 border-t border-white/[0.06] mt-auto">
         {!isOwner && !isContactOwner && (
           <button
             type="button"
@@ -761,9 +714,9 @@ function MarketplaceModelCard({
               e.preventDefault();
               onBuy(model);
             }}
-            className="flex items-center gap-2 px-4 py-2 rounded-lg bg-green-600 hover:bg-green-500 text-white text-sm font-medium transition-colors"
+            className="flex items-center gap-2 px-5 py-2.5 rounded-lg bg-green-600 hover:bg-green-500 text-white text-sm font-semibold transition-colors"
           >
-            <ShoppingCart size={14} />
+            <ShoppingCart size={15} />
             Buy
           </button>
         )}
@@ -772,14 +725,14 @@ function MarketplaceModelCard({
         )}
         <Link
           href={`/models/${model.tokenId}`}
-          className="flex items-center gap-2 px-4 py-2 rounded-lg bg-white text-black text-sm font-medium hover:bg-white/90 transition-colors"
+          className="flex items-center gap-2 px-5 py-2.5 rounded-lg bg-white text-black text-sm font-semibold hover:bg-white/90 transition-colors"
         >
-          <Sparkles size={14} />
+          <Sparkles size={15} />
           View Model
         </Link>
         {isOwner && (
-          <span className="flex items-center gap-2 px-4 py-2 rounded-lg bg-helix-surface border border-helix-border text-sm text-helix-text">
-            <Layers size={14} />
+          <span className="flex items-center gap-2 px-5 py-2.5 rounded-lg bg-helix-surface border border-helix-border text-sm text-helix-text2">
+            <Layers size={15} />
             Yours
           </span>
         )}
@@ -800,6 +753,18 @@ export default function ModelsPage() {
   const [categoryFilter, setCategoryFilter] = useState<string | null>(null);
   const [buyingModel, setBuyingModel] = useState<PublicModel | null>(null);
   const [ratingModel, setRatingModel] = useState<PublicModel | null>(null);
+  const [sortOpen, setSortOpen] = useState(false);
+  const sortRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    function handleClickOutside(e: MouseEvent) {
+      if (sortRef.current && !sortRef.current.contains(e.target as Node)) {
+        setSortOpen(false);
+      }
+    }
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
 
   const { address: walletAddress, isConnected: isWalletConnected } = useAccount();
 
@@ -944,67 +909,99 @@ export default function ModelsPage() {
     >
       {/* Header */}
       <div className="flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <h1 className="page-title">Models</h1>
-          <Badge variant="default" className="flex items-center gap-1">
-            <Globe size={10} />
-            Public Registry
-          </Badge>
+        <div>
+          <div className="flex items-center gap-3 mb-1">
+            <h1 className="text-3xl font-bold text-helix-text tracking-tight">Marketplace</h1>
+            <Badge variant="default" className="flex items-center gap-2 text-sm">
+              <Globe size={12} />
+              Public Registry
+            </Badge>
+          </div>
+          <p className="text-sm text-helix-muted">Browse, discover, and acquire verified ML models</p>
         </div>
         {isConnected && (
           <Link
-            href="/my-models"
-            className="flex items-center gap-2 px-4 py-2 rounded-lg bg-helix-surface border border-helix-border text-sm text-helix-text hover:border-helix-border2 hover:text-white transition-colors"
+            href="/dashboard"
+            className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-helix-surface border border-helix-border text-sm font-medium text-helix-text hover:border-helix-border2 hover:text-white transition-all"
           >
-            <Layers size={14} />
-            My Models
+            <Layers size={16} />
+            Dashboard
           </Link>
         )}
       </div>
 
       {/* Mode Toggle + Filter + Search + Sort */}
-      <div className="space-y-3">
+      <div className="space-y-4">
         <div className="flex flex-col sm:flex-row items-start sm:items-center gap-3">
           <FilterTabs active={filter} onChange={setFilter} counts={counts} filters={filterLabels} />
           <ModeToggle mode={mode} onChange={handleModeChange} />
-          <div className="relative flex-1 max-w-xs">
-            <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-helix-muted" />
+          <div className="relative flex-1 max-w-sm">
+            <Search size={16} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-helix-muted" />
             <input
               type="text"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               placeholder="Search models..."
-              className="w-full pl-9 pr-3 py-2 bg-helix-bg border border-helix-border rounded-lg text-sm text-helix-text placeholder:text-helix-dim focus:outline-none focus:border-helix-border2 transition-colors"
+              className="w-full pl-10 pr-4 py-2.5 bg-helix-bg border border-helix-border rounded-xl text-sm text-helix-text placeholder:text-helix-dim focus:outline-none focus:border-helix-border2 focus:ring-1 focus:ring-helix-border2 transition-all"
             />
           </div>
-          <div className="relative">
-            <ArrowUpDown size={12} className="absolute left-3 top-1/2 -translate-y-1/2 text-helix-muted pointer-events-none" />
-            <select
-              value={sort}
-              onChange={(e) => setSort(e.target.value as SortOption)}
-              className="appearance-none pl-8 pr-8 py-2 bg-helix-bg border border-helix-border rounded-lg text-sm text-helix-text focus:outline-none focus:border-helix-border2 transition-colors cursor-pointer"
+          <div className="relative" ref={sortRef}>
+            <button
+              type="button"
+              onClick={() => setSortOpen((v) => !v)}
+              className={cn(
+                'flex items-center gap-2 pl-3.5 pr-3 py-2.5 bg-helix-bg border rounded-xl text-sm text-helix-text transition-all cursor-pointer',
+                sortOpen ? 'border-helix-border2 ring-1 ring-helix-border2' : 'border-helix-border hover:border-helix-border2',
+              )}
             >
-              {sortOptions.map((o) => (
-                <option key={o.id} value={o.id}>{o.label}</option>
-              ))}
-            </select>
+              <ArrowUpDown size={14} className="text-helix-muted" />
+              <span>{sortOptions.find((o) => o.id === sort)?.label ?? 'Sort'}</span>
+              <ChevronDown size={14} className={cn('text-helix-muted transition-transform', sortOpen && 'rotate-180')} />
+            </button>
+            <AnimatePresence>
+              {sortOpen && (
+                <motion.div
+                  initial={{ opacity: 0, y: -4 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -4 }}
+                  transition={{ duration: 0.15 }}
+                  className="absolute right-0 top-full mt-1.5 z-50 min-w-[180px] bg-helix-surface border border-helix-border rounded-xl shadow-xl overflow-hidden"
+                >
+                  {sortOptions.map((o) => (
+                    <button
+                      key={o.id}
+                      type="button"
+                      onClick={() => { setSort(o.id); setSortOpen(false); }}
+                      className={cn(
+                        'w-full text-left px-4 py-2.5 text-sm transition-colors',
+                        sort === o.id
+                          ? 'text-white bg-white/[0.06]'
+                          : 'text-helix-text2 hover:bg-white/[0.04] hover:text-white',
+                      )}
+                    >
+                      {o.label}
+                    </button>
+                  ))}
+                </motion.div>
+              )}
+            </AnimatePresence>
           </div>
         </div>
 
         {/* Category tags */}
         {availableCategories.length > 0 && (
-          <div className="flex items-center gap-2 flex-wrap">
-            <span className="text-2xs text-helix-dim">Type:</span>
+          <div className="flex items-center gap-2.5 flex-wrap">
+            <span className="text-sm text-helix-dim font-medium">Type:</span>
             {availableCategories.map(({ tag, count }) => (
               <button
                 key={tag}
                 type="button"
                 onClick={() => setCategoryFilter(categoryFilter === tag ? null : tag)}
                 className={cn(
-                  'flex items-center gap-1.5 px-2.5 py-1 rounded-full text-2xs transition-colors',
+                  'flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs transition-all',
                   categoryFilter === tag
-                    ? 'bg-white text-black'
-                    : 'bg-white/[0.04] text-helix-text2 border border-white/[0.06] hover:border-white/[0.12]',
+                    ? 'bg-white text-black font-medium shadow-sm'
+                    : 'bg-white/[0.04] text-helix-text2 border border-white/[0.06] hover:border-white/[0.15] hover:bg-white/[0.06]',
                 )}
               >
                 {tag}
@@ -1014,7 +1011,7 @@ export default function ModelsPage() {
                 )}>
                   {count}
                 </span>
-                {categoryFilter === tag && <X size={10} />}
+                {categoryFilter === tag && <X size={12} />}
               </button>
             ))}
           </div>
@@ -1023,8 +1020,8 @@ export default function ModelsPage() {
 
       {/* Content */}
       {isLoading ? (
-        <div className="flex flex-col items-center py-16 gap-4">
-          <Loader2 size={24} className="animate-spin text-helix-muted" />
+        <div className="flex flex-col items-center py-24 gap-5">
+          <Loader2 size={32} className="animate-spin text-helix-muted" />
           <p className="text-sm text-helix-muted">Loading models from chain...</p>
         </div>
       ) : !isContractDeployed ? (
@@ -1052,10 +1049,10 @@ export default function ModelsPage() {
               ? 'Try a different search term or clear the filters.'
               : mode === 'marketplace'
                 ? filter === 'mine'
-                  ? 'Go to My Models to list a model for sale.'
+                  ? 'Go to your Dashboard to list a model for sale.'
                   : 'No models are currently listed for sale on the marketplace.'
                 : filter === 'mine'
-                  ? 'Go to My Models to make a model public.'
+                  ? 'Go to your Dashboard to make a model public.'
                   : 'Be the first to create and publish a model.'
           }
           action={
@@ -1077,7 +1074,7 @@ export default function ModelsPage() {
               </button>
             ) : isConnected ? (
               <Link
-                href="/my-models"
+                href="/dashboard"
                 className="flex items-center gap-2 px-4 py-2 rounded-lg bg-white text-black text-sm font-medium hover:bg-white/90 transition-colors"
               >
                 <Layers size={14} />
@@ -1094,7 +1091,7 @@ export default function ModelsPage() {
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
             transition={{ duration: 0.15 }}
-            className="grid grid-cols-1 lg:grid-cols-2 gap-4"
+            className="grid grid-cols-1 lg:grid-cols-2 gap-5"
           >
             {filteredModels.map((model) => {
               const isOwner = !!address && model.owner.toLowerCase() === address.toLowerCase();

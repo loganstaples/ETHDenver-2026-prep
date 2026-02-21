@@ -36,14 +36,14 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
         uint256 currentStep;
         bytes32 latestWeightCommitment;
         uint256 latestLoss;
-        bool active;
-        bool completed;
+        JobStatus status;
         // Risk-based ZK activation fields
         bool zkEnabled;               // User toggle: always require ZK
         uint256 zkCheckpointFreq;     // ZK proof every N checkpoints (0 = end only)
         bool riskZkEnabled;           // User toggle: enable auto-ZK on risk
         uint256 minWorkersForMpc;     // Threshold (default 2)
         bool zkActivatedByRisk;       // Set true when workers drop below threshold
+        uint256 stepAtLastResume;     // Tracks currentStep at last resume (for pro-rata payment)
     }
 
     /// @notice Per-job worker state
@@ -91,6 +91,9 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
         bool available;             // true = accepting new jobs
         uint256 activeJobId;        // current job assignment (0 = none)
     }
+
+    /// @notice Training job lifecycle status
+    enum JobStatus { Active, Paused, Stopped, Completed }
 
     // ============ Constants ============
 
@@ -154,6 +157,12 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
     /// @notice Number of active jobs a worker is currently participating in
     mapping(address => uint256) public workerActiveJobs;
 
+    /// @notice Number of jobs a worker has successfully completed
+    mapping(address => uint256) public workerJobsCompleted;
+
+    /// @notice Number of times a worker has been slashed across all jobs
+    mapping(address => uint256) public workerSlashCount;
+
     /// @notice Stake required per active job slot (rate limiting)
     uint256 public stakePerJobSlot = 0.001 ether;
 
@@ -179,6 +188,9 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
 
     /// @notice Minimum stake required to join the worker pool
     uint256 public poolMinStake = 0.001 ether;
+
+    /// @notice Total ETH held on behalf of users (payments + stakes). Excess above this is sweepable.
+    uint256 public totalObligations;
 
     // ============ Events ============
 
@@ -244,6 +256,9 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
     event TreasuryUpdated(address indexed oldTreasury, address indexed newTreasury);
     event VerifierUpdated(address indexed oldVerifier, address indexed newVerifier);
     event ZkActivatedByRisk(uint256 indexed jobId, uint256 activeWorkerCount);
+    event TrainingPaused(uint256 indexed jobId, uint256 pausedAtStep, uint256 releasedWorkerCount);
+    event TrainingStopped(uint256 indexed jobId, uint256 stoppedAtStep, uint256 refundAmount);
+    event TrainingResumed(uint256 indexed jobId, uint256 resumeFromStep);
 
     event InferenceResultCommitted(
         uint256 indexed inferenceId,
@@ -253,6 +268,8 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
         bytes32 outputHash,
         uint256 signerCount
     );
+
+    event EmergencyWithdraw(address indexed to, uint256 amount);
 
     // Worker pool events
     event WorkerPoolRegistered(address indexed worker, string endpoint, uint256 stakeAmount);
@@ -296,6 +313,10 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
     error WorkerNotInPool();
     error WorkerBusy();
     error NotEnoughPoolWorkers();
+    error JobNotPaused();
+    error NotJobOwnerOrOperator();
+    error InvalidAddress();
+    error InsufficientExcess();
 
     // ============ Modifiers ============
 
@@ -310,8 +331,7 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
     }
 
     modifier jobActive(uint256 jobId) {
-        if (!jobs[jobId].active) revert JobNotActive();
-        if (jobs[jobId].completed) revert JobAlreadyCompleted();
+        if (jobs[jobId].status != JobStatus.Active) revert JobNotActive();
         _;
     }
 
@@ -371,14 +391,16 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
             currentStep: 0,
             latestWeightCommitment: bytes32(0),
             latestLoss: 0,
-            active: true,
-            completed: false,
+            status: JobStatus.Active,
             zkEnabled: zkEnabled,
             zkCheckpointFreq: zkCheckpointFreq,
             riskZkEnabled: riskZkEnabled,
             minWorkersForMpc: effectiveMinWorkers,
-            zkActivatedByRisk: false
+            zkActivatedByRisk: false,
+            stepAtLastResume: 0
         });
+
+        totalObligations += msg.value;
 
         emit JobRegistered(jobId, msg.sender, architectureHash, checkpointFreq, numRounds, paymentAmount);
     }
@@ -410,6 +432,7 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
         // Update rate limiting state
         workerTotalStaked[msg.sender] += msg.value;
         workerActiveJobs[msg.sender]++;
+        totalObligations += msg.value;
 
         emit WorkerJoined(jobId, msg.sender, msg.value);
     }
@@ -524,6 +547,8 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
         workers[jobId][cheater].slashed = true;
         workers[jobId][cheater].stakeAmount = 0;
         slashedAt[jobId][stepNumber][cheater] = true;
+        workerSlashCount[cheater]++;
+        totalObligations -= stakeAmount;
 
         // Remove cheater from active worker list
         _removeActiveWorker(jobId, cheater);
@@ -573,6 +598,7 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
             delete poolWorkers[cheater];
             // Pool stake is also forfeited (already held in contract)
             if (poolStake > 0) {
+                totalObligations -= poolStake;
                 (bool s, ) = treasury.call{value: poolStake}("");
                 if (!s) revert TransferFailed();
             }
@@ -620,8 +646,7 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
         _verifyAllWorkerSignatures(jobId, ethSignedHash, signatures);
 
         // Mark job as completed
-        job.completed = true;
-        job.active = false;
+        job.status = JobStatus.Completed;
         job.latestWeightCommitment = finalCommitment;
         jobCompletionTime[jobId] = block.timestamp;
 
@@ -630,19 +655,22 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
         for (uint256 i = 0; i < activeCount; i++) {
             address w = _activeWorkers[jobId][i];
             workers[jobId][w].lastActiveStep = finalStep;
+            // Track successful job completion for reputation
+            workerJobsCompleted[w]++;
             // Decrement active job count for rate limiting
             if (workerActiveJobs[w] > 0) {
                 workerActiveJobs[w]--;
             }
-            // Release pool workers back to available
-            if (_poolWorkerIndex[w] != 0) {
-                poolWorkers[w].available = true;
-                poolWorkers[w].activeJobId = 0;
-            }
+            // Auto-return job stake to pool for pool workers
+            _returnJobStakeToPool(jobId, w);
         }
 
         // Distribute payment proportionally to participation
+        totalObligations -= job.paymentAmount;
         _distributePayment(jobId);
+
+        // Auto-return stakes to honest non-pool workers
+        _autoReturnStakes(jobId);
 
         emit TrainingCompleted(jobId, finalCommitment, finalStep, activeCount);
     }
@@ -707,13 +735,109 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
         emit CheckpointWithProofSubmitted(jobId, stepNumber, weightCommitment, loss, true);
     }
 
+    // ============ Pause / Stop / Resume ============
+
+    /// @notice Pause an active training job, releasing all workers
+    function pauseTraining(uint256 jobId) external nonReentrant jobExists(jobId) {
+        Job storage job = jobs[jobId];
+        if (job.status != JobStatus.Active) revert JobNotActive();
+        if (msg.sender != job.owner && msg.sender != job.operator) revert NotJobOwnerOrOperator();
+
+        uint256 activeCount = _activeWorkers[jobId].length;
+
+        // Auto-return stakes to honest non-pool workers
+        _autoReturnStakes(jobId);
+
+        // Release all workers
+        for (uint256 i = activeCount; i > 0; i--) {
+            address w = _activeWorkers[jobId][i - 1];
+            if (workerActiveJobs[w] > 0) {
+                workerActiveJobs[w]--;
+            }
+            // Auto-return job stake to pool for pool workers
+            _returnJobStakeToPool(jobId, w);
+            _workerIndex[jobId][w] = 0;
+        }
+        delete _activeWorkers[jobId];
+
+        job.status = JobStatus.Paused;
+        emit TrainingPaused(jobId, job.currentStep, activeCount);
+    }
+
+    /// @notice Stop an active or paused training job permanently
+    function stopTraining(uint256 jobId) external nonReentrant jobExists(jobId) {
+        Job storage job = jobs[jobId];
+        if (job.status != JobStatus.Active && job.status != JobStatus.Paused) revert JobNotActive();
+        if (msg.sender != job.owner && msg.sender != job.operator) revert NotJobOwnerOrOperator();
+
+        uint256 activeCount = _activeWorkers[jobId].length;
+        uint256 workerPayout = 0;
+
+        uint256 stepsThisSession = job.currentStep - job.stepAtLastResume;
+        if (activeCount > 0 && stepsThisSession > 0) {
+            workerPayout = (job.paymentAmount * stepsThisSession) / job.numRounds;
+            if (workerPayout > job.paymentAmount) workerPayout = job.paymentAmount;
+
+            _distributePartialPayment(jobId, workerPayout);
+        }
+
+        // Release all workers and return stakes
+        if (activeCount > 0) {
+            // Auto-return stakes to honest non-pool workers (must be before delete)
+            _autoReturnStakes(jobId);
+
+            for (uint256 i = activeCount; i > 0; i--) {
+                address w = _activeWorkers[jobId][i - 1];
+                if (workerActiveJobs[w] > 0) {
+                    workerActiveJobs[w]--;
+                }
+                _returnJobStakeToPool(jobId, w);
+                _workerIndex[jobId][w] = 0;
+            }
+            delete _activeWorkers[jobId];
+        }
+
+        uint256 refund = job.paymentAmount - workerPayout;
+        job.status = JobStatus.Stopped;
+        jobCompletionTime[jobId] = block.timestamp;
+        totalObligations -= job.paymentAmount;
+
+        if (refund > 0) {
+            (bool success, ) = job.owner.call{value: refund}("");
+            if (!success) revert TransferFailed();
+        }
+
+        emit TrainingStopped(jobId, job.currentStep, refund);
+    }
+
+    /// @notice Resume a paused training job
+    function resumeTraining(uint256 jobId) external payable nonReentrant jobExists(jobId) {
+        Job storage job = jobs[jobId];
+        if (job.status != JobStatus.Paused) revert JobNotPaused();
+        if (msg.sender != job.owner && msg.sender != job.operator) revert NotJobOwnerOrOperator();
+
+        job.status = JobStatus.Active;
+        job.stepAtLastResume = job.currentStep;
+        if (msg.value > 0) {
+            job.paymentAmount += msg.value;
+            totalObligations += msg.value;
+        }
+
+        emit TrainingResumed(jobId, job.currentStep);
+    }
+
     // ============ Stake Withdrawal ============
 
     /// @notice Withdraw stake after job completion and cooldown period
     /// @param jobId The completed job
     function withdrawStake(uint256 jobId) external nonReentrant jobExists(jobId) {
-        if (!jobs[jobId].completed) revert JobNotCompleted();
-        if (block.timestamp < jobCompletionTime[jobId] + STAKE_COOLDOWN) revert CooldownNotExpired();
+        JobStatus status = jobs[jobId].status;
+        if (status != JobStatus.Completed && status != JobStatus.Stopped && status != JobStatus.Paused) {
+            revert JobNotCompleted();
+        }
+        if (status != JobStatus.Paused) {
+            if (block.timestamp < jobCompletionTime[jobId] + STAKE_COOLDOWN) revert CooldownNotExpired();
+        }
         if (stakeWithdrawn[jobId][msg.sender]) revert AlreadyWithdrawn();
 
         WorkerInfo storage worker = workers[jobId][msg.sender];
@@ -724,6 +848,7 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
         uint256 amount = worker.stakeAmount;
         worker.stakeAmount = 0;
         stakeWithdrawn[jobId][msg.sender] = true;
+        totalObligations -= amount;
 
         (bool success, ) = msg.sender.call{value: amount}("");
         if (!success) revert TransferFailed();
@@ -851,34 +976,35 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
         _workerIndex[jobId][worker] = 0;
     }
 
-    /// @dev Distribute payment proportionally based on steps participated
+    /// @dev Distribute full payment proportionally based on steps participated
     function _distributePayment(uint256 jobId) internal {
-        Job storage job = jobs[jobId];
+        _distributePartialPayment(jobId, jobs[jobId].paymentAmount);
+    }
+
+    /// @dev Distribute a partial payment amount proportionally based on steps participated
+    function _distributePartialPayment(uint256 jobId, uint256 totalPayout) internal {
         address[] storage active = _activeWorkers[jobId];
         uint256 activeCount = active.length;
-        if (activeCount == 0) return;
+        if (activeCount == 0 || totalPayout == 0) return;
 
-        // Calculate total participation weight (steps participated by each active worker)
         uint256 totalWeight = 0;
         uint256[] memory weights = new uint256[](activeCount);
 
         for (uint256 i = 0; i < activeCount; i++) {
             WorkerInfo storage w = workers[jobId][active[i]];
             uint256 stepsParticipated = w.lastActiveStep - w.joinedAtStep;
-            if (stepsParticipated == 0) stepsParticipated = 1; // minimum 1 for participation
+            if (stepsParticipated == 0) stepsParticipated = 1;
             weights[i] = stepsParticipated;
             totalWeight += stepsParticipated;
         }
 
-        // Distribute payment proportionally
         uint256 totalDistributed = 0;
         for (uint256 i = 0; i < activeCount; i++) {
             uint256 payment;
             if (i == activeCount - 1) {
-                // Last worker gets remainder to avoid dust
-                payment = job.paymentAmount - totalDistributed;
+                payment = totalPayout - totalDistributed;
             } else {
-                payment = (job.paymentAmount * weights[i]) / totalWeight;
+                payment = (totalPayout * weights[i]) / totalWeight;
             }
             totalDistributed += payment;
 
@@ -890,13 +1016,81 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
         }
     }
 
+    /// @dev Return a pool worker's job stake back to their pool stake on job end.
+    ///      No ETH leaves the contract — just moves between accounting buckets.
+    function _returnJobStakeToPool(uint256 jobId, address w) internal {
+        if (_poolWorkerIndex[w] == 0) return; // not a pool worker
+        uint256 jobStake = workers[jobId][w].stakeAmount;
+        if (jobStake == 0) return;
+
+        // Move stake from job bucket back to pool bucket
+        poolWorkers[w].stakeAmount += jobStake;
+        workers[jobId][w].stakeAmount = 0;
+        stakeWithdrawn[jobId][w] = true; // prevent double-withdrawal via withdrawStake
+
+        // Reverse the increment from assignPoolWorkers
+        if (workerTotalStaked[w] >= jobStake) {
+            workerTotalStaked[w] -= jobStake;
+        } else {
+            workerTotalStaked[w] = 0;
+        }
+
+        // Mark pool worker as available again
+        poolWorkers[w].available = true;
+        poolWorkers[w].activeJobId = 0;
+    }
+
+    /// @dev Auto-return stakes to all honest, non-pool workers when a job ends.
+    ///      Pool workers are handled separately by _returnJobStakeToPool.
+    function _autoReturnStakes(uint256 jobId) internal {
+        address[] storage active = _activeWorkers[jobId];
+        uint256 len = active.length;
+        for (uint256 i = 0; i < len; i++) {
+            address w = active[i];
+            // Skip pool workers (handled by _returnJobStakeToPool)
+            if (_poolWorkerIndex[w] != 0) continue;
+            // Skip slashed workers
+            if (workers[jobId][w].slashed) continue;
+            // Skip already withdrawn
+            if (stakeWithdrawn[jobId][w]) continue;
+
+            uint256 amount = workers[jobId][w].stakeAmount;
+            if (amount == 0) continue;
+
+            workers[jobId][w].stakeAmount = 0;
+            stakeWithdrawn[jobId][w] = true;
+            totalObligations -= amount;
+            if (workerTotalStaked[w] >= amount) {
+                workerTotalStaked[w] -= amount;
+            } else {
+                workerTotalStaked[w] = 0;
+            }
+
+            (bool success, ) = w.call{value: amount}("");
+            if (!success) revert TransferFailed();
+
+            emit StakeReturned(jobId, w, amount);
+        }
+    }
+
     // ============ Global Worker Pool ============
 
     /// @notice Register in the global worker pool, staking ETH as collateral.
     ///         Any user who submits a training job can auto-assign pool workers.
     /// @param endpoint TCP endpoint the worker is listening on (e.g. "192.168.1.5:9001")
     function registerInPool(string calldata endpoint) external payable nonReentrant {
-        if (_poolWorkerIndex[msg.sender] != 0) revert WorkerAlreadyInPool();
+        if (_poolWorkerIndex[msg.sender] != 0) {
+            // Already in pool — refresh: top up stake, mark available, update endpoint.
+            PoolWorker storage pw = poolWorkers[msg.sender];
+            pw.stakeAmount += msg.value;
+            pw.available = true;
+            pw.activeJobId = 0;
+            pw.endpoint = endpoint;
+            totalObligations += msg.value;
+            emit WorkerPoolRegistered(msg.sender, endpoint, pw.stakeAmount);
+            return;
+        }
+
         if (msg.value < poolMinStake) revert InsufficientStake();
 
         poolWorkers[msg.sender] = PoolWorker({
@@ -909,8 +1103,45 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
 
         _poolWorkerList.push(msg.sender);
         _poolWorkerIndex[msg.sender] = _poolWorkerList.length; // 1-indexed
+        totalObligations += msg.value;
 
         emit WorkerPoolRegistered(msg.sender, endpoint, msg.value);
+    }
+
+    /// @notice Register a worker in the global pool on their behalf.
+    ///         The caller (typically the job owner) pays the ETH stake.
+    /// @param worker Address of the worker to register
+    /// @param endpoint TCP endpoint the worker is listening on
+    function registerWorkerInPoolFor(address worker, string calldata endpoint) external payable nonReentrant {
+        if (worker == address(0)) revert InvalidAddress();
+
+        if (_poolWorkerIndex[worker] != 0) {
+            // Already in pool — refresh: top up stake, mark available, update endpoint.
+            PoolWorker storage pw = poolWorkers[worker];
+            pw.stakeAmount += msg.value;
+            pw.available = true;
+            pw.activeJobId = 0;
+            pw.endpoint = endpoint;
+            totalObligations += msg.value;
+            emit WorkerPoolRegistered(worker, endpoint, pw.stakeAmount);
+            return;
+        }
+
+        if (msg.value < poolMinStake) revert InsufficientStake();
+
+        poolWorkers[worker] = PoolWorker({
+            endpoint: endpoint,
+            stakeAmount: msg.value,
+            registeredAt: block.timestamp,
+            available: true,
+            activeJobId: 0
+        });
+
+        _poolWorkerList.push(worker);
+        _poolWorkerIndex[worker] = _poolWorkerList.length; // 1-indexed
+        totalObligations += msg.value;
+
+        emit WorkerPoolRegistered(worker, endpoint, msg.value);
     }
 
     /// @notice Leave the worker pool and withdraw staked ETH.
@@ -935,6 +1166,7 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
 
         // Return stake
         if (stake > 0) {
+            totalObligations -= stake;
             (bool success, ) = msg.sender.call{value: stake}("");
             if (!success) revert TransferFailed();
         }
@@ -960,8 +1192,10 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
             if (pw.stakeAmount < jobs[jobId].minStake) continue;
             if (workers[jobId][w].registered) continue; // already in this job
 
-            // Register this pool worker into the job
+            // Register this pool worker into the job, locking part of their pool stake
             uint256 jobStake = jobs[jobId].minStake;
+            pw.stakeAmount -= jobStake; // Move from pool stake to job stake
+
             workers[jobId][w] = WorkerInfo({
                 stakeAmount: jobStake,
                 joinedAtStep: jobs[jobId].currentStep,
@@ -990,6 +1224,41 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
     }
 
     // ============ View Functions ============
+
+    /// @notice Compute a worker's reputation score from on-chain data
+    /// @dev Score is in basis points (0-10000). Factors: jobs completed, stake, slashing.
+    ///      - Base score: 5000 (50%)
+    ///      - Job completion bonus: +500 per job completed (capped at +3000)
+    ///      - Stake bonus: +1 per 0.001 ETH staked (capped at +2000)
+    ///      - Slash penalty: -2500 per slash (can drive score to 0)
+    ///      - Result clamped to [0, 10000]
+    /// @param worker Address of the worker to query
+    /// @return score Reputation score in basis points (0 = worst, 10000 = best)
+    function getReputationScore(address worker) external view returns (uint256 score) {
+        // Base score: 5000 (50%)
+        uint256 base = 5000;
+
+        // Job completion bonus: +500 per job, capped at +3000
+        uint256 jobBonus = workerJobsCompleted[worker] * 500;
+        if (jobBonus > 3000) jobBonus = 3000;
+
+        // Stake bonus: +1 per 0.001 ETH (i.e. +1000 per 1 ETH), capped at +2000
+        uint256 stakeBonus = workerTotalStaked[worker] / 0.001 ether;
+        if (stakeBonus > 2000) stakeBonus = 2000;
+
+        // Slash penalty: -2500 per slash
+        uint256 slashPenalty = workerSlashCount[worker] * 2500;
+
+        // Combine: base + bonuses - penalty, clamped to [0, 10000]
+        uint256 raw = base + jobBonus + stakeBonus;
+        if (slashPenalty >= raw) {
+            return 0;
+        }
+        score = raw - slashPenalty;
+        if (score > 10000) {
+            score = 10000;
+        }
+    }
 
     /// @notice Get the number of active workers for a job
     function getActiveWorkerCount(uint256 jobId) external view returns (uint256) {
@@ -1054,8 +1323,7 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
         uint256 numRounds,
         uint256 paymentAmount,
         uint256 activeWorkerCount,
-        bool active,
-        bool completed,
+        JobStatus status,
         bool zkEnabled,
         bool zkActivatedByRisk
     ) {
@@ -1066,8 +1334,7 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
             job.numRounds,
             job.paymentAmount,
             _activeWorkers[jobId].length,
-            job.active,
-            job.completed,
+            job.status,
             job.zkEnabled,
             job.zkActivatedByRisk
         );
@@ -1129,9 +1396,9 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
         bytes32 outputHash,
         bytes[] calldata signatures
     ) external nonReentrant {
-        // Job must exist and be completed (model trained)
+        // Job must exist and be completed or stopped (model trained)
         if (jobs[jobId].owner == address(0)) revert JobNotFound();
-        if (!jobs[jobId].completed) revert JobNotCompleted();
+        if (jobs[jobId].status != JobStatus.Completed && jobs[jobId].status != JobStatus.Stopped) revert JobNotCompleted();
 
         // Must have at least MIN_WORKERS signatures
         if (signatures.length < MIN_WORKERS) revert InvalidSignatureCount();
@@ -1212,6 +1479,39 @@ contract HelixCoordinatorV4 is ReentrancyGuard {
     function setVerifier(address _verifier) external onlyOwner {
         emit VerifierUpdated(address(verifier), _verifier);
         verifier = IHelixVerifier(_verifier);
+    }
+
+    /// @notice Withdraw excess ETH not owed to any user (from rounding dust, failed transfers, accidental sends)
+    function emergencyWithdraw(address to, uint256 amount) external onlyOwner nonReentrant {
+        if (to == address(0)) revert InvalidAddress();
+        uint256 excess = address(this).balance > totalObligations ? address(this).balance - totalObligations : 0;
+        if (amount > excess) revert InsufficientExcess();
+
+        (bool success, ) = to.call{value: amount}("");
+        if (!success) revert TransferFailed();
+
+        emit EmergencyWithdraw(to, amount);
+    }
+
+    /// @notice Admin force-remove pool workers so they can be re-registered fresh.
+    ///         Use when workers are stuck with 0 stake from a failed job.
+    function adminRemovePoolWorkers(address[] calldata workerAddrs) external onlyOwner {
+        for (uint256 i = 0; i < workerAddrs.length; i++) {
+            address w = workerAddrs[i];
+            if (_poolWorkerIndex[w] == 0) continue; // not in pool
+
+            // Remove from list (swap-and-pop)
+            uint256 index = _poolWorkerIndex[w] - 1;
+            uint256 lastIndex = _poolWorkerList.length - 1;
+            if (index != lastIndex) {
+                address lastWorker = _poolWorkerList[lastIndex];
+                _poolWorkerList[index] = lastWorker;
+                _poolWorkerIndex[lastWorker] = index + 1;
+            }
+            _poolWorkerList.pop();
+            _poolWorkerIndex[w] = 0;
+            delete poolWorkers[w];
+        }
     }
 
     /// @notice Receives ETH (for job payments)

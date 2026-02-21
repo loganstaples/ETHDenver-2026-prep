@@ -43,7 +43,7 @@ export function Tab({ label, isActive, onClick }: TabProps) {
     <button
       onClick={onClick}
       className={cn(
-        'relative px-3 py-2 text-sm transition-colors',
+        'relative px-4 py-2.5 text-base font-medium transition-colors',
         isActive ? 'text-helix-text' : 'text-helix-muted hover:text-helix-text2',
       )}
     >

@@ -29,3 +29,9 @@ rand = "0.8"
 rand_chacha = "0.3"
 chrono = "0.4"
 sha2 = "0.10"
+hex = "0.4"
+ethers = { version = "2.0.14", features = ["ws"], optional = true }
+
+[features]
+default = ["chain"]
+chain = ["ethers", "helix-client/chain"]

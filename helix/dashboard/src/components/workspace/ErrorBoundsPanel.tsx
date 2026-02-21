@@ -138,7 +138,7 @@ export function ErrorBoundsPanel({ modelId }: ErrorBoundsPanelProps) {
       {/* Risk Assessment */}
       <Card variant="default" className="space-y-3">
         <div className="flex items-center justify-between">
-          <h3 className="text-2xs font-mono uppercase tracking-wider text-helix-muted">
+          <h3 className="text-sm text-helix-muted">
             Risk Assessment
           </h3>
           {isWithinBounds ? (
@@ -178,7 +178,7 @@ export function ErrorBoundsPanel({ modelId }: ErrorBoundsPanelProps) {
 
       {/* Error Bound Chart */}
       <Card variant="default" className="space-y-3">
-        <h3 className="text-2xs font-mono uppercase tracking-wider text-helix-muted">
+        <h3 className="text-sm text-helix-muted">
           Error Bound History
         </h3>
         {chartData.length > 0 ? (
@@ -198,7 +198,7 @@ export function ErrorBoundsPanel({ modelId }: ErrorBoundsPanelProps) {
 
       {/* Layer Propagation Table */}
       <div className="space-y-3">
-        <h3 className="text-2xs font-mono uppercase tracking-wider text-helix-muted">
+        <h3 className="text-sm text-helix-muted">
           Layer Error Propagation
         </h3>
         <Card variant="default" className="p-0 overflow-hidden">

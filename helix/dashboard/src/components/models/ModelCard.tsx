@@ -48,10 +48,10 @@ export function ModelCard({ model }: ModelCardProps) {
         whileHover={{ y: -2 }}
         transition={{ duration: 0.15 }}
       >
-        <Card variant="glass" hover className="space-y-4">
+        <Card variant="glass" hover className="space-y-5">
           {/* Header: Name + Status Badge */}
-          <div className="flex items-start justify-between gap-2">
-            <h3 className="text-sm font-medium text-white truncate">
+          <div className="flex items-start justify-between gap-3">
+            <h3 className="text-lg font-semibold text-white truncate">
               {deriveModelName(model.ipfsHash)}
             </h3>
             {model.active ? (
@@ -62,25 +62,25 @@ export function ModelCard({ model }: ModelCardProps) {
           </div>
 
           {/* IPFS Hash */}
-          <p className="font-mono text-2xs text-helix-muted truncate">
+          <p className="font-mono text-sm text-helix-muted truncate">
             {truncateHash(model.ipfsHash, 20)}
           </p>
 
           {/* Metrics Row */}
-          <div className="grid grid-cols-3 gap-3">
+          <div className="grid grid-cols-3 gap-4">
             <div>
-              <p className="text-2xs text-helix-muted uppercase tracking-wider mb-0.5">
+              <p className="text-sm text-helix-muted mb-1">
                 Loss
               </p>
-              <p className="font-mono text-xs text-helix-text">
+              <p className="font-mono text-base font-medium text-helix-text">
                 {trainingLoading ? '--' : formatMetric(metrics.loss)}
               </p>
             </div>
             <div>
-              <p className="text-2xs text-helix-muted uppercase tracking-wider mb-0.5">
+              <p className="text-sm text-helix-muted mb-1">
                 Accuracy
               </p>
-              <p className="font-mono text-xs text-helix-text">
+              <p className="font-mono text-base font-medium text-helix-text">
                 {trainingLoading
                   ? '--'
                   : metrics.accuracy !== undefined
@@ -89,23 +89,23 @@ export function ModelCard({ model }: ModelCardProps) {
               </p>
             </div>
             <div>
-              <p className="text-2xs text-helix-muted uppercase tracking-wider mb-0.5">
+              <p className="text-sm text-helix-muted mb-1">
                 Error Bound
               </p>
-              <p className="font-mono text-xs text-helix-text">
+              <p className="font-mono text-base font-medium text-helix-text">
                 {formatMetric(model.errorBoundFormatted)}
               </p>
             </div>
           </div>
 
           {/* Progress + Workers */}
-          <div className="space-y-2">
+          <div className="space-y-2.5">
             <ProgressBar value={progress.overallProgress} size="sm" />
             <div className="flex items-center justify-between">
-              <span className="text-2xs text-helix-dim font-mono">
+              <span className="text-sm text-helix-muted">
                 {progress.overallProgress.toFixed(0)}% complete
               </span>
-              <span className="text-2xs text-helix-dim font-mono">
+              <span className="text-sm text-helix-muted">
                 {stats.verified} proofs
               </span>
             </div>

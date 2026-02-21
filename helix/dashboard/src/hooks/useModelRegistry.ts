@@ -20,6 +20,7 @@ export interface ModelWithVersions {
   description: string;
   architecture: string;
   creator: string;
+  owner: string;
   createdAt: number;
   isPublic: boolean;
   inferenceFee: number;
@@ -50,6 +51,7 @@ export interface UseModelRegistryReturn {
   setSalePrice: (params: { tokenId: number; priceEth: number }) => void;
   buyModel: (params: { tokenId: number; priceEth: number }) => void;
   withdrawFees: (params: { tokenId: number }) => void;
+  deleteModel: (params: { tokenId: number }) => void;
   grantAccess: (params: { tokenId: number; account: string }) => void;
   revokeAccess: (params: { tokenId: number; account: string }) => void;
   isWritePending: boolean;
@@ -111,8 +113,8 @@ export function useModelRegistry(): UseModelRegistryReturn {
       .map((r) => Number(r.result));
   }, [tokenIdResults]);
 
-  // ── Phase 3: Get model data + versions + sale info ────────────────
-  const CALLS_PER_TOKEN = 5;
+  // ── Phase 3: Get model data + versions + sale info + owner ────────
+  const CALLS_PER_TOKEN = 6;
   const modelDataCalls = useMemo(() => {
     if (tokenIds.length === 0) return [];
     const calls: {
@@ -152,6 +154,12 @@ export function useModelRegistry(): UseModelRegistryReturn {
         functionName: 'inferenceFeesAccrued',
         args: [BigInt(tokenId)],
       });
+      calls.push({
+        address: addr,
+        abi: HELIX_MODEL_STORE_ABI,
+        functionName: 'ownerOf',
+        args: [BigInt(tokenId)],
+      });
     }
     return calls;
   }, [tokenIds, addr]);
@@ -177,10 +185,22 @@ export function useModelRegistry(): UseModelRegistryReturn {
       const forSaleResult = modelDataResults[base + 2];
       const salePriceResult = modelDataResults[base + 3];
       const feesAccruedResult = modelDataResults[base + 4];
+      const ownerOfResult = modelDataResults[base + 5];
 
       if (modelResult?.status !== 'success' || !modelResult.result) continue;
 
-      const m = modelResult.result as unknown as readonly [string, string, string, string, string, bigint, boolean, number];
+      // Named struct access — more robust than array indexing
+      const raw = modelResult.result as unknown as Record<string, unknown>;
+      const m = {
+        slug: String(raw.slug ?? raw[0] ?? ''),
+        name: String(raw.name ?? raw[1] ?? ''),
+        description: String(raw.description ?? raw[2] ?? ''),
+        architecture: String(raw.architecture ?? raw[3] ?? ''),
+        creator: String(raw.creator ?? raw[4] ?? ''),
+        createdAt: Number(raw.createdAt ?? raw[5] ?? 0),
+        isPublic: Boolean(raw.isPublic ?? raw[6] ?? false),
+        inferenceFee: Number(raw.inferenceFee ?? raw[7] ?? 0),
+      };
       const forSale = forSaleResult?.status === 'success' ? (forSaleResult.result as unknown as boolean) : false;
       const salePriceWei = salePriceResult?.status === 'success' ? (salePriceResult.result as unknown as bigint) : BigInt(0);
       const salePrice = Number(salePriceWei) / 1e18;
@@ -209,16 +229,19 @@ export function useModelRegistry(): UseModelRegistryReturn {
         }
       }
 
+      const owner = ownerOfResult?.status === 'success' ? (ownerOfResult.result as unknown as string) : m.creator;
+
       result.push({
         tokenId: tokenIds[i],
-        slug: m[0],
-        name: m[1],
-        description: m[2],
-        architecture: m[3],
-        creator: m[4],
-        createdAt: Number(m[5]),
-        isPublic: m[6],
-        inferenceFee: Number(m[7]),
+        slug: m.slug,
+        name: m.name,
+        description: m.description,
+        architecture: m.architecture,
+        creator: m.creator,
+        owner,
+        createdAt: m.createdAt,
+        isPublic: m.isPublic,
+        inferenceFee: m.inferenceFee,
         forSale,
         salePrice,
         feesAccrued,
@@ -367,6 +390,19 @@ export function useModelRegistry(): UseModelRegistryReturn {
     [isConnected, isContractDeployed, addr, writeContract],
   );
 
+  const deleteModel = useCallback(
+    (params: { tokenId: number }) => {
+      if (!isConnected || !isContractDeployed) return;
+      writeContract({
+        address: addr,
+        abi: HELIX_MODEL_STORE_ABI,
+        functionName: 'deleteModel',
+        args: [BigInt(params.tokenId)],
+      });
+    },
+    [isConnected, isContractDeployed, addr, writeContract],
+  );
+
   const grantAccess = useCallback(
     (params: { tokenId: number; account: string }) => {
       if (!isConnected || !isContractDeployed) return;
@@ -412,6 +448,7 @@ export function useModelRegistry(): UseModelRegistryReturn {
     setSalePrice,
     buyModel,
     withdrawFees,
+    deleteModel,
     grantAccess,
     revokeAccess,
     isWritePending,

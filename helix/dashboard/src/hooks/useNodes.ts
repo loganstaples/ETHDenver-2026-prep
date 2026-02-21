@@ -49,6 +49,11 @@ export interface WorkerNode {
     };
     earningsTotal: bigint;
     slashed: boolean;
+    // Live fields from backend worker registry
+    successRate?: number;
+    registeredAt?: number;
+    endpoint?: string;
+    partyIndex?: number;
 }
 
 export interface NetworkConnection {
@@ -201,7 +206,7 @@ export function useNodes(options: UseNodesOptions = {}): UseNodesReturn {
             }
         });
 
-        // Process proof events
+        // Process proof events (job completion increases reputation)
         proofEvents.forEach((event) => {
             const addr = event.prover;
             if (nodeMap.has(addr)) {
@@ -209,22 +214,33 @@ export function useNodes(options: UseNodesOptions = {}): UseNodesReturn {
                 node.proofsSubmitted++;
                 node.proofsVerified++;
                 node.roundsParticipated++;
+                node.roundsCompleted++;
                 node.lastSeen = Math.max(node.lastSeen, event.timestamp);
                 node.lastHeartbeat = event.timestamp;
-                node.reputation = Math.min(100, node.reputation + 0.5);
                 node.status = 'active';
             }
         });
 
-        // Process slashed events
+        // Process slashed events (slashing decreases reputation significantly)
         slashedEvents.forEach((event) => {
             const addr = event.prover;
             if (nodeMap.has(addr)) {
                 const node = nodeMap.get(addr)!;
-                node.reputation = Math.max(0, node.reputation - 25);
                 node.slashed = true;
                 node.proofsFailed++;
             }
+        });
+
+        // Compute reputation scores matching the on-chain formula (basis points → 0-100 scale):
+        //   Base: 50 + jobBonus (5/job, cap 30) + stakeBonus (scaled, cap 20) - slashPenalty (25/slash)
+        nodeMap.forEach((node) => {
+            const base = 50;
+            const jobBonus = Math.min(node.roundsCompleted * 5, 30);
+            // Stake bonus: +1 per 0.001 ETH equivalent, capped at 20
+            const stakeEth = Number(node.stakedAmount) / 1e18;
+            const stakeBonus = Math.min(Math.floor(stakeEth * 1000) / 10, 20);
+            const slashPenalty = node.proofsFailed * 25;
+            node.reputation = Math.max(0, Math.min(100, base + jobBonus + stakeBonus - slashPenalty));
         });
 
         // Update status based on last seen time
@@ -258,40 +274,85 @@ export function useNodes(options: UseNodesOptions = {}): UseNodesReturn {
             if (eventNodes.size === 0) {
                 // Fallback: fetch workers from backend API
                 try {
-                    const res = await fetch(`${API_BASE}/api/workers`);
+                    const controller = new AbortController();
+                    const timeout = setTimeout(() => controller.abort(), 3000);
+                    const res = await fetch(`${API_BASE}/api/workers`, { signal: controller.signal });
+                    clearTimeout(timeout);
                     if (res.ok) {
                         const data = await res.json();
-                        const workers: { address?: string; addr?: string; id?: string; status?: string }[] =
+                        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                        const workers: any[] =
                             Array.isArray(data) ? data : (data.workers ?? []);
 
-                        const backendNodes: WorkerNode[] = workers.map((w, i) => {
-                            const addr = w.address || w.addr || w.id || `0x${i.toString(16).padStart(40, '0')}`;
-                            const types: WorkerNode['type'][] = ['compute', 'aggregator', 'verifier'];
+                        const backendNodes: WorkerNode[] = workers.map((w) => {
+                            const addr = w.address || w.addr || w.id || '0x0';
+                            const caps = w.capabilities || {};
+
+                            // Derive node type from real capabilities
+                            let nodeType: WorkerNode['type'] = 'compute';
+                            if (caps.can_aggregate) nodeType = 'aggregator';
+                            else if (caps.can_prove) nodeType = 'verifier';
+
+                            // Map backend status to frontend status
+                            let status: WorkerNode['status'] = 'active';
+                            const rawStatus = (w.status || '').toLowerCase();
+                            if (rawStatus === 'offline') status = 'offline';
+                            else if (rawStatus === 'idle') status = 'idle';
+                            else if (rawStatus === 'busy' || rawStatus === 'training') status = 'training';
+
+                            // Convert reputation_score (0.0-1.0) to 0-100 scale
+                            const repScore = typeof w.reputation_score === 'number'
+                                ? Math.round(w.reputation_score * 100)
+                                : 50;
+
+                            // Convert timestamps: backend uses unix seconds (f64), frontend uses ms
+                            const lastHb = typeof w.last_heartbeat === 'number'
+                                ? w.last_heartbeat * 1000
+                                : Date.now();
+                            const registeredAt = typeof w.registered_at === 'number'
+                                ? w.registered_at * 1000
+                                : Date.now();
+
                             return {
-                                id: `node-${addr.slice(0, 10)}`,
+                                id: w.id || `node-${addr.slice(0, 10)}`,
                                 address: addr,
-                                type: types[i % 3],
-                                status: 'active' as WorkerNode['status'],
-                                lastSeen: Date.now(),
-                                lastHeartbeat: Date.now(),
-                                stakedAmount: BigInt(0),
-                                proofsSubmitted: 0,
-                                proofsVerified: 0,
+                                type: nodeType,
+                                status,
+                                lastSeen: lastHb,
+                                lastHeartbeat: lastHb,
+                                stakedAmount: w.stake_eth ? BigInt(Math.floor(w.stake_eth * 1e18)) : BigInt(0),
+                                proofsSubmitted: Number(w.rounds_completed || 0),
+                                proofsVerified: Number(w.rounds_completed || 0),
                                 proofsFailed: 0,
-                                roundsParticipated: 0,
-                                roundsCompleted: 0,
-                                reputation: 100,
-                                metrics: { cpu: 0, memory: 0, networkIn: 0, networkOut: 0 },
-                                capabilities: {
-                                    canTrain: true,
-                                    canAggregate: i % 3 === 1,
-                                    canProve: i % 3 === 2,
-                                    gpuMemoryMb: 0,
-                                    maxBatchSize: 64,
+                                roundsParticipated: Number(w.rounds_participated || 0),
+                                roundsCompleted: Number(w.rounds_completed || 0),
+                                reputation: repScore,
+                                metrics: {
+                                    cpu: Number(w.cpu_load || 0),
+                                    memory: Number(w.memory_mb || 0),
+                                    gpu: undefined,
+                                    gpuMemory: undefined,
+                                    networkIn: 0,
+                                    networkOut: 0,
+                                    temperature: undefined,
                                 },
-                                earningsTotal: BigInt(0),
+                                capabilities: {
+                                    canTrain: caps.can_train ?? true,
+                                    canAggregate: caps.can_aggregate ?? false,
+                                    canProve: caps.can_prove ?? false,
+                                    gpuModel: caps.gpu_model,
+                                    gpuMemoryMb: Number(caps.gpu_memory_mb || 0),
+                                    maxBatchSize: Number(caps.max_batch_size || 64),
+                                },
+                                location: undefined,
+                                earningsTotal: w.earnings_wei ? BigInt(w.earnings_wei) : BigInt(0),
                                 slashed: false,
-                            };
+                                // Extra live fields for display
+                                successRate: typeof w.success_rate === 'number' ? w.success_rate : 0,
+                                registeredAt,
+                                endpoint: w.endpoint || '',
+                                partyIndex: typeof w.party_index === 'number' ? w.party_index : undefined,
+                            } as WorkerNode;
                         });
 
                         setNodes(backendNodes);
@@ -414,11 +475,22 @@ export function useNodes(options: UseNodesOptions = {}): UseNodesReturn {
                     setNodes((prev) => {
                         // Don't add if already exists
                         if (prev.some((n) => n.id === w.id)) return prev;
+
+                        const caps = w.capabilities || {};
+                        let nodeType: WorkerNode['type'] = 'compute';
+                        if (caps.can_aggregate) nodeType = 'aggregator';
+                        else if (caps.can_prove) nodeType = 'verifier';
+
+                        const rawStatus = (w.status || 'idle').toLowerCase();
+                        let wsStatus: WorkerNode['status'] = 'idle';
+                        if (rawStatus === 'busy' || rawStatus === 'training') wsStatus = 'training';
+                        else if (rawStatus === 'active') wsStatus = 'active';
+
                         const newNode: WorkerNode = {
                             id: w.id,
                             address: w.endpoint || w.id,
-                            type: 'compute',
-                            status: 'active',
+                            type: nodeType,
+                            status: wsStatus,
                             lastSeen: Date.now(),
                             lastHeartbeat: Date.now(),
                             stakedAmount: BigInt(0),
@@ -430,14 +502,16 @@ export function useNodes(options: UseNodesOptions = {}): UseNodesReturn {
                             reputation: w.reputation_score ? Math.round(w.reputation_score * 100) : 50,
                             metrics: { cpu: w.cpu_load || 0, memory: 0, networkIn: 0, networkOut: 0 },
                             capabilities: {
-                                canTrain: w.capabilities?.can_train ?? true,
-                                canAggregate: w.capabilities?.can_aggregate ?? false,
-                                canProve: w.capabilities?.can_prove ?? false,
+                                canTrain: caps.can_train ?? true,
+                                canAggregate: caps.can_aggregate ?? false,
+                                canProve: caps.can_prove ?? false,
                                 gpuMemoryMb: 0,
-                                maxBatchSize: w.capabilities?.max_batch_size ?? 64,
+                                maxBatchSize: caps.max_batch_size ?? 64,
                             },
                             earningsTotal: BigInt(0),
                             slashed: false,
+                            endpoint: w.endpoint,
+                            partyIndex: w.party_index,
                         };
                         return [...prev, newNode];
                     });
@@ -520,9 +594,9 @@ export function useNodes(options: UseNodesOptions = {}): UseNodesReturn {
         if (!autoRefresh) return;
         const interval = setInterval(() => {
             fetchNodes();
-        }, 10000);
+        }, refreshInterval);
         return () => clearInterval(interval);
-    }, [autoRefresh, fetchNodes]);
+    }, [autoRefresh, refreshInterval, fetchNodes]);
 
     // Update nodes when contract events change
     useEffect(() => {

@@ -226,15 +226,14 @@ contract HelixCoordinatorV4Test is Test {
         );
         assertEq(jobId, 0);
 
-        (address jOwner, uint256 step, uint256 rounds, uint256 payment, uint256 activeCount, bool active, bool completed,,) =
+        (address jOwner, uint256 step, uint256 rounds, uint256 payment, uint256 activeCount, HelixCoordinatorV4.JobStatus status,,) =
             coordinator.getJobSummary(jobId);
         assertEq(jOwner, jobOwner);
         assertEq(step, 0);
         assertEq(rounds, NUM_ROUNDS);
         assertEq(payment, PAYMENT_AMOUNT);
         assertEq(activeCount, 0);
-        assertTrue(active);
-        assertFalse(completed);
+        assertEq(uint(status), uint(HelixCoordinatorV4.JobStatus.Active));
     }
 
     function test_RegisterTrainingJob_RejectsZeroPayment() public {
@@ -358,14 +357,17 @@ contract HelixCoordinatorV4Test is Test {
         coordinator.completeTraining(jobId, finalCommitment, completionSigs);
 
         // Verify job is completed
-        (, , , , , bool active, bool completed,,) = coordinator.getJobSummary(jobId);
-        assertFalse(active);
-        assertTrue(completed);
+        (,,,,, HelixCoordinatorV4.JobStatus status,,) = coordinator.getJobSummary(jobId);
+        assertEq(uint(status), uint(HelixCoordinatorV4.JobStatus.Completed));
 
         // Verify payment was distributed (all workers participated equally)
-        uint256 w1Payment = worker1.balance - w1BalBefore;
-        uint256 w2Payment = worker2.balance - w2BalBefore;
-        uint256 w3Payment = worker3.balance - w3BalBefore;
+        // Each worker receives payment + auto-returned stake (STAKE_AMOUNT)
+        uint256 w1Received = worker1.balance - w1BalBefore;
+        uint256 w2Received = worker2.balance - w2BalBefore;
+        uint256 w3Received = worker3.balance - w3BalBefore;
+        uint256 w1Payment = w1Received - STAKE_AMOUNT;
+        uint256 w2Payment = w2Received - STAKE_AMOUNT;
+        uint256 w3Payment = w3Received - STAKE_AMOUNT;
         uint256 totalPaid = w1Payment + w2Payment + w3Payment;
         assertEq(totalPaid, PAYMENT_AMOUNT);
 
@@ -528,8 +530,12 @@ contract HelixCoordinatorV4Test is Test {
 
         coordinator.completeTraining(jobId, finalCommitment, completionSigs);
 
-        uint256 w1Payment = worker1.balance - w1BalBefore;
-        uint256 w3Payment = worker3.balance - w3BalBefore;
+        uint256 w1Received = worker1.balance - w1BalBefore;
+        uint256 w3Received = worker3.balance - w3BalBefore;
+
+        // Each active worker receives payment + auto-returned stake (STAKE_AMOUNT)
+        uint256 w1Payment = w1Received - STAKE_AMOUNT;
+        uint256 w3Payment = w3Received - STAKE_AMOUNT;
 
         // Both worker1 and worker3 participated from step 0 to step 100 (same weight)
         // Worker2 was slashed and gets nothing
@@ -618,10 +624,12 @@ contract HelixCoordinatorV4Test is Test {
         noVerifier.submitCheckpointWithProof(jobId, 100, keccak256("x"), 500, proof, publicInputs);
     }
 
-    function test_stake_withdrawal_after_cooldown() public {
+    function test_stake_autoReturned_on_completion() public {
         uint256 jobId = _setupJobWith3Workers();
 
-        // Complete training
+        uint256 balBefore = worker1.balance;
+
+        // Complete training — stakes auto-returned to non-pool workers
         bytes32 finalCommitment = keccak256("final");
         uint256[] memory allPKs = new uint256[](3);
         allPKs[0] = WORKER1_PK;
@@ -630,21 +638,12 @@ contract HelixCoordinatorV4Test is Test {
         bytes[] memory sigs = _signCompletion(jobId, finalCommitment, allPKs);
         coordinator.completeTraining(jobId, finalCommitment, sigs);
 
-        // Can't withdraw before cooldown
-        vm.prank(worker1);
-        vm.expectRevert(HelixCoordinatorV4.CooldownNotExpired.selector);
-        coordinator.withdrawStake(jobId);
+        // Stake was auto-returned (balance includes payment + stake refund)
+        assertGe(worker1.balance - balBefore, STAKE_AMOUNT);
+        assertTrue(coordinator.stakeWithdrawn(jobId, worker1));
 
-        // Fast forward past cooldown
+        // Manual withdrawal reverts since auto-return already handled it
         vm.warp(block.timestamp + 7 days + 1);
-
-        uint256 balBefore = worker1.balance;
-        vm.prank(worker1);
-        coordinator.withdrawStake(jobId);
-
-        assertEq(worker1.balance - balBefore, STAKE_AMOUNT);
-
-        // Can't withdraw twice
         vm.prank(worker1);
         vm.expectRevert(HelixCoordinatorV4.AlreadyWithdrawn.selector);
         coordinator.withdrawStake(jobId);
@@ -773,9 +772,14 @@ contract HelixCoordinatorV4Test is Test {
 
         coordinator.completeTraining(jobId, finalCommitment, completionSigs);
 
-        uint256 w1Payment = worker1.balance - w1Before;
-        uint256 w2Payment = worker2.balance - w2Before;
-        uint256 w3Payment = worker3.balance - w3Before;
+        uint256 w1Received = worker1.balance - w1Before;
+        uint256 w2Received = worker2.balance - w2Before;
+        uint256 w3Received = worker3.balance - w3Before;
+
+        // Each worker receives payment + auto-returned stake (STAKE_AMOUNT)
+        uint256 w1Payment = w1Received - STAKE_AMOUNT;
+        uint256 w2Payment = w2Received - STAKE_AMOUNT;
+        uint256 w3Payment = w3Received - STAKE_AMOUNT;
 
         // Worker1 and Worker2 participated from 0-100 (100 steps)
         // Worker3 participated from 50-100 (50 steps)
@@ -912,9 +916,8 @@ contract HelixCoordinatorV4Test is Test {
         coordinator.completeTraining(jobId, finalCommitment, completionSigs);
 
         // Verify final state
-        (, , , , , bool active, bool completed,,) = coordinator.getJobSummary(jobId);
-        assertFalse(active);
-        assertTrue(completed);
+        (,,,,, HelixCoordinatorV4.JobStatus status,,) = coordinator.getJobSummary(jobId);
+        assertEq(uint(status), uint(HelixCoordinatorV4.JobStatus.Completed));
         assertEq(coordinator.getActiveWorkerCount(jobId), 2);
         assertEq(coordinator.getCheckpointCount(jobId), 2);
         assertEq(coordinator.getMACFailureReportCount(jobId), 1);
@@ -1349,6 +1352,162 @@ contract HelixCoordinatorV4Test is Test {
 
     // ============ Pool Worker Slashing Tests ============
 
+    // ============ Reputation Score Tests ============
+
+    function test_reputationScore_initialBaseScore() public view {
+        // A worker who has never interacted should have base score of 5000
+        uint256 score = coordinator.getReputationScore(worker1);
+        assertEq(score, 5000);
+    }
+
+    function test_reputationScore_jobCompletionBonus() public {
+        uint256 jobId = _setupJobWith3Workers();
+
+        uint256 scoreBefore = coordinator.getReputationScore(worker1);
+        // Before: 5000 (base) + 0 (jobs) + 1000 (1 ETH stake) = 6000
+        assertEq(scoreBefore, 6000);
+
+        // Complete training
+        bytes32 finalCommitment = keccak256("final");
+        uint256[] memory allPKs = new uint256[](3);
+        allPKs[0] = WORKER1_PK;
+        allPKs[1] = WORKER2_PK;
+        allPKs[2] = WORKER3_PK;
+        bytes[] memory sigs = _signCompletion(jobId, finalCommitment, allPKs);
+        coordinator.completeTraining(jobId, finalCommitment, sigs);
+
+        uint256 scoreAfter = coordinator.getReputationScore(worker1);
+        // After auto-return: 5000 (base) + 500 (1 job) + 0 (stake returned) = 5500
+        // Stake bonus drops because auto-return zeroes workerTotalStaked,
+        // but job completion bonus of +500 is applied
+        assertEq(scoreAfter, 5500);
+        assertEq(coordinator.workerJobsCompleted(worker1), 1);
+    }
+
+    function test_reputationScore_decreasesSignificantlyOnSlash() public {
+        uint256 jobId = _setupJobWith3Workers();
+
+        uint256 scoreBefore = coordinator.getReputationScore(worker2);
+
+        // Slash worker2
+        bytes memory evidence = abi.encode("evidence");
+        uint256[] memory reporterPKs = new uint256[](2);
+        reporterPKs[0] = WORKER1_PK;
+        reporterPKs[1] = WORKER3_PK;
+        bytes[] memory reportSigs = _signMACFailure(jobId, 100, worker2, evidence, reporterPKs);
+        coordinator.reportMACFailure(jobId, 100, worker2, evidence, reportSigs);
+
+        uint256 scoreAfter = coordinator.getReputationScore(worker2);
+        assertLt(scoreAfter, scoreBefore);
+        // Slash penalty is 2500 and stake is zeroed (-1000 stake bonus for 1 ETH)
+        // Before: 5000 (base) + 1000 (1 ETH stake) = 6000
+        // After:  5000 (base) + 0 (stake zeroed) - 2500 (1 slash) = 2500
+        assertEq(scoreBefore, 6000);
+        assertEq(scoreAfter, 2500);
+    }
+
+    function test_reputationScore_stakeIncreasesScore() public {
+        // Worker1 before staking has base score
+        uint256 scoreBefore = coordinator.getReputationScore(worker1);
+        assertEq(scoreBefore, 5000);
+
+        // Register a job and have worker1 stake 1 ETH
+        vm.prank(jobOwner);
+        uint256 jobId = coordinator.registerTrainingJob{value: PAYMENT_AMOUNT}(
+            ARCH_HASH, CHECKPOINT_FREQ, NUM_ROUNDS, PAYMENT_AMOUNT, false, 0, false, 0, address(0)
+        );
+        vm.prank(worker1);
+        coordinator.stakeAndJoin{value: 1 ether}(jobId);
+
+        uint256 scoreAfter = coordinator.getReputationScore(worker1);
+        // 1 ETH = 1000 * 0.001 ETH = +1000 stake bonus
+        assertEq(scoreAfter, 6000);
+        assertGt(scoreAfter, scoreBefore);
+    }
+
+    function test_reputationScore_noOverflowOrUnderflow() public {
+        uint256 jobId = _setupJobWith3Workers();
+
+        // Slash worker2 — score should not underflow
+        bytes memory evidence = abi.encode("evidence");
+        uint256[] memory reporterPKs = new uint256[](2);
+        reporterPKs[0] = WORKER1_PK;
+        reporterPKs[1] = WORKER3_PK;
+        bytes[] memory reportSigs = _signMACFailure(jobId, 100, worker2, evidence, reporterPKs);
+        coordinator.reportMACFailure(jobId, 100, worker2, evidence, reportSigs);
+
+        // Score after 1 slash: 5000 + 0 (stake zeroed) - 2500 = 2500
+        uint256 score = coordinator.getReputationScore(worker2);
+        assertEq(score, 2500);
+
+        // Now slash worker2 again in a new job to push score to 0
+        vm.prank(jobOwner);
+        uint256 jobId2 = coordinator.registerTrainingJob{value: PAYMENT_AMOUNT}(
+            ARCH_HASH, CHECKPOINT_FREQ, NUM_ROUNDS, PAYMENT_AMOUNT, false, 0, false, 0, address(0)
+        );
+        // Worker2 stakes again
+        vm.prank(worker2);
+        coordinator.stakeAndJoin{value: STAKE_AMOUNT}(jobId2);
+
+        // Slash worker2 again
+        bytes memory evidence2 = abi.encode("evidence2");
+        // Need worker1 and worker3 in this job too
+        vm.prank(worker1);
+        coordinator.stakeAndJoin{value: STAKE_AMOUNT}(jobId2);
+        vm.prank(worker3);
+        coordinator.stakeAndJoin{value: STAKE_AMOUNT}(jobId2);
+
+        uint256[] memory reporterPKs2 = new uint256[](2);
+        reporterPKs2[0] = WORKER1_PK;
+        reporterPKs2[1] = WORKER3_PK;
+        bytes[] memory reportSigs2 = _signMACFailure(jobId2, 100, worker2, evidence2, reporterPKs2);
+        coordinator.reportMACFailure(jobId2, 100, worker2, evidence2, reportSigs2);
+
+        // 2 slashes = 5000 penalty, score should be 0 (not underflow)
+        uint256 score2 = coordinator.getReputationScore(worker2);
+        assertEq(score2, 0);
+    }
+
+    function test_reputationScore_readableByAnyAddress() public {
+        uint256 jobId = _setupJobWith3Workers();
+
+        // Complete training so workers have a score
+        bytes32 finalCommitment = keccak256("final");
+        uint256[] memory allPKs = new uint256[](3);
+        allPKs[0] = WORKER1_PK;
+        allPKs[1] = WORKER2_PK;
+        allPKs[2] = WORKER3_PK;
+        bytes[] memory sigs = _signCompletion(jobId, finalCommitment, allPKs);
+        coordinator.completeTraining(jobId, finalCommitment, sigs);
+
+        // Any address can read any worker's reputation
+        vm.prank(outsider);
+        uint256 score1 = coordinator.getReputationScore(worker1);
+        assertGt(score1, 0);
+
+        vm.prank(address(0xdead));
+        uint256 score2 = coordinator.getReputationScore(worker2);
+        assertGt(score2, 0);
+    }
+
+    function test_reputationScore_cappedAt10000() public {
+        // Complete many jobs to hit the cap
+        for (uint256 i = 0; i < 10; i++) {
+            uint256 jobId = _setupJobWith3Workers();
+            bytes32 fc = keccak256(abi.encodePacked("final_", i));
+            uint256[] memory pks = new uint256[](3);
+            pks[0] = WORKER1_PK;
+            pks[1] = WORKER2_PK;
+            pks[2] = WORKER3_PK;
+            bytes[] memory sigs = _signCompletion(jobId, fc, pks);
+            coordinator.completeTraining(jobId, fc, sigs);
+        }
+
+        uint256 score = coordinator.getReputationScore(worker1);
+        // Max: base 5000 + jobBonus 3000 (capped) + stakeBonus 2000 (capped) = 10000
+        assertLe(score, 10000);
+    }
+
     function test_slashedPoolWorkerRemoved() public {
         // Register workers in pool
         vm.prank(worker1);
@@ -1376,6 +1535,584 @@ contract HelixCoordinatorV4Test is Test {
 
         // Worker2 should be removed from the pool entirely
         assertEq(coordinator.getPoolWorkerCount(), 2);
+    }
+
+    // ============ Pause Training Tests ============
+
+    function test_pauseTraining_basic() public {
+        uint256 jobId = _setupJobWith3Workers();
+
+        // Submit a checkpoint to advance state
+        bytes32 commitment = keccak256("weights_100");
+        bytes[] memory sigs = _signCheckpoint(jobId, 100, commitment, 500);
+        coordinator.submitCheckpoint(jobId, 100, commitment, 500, sigs);
+
+        // Pause the job
+        vm.prank(jobOwner);
+        coordinator.pauseTraining(jobId);
+
+        // Verify status is Paused
+        (,,,,, HelixCoordinatorV4.JobStatus status,,) = coordinator.getJobSummary(jobId);
+        assertEq(uint(status), uint(HelixCoordinatorV4.JobStatus.Paused));
+
+        // Workers should be released (active count = 0)
+        assertEq(coordinator.getActiveWorkerCount(jobId), 0);
+    }
+
+    function test_pauseTraining_onlyOwnerOrOperator() public {
+        uint256 jobId = _setupJobWith3Workers();
+
+        // Outsider cannot pause
+        vm.prank(outsider);
+        vm.expectRevert(HelixCoordinatorV4.NotJobOwnerOrOperator.selector);
+        coordinator.pauseTraining(jobId);
+
+        // Worker cannot pause
+        vm.prank(worker1);
+        vm.expectRevert(HelixCoordinatorV4.NotJobOwnerOrOperator.selector);
+        coordinator.pauseTraining(jobId);
+    }
+
+    function test_pauseTraining_operatorCanPause() public {
+        // Register job with operator
+        vm.prank(jobOwner);
+        uint256 jobId = coordinator.registerTrainingJob{value: PAYMENT_AMOUNT}(
+            ARCH_HASH, CHECKPOINT_FREQ, NUM_ROUNDS, PAYMENT_AMOUNT, false, 0, false, 0, outsider
+        );
+
+        vm.prank(worker1);
+        coordinator.stakeAndJoin{value: STAKE_AMOUNT}(jobId);
+        vm.prank(worker2);
+        coordinator.stakeAndJoin{value: STAKE_AMOUNT}(jobId);
+        vm.prank(worker3);
+        coordinator.stakeAndJoin{value: STAKE_AMOUNT}(jobId);
+
+        // Operator can pause
+        vm.prank(outsider);
+        coordinator.pauseTraining(jobId);
+
+        (,,,,, HelixCoordinatorV4.JobStatus status,,) = coordinator.getJobSummary(jobId);
+        assertEq(uint(status), uint(HelixCoordinatorV4.JobStatus.Paused));
+    }
+
+    function test_pauseTraining_rejectsNonActive() public {
+        uint256 jobId = _setupJobWith3Workers();
+
+        // Complete training first
+        bytes32 finalCommitment = keccak256("final");
+        uint256[] memory allPKs = new uint256[](3);
+        allPKs[0] = WORKER1_PK;
+        allPKs[1] = WORKER2_PK;
+        allPKs[2] = WORKER3_PK;
+        bytes[] memory sigs = _signCompletion(jobId, finalCommitment, allPKs);
+        coordinator.completeTraining(jobId, finalCommitment, sigs);
+
+        // Can't pause a completed job
+        vm.prank(jobOwner);
+        vm.expectRevert(HelixCoordinatorV4.JobNotActive.selector);
+        coordinator.pauseTraining(jobId);
+    }
+
+    function test_pauseTraining_workersGetStakeAutoReturned() public {
+        uint256 jobId = _setupJobWith3Workers();
+
+        uint256 balBefore = worker1.balance;
+
+        // Pause the job — stakes auto-returned to non-pool workers
+        vm.prank(jobOwner);
+        coordinator.pauseTraining(jobId);
+
+        // Stake was auto-returned during pause
+        assertEq(worker1.balance - balBefore, STAKE_AMOUNT);
+        assertTrue(coordinator.stakeWithdrawn(jobId, worker1));
+
+        // Manual withdrawal now reverts with AlreadyWithdrawn
+        vm.prank(worker1);
+        vm.expectRevert(HelixCoordinatorV4.AlreadyWithdrawn.selector);
+        coordinator.withdrawStake(jobId);
+    }
+
+    function test_pauseTraining_workerActiveJobsDecremented() public {
+        uint256 jobId = _setupJobWith3Workers();
+
+        // Worker1 should have 1 active job
+        assertEq(coordinator.workerActiveJobs(worker1), 1);
+
+        // Pause
+        vm.prank(jobOwner);
+        coordinator.pauseTraining(jobId);
+
+        // After pause, active jobs should be decremented
+        assertEq(coordinator.workerActiveJobs(worker1), 0);
+    }
+
+    // ============ Stop Training Tests ============
+
+    function test_stopTraining_fromActive() public {
+        uint256 jobId = _setupJobWith3Workers();
+
+        // Submit a checkpoint to advance state
+        bytes32 commitment = keccak256("weights_100");
+        bytes[] memory sigs = _signCheckpoint(jobId, 100, commitment, 500);
+        coordinator.submitCheckpoint(jobId, 100, commitment, 500, sigs);
+
+        uint256 ownerBalBefore = jobOwner.balance;
+        uint256 w1BalBefore = worker1.balance;
+        uint256 w2BalBefore = worker2.balance;
+        uint256 w3BalBefore = worker3.balance;
+
+        // Stop the job
+        vm.prank(jobOwner);
+        coordinator.stopTraining(jobId);
+
+        // Verify status is Stopped
+        (,,,,, HelixCoordinatorV4.JobStatus status,,) = coordinator.getJobSummary(jobId);
+        assertEq(uint(status), uint(HelixCoordinatorV4.JobStatus.Stopped));
+
+        // Workers should have received partial payment + auto-returned stake
+        // currentStep = 100, numRounds = 500, so workerPayout = 10 ether * 100/500 = 2 ether
+        uint256 expectedWorkerPayout = (PAYMENT_AMOUNT * 100) / NUM_ROUNDS;
+        uint256 expectedRefund = PAYMENT_AMOUNT - expectedWorkerPayout;
+
+        uint256 w1Received = worker1.balance - w1BalBefore;
+        uint256 w2Received = worker2.balance - w2BalBefore;
+        uint256 w3Received = worker3.balance - w3BalBefore;
+        // Each worker receives payment + auto-returned STAKE_AMOUNT
+        uint256 totalStakeRefund = STAKE_AMOUNT * 3;
+        uint256 totalWorkerReceived = w1Received + w2Received + w3Received;
+        assertEq(totalWorkerReceived, expectedWorkerPayout + totalStakeRefund);
+
+        // Owner gets refund
+        uint256 ownerRefund = jobOwner.balance - ownerBalBefore;
+        assertEq(ownerRefund, expectedRefund);
+
+        // Active workers cleared
+        assertEq(coordinator.getActiveWorkerCount(jobId), 0);
+    }
+
+    function test_stopTraining_fromPaused() public {
+        uint256 jobId = _setupJobWith3Workers();
+
+        // Pause first (no checkpoints submitted, currentStep = 0)
+        vm.prank(jobOwner);
+        coordinator.pauseTraining(jobId);
+
+        uint256 ownerBalBefore = jobOwner.balance;
+
+        // Stop from paused (no active workers, no steps => full refund to owner)
+        vm.prank(jobOwner);
+        coordinator.stopTraining(jobId);
+
+        (,,,,, HelixCoordinatorV4.JobStatus status,,) = coordinator.getJobSummary(jobId);
+        assertEq(uint(status), uint(HelixCoordinatorV4.JobStatus.Stopped));
+
+        // Owner gets full refund since no work was done
+        uint256 ownerRefund = jobOwner.balance - ownerBalBefore;
+        assertEq(ownerRefund, PAYMENT_AMOUNT);
+    }
+
+    function test_stopTraining_rejectsNonOwner() public {
+        uint256 jobId = _setupJobWith3Workers();
+
+        vm.prank(outsider);
+        vm.expectRevert(HelixCoordinatorV4.NotJobOwnerOrOperator.selector);
+        coordinator.stopTraining(jobId);
+    }
+
+    function test_stopTraining_rejectsCompletedJob() public {
+        uint256 jobId = _setupJobWith3Workers();
+
+        // Complete training
+        bytes32 finalCommitment = keccak256("final");
+        uint256[] memory allPKs = new uint256[](3);
+        allPKs[0] = WORKER1_PK;
+        allPKs[1] = WORKER2_PK;
+        allPKs[2] = WORKER3_PK;
+        bytes[] memory sigs = _signCompletion(jobId, finalCommitment, allPKs);
+        coordinator.completeTraining(jobId, finalCommitment, sigs);
+
+        // Can't stop a completed job
+        vm.prank(jobOwner);
+        vm.expectRevert(HelixCoordinatorV4.JobNotActive.selector);
+        coordinator.stopTraining(jobId);
+    }
+
+    function test_stopTraining_autoReturnsStakes() public {
+        uint256 jobId = _setupJobWith3Workers();
+
+        // Submit checkpoint
+        bytes32 commitment = keccak256("weights_100");
+        bytes[] memory sigs = _signCheckpoint(jobId, 100, commitment, 500);
+        coordinator.submitCheckpoint(jobId, 100, commitment, 500, sigs);
+
+        uint256 balBefore = worker1.balance;
+
+        // Stop the job — stakes auto-returned to non-pool workers
+        vm.prank(jobOwner);
+        coordinator.stopTraining(jobId);
+
+        // Stake was auto-returned (balance includes partial payment + stake refund)
+        assertGe(worker1.balance - balBefore, STAKE_AMOUNT);
+        assertTrue(coordinator.stakeWithdrawn(jobId, worker1));
+
+        // Manual withdrawal reverts since auto-return already handled it
+        vm.warp(block.timestamp + 7 days + 1);
+        vm.prank(worker1);
+        vm.expectRevert(HelixCoordinatorV4.AlreadyWithdrawn.selector);
+        coordinator.withdrawStake(jobId);
+    }
+
+    // ============ Resume Training Tests ============
+
+    function test_resumeTraining_basic() public {
+        uint256 jobId = _setupJobWith3Workers();
+
+        // Pause
+        vm.prank(jobOwner);
+        coordinator.pauseTraining(jobId);
+
+        // Resume
+        vm.prank(jobOwner);
+        coordinator.resumeTraining(jobId);
+
+        (,,,,, HelixCoordinatorV4.JobStatus status,,) = coordinator.getJobSummary(jobId);
+        assertEq(uint(status), uint(HelixCoordinatorV4.JobStatus.Active));
+    }
+
+    function test_resumeTraining_rejectsNonPaused() public {
+        uint256 jobId = _setupJobWith3Workers();
+
+        // Active job can't be resumed
+        vm.prank(jobOwner);
+        vm.expectRevert(HelixCoordinatorV4.JobNotPaused.selector);
+        coordinator.resumeTraining(jobId);
+    }
+
+    function test_resumeTraining_workersCanRejoin() public {
+        uint256 jobId = _setupJobWith3Workers();
+
+        // Submit checkpoint
+        bytes32 commitment = keccak256("weights_100");
+        bytes[] memory sigs = _signCheckpoint(jobId, 100, commitment, 500);
+        coordinator.submitCheckpoint(jobId, 100, commitment, 500, sigs);
+
+        // Pause (releases workers)
+        vm.prank(jobOwner);
+        coordinator.pauseTraining(jobId);
+        assertEq(coordinator.getActiveWorkerCount(jobId), 0);
+
+        // Resume
+        vm.prank(jobOwner);
+        coordinator.resumeTraining(jobId);
+
+        // New workers can now stake and join the resumed job
+        // (original workers can't rejoin since they're still "registered")
+        // But new outsider can join
+        vm.prank(outsider);
+        coordinator.stakeAndJoin{value: STAKE_AMOUNT}(jobId);
+        assertEq(coordinator.getActiveWorkerCount(jobId), 1);
+    }
+
+    function test_resumeTraining_acceptsTopUpPayment() public {
+        uint256 jobId = _setupJobWith3Workers();
+
+        // Check initial payment
+        (,,, uint256 paymentBefore,,,,) = coordinator.getJobSummary(jobId);
+        assertEq(paymentBefore, PAYMENT_AMOUNT);
+
+        // Pause
+        vm.prank(jobOwner);
+        coordinator.pauseTraining(jobId);
+
+        // Resume with extra payment
+        uint256 topUp = 5 ether;
+        vm.prank(jobOwner);
+        coordinator.resumeTraining{value: topUp}(jobId);
+
+        (,,, uint256 paymentAfter,,,,) = coordinator.getJobSummary(jobId);
+        assertEq(paymentAfter, PAYMENT_AMOUNT + topUp);
+    }
+
+    // ============ Resume-then-Stop Pro-Rata Tests ============
+
+    function test_stopTraining_afterResume_paysOnlyCurrentSessionWork() public {
+        uint256 jobId = _setupJobWith3Workers();
+
+        // Workers do 100 steps
+        bytes32 commitment = keccak256("weights_100");
+        bytes[] memory sigs = _signCheckpoint(jobId, 100, commitment, 500);
+        coordinator.submitCheckpoint(jobId, 100, commitment, 500, sigs);
+
+        // Pause (workers released unpaid)
+        vm.prank(jobOwner);
+        coordinator.pauseTraining(jobId);
+
+        // Resume
+        vm.prank(jobOwner);
+        coordinator.resumeTraining(jobId);
+
+        // New worker joins
+        vm.prank(outsider);
+        coordinator.stakeAndJoin{value: 1 ether}(jobId);
+
+        // Stop immediately (outsider did 0 steps since resume)
+        uint256 ownerBalBefore = jobOwner.balance;
+        vm.prank(jobOwner);
+        coordinator.stopTraining(jobId);
+
+        // Owner should get FULL refund since no work done since resume
+        uint256 ownerRefund = jobOwner.balance - ownerBalBefore;
+        assertEq(ownerRefund, 10 ether); // Full payment refunded
+    }
+
+    // ============ Inference on Stopped Model ============
+
+    function test_submitInferenceResult_allowsStoppedModel() public {
+        uint256 jobId = _setupJobWith3Workers();
+
+        // Submit a checkpoint so workers have lastActiveStep
+        bytes32 commitment = keccak256("weights_100");
+        bytes[] memory cpSigs = _signCheckpoint(jobId, 100, commitment, 500);
+        coordinator.submitCheckpoint(jobId, 100, commitment, 500, cpSigs);
+
+        // Stop the job
+        vm.prank(jobOwner);
+        coordinator.stopTraining(jobId);
+
+        // Submit inference on stopped job should work
+        uint256 prediction = 3;
+        bytes32 inputHash = keccak256("test_input");
+        bytes32 outputHash = keccak256("test_output");
+
+        bytes32 inferMessage = keccak256(abi.encodePacked(
+            "HELIX_INFERENCE", jobId, prediction, inputHash, outputHash
+        ));
+        bytes[] memory inferSigs = new bytes[](2);
+        inferSigs[0] = _sign(WORKER1_PK, inferMessage);
+        inferSigs[1] = _sign(WORKER2_PK, inferMessage);
+
+        coordinator.submitInferenceResult(jobId, prediction, inputHash, outputHash, inferSigs);
+
+        // Verify stored result
+        (uint256 rJobId, uint256 rPrediction,,,, uint256 rSignerCount) =
+            coordinator.getInferenceResult(1);
+        assertEq(rJobId, jobId);
+        assertEq(rPrediction, 3);
+        assertEq(rSignerCount, 2);
+    }
+    // ============ registerWorkerInPoolFor Tests ============
+
+    function test_registerWorkerInPoolFor_basic() public {
+        vm.prank(jobOwner);
+        coordinator.registerWorkerInPoolFor{value: 0.01 ether}(worker1, "192.168.1.1:9001");
+
+        assertEq(coordinator.getPoolWorkerCount(), 1);
+
+        (string memory endpoint, uint256 stakeAmount, , bool available, uint256 activeJobId) =
+            coordinator.getPoolWorkerInfo(worker1);
+        assertEq(endpoint, "192.168.1.1:9001");
+        assertEq(stakeAmount, 0.01 ether);
+        assertTrue(available);
+        assertEq(activeJobId, 0);
+    }
+
+    function test_registerWorkerInPoolFor_rejectsZeroAddress() public {
+        vm.prank(jobOwner);
+        vm.expectRevert(HelixCoordinatorV4.InvalidAddress.selector);
+        coordinator.registerWorkerInPoolFor{value: 0.01 ether}(address(0), "endpoint");
+    }
+
+    function test_registerWorkerInPoolFor_rejectsDuplicate() public {
+        vm.prank(jobOwner);
+        coordinator.registerWorkerInPoolFor{value: 0.01 ether}(worker1, "192.168.1.1:9001");
+
+        vm.prank(jobOwner);
+        vm.expectRevert(HelixCoordinatorV4.WorkerAlreadyInPool.selector);
+        coordinator.registerWorkerInPoolFor{value: 0.01 ether}(worker1, "192.168.1.1:9002");
+    }
+
+    function test_registerWorkerInPoolFor_rejectsInsufficientStake() public {
+        vm.prank(jobOwner);
+        vm.expectRevert(HelixCoordinatorV4.InsufficientStake.selector);
+        coordinator.registerWorkerInPoolFor{value: 0.0001 ether}(worker1, "endpoint");
+    }
+
+    function test_registerWorkerInPoolFor_ownerPaysNotWorker() public {
+        uint256 ownerBalBefore = jobOwner.balance;
+        uint256 workerBalBefore = worker1.balance;
+
+        vm.prank(jobOwner);
+        coordinator.registerWorkerInPoolFor{value: 0.01 ether}(worker1, "192.168.1.1:9001");
+
+        // Owner paid the stake
+        assertEq(ownerBalBefore - jobOwner.balance, 0.01 ether);
+        // Worker balance unchanged
+        assertEq(worker1.balance, workerBalBefore);
+    }
+
+    function test_registerWorkerInPoolFor_fullLifecycle() public {
+        // Owner registers 3 workers in pool
+        vm.startPrank(jobOwner);
+        coordinator.registerWorkerInPoolFor{value: 0.01 ether}(worker1, "192.168.1.1:9001");
+        coordinator.registerWorkerInPoolFor{value: 0.01 ether}(worker2, "192.168.1.2:9001");
+        coordinator.registerWorkerInPoolFor{value: 0.01 ether}(worker3, "192.168.1.3:9001");
+
+        // Create job and assign pool workers
+        uint256 jobId = coordinator.registerTrainingJob{value: PAYMENT_AMOUNT}(
+            ARCH_HASH, CHECKPOINT_FREQ, NUM_ROUNDS, PAYMENT_AMOUNT, false, 0, false, 0, address(0)
+        );
+        coordinator.assignPoolWorkers(jobId, 3);
+        vm.stopPrank();
+
+        // Verify all 3 are in the job
+        assertEq(coordinator.getActiveWorkerCount(jobId), 3);
+        assertTrue(coordinator.isActiveWorker(jobId, worker1));
+        assertTrue(coordinator.isActiveWorker(jobId, worker2));
+        assertTrue(coordinator.isActiveWorker(jobId, worker3));
+
+        // Submit checkpoint
+        bytes32 commitment = keccak256("weights_100");
+        bytes[] memory sigs = _signCheckpoint(jobId, 100, commitment, 500);
+        coordinator.submitCheckpoint(jobId, 100, commitment, 500, sigs);
+
+        // Complete training
+        bytes32 finalCommitment = keccak256("final");
+        uint256[] memory allPKs = new uint256[](3);
+        allPKs[0] = WORKER1_PK;
+        allPKs[1] = WORKER2_PK;
+        allPKs[2] = WORKER3_PK;
+        bytes[] memory completionSigs = _signCompletion(jobId, finalCommitment, allPKs);
+
+        uint256 w1BalBefore = worker1.balance;
+        coordinator.completeTraining(jobId, finalCommitment, completionSigs);
+
+        // Workers received payment
+        uint256 w1Payment = worker1.balance - w1BalBefore;
+        assertGt(w1Payment, 0);
+
+        // Pool workers are available again with stake returned to pool
+        (, uint256 poolStake, , bool avail,) = coordinator.getPoolWorkerInfo(worker1);
+        assertTrue(avail);
+        assertEq(poolStake, 0.01 ether); // Full pool stake restored
+    }
+
+    // ============ Auto-Return Job Stake Tests ============
+
+    function test_completeTraining_autoReturnsPoolStake() public {
+        // Register pool workers (owner pays)
+        vm.startPrank(jobOwner);
+        coordinator.registerWorkerInPoolFor{value: 0.01 ether}(worker1, "192.168.1.1:9001");
+        coordinator.registerWorkerInPoolFor{value: 0.01 ether}(worker2, "192.168.1.2:9001");
+        coordinator.registerWorkerInPoolFor{value: 0.01 ether}(worker3, "192.168.1.3:9001");
+
+        uint256 jobId = coordinator.registerTrainingJob{value: PAYMENT_AMOUNT}(
+            ARCH_HASH, CHECKPOINT_FREQ, NUM_ROUNDS, PAYMENT_AMOUNT, false, 0, false, 0, address(0)
+        );
+        coordinator.assignPoolWorkers(jobId, 3);
+        vm.stopPrank();
+
+        // Complete training
+        bytes32 finalCommitment = keccak256("final");
+        uint256[] memory allPKs = new uint256[](3);
+        allPKs[0] = WORKER1_PK;
+        allPKs[1] = WORKER2_PK;
+        allPKs[2] = WORKER3_PK;
+        bytes[] memory completionSigs = _signCompletion(jobId, finalCommitment, allPKs);
+        coordinator.completeTraining(jobId, finalCommitment, completionSigs);
+
+        // Job stake should be returned to pool (not requiring withdrawStake)
+        (uint256 jobStake,,,,) = coordinator.getWorkerInfo(jobId, worker1);
+        assertEq(jobStake, 0); // Job stake zeroed
+
+        // Pool stake should be restored to original amount
+        (, uint256 poolStake,,,) = coordinator.getPoolWorkerInfo(worker1);
+        assertEq(poolStake, 0.01 ether);
+
+        // stakeWithdrawn should be true (prevents double-withdrawal)
+        assertTrue(coordinator.stakeWithdrawn(jobId, worker1));
+    }
+
+    function test_pauseTraining_autoReturnsPoolStake() public {
+        // Register pool workers
+        vm.startPrank(jobOwner);
+        coordinator.registerWorkerInPoolFor{value: 0.01 ether}(worker1, "192.168.1.1:9001");
+        coordinator.registerWorkerInPoolFor{value: 0.01 ether}(worker2, "192.168.1.2:9001");
+        coordinator.registerWorkerInPoolFor{value: 0.01 ether}(worker3, "192.168.1.3:9001");
+
+        uint256 jobId = coordinator.registerTrainingJob{value: PAYMENT_AMOUNT}(
+            ARCH_HASH, CHECKPOINT_FREQ, NUM_ROUNDS, PAYMENT_AMOUNT, false, 0, false, 0, address(0)
+        );
+        coordinator.assignPoolWorkers(jobId, 3);
+        vm.stopPrank();
+
+        // Pause
+        vm.prank(jobOwner);
+        coordinator.pauseTraining(jobId);
+
+        // Pool workers available again with stake restored
+        (, uint256 poolStake, , bool avail,) = coordinator.getPoolWorkerInfo(worker1);
+        assertTrue(avail);
+        assertEq(poolStake, 0.01 ether);
+        assertTrue(coordinator.stakeWithdrawn(jobId, worker1));
+    }
+
+    function test_stopTraining_autoReturnsPoolStake() public {
+        // Register pool workers
+        vm.startPrank(jobOwner);
+        coordinator.registerWorkerInPoolFor{value: 0.01 ether}(worker1, "192.168.1.1:9001");
+        coordinator.registerWorkerInPoolFor{value: 0.01 ether}(worker2, "192.168.1.2:9001");
+        coordinator.registerWorkerInPoolFor{value: 0.01 ether}(worker3, "192.168.1.3:9001");
+
+        uint256 jobId = coordinator.registerTrainingJob{value: PAYMENT_AMOUNT}(
+            ARCH_HASH, CHECKPOINT_FREQ, NUM_ROUNDS, PAYMENT_AMOUNT, false, 0, false, 0, address(0)
+        );
+        coordinator.assignPoolWorkers(jobId, 3);
+        vm.stopPrank();
+
+        // Submit a checkpoint
+        bytes32 commitment = keccak256("weights_100");
+        bytes[] memory sigs = _signCheckpoint(jobId, 100, commitment, 500);
+        coordinator.submitCheckpoint(jobId, 100, commitment, 500, sigs);
+
+        // Stop
+        vm.prank(jobOwner);
+        coordinator.stopTraining(jobId);
+
+        // Pool workers available again with stake restored
+        (, uint256 poolStake, , bool avail,) = coordinator.getPoolWorkerInfo(worker1);
+        assertTrue(avail);
+        assertEq(poolStake, 0.01 ether);
+        assertTrue(coordinator.stakeWithdrawn(jobId, worker1));
+    }
+
+    function test_autoReturn_nonPoolWorkersGetStakeBack() public {
+        // Direct stakers (not pool workers) get auto-returned on job end
+        uint256 jobId = _setupJobWith3Workers(); // Workers stake directly
+
+        uint256 balBefore = worker1.balance;
+
+        // Complete training
+        bytes32 finalCommitment = keccak256("final");
+        uint256[] memory allPKs = new uint256[](3);
+        allPKs[0] = WORKER1_PK;
+        allPKs[1] = WORKER2_PK;
+        allPKs[2] = WORKER3_PK;
+        bytes[] memory completionSigs = _signCompletion(jobId, finalCommitment, allPKs);
+        coordinator.completeTraining(jobId, finalCommitment, completionSigs);
+
+        // Non-pool workers get auto-returned: stake amount zeroed, withdrawn flag set
+        (uint256 jobStake,,,,) = coordinator.getWorkerInfo(jobId, worker1);
+        assertEq(jobStake, 0); // Stake was auto-returned
+        assertTrue(coordinator.stakeWithdrawn(jobId, worker1));
+
+        // Balance increased by at least STAKE_AMOUNT (payment + stake refund)
+        assertGe(worker1.balance - balBefore, STAKE_AMOUNT);
+
+        // Manual withdrawal now reverts with AlreadyWithdrawn
+        vm.warp(block.timestamp + 7 days + 1);
+        vm.prank(worker1);
+        vm.expectRevert(HelixCoordinatorV4.AlreadyWithdrawn.selector);
+        coordinator.withdrawStake(jobId);
     }
 }
 

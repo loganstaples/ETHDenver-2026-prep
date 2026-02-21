@@ -70,6 +70,7 @@ contract HelixModelStore is ERC721Enumerable, ReentrancyGuard {
     event TransferInitiated(uint256 indexed tokenId, address indexed seller, address indexed buyer, uint256 price, uint40 deadline);
     event TransferCompleted(uint256 indexed tokenId, address indexed seller, address indexed buyer, string newRootHash);
     event TransferCancelled(uint256 indexed tokenId, address indexed cancelledBy);
+    event ModelDeleted(uint256 indexed tokenId, address indexed owner, string slug);
 
     modifier onlyModelOwner(uint256 tokenId) {
         require(ownerOf(tokenId) == msg.sender, "Not model owner");
@@ -341,6 +342,41 @@ contract HelixModelStore is ERC721Enumerable, ReentrancyGuard {
         inferenceFeesAccrued[tokenId] = 0;
         (bool sent, ) = payable(msg.sender).call{value: amount}("");
         require(sent, "Withdrawal failed");
+    }
+
+    /// @notice Permanently delete a model NFT. Burns the token, releases the slug,
+    ///         and cleans up all associated state. Any accrued inference fees are
+    ///         sent to the owner. Cannot delete while a sale escrow is pending.
+    /// @param tokenId The model token ID to delete
+    function deleteModel(uint256 tokenId) external nonReentrant onlyModelOwner(tokenId) {
+        require(pendingTransfers[tokenId].buyer == address(0), "Cannot delete with pending transfer");
+
+        // Withdraw any accrued inference fees to owner
+        uint256 fees = inferenceFeesAccrued[tokenId];
+        if (fees > 0) {
+            inferenceFeesAccrued[tokenId] = 0;
+            (bool sent, ) = payable(msg.sender).call{value: fees}("");
+            require(sent, "Fee withdrawal failed");
+        }
+
+        // Release the slug so it can be reused
+        string memory slug = models[tokenId].slug;
+        bytes32 slugHash = keccak256(abi.encodePacked(slug));
+        delete _slugTaken[slugHash];
+        delete _slugToToken[slugHash];
+
+        // Clean up model data
+        delete models[tokenId];
+        delete _versions[tokenId];
+
+        // Clean up marketplace state
+        delete isForSale[tokenId];
+        delete salePrice[tokenId];
+
+        emit ModelDeleted(tokenId, msg.sender, slug);
+
+        // Burn the NFT (must be last — _burn checks ownership)
+        _burn(tokenId);
     }
 
     /// @notice Check if an account has access to a model

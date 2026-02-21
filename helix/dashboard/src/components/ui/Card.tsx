@@ -14,9 +14,9 @@ interface CardProps extends Omit<HTMLMotionProps<'div'>, 'children'> {
 }
 
 const variantStyles: Record<CardVariant, string> = {
-  default: 'bg-helix-surface border border-helix-border rounded-lg p-5',
-  glass: 'bg-white/[0.02] backdrop-blur-md border border-white/[0.06] rounded-lg p-5 relative overflow-hidden',
-  ghost: 'rounded-lg p-5',
+  default: 'bg-helix-surface/50 border border-helix-border rounded-2xl p-6',
+  glass: 'bg-white/[0.03] backdrop-blur-md border border-white/[0.07] rounded-2xl p-6 relative overflow-hidden',
+  ghost: 'rounded-2xl p-6',
 };
 
 export function Card({
@@ -33,13 +33,13 @@ export function Card({
       transition={{ duration: 0.2 }}
       className={cn(
         variantStyles[variant],
-        hover && 'hover:border-helix-border2 transition-colors',
+        hover && 'hover:border-white/[0.15] hover:bg-white/[0.04] transition-all duration-300',
         className,
       )}
       {...props}
     >
       {variant === 'glass' && (
-        <div className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-white/20 to-transparent" />
+        <div className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-white/25 to-transparent" />
       )}
       {children}
     </motion.div>

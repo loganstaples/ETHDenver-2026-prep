@@ -95,7 +95,7 @@ impl Default for WorkerConfig {
             #[cfg(feature = "chain")]
             coordinator_address: None,
             #[cfg(feature = "chain")]
-            stake_amount_eth: 0.1,
+            stake_amount_eth: 0.001,
         }
     }
 }

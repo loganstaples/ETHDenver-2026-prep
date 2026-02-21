@@ -80,7 +80,7 @@ export function RegisterModelDialog({ isOpen, onClose }: RegisterModelDialogProp
           <div className="space-y-1.5">
             <label
               htmlFor="ipfs-hash"
-              className="block text-2xs font-mono uppercase tracking-wider text-helix-muted"
+              className="block text-sm text-helix-muted"
             >
               IPFS Hash
             </label>
@@ -98,7 +98,7 @@ export function RegisterModelDialog({ isOpen, onClose }: RegisterModelDialogProp
           <div className="space-y-1.5">
             <label
               htmlFor="commitment"
-              className="block text-2xs font-mono uppercase tracking-wider text-helix-muted"
+              className="block text-sm text-helix-muted"
             >
               Initial Commitment
             </label>
@@ -116,7 +116,7 @@ export function RegisterModelDialog({ isOpen, onClose }: RegisterModelDialogProp
           <div className="space-y-1.5">
             <label
               htmlFor="min-stake"
-              className="block text-2xs font-mono uppercase tracking-wider text-helix-muted"
+              className="block text-sm text-helix-muted"
             >
               Minimum Stake (ADI)
             </label>

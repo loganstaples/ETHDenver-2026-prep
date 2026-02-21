@@ -232,13 +232,21 @@ else
     echo "  ✓ Workers running (PID $WORKERS_PID)"
 fi
 
-# ── 8. Start Frontend ──
+# ── 8. Start Frontend (production build — dev server hangs under load) ──
+echo "▸ Building frontend dashboard..."
+(cd dashboard && npm run build > "$LOGS_DIR/frontend-build.log" 2>&1)
+if [[ $? -ne 0 ]]; then
+    echo "  ✗ Frontend build failed. Check $LOGS_DIR/frontend-build.log"
+    cat "$LOGS_DIR/frontend-build.log" | tail -20
+    exit 1
+fi
+echo "  ✓ Build complete"
 echo "▸ Starting frontend dashboard (port 3000)..."
-(cd dashboard && npm run dev > "$LOGS_DIR/frontend.log" 2>&1) &
+(cd dashboard && npm run start > "$LOGS_DIR/frontend.log" 2>&1) &
 FRONTEND_PID=$!
 echo "$FRONTEND_PID frontend" >> "$PID_FILE"
 sleep 3
-echo "  ✓ Frontend starting (PID $FRONTEND_PID)"
+echo "  ✓ Frontend running (PID $FRONTEND_PID)"
 
 echo
 echo "╔══════════════════════════════════════════════════════════════╗"

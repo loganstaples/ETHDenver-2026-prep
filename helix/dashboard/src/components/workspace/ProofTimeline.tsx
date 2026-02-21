@@ -105,7 +105,7 @@ export function ProofTimeline({ modelId }: ProofTimelineProps) {
       {formattedGroups.map((group) => (
         <div key={group.date} className="space-y-3">
           {/* Date Header */}
-          <p className="text-2xs text-helix-muted uppercase tracking-wider font-mono">
+          <p className="text-sm text-helix-muted font-mono">
             {group.formattedDate}
           </p>
 

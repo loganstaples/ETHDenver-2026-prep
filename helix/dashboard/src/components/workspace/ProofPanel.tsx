@@ -157,7 +157,7 @@ export function ProofPanel({ modelId }: ProofPanelProps) {
 
       {/* Active Generations */}
       <div className="space-y-3">
-        <h3 className="text-2xs font-mono uppercase tracking-wider text-helix-muted">
+        <h3 className="text-sm text-helix-muted">
           Active Generations
         </h3>
 
@@ -200,7 +200,7 @@ export function ProofPanel({ modelId }: ProofPanelProps) {
 
       {/* Proof Explorer */}
       <div className="space-y-3">
-        <h3 className="text-2xs font-mono uppercase tracking-wider text-helix-muted">
+        <h3 className="text-sm text-helix-muted">
           Proof Explorer
         </h3>
         <Card variant="default" className="p-0 overflow-hidden">

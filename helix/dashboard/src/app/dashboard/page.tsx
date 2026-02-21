@@ -1,20 +1,8 @@
 'use client';
 
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import {
-  ChevronDown,
-  ChevronRight,
-  Pause,
-  Square,
-  CheckCircle,
-  AlertTriangle,
-  Info,
-  XCircle,
-  X,
-  Users,
-  Shield,
-} from 'lucide-react';
+import { useRouter } from 'next/navigation';
 import {
   AreaChart,
   Area,
@@ -23,308 +11,179 @@ import {
   Tooltip,
   ResponsiveContainer,
 } from 'recharts';
+import {
+  Layers,
+  DollarSign,
+  Activity,
+  Zap,
+  Search,
+  Plus,
+  ChevronRight,
+  Wallet,
+  TrendingUp,
+  CheckCircle,
+  AlertTriangle,
+  Info,
+  XCircle,
+  Globe,
+  Lock,
+  Tag,
+  GitBranch,
+} from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { getExplorerTxUrl } from '@/lib/contracts';
-import { CheaterToast } from '@/components/ui/CheaterToast';
+import { useModelRegistry, type ModelWithVersions } from '@/hooks/useModelRegistry';
 import { useDashboardSessions, type TrainingEvent } from '@/hooks/useDashboardSessions';
-import { useBackendApi, type BackendWorker } from '@/hooks/useBackendApi';
-import { useWorkerHealth, type WorkerHealth } from '@/hooks/useWorkerHealth';
-import { useChainId } from 'wagmi';
-import { formatEther } from 'viem';
+import { useAccount } from 'wagmi';
+import { CreateModelModal } from '@/components/models/CreateModelModal';
 
 // ============================================================================
-// Alert icon/color helpers
+// Constants & helpers
 // ============================================================================
 
-const ALERT_CONFIG: Record<string, { icon: typeof Info; color: string }> = {
-  info: { icon: Info, color: '#60a5fa' },
-  success: { icon: CheckCircle, color: '#4ade80' },
-  warning: { icon: AlertTriangle, color: '#fbbf24' },
-  error: { icon: XCircle, color: '#f87171' },
-};
+type SortOption = 'revenue' | 'accuracy' | 'newest' | 'name';
+
+const SORT_OPTIONS: { id: SortOption; label: string }[] = [
+  { id: 'revenue', label: 'Revenue' },
+  { id: 'accuracy', label: 'Accuracy' },
+  { id: 'newest', label: 'Newest' },
+  { id: 'name', label: 'Name' },
+];
+
+function sortModels(models: ModelWithVersions[], sort: SortOption): ModelWithVersions[] {
+  const sorted = [...models];
+  switch (sort) {
+    case 'revenue':
+      return sorted.sort((a, b) => b.feesAccrued - a.feesAccrued);
+    case 'accuracy': {
+      const bestAcc = (m: ModelWithVersions) =>
+        m.versions.reduce((best, v) => (v.accuracy > best ? v.accuracy : best), 0);
+      return sorted.sort((a, b) => bestAcc(b) - bestAcc(a));
+    }
+    case 'newest':
+      return sorted.sort((a, b) => b.createdAt - a.createdAt);
+    case 'name':
+      return sorted.sort((a, b) => a.name.localeCompare(b.name));
+    default:
+      return sorted;
+  }
+}
+
+function formatADI(value: number): string {
+  if (value >= 1000) return `${(value / 1000).toFixed(1)}k`;
+  return value.toFixed(2);
+}
 
 function timeAgo(ts: number): string {
   const s = Math.floor((Date.now() - ts) / 1000);
   if (s < 60) return `${s}s ago`;
   if (s < 3600) return `${Math.floor(s / 60)}m ago`;
-  return `${Math.floor(s / 3600)}h ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
 }
 
-/** Format milliseconds as "Xm Ys" or just "Ys" */
-function formatDuration(ms: number): string {
-  const totalSec = Math.floor(ms / 1000);
-  const m = Math.floor(totalSec / 60);
-  const s = totalSec % 60;
-  if (m > 0) return `${m}m ${s}s`;
-  return `${s}s`;
+// ============================================================================
+// Stacked area chart colors for per-model revenue
+// ============================================================================
+
+const STACK_COLORS = [
+  { stroke: '#818cf8', fill: '#818cf8' },  // indigo
+  { stroke: '#a78bfa', fill: '#a78bfa' },  // violet
+  { stroke: '#38bdf8', fill: '#38bdf8' },  // sky
+  { stroke: '#4ade80', fill: '#4ade80' },  // emerald
+  { stroke: '#fbbf24', fill: '#fbbf24' },  // amber
+  { stroke: '#fb7185', fill: '#fb7185' },  // rose
+];
+
+// ============================================================================
+// Mock month-to-date revenue data (stacked per model)
+// ============================================================================
+
+function generateRevenueData(models: ModelWithVersions[]) {
+  if (models.length === 0) return { data: [], modelNames: [] };
+
+  const now = new Date();
+  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+  const days = Math.floor((now.getTime() - startOfMonth.getTime()) / 86400000) + 1;
+
+  const stackModels = [...models].sort((a, b) => b.feesAccrued - a.feesAccrued).slice(0, 6);
+
+  const data = [];
+  for (let i = 0; i < days; i++) {
+    const date = new Date(startOfMonth.getTime() + i * 86400000);
+    const dayLabel = date.toLocaleDateString('en', { month: 'short', day: 'numeric' });
+    const progress = days > 1 ? i / (days - 1) : 1;
+
+    const entry: Record<string, string | number> = { day: dayLabel };
+
+    stackModels.forEach((model, mi) => {
+      const revenue = model.feesAccrued || 1;
+      // Each model gets a unique growth curve with seeded variation
+      const phase = 0.3 + mi * 0.08;
+      const curve = 1 / (1 + Math.exp(-8 * (progress - phase)));
+      const noise = 1 + (Math.sin(i * (2.3 + mi * 0.7)) * 0.2 + Math.sin(i * (1.1 + mi * 0.5)) * 0.1);
+      const daily = (revenue / Math.max(days, 1)) * curve * 2.5 * noise;
+      entry[model.name] = Math.max(0, Number(daily.toFixed(4)));
+    });
+
+    data.push(entry);
+  }
+
+  return { data, modelNames: stackModels.map((m) => m.name) };
 }
 
-/** Live elapsed since timestamp, with seconds */
-function elapsedSince(ts: number): string {
-  return formatDuration(Date.now() - ts);
-}
+// ============================================================================
+// Alert icon/color helpers
+// ============================================================================
 
-function ReputationBadge({ score }: { score: number }) {
-  const display = Math.round(score * 100);
-  const color = display >= 80 ? 'text-green-400 bg-green-400/10'
-    : display >= 50 ? 'text-yellow-400 bg-yellow-400/10'
-    : 'text-red-400 bg-red-400/10';
+const ALERT_CONFIG: Record<string, { icon: typeof Info; color: string; bg: string }> = {
+  info: { icon: Info, color: '#818cf8', bg: 'bg-indigo-500/10' },
+  success: { icon: CheckCircle, color: '#4ade80', bg: 'bg-green-500/10' },
+  warning: { icon: AlertTriangle, color: '#fbbf24', bg: 'bg-yellow-500/10' },
+  error: { icon: XCircle, color: '#f87171', bg: 'bg-red-500/10' },
+};
+
+// Accent dots for top earners
+const EARNER_COLORS = [
+  'bg-indigo-400',
+  'bg-violet-400',
+  'bg-sky-400',
+  'bg-emerald-400',
+  'bg-amber-400',
+  'bg-rose-400',
+];
+
+// ============================================================================
+// Stat Card
+// ============================================================================
+
+function StatCard({
+  label,
+  value,
+  icon: Icon,
+  delay = 0,
+  accent,
+}: {
+  label: string;
+  value: string;
+  icon: typeof Layers;
+  delay?: number;
+  accent?: string;
+}) {
   return (
-    <span className={cn('text-xs font-mono font-medium px-2 py-0.5 rounded-md tabular-nums', color)}>
-      {display}
-    </span>
-  );
-}
-
-// ============================================================================
-// Types (populated from API)
-// ============================================================================
-
-interface TrainingSession {
-  id: string;
-  name: string;
-  modelId: bigint;
-  status: 'training' | 'paused';
-}
-
-interface DashboardInferenceRequest {
-  id: string;
-  model: string;
-  status: 'processing' | 'completed';
-  progress: number;
-  phase: string;
-  workers: number;
-  created: number;
-  inputLabel: string;
-  result: string | null;
-  confidence: number | null;
-  duration: number | null;
-}
-
-// ============================================================================
-// Horseshoe Progress
-// ============================================================================
-
-function HorseshoeProgress({ progress, size = 150 }: { progress: number; size?: number }) {
-  const pad = 16; // extra padding so glow never clips
-  const full = size + pad * 2;
-  const strokeWidth = 7;
-  const radius = (size - strokeWidth) / 2;
-  const center = full / 2;
-
-  // 270° arc (gap at bottom)
-  const arcDeg = 270;
-  const circumference = 2 * Math.PI * radius;
-  const arcLength = (arcDeg / 360) * circumference;
-  const filledLength = (Math.min(100, Math.max(0, progress)) / 100) * arcLength;
-
-  // Rotate so gap is at the bottom center: start at 135° (bottom-left)
-  const rotation = 135;
-
-  // The 90° gap at the bottom shifts the visual center upward.
-  // Nudge the whole SVG down to compensate (~8% of size).
-  const yOffset = size * 0.08;
-
-  const filterId = `glow-${size}`;
-
-  return (
-    <svg
-      width={full}
-      height={full}
-      viewBox={`0 0 ${full} ${full}`}
-      style={{ margin: -pad, marginTop: -pad + yOffset, overflow: 'visible' }}
+    <motion.div
+      initial={{ opacity: 0, y: 8 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.4, delay }}
+      className="rounded-2xl border border-helix-border bg-helix-surface/50 p-6"
     >
-      <defs>
-        <filter id={filterId} x="-100%" y="-100%" width="400%" height="400%">
-          <feGaussianBlur in="SourceGraphic" stdDeviation="5" result="blur" />
-          <feMerge>
-            <feMergeNode in="blur" />
-            <feMergeNode in="SourceGraphic" />
-          </feMerge>
-        </filter>
-      </defs>
-
-      {/* Track (dark) */}
-      <circle
-        cx={center}
-        cy={center}
-        r={radius}
-        fill="none"
-        stroke="#1e1e22"
-        strokeWidth={strokeWidth}
-        strokeDasharray={`${arcLength} ${circumference}`}
-        strokeLinecap="round"
-        transform={`rotate(${rotation} ${center} ${center})`}
-      />
-
-      {/* Filled arc (white with glow) */}
-      {progress > 0 && (
-        <circle
-          cx={center}
-          cy={center}
-          r={radius}
-          fill="none"
-          stroke="white"
-          strokeWidth={strokeWidth}
-          strokeDasharray={`${filledLength} ${circumference}`}
-          strokeLinecap="round"
-          transform={`rotate(${rotation} ${center} ${center})`}
-          filter={`url(#${filterId})`}
-          style={{ transition: 'stroke-dasharray 0.6s ease-out' }}
-        />
-      )}
-
-      {/* Percentage text */}
-      <text
-        x={center}
-        y={center - size * 0.02}
-        textAnchor="middle"
-        dominantBaseline="central"
-        className="fill-white font-sans"
-        style={{ fontSize: size * 0.26, fontWeight: 600, letterSpacing: '-0.02em' }}
-      >
-        {Math.round(progress)}%
-      </text>
-    </svg>
-  );
-}
-
-// ============================================================================
-// Worker Detail Modal
-// ============================================================================
-
-function WorkerModal({ worker, onClose }: { worker: WorkerHealth; onClose: () => void }) {
-  const earnings = Number(formatEther(worker.performance.totalEarnings));
-  const stake = Number(formatEther(worker.stake.amount));
-
-  const resources = [
-    { label: 'CPU', value: worker.metrics.cpu },
-    { label: 'Memory', value: worker.metrics.memory },
-    ...(worker.metrics.gpu != null ? [{ label: 'GPU', value: worker.metrics.gpu }] : []),
-  ];
-
-  return (
-    <div
-      className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm"
-      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
-    >
-      <motion.div
-        initial={{ opacity: 0, scale: 0.96, y: 8 }}
-        animate={{ opacity: 1, scale: 1, y: 0 }}
-        exit={{ opacity: 0, scale: 0.96, y: 8 }}
-        transition={{ duration: 0.2 }}
-        className="w-[480px] bg-helix-surface border border-helix-border rounded-2xl shadow-2xl overflow-hidden"
-      >
-        {/* Header */}
-        <div className="flex items-center justify-between px-6 py-4 border-b border-helix-border">
-          <div className="flex items-center gap-3">
-            <div className={cn(
-              'w-2.5 h-2.5 rounded-full',
-              worker.status === 'healthy' ? 'bg-green-400'
-                : worker.status === 'degraded' ? 'bg-yellow-400'
-                  : worker.status === 'unhealthy' ? 'bg-red-400'
-                    : 'bg-helix-dim',
-            )} />
-            <span className="text-sm font-mono text-white">{worker.address}</span>
-          </div>
-          <button onClick={onClose} className="text-helix-muted hover:text-white transition-colors p-1">
-            <X size={16} />
-          </button>
+      <div className="flex items-center justify-between mb-3">
+        <span className="text-sm font-medium text-helix-muted">{label}</span>
+        <div className={cn('p-2 rounded-xl', accent || 'bg-white/[0.04]')}>
+          <Icon size={16} className="text-helix-muted" />
         </div>
-
-        <div className="p-6 space-y-6">
-          {/* Status + Role */}
-          <div className="flex gap-2">
-            <span className={cn(
-              'text-xs px-2.5 py-1 rounded-lg capitalize',
-              worker.status === 'healthy' ? 'bg-green-400/10 text-green-400'
-                : worker.status === 'degraded' ? 'bg-yellow-400/10 text-yellow-400'
-                  : worker.status === 'unhealthy' ? 'bg-red-400/10 text-red-400'
-                    : 'bg-helix-border text-helix-muted',
-            )}>
-              {worker.status}
-            </span>
-            <span className="text-xs px-2.5 py-1 rounded-lg bg-helix-border text-helix-text2 capitalize">
-              {worker.role}
-            </span>
-            <span className="text-xs px-2.5 py-1 rounded-lg bg-helix-border text-helix-text2 capitalize">
-              {worker.activity}
-            </span>
-          </div>
-
-          {/* Resources */}
-          <div>
-            <div className="text-xs text-helix-muted mb-3">Resources</div>
-            <div className="space-y-3">
-              {resources.map((r) => (
-                <div key={r.label} className="flex items-center gap-3">
-                  <span className="text-xs text-helix-text2 w-14">{r.label}</span>
-                  <div className="flex-1 h-1.5 bg-helix-border rounded-full overflow-hidden">
-                    <div
-                      className="h-full rounded-full bg-white/80 transition-all"
-                      style={{ width: `${Math.min(100, r.value)}%` }}
-                    />
-                  </div>
-                  <span className="text-xs text-white font-mono tabular-nums w-10 text-right">
-                    {r.value.toFixed(0)}%
-                  </span>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          {/* Stats */}
-          <div className="grid grid-cols-3 gap-3">
-            <div className="bg-helix-bg rounded-xl px-4 py-3">
-              <div className="text-xs text-helix-muted mb-1">Earnings</div>
-              <div className="text-lg font-mono font-medium text-white tabular-nums">{earnings.toFixed(2)}</div>
-              <div className="text-xs text-helix-muted">ADI</div>
-            </div>
-            <div className="bg-helix-bg rounded-xl px-4 py-3">
-              <div className="text-xs text-helix-muted mb-1">Stake</div>
-              <div className="text-lg font-mono font-medium text-white tabular-nums">{stake.toFixed(2)}</div>
-              <div className="text-xs text-helix-muted">ADI</div>
-            </div>
-            <div className="bg-helix-bg rounded-xl px-4 py-3">
-              <div className="text-xs text-helix-muted mb-1">Success</div>
-              <div className="text-lg font-mono font-medium text-white tabular-nums">
-                {(worker.performance.successRate * 100).toFixed(1)}%
-              </div>
-              <div className="text-xs text-helix-muted">rate</div>
-            </div>
-          </div>
-
-          {/* Performance details */}
-          <div className="grid grid-cols-2 gap-x-8 gap-y-2">
-            {[
-              { label: 'Proofs submitted', value: worker.performance.proofsSubmitted },
-              { label: 'Proofs verified', value: worker.performance.proofsVerified },
-              { label: 'Avg proof time', value: `${worker.performance.averageProofTime.toFixed(0)}ms` },
-              { label: 'Uptime', value: `${(worker.performance.uptime * 100).toFixed(1)}%` },
-              { label: 'Latency', value: `${worker.metrics.latency.toFixed(0)}ms` },
-              { label: 'Rounds', value: worker.performance.roundsParticipated },
-            ].map((s) => (
-              <div key={s.label} className="flex items-center justify-between py-1">
-                <span className="text-xs text-helix-muted">{s.label}</span>
-                <span className="text-xs text-white font-mono tabular-nums">{s.value}</span>
-              </div>
-            ))}
-          </div>
-
-          {/* Issues */}
-          {worker.issues.filter(i => !i.resolved).length > 0 && (
-            <div className="space-y-1.5">
-              {worker.issues.filter(i => !i.resolved).map((issue) => (
-                <div key={issue.id} className="flex items-center gap-2 px-3 py-2 rounded-xl bg-red-500/5 border border-red-500/10">
-                  <div className="w-1.5 h-1.5 rounded-full bg-red-400 shrink-0" />
-                  <span className="text-xs text-red-300">{issue.message}</span>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      </motion.div>
-    </div>
+      </div>
+      <div className="text-2xl font-semibold text-helix-text tracking-tight">{value}</div>
+    </motion.div>
   );
 }
 
@@ -333,125 +192,96 @@ function WorkerModal({ worker, onClose }: { worker: WorkerHealth; onClose: () =>
 // ============================================================================
 
 export default function DashboardPage() {
-  const [tab, setTab] = useState<'training' | 'inference'>('training');
-  const [inferenceRequests, setInferenceRequests] = useState<DashboardInferenceRequest[]>([]);
-  const [dropdownOpen, setDropdownOpen] = useState(false);
-  const [selectedWorker, setSelectedWorker] = useState<WorkerHealth | null>(null);
-
-  // Config display values (read-only — backend doesn't support mid-training changes)
-  const displayLR = '0.001';
-  const displayBatch = '64';
-
-  // Backend data via useDashboardSessions
+  const router = useRouter();
+  const { isConnected } = useAccount();
   const {
-    sessions: backendSessions,
-    activeSession,
-    losses,
+    models,
+    isLoading: isModelsLoading,
+    isContractDeployed: _isContractDeployed,
+    refetch: refetchModels,
+  } = useModelRegistry();
+
+  const {
+    sessions,
+    activeSession: _activeSession,
     events,
-    selectSession,
   } = useDashboardSessions();
 
-  const chainId = useChainId();
-  const { workers: healthWorkers } = useWorkerHealth();
+  const [search, setSearch] = useState('');
+  const [sort, setSort] = useState<SortOption>('revenue');
+  const [showCreateModal, setShowCreateModal] = useState(false);
+  const [totalInferences, setTotalInferences] = useState<number | null>(null);
 
-  const { workers: backendWorkers, health: backendHealth, roundStatus } = useBackendApi({ refreshInterval: 5000 });
-  const [workerTab, setWorkerTab] = useState<'active' | 'inactive'>('active');
-  const [expandedWorker, setExpandedWorker] = useState<string | null>(null);
-
-  // Map backend sessions to dropdown items
-  const sessions: TrainingSession[] = useMemo(
-    () => backendSessions.map((s) => ({
-      id: s.session_id,
-      name: `Session ${s.session_id.slice(0, 8)}`,
-      modelId: BigInt(s.job_id || 0),
-      status: (s.status === 'running' || s.status === 'starting') ? 'training' as const : 'paused' as const,
-    })),
-    [backendSessions],
-  );
-
-  const selectedSession = useMemo(
-    () => activeSession ? sessions.find((s) => s.id === activeSession.session_id) ?? null : null,
-    [activeSession, sessions],
-  );
-
-  // Load inference history from localStorage
+  // ── Fetch inference stats from server ───────────────────
   useEffect(() => {
-    const loadInferenceHistory = () => {
+    async function fetchStats() {
       try {
-        const raw = localStorage.getItem('helix-inference-history');
-        if (raw) {
-          const parsed = JSON.parse(raw) as DashboardInferenceRequest[];
-          setInferenceRequests(parsed);
-        }
+        const res = await fetch('/api/models/stats');
+        if (!res.ok) return;
+        const data: Record<string, { inferenceCount: number }> = await res.json();
+        const total = Object.values(data).reduce((sum, s) => sum + s.inferenceCount, 0);
+        setTotalInferences(total);
       } catch {
-        // Ignore parse errors
+        // Non-fatal
       }
-    };
-    loadInferenceHistory();
-    // Re-check periodically in case inference page writes new entries
-    const interval = setInterval(loadInferenceHistory, 3000);
+    }
+    fetchStats();
+    const interval = setInterval(fetchStats, 15000);
     return () => clearInterval(interval);
   }, []);
 
-  // EMA-smoothed chart data — downsample to ~200 points max
-  const lossData = useMemo(() => {
-    if (losses.length === 0) return [];
-    const alpha = 0.35;
-    let ema = losses[0].loss;
-    const smoothed = losses.map((l) => {
-      ema = alpha * l.loss + (1 - alpha) * ema;
-      return { step: l.step, value: ema };
-    });
-    if (smoothed.length <= 200) return smoothed;
-    const s = Math.ceil(smoothed.length / 200);
-    return smoothed.filter((_, i) => i % s === 0 || i === smoothed.length - 1);
-  }, [losses]);
+  // ── Computed values ──────────────────────────────────────────
 
-  // EMA-smoothed accuracy curve from per-step estimates
-  const accData = useMemo(() => {
-    if (losses.length === 0) return [];
-    const alpha = 0.3;
-    let ema = (losses[0].accuracy ?? 0) * 100;
-    const smoothed = losses.map((l) => {
-      const raw = (l.accuracy ?? Math.max(0, Math.min(1, 1 - l.loss / 2.302585))) * 100;
-      ema = alpha * raw + (1 - alpha) * ema;
-      return { step: l.step, value: ema };
-    });
-    if (smoothed.length <= 200) return smoothed;
-    const s = Math.ceil(smoothed.length / 200);
-    return smoothed.filter((_, i) => i % s === 0 || i === smoothed.length - 1);
-  }, [losses]);
+  const totalRevenue = useMemo(
+    () => models.reduce((sum, m) => sum + m.feesAccrued, 0),
+    [models],
+  );
 
-  // Headline numbers use raw (unsmoothed) values; curves use EMA
-  // Prefer real evaluated accuracy (session.accuracy) over per-step estimates
-  const lastRaw = losses.length > 0 ? losses[losses.length - 1] : null;
-  const currentLoss = lastRaw?.loss ?? (activeSession?.current_loss ?? 0);
-  const currentAcc = (activeSession?.accuracy != null ? activeSession.accuracy : null)
-    ?? lastRaw?.accuracy
-    ?? 0;
-  const prevRawLoss = losses.length > 10 ? losses[losses.length - 11].loss : currentLoss;
-  const lossDelta = currentLoss - prevRawLoss;
-  const prevRawAcc = losses.length > 10 ? (losses[losses.length - 11].accuracy ?? 0) : (losses.length > 0 ? (losses[0].accuracy ?? 0) : 0);
-  const accDelta = currentAcc - prevRawAcc;
+  const activeSessions = useMemo(
+    () => sessions.filter((s) => s.status === 'running' || s.status === 'starting'),
+    [sessions],
+  );
 
-  const progress = activeSession
-    ? activeSession.total_steps > 0
-      ? (activeSession.current_step / activeSession.total_steps) * 100
-      : 0
-    : 0;
+  const { data: revenueData, modelNames: revenueModelNames } = useMemo(() => generateRevenueData(models), [models]);
 
-  // Generate activity feed from WebSocket events
+  const topEarners = useMemo(
+    () => [...models].sort((a, b) => b.feesAccrued - a.feesAccrued).slice(0, 6),
+    [models],
+  );
+
+  const filteredModels = useMemo(() => {
+    let list = models;
+    if (search.trim()) {
+      const q = search.toLowerCase();
+      list = list.filter(
+        (m) =>
+          m.name.toLowerCase().includes(q) ||
+          m.slug.toLowerCase().includes(q) ||
+          m.description.toLowerCase().includes(q),
+      );
+    }
+    return sortModels(list, sort);
+  }, [models, search, sort]);
+
+  // ── Activity feed from events + sessions + models ──────
+
   const activityFeed = useMemo(() => {
-    type FeedItem = { id: string; type: string; title: string; message: string; timestamp: number; txHash?: string; explorerUrl?: string };
+    type FeedItem = {
+      id: string;
+      type: string;
+      title: string;
+      message: string;
+      timestamp: number;
+    };
     const items: FeedItem[] = [];
 
+    // 1. Real-time WebSocket events (from current browser session)
     events.forEach((e, i) => {
       const evt = e.event;
       const ts = (e as TrainingEvent & { receivedAt?: number }).receivedAt ?? (Date.now() - (events.length - i) * 100);
 
       if (evt.type === 'training_step') {
         const step = evt.step as number;
-        // Show every 20 steps
         if (step > 0 && step % 20 === 0) {
           items.push({
             id: `step-${step}`,
@@ -470,16 +300,12 @@ export default function DashboardPage() {
           timestamp: ts,
         });
       } else if (evt.type === 'checkpoint_submitted') {
-        const txHash = (evt.tx_hash as string) || undefined;
-        const explorerUrl = txHash ? getExplorerTxUrl(chainId, txHash) ?? undefined : undefined;
         items.push({
           id: `checkpoint-${i}`,
           type: 'success',
           title: 'Checkpoint submitted',
-          message: txHash ? `tx ${txHash.slice(0, 10)}...` : 'On-chain attestation',
+          message: 'On-chain attestation',
           timestamp: ts,
-          txHash,
-          explorerUrl,
         });
       } else if (evt.type === 'cheater_detected') {
         items.push({
@@ -490,22 +316,19 @@ export default function DashboardPage() {
           timestamp: ts,
         });
       } else if (evt.type === 'cheater_slashed') {
-        const txHash = evt.tx_hash as string | undefined;
         items.push({
           id: `slashed-${i}`,
           type: 'warning',
-          title: 'Cheater slashed on-chain',
+          title: 'Cheater slashed',
           message: `Worker ${evt.party_index} stake slashed`,
           timestamp: ts,
-          txHash,
-          explorerUrl: txHash ? `https://explorer.ab.testnet.adifoundation.ai/tx/${txHash}` : undefined,
         });
       } else if (evt.type === 'recovery_completed') {
         items.push({
           id: `recovery-${i}`,
           type: 'success',
           title: 'Training recovered',
-          message: `${evt.honest_workers} workers continuing from step ${evt.resumed_from_step}`,
+          message: `${evt.honest_workers} workers continuing`,
           timestamp: ts,
         });
       } else if (evt.type === 'session_complete' || evt.type === 'training_complete') {
@@ -527,796 +350,594 @@ export default function DashboardPage() {
       }
     });
 
-    return items.sort((a, b) => b.timestamp - a.timestamp).slice(0, 20);
-  }, [events, chainId]);
+    // 2. Derive activity from training sessions (persisted on backend)
+    sessions.forEach((session) => {
+      const name = session.model_name || `Session ${session.session_id.slice(0, 8)}`;
+      // started_at is unix seconds from backend
+      const sessionTs = session.started_at > 0
+        ? session.started_at * 1000
+        : Date.now() - 60000;
 
-  // Workers sorted: active first by earnings, then offline
-  const sortedWorkers = useMemo(() => {
-    return [...healthWorkers].sort((a, b) => {
-      if (a.status === 'offline' && b.status !== 'offline') return 1;
-      if (a.status !== 'offline' && b.status === 'offline') return -1;
-      return Number(formatEther(b.performance.totalEarnings)) - Number(formatEther(a.performance.totalEarnings));
+      if (session.status === 'complete') {
+        items.push({
+          id: `session-complete-${session.session_id}`,
+          type: 'success',
+          title: 'Training completed',
+          message: session.accuracy
+            ? `${name} \u2014 ${(session.accuracy * 100).toFixed(1)}% accuracy`
+            : name,
+          timestamp: sessionTs,
+        });
+      } else if (session.status === 'failed') {
+        items.push({
+          id: `session-failed-${session.session_id}`,
+          type: 'error',
+          title: 'Training failed',
+          message: name,
+          timestamp: sessionTs,
+        });
+      } else if (session.status === 'running' || session.status === 'starting') {
+        items.push({
+          id: `session-active-${session.session_id}`,
+          type: 'info',
+          title: 'Training in progress',
+          message: session.current_step > 0
+            ? `${name} \u2014 step ${session.current_step}/${session.total_steps}`
+            : name,
+          timestamp: sessionTs,
+        });
+      }
     });
-  }, [healthWorkers]);
 
-  const activeWorkers = useMemo(
-    () => backendWorkers.filter((w) => w.status !== 'offline' && w.status !== 'Excluded'),
-    [backendWorkers],
-  );
-  const inactiveWorkers = useMemo(
-    () => backendWorkers.filter((w) => w.status === 'offline' || w.status === 'Excluded'),
-    [backendWorkers],
-  );
-  const displayWorkers = workerTab === 'active' ? activeWorkers : inactiveWorkers;
+    // 3. Model creation events (from on-chain data)
+    models.forEach((model) => {
+      if (model.createdAt > 0) {
+        items.push({
+          id: `model-created-${model.tokenId}`,
+          type: 'success',
+          title: 'Model registered',
+          message: model.name,
+          // On-chain timestamps are unix seconds
+          timestamp: model.createdAt * 1000,
+        });
+      }
 
-  // Always exactly 3 Y-axis ticks spanning the data range (no 0 baseline)
-  function niceTicks3(values: number[], decimals: number): number[] {
-    if (values.length === 0) return [0, 0.5, 1];
-    let min = Math.min(...values);
-    let max = Math.max(...values);
-    // If flat or single point, pad ±10% around the value
-    if (max - min < 0.001) {
-      const pad = Math.max(Math.abs(max) * 0.1, 0.5);
-      min = min - pad;
-      max = max + pad;
-    }
-    const step = (max - min) / 2;
-    return [
-      Number(min.toFixed(decimals)),
-      Number((min + step).toFixed(decimals)),
-      Number(max.toFixed(decimals)),
-    ];
-  }
+      // Version additions
+      model.versions.forEach((version, vi) => {
+        if (version.timestamp > 0) {
+          items.push({
+            id: `version-added-${model.tokenId}-${vi}`,
+            type: 'info',
+            title: 'Version added',
+            message: `${model.name} v${version.semver}${version.accuracy > 0 ? ` \u2014 ${(version.accuracy * 100).toFixed(1)}%` : ''}`,
+            timestamp: version.timestamp * 1000,
+          });
+        }
+      });
+    });
 
-  const lossTicks = useMemo(() => niceTicks3(lossData.map((d) => d.value), 2), [lossData]);
-  const accTicks = useMemo(() => niceTicks3(accData.map((d) => d.value), 1), [accData]);
+    // Deduplicate by id (WS events take priority)
+    const seen = new Set<string>();
+    const deduped = items.filter((item) => {
+      if (seen.has(item.id)) return false;
+      seen.add(item.id);
+      return true;
+    });
+
+    return deduped.sort((a, b) => b.timestamp - a.timestamp).slice(0, 20);
+  }, [events, sessions, models]);
 
   const chartTooltipStyle = {
     backgroundColor: '#111113',
-    border: '1px solid #1e1e22',
+    border: '1px solid rgba(255,255,255,0.06)',
     borderRadius: 12,
     fontSize: 12,
     fontFamily: 'var(--font-geist-mono)',
   };
 
+  // ── Not connected state ──────────────────────────────────────
+
+  if (!isConnected) {
+    return (
+      <motion.div
+        initial={{ opacity: 0, y: 8 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.4, ease: 'easeOut' }}
+        className="space-y-8 max-w-7xl mx-auto"
+      >
+        <div>
+          <h1 className="text-2xl font-semibold text-helix-text">Portfolio</h1>
+          <p className="text-sm text-helix-muted mt-1">Your models, revenue, and activity</p>
+        </div>
+        <div className="rounded-2xl border border-helix-border bg-helix-surface/50 flex flex-col items-center justify-center py-24 px-8">
+          <div className="p-4 rounded-2xl bg-white/[0.04] mb-5">
+            <Wallet size={32} className="text-helix-dim" />
+          </div>
+          <p className="text-lg font-medium text-helix-text mb-2">Connect your wallet</p>
+          <p className="text-sm text-helix-muted text-center max-w-sm">
+            Connect your wallet to view your model portfolio, track revenue, and manage training sessions.
+          </p>
+        </div>
+      </motion.div>
+    );
+  }
+
+  // ── Main portfolio view ──────────────────────────────────────
+
   return (
     <>
-    {/* Global cheater toast notification */}
-    <CheaterToast cheater={activeSession?.cheater_detected ?? null} />
-
-    <motion.div
-      initial={{ opacity: 0, y: 8 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.4, ease: 'easeOut' }}
-      className="space-y-6 max-w-[1200px]"
-    >
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <h1 className="text-3xl font-semibold tracking-tight text-white">Dashboard</h1>
-
-        <div className="flex items-center gap-3">
-          {/* Session Selector */}
-          {tab === 'training' && selectedSession && (
-            <div className="relative">
-              <button
-                onClick={() => setDropdownOpen(!dropdownOpen)}
-                className="flex items-center gap-2.5 px-4 py-2 bg-helix-surface border border-helix-border rounded-xl text-sm text-white hover:border-helix-border2 transition-colors"
-              >
-                <div className={cn(
-                  'w-2 h-2 rounded-full',
-                  selectedSession.status === 'training' ? 'bg-green-400' : 'bg-yellow-400',
-                )} />
-                {selectedSession.name}
-                <ChevronDown size={14} className="text-helix-muted" />
-              </button>
-
-              <AnimatePresence>
-                {dropdownOpen && (
-                  <motion.div
-                    initial={{ opacity: 0, y: -4 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    exit={{ opacity: 0, y: -4 }}
-                    className="absolute right-0 top-full mt-2 w-64 bg-helix-surface border border-helix-border rounded-xl shadow-xl z-50 overflow-hidden"
-                  >
-                    {sessions.map((s) => (
-                      <button
-                        key={s.id}
-                        onClick={() => { selectSession(s.id); setDropdownOpen(false); }}
-                        className={cn(
-                          'w-full flex items-center gap-3 px-4 py-3 text-sm text-left hover:bg-white/[0.04] transition-colors',
-                          s.id === selectedSession.id && 'bg-white/[0.06]',
-                        )}
-                      >
-                        <div className={cn(
-                          'w-2 h-2 rounded-full',
-                          s.status === 'training' ? 'bg-green-400' : 'bg-yellow-400',
-                        )} />
-                        <div>
-                          <div className="text-white">{s.name}</div>
-                          <div className="text-xs text-helix-muted capitalize mt-0.5">{s.status}</div>
-                        </div>
-                      </button>
-                    ))}
-                  </motion.div>
-                )}
-              </AnimatePresence>
-            </div>
-          )}
-
-          {/* Tab Switcher */}
-          <div className="flex bg-helix-surface rounded-xl p-1 border border-helix-border">
-            {(['training', 'inference'] as const).map((t) => (
-              <button
-                key={t}
-                onClick={() => setTab(t)}
-                className={cn(
-                  'px-5 py-1.5 rounded-lg text-sm font-medium transition-all capitalize',
-                  tab === t ? 'bg-white text-black' : 'text-helix-muted hover:text-white',
-                )}
-              >
-                {t}
-              </button>
-            ))}
-          </div>
+      <motion.div
+        initial={{ opacity: 0, y: 8 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.4, ease: 'easeOut' }}
+        className="space-y-8 max-w-7xl mx-auto"
+      >
+        {/* ── 1. Header ────────────────────────────────────────── */}
+        <div>
+          <h1 className="text-2xl font-semibold text-helix-text">Portfolio</h1>
+          <p className="text-sm text-helix-muted mt-1">Your models, revenue, and activity</p>
         </div>
-      </div>
 
-      {/* ================================================================ */}
-      {/* Training Tab */}
-      {/* ================================================================ */}
-      {tab === 'training' && !selectedSession && (
+        {/* ── 2. Stat Cards ────────────────────────────────────── */}
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+          <StatCard
+            label="Models Owned"
+            value={isModelsLoading ? '--' : String(models.length)}
+            icon={Layers}
+            delay={0}
+            accent="bg-indigo-500/10"
+          />
+          <StatCard
+            label="Total Revenue"
+            value={isModelsLoading ? '--' : `${formatADI(totalRevenue)} ADI`}
+            icon={DollarSign}
+            delay={0.05}
+            accent="bg-emerald-500/10"
+          />
+          <StatCard
+            label="Active Training"
+            value={String(activeSessions.length)}
+            icon={Activity}
+            delay={0.1}
+            accent="bg-sky-500/10"
+          />
+          <StatCard
+            label="Inferences Served"
+            value={totalInferences === null ? '--' : String(totalInferences)}
+            icon={Zap}
+            delay={0.15}
+            accent="bg-amber-500/10"
+          />
+        </div>
+
+        {/* ── 3. Revenue Section ───────────────────────────────── */}
         <motion.div
-          key="training-empty"
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          transition={{ duration: 0.25 }}
+          initial={{ opacity: 0, y: 8 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.4, delay: 0.15 }}
+          className="grid grid-cols-1 lg:grid-cols-5 gap-4"
         >
-          <div className="bg-helix-surface border border-helix-border rounded-2xl p-16 text-center">
-            <div className="text-sm text-helix-muted">No active training sessions</div>
-            <div className="text-xs text-helix-dim mt-2">Start a training session from the Train page</div>
+          {/* Revenue chart (3/5) */}
+          <div className="lg:col-span-3 rounded-2xl border border-helix-border bg-helix-surface/50 p-6">
+            <div className="flex items-center justify-between mb-4">
+              <div>
+                <span className="text-sm font-medium text-helix-muted">Revenue</span>
+                <p className="text-sm text-helix-dim mt-0.5">Month to date</p>
+              </div>
+              {revenueData.length > 0 && (
+                <div className="flex items-center gap-2">
+                  <TrendingUp size={14} className="text-indigo-400" />
+                  <span className="text-sm font-medium text-indigo-300">{formatADI(totalRevenue)} ADI</span>
+                </div>
+              )}
+            </div>
+            {revenueData.length === 0 ? (
+              <div className="flex flex-col items-center justify-center h-64 text-center">
+                <div className="p-4 rounded-2xl bg-white/[0.03] mb-4">
+                  <TrendingUp size={24} className="text-white/20" />
+                </div>
+                <p className="text-[15px] text-white/40 font-medium">No revenue yet</p>
+                <p className="text-sm text-white/20 mt-1">Register a model to start earning</p>
+              </div>
+            ) : (
+              <>
+                {/* Legend */}
+                <div className="flex flex-wrap gap-x-4 gap-y-1 mb-4">
+                  {revenueModelNames.map((name, i) => (
+                    <div key={name} className="flex items-center gap-1.5">
+                      <div
+                        className="w-2.5 h-2.5 rounded-sm"
+                        style={{ backgroundColor: STACK_COLORS[i % STACK_COLORS.length].fill, opacity: 0.8 }}
+                      />
+                      <span className="text-sm text-helix-dim truncate max-w-[100px]">{name}</span>
+                    </div>
+                  ))}
+                </div>
+                <div className="h-52">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <AreaChart data={revenueData} margin={{ top: 4, right: 4, bottom: 0, left: 0 }}>
+                      <defs>
+                        {revenueModelNames.map((name, i) => {
+                          const color = STACK_COLORS[i % STACK_COLORS.length].fill;
+                          return (
+                            <linearGradient key={name} id={`stackGrad-${i}`} x1="0" y1="0" x2="0" y2="1">
+                              <stop offset="0%" stopColor={color} stopOpacity={0.4} />
+                              <stop offset="100%" stopColor={color} stopOpacity={0.05} />
+                            </linearGradient>
+                          );
+                        })}
+                      </defs>
+                      <XAxis
+                        dataKey="day"
+                        tick={{ fill: '#63636e', fontSize: 10, fontFamily: 'var(--font-geist-mono)' }}
+                        axisLine={{ stroke: '#1e1e22' }}
+                        tickLine={false}
+                        tickMargin={6}
+                        interval={Math.max(0, Math.floor(revenueData.length / 6) - 1)}
+                      />
+                      <YAxis
+                        tick={{ fill: '#63636e', fontSize: 10, fontFamily: 'var(--font-geist-mono)' }}
+                        axisLine={false}
+                        tickLine={false}
+                        tickMargin={4}
+                        width={38}
+                      />
+                      <Tooltip
+                        contentStyle={chartTooltipStyle}
+                        labelStyle={{ color: '#63636e' }}
+                        formatter={(value: number | undefined, name?: string) => [`${(value ?? 0).toFixed(4)} ADI`, name ?? '']}
+                      />
+                      {revenueModelNames.map((name, i) => {
+                        const color = STACK_COLORS[i % STACK_COLORS.length];
+                        return (
+                          <Area
+                            key={name}
+                            type="monotone"
+                            dataKey={name}
+                            stackId="revenue"
+                            stroke={color.stroke}
+                            fill={`url(#stackGrad-${i})`}
+                            strokeWidth={1.5}
+                            dot={false}
+                          />
+                        );
+                      })}
+                    </AreaChart>
+                  </ResponsiveContainer>
+                </div>
+              </>
+            )}
+          </div>
+
+          {/* Top earners (2/5) */}
+          <div className="lg:col-span-2 rounded-2xl border border-helix-border bg-helix-surface/50 p-6">
+            <span className="text-sm font-medium text-helix-muted block mb-4">Top Earners</span>
+            {topEarners.length === 0 ? (
+              <div className="flex items-center justify-center h-40 text-sm text-helix-dim">
+                No models yet
+              </div>
+            ) : (
+              <div className="space-y-1">
+                {topEarners.map((model, i) => (
+                  <button
+                    key={model.tokenId}
+                    onClick={() => router.push(`/models/${model.tokenId}`)}
+                    className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl hover:bg-white/[0.03] transition-colors text-left group"
+                  >
+                    <div className={cn('w-2 h-2 rounded-full shrink-0', EARNER_COLORS[i % EARNER_COLORS.length])} />
+                    <span className="text-sm text-helix-text flex-1 truncate group-hover:text-white transition-colors">
+                      {model.name}
+                    </span>
+                    <span className="text-sm font-mono text-helix-muted tabular-nums">
+                      {formatADI(model.feesAccrued)}
+                    </span>
+                    <span className="text-sm text-helix-dim">ADI</span>
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
         </motion.div>
-      )}
 
-      {tab === 'training' && selectedSession && (
+        {/* ── 4. My Models Section ─────────────────────────────── */}
         <motion.div
-          key="training"
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          transition={{ duration: 0.25 }}
-          className="space-y-4"
+          initial={{ opacity: 0, y: 8 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.4, delay: 0.2 }}
         >
-          {/* Hero Metrics: Loss + Accuracy */}
-          <div className="grid grid-cols-2 gap-4">
-            {/* Loss */}
-            <div className="bg-helix-surface border border-helix-border rounded-2xl p-6">
-              <div className="text-xs text-helix-muted mb-1">Loss</div>
-              <div className="flex items-baseline gap-3">
-                <span className="text-4xl font-semibold text-white tabular-nums font-mono">
-                  {currentLoss.toFixed(4)}
-                </span>
-                <span className={cn(
-                  'text-sm font-medium tabular-nums',
-                  lossDelta <= 0 ? 'text-green-400' : 'text-red-400',
-                )}>
-                  {lossDelta <= 0 ? '\u2193' : '\u2191'} {Math.abs(lossDelta).toFixed(4)}
-                </span>
-              </div>
-              <div className="mt-4 h-36">
-                <ResponsiveContainer width="100%" height="100%">
-                  <AreaChart data={lossData} margin={{ top: 4, right: 4, bottom: 0, left: 0 }}>
-                    <defs>
-                      <linearGradient id="lG" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="0%" stopColor="#ffffff" stopOpacity={0.08} />
-                        <stop offset="100%" stopColor="#ffffff" stopOpacity={0} />
-                      </linearGradient>
-                    </defs>
-                    <XAxis
-                      dataKey="step"
-                      tick={{ fill: '#63636e', fontSize: 10, fontFamily: 'var(--font-geist-mono)' }}
-                      axisLine={{ stroke: '#1e1e22' }}
-                      tickLine={false}
-                      tickMargin={6}
-                    />
-                    <YAxis
-                      domain={[lossTicks[0], lossTicks[lossTicks.length - 1]]}
-                      ticks={lossTicks}
-                      tick={{ fill: '#63636e', fontSize: 10, fontFamily: 'var(--font-geist-mono)' }}
-                      axisLine={false}
-                      tickLine={false}
-                      tickMargin={4}
-                      width={38}
-                    />
-                    <Tooltip contentStyle={chartTooltipStyle} labelStyle={{ color: '#63636e' }} />
-                    <Area
-                      type="monotone"
-                      dataKey="value"
-                      stroke="rgba(255,255,255,0.5)"
-                      fill="url(#lG)"
-                      strokeWidth={1.5}
-                      dot={false}
-                    />
-                  </AreaChart>
-                </ResponsiveContainer>
-              </div>
-            </div>
+          {/* Models header */}
+          <div className="flex flex-col sm:flex-row sm:items-center gap-4 mb-5">
+            <span className="text-lg font-semibold text-helix-text flex-shrink-0">My Models</span>
 
-            {/* Accuracy */}
-            <div className="bg-helix-surface border border-helix-border rounded-2xl p-6">
-              <div className="text-xs text-helix-muted mb-1">Accuracy</div>
-              <div className="flex items-baseline gap-3">
-                <span className="text-4xl font-semibold text-white tabular-nums font-mono">
-                  {(currentAcc * 100).toFixed(1)}%
-                </span>
-                <span className={cn(
-                  'text-sm font-medium tabular-nums',
-                  accDelta >= 0 ? 'text-green-400' : 'text-red-400',
-                )}>
-                  {accDelta >= 0 ? '\u2191' : '\u2193'} {Math.abs(accDelta).toFixed(1)}%
-                </span>
-              </div>
-              <div className="mt-4 h-36">
-                <ResponsiveContainer width="100%" height="100%">
-                  <AreaChart data={accData} margin={{ top: 4, right: 4, bottom: 0, left: 0 }}>
-                    <defs>
-                      <linearGradient id="aG" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="0%" stopColor="#4ade80" stopOpacity={0.1} />
-                        <stop offset="100%" stopColor="#4ade80" stopOpacity={0} />
-                      </linearGradient>
-                    </defs>
-                    <XAxis
-                      dataKey="step"
-                      tick={{ fill: '#63636e', fontSize: 10, fontFamily: 'var(--font-geist-mono)' }}
-                      axisLine={{ stroke: '#1e1e22' }}
-                      tickLine={false}
-                      tickMargin={6}
-                    />
-                    <YAxis
-                      domain={[accTicks[0], accTicks[accTicks.length - 1]]}
-                      ticks={accTicks}
-                      tick={{ fill: '#63636e', fontSize: 10, fontFamily: 'var(--font-geist-mono)' }}
-                      axisLine={false}
-                      tickLine={false}
-                      tickMargin={4}
-                      width={42}
-                      unit="%"
-                    />
-                    <Tooltip contentStyle={chartTooltipStyle} labelStyle={{ color: '#63636e' }} />
-                    <Area
-                      type="monotone"
-                      dataKey="value"
-                      stroke="#4ade80"
-                      fill="url(#aG)"
-                      strokeWidth={1.5}
-                      dot={false}
-                    />
-                  </AreaChart>
-                </ResponsiveContainer>
-              </div>
-            </div>
-          </div>
-
-          {/* Progress */}
-          <div className="bg-helix-surface border border-helix-border rounded-2xl p-6">
-            <div className="flex items-center justify-between mb-1">
-              <div className="flex items-center gap-3">
-                <span className="text-3xl font-bold text-white tabular-nums font-mono">
-                  {activeSession?.current_step ?? 0}
-                </span>
-                <span className="text-lg text-helix-dim font-mono">/ {activeSession?.total_steps ?? 0}</span>
-                <span className="text-sm text-helix-muted">steps</span>
-              </div>
-              <span className="text-sm text-helix-muted tabular-nums font-mono">{progress.toFixed(0)}%</span>
-            </div>
-            {activeSession?.phase_description && (
-              <p className="text-sm text-helix-muted mb-3">{activeSession.phase_description}</p>
-            )}
-            <div className="h-2.5 bg-helix-border rounded-full overflow-hidden">
-              <motion.div
-                className="h-full rounded-full bg-white"
-                initial={{ width: 0 }}
-                animate={{ width: `${progress}%` }}
-                transition={{ duration: 0.5, ease: 'easeOut' }}
-                style={{ boxShadow: progress > 0 && progress < 100 ? '0 0 12px rgba(255,255,255,0.4)' : 'none' }}
+            {/* Search */}
+            <div className="relative flex-1 max-w-sm">
+              <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-helix-dim" />
+              <input
+                type="text"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="Search models..."
+                className="w-full pl-10 pr-4 py-2 bg-helix-bg border border-helix-border rounded-xl text-sm text-helix-text placeholder:text-helix-dim focus:outline-none focus:border-helix-border2 transition-colors"
               />
             </div>
-            {activeSession?.status === 'complete' && (
-              <div className="mt-2 text-xs text-green-400">Training complete</div>
-            )}
-            {activeSession?.status === 'failed' && (
-              <div className="mt-2 text-xs text-red-400">Training failed</div>
-            )}
-          </div>
 
-          {/* Round Status (from backend) */}
-          {roundStatus && (
-            <div className="grid grid-cols-4 gap-3">
-              <div className="bg-helix-bg rounded-xl px-4 py-3">
-                <div className="text-[10px] uppercase tracking-wider text-helix-muted mb-1">Phase</div>
-                <div className="text-sm font-mono text-white truncate">
-                  {roundStatus.current_round?.phase ?? 'Idle'}
-                </div>
-              </div>
-              <div className="bg-helix-bg rounded-xl px-4 py-3">
-                <div className="text-[10px] uppercase tracking-wider text-helix-muted mb-1">Gradients</div>
-                <div className="text-sm font-mono text-white tabular-nums">
-                  {roundStatus.current_round
-                    ? `${roundStatus.current_round.gradients_received}/${roundStatus.current_round.workers_assigned}`
-                    : '--'}
-                </div>
-              </div>
-              <div className="bg-helix-bg rounded-xl px-4 py-3">
-                <div className="text-[10px] uppercase tracking-wider text-helix-muted mb-1">Rounds Done</div>
-                <div className="text-sm font-mono text-white tabular-nums">{roundStatus.completed_rounds}</div>
-              </div>
-              <div className="bg-helix-bg rounded-xl px-4 py-3">
-                <div className="text-[10px] uppercase tracking-wider text-helix-muted mb-1">MPC</div>
-                <div className="text-sm font-mono text-white">
-                  {backendHealth?.mpc?.active_session ? (
-                    <span className="flex items-center gap-1.5">
-                      <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
-                      Active
-                    </span>
-                  ) : 'Idle'}
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* Workers + Settings */}
-          <div className="grid grid-cols-5 gap-4">
-            {/* Workers */}
-            <div className="col-span-3 bg-helix-surface border border-helix-border rounded-2xl p-6">
-              <div className="flex items-center justify-between mb-4">
-                <span className="text-sm font-medium text-white">Workers</span>
-                <span className="text-xs text-helix-muted">
-                  {healthWorkers.filter((w) => w.status !== 'offline').length} active
-                </span>
-              </div>
-              <div className="space-y-0.5 max-h-[280px] overflow-y-auto">
-                {sortedWorkers.map((w) => {
-                  const eth = Number(formatEther(w.performance.totalEarnings));
-                  const offline = w.status === 'offline';
-                  return (
-                    <button
-                      key={w.id}
-                      type="button"
-                      onClick={() => setSelectedWorker(w)}
-                      className={cn(
-                        'w-full flex items-center gap-4 px-4 py-3 rounded-xl text-left transition-colors',
-                        offline ? 'opacity-35' : 'hover:bg-white/[0.03]',
-                      )}
-                    >
-                      <div className={cn(
-                        'w-2 h-2 rounded-full shrink-0',
-                        w.status === 'healthy' ? 'bg-green-400'
-                          : w.status === 'degraded' ? 'bg-yellow-400'
-                            : w.status === 'unhealthy' ? 'bg-red-400'
-                              : 'bg-helix-dim',
-                      )} />
-                      <span className="text-sm text-white font-mono flex-1">
-                        {w.address.slice(0, 6)}...{w.address.slice(-4)}
-                      </span>
-                      <span className="text-xs text-helix-muted capitalize w-20">{w.activity}</span>
-                      <span className="text-sm text-white font-mono tabular-nums w-20 text-right">
-                        {eth.toFixed(2)} <span className="text-helix-muted text-xs">ADI</span>
-                      </span>
-                    </button>
-                  );
-                })}
-                {sortedWorkers.length === 0 && (
-                  <div className="text-sm text-helix-muted text-center py-8">No workers</div>
-                )}
-              </div>
-            </div>
-
-            {/* Settings & Controls */}
-            <div className="col-span-2 bg-helix-surface border border-helix-border rounded-2xl p-6 flex flex-col">
-              <span className="text-sm font-medium text-white mb-4">Configuration</span>
-
-              <div className="space-y-4 flex-1">
-                <div>
-                  <label className="text-xs text-helix-muted block mb-1.5">Learning Rate</label>
-                  <div className="px-3 py-2 bg-helix-bg border border-helix-border rounded-xl text-sm text-helix-text2 font-mono">
-                    {displayLR}
-                  </div>
-                </div>
-                <div>
-                  <label className="text-xs text-helix-muted block mb-1.5">Batch Size</label>
-                  <div className="px-3 py-2 bg-helix-bg border border-helix-border rounded-xl text-sm text-helix-text2 font-mono">
-                    {displayBatch}
-                  </div>
-                </div>
-                <div>
-                  <label className="text-xs text-helix-muted block mb-1.5">Optimizer</label>
-                  <div className="px-3 py-2 bg-helix-bg border border-helix-border rounded-xl text-sm text-helix-text2">
-                    AdamW
-                  </div>
-                </div>
-                <div>
-                  <label className="text-xs text-helix-muted block mb-1.5">Loss Function</label>
-                  <div className="px-3 py-2 bg-helix-bg border border-helix-border rounded-xl text-sm text-helix-text2">
-                    CrossEntropy
-                  </div>
-                </div>
-              </div>
-
-              {/* Actions (disabled — backend doesn't support pause/resume) */}
-              <div className="flex gap-3 mt-6">
+            {/* Sort pills */}
+            <div className="flex items-center gap-1">
+              {SORT_OPTIONS.map((opt) => (
                 <button
-                  disabled
-                  title="Pause/resume not supported by backend"
-                  className="flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm font-medium bg-white/5 text-helix-dim cursor-not-allowed"
+                  key={opt.id}
+                  onClick={() => setSort(opt.id)}
+                  className={cn(
+                    'px-4 py-2 rounded-xl text-sm font-medium transition-all',
+                    sort === opt.id
+                      ? 'bg-white/10 text-helix-text'
+                      : 'text-helix-dim hover:text-helix-muted',
+                  )}
                 >
-                  <Pause size={14} />
-                  Pause
+                  {opt.label}
                 </button>
-                <button
-                  disabled
-                  title="Stop not supported by backend"
-                  className="flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl text-sm font-medium bg-red-500/5 text-red-300/30 cursor-not-allowed"
-                >
-                  <Square size={14} />
-                  Stop
-                </button>
-              </div>
-            </div>
-          </div>
-
-          {/* Activity Feed */}
-          <div className="bg-helix-surface border border-helix-border rounded-2xl p-6">
-            <span className="text-sm font-medium text-white block mb-4">Recent Activity</span>
-            <div className="space-y-0.5 max-h-[240px] overflow-y-auto">
-              {activityFeed.length === 0 ? (
-                <div className="text-sm text-helix-muted text-center py-6">No activity yet</div>
-              ) : (
-                activityFeed.map((item) => {
-                  const cfg = ALERT_CONFIG[item.type] ?? ALERT_CONFIG.info;
-                  const Icon = cfg.icon;
-                  return (
-                    <div key={item.id} className="flex items-center gap-3 px-3 py-2.5 rounded-xl hover:bg-white/[0.02] transition-colors">
-                      <Icon size={14} style={{ color: cfg.color }} className="shrink-0" />
-                      <span className="text-sm text-white flex-1">{item.title}</span>
-                      {item.explorerUrl ? (
-                        <a
-                          href={item.explorerUrl}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-xs text-blue-400 hover:text-blue-300 font-mono transition-colors"
-                        >
-                          {item.message}
-                        </a>
-                      ) : item.message && item.message !== item.title ? (
-                        <span className="text-xs text-helix-muted">{item.message}</span>
-                      ) : null}
-                      <span className="text-xs text-helix-dim tabular-nums font-mono w-14 text-right">
-                        {timeAgo(item.timestamp)}
-                      </span>
-                    </div>
-                  );
-                })
-              )}
-            </div>
-          </div>
-
-          {/* Worker Panel */}
-          <div className="bg-helix-surface border border-helix-border rounded-2xl overflow-hidden">
-            <div className="flex items-center justify-between px-6 py-4 border-b border-helix-border">
-              <div className="flex items-center gap-3">
-                <Users size={16} className="text-helix-muted" />
-                <span className="text-sm font-medium text-white">Workers</span>
-                {backendWorkers.length > 0 && (
-                  <span className="text-xs text-helix-muted">
-                    {backendWorkers.filter(w => w.status === 'idle' || w.status === 'busy').length} healthy &middot; {backendWorkers.filter(w => w.status === 'offline').length} offline
-                  </span>
-                )}
-              </div>
-              <div className="flex bg-helix-bg rounded-lg p-0.5 border border-helix-border">
-                {(['active', 'inactive'] as const).map((t) => (
-                  <button
-                    key={t}
-                    onClick={() => setWorkerTab(t)}
-                    className={cn(
-                      'px-3 py-1 rounded-md text-xs font-medium transition-all capitalize',
-                      workerTab === t ? 'bg-white text-black' : 'text-helix-muted hover:text-white',
-                    )}
-                  >
-                    {t} ({t === 'active' ? activeWorkers.length : inactiveWorkers.length})
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {/* Table Header */}
-            <div className="grid grid-cols-[1fr_70px_55px_50px_55px_65px_55px_65px_24px] gap-2 px-6 py-2.5 border-b border-helix-border bg-helix-bg/30 text-[10px] text-helix-muted uppercase tracking-wider">
-              <span>Worker</span>
-              <span>Status</span>
-              <span>Rep</span>
-              <span>CPU</span>
-              <span>Mem</span>
-              <span>Rounds</span>
-              <span>Success</span>
-              <span>Earnings</span>
-              <span></span>
-            </div>
-
-            {/* Worker Rows */}
-            <div className="max-h-[320px] overflow-y-auto">
-              {displayWorkers.map((w) => (
-                <div key={w.id}>
-                  <button
-                    type="button"
-                    onClick={() => setExpandedWorker(expandedWorker === w.id ? null : w.id)}
-                    className="w-full grid grid-cols-[1fr_70px_55px_50px_55px_65px_55px_65px_24px] gap-2 px-6 py-3 border-b border-helix-border/50 hover:bg-white/[0.015] text-xs transition-colors items-center text-left"
-                  >
-                    <span className="text-white font-mono truncate">
-                      {w.id.length > 12 ? `${w.id.slice(0, 8)}...${w.id.slice(-4)}` : w.id}
-                    </span>
-                    <span className={cn(
-                      'text-[10px] px-1.5 py-0.5 rounded text-center capitalize truncate',
-                      w.status === 'Available' || w.status === 'idle' ? 'bg-green-400/10 text-green-400'
-                        : w.status === 'Computing' || w.status === 'busy' ? 'bg-blue-400/10 text-blue-400'
-                        : w.status === 'Assigned' ? 'bg-yellow-400/10 text-yellow-400'
-                        : 'bg-helix-border text-helix-muted',
-                    )}>
-                      {w.status.toLowerCase()}
-                    </span>
-                    <ReputationBadge score={w.reputation_score} />
-                    <span className="text-white font-mono tabular-nums text-right">{w.cpu_load}%</span>
-                    <span className="text-helix-text2 font-mono tabular-nums text-right">{w.memory_mb}M</span>
-                    <span className="text-helix-text2 font-mono tabular-nums">
-                      {w.rounds_completed}/{w.rounds_participated}
-                    </span>
-                    <span className="text-white font-mono tabular-nums">
-                      {(w.success_rate * 100).toFixed(0)}%
-                    </span>
-                    <span className="text-white font-mono tabular-nums text-right">
-                      {(w.earnings_wei / 1e18).toFixed(3)}
-                    </span>
-                    <ChevronRight size={12} className={cn(
-                      'text-helix-dim transition-transform',
-                      expandedWorker === w.id && 'rotate-90',
-                    )} />
-                  </button>
-
-                  {/* Expanded Detail */}
-                  <AnimatePresence>
-                    {expandedWorker === w.id && (
-                      <motion.div
-                        initial={{ height: 0, opacity: 0 }}
-                        animate={{ height: 'auto', opacity: 1 }}
-                        exit={{ height: 0, opacity: 0 }}
-                        transition={{ duration: 0.2 }}
-                        className="overflow-hidden"
-                      >
-                        <div className="px-6 py-4 bg-helix-bg/50 border-b border-helix-border/50">
-                          <div className="grid grid-cols-3 gap-6">
-                            <div>
-                              <div className="text-[10px] uppercase tracking-wider text-helix-muted mb-2">Capabilities</div>
-                              <div className="flex flex-wrap gap-1.5">
-                                {w.capabilities.can_train && <span className="text-[10px] px-2 py-0.5 rounded bg-white/5 text-helix-text2">Train</span>}
-                                {w.capabilities.can_prove && <span className="text-[10px] px-2 py-0.5 rounded bg-white/5 text-helix-text2">Prove</span>}
-                                {w.capabilities.can_aggregate && <span className="text-[10px] px-2 py-0.5 rounded bg-white/5 text-helix-text2">Aggregate</span>}
-                                {w.capabilities.gpu_model && <span className="text-[10px] px-2 py-0.5 rounded bg-white/5 text-helix-text2">{w.capabilities.gpu_model}</span>}
-                                <span className="text-[10px] px-2 py-0.5 rounded bg-white/5 text-helix-text2">Batch: {w.capabilities.max_batch_size}</span>
-                              </div>
-                            </div>
-                            <div>
-                              <div className="text-[10px] uppercase tracking-wider text-helix-muted mb-2">Resources</div>
-                              <div className="space-y-2">
-                                {[
-                                  { label: 'CPU', value: w.cpu_load },
-                                  { label: 'Mem', value: Math.min(100, Math.round(w.memory_mb / 10)) },
-                                ].map((r) => (
-                                  <div key={r.label} className="flex items-center gap-2">
-                                    <span className="text-[10px] text-helix-text2 w-8">{r.label}</span>
-                                    <div className="flex-1 h-1 bg-helix-border rounded-full overflow-hidden">
-                                      <div
-                                        className={cn(
-                                          'h-full rounded-full transition-all',
-                                          r.value > 90 ? 'bg-red-400' : r.value > 70 ? 'bg-yellow-400' : 'bg-white/70',
-                                        )}
-                                        style={{ width: `${Math.min(100, r.value)}%` }}
-                                      />
-                                    </div>
-                                    <span className="text-[10px] text-white font-mono w-8 text-right">{r.value}%</span>
-                                  </div>
-                                ))}
-                              </div>
-                            </div>
-                            <div>
-                              <div className="text-[10px] uppercase tracking-wider text-helix-muted mb-2">Reputation</div>
-                              <div className="flex items-baseline gap-2">
-                                <span className="text-2xl font-mono font-semibold text-white tabular-nums">
-                                  {Math.round(w.reputation_score * 100)}
-                                </span>
-                                <span className="text-xs text-helix-muted">/ 100</span>
-                              </div>
-                              <div className="text-[10px] text-helix-muted mt-1">
-                                {w.rounds_participated > 0
-                                  ? `${w.rounds_completed} of ${w.rounds_participated} rounds completed`
-                                  : 'No rounds yet'}
-                              </div>
-                              <div className="text-[10px] text-helix-muted">
-                                Success rate: {(w.success_rate * 100).toFixed(1)}%
-                              </div>
-                            </div>
-                          </div>
-                        </div>
-                      </motion.div>
-                    )}
-                  </AnimatePresence>
-                </div>
               ))}
-              {displayWorkers.length === 0 && (
-                <div className="flex items-center justify-center py-8 text-sm text-helix-muted">
-                  No {workerTab} workers
-                </div>
+            </div>
+
+            {/* Create button */}
+            <button
+              onClick={() => setShowCreateModal(true)}
+              className="flex items-center gap-2 px-5 py-2 rounded-xl bg-white text-black text-sm font-semibold hover:bg-white/90 transition-colors flex-shrink-0"
+            >
+              <Plus size={16} />
+              Create
+            </button>
+          </div>
+
+          {/* Model cards grid */}
+          {isModelsLoading ? (
+            <div className="flex items-center justify-center py-20">
+              <div className="w-6 h-6 border-2 border-helix-dim border-t-white rounded-full animate-spin" />
+            </div>
+          ) : filteredModels.length === 0 ? (
+            <div className="rounded-2xl border border-helix-border bg-helix-surface/50 flex flex-col items-center justify-center py-20 px-8">
+              {models.length === 0 ? (
+                <>
+                  <Layers size={28} className="text-helix-dim mb-4" />
+                  <p className="text-base text-helix-muted mb-2">No models yet</p>
+                  <p className="text-sm text-helix-dim text-center max-w-sm">
+                    Create your first model to start training and earning revenue.
+                  </p>
+                </>
+              ) : (
+                <>
+                  <Search size={24} className="text-helix-dim mb-3" />
+                  <p className="text-base text-helix-muted">No models match your search</p>
+                </>
               )}
             </div>
-          </div>
-        </motion.div>
-      )}
-
-      {/* ================================================================ */}
-      {/* Inference Tab */}
-      {/* ================================================================ */}
-      {tab === 'inference' && (
-        <motion.div
-          key="inference"
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          transition={{ duration: 0.25 }}
-          className="space-y-8"
-        >
-          {/* Active Requests */}
-          {inferenceRequests.filter((r) => r.status === 'processing').length > 0 && (
-            <div>
-              <span className="text-xs uppercase tracking-wider text-helix-muted block mb-4">In Progress</span>
-              <div className="space-y-4">
-                {inferenceRequests.filter((r) => r.status === 'processing').map((req, i) => (
-                  <motion.div
-                    key={req.id}
-                    initial={{ opacity: 0, y: 12 }}
+          ) : (
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              {filteredModels.map((model, i) => {
+                const bestVersion = model.versions.length > 0
+                  ? model.versions.reduce((best, v) => (v.accuracy > best.accuracy ? v : best), model.versions[0])
+                  : null;
+                const bestAccuracy = bestVersion?.accuracy ?? 0;
+                return (
+                  <motion.button
+                    key={model.tokenId}
+                    initial={{ opacity: 0, y: 6 }}
                     animate={{ opacity: 1, y: 0 }}
-                    transition={{ duration: 0.35, delay: i * 0.08 }}
-                    className="relative bg-helix-surface border border-helix-border rounded-2xl p-8 overflow-hidden group hover:border-helix-border2 transition-colors"
+                    transition={{ duration: 0.3, delay: i * 0.04 }}
+                    onClick={() => router.push(`/models/${model.tokenId}`)}
+                    className="rounded-2xl border border-helix-border bg-helix-surface/50 p-5 hover:bg-helix-surface/80 hover:border-helix-border2 transition-all text-left group"
                   >
-                    {/* Subtle top-edge accent line */}
-                    <div
-                      className="absolute top-0 left-0 h-[1px] bg-gradient-to-r from-transparent via-white/20 to-transparent"
-                      style={{ width: `${req.progress}%`, transition: 'width 0.6s ease-out' }}
-                    />
-
-                    <div className="flex items-center gap-8">
-                      {/* Horseshoe with radial backdrop */}
-                      <div className="relative shrink-0 flex items-center justify-center">
-                        <div className="absolute inset-0 rounded-full bg-white/[0.02] blur-xl scale-110" />
-                        <HorseshoeProgress progress={req.progress} size={150} />
-                      </div>
-
-                      {/* Details */}
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center justify-between mb-1">
-                          <div className="flex items-center gap-3">
-                            <span className="text-lg font-medium text-white">{req.model}</span>
-                            <span className="text-[11px] uppercase tracking-wider px-2.5 py-0.5 rounded-md bg-white/[0.06] text-helix-text2">
-                              {req.phase}
+                    {/* Top row: name + badges */}
+                    <div className="flex items-start justify-between gap-3 mb-3">
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2.5">
+                          <h3 className="text-base font-semibold text-helix-text group-hover:text-white transition-colors truncate">
+                            {model.name}
+                          </h3>
+                          {bestVersion && (
+                            <span className="text-sm font-mono px-2 py-0.5 rounded-md shrink-0 text-helix-muted bg-white/[0.04]">
+                              v{bestVersion.semver}
                             </span>
-                          </div>
-                          <span className="text-[11px] uppercase tracking-wider px-2.5 py-0.5 rounded-md bg-green-500/10 text-green-400">
-                            Live
+                          )}
+                        </div>
+                        <p className="text-sm text-helix-muted mt-1 font-mono">{model.slug}</p>
+                      </div>
+                      <div className="flex items-center gap-2 shrink-0">
+                        {model.isPublic ? (
+                          <span className="flex items-center gap-1 text-sm text-emerald-400 bg-emerald-500/10 px-2 py-1 rounded-lg">
+                            <Globe size={12} />
+                            Public
+                          </span>
+                        ) : (
+                          <span className="flex items-center gap-1 text-sm text-helix-muted bg-white/[0.04] px-2 py-1 rounded-lg">
+                            <Lock size={12} />
+                            Private
+                          </span>
+                        )}
+                        {model.forSale && (
+                          <span className="flex items-center gap-1 text-sm text-amber-400 bg-amber-500/10 px-2 py-1 rounded-lg">
+                            <Tag size={12} />
+                            For Sale
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Description */}
+                    {model.description && (
+                      <p className="text-sm text-helix-muted mb-4 line-clamp-2 leading-relaxed">
+                        {model.description}
+                      </p>
+                    )}
+
+                    {/* Stats row */}
+                    <div className="flex items-center gap-6 pt-3 border-t border-helix-border/50">
+                      <div>
+                        <span className="text-sm text-helix-dim block mb-0.5">Accuracy</span>
+                        <span className="text-sm font-mono font-medium text-helix-text tabular-nums">
+                          {bestAccuracy > 0 ? `${(bestAccuracy * 100).toFixed(1)}%` : '\u2014'}
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-sm text-helix-dim block mb-0.5">Revenue</span>
+                        <span className="text-sm font-mono font-medium text-helix-text tabular-nums">
+                          {formatADI(model.feesAccrued)} <span className="text-sm text-helix-dim">ADI</span>
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-sm text-helix-dim block mb-0.5">Versions</span>
+                        <span className="text-sm font-mono font-medium text-helix-text tabular-nums flex items-center gap-1">
+                          <GitBranch size={12} className="text-helix-dim" />
+                          {model.versions.length}
+                        </span>
+                      </div>
+                      {model.architecture && (
+                        <div className="ml-auto">
+                          <span className="text-sm text-helix-dim block mb-0.5">Architecture</span>
+                          <span className="text-sm font-mono text-helix-muted truncate max-w-[120px] block">
+                            {model.architecture}
                           </span>
                         </div>
-
-                        <div className="text-sm text-helix-muted mb-5">{req.inputLabel}</div>
-
-                        <div className="grid grid-cols-3 gap-4">
-                          <div>
-                            <div className="text-[10px] uppercase tracking-wider text-helix-muted mb-1">Workers</div>
-                            <div className="text-lg font-medium text-white tabular-nums">{req.workers} nodes</div>
-                          </div>
-                          <div className="border-l border-helix-border pl-4">
-                            <div className="text-[10px] uppercase tracking-wider text-helix-muted mb-1">Elapsed</div>
-                            <div className="text-lg font-medium text-white tabular-nums font-mono">{elapsedSince(req.created)}</div>
-                          </div>
-                          <div className="border-l border-helix-border pl-4">
-                            <div className="text-[10px] uppercase tracking-wider text-helix-muted mb-1">Status</div>
-                            <div className="flex items-center gap-2">
-                              <div className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
-                              <span className="text-lg font-medium text-white">Active</span>
-                            </div>
-                          </div>
-                        </div>
-                      </div>
+                      )}
+                      <ChevronRight
+                        size={18}
+                        className="text-helix-dim group-hover:text-helix-muted transition-colors shrink-0 ml-auto"
+                      />
                     </div>
-                  </motion.div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Completed Requests */}
-          {inferenceRequests.filter((r) => r.status === 'completed').length > 0 && (
-            <div>
-              <span className="text-xs uppercase tracking-wider text-helix-muted block mb-4">Completed</span>
-              <div className="space-y-4">
-                {inferenceRequests.filter((r) => r.status === 'completed').map((req, i) => (
-                  <motion.div
-                    key={req.id}
-                    initial={{ opacity: 0, y: 12 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    transition={{ duration: 0.35, delay: i * 0.08 }}
-                    className="relative bg-helix-surface border border-helix-border rounded-2xl p-8 overflow-hidden group hover:border-helix-border2 transition-colors opacity-50"
-                  >
-                    {/* Full accent line */}
-                    <div className="absolute top-0 left-0 w-full h-[1px] bg-gradient-to-r from-transparent via-white/10 to-transparent" />
-
-                    <div className="flex items-center gap-8">
-                      {/* Horseshoe with radial backdrop */}
-                      <div className="relative shrink-0 flex items-center justify-center">
-                        <div className="absolute inset-0 rounded-full bg-white/[0.02] blur-xl scale-110" />
-                        <HorseshoeProgress progress={100} size={150} />
-                      </div>
-
-                      {/* Details */}
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center justify-between mb-1">
-                          <div className="flex items-center gap-3">
-                            <span className="text-lg font-medium text-white">{req.model}</span>
-                            <span className="text-[11px] uppercase tracking-wider px-2.5 py-0.5 rounded-md bg-green-400/10 text-green-400">
-                              Complete
-                            </span>
-                          </div>
-                          <span className="text-sm text-helix-muted font-mono tabular-nums">{timeAgo(req.created)}</span>
-                        </div>
-
-                        <div className="text-sm text-helix-muted mb-5">
-                          Predicted &ldquo;{req.result}&rdquo; with {req.confidence != null ? `${(req.confidence * 100).toFixed(1)}%` : '\u2014'} confidence
-                        </div>
-
-                        <div className="grid grid-cols-3 gap-4">
-                          <div>
-                            <div className="text-[10px] uppercase tracking-wider text-helix-muted mb-1">Result</div>
-                            <div className="text-lg font-medium text-white tabular-nums">{req.result}</div>
-                          </div>
-                          <div className="border-l border-helix-border pl-4">
-                            <div className="text-[10px] uppercase tracking-wider text-helix-muted mb-1">Confidence</div>
-                            <div className="text-lg font-medium text-white tabular-nums font-mono">
-                              {req.confidence != null ? `${(req.confidence * 100).toFixed(1)}%` : '\u2014'}
-                            </div>
-                          </div>
-                          <div className="border-l border-helix-border pl-4">
-                            <div className="text-[10px] uppercase tracking-wider text-helix-muted mb-1">Duration</div>
-                            <div className="text-lg font-medium text-white tabular-nums font-mono">
-                              {req.duration != null ? formatDuration(req.duration) : '\u2014'}
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                  </motion.div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {inferenceRequests.length === 0 && (
-            <div className="bg-helix-surface border border-helix-border rounded-2xl p-16 text-center">
-              <div className="text-sm text-helix-muted">No inference requests yet</div>
-              <div className="text-xs text-helix-dim mt-2">Run inference from the Inference page</div>
+                  </motion.button>
+                );
+              })}
             </div>
           )}
         </motion.div>
-      )}
 
-      {/* Worker Detail Modal */}
+        {/* ── 5. Active Training ───────────────────────────────── */}
+        {activeSessions.length > 0 && (
+          <motion.div
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.4, delay: 0.25 }}
+          >
+            <div className="flex items-center justify-between mb-4">
+              <span className="text-sm font-medium text-helix-muted">Active Training</span>
+              <button
+                onClick={() => router.push('/train')}
+                className="text-sm text-indigo-400 hover:text-indigo-300 transition-colors"
+              >
+                View all
+              </button>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+              {activeSessions.map((session, i) => {
+                const progress = session.total_steps > 0
+                  ? (session.current_step / session.total_steps) * 100
+                  : 0;
+
+                return (
+                  <motion.div
+                    key={session.session_id}
+                    initial={{ opacity: 0, y: 8 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    transition={{ duration: 0.3, delay: i * 0.05 }}
+                    className="rounded-2xl border border-helix-border bg-helix-surface/50 p-5"
+                  >
+                    <div className="flex items-center justify-between mb-3">
+                      <div className="flex items-center gap-2">
+                        <div className="w-2 h-2 rounded-full bg-green-400 animate-pulse" />
+                        <span className="text-sm font-medium text-helix-text truncate">
+                          {session.model_name || `Session ${session.session_id.slice(0, 8)}`}
+                        </span>
+                      </div>
+                      <span className="text-sm text-helix-dim font-mono tabular-nums">
+                        {progress.toFixed(0)}%
+                      </span>
+                    </div>
+
+                    {/* Progress bar */}
+                    <div className="h-1.5 bg-helix-border rounded-full overflow-hidden mb-3">
+                      <motion.div
+                        className="h-full rounded-full bg-indigo-400"
+                        initial={{ width: 0 }}
+                        animate={{ width: `${progress}%` }}
+                        transition={{ duration: 0.5, ease: 'easeOut' }}
+                      />
+                    </div>
+
+                    <div className="flex items-center justify-between">
+                      <span className="text-sm text-helix-dim">
+                        Step {session.current_step} / {session.total_steps}
+                      </span>
+                      <button
+                        onClick={() => router.push('/train')}
+                        className="text-sm text-indigo-400 hover:text-indigo-300 transition-colors"
+                      >
+                        View
+                      </button>
+                    </div>
+                  </motion.div>
+                );
+              })}
+            </div>
+          </motion.div>
+        )}
+
+        {/* ── 6. Recent Activity ───────────────────────────────── */}
+        <motion.div
+          initial={{ opacity: 0, y: 8 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.4, delay: 0.3 }}
+          className="rounded-2xl border border-helix-border bg-helix-surface/50 p-6"
+        >
+          <span className="text-sm font-medium text-helix-muted block mb-4">Recent Activity</span>
+          <div className="space-y-0.5 max-h-[320px] overflow-y-auto">
+            {activityFeed.length === 0 ? (
+              <div className="flex flex-col items-center justify-center py-10">
+                <Activity size={20} className="text-helix-dim mb-2" />
+                <p className="text-sm text-helix-dim">No recent activity</p>
+                <p className="text-sm text-helix-dim mt-1">Activity from training sessions will appear here</p>
+              </div>
+            ) : (
+              activityFeed.map((item, i) => {
+                const cfg = ALERT_CONFIG[item.type] ?? ALERT_CONFIG.info;
+                const Icon = cfg.icon;
+                return (
+                  <motion.div
+                    key={item.id}
+                    initial={{ opacity: 0, x: -4 }}
+                    animate={{ opacity: 1, x: 0 }}
+                    transition={{ duration: 0.2, delay: i * 0.02 }}
+                    className="flex items-center gap-3 px-3 py-2.5 rounded-xl hover:bg-white/[0.02] transition-colors"
+                  >
+                    <div className={cn('p-1.5 rounded-lg', cfg.bg)}>
+                      <Icon size={12} style={{ color: cfg.color }} />
+                    </div>
+                    <span className="text-sm text-helix-text flex-1 truncate">{item.title}</span>
+                    {item.message && item.message !== item.title && (
+                      <span className="text-sm text-helix-muted truncate max-w-[200px]">{item.message}</span>
+                    )}
+                    <span className="text-sm text-helix-dim tabular-nums font-mono w-14 text-right shrink-0">
+                      {timeAgo(item.timestamp)}
+                    </span>
+                  </motion.div>
+                );
+              })
+            )}
+          </div>
+        </motion.div>
+      </motion.div>
+
+      {/* Create Model Modal */}
       <AnimatePresence>
-        {selectedWorker && (
-          <WorkerModal worker={selectedWorker} onClose={() => setSelectedWorker(null)} />
+        {showCreateModal && (
+          <CreateModelModal
+            onClose={() => setShowCreateModal(false)}
+            onCreated={() => {
+              setShowCreateModal(false);
+              refetchModels();
+            }}
+          />
         )}
       </AnimatePresence>
-    </motion.div>
     </>
   );
 }

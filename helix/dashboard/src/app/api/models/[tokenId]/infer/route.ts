@@ -58,70 +58,87 @@ interface ForwardPassResult {
   probabilities: number[];
 }
 
+/**
+ * Get a weight value from either a flat 1D array or a 2D array.
+ * Flat layout: W[row][col] = W[row * numCols + col]  (row-major)
+ * 2D layout:   W[row][col]
+ */
+function getWeight(w: number[] | number[][], row: number, col: number, numCols: number): number {
+  if (Array.isArray(w[0])) {
+    return (w as number[][])[row]?.[col] ?? 0;
+  }
+  return (w as number[])[row * numCols + col] ?? 0;
+}
+
 function runForwardPass(
   weights: Record<string, unknown>,
   input: number[],
 ): ForwardPassResult {
-  // Extract weight matrices from the model artifact format
-  const w = (weights as Record<string, number[] | Record<string, number[]>>);
+  const w = weights as Record<string, unknown>;
 
-  let hiddenW: number[][] | undefined;
+  let hiddenW: number[] | number[][] | undefined;
   let hiddenB: number[] | undefined;
-  let outputW: number[][] | undefined;
+  let outputW: number[] | number[][] | undefined;
   let outputB: number[] | undefined;
 
-  if (w.weights && typeof w.weights === 'object') {
-    const inner = w.weights as Record<string, number[] | number[][]>;
-    hiddenW = inner.layer0_weight as number[][] || inner.hidden_weights as number[][];
-    hiddenB = inner.layer0_bias as number[] || inner.hidden_bias as number[];
-    outputW = inner.layer1_weight as number[][] || inner.output_weights as number[][];
-    outputB = inner.layer1_bias as number[] || inner.output_bias as number[];
-  } else {
-    hiddenW = w.hidden_weights as unknown as number[][] | undefined;
-    hiddenB = w.hidden_bias as unknown as number[] | undefined;
-    outputW = w.output_weights as unknown as number[][] | undefined;
-    outputB = w.output_bias as unknown as number[] | undefined;
+  // Format 1: MPC training output { w1, b1, w2, b2 } (flat arrays)
+  if (w.w1 && w.b1 && w.w2 && w.b2) {
+    hiddenW = w.w1 as number[];
+    hiddenB = w.b1 as number[];
+    outputW = w.w2 as number[];
+    outputB = w.b2 as number[];
+  }
+  // Format 2: Nested { weights: { layer0_weight, layer0_bias, ... } }
+  else if (w.weights && typeof w.weights === 'object') {
+    const inner = w.weights as Record<string, unknown>;
+    hiddenW = (inner.layer0_weight ?? inner.hidden_weights) as number[] | number[][] | undefined;
+    hiddenB = (inner.layer0_bias ?? inner.hidden_bias) as number[] | undefined;
+    outputW = (inner.layer1_weight ?? inner.output_weights) as number[] | number[][] | undefined;
+    outputB = (inner.layer1_bias ?? inner.output_bias) as number[] | undefined;
+  }
+  // Format 3: Top-level { hidden_weights, hidden_bias, ... }
+  else {
+    hiddenW = w.hidden_weights as number[] | number[][] | undefined;
+    hiddenB = w.hidden_bias as number[] | undefined;
+    outputW = w.output_weights as number[] | number[][] | undefined;
+    outputB = w.output_bias as number[] | undefined;
   }
 
   if (!hiddenW || !hiddenB || !outputW || !outputB) {
-    // Fallback: return uniform distribution if weight format not recognized
-    const probs = new Array(10).fill(0.1);
-    return { label: 0, confidence: 0.1, probabilities: probs };
+    throw new Error('Weight format not recognized. Please re-upload weights in the standard format.');
   }
 
-  // Layer 1: hidden = ReLU(input * W_h + b_h)
+  const inputSize = input.length;
   const hiddenSize = hiddenB.length;
-  const hidden = new Array(hiddenSize).fill(0);
+  const outputSize = outputB.length;
+
+  // Layer 1: hidden = ReLU(W_h * input + b_h)
+  // W_h is [hiddenSize x inputSize], row j = weights for hidden unit j
+  const hidden = new Array(hiddenSize);
   for (let j = 0; j < hiddenSize; j++) {
-    let sum = hiddenB[j] || 0;
-    for (let i = 0; i < input.length; i++) {
-      const wRow = hiddenW[j] || hiddenW[i];
-      if (wRow) {
-        sum += input[i] * (Array.isArray(wRow) ? (wRow[i] ?? wRow[j] ?? 0) : 0);
-      }
+    let sum = hiddenB[j] ?? 0;
+    for (let i = 0; i < inputSize; i++) {
+      sum += input[i] * getWeight(hiddenW, j, i, inputSize);
     }
     hidden[j] = Math.max(0, sum); // ReLU
   }
 
-  // Layer 2: output = softmax(hidden * W_o + b_o)
-  const outputSize = outputB.length;
-  const logits = new Array(outputSize).fill(0);
+  // Layer 2: logits = W_o * hidden + b_o
+  // W_o is [outputSize x hiddenSize], row j = weights for output unit j
+  const logits = new Array(outputSize);
   for (let j = 0; j < outputSize; j++) {
-    let sum = outputB[j] || 0;
+    let sum = outputB[j] ?? 0;
     for (let i = 0; i < hiddenSize; i++) {
-      const wRow = outputW[j] || outputW[i];
-      if (wRow) {
-        sum += hidden[i] * (Array.isArray(wRow) ? (wRow[i] ?? wRow[j] ?? 0) : 0);
-      }
+      sum += hidden[i] * getWeight(outputW, j, i, hiddenSize);
     }
     logits[j] = sum;
   }
 
   // Softmax
   const maxLogit = Math.max(...logits);
-  const exps = logits.map((l) => Math.exp(l - maxLogit));
-  const sumExp = exps.reduce((a, b) => a + b, 0);
-  const probabilities = exps.map((e) => e / sumExp);
+  const exps = logits.map((l: number) => Math.exp(l - maxLogit));
+  const sumExp = exps.reduce((a: number, b: number) => a + b, 0);
+  const probabilities = exps.map((e: number) => e / sumExp);
 
   const label = probabilities.indexOf(Math.max(...probabilities));
   const confidence = probabilities[label];

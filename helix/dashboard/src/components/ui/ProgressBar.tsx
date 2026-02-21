@@ -12,8 +12,8 @@ interface ProgressBarProps {
 }
 
 const sizeStyles: Record<ProgressSize, string> = {
-  sm: 'h-1',
-  md: 'h-1.5',
+  sm: 'h-2',
+  md: 'h-3',
 };
 
 export function ProgressBar({

@@ -48,7 +48,11 @@ async fn test_tcp_e2e_basic_no_mac() {
         batch_size: 1,
         on_step: None,
         on_sub_step: None,
+        on_cheater_detected: None,
+        on_recovery_completed: None,
         capture_checkpoint_weights: false,
+        signal_rx: None,
+        starting_step: 0,
     };
 
     let result = run_mpc_training(config).await.expect("TCP training should succeed");
@@ -91,7 +95,11 @@ async fn test_tcp_e2e_with_mac() {
         batch_size: 1,
         on_step: None,
         on_sub_step: None,
+        on_cheater_detected: None,
+        on_recovery_completed: None,
         capture_checkpoint_weights: false,
+        signal_rx: None,
+        starting_step: 0,
     };
 
     let result = run_mpc_training(config).await.expect("TCP MAC training should succeed");
@@ -138,7 +146,11 @@ async fn test_tcp_e2e_with_checkpoints() {
         batch_size: 1,
         on_step: None,
         on_sub_step: None,
+        on_cheater_detected: None,
+        on_recovery_completed: None,
         capture_checkpoint_weights: false,
+        signal_rx: None,
+        starting_step: 0,
     };
 
     let result = run_mpc_training(config).await.expect("TCP checkpoint training should succeed");
@@ -184,7 +196,11 @@ async fn test_tcp_e2e_loss_decreases() {
         batch_size: 1,
         on_step: None,
         on_sub_step: None,
+        on_cheater_detected: None,
+        on_recovery_completed: None,
         capture_checkpoint_weights: false,
+        signal_rx: None,
+        starting_step: 0,
     };
 
     let result = run_mpc_training(config).await.expect("TCP training should succeed");
@@ -230,7 +246,11 @@ async fn test_tcp_e2e_weight_reconstruction() {
         batch_size: 1,
         on_step: None,
         on_sub_step: None,
+        on_cheater_detected: None,
+        on_recovery_completed: None,
         capture_checkpoint_weights: false,
+        signal_rx: None,
+        starting_step: 0,
     };
 
     let result = run_mpc_training(config).await.expect("TCP training should succeed");
@@ -298,7 +318,11 @@ async fn test_tcp_e2e_cheater_detection() {
         batch_size: 1,
         on_step: None,
         on_sub_step: None,
+        on_cheater_detected: None,
+        on_recovery_completed: None,
         capture_checkpoint_weights: false,
+        signal_rx: None,
+        starting_step: 0,
     };
 
     let cheater_party = 2;
@@ -366,7 +390,11 @@ async fn test_tcp_e2e_cheater_early_corruption() {
         batch_size: 1,
         on_step: None,
         on_sub_step: None,
+        on_cheater_detected: None,
+        on_recovery_completed: None,
         capture_checkpoint_weights: false,
+        signal_rx: None,
+        starting_step: 0,
     };
 
     // Worker 1 corrupts at step 2.
@@ -418,7 +446,11 @@ async fn test_tcp_e2e_dealer_cheats() {
         batch_size: 1,
         on_step: None,
         on_sub_step: None,
+        on_cheater_detected: None,
+        on_recovery_completed: None,
         capture_checkpoint_weights: false,
+        signal_rx: None,
+        starting_step: 0,
     };
 
     // Party 0 (the dealer) corrupts at step 8.
@@ -472,7 +504,11 @@ async fn test_tcp_e2e_larger_model() {
         batch_size: 1,
         on_step: None,
         on_sub_step: None,
+        on_cheater_detected: None,
+        on_recovery_completed: None,
         capture_checkpoint_weights: false,
+        signal_rx: None,
+        starting_step: 0,
     };
 
     let result = run_mpc_training(config).await.expect("TCP larger model training should succeed");
@@ -531,7 +567,11 @@ async fn test_tcp_e2e_matches_local_transport() {
         batch_size: 1,
         on_step: None,
         on_sub_step: None,
+        on_cheater_detected: None,
+        on_recovery_completed: None,
         capture_checkpoint_weights: false,
+        signal_rx: None,
+        starting_step: 0,
     };
 
     // Run with local transport.
@@ -610,7 +650,11 @@ async fn test_tcp_e2e_training_time_tracked() {
         batch_size: 1,
         on_step: None,
         on_sub_step: None,
+        on_cheater_detected: None,
+        on_recovery_completed: None,
         capture_checkpoint_weights: false,
+        signal_rx: None,
+        starting_step: 0,
     };
 
     let result = run_mpc_training(config).await.expect("TCP training should succeed");
@@ -656,7 +700,11 @@ async fn test_tcp_e2e_mnist_scale_50_steps() {
         batch_size: 1,
         on_step: None,
         on_sub_step: None,
+        on_cheater_detected: None,
+        on_recovery_completed: None,
         capture_checkpoint_weights: false,
+        signal_rx: None,
+        starting_step: 0,
     };
 
     let result = run_mpc_training(config).await.expect("MNIST TCP training should succeed");

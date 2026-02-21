@@ -55,7 +55,7 @@ export function usePublicModels() {
     address: addr,
     abi: HELIX_MODEL_STORE_ABI,
     functionName: 'totalSupply',
-    query: { enabled: isContractDeployed },
+    query: { enabled: isContractDeployed, refetchOnWindowFocus: true },
   });
 
   const totalSupply = rawTotalSupply ? Number(rawTotalSupply) : 0;
@@ -76,7 +76,7 @@ export function usePublicModels() {
     isLoading: isLoadingTokenIds,
   } = useReadContracts({
     contracts: tokenIdCalls,
-    query: { enabled: tokenIdCalls.length > 0 },
+    query: { enabled: tokenIdCalls.length > 0, refetchOnWindowFocus: true },
   });
 
   const tokenIds = useMemo(() => {
@@ -137,7 +137,7 @@ export function usePublicModels() {
     refetch: refetchModelData,
   } = useReadContracts({
     contracts: modelDataCalls,
-    query: { enabled: modelDataCalls.length > 0 },
+    query: { enabled: modelDataCalls.length > 0, refetchOnWindowFocus: true },
   });
 
   // Parse on-chain results into PublicModel[]
@@ -156,7 +156,18 @@ export function usePublicModels() {
       if (modelResult?.status !== 'success' || !modelResult.result) continue;
       if (ownerResult?.status !== 'success' || !ownerResult.result) continue;
 
-      const m = modelResult.result as unknown as readonly [string, string, string, string, string, bigint, boolean, number];
+      // Named struct access — more robust than array indexing
+      const raw = modelResult.result as unknown as Record<string, unknown>;
+      const m = {
+        slug: String(raw.slug ?? raw[0] ?? ''),
+        name: String(raw.name ?? raw[1] ?? ''),
+        description: String(raw.description ?? raw[2] ?? ''),
+        architecture: String(raw.architecture ?? raw[3] ?? ''),
+        creator: String(raw.creator ?? raw[4] ?? ''),
+        createdAt: Number(raw.createdAt ?? raw[5] ?? 0),
+        isPublic: Boolean(raw.isPublic ?? raw[6] ?? false),
+        inferenceFee: Number(raw.inferenceFee ?? raw[7] ?? 0),
+      };
       const owner = ownerResult.result as unknown as string;
       const forSale = forSaleResult?.status === 'success' ? (forSaleResult.result as unknown as boolean) : false;
       const salePriceWei = salePriceResult?.status === 'success' ? (salePriceResult.result as unknown as bigint) : BigInt(0);
@@ -199,15 +210,15 @@ export function usePublicModels() {
 
       result.push({
         tokenId: tokenIds[i],
-        slug: m[0],
-        name: m[1],
-        description: m[2],
-        architecture: m[3],
-        creator: m[4],
+        slug: m.slug,
+        name: m.name,
+        description: m.description,
+        architecture: m.architecture,
+        creator: m.creator,
         owner,
-        createdAt: Number(m[5]),
-        isPublic: m[6],
-        inferenceFee: Number(m[7]),
+        createdAt: m.createdAt,
+        isPublic: m.isPublic,
+        inferenceFee: m.inferenceFee,
         forSale,
         salePrice,
         versionCount,

@@ -44,11 +44,13 @@ export interface CheaterInfo {
   slash_tx_hash: string | null;
   recovered: boolean;
   recovery_workers: number | null;
+  /** Step training resumed from after checkpoint rollback */
+  resumed_from_step: number | null;
 }
 
 export interface TrainingSessionState {
   session_id: string;
-  status: 'starting' | 'running' | 'complete' | 'failed';
+  status: 'starting' | 'running' | 'paused' | 'stopped' | 'complete' | 'failed';
   current_step: number;
   total_steps: number;
   current_loss: number;
@@ -70,6 +72,9 @@ export interface TrainingSessionState {
   workers_active?: number;
   model_name?: string;
   model_slug?: string;
+  cost_gas_spent_wei?: number;
+  cost_worker_fees_adi?: number;
+  cost_deposit_adi?: number;
 }
 
 export interface TrainingEvent {
@@ -108,6 +113,7 @@ export interface UseMpcTrainingReturn {
   uploadWeights: (file: File) => Promise<void>;
   downloadModel: (sessionId: string) => Promise<void>;
   storeOnZeroG: (sessionId: string, version?: string) => Promise<void>;
+  sendCommand: (command: Record<string, unknown>) => void;
   session: TrainingSessionState | null;
   losses: LossDataPoint[];
   events: TrainingEvent[];
@@ -163,7 +169,7 @@ export function useMpcTraining(): UseMpcTrainingReturn {
       const res = await fetch(`${API_BASE}/api/training/sessions`);
       if (res.ok) {
         const sessions: TrainingSessionState[] = await res.json();
-        setHistory(sessions.filter(s => s.status === 'complete' || s.status === 'failed'));
+        setHistory(sessions.filter(s => s.status === 'complete' || s.status === 'failed' || s.status === 'stopped'));
       }
     } catch {
       // Silently fail
@@ -245,7 +251,7 @@ export function useMpcTraining(): UseMpcTrainingReturn {
                 // Use real evaluated accuracy on last point if session has it
                 accuracy: (i === s.losses.length - 1 && s.accuracy != null)
                   ? s.accuracy
-                  : Math.max(0, Math.min(1, 1 - loss / 2.302585)),
+                  : Math.max(0, Math.min(1, Math.exp(-loss))),
               })));
             }
             return;
@@ -325,19 +331,22 @@ export function useMpcTraining(): UseMpcTrainingReturn {
             });
           }
 
-          // Handle cheater detection
+          // Handle cheater detection — set cheater state for CheaterToast overlay.
+          // Training continues uninterrupted; the loss curve keeps a red reference line.
           if (evt.type === 'cheater_detected') {
+            const cheaterStep = evt.step as number;
             setSession((prev) => {
               if (!prev) return prev;
               return {
                 ...prev,
                 cheater_detected: {
                   party_index: evt.party_index as number,
-                  step: evt.step as number,
+                  step: cheaterStep,
                   slashed: false,
                   slash_tx_hash: null,
                   recovered: false,
                   recovery_workers: null,
+                  resumed_from_step: null,
                 },
               };
             });
@@ -372,6 +381,7 @@ export function useMpcTraining(): UseMpcTrainingReturn {
                       ...prev.cheater_detected,
                       recovered: true,
                       recovery_workers: (evt.honest_workers as number) ?? null,
+                      resumed_from_step: (evt.resumed_from_step as number) ?? null,
                     }
                   : prev.cheater_detected,
               };
@@ -459,6 +469,37 @@ export function useMpcTraining(): UseMpcTrainingReturn {
             setError(reason || 'Training session failed');
             fetchHistory();
           }
+
+          // Handle training paused
+          if (evt.type === 'training_paused') {
+            const step = evt.step as number | undefined;
+            setSession((prev) => {
+              if (!prev) return prev;
+              return { ...prev, status: 'paused', current_step: step ?? prev.current_step };
+            });
+          }
+
+          // Handle training stopped
+          if (evt.type === 'training_stopped') {
+            setSession((prev) => {
+              if (!prev) return prev;
+              return { ...prev, status: 'stopped' };
+            });
+            fetchHistory();
+          }
+
+          // Handle cost updates
+          if (evt.type === 'cost_update') {
+            setSession((prev) => {
+              if (!prev) return prev;
+              return {
+                ...prev,
+                cost_gas_spent_wei: (evt.gas_spent_wei as number) ?? 0,
+                cost_worker_fees_adi: (evt.worker_fees_accrued as number) ?? 0,
+                cost_deposit_adi: (evt.deposit_amount as number) ?? 0,
+              };
+            });
+          }
         } catch {
           // Ignore malformed messages
         }
@@ -493,6 +534,7 @@ export function useMpcTraining(): UseMpcTrainingReturn {
                   slash_tx_hash: raw.cheater_detected.slash_tx_hash ?? null,
                   recovered: raw.cheater_detected.recovered ?? false,
                   recovery_workers: raw.cheater_detected.recovery_workers ?? null,
+                  resumed_from_step: raw.cheater_detected.resumed_from_step ?? null,
                 }
               : null,
           };
@@ -506,7 +548,7 @@ export function useMpcTraining(): UseMpcTrainingReturn {
               const cheater = prev.cheater_detected && (!data.cheater_detected?.slashed && prev.cheater_detected.slashed)
                 ? prev.cheater_detected
                 : data.cheater_detected;
-              return { ...data, cheater_detected: cheater };
+              return { ...data, cheater_detected: cheater, checkpoint_freq: prev.checkpoint_freq || data.checkpoint_freq };
             }
             return {
               ...prev,
@@ -526,7 +568,7 @@ export function useMpcTraining(): UseMpcTrainingReturn {
                 // Use real evaluated accuracy on last point if session has it
                 accuracy: (i === data.losses.length - 1 && data.accuracy != null)
                   ? data.accuracy
-                  : Math.max(0, Math.min(1, 1 - loss / 2.302585)),
+                  : Math.max(0, Math.min(1, Math.exp(-loss))),
               }));
             }
             return prev;
@@ -612,6 +654,56 @@ export function useMpcTraining(): UseMpcTrainingReturn {
     } finally {
       setIsStarting(false);
     }
+  }, [connectWebSocket, startPolling]);
+
+  // ========================================================================
+  // Recover active session on mount (so navigating back to /train reconnects)
+  // ========================================================================
+
+  const recoveredRef = useRef(false);
+
+  useEffect(() => {
+    if (recoveredRef.current || sessionIdRef.current) return;
+    recoveredRef.current = true;
+
+    const recover = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/training/sessions`);
+        if (!res.ok) return;
+        const sessions: TrainingSessionState[] = await res.json();
+        const active = sessions.find(
+          (s) => s.status === 'starting' || s.status === 'running' || s.status === 'paused',
+        );
+        if (!active) return;
+
+        // Restore session state
+        sessionIdRef.current = active.session_id;
+        setSession(active);
+        if (active.losses && active.losses.length > 0) {
+          setLosses(
+            active.losses.map((loss: number, i: number) => ({
+              step: i + 1,
+              loss,
+              accuracy:
+                i === active.losses.length - 1 && active.accuracy != null
+                  ? active.accuracy
+                  : Math.max(0, Math.min(1, Math.exp(-loss))),
+            })),
+          );
+        }
+        if (active.started_at > 0) {
+          setElapsedTime(Math.floor(Date.now() / 1000 - active.started_at));
+        }
+
+        // Reconnect WebSocket + polling
+        connectWebSocket(active.session_id);
+        startPolling(active.session_id);
+      } catch {
+        // Non-fatal — user can still start a new session
+      }
+    };
+
+    recover();
   }, [connectWebSocket, startPolling]);
 
   // ========================================================================
@@ -805,12 +897,23 @@ export function useMpcTraining(): UseMpcTrainingReturn {
     };
   }, []);
 
+  // ========================================================================
+  // Send command via WebSocket
+  // ========================================================================
+
+  const sendCommand = useCallback((command: Record<string, unknown>) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify(command));
+    }
+  }, []);
+
   return {
     startTraining,
     uploadData,
     uploadWeights,
     downloadModel,
     storeOnZeroG,
+    sendCommand,
     session,
     losses,
     events,

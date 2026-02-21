@@ -38,19 +38,19 @@ export function StatCard({
   return (
     <Card variant="default" className={cn('relative', className)} style={style}>
       {icon && (
-        <div className="absolute top-4 right-4 text-helix-dim">
+        <div className="absolute top-5 right-5 text-helix-dim">
           {icon}
         </div>
       )}
-      <div className="space-y-1">
-        <p className="text-2xs font-mono uppercase tracking-wider text-helix-muted">
+      <div className="space-y-1.5">
+        <p className="text-sm text-helix-muted">
           {label}
         </p>
-        <p className="text-2xl font-light tracking-tight text-helix-text">
+        <p className="text-3xl font-light tracking-tight text-helix-text">
           {value}
         </p>
         {delta && (
-          <p className={cn('text-2xs', deltaColors[deltaDirection])}>
+          <p className={cn('text-sm', deltaColors[deltaDirection])}>
             {deltaSymbols[deltaDirection]}
             {deltaSymbols[deltaDirection] ? ' ' : ''}
             {delta}

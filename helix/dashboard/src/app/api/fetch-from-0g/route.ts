@@ -3,6 +3,7 @@ import { Indexer } from '@0glabs/0g-ts-sdk';
 import { readFile, unlink, mkdtemp } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { gunzipSync } from 'zlib';
 
 const ZG_INDEXER = process.env.ZG_INDEXER_URL || 'https://indexer-storage-testnet-turbo.0g.ai';
 
@@ -33,9 +34,41 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Read file and return as base64
-    const data = await readFile(tmpPath);
+    // Read file and decompress if gzipped
+    let data = await readFile(tmpPath);
+    const rawSize = data.length;
     await unlink(tmpPath).catch(() => {});
+
+    // Detect gzip magic bytes (1f 8b) and decompress.
+    // We also try unconditionally as a fallback in case the magic bytes are
+    // at a slight offset (e.g. sector alignment metadata from the storage layer).
+    let decompressed = false;
+    if (data.length >= 2 && data[0] === 0x1f && data[1] === 0x8b) {
+      try {
+        data = gunzipSync(data);
+        decompressed = true;
+        console.log(`[0G Storage] Decompressed: ${rawSize} → ${data.length} bytes`);
+      } catch (gzErr) {
+        console.warn('[0G Storage] Gzip decompression failed (magic bytes present):', gzErr);
+        // Try again — scan for gzip header in first 256 bytes in case of prefix
+        for (let i = 1; i < Math.min(data.length - 1, 256); i++) {
+          if (data[i] === 0x1f && data[i + 1] === 0x8b) {
+            try {
+              data = gunzipSync(data.subarray(i));
+              decompressed = true;
+              console.log(`[0G Storage] Decompressed from offset ${i}: ${rawSize} → ${data.length} bytes`);
+              break;
+            } catch {
+              // Continue scanning
+            }
+          }
+        }
+      }
+    }
+
+    if (!decompressed) {
+      console.log(`[0G Storage] Data not gzipped (${rawSize} bytes), first bytes: ${data[0]?.toString(16)} ${data[1]?.toString(16)}`);
+    }
 
     // Try to parse as JSON first — if it is, return the JSON directly
     try {

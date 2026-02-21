@@ -7,6 +7,7 @@
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use helix_mpc::mac_verification::MACVerificationConfig;
 use helix_mpc::mpc_trainer::{MPCTrainer, MPCTrainerConfig, ModelWeights};
 use helix_mpc::session::transport::LocalTransport;
 use helix_mpc::types::PartyId;
@@ -71,7 +72,11 @@ pub async fn run_mpc_training(
         generate_proofs,
         base_error: 1e-6,
         checkpoint_interval: 1,
-        mac_config: None,
+        mac_config: Some(MACVerificationConfig {
+            check_interval: 1,
+            enable_cheater_identification: true,
+            mac_seed: seed + 1000,
+        }),
     };
 
     // Create initial weights (same as non-MPC for comparison)

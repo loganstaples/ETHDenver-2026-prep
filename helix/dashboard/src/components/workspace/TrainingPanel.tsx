@@ -44,13 +44,13 @@ export function TrainingPanel({ modelId }: TrainingPanelProps) {
     <div className="space-y-6">
       {/* Config Summary */}
       <Card>
-        <p className="text-2xs font-mono uppercase tracking-wider text-helix-muted mb-4">
+        <p className="text-sm text-helix-muted mb-4">
           Training Configuration
         </p>
         <div className="grid grid-cols-2 gap-x-8 gap-y-3">
           {configItems.map((item) => (
             <div key={item.label} className="flex items-baseline justify-between">
-              <span className="text-2xs text-helix-muted uppercase tracking-wider">
+              <span className="text-sm text-helix-muted">
                 {item.label}
               </span>
               <span className="text-sm text-helix-text2 font-mono">
@@ -63,7 +63,7 @@ export function TrainingPanel({ modelId }: TrainingPanelProps) {
 
       {/* Progress Section */}
       <Card>
-        <p className="text-2xs font-mono uppercase tracking-wider text-helix-muted mb-4">
+        <p className="text-sm text-helix-muted mb-4">
           Progress
         </p>
         <div className="space-y-4">

@@ -78,6 +78,7 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
     error NoTimelockPending();
     error TimelockAlreadyPending();
     error PaginationOutOfBounds();
+    error InsufficientExcess();
     // Proof replay error
     error ProofAlreadyUsed();
     // Batch submission error
@@ -247,6 +248,9 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
 
     /// @notice Challenger rewards enabled
     bool public challengerRewardsEnabled;
+
+    /// @notice Total ETH owed to active (non-slashed) stakers
+    uint256 public totalStaked;
 
     // ============ Mappings ============
 
@@ -525,6 +529,9 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
         uint256 maxBudget
     );
 
+    /// @notice Emitted when owner withdraws excess ETH
+    event EmergencyWithdraw(address indexed to, uint256 amount);
+
     /// @notice Emitted when a round is finalized
     event RoundFinalized(
         uint256 indexed modelId,
@@ -708,6 +715,7 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
         uint128 newAmount = s.amount + uint128(msg.value);
         s.amount = newAmount;
         s.lockedUntil = uint40(block.timestamp + uint256(stakeLockDays) * 1 days);
+        totalStaked += msg.value;
 
         emit Staked(msg.sender, modelId, msg.value, newAmount);
     }
@@ -721,6 +729,7 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
 
         uint256 amount = s.amount;
         s.amount = 0;
+        totalStaked -= amount;
 
         (bool success, ) = msg.sender.call{value: amount}("");
         if (!success) revert TransferFailed();
@@ -938,9 +947,12 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
         if (s.amount == 0) revert NoStakeToSlash();
         if (s.slashed) revert AlreadySlashed();
 
+        uint256 preSlashAmount = s.amount;
         uint128 slashAmount = uint128((uint256(s.amount) * slashPercentage) / MAX_PERCENTAGE);
         s.amount -= slashAmount;
         s.slashed = true;
+        // Remove full pre-slash amount from totalStaked since slashed stakers cannot unstake
+        totalStaked -= preSlashAmount;
 
         // Calculate challenger reward if applicable
         uint128 challengerReward = 0;
@@ -1715,6 +1727,18 @@ contract HelixCoordinatorV2 is ReentrancyGuard {
         // For now, just check that data was committed
         // In production, this would verify the round data is derived from model data
         return true;
+    }
+
+    /// @notice Withdraw excess ETH not owed to stakers (e.g. from slashing remainders, accidental sends)
+    function emergencyWithdraw(address to, uint256 amount) external onlyOwner nonReentrant {
+        if (to == address(0)) revert InvalidAddress();
+        uint256 excess = address(this).balance > totalStaked ? address(this).balance - totalStaked : 0;
+        if (amount > excess) revert InsufficientExcess();
+
+        (bool success, ) = to.call{value: amount}("");
+        if (!success) revert TransferFailed();
+
+        emit EmergencyWithdraw(to, amount);
     }
 
     /// @notice Receives ETH

@@ -219,6 +219,40 @@ pub fn zk_prover_init_done(elapsed_ms: u64) {
 }
 
 // ============================================================================
+// Training Signal Display
+// ============================================================================
+
+/// Prints a notice that training was paused at the given step.
+pub fn training_paused(step: usize) {
+    println!();
+    println!(
+        "  {} Training paused at step {}",
+        "[PAUSED]".bright_yellow().bold(),
+        format!("{}", step).bright_white().bold(),
+    );
+    println!(
+        "       {}",
+        "Checkpoint saved — training can be resumed later".yellow()
+    );
+    println!();
+}
+
+/// Prints a notice that training was stopped at the given step.
+pub fn training_stopped(step: usize) {
+    println!();
+    println!(
+        "  {} Training stopped at step {}",
+        "[STOPPED]".bright_red().bold(),
+        format!("{}", step).bright_white().bold(),
+    );
+    println!(
+        "       {}",
+        "Training terminated permanently — proceeding to settlement".red()
+    );
+    println!();
+}
+
+// ============================================================================
 // Cheater Detection Display
 // ============================================================================
 
@@ -360,8 +394,35 @@ pub fn loss_curve(losses: &[f64]) {
 }
 
 // ============================================================================
+// On-Chain Display
+// ============================================================================
+
+/// Prints a successful on-chain checkpoint submission.
+pub fn chain_checkpoint_submitted(step: u64, tx_hash: &str, gas_used: u64, signers: usize) {
+    println!(
+        "  {} Checkpoint step {} submitted on-chain ({} signers, {} gas)",
+        "[TX]".bright_green().bold(),
+        format!("{}", step).bright_white().bold(),
+        signers,
+        format!("{}", gas_used).dimmed(),
+    );
+    println!(
+        "       tx: {}",
+        tx_hash.dimmed(),
+    );
+}
+
+// ============================================================================
 // Summary
 // ============================================================================
+
+/// On-chain settlement stats for the summary display.
+pub struct ChainStats {
+    pub checkpoints_submitted: usize,
+    pub total_gas: u64,
+    pub contract_address: String,
+    pub job_completed: bool,
+}
 
 /// Holds all the stats for the final summary.
 pub struct DemoSummary {
@@ -378,6 +439,7 @@ pub struct DemoSummary {
     pub zk_proofs_generated: usize,
     pub zk_proofs_verified: usize,
     pub zk_total_proving_time_ms: u64,
+    pub chain_stats: Option<ChainStats>,
 }
 
 /// Prints the final demo summary with all metrics.
@@ -443,6 +505,26 @@ pub fn summary(stats: &DemoSummary) {
         );
     }
 
+    if let Some(ref cs) = stats.chain_stats {
+        println!(
+            "    {} On-chain settlement: {} checkpoints submitted to HelixCoordinatorV4",
+            "[OK]".bright_green(),
+            cs.checkpoints_submitted,
+        );
+        println!(
+            "    {} Multi-party attestation: all {} workers signed each checkpoint (ECDSA/EIP-191)",
+            "[OK]".bright_green(),
+            stats.num_workers,
+        );
+        if cs.job_completed {
+            println!(
+                "    {} Training finalized on-chain (contract: {})",
+                "[OK]".bright_green(),
+                &cs.contract_address[..20.min(cs.contract_address.len())],
+            );
+        }
+    }
+
     println!();
     println!("  {}", "Key metrics:".white().bold());
     println!(
@@ -481,6 +563,17 @@ pub fn summary(stats: &DemoSummary) {
         );
     }
 
+    if let Some(ref cs) = stats.chain_stats {
+        println!(
+            "    On-chain TXs:     {}",
+            format!("{} checkpoint submissions", cs.checkpoints_submitted).bright_cyan(),
+        );
+        println!(
+            "    Total gas:        {}",
+            format!("{} ({:.4} ETH @ 1 gwei)", cs.total_gas, cs.total_gas as f64 / 1e9).bright_cyan(),
+        );
+    }
+
     println!();
     println!("  {}", "Security properties:".white().bold());
     println!(
@@ -499,5 +592,11 @@ pub fn summary(stats: &DemoSummary) {
         "    {} Self-healing: remove cheater, continue training with remaining parties",
         "*".bright_yellow(),
     );
+    if stats.chain_stats.is_some() {
+        println!(
+            "    {} On-chain settlement: multi-party attestation with minimal gas (~50-80K per checkpoint)",
+            "*".bright_yellow(),
+        );
+    }
     println!();
 }

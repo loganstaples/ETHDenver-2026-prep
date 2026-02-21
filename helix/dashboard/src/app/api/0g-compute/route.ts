@@ -203,8 +203,8 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({
       prediction,
       confidence,
-      raw_response: content,
-      model_used: model,
+      providerResponse: content,
+      modelId: model,
       provider: providerAddress,
       source: '0g-compute',
     });

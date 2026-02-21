@@ -74,7 +74,7 @@ const config = getDefaultConfig({
         [sepolia.id]: http(),
         [hardhat.id]: http(process.env.NEXT_PUBLIC_ETH_RPC_URL || 'http://127.0.0.1:8545', { timeout: 10_000 }),
         [localhost.id]: http(process.env.NEXT_PUBLIC_ETH_RPC_URL || 'http://127.0.0.1:8545', { timeout: 10_000 }),
-        [adiTestnet.id]: http('https://rpc.ab.testnet.adifoundation.ai', { timeout: 15_000 }),
+        [adiTestnet.id]: http(process.env.NEXT_PUBLIC_ETH_RPC_URL || 'https://rpc.ab.testnet.adifoundation.ai', { timeout: 15_000 }),
     },
     ssr: true,
 });

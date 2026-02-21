@@ -54,7 +54,7 @@ export function LossCurve({ modelId }: LossCurveProps) {
   if (chartData.length === 0) {
     return (
       <Card>
-        <p className="text-2xs font-mono uppercase tracking-wider text-helix-muted mb-3">
+        <p className="text-sm text-helix-muted mb-3">
           Loss & Accuracy
         </p>
         <p className="text-sm text-helix-muted py-8 text-center">
@@ -66,7 +66,7 @@ export function LossCurve({ modelId }: LossCurveProps) {
 
   return (
     <Card>
-      <p className="text-2xs font-mono uppercase tracking-wider text-helix-muted mb-4">
+      <p className="text-sm text-helix-muted mb-4">
         Loss & Accuracy
       </p>
 

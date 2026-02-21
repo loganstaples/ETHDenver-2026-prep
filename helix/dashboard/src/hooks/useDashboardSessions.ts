@@ -83,7 +83,7 @@ export function useDashboardSessions(): UseDashboardSessionsReturn {
             // Use real evaluated accuracy on last point if session has it
             accuracy: (i === data.losses.length - 1 && data.accuracy != null)
               ? data.accuracy
-              : Math.max(0, Math.min(1, 1 - loss / 2.302585)),
+              : Math.max(0, Math.min(1, Math.exp(-loss))),
           }));
         }
         return prev;
@@ -133,7 +133,7 @@ export function useDashboardSessions(): UseDashboardSessionsReturn {
                 // Use real evaluated accuracy on last point if session has it
                 accuracy: (i === s.losses.length - 1 && s.accuracy != null)
                   ? s.accuracy
-                  : Math.max(0, Math.min(1, 1 - loss / 2.302585)),
+                  : Math.max(0, Math.min(1, Math.exp(-loss))),
               })));
             }
             return;
@@ -160,7 +160,7 @@ export function useDashboardSessions(): UseDashboardSessionsReturn {
             });
             const loss = evt.loss as number;
             const accuracy = (evt.accuracy as number | undefined)
-              ?? Math.max(0, Math.min(1, 1 - loss / 2.302585));
+              ?? Math.max(0, Math.min(1, Math.exp(-loss)));
             setLosses((prev) => [...prev, { step: evt.step as number, loss, accuracy }]);
           }
 
@@ -199,6 +199,7 @@ export function useDashboardSessions(): UseDashboardSessionsReturn {
                   slash_tx_hash: null,
                   recovered: false,
                   recovery_workers: null,
+                  resumed_from_step: null,
                 },
               };
             });
@@ -231,6 +232,7 @@ export function useDashboardSessions(): UseDashboardSessionsReturn {
                       ...prev.cheater_detected,
                       recovered: true,
                       recovery_workers: (evt.honest_workers as number) ?? null,
+                      resumed_from_step: (evt.resumed_from_step as number) ?? null,
                     }
                   : prev.cheater_detected,
               };

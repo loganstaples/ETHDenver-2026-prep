@@ -32,19 +32,19 @@ body {
   }
 
   .page-title {
-    @apply text-xl font-semibold tracking-tight text-white;
+    @apply text-2xl font-semibold tracking-tight text-white;
   }
 
   .section-header {
-    @apply text-sm font-medium text-white;
+    @apply text-lg font-semibold text-white;
   }
 
   .label-text {
-    @apply text-2xs text-helix-muted uppercase tracking-wider;
+    @apply text-sm text-helix-muted;
   }
 
   .data-text {
-    @apply font-mono text-2xl font-semibold text-white tracking-tight;
+    @apply font-mono text-3xl font-semibold text-white tracking-tight;
   }
 }
 

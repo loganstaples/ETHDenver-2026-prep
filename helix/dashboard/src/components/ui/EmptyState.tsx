@@ -32,9 +32,9 @@ export function EmptyState({
       {icon && (
         <div className="text-helix-dim mb-3">{icon}</div>
       )}
-      <p className="text-sm font-medium text-helix-text2">{title}</p>
+      <p className="text-lg font-medium text-helix-text2">{title}</p>
       {description && (
-        <p className="text-2xs text-helix-muted mt-1 text-center max-w-xs">
+        <p className="text-base text-helix-muted mt-2 text-center max-w-sm">
           {description}
         </p>
       )}

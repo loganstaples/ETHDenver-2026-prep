@@ -71,7 +71,7 @@ export function WorkerList({ modelId }: WorkerListProps) {
   return (
     <Card>
       <div className="flex items-baseline justify-between mb-4">
-        <p className="text-2xs font-mono uppercase tracking-wider text-helix-muted">
+        <p className="text-sm text-helix-muted">
           Workers
         </p>
         <span className="text-2xs text-helix-dim">

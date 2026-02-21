@@ -55,8 +55,8 @@ export function Modal({
             exit={{ opacity: 0, scale: 0.95 }}
             transition={{ duration: 0.15 }}
             className={cn(
-              'bg-helix-surface border border-helix-border rounded-lg',
-              'max-w-lg w-full mx-4 p-6 relative',
+              'bg-helix-surface/95 backdrop-blur-xl border border-white/[0.06] rounded-3xl',
+              'max-w-lg w-full mx-4 p-8 relative',
               className,
             )}
             onClick={(e) => e.stopPropagation()}

@@ -120,7 +120,7 @@ export function ModelOverview({ modelId }: ModelOverviewProps) {
       {/* Mini Loss Curve */}
       {chartData.length > 0 && (
         <Card>
-          <p className="text-2xs font-mono uppercase tracking-wider text-helix-muted mb-3">
+          <p className="text-sm text-helix-muted mb-3">
             Loss Curve
           </p>
           <Chart
@@ -136,7 +136,7 @@ export function ModelOverview({ modelId }: ModelOverviewProps) {
       <div className="grid grid-cols-2 gap-4">
         {/* Current Round Status */}
         <Card>
-          <p className="text-2xs font-mono uppercase tracking-wider text-helix-muted mb-3">
+          <p className="text-sm text-helix-muted mb-3">
             Current Round
           </p>
           {currentRound ? (
@@ -179,7 +179,7 @@ export function ModelOverview({ modelId }: ModelOverviewProps) {
 
         {/* Recent Proofs */}
         <Card>
-          <p className="text-2xs font-mono uppercase tracking-wider text-helix-muted mb-3">
+          <p className="text-sm text-helix-muted mb-3">
             Recent Proofs
           </p>
           {proofsLoading ? (

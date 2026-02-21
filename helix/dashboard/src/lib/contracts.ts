@@ -23,7 +23,7 @@ export const CONTRACT_ADDRESSES = {
     },
     // ADI Network Testnet
     99999: {
-        helixCoordinator: '0xFeE35d793277FaCDD112f07A51aFd79CDcb92cFc',
+        helixCoordinator: '0x0b4a2E27dF67f5D8e90405C76817689B4F048c19',
         helixVerifier: '0x76e537b6AD41ad670E126689C7CB4488ebd0598a',
         helixToken: '0x73E04552246D905795EBC18F3068a2528f8588a1',
         helixModelStore: '0x163a4D4074a29Bfbe28DC98288a4f71f6778d147',
@@ -483,6 +483,15 @@ export const HELIX_MODEL_STORE_ABI = [
     },
     {
         type: 'function',
+        name: 'deleteModel',
+        inputs: [
+            { name: 'tokenId', type: 'uint256' },
+        ],
+        outputs: [],
+        stateMutability: 'nonpayable',
+    },
+    {
+        type: 'function',
         name: 'grantAccess',
         inputs: [
             { name: 'tokenId', type: 'uint256' },
@@ -721,6 +730,15 @@ export const HELIX_MODEL_STORE_ABI = [
             { name: 'versionIndex', type: 'uint256', indexed: true },
             { name: 'semver', type: 'string', indexed: false },
             { name: 'rootHash', type: 'string', indexed: false },
+        ],
+    },
+    {
+        type: 'event',
+        name: 'ModelDeleted',
+        inputs: [
+            { name: 'tokenId', type: 'uint256', indexed: true },
+            { name: 'owner', type: 'address', indexed: true },
+            { name: 'slug', type: 'string', indexed: false },
         ],
     },
     {
@@ -1025,6 +1043,28 @@ export function getExplorerTxUrl(chainId: number, txHash: string): string | null
     if (!base) return null;
     return `${base}/tx/${txHash}`;
 }
+
+/** Get block explorer link for a contract/address. */
+export function getExplorerAddressUrl(chainId: number, address: string): string | null {
+    const base = EXPLORER_URLS[chainId];
+    if (!base) return null;
+    return `${base}/address/${address}`;
+}
+
+/** Get block explorer link for an NFT (ERC-721 token). */
+export function getExplorerTokenUrl(chainId: number, contractAddress: string, tokenId: number): string | null {
+    const base = EXPLORER_URLS[chainId];
+    if (!base) return null;
+    return `${base}/token/${contractAddress}?a=${tokenId}`;
+}
+
+/** Human-readable chain name. */
+export const CHAIN_NAMES: Record<number, string> = {
+    1: 'Ethereum Mainnet',
+    11155111: 'Sepolia Testnet',
+    31337: 'Localhost',
+    99999: 'ADI Testnet',
+};
 
 // Helper to get contract address for current chain.
 // Supports env-var override: NEXT_PUBLIC_MODEL_STORE_ADDRESS takes precedence.

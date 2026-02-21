@@ -25,27 +25,27 @@ export function QuickStats() {
       value: contractLoading
         ? '--'
         : String(networkState?.totalModels ?? 0),
-      icon: <Boxes size={16} strokeWidth={1.5} />,
+      icon: <Boxes size={22} strokeWidth={1.5} />,
     },
     {
       label: 'Total Rounds',
       value: totalRounds !== null ? totalRounds.toLocaleString() : '--',
-      icon: <Activity size={16} strokeWidth={1.5} />,
+      icon: <Activity size={22} strokeWidth={1.5} />,
     },
     {
       label: 'Network Nodes',
       value: `${networkStats.activeNodes}/${networkStats.totalNodes}`,
-      icon: <Server size={16} strokeWidth={1.5} />,
+      icon: <Server size={22} strokeWidth={1.5} />,
     },
     {
       label: 'Proofs Verified',
       value: networkStats.totalProofs.toLocaleString(),
-      icon: <ShieldCheck size={16} strokeWidth={1.5} />,
+      icon: <ShieldCheck size={22} strokeWidth={1.5} />,
     },
   ];
 
   return (
-    <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+    <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
       {items.map((item, i) => (
         <motion.div
           key={item.label}

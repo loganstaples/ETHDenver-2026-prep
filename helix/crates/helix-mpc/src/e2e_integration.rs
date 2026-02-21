@@ -38,6 +38,34 @@ use crate::share_distribution::{
 use crate::types::PartyId;
 
 // ============================================================================
+// Signal & Outcome types
+// ============================================================================
+
+/// Signal sent to the training loop to control execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrainingSignal {
+    /// Continue training normally.
+    Continue,
+    /// Pause training: save checkpoint and exit cleanly.
+    Pause,
+    /// Stop training permanently: save checkpoint and exit.
+    Stop,
+}
+
+/// Outcome of a training run (how/why it ended).
+#[derive(Debug, Clone)]
+pub enum TrainingOutcome {
+    /// Training completed all steps.
+    Completed,
+    /// Training was paused at a checkpoint.
+    Paused { step: usize, checkpoint: Option<CheckpointRecord> },
+    /// Training was stopped permanently.
+    Stopped { step: usize, checkpoint: Option<CheckpointRecord> },
+    /// A cheater was detected.
+    CheaterDetected { record: CheaterRecord },
+}
+
+// ============================================================================
 // Configuration
 // ============================================================================
 
@@ -95,6 +123,19 @@ pub struct MPCIntegrationConfig {
     /// Optional callback for sub-step progress within each training step (party 0 only).
     #[serde(skip)]
     pub on_sub_step: Option<crate::mpc_trainer::SubStepCallback>,
+    /// Optional callback fired immediately when a cheater is detected (before recovery starts).
+    /// Arguments: (party_index, detected_at_step).
+    #[serde(skip)]
+    pub on_cheater_detected: Option<std::sync::Arc<dyn Fn(usize, u64) + Send + Sync>>,
+    /// Optional callback fired immediately when recovery training completes.
+    /// Arguments: (honest_workers, resumed_from_step, post_recovery_steps).
+    #[serde(skip)]
+    pub on_recovery_completed: Option<std::sync::Arc<dyn Fn(usize, usize, usize) + Send + Sync>>,
+    /// Optional receiver for pause/stop signals from the orchestrator.
+    #[serde(skip)]
+    pub signal_rx: Option<tokio::sync::watch::Receiver<TrainingSignal>>,
+    /// Starting step for resumed training (0 for fresh training).
+    pub starting_step: usize,
 }
 
 impl std::fmt::Debug for MPCIntegrationConfig {
@@ -119,6 +160,10 @@ impl std::fmt::Debug for MPCIntegrationConfig {
             .field("capture_checkpoint_weights", &self.capture_checkpoint_weights)
             .field("on_step", &self.on_step.as_ref().map(|_| "<callback>"))
             .field("on_sub_step", &self.on_sub_step.as_ref().map(|_| "<callback>"))
+            .field("on_cheater_detected", &self.on_cheater_detected.as_ref().map(|_| "<callback>"))
+            .field("on_recovery_completed", &self.on_recovery_completed.as_ref().map(|_| "<callback>"))
+            .field("signal_rx", &self.signal_rx.as_ref().map(|_| "<watch::Receiver>"))
+            .field("starting_step", &self.starting_step)
             .finish()
     }
 }
@@ -159,6 +204,10 @@ impl Default for MPCIntegrationConfig {
             capture_checkpoint_weights: false,
             on_step: None,
             on_sub_step: None,
+            on_cheater_detected: None,
+            on_recovery_completed: None,
+            signal_rx: None,
+            starting_step: 0,
         }
     }
 }
@@ -170,6 +219,8 @@ impl Default for MPCIntegrationConfig {
 /// Result of a full MPC training integration run.
 #[derive(Debug)]
 pub struct MPCIntegrationResult {
+    /// How the training ended.
+    pub outcome: TrainingOutcome,
     /// Total number of training steps completed.
     pub steps_completed: usize,
     /// Final loss value from the last training step.
@@ -258,10 +309,13 @@ pub async fn run_mpc_training(
     let capture_checkpoint_weights = config.capture_checkpoint_weights;
     let on_step = config.on_step.clone();
     let on_sub_step = config.on_sub_step.clone();
+    let signal_rx = config.signal_rx.clone();
+    let starting_step = config.starting_step;
 
     info!(
         num_workers = num_workers,
         num_steps = num_steps,
+        starting_step = starting_step,
         d_in = config.d_in,
         d_hid = config.d_hid,
         d_out = config.d_out,
@@ -317,6 +371,8 @@ pub async fn run_mpc_training(
                 capture_checkpoint_weights,
                 on_step.clone(),
                 on_sub_step.clone(),
+                signal_rx,
+                starting_step,
             ).await
         }
         #[cfg(not(feature = "network-mpc"))]
@@ -332,6 +388,8 @@ pub async fn run_mpc_training(
             capture_checkpoint_weights,
             on_step.clone(),
             on_sub_step.clone(),
+            signal_rx,
+            starting_step,
         ).await
     } else {
         run_with_local_transport(
@@ -340,6 +398,8 @@ pub async fn run_mpc_training(
             capture_checkpoint_weights,
             on_step.clone(),
             on_sub_step.clone(),
+            signal_rx,
+            starting_step,
         ).await
     }
 }
@@ -360,6 +420,8 @@ pub async fn run_mpc_training_with_cheater(
     let capture_checkpoint_weights = config.capture_checkpoint_weights;
     let on_step = config.on_step.clone();
     let on_sub_step = config.on_sub_step.clone();
+    let on_cheater_detected = config.on_cheater_detected.clone();
+    let on_recovery_completed = config.on_recovery_completed.clone();
 
     if cheater_party >= num_workers {
         return Err(anyhow::anyhow!(
@@ -417,6 +479,8 @@ pub async fn run_mpc_training_with_cheater(
                 capture_checkpoint_weights,
                 on_step.clone(),
                 on_sub_step.clone(),
+                on_cheater_detected.clone(),
+                on_recovery_completed.clone(),
             ).await
         }
         #[cfg(not(feature = "network-mpc"))]
@@ -433,6 +497,8 @@ pub async fn run_mpc_training_with_cheater(
             capture_checkpoint_weights,
             on_step.clone(),
             on_sub_step.clone(),
+            on_cheater_detected,
+            on_recovery_completed,
         ).await
     }
 }
@@ -525,6 +591,8 @@ async fn run_with_local_transport(
     capture_checkpoint_weights: bool,
     on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync>>,
     on_sub_step: Option<crate::mpc_trainer::SubStepCallback>,
+    signal_rx: Option<tokio::sync::watch::Receiver<TrainingSignal>>,
+    starting_step: usize,
 ) -> Result<MPCIntegrationResult, anyhow::Error> {
     let num_workers = parties.len();
     let transports = LocalTransport::create_mesh(&parties);
@@ -539,6 +607,8 @@ async fn run_with_local_transport(
         let data = training_data.clone();
         let step_cb = if i == 0 { on_step.clone() } else { None };
         let sub_step_cb = if i == 0 { on_sub_step.clone() } else { None };
+        // Only party 0 (coordinator) checks the signal channel.
+        let sig_rx = if i == 0 { signal_rx.clone() } else { None };
 
         // Spawn each worker on a dedicated OS thread so rayon parallelism
         // from multiple workers runs truly concurrently across all CPU cores.
@@ -555,6 +625,8 @@ async fn run_with_local_transport(
                 capture_checkpoint_weights,
                 step_cb,
                 sub_step_cb,
+                sig_rx,
+                starting_step,
             ))
         });
         handles.push(handle);
@@ -575,6 +647,8 @@ async fn run_with_node_transport(
     capture_checkpoint_weights: bool,
     on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync>>,
     on_sub_step: Option<crate::mpc_trainer::SubStepCallback>,
+    signal_rx: Option<tokio::sync::watch::Receiver<TrainingSignal>>,
+    starting_step: usize,
 ) -> Result<MPCIntegrationResult, anyhow::Error> {
     let num_workers = parties.len();
     let transports = NodeTransport::create_mesh(&parties, "e2e-integration");
@@ -589,6 +663,7 @@ async fn run_with_node_transport(
         let data = training_data.clone();
         let step_cb = if i == 0 { on_step.clone() } else { None };
         let sub_step_cb = if i == 0 { on_sub_step.clone() } else { None };
+        let sig_rx = if i == 0 { signal_rx.clone() } else { None };
 
         let handle = tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -603,6 +678,8 @@ async fn run_with_node_transport(
                 capture_checkpoint_weights,
                 step_cb,
                 sub_step_cb,
+                sig_rx,
+                starting_step,
             ))
         });
         handles.push(handle);
@@ -629,6 +706,8 @@ async fn run_with_tcp_transport(
     capture_checkpoint_weights: bool,
     on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync>>,
     on_sub_step: Option<crate::mpc_trainer::SubStepCallback>,
+    signal_rx: Option<tokio::sync::watch::Receiver<TrainingSignal>>,
+    starting_step: usize,
 ) -> Result<MPCIntegrationResult, anyhow::Error> {
     use std::collections::HashMap;
     use std::net::SocketAddr;
@@ -711,6 +790,7 @@ async fn run_with_tcp_transport(
         let data = training_data.clone();
         let step_cb = if i == 0 { on_step.clone() } else { None };
         let sub_step_cb = if i == 0 { on_sub_step.clone() } else { None };
+        let sig_rx = if i == 0 { signal_rx.clone() } else { None };
 
         let handle = tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -725,6 +805,8 @@ async fn run_with_tcp_transport(
                 capture_checkpoint_weights,
                 step_cb,
                 sub_step_cb,
+                sig_rx,
+                starting_step,
             ))
         });
         handles.push(handle);
@@ -749,6 +831,8 @@ async fn run_with_tcp_cheater(
     capture_checkpoint_weights: bool,
     on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync>>,
     on_sub_step: Option<crate::mpc_trainer::SubStepCallback>,
+    _on_cheater_detected: Option<std::sync::Arc<dyn Fn(usize, u64) + Send + Sync>>,
+    _on_recovery_completed: Option<std::sync::Arc<dyn Fn(usize, usize, usize) + Send + Sync>>,
 ) -> Result<MPCIntegrationResult, anyhow::Error> {
     use std::collections::HashMap;
     use std::net::SocketAddr;
@@ -846,6 +930,8 @@ async fn run_with_tcp_cheater(
                 capture_checkpoint_weights,
                 step_cb,
                 sub_step_cb,
+                None, // no signal_rx for cheater tests
+                0,    // starting_step
             ))
         });
         handles.push(handle);
@@ -868,6 +954,8 @@ async fn run_with_cheater(
     capture_checkpoint_weights: bool,
     on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync>>,
     on_sub_step: Option<crate::mpc_trainer::SubStepCallback>,
+    on_cheater_detected: Option<std::sync::Arc<dyn Fn(usize, u64) + Send + Sync>>,
+    on_recovery_completed: Option<std::sync::Arc<dyn Fn(usize, usize, usize) + Send + Sync>>,
 ) -> Result<MPCIntegrationResult, anyhow::Error> {
     let num_workers = parties.len();
     let transports = LocalTransport::create_mesh(&parties);
@@ -905,6 +993,8 @@ async fn run_with_cheater(
                 capture_checkpoint_weights,
                 step_cb,
                 sub_step_cb,
+                None, // no signal_rx for cheater tests
+                0,    // starting_step
             ))
         });
         handles.push(handle);
@@ -931,20 +1021,59 @@ async fn run_with_cheater(
     // ================================================================
     if let Some(ref cheater_record) = cheater_detected {
         let detected_cheater = cheater_record.party_index;
-        let remaining_steps = num_steps.saturating_sub(phase1_steps);
 
-        if remaining_steps > 0 && num_workers > 2 {
+        // Fire CheaterDetected immediately — before recovery starts.
+        if let Some(ref cb) = on_cheater_detected {
+            cb(cheater_record.party_index, cheater_record.detected_at_step);
+        }
+        // Use checkpoint_step (the last verified checkpoint) rather than phase1_steps
+        // (the step where MAC failure was detected). The checkpoint may be earlier.
+        let checkpoint_step = phase1_party_results[0].checkpoint_step as usize;
+        let remaining_steps = num_steps.saturating_sub(checkpoint_step);
+
+        if remaining_steps > 0 && num_workers > 2 && checkpoint_step > 0 {
             info!(
                 cheater = detected_cheater,
                 steps_done = phase1_steps,
+                checkpoint_step = checkpoint_step,
                 remaining_steps = remaining_steps,
-                "Starting Phase 2: recovery training with honest parties"
+                "Starting Phase 2: recovery from checkpoint with honest parties"
             );
 
-            // Fresh He init for recovery. Summing only honest parties' additive
-            // shares gives w_real - missing_share (a random ~254-bit field
-            // element) which produces catastrophically wrong f64 weights.
-            // The correct approach: restart from fresh init with honest workers.
+            // Reconstruct full weights at the checkpoint by summing ALL parties'
+            // checkpoint shares (including the cheater's). The cheater's shares from
+            // *before* corruption are still valid — corruption only happened after
+            // the checkpoint. Summing all N shares recovers exact weights.
+            let w1_len = phase1_party_results[0].checkpoint_w1.len();
+            let b1_len = phase1_party_results[0].checkpoint_b1.len();
+            let w2_len = phase1_party_results[0].checkpoint_w2.len();
+            let b2_len = phase1_party_results[0].checkpoint_b2.len();
+
+            let mut w1_sum = vec![Fr::ZERO; w1_len];
+            let mut b1_sum = vec![Fr::ZERO; b1_len];
+            let mut w2_sum = vec![Fr::ZERO; w2_len];
+            let mut b2_sum = vec![Fr::ZERO; b2_len];
+
+            for pr in &phase1_party_results {
+                for (s, v) in w1_sum.iter_mut().zip(pr.checkpoint_w1.iter()) { *s += *v; }
+                for (s, v) in b1_sum.iter_mut().zip(pr.checkpoint_b1.iter()) { *s += *v; }
+                for (s, v) in w2_sum.iter_mut().zip(pr.checkpoint_w2.iter()) { *s += *v; }
+                for (s, v) in b2_sum.iter_mut().zip(pr.checkpoint_b2.iter()) { *s += *v; }
+            }
+
+            let recovery_weights = ModelWeights {
+                w1: w1_sum,
+                b1: b1_sum,
+                w2: w2_sum,
+                b2: b2_sum,
+            };
+
+            info!(
+                honest_parties = num_workers - 1,
+                checkpoint_step = checkpoint_step,
+                "Recovery: reconstructed weights from checkpoint shares (all N parties' pre-corruption shares)"
+            );
+
             let honest_count = num_workers - 1;
             let honest_parties: Vec<PartyId> = (0..honest_count).map(PartyId::from_index).collect();
             let recovery_transports = LocalTransport::create_mesh(&honest_parties);
@@ -954,36 +1083,20 @@ async fn run_with_cheater(
                 ..trainer_config.clone()
             };
 
-            info!(
-                honest_parties = honest_count,
-                "Recovery: fresh He init (partial share reconstruction is mathematically unsound)"
-            );
-
             let (recovery_owner_secret, _recovery_commitment, recovery_bundles) =
                 prepare_encrypted_shares(
                     &recovery_config,
-                    &None, // Fresh He init — cannot reconstruct from partial shares
+                    &Some(recovery_weights),
                     &honest_parties,
                     seed.wrapping_add(0xBEC0_BEC0),
                 )?;
-
-            let steps_already_done = phase1_steps;
 
             let mut recovery_handles = Vec::new();
             for (i, (transport, bundle)) in recovery_transports.into_iter().zip(recovery_bundles.into_iter()).enumerate() {
                 let cfg = recovery_config.clone();
                 let data = training_data.clone();
-                let total_steps = remaining_steps;
                 let step_cb = if i == 0 { on_step.clone() } else { None };
                 let sub_step_cb = if i == 0 { on_sub_step.clone() } else { None };
-                let offset = steps_already_done;
-                let original_total = steps_already_done + remaining_steps;
-                let wrapped_cb: Option<std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync>> =
-                    step_cb.map(|cb| -> std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync> {
-                        std::sync::Arc::new(move |step, _total, loss, acc, mac_ok| {
-                            cb(offset + step, original_total, loss, acc, mac_ok);
-                        })
-                    });
 
                 let handle = tokio::task::spawn_blocking(move || {
                     let rt = tokio::runtime::Builder::new_current_thread()
@@ -992,12 +1105,14 @@ async fn run_with_cheater(
                         .expect("failed to build per-worker tokio runtime");
                     rt.block_on(run_party_training(
                         cfg, transport, i, None, data,
-                        total_steps, checkpoint_interval, seed.wrapping_add(0xBEC0_BEC0),
+                        num_steps, checkpoint_interval, seed.wrapping_add(0xBEC0_BEC0),
                         None, 0, // no cheater in recovery
                         Some(bundle),
                         capture_checkpoint_weights,
-                        wrapped_cb,
+                        step_cb,
                         sub_step_cb,
+                        None, // no signal_rx for recovery
+                        checkpoint_step, // resume from checkpoint, not step 0
                     ))
                 });
                 recovery_handles.push(handle);
@@ -1011,18 +1126,30 @@ async fn run_with_cheater(
                     info!(
                         recovery_steps = recovery_result.steps_completed,
                         recovery_final_loss = recovery_result.final_loss,
-                        "Phase 2 recovery training complete"
+                        "Phase 2 recovery training complete (resumed from checkpoint {})",
+                        checkpoint_step
                     );
+
+                    // Fire RecoveryCompleted immediately.
+                    if let Some(ref cb) = on_recovery_completed {
+                        cb(honest_count, checkpoint_step, recovery_result.steps_completed);
+                    }
 
                     let mut all_losses = phase1_losses;
                     all_losses.extend(recovery_result.losses.iter());
                     let final_loss = all_losses.last().copied().unwrap_or(0.0);
 
+                    let outcome = if let Some(ref cd) = cheater_detected {
+                        TrainingOutcome::CheaterDetected { record: cd.clone() }
+                    } else {
+                        TrainingOutcome::Completed
+                    };
                     return Ok(MPCIntegrationResult {
-                        steps_completed: phase1_steps + recovery_result.steps_completed,
+                        outcome,
+                        steps_completed: checkpoint_step + recovery_result.steps_completed,
                         final_loss,
                         losses: all_losses,
-                        checkpoints: Vec::new(), // checkpoints from Phase 1 are invalidated
+                        checkpoints: Vec::new(),
                         mac_checks_passed: phase1_mac_checks + recovery_result.mac_checks_passed,
                         cheater_detected,
                         training_time_ms: start.elapsed().as_millis(),
@@ -1078,7 +1205,13 @@ async fn run_with_cheater(
         })
         .collect();
 
+    let outcome = if let Some(ref cd) = cheater_detected {
+        TrainingOutcome::CheaterDetected { record: cd.clone() }
+    } else {
+        TrainingOutcome::Completed
+    };
     Ok(MPCIntegrationResult {
+        outcome,
         steps_completed: phase1_steps,
         final_loss: phase1_losses.last().copied().unwrap_or(0.0),
         losses: phase1_losses,
@@ -1103,6 +1236,8 @@ async fn run_with_cheater(
 #[derive(Debug)]
 pub struct PartyResult {
     pub party_index: usize,
+    /// How the training ended for this party.
+    pub outcome: TrainingOutcome,
     pub steps_completed: usize,
     pub losses: Vec<f64>,
     pub mac_checks_passed: usize,
@@ -1313,7 +1448,7 @@ pub async fn run_distributed_party<T: crate::session::transport::MPCTransport + 
         steps_completed += 1;
 
         if let Some(ref cb) = on_step {
-            let acc_est = (1.0 - step_result.loss / 2.302585_f64).clamp(0.0, 1.0);
+            let acc_est = (-step_result.loss).exp().clamp(0.0, 1.0);
             cb(step + 1, num_steps, step_result.loss, acc_est, true);
         }
 
@@ -1406,8 +1541,15 @@ pub async fn run_distributed_party<T: crate::session::transport::MPCTransport + 
         "Distributed party training complete"
     );
 
+    let outcome = if let Some(ref cd) = cheater_detected {
+        TrainingOutcome::CheaterDetected { record: cd.clone() }
+    } else {
+        TrainingOutcome::Completed
+    };
+
     Ok(PartyResult {
         party_index,
+        outcome,
         steps_completed,
         losses,
         mac_checks_passed,
@@ -1446,6 +1588,8 @@ pub async fn run_party_training<T: crate::session::transport::MPCTransport + 'st
     capture_checkpoint_weights: bool,
     on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync>>,
     on_sub_step: Option<crate::mpc_trainer::SubStepCallback>,
+    signal_rx: Option<tokio::sync::watch::Receiver<TrainingSignal>>,
+    starting_step: usize,
 ) -> Result<PartyResult, anyhow::Error> {
     // Phase 1: Initialize weight shares.
     let mut trainer = MPCTrainer::new(config.clone(), transport, party_index, seed);
@@ -1517,7 +1661,8 @@ pub async fn run_party_training<T: crate::session::transport::MPCTransport + 'st
     let bs = config.batch_size.max(1);
     let base_lr = config.learning_rate;
     let warmup_steps = (num_steps as f64 * 0.05).ceil() as usize; // 5% warmup
-    for step in 0..num_steps {
+    let mut outcome = TrainingOutcome::Completed;
+    for step in starting_step..num_steps {
         // Cosine decay with linear warmup.
         // Warmup: linearly ramp from 0 to base_lr over first 5% of steps.
         // Decay: cosine anneal from base_lr to ~0 over remaining steps.
@@ -1573,11 +1718,13 @@ pub async fn run_party_training<T: crate::session::transport::MPCTransport + 'st
                                 round2_sigmas: Vec::new(),
                             },
                         });
-                    cheater_detected = Some(CheaterRecord {
+                    let cheater_record = CheaterRecord {
                         party_index: cheater.unwrap_or(usize::MAX),
                         detected_at_step: fail_step,
                         failure_report,
-                    });
+                    };
+                    outcome = TrainingOutcome::CheaterDetected { record: cheater_record.clone() };
+                    cheater_detected = Some(cheater_record);
                     // Save checkpoint state for recovery: grab current weight shares
                     // (trainer may have rolled back to last good checkpoint).
                     let (cw1, cb1, cw2, cb2) = trainer.weight_shares();
@@ -1617,9 +1764,9 @@ pub async fn run_party_training<T: crate::session::transport::MPCTransport + 'st
         steps_completed += 1;
 
         if let Some(ref cb) = on_step {
-            // Estimate accuracy from cross-entropy loss: random baseline for
-            // 10-class is ln(10) ≈ 2.3026. Map loss linearly to 0-100%.
-            let acc_est = (1.0 - step_result.loss / 2.302585).clamp(0.0, 1.0);
+            // Estimate accuracy from cross-entropy loss: exp(-loss) gives the
+            // geometric mean probability assigned to the correct class.
+            let acc_est = (-step_result.loss).exp().clamp(0.0, 1.0);
             cb(step + 1, num_steps, step_result.loss, acc_est, true);
         }
 
@@ -1629,6 +1776,42 @@ pub async fn run_party_training<T: crate::session::transport::MPCTransport + 'st
             loss = step_result.loss,
             "Training step completed"
         );
+
+        // Check for pause/stop signal (only party 0 / coordinator checks).
+        if let Some(ref signal_rx) = signal_rx {
+            let signal = *signal_rx.borrow();
+            match signal {
+                TrainingSignal::Pause => {
+                    info!(party = party_index, step = step, "Training paused by signal");
+                    let last_checkpoint = checkpoints.last().cloned().map(|cp| CheckpointRecord {
+                        step: cp.step,
+                        commitment_bytes32: cp.commitment_bytes32,
+                        loss: cp.loss,
+                        weight_snapshot: None,
+                    });
+                    outcome = TrainingOutcome::Paused {
+                        step: steps_completed,
+                        checkpoint: last_checkpoint,
+                    };
+                    break;
+                }
+                TrainingSignal::Stop => {
+                    info!(party = party_index, step = step, "Training stopped by signal");
+                    let last_checkpoint = checkpoints.last().cloned().map(|cp| CheckpointRecord {
+                        step: cp.step,
+                        commitment_bytes32: cp.commitment_bytes32,
+                        loss: cp.loss,
+                        weight_snapshot: None,
+                    });
+                    outcome = TrainingOutcome::Stopped {
+                        step: steps_completed,
+                        checkpoint: last_checkpoint,
+                    };
+                    break;
+                }
+                TrainingSignal::Continue => {} // normal flow
+            }
+        }
 
         // Pedersen checkpoint at configured intervals: exchange + combine via transport.
         if checkpoint_interval > 0 && (step + 1) % checkpoint_interval == 0 {
@@ -1720,6 +1903,7 @@ pub async fn run_party_training<T: crate::session::transport::MPCTransport + 'st
 
     Ok(PartyResult {
         party_index,
+        outcome,
         steps_completed,
         losses,
         mac_checks_passed,
@@ -1906,7 +2090,12 @@ pub async fn collect_results(
         "MPC integration training complete"
     );
 
+    // Use party 0's outcome — it is the coordinator and the only party
+    // that checks the signal channel, so it knows if training was paused/stopped.
+    let outcome = party_results[0].outcome.clone();
+
     Ok(MPCIntegrationResult {
+        outcome,
         steps_completed,
         final_loss,
         losses,
@@ -1960,7 +2149,11 @@ mod tests {
             batch_size: 1,
             on_step: None,
             on_sub_step: None,
+            on_cheater_detected: None,
+            on_recovery_completed: None,
             capture_checkpoint_weights: false,
+            signal_rx: None,
+            starting_step: 0,
         };
 
         let result = run_mpc_training(config).await.expect("training should succeed");
@@ -2000,7 +2193,11 @@ mod tests {
             batch_size: 1,
             on_step: None,
             on_sub_step: None,
+            on_cheater_detected: None,
+            on_recovery_completed: None,
             capture_checkpoint_weights: false,
+            signal_rx: None,
+            starting_step: 0,
         };
 
         let result = run_mpc_training(config).await.expect("training should succeed");
@@ -2043,7 +2240,11 @@ mod tests {
             batch_size: 1,
             on_step: None,
             on_sub_step: None,
+            on_cheater_detected: None,
+            on_recovery_completed: None,
             capture_checkpoint_weights: false,
+            signal_rx: None,
+            starting_step: 0,
         };
 
         let result = run_mpc_training(config).await.expect("training should succeed");
@@ -2076,7 +2277,11 @@ mod tests {
             batch_size: 1,
             on_step: None,
             on_sub_step: None,
+            on_cheater_detected: None,
+            on_recovery_completed: None,
             capture_checkpoint_weights: false,
+            signal_rx: None,
+            starting_step: 0,
         };
 
         let result = run_mpc_training(config).await.expect("training should succeed");
@@ -2136,7 +2341,11 @@ mod tests {
                 batch_size: 1,
                 on_step: None,
                 on_sub_step: None,
+                on_cheater_detected: None,
+                on_recovery_completed: None,
                 capture_checkpoint_weights: false,
+                signal_rx: None,
+                starting_step: 0,
             };
 
             let result = run_mpc_training(config).await.expect("should succeed");
@@ -2190,7 +2399,11 @@ mod tests {
             batch_size: 1,
             on_step: None,
             on_sub_step: None,
+            on_cheater_detected: None,
+            on_recovery_completed: None,
             capture_checkpoint_weights: false,
+            signal_rx: None,
+            starting_step: 0,
         };
 
         let result = run_mpc_training_with_cheater(config, 2, 5).await
@@ -2236,5 +2449,73 @@ mod tests {
             result.post_recovery_steps,
             result.final_loss,
         );
+    }
+
+    /// Benchmark: time 10 steps at dashboard scale (784→128→10) with MAC vs without.
+    #[tokio::test]
+    async fn bench_mac_vs_batched_dashboard_scale() {
+        use std::time::Instant;
+
+        // Generate synthetic MNIST-like data: 50 samples
+        let mut rng = ChaCha20Rng::seed_from_u64(42);
+        let training_data: Vec<(Vec<f64>, Vec<f64>)> = (0..50)
+            .map(|i| {
+                let input: Vec<f64> = (0..784).map(|_| rand::Rng::gen_range(&mut rng, 0.0..1.0)).collect();
+                let mut target = vec![0.0; 10];
+                target[i % 10] = 1.0;
+                (input, target)
+            })
+            .collect();
+
+        let base_config = MPCIntegrationConfig {
+            d_in: 784,
+            d_hid: 128,
+            d_out: 10,
+            num_workers: 3,
+            num_steps: 10,
+            learning_rate: 0.05,
+            checkpoint_interval: 50,
+            mac_check_interval: 0,
+            beaver_batch_size: 4096,
+            initial_weights: None,
+            training_data: training_data.clone(),
+            seed: 42,
+            use_node_transport: false,
+            use_tcp_transport: false,
+            worker_endpoints: None,
+            batch_size: 32,
+            on_step: None,
+            on_sub_step: None,
+            on_cheater_detected: None,
+            on_recovery_completed: None,
+            capture_checkpoint_weights: false,
+            signal_rx: None,
+            starting_step: 0,
+        };
+
+        // Benchmark batched path (no MAC, batch_size=32)
+        let t0 = Instant::now();
+        let r1 = run_mpc_training(base_config.clone()).await.expect("batched should succeed");
+        let batched_ms = t0.elapsed().as_millis();
+
+        // Benchmark MAC path (mac_check_interval=1, forces batch_size=1)
+        let mac_config = MPCIntegrationConfig {
+            mac_check_interval: 1,
+            batch_size: 1,
+            ..base_config
+        };
+        let t1 = Instant::now();
+        let r2 = run_mpc_training(mac_config).await.expect("mac should succeed");
+        let mac_ms = t1.elapsed().as_millis();
+
+        let batched_per_step = batched_ms as f64 / r1.steps_completed as f64;
+        let mac_per_step = mac_ms as f64 / r2.steps_completed as f64;
+
+        eprintln!("=== Dashboard-scale benchmark (784→128→10, 3 workers, 10 steps) ===");
+        eprintln!("Batched (bs=32, no MAC): {}ms total, {:.0}ms/step, final_loss={:.4}", batched_ms, batched_per_step, r1.final_loss);
+        eprintln!("MAC (bs=1, check every step): {}ms total, {:.0}ms/step, final_loss={:.4}", mac_ms, mac_per_step, r2.final_loss);
+        eprintln!("Slowdown: {:.1}x", mac_per_step / batched_per_step);
+        eprintln!("At MAC speed: {:.0} steps in 180s (3 min)", 180_000.0 / mac_per_step);
+        eprintln!("At batched speed: {:.0} steps in 180s (3 min)", 180_000.0 / batched_per_step);
     }
 }

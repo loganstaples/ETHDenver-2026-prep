@@ -671,7 +671,7 @@ pub struct NetworkSettings {
 fn default_min_workers() -> u32 { 3 }
 fn default_max_workers() -> u32 { 10 }
 fn default_round_timeout() -> u64 { 120 }
-fn default_stake() -> f64 { 0.5 }
+fn default_stake() -> f64 { 0.001 }
 fn default_byzantine_threshold() -> f64 { 0.33 }
 
 impl Default for NetworkSettings {
@@ -681,7 +681,7 @@ impl Default for NetworkSettings {
             max_workers: 10,
             round_timeout_secs: 120,
             coordinator: String::new(),
-            stake_amount: 0.5,
+            stake_amount: 0.001,
             auto_stake: true,
             byzantine_threshold: 0.33,
         }

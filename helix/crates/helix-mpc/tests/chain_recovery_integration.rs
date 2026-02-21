@@ -323,7 +323,11 @@ async fn test_chain_recovery_full_e2e() -> anyhow::Result<()> {
         batch_size: 1,
         on_step: None,
         on_sub_step: None,
+        on_cheater_detected: None,
+        on_recovery_completed: None,
         capture_checkpoint_weights: false,
+        signal_rx: None,
+        starting_step: 0,
     };
 
     let result = run_mpc_training_with_cheater(mpc_config, cheater_party, corrupt_at_step).await?;
@@ -507,7 +511,11 @@ async fn test_chain_recovery_full_e2e() -> anyhow::Result<()> {
         batch_size: 1,
         on_step: None,
         on_sub_step: None,
+        on_cheater_detected: None,
+        on_recovery_completed: None,
         capture_checkpoint_weights: false,
+        signal_rx: None,
+        starting_step: 0,
     };
 
     let recovery_result = run_mpc_training(recovery_config).await?;

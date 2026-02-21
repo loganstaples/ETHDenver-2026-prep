@@ -13,7 +13,8 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use helix_mpc::e2e_integration::{
-    MPCIntegrationConfig, MPCIntegrationResult, run_mpc_training, run_mpc_training_with_cheater,
+    MPCIntegrationConfig, MPCIntegrationResult, TrainingOutcome, TrainingSignal,
+    run_mpc_training, run_mpc_training_with_cheater,
 };
 use helix_mpc::mnist::{MnistDataset, NativeTrainer};
 
@@ -45,12 +46,26 @@ const D_OUT: usize = 10;
 /// Core demo runner.
 pub struct DemoRunner {
     args: Args,
+    /// Sender for training control signals (pause/stop).
+    /// Kept here so a future CLI or API layer can send signals.
+    #[allow(dead_code)]
+    signal_tx: tokio::sync::watch::Sender<TrainingSignal>,
 }
 
 impl DemoRunner {
     /// Creates a new demo runner from CLI arguments.
     pub fn new(args: Args) -> Self {
-        Self { args }
+        let (signal_tx, _signal_rx) = tokio::sync::watch::channel(TrainingSignal::Continue);
+        Self { args, signal_tx }
+    }
+
+    /// Returns a reference to the signal sender.
+    ///
+    /// External code (e.g. a CLI command handler) can call
+    /// `runner.signal_sender().send(TrainingSignal::Pause)` to pause training.
+    #[allow(dead_code)]
+    pub fn signal_sender(&self) -> &tokio::sync::watch::Sender<TrainingSignal> {
+        &self.signal_tx
     }
 
     /// Runs the complete HELIX MPC training demo.
@@ -153,6 +168,8 @@ impl DemoRunner {
             },
         );
 
+        let signal_rx = self.signal_tx.subscribe();
+
         let config = MPCIntegrationConfig {
             d_in: D_IN,
             d_hid: D_HID,
@@ -173,6 +190,8 @@ impl DemoRunner {
             on_step: Some(on_step),
             on_sub_step: None,
             capture_checkpoint_weights: self.args.zk_mode != ZkMode::Off,
+            signal_rx: Some(signal_rx),
+            starting_step: 0,
         };
 
         let result = if self.args.simulate_cheater && self.args.workers > 2 {
@@ -191,6 +210,34 @@ impl DemoRunner {
         };
 
         display::step_update_finish();
+
+        // Handle training outcome (pause/stop signals)
+        match &result.outcome {
+            TrainingOutcome::Paused { step, .. } => {
+                display::training_paused(*step);
+                let training_time = phase2_start.elapsed();
+                display::success(&format!(
+                    "Completed {} steps in {:.1}s before pause",
+                    result.steps_completed,
+                    training_time.as_secs_f64(),
+                ));
+                display::success(&format!(
+                    "MAC checks passed: {} (information-theoretic integrity)",
+                    result.mac_checks_passed,
+                ));
+                return Ok(());
+            }
+            TrainingOutcome::Stopped { step, .. } => {
+                display::training_stopped(*step);
+                // Continue to settlement/summary with partial results
+            }
+            TrainingOutcome::Completed => {
+                // Normal flow continues below
+            }
+            TrainingOutcome::CheaterDetected { .. } => {
+                // Handled by existing cheater_detected logic below
+            }
+        }
 
         let training_time = phase2_start.elapsed();
         display::success(&format!(
@@ -555,7 +602,7 @@ impl DemoRunner {
         display::success(&format!("Training job registered (job_id={})", job_id));
 
         // Workers stake and join
-        let stake = U256::from(100_000_000_000_000_000u128); // 0.1 ETH
+        let stake = U256::from(1_000_000_000_000_000u128); // 0.001 ETH (matches poolMinStake)
         for (i, pk) in worker_pks.iter().enumerate() {
             let worker_client = ChainClientV4::new(
                 &rpc_url,

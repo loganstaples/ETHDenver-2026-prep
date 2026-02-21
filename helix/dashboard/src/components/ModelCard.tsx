@@ -33,6 +33,18 @@ export interface ModelCardProps {
   userAddress?: string;
   /** On-chain token ID for linking */
   tokenId?: number;
+  /** Inference fee in basis points (e.g. 500 = 5%) */
+  inferenceFee?: number;
+  /** Model architecture label */
+  architecture?: string;
+  /** Total inference count */
+  inferenceCount?: number;
+  /** Average user rating (0-5) */
+  averageRating?: number;
+  /** Number of user ratings */
+  ratingCount?: number;
+  /** Whether to show fee badge (default: true) */
+  showFee?: boolean;
 }
 
 // ─── Trained Session Card ────────────────────────────────────────────────────
@@ -43,48 +55,119 @@ export interface TrainedSessionCardProps {
   accuracy: number | null;
   isSelected: boolean;
   onSelect: () => void;
+  /** Whether to show fee badge (default: true) */
+  showFee?: boolean;
 }
 
 export function TrainedSessionCard({
-  name, accuracy, isSelected, onSelect,
+  name, accuracy, isSelected, onSelect, showFee = true,
 }: TrainedSessionCardProps) {
   return (
     <button
       type="button"
       onClick={onSelect}
       className={cn(
-        'w-full text-left rounded-2xl transition-all',
+        'w-full text-left rounded-2xl transition-all duration-200 relative overflow-hidden group',
         isSelected
-          ? 'bg-white/[0.07] ring-1 ring-white/20 px-6 py-6'
-          : 'bg-helix-surface border border-helix-border hover:border-helix-border2 px-5 py-4',
+          ? 'bg-white/[0.06] backdrop-blur-xl ring-1 ring-white/20 shadow-lg shadow-white/[0.03] px-5 py-4'
+          : 'bg-white/[0.02] backdrop-blur-md border border-white/[0.06] hover:bg-white/[0.04] hover:border-white/[0.12] px-5 py-3.5',
       )}
     >
-      <div className="flex items-baseline justify-between gap-4">
-        <h3 className={cn(
-          'font-semibold text-white truncate tracking-tight',
-          isSelected ? 'text-xl' : 'text-[15px]',
-        )}>
-          {name || 'Trained Model'}
-        </h3>
-        {accuracy != null && (
-          <span className={cn(
-            'font-mono tabular-nums text-white shrink-0',
-            isSelected ? 'text-xl font-semibold' : 'text-sm font-medium text-white/60',
-          )}>
-            {(accuracy * 100).toFixed(1)}%
-          </span>
+      {/* Top edge gradient */}
+      <div className={cn(
+        'absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-white/20 to-transparent transition-opacity duration-200',
+        isSelected ? 'opacity-100' : 'opacity-0 group-hover:opacity-60',
+      )} />
+
+      {/* Subtle inner glow when selected */}
+      {isSelected && (
+        <div className="absolute inset-0 bg-gradient-to-b from-white/[0.04] to-transparent pointer-events-none" />
+      )}
+
+      <div className="relative">
+        {/* Row 1: Name + accuracy */}
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0 flex-1">
+            <h3 className={cn(
+              'font-semibold text-white truncate tracking-tight',
+              isSelected ? 'text-2xl' : 'text-xl',
+            )}>
+              {name || 'Trained Model'}
+            </h3>
+          </div>
+          {accuracy != null && (
+            <div className="text-right shrink-0">
+              <span className={cn(
+                'font-mono tabular-nums text-white block font-semibold',
+                isSelected ? 'text-2xl' : 'text-xl text-white/80',
+              )}>
+                {(accuracy * 100).toFixed(1)}%
+              </span>
+              <span className="text-sm text-white/50">accuracy</span>
+            </div>
+          )}
+        </div>
+
+        {/* Row 2: Fee badge (conditional) */}
+        {showFee && (
+          <div className="flex items-center gap-2 mt-3">
+            <span className="inline-flex items-center gap-1.5 text-sm font-semibold px-3.5 py-1.5 rounded-full bg-emerald-500/10 text-emerald-400/90 border border-emerald-500/10">
+              0% fee
+            </span>
+            <span className="text-sm text-white/40 ml-auto">Your model</span>
+          </div>
         )}
       </div>
     </button>
   );
 }
 
-// ─── On-Chain Model Card ─────────────────────────────────────────────────────
+// ─── Version Dropdown (full-width, centered in card) ─────────────────────────
+
+function VersionDropdown({
+  versions,
+  selectedIndex,
+  onChange,
+}: {
+  versions: ModelCardVersion[];
+  selectedIndex: number;
+  onChange: (index: number) => void;
+}) {
+  if (versions.length === 0) return null;
+
+  // Sort by accuracy descending, preserving original indices
+  const sorted = versions
+    .map((v, i) => ({ ...v, idx: i }))
+    .sort((a, b) => b.accuracy - a.accuracy);
+
+  return (
+    <div className="w-full mt-3">
+      <select
+        value={selectedIndex}
+        onChange={(e) => { e.stopPropagation(); onChange(Number(e.target.value)); }}
+        onClick={(e) => e.stopPropagation()}
+        className="w-full bg-white/[0.06] border border-white/[0.10] rounded-xl px-4 py-2.5 text-sm text-white/90 font-medium cursor-pointer focus:outline-none focus:ring-1 focus:ring-white/20 transition-all hover:bg-white/[0.09]"
+        style={{ colorScheme: 'dark' }}
+      >
+        {sorted.map((v) => (
+          <option key={v.idx} value={v.idx}>
+            {v.semver || `v${v.idx + 1}`}  ·  {(v.accuracy * 100).toFixed(1)}% accuracy
+          </option>
+        ))}
+      </select>
+    </div>
+  );
+}
+
+// ─── Model Card ──────────────────────────────────────────────────────────────
 
 export function ModelCard({
   name, accuracy, isSelected, onSelect,
   versions, selectedVersionIndex, onVersionChange,
   ownerAddress, userAddress, tokenId,
+  inferenceFee, architecture, inferenceCount,
+  averageRating, ratingCount,
+  showFee = true,
 }: ModelCardProps) {
   const isOwner = ownerAddress && userAddress
     ? ownerAddress.toLowerCase() === userAddress.toLowerCase()
@@ -94,80 +177,124 @@ export function ModelCard({
     ? versions[selectedVersionIndex] ?? null
     : null;
   const displayAccuracy = isSelected && sv ? sv.accuracy : (accuracy ?? 0);
-  const hasMultipleVersions = versions && versions.length > 1;
+
+  // Fee display
+  const feeBps = inferenceFee ?? 0;
+  const feePercent = isOwner ? 0 : feeBps / 100;
 
   return (
     <div
       className={cn(
-        'w-full rounded-2xl transition-all overflow-hidden',
+        'w-full rounded-2xl transition-all duration-200 overflow-hidden relative group',
         isSelected
-          ? 'bg-white/[0.07] ring-1 ring-white/20'
-          : 'bg-helix-surface border border-helix-border hover:border-helix-border2',
+          ? 'bg-white/[0.06] backdrop-blur-xl ring-1 ring-white/20 shadow-lg shadow-white/[0.03]'
+          : 'bg-white/[0.02] backdrop-blur-md border border-white/[0.06] hover:bg-white/[0.04] hover:border-white/[0.12]',
       )}
     >
+      {/* Top edge gradient */}
+      <div className={cn(
+        'absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-white/20 to-transparent transition-opacity duration-200 z-10',
+        isSelected ? 'opacity-100' : 'opacity-0 group-hover:opacity-60',
+      )} />
+
+      {/* Subtle inner glow when selected */}
+      {isSelected && (
+        <div className="absolute inset-0 bg-gradient-to-b from-white/[0.04] to-transparent pointer-events-none" />
+      )}
+
       <button
         type="button"
         onClick={onSelect}
         className={cn(
-          'w-full text-left',
-          isSelected ? 'px-6 py-6' : 'px-5 py-4',
+          'w-full text-left relative',
+          isSelected ? 'px-5 py-4' : 'px-5 py-3.5',
         )}
       >
-        <div className="flex items-baseline justify-between gap-4">
-          <h3 className={cn(
-            'font-semibold text-white truncate tracking-tight',
-            isSelected ? 'text-xl' : 'text-[15px]',
-          )}>
-            {name}
-          </h3>
-          {displayAccuracy > 0 && (
-            <span className={cn(
-              'font-mono tabular-nums text-white shrink-0',
-              isSelected ? 'text-xl font-semibold' : 'text-sm font-medium text-white/60',
+        {/* Row 1: Name + accuracy */}
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0 flex-1">
+            <h3 className={cn(
+              'font-semibold text-white truncate tracking-tight',
+              isSelected ? 'text-2xl' : 'text-xl',
             )}>
-              {(displayAccuracy * 100).toFixed(1)}%
+              {name}
+            </h3>
+            {architecture && (
+              <p className="text-sm text-white/40 mt-1 font-medium truncate">{architecture}</p>
+            )}
+          </div>
+          {displayAccuracy > 0 && (
+            <div className="text-right shrink-0">
+              <span className={cn(
+                'font-mono tabular-nums text-white block font-semibold',
+                isSelected ? 'text-2xl' : 'text-xl text-white/80',
+              )}>
+                {(displayAccuracy * 100).toFixed(1)}%
+              </span>
+              <span className="text-sm text-white/50">accuracy</span>
+            </div>
+          )}
+        </div>
+
+        {/* Version dropdown — shown in the middle when selected */}
+        {isSelected && versions && versions.length > 0 && onVersionChange && (
+          <VersionDropdown
+            versions={versions}
+            selectedIndex={selectedVersionIndex ?? versions.length - 1}
+            onChange={onVersionChange}
+          />
+        )}
+
+        {/* Row 2: Fee + metadata badges */}
+        <div className="flex items-center gap-2 mt-3 flex-wrap">
+          {showFee && (
+            isOwner || feePercent === 0 ? (
+              <span className="inline-flex items-center gap-1.5 text-sm font-semibold px-3.5 py-1.5 rounded-full bg-emerald-500/10 text-emerald-400/90 border border-emerald-500/10">
+                0% fee
+              </span>
+            ) : (
+              <span className="inline-flex items-center gap-1.5 text-sm font-semibold px-3.5 py-1.5 rounded-full bg-amber-500/10 text-amber-400/80 border border-amber-500/10">
+                {feePercent % 1 === 0 ? feePercent.toFixed(0) : feePercent.toFixed(1)}% fee
+              </span>
+            )
+          )}
+
+          {versions && versions.length > 0 && (
+            <span className="inline-flex items-center text-sm font-medium px-3 py-1.5 rounded-full bg-white/[0.04] text-white/30 border border-white/[0.05]">
+              {versions.length} ver{versions.length !== 1 ? 's' : ''}
             </span>
           )}
+
+          {inferenceCount != null && inferenceCount > 0 && (
+            <span className="inline-flex items-center text-sm font-medium px-3 py-1.5 rounded-full bg-white/[0.04] text-white/30 border border-white/[0.05]">
+              {inferenceCount} run{inferenceCount !== 1 ? 's' : ''}
+            </span>
+          )}
+
+          {averageRating != null && averageRating > 0 && (
+            <span className="inline-flex items-center gap-1 text-sm font-medium px-3 py-1.5 rounded-full bg-yellow-500/[0.06] text-yellow-400/80 border border-yellow-500/[0.08]">
+              ★ {averageRating.toFixed(1)}
+            </span>
+          )}
+
+          <span className="text-sm text-white/40 ml-auto">
+            {isOwner ? 'Your model' : 'Public'}
+          </span>
         </div>
       </button>
 
-      {/* Expanded content */}
-      {isSelected && (
-        <div className="px-6 pb-5 flex items-center gap-2">
-          {/* Version dropdown */}
-          {hasMultipleVersions && onVersionChange && (
-            <select
-              value={selectedVersionIndex ?? 0}
-              onChange={(e) => onVersionChange(Number(e.target.value))}
-              className="h-8 px-3 bg-white/[0.05] border border-white/[0.08] rounded-lg text-xs text-white/70 focus:outline-none focus:border-white/20 transition-colors appearance-none cursor-pointer"
-              style={{
-                backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 24 24' fill='none' stroke='%23888' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E")`,
-                backgroundRepeat: 'no-repeat',
-                backgroundPosition: 'right 8px center',
-                paddingRight: '28px',
-              }}
-            >
-              {versions!.map((v, i) => (
-                <option key={i} value={i}>
-                  {v.semver || `v${i + 1}`}{i === versions!.length - 1 ? ' (latest)' : ''}
-                </option>
-              ))}
-            </select>
-          )}
-
-          {/* Spacer */}
-          <div className="flex-1" />
-
-          {/* View / Manage button */}
-          {tokenId != null && (
+      {/* Expanded content — actions */}
+      {isSelected && tokenId != null && (
+        <div className="px-5 pb-4 relative">
+          <div className="flex items-center justify-end">
             <Link
-              href={isOwner ? `/my-models/${tokenId}` : `/models/${tokenId}`}
+              href={`/models/${tokenId}`}
               onClick={(e) => e.stopPropagation()}
-              className="h-8 px-4 inline-flex items-center justify-center rounded-lg bg-white text-black text-xs font-semibold hover:bg-white/90 transition-colors shrink-0"
+              className="h-10 px-5 inline-flex items-center justify-center rounded-lg bg-white text-black text-sm font-semibold hover:bg-white/90 transition-colors shrink-0"
             >
-              {isOwner ? 'Manage' : 'View'}
+              View
             </Link>
-          )}
+          </div>
         </div>
       )}
     </div>

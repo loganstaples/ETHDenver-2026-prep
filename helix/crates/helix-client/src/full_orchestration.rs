@@ -51,7 +51,7 @@ use ethers::utils::keccak256;
 
 use helix_mpc::e2e_integration::{
     CheaterRecord, FinalWeights, InitialWeights, MPCIntegrationConfig,
-    MPCIntegrationResult,
+    MPCIntegrationResult, TrainingOutcome, TrainingSignal,
 };
 use helix_mpc::mnist::{MnistDataset, MnistSample};
 
@@ -135,6 +135,19 @@ pub enum ProgressEvent {
     ZkRiskActivated { active_workers: u64, min_workers: usize },
     /// Training recovered after cheater removal.
     RecoveryCompleted { honest_workers: usize, resumed_from_step: usize, post_recovery_steps: usize },
+    /// Live cost update during training.
+    CostUpdate {
+        /// Total gas spent in wei across all on-chain operations.
+        gas_spent_wei: u128,
+        /// Worker compute fees accrued so far (in ADI).
+        worker_fees_accrued: f64,
+        /// Original deposit amount (in ADI).
+        deposit_amount: f64,
+    },
+    /// Training was paused by user.
+    TrainingPaused { step: usize, checkpoint_commitment: Option<String> },
+    /// Training was stopped by user.
+    TrainingStopped { step: usize, checkpoint_commitment: Option<String>, refund_amount: f64 },
 }
 
 /// A callback for receiving progress events.
@@ -322,6 +335,10 @@ pub struct FullOrchestrationConfig {
     /// (additive secret sharing requires ALL shares).
     #[serde(default)]
     pub trusted_nodes: Option<Vec<String>>,
+
+    /// Optional sender for pause/stop signals (dashboard/CLI sends, training loop receives).
+    #[serde(skip)]
+    pub signal_tx: Option<tokio::sync::watch::Sender<TrainingSignal>>,
 }
 
 impl Default for FullOrchestrationConfig {
@@ -380,6 +397,7 @@ impl Default for FullOrchestrationConfig {
             cheater_party: None,
             cheater_step: None,
             trusted_nodes: None,
+            signal_tx: None,
         }
     }
 }
@@ -437,6 +455,28 @@ pub struct CheaterInfo {
     pub slashed: bool,
     /// Transaction hash of the slash, if successful.
     pub slash_tx_hash: Option<String>,
+}
+
+// ============================================================================
+// Cost Tracking
+// ============================================================================
+
+/// Tracks cumulative costs during training for live display.
+#[derive(Debug, Clone, Default)]
+struct CostTracker {
+    gas_spent_wei: u128,
+    worker_fees_accrued: f64,
+    deposit_amount: f64,
+}
+
+impl CostTracker {
+    fn add_gas(&mut self, gas: u64, gas_price_wei: u128) {
+        self.gas_spent_wei += gas as u128 * gas_price_wei;
+    }
+
+    fn update_worker_fees(&mut self, steps: usize, workers: usize, per_step_fee: f64) {
+        self.worker_fees_accrued = steps as f64 * workers as f64 * per_step_fee;
+    }
 }
 
 // ============================================================================
@@ -633,7 +673,7 @@ impl FullOrchestrator {
             && self.config.pre_registered_job_id.is_none();
 
         #[cfg(feature = "chain")]
-        let (job_id, coordinator_address, chain_client, worker_wallets, chain_gas) = if skip_chain {
+        let (job_id, coordinator_address, chain_client, worker_wallets, chain_gas, workers_generated) = if skip_chain {
             info!("Skipping on-chain phases (payment=0, no pre-registered job). Using local-only mode.");
             for phase in 3..=7 {
                 self.emit(ProgressEvent::PhaseStarted {
@@ -645,16 +685,22 @@ impl FullOrchestrator {
             // No chain client needed — job_id=0 gates all downstream chain usage
             // (settlement and withdrawal phases both check job_id==0 and skip).
             let coord_addr = self.config.coordinator_address.clone().unwrap_or_default();
-            (0u64, coord_addr, None, Vec::new(), 0u64)
+            (0u64, coord_addr, None, Vec::new(), 0u64, false)
         } else {
+            // Track whether wallets existed before chain setup — if they didn't,
+            // any keys added by Phase 5.5 are generated (owner-controlled) and
+            // should be swept on failure. Pre-existing worker wallets are never swept.
+            let had_pre_existing_keys = !self.config.worker_private_keys.is_empty();
             match self.run_chain_setup_phases(d_in, d_hid, d_out, num_workers).await {
-                Ok((jid, addr, client, wallets, gas)) => {
-                    (jid, addr, Some(client), wallets, gas)
+                Ok((jid, addr, client, wallets, gas, generated)) => {
+                    (jid, addr, Some(client), wallets, gas, generated)
                 }
                 Err(e) => {
-                    // Chain setup failed — sweep any funded worker wallets back
-                    // to the owner before propagating the error.
-                    self.sweep_worker_funds_on_failure().await;
+                    // Only sweep generated wallets back to owner on failure.
+                    // Pre-existing worker wallets belong to the workers.
+                    if !had_pre_existing_keys {
+                        self.sweep_worker_funds_on_failure().await;
+                    }
                     return Err(e);
                 }
             }
@@ -678,7 +724,7 @@ impl FullOrchestrator {
         info!("Phase 8: Running MPC training");
         let phase8_start = Instant::now();
 
-        let mpc_result = if self.config.distributed {
+        let mpc_training_result = if self.config.distributed {
             // Distributed mode: workers run the MPC training loop themselves.
             // The orchestrator distributes shares + training config to each worker
             // over the data channel. Workers create TcpTransport meshes, run
@@ -692,12 +738,51 @@ impl FullOrchestrator {
                 d_in, d_hid, d_out, num_workers,
                 initial_weights, training_pairs,
             ).await
-            .context("Phase 8: Distributed MPC training failed")?
+            .context("Phase 8: Distributed MPC training failed")
         } else {
             // Local mode: all MPC parties run in this process using LocalTransport.
-            // Clone the progress callback so live per-step events fire during training.
             let progress_for_step = self.progress.clone();
             let progress_for_sub_step = self.progress.clone();
+            let signal_rx = self.config.signal_tx.as_ref().map(|tx| tx.subscribe());
+
+            let simulate_cheater = self.config.simulate_cheater;
+            let cheater_party = self.config.cheater_party.unwrap_or(num_workers - 1);
+            let corrupt_at_step = self.config.cheater_step.unwrap_or((self.config.num_steps / 2) as u64);
+
+            // Wire real progress callbacks
+            let on_step_cb: Option<std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync>> =
+                progress_for_step.map(|cb| -> std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync> {
+                    std::sync::Arc::new(move |step, total, loss, accuracy, mac_ok| {
+                        cb(ProgressEvent::TrainingStep { step, total, loss, accuracy, mac_ok });
+                    })
+                });
+
+            let on_sub_step_cb: Option<std::sync::Arc<dyn Fn(usize, usize, &str) + Send + Sync>> =
+                progress_for_sub_step.map(|cb| -> std::sync::Arc<dyn Fn(usize, usize, &str) + Send + Sync> {
+                    std::sync::Arc::new(move |step, total, operation| {
+                        cb(ProgressEvent::SubStep { step, total, operation: operation.to_string() });
+                    })
+                });
+
+            // Wire real cheater detection/recovery callbacks
+            let cheater_cb: Option<std::sync::Arc<dyn Fn(usize, u64) + Send + Sync>> = if simulate_cheater {
+                let cb = self.progress.clone();
+                cb.map(|cb| -> std::sync::Arc<dyn Fn(usize, u64) + Send + Sync> {
+                    std::sync::Arc::new(move |party_index, step| {
+                        cb(ProgressEvent::CheaterDetected { party_index, step });
+                    })
+                })
+            } else { None };
+
+            let recovery_cb: Option<std::sync::Arc<dyn Fn(usize, usize, usize) + Send + Sync>> = if simulate_cheater {
+                let cb = self.progress.clone();
+                cb.map(|cb| -> std::sync::Arc<dyn Fn(usize, usize, usize) + Send + Sync> {
+                    std::sync::Arc::new(move |honest_workers, resumed_from_step, post_recovery_steps| {
+                        cb(ProgressEvent::RecoveryCompleted { honest_workers, resumed_from_step, post_recovery_steps });
+                    })
+                })
+            } else { None };
+
             let mpc_config = MPCIntegrationConfig {
                 d_in,
                 d_hid,
@@ -715,62 +800,112 @@ impl FullOrchestrator {
                 use_tcp_transport: false,
                 worker_endpoints: None,
                 batch_size: self.config.batch_size,
-                on_step: progress_for_step.map(|cb| -> std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync> {
-                    std::sync::Arc::new(move |step, total, loss, accuracy, mac_ok| {
-                        cb(ProgressEvent::TrainingStep { step, total, loss, accuracy, mac_ok });
-                    })
-                }),
-                on_sub_step: progress_for_sub_step.map(|cb| -> std::sync::Arc<dyn Fn(usize, usize, &str) + Send + Sync> {
-                    std::sync::Arc::new(move |step, total, operation| {
-                        cb(ProgressEvent::SubStep {
-                            step,
-                            total,
-                            operation: operation.to_string(),
-                        });
-                    })
-                }),
+                on_step: on_step_cb,
+                on_sub_step: on_sub_step_cb,
+                on_cheater_detected: cheater_cb,
+                on_recovery_completed: recovery_cb,
                 capture_checkpoint_weights: false,
+                signal_rx,
+                starting_step: 0,
             };
 
-            if self.config.simulate_cheater {
-                let cheater_party = self.config.cheater_party.unwrap_or(num_workers - 1);
-                let corrupt_at_step = self.config.cheater_step.unwrap_or((self.config.num_steps / 2) as u64);
+            if simulate_cheater {
                 info!(
                     cheater_party = cheater_party,
                     corrupt_at_step = corrupt_at_step,
-                    "Simulating cheater injection for demo"
+                    mac_check_interval = self.config.mac_check_interval,
+                    "Real cheater simulation: MAC-verified training with cheater injection"
                 );
                 helix_mpc::e2e_integration::run_mpc_training_with_cheater(
-                    mpc_config,
-                    cheater_party,
-                    corrupt_at_step,
-                )
-                .await
-                .context("Phase 8: MPC training with cheater simulation failed")?
+                    mpc_config, cheater_party, corrupt_at_step,
+                ).await.context("Phase 8: MPC training with cheater failed")
             } else {
                 helix_mpc::e2e_integration::run_mpc_training(mpc_config)
                     .await
-                    .context("Phase 8: MPC training failed")?
+                    .context("Phase 8: MPC training failed")
             }
         };
 
-        // Note: per-step progress for local mode is now emitted live via the
-        // on_step callback wired into the MPC config above.
+        // If Phase 8 failed, call stopTraining on the contract to refund
+        // the escrowed payment before propagating the error.
+        let mpc_result = match mpc_training_result {
+            Ok(result) => result,
+            Err(e) => {
+                #[cfg(feature = "chain")]
+                if job_id != 0 {
+                    if let Some(ref client) = chain_client {
+                        info!(job_id = job_id, "Training failed — calling stopTraining to refund escrowed payment");
+                        match client.stop_training(job_id).await {
+                            Ok(receipt) => {
+                                info!(
+                                    job_id = job_id,
+                                    tx_hash = %receipt.transaction_hash,
+                                    "stopTraining succeeded — payment refunded to owner"
+                                );
+                                self.emit(ProgressEvent::TrainingStopped {
+                                    step: 0,
+                                    checkpoint_commitment: None,
+                                    refund_amount: 0.0, // actual amount is in the event logs
+                                });
+                            }
+                            Err(stop_err) => {
+                                warn!(
+                                    job_id = job_id,
+                                    error = %stop_err,
+                                    "stopTraining failed — payment may be stuck in contract"
+                                );
+                            }
+                        }
+                    }
+                    // Only sweep generated wallets; pre-existing worker wallets
+                    // belong to workers. Stakes are auto-returned by the contract
+                    // via stopTraining → _autoReturnStakes.
+                    if workers_generated {
+                        self.sweep_worker_funds_on_failure().await;
+                    }
+                }
+                return Err(e);
+            }
+        };
 
-        if let Some(ref cheater) = mpc_result.cheater_detected {
-            self.emit(ProgressEvent::CheaterDetected {
-                party_index: cheater.party_index,
-                step: cheater.detected_at_step,
-            });
-        }
+        // Note: CheaterDetected and RecoveryCompleted events are now emitted live
+        // via the on_cheater_detected/on_recovery_completed callbacks wired into the
+        // MPC config above. They fire at the exact moment of detection/recovery,
+        // not post-hoc after the entire training run returns.
 
-        if mpc_result.recovery_completed {
-            let resumed_from = mpc_result.steps_completed.saturating_sub(mpc_result.post_recovery_steps);
-            self.emit(ProgressEvent::RecoveryCompleted {
-                honest_workers: num_workers - 1,
-                resumed_from_step: resumed_from,
-                post_recovery_steps: mpc_result.post_recovery_steps,
-            });
+        // Emit pause/stop events based on training outcome.
+        match &mpc_result.outcome {
+            TrainingOutcome::Paused { step, .. } => {
+                if let Some(ref cb) = self.progress {
+                    cb(ProgressEvent::TrainingPaused { step: *step, checkpoint_commitment: None });
+                }
+            }
+            TrainingOutcome::Stopped { step, .. } => {
+                // Call stopTraining on-chain to refund remaining escrowed payment.
+                #[cfg(feature = "chain")]
+                if job_id != 0 {
+                    if let Some(ref client) = chain_client {
+                        info!(job_id = job_id, step = *step, "Training stopped by user — calling stopTraining to refund");
+                        match client.stop_training(job_id).await {
+                            Ok(receipt) => {
+                                info!(
+                                    job_id = job_id,
+                                    tx_hash = %receipt.transaction_hash,
+                                    "stopTraining succeeded — proportional refund issued"
+                                );
+                            }
+                            Err(stop_err) => {
+                                warn!(job_id = job_id, error = %stop_err, "stopTraining on user-stop failed");
+                            }
+                        }
+                    }
+                }
+                if let Some(ref cb) = self.progress {
+                    cb(ProgressEvent::TrainingStopped { step: *step, checkpoint_commitment: None, refund_amount: 0.0 });
+                }
+            }
+            TrainingOutcome::Completed => { /* normal flow */ }
+            TrainingOutcome::CheaterDetected { .. } => { /* handled above */ }
         }
 
         let phase8_elapsed = phase8_start.elapsed().as_millis();
@@ -808,13 +943,34 @@ impl FullOrchestrator {
             });
             (0, ci, 0u64, 0usize)
         } else {
-            self.run_chain_settlement_phases(
+            match self.run_chain_settlement_phases(
                 job_id,
                 &mpc_result,
                 chain_client.as_ref().expect("chain_client must exist when job_id != 0"),
                 &worker_wallets,
             )
-            .await?
+            .await {
+                Ok(result) => result,
+                Err(e) => {
+                    // Settlement failed — try to stop the job and refund escrow.
+                    if let Some(ref client) = chain_client {
+                        info!(job_id = job_id, "Settlement failed — calling stopTraining to refund");
+                        match client.stop_training(job_id).await {
+                            Ok(receipt) => {
+                                info!(
+                                    job_id = job_id,
+                                    tx_hash = %receipt.transaction_hash,
+                                    "stopTraining succeeded after settlement failure — payment refunded"
+                                );
+                            }
+                            Err(stop_err) => {
+                                warn!(job_id = job_id, error = %stop_err, "stopTraining after settlement failure also failed");
+                            }
+                        }
+                    }
+                    return Err(e);
+                }
+            }
         };
 
         #[cfg(not(feature = "chain"))]
@@ -829,25 +985,12 @@ impl FullOrchestrator {
         };
 
         // ================================================================
-        // Phase 11.5: Stake withdrawal (feature-gated, opt-in)
+        // Phase 11.5: Stake withdrawal — SKIPPED
+        // Contract now auto-returns stakes to honest workers on job
+        // completion/stop/pause via _autoReturnStakes().
         // ================================================================
         #[cfg(feature = "chain")]
-        let withdrawal_gas = if self.config.enable_withdrawal {
-            self.run_withdrawal_phase(
-                job_id,
-                &coordinator_address,
-                &worker_wallets,
-                &cheater_info,
-            )
-            .await
-            .unwrap_or_else(|e| {
-                warn!("Phase 11.5: Stake withdrawal failed: {}. Continuing.", e);
-                0
-            })
-        } else {
-            info!("Phase 11.5: Stake withdrawal skipped (enable_withdrawal=false)");
-            0
-        };
+        let withdrawal_gas: u64 = 0;
         #[cfg(not(feature = "chain"))]
         let withdrawal_gas: u64 = 0;
 
@@ -948,9 +1091,11 @@ impl FullOrchestrator {
 
         // ================================================================
         // Phase 12.9: Sweep remaining ETH from worker wallets back to owner
+        // Only sweep GENERATED wallets (owner-controlled ephemeral wallets).
+        // Pre-existing worker wallets keep their own funds (stake + earnings).
         // ================================================================
         #[cfg(feature = "chain")]
-        if !worker_wallets.is_empty() {
+        if workers_generated && !worker_wallets.is_empty() {
             if let Some(ref rpc_url) = self.rpc_url {
                 let owner_pk = self.config.private_key.strip_prefix("0x")
                     .unwrap_or(&self.config.private_key);
@@ -1405,7 +1550,13 @@ impl FullOrchestrator {
         let training_time_ms = start.elapsed().as_millis();
         let final_loss = all_losses.last().copied().unwrap_or(0.0);
 
+        let outcome = if let Some(ref cd) = cheater_detected {
+            helix_mpc::e2e_integration::TrainingOutcome::CheaterDetected { record: cd.clone() }
+        } else {
+            helix_mpc::e2e_integration::TrainingOutcome::Completed
+        };
         Ok(MPCIntegrationResult {
+            outcome,
             steps_completed: total_steps,
             final_loss,
             losses: all_losses,
@@ -1719,7 +1870,9 @@ impl FullOrchestrator {
     /// Runs phases 3 through 7: Anvil startup, contract deployment, job
     /// registration, worker staking, and readiness polling.
     ///
-    /// Returns (job_id, coordinator_address, chain_client, worker_wallets, gas_used).
+    /// Returns (job_id, coordinator_address, chain_client, worker_wallets, gas_used, workers_generated).
+    /// `workers_generated` is true when Phase 5.5 created ephemeral wallets (owner should sweep them).
+    /// When false, worker keys were pre-existing (workers keep their own funds).
     #[cfg(feature = "chain")]
     async fn run_chain_setup_phases(
         &mut self,
@@ -1727,7 +1880,7 @@ impl FullOrchestrator {
         d_hid: usize,
         d_out: usize,
         num_workers: usize,
-    ) -> Result<(u64, String, ChainClientV4, Vec<LocalWallet>, u64)> {
+    ) -> Result<(u64, String, ChainClientV4, Vec<LocalWallet>, u64, bool)> {
         let mut total_gas: u64 = 0;
 
         // -- Phase 3: Start Anvil if needed --
@@ -1969,7 +2122,8 @@ impl FullOrchestrator {
         // -- Phase 5.5: Generate and fund worker wallets if needed --
         // On remote testnets (not Anvil), workers don't come pre-funded.
         // Generate random wallets and transfer funds from the owner.
-        if self.config.worker_private_keys.is_empty() && num_workers > 0 {
+        let workers_generated = self.config.worker_private_keys.is_empty() && num_workers > 0;
+        if workers_generated {
             info!(
                 "Phase 5.5: No worker keys provided — generating {} random wallets",
                 num_workers
@@ -2247,7 +2401,7 @@ impl FullOrchestrator {
         }
         self.emit(ProgressEvent::PhaseCompleted { phase: 7, elapsed_ms: phase7_start.elapsed().as_millis() });
 
-        Ok((job_id, coordinator_addr_str, chain_client, worker_wallets, total_gas))
+        Ok((job_id, coordinator_addr_str, chain_client, worker_wallets, total_gas, workers_generated))
     }
 
     // ========================================================================
@@ -3387,6 +3541,7 @@ mod tests {
             cheater_step: None,
             worker_seeds: Vec::new(),
             trusted_nodes: None,
+            signal_tx: None,
         };
         let orchestrator = FullOrchestrator::new(config);
         assert!(orchestrator.validate_config().is_ok());

@@ -235,6 +235,7 @@ impl TrainingDb {
                 model_token_id: None,       // Not stored in DB
                 model_version_index: None,  // Not stored in DB
                 sub_step: None,             // Transient, not stored in DB
+                checkpoint_freq: 0,         // Not stored in DB
             })
         });
 

@@ -32,7 +32,7 @@ export function Table({ columns, data, onRowClick, className }: TableProps) {
               <th
                 key={col.key}
                 className={cn(
-                  'px-4 py-3 text-2xs font-mono font-normal uppercase tracking-wider text-helix-muted',
+                  'px-4 py-3.5 text-sm font-medium text-helix-muted',
                   alignClass[col.align ?? 'left'],
                 )}
               >
@@ -55,7 +55,7 @@ export function Table({ columns, data, onRowClick, className }: TableProps) {
                 <td
                   key={col.key}
                   className={cn(
-                    'px-4 py-3 text-sm text-helix-text2',
+                    'px-4 py-3.5 text-base text-helix-text2',
                     alignClass[col.align ?? 'left'],
                     col.mono && 'font-mono',
                   )}

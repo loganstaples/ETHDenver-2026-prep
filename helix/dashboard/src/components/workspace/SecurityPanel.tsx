@@ -151,7 +151,7 @@ export function SecurityPanel({ modelId }: SecurityPanelProps) {
         )}
       >
         <div className="flex items-center justify-between">
-          <h3 className="text-2xs font-mono uppercase tracking-wider text-helix-muted">
+          <h3 className="text-sm text-helix-muted">
             Threat Level
           </h3>
           <ShieldAlert size={18} className={threatStyle.text} />
@@ -223,7 +223,7 @@ export function SecurityPanel({ modelId }: SecurityPanelProps) {
 
       {/* Events Table */}
       <div className="space-y-3">
-        <h3 className="text-2xs font-mono uppercase tracking-wider text-helix-muted">
+        <h3 className="text-sm text-helix-muted">
           Security Events
         </h3>
         {adversarialEvents.length > 0 ? (
