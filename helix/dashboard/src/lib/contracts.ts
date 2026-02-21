@@ -865,6 +865,44 @@ export const HELIX_COORDINATOR_V4_ABI = [
             { name: 'paymentAmount', type: 'uint256', indexed: false },
         ],
     },
+    {
+        name: 'submitCheckpointWithProof',
+        type: 'function',
+        stateMutability: 'nonpayable',
+        inputs: [
+            { name: 'jobId', type: 'uint256' },
+            { name: 'stepNumber', type: 'uint256' },
+            { name: 'weightCommitment', type: 'bytes32' },
+            { name: 'loss', type: 'uint256' },
+            { name: 'proof', type: 'bytes' },
+            { name: 'publicInputs', type: 'uint256[]' },
+        ],
+        outputs: [],
+    },
+    {
+        name: 'isZkRequired',
+        type: 'function',
+        stateMutability: 'view',
+        inputs: [{ name: 'jobId', type: 'uint256' }],
+        outputs: [{ name: '', type: 'bool' }],
+    },
+    {
+        name: 'ZkActivatedByRisk',
+        type: 'event',
+        inputs: [
+            { name: 'jobId', type: 'uint256', indexed: true },
+            { name: 'activeWorkerCount', type: 'uint256', indexed: false },
+        ],
+    },
+    {
+        name: 'CheckpointWithProofSubmitted',
+        type: 'event',
+        inputs: [
+            { name: 'jobId', type: 'uint256', indexed: true },
+            { name: 'stepNumber', type: 'uint256', indexed: false },
+            { name: 'weightCommitment', type: 'bytes32', indexed: false },
+        ],
+    },
 ] as const;
 
 export const ABIS = {
