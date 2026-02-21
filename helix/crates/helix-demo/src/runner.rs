@@ -30,7 +30,12 @@ use helix_client::rpc::chain_v4::{sign_completion, ChainClientV4};
 
 use crate::display::{self, ChainStats};
 use crate::evaluator;
+use crate::risk::RiskAssessor;
+use crate::zk_prover::LazyZkProver;
 use crate::Args;
+use crate::ZkMode;
+
+use helix_prover::halo2curves::bn256::Fr as Halo2Fr;
 
 /// MNIST network dimensions.
 const D_IN: usize = 784;
@@ -167,7 +172,7 @@ impl DemoRunner {
             batch_size: 1,
             on_step: Some(on_step),
             on_sub_step: None,
-            capture_checkpoint_weights: false,
+            capture_checkpoint_weights: self.args.zk_mode != ZkMode::Off,
         };
 
         let result = if self.args.simulate_cheater && self.args.workers > 2 {
@@ -218,6 +223,85 @@ impl DemoRunner {
                 display::success(&format!(
                     "Recovery completed: {} additional steps after cheater removal",
                     result.post_recovery_steps,
+                ));
+            }
+        }
+
+        // ================================================================
+        // Phase 4b: ZK Proof Generation (optional)
+        // ================================================================
+        let mut zk_proofs: Vec<crate::zk_prover::ZkCheckpointResult> = Vec::new();
+
+        if self.args.zk_mode != ZkMode::Off && !result.checkpoints.is_empty() {
+            let has_snapshots = result.checkpoints.iter().all(|cp| cp.weight_snapshot.is_some());
+
+            if has_snapshots {
+                display::phase("Phase 4b: ZK Proof Generation (StateTransitionCircuit)");
+
+                // Determine which checkpoints need proofs
+                let prove_checkpoint: Vec<bool> = match self.args.zk_mode {
+                    ZkMode::Off => vec![false; result.checkpoints.len()],
+                    ZkMode::Always => vec![true; result.checkpoints.len()],
+                    ZkMode::Risk => {
+                        let mut assessor = RiskAssessor::new(self.args.min_workers_for_mpc);
+                        assessor.evaluate(&result);
+                        if assessor.is_triggered() {
+                            display::info(&format!(
+                                "Risk detected at step {} — activating ZK proofs for subsequent checkpoints",
+                                assessor.trigger_step().unwrap_or(0),
+                            ));
+                        } else {
+                            display::info("No risk conditions detected — skipping ZK proofs");
+                        }
+                        result.checkpoints.iter()
+                            .map(|cp| assessor.needs_proof(cp.step))
+                            .collect()
+                    }
+                };
+
+                let mut prover = LazyZkProver::new(
+                    self.args.d_in(),
+                    self.args.d_hid(),
+                    self.args.d_out(),
+                );
+
+                for (i, cp) in result.checkpoints.iter().enumerate() {
+                    if !prove_checkpoint[i] {
+                        continue;
+                    }
+
+                    // Convert MPC Fr to Halo2 Fr. The MPC Fr wraps bn256::Fr, accessed via .inner()
+                    let weights_halo2: Vec<Halo2Fr> = cp.weight_snapshot.as_ref().unwrap()
+                        .iter()
+                        .map(|mpc_fr| *mpc_fr.inner())
+                        .collect();
+
+                    let error_bound = 0.001; // Conservative error bound for state transition
+
+                    match prover.generate_proof(cp.step as u64, weights_halo2, error_bound) {
+                        Ok(Some(proof_result)) => {
+                            zk_proofs.push(proof_result);
+                        }
+                        Ok(None) => {
+                            // First checkpoint — stored as initial weight state
+                            display::info(&format!(
+                                "  Step {}: stored as initial weight state (no proof needed)",
+                                cp.step,
+                            ));
+                        }
+                        Err(e) => {
+                            display::warn(&format!(
+                                "  Step {}: ZK proof failed: {}",
+                                cp.step, e,
+                            ));
+                        }
+                    }
+                }
+
+                display::info(&format!(
+                    "ZK proof generation complete: {} proofs generated, {} verified",
+                    prover.proofs_generated(),
+                    prover.proofs_verified(),
                 ));
             }
         }
@@ -339,9 +423,9 @@ impl DemoRunner {
             mac_checks_passed: result.mac_checks_passed,
             cheater_detected: result.cheater_detected.is_some(),
             cheater_party: result.cheater_detected.as_ref().map(|c| c.party_index),
-            zk_proofs_generated: 0,
-            zk_proofs_verified: 0,
-            zk_total_proving_time_ms: 0,
+            zk_proofs_generated: zk_proofs.len(),
+            zk_proofs_verified: zk_proofs.iter().filter(|p| p.proof.verified).count(),
+            zk_total_proving_time_ms: zk_proofs.iter().map(|p| p.total_time_ms).sum(),
             chain_stats,
         });
 
