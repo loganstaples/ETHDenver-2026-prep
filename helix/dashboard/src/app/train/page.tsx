@@ -96,6 +96,27 @@ const PHASE_DESCRIPTIONS: Record<number, string> = {
 
 const TOTAL_PHASES = 13;
 
+// ============================================================================
+// Cost Estimation Constants
+// ============================================================================
+
+const COST = {
+  /** Base compute fee per step per worker (ADI) — reflects MPC overhead */
+  PER_STEP_FEE: 0.0000001,
+  /** Gas units for a checkpoint submission tx (~80K on ADI testnet) */
+  CHECKPOINT_GAS: 80_000,
+  /** Gas units for job registration tx */
+  REGISTER_GAS: 200_000,
+  /** Gas units for each worker's stake tx */
+  STAKE_GAS: 120_000,
+  /** Flat protocol fee per training job (ADI). Currently 0 — no protocol cut. */
+  PROTOCOL_FEE: 0,
+  /** Default gas price in gwei when network query fails */
+  DEFAULT_GAS_GWEI: 1,
+  /** Safety cap to prevent display/payment overflow */
+  MAX_COST: 1_000_000,
+} as const;
+
 type WeightFetchStatus = 'idle' | 'fetching' | 'decrypting' | 'uploading' | 'done' | 'error';
 
 type MintStep = 'idle' | 'downloading' | 'encrypting' | 'uploading' | 'creating-nft' | 'adding-version' | 'success' | 'error';
@@ -484,6 +505,169 @@ function PaymentNumber({
 }
 
 // ============================================================================
+// Cost Breakdown Panel — real-time line-item cost estimator
+// ============================================================================
+
+interface CostEstimate {
+  computeCost: number;
+  checkpointGas: number;
+  registerGas: number;
+  stakeGas: number;
+  totalGas: number;
+  commission: number;
+  commissionRate: number;
+  protocolFee: number;
+  numCheckpoints: number;
+  /** Payment to contract (compute + commission + protocol fee) */
+  recommendedPayment: number;
+  /** All-in cost (compute + gas + commission + protocol fee) */
+  totalCost: number;
+  stakeDeposit: number;
+}
+
+function estimateCost(
+  workers: number,
+  steps: number,
+  checkpointFreq: number,
+  zkMode: 'off' | 'always' | 'risk',
+  gasPriceGwei: number,
+  modelFeeBps: number,
+  stakePerWorker: number,
+): CostEstimate {
+  const zkMult = zkMode === 'always' ? 1.75 : zkMode === 'risk' ? 1.25 : 1.0;
+  const safeFreq = Math.max(checkpointFreq, 1);
+  const safeWorkers = Math.max(workers, 1);
+  const safeSteps = Math.max(steps, 1);
+  const safeGas = Math.max(gasPriceGwei, 0);
+
+  const numCheckpoints = Math.ceil(safeSteps / safeFreq);
+
+  const computeCost = safeWorkers * safeSteps * COST.PER_STEP_FEE * zkMult;
+  const checkpointGas = numCheckpoints * COST.CHECKPOINT_GAS * safeGas / 1e9;
+  const registerGas = COST.REGISTER_GAS * safeGas / 1e9;
+  const stakeGas = safeWorkers * COST.STAKE_GAS * safeGas / 1e9;
+  const totalGas = checkpointGas + registerGas + stakeGas;
+
+  const commissionRate = modelFeeBps / 10_000;
+  const commission = computeCost * commissionRate;
+  const protocolFee = COST.PROTOCOL_FEE;
+
+  const recommendedPayment = Math.min(computeCost + commission + protocolFee, COST.MAX_COST);
+  const totalCost = Math.min(recommendedPayment + totalGas, COST.MAX_COST);
+  const stakeDeposit = safeWorkers * stakePerWorker;
+
+  return {
+    computeCost, checkpointGas, registerGas, stakeGas,
+    totalGas, commission, commissionRate, protocolFee, numCheckpoints,
+    recommendedPayment: parseFloat(recommendedPayment.toFixed(7)),
+    totalCost, stakeDeposit,
+  };
+}
+
+function CostBreakdownPanel({
+  estimate,
+  gasPriceGwei,
+  isLiveGas,
+}: {
+  estimate: CostEstimate;
+  gasPriceGwei: number;
+  isLiveGas: boolean;
+}) {
+  const formatVal = (v: number) =>
+    v < 0.0000001 && v > 0 ? '<0.0000001' : v.toFixed(7);
+
+  const rows = [
+    {
+      label: 'Worker compute',
+      detail: `${estimate.computeCost > 0 ? '' : '0 '}steps × workers`,
+      value: estimate.computeCost,
+      color: 'text-helix-text2',
+    },
+    {
+      label: 'Checkpoint gas',
+      detail: `${estimate.numCheckpoints} × ${(COST.CHECKPOINT_GAS / 1000).toFixed(0)}K`,
+      value: estimate.checkpointGas,
+      color: 'text-helix-text2',
+    },
+    {
+      label: 'Registration gas',
+      detail: `${(COST.REGISTER_GAS / 1000).toFixed(0)}K`,
+      value: estimate.registerGas,
+      color: 'text-helix-text2',
+    },
+    {
+      label: 'Staking gas',
+      detail: `workers × ${(COST.STAKE_GAS / 1000).toFixed(0)}K`,
+      value: estimate.stakeGas,
+      color: 'text-helix-text2',
+    },
+  ];
+
+  if (estimate.protocolFee > 0) {
+    rows.push({
+      label: 'Protocol fee',
+      detail: 'flat per job',
+      value: estimate.protocolFee,
+      color: 'text-helix-text2',
+    });
+  }
+
+  if (estimate.commission > 0) {
+    rows.push({
+      label: 'Model license',
+      detail: `${(estimate.commissionRate * 100).toFixed(1)}% of compute`,
+      value: estimate.commission,
+      color: 'text-amber-400/80',
+    });
+  }
+
+  return (
+    <div className="space-y-1.5 mt-4">
+      {rows.map((row) => (
+        <div key={row.label} className="flex items-center justify-between px-1 py-[3px]">
+          <div className="flex items-baseline gap-1.5 min-w-0">
+            <span className={cn('text-[11px]', row.color)}>{row.label}</span>
+            <span className="text-[10px] text-helix-dim truncate">{row.detail}</span>
+          </div>
+          <span className="text-[11px] text-helix-dim tabular-nums font-mono shrink-0 ml-3">
+            {formatVal(row.value)}
+          </span>
+        </div>
+      ))}
+
+      <div className="border-t border-white/[0.06] pt-1.5 flex items-center justify-between px-1">
+        <span className="text-[11px] font-medium text-white">Estimated total</span>
+        <span className="text-[11px] font-semibold text-white tabular-nums font-mono">
+          {estimate.totalCost.toFixed(6)} ADI
+        </span>
+      </div>
+
+      {estimate.stakeDeposit > 0 && (
+        <div className="flex items-center justify-between px-1">
+          <div className="flex items-baseline gap-1">
+            <span className="text-[10px] text-helix-dim">+ Stake deposit</span>
+            <span className="text-[9px] text-helix-dim/60">(refundable after 7d)</span>
+          </div>
+          <span className="text-[10px] text-helix-dim tabular-nums font-mono">
+            {estimate.stakeDeposit.toFixed(4)} ADI
+          </span>
+        </div>
+      )}
+
+      <div className="flex items-center gap-1.5 px-1 pt-0.5">
+        <span className={cn(
+          'w-1.5 h-1.5 rounded-full shrink-0',
+          isLiveGas ? 'bg-green-400' : 'bg-helix-dim',
+        )} />
+        <span className="text-[10px] text-helix-dim">
+          Gas price: {gasPriceGwei} gwei {isLiveGas ? '(live)' : '(est.)'}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
 // Config Form — two-column full-width layout
 // ============================================================================
 
@@ -518,6 +702,8 @@ interface ConfigFormProps {
   isConfirmingPayment: boolean;
   walletConnected: boolean;
   userAddress?: string;
+  gasPriceGwei: number;
+  isLiveGas: boolean;
 }
 
 function ConfigForm({
@@ -526,6 +712,7 @@ function ConfigForm({
   models, trainedSessions, selectedModelId, selectedSessionId, onSelectModel, onSelectSession,
   isFetchingWeights, fetchedModelName,
   isWalletPrompting, isConfirmingPayment, walletConnected, userAddress,
+  gasPriceGwei, isLiveGas,
 }: ConfigFormProps) {
   const [hiddenSize, setHiddenSize] = useState(128);
   const [minWorkers, setMinWorkers] = useState(workersOnline > 0 ? workersOnline : 3);
@@ -533,7 +720,7 @@ function ConfigForm({
   const [learningRate, setLearningRate] = useState(0.05);
   const [checkpointFreq, setCheckpointFreq] = useState(50);
   const [zkMode, setZkMode] = useState<'off' | 'always' | 'risk'>('off');
-  const [zkCheckpointFreq, setZkCheckpointFreq] = useState(5);
+
   const [minWorkersForMpc, setMinWorkersForMpc] = useState(2);
   const [paymentEth, setPaymentEth] = useState(0.0001);
   const [stakePerWorkerEth, setStakePerWorkerEth] = useState(0.001);
@@ -549,6 +736,11 @@ function ConfigForm({
   const hasExistingModels = models.length > 0 || trainedSessions.length > 0;
   const [modelMode, setModelMode] = useState<'new' | 'existing'>((selectedModelId !== null || selectedSessionId !== null) ? 'existing' : 'new');
   const [modelName, setModelName] = useState('');
+
+  // Sync modelMode when parent auto-selects a model/session via query param
+  useEffect(() => {
+    if (selectedModelId !== null || selectedSessionId !== null) setModelMode('existing');
+  }, [selectedModelId, selectedSessionId]);
   const [modelSlug, setModelSlug] = useState('');
   const [modelSearch, setModelSearch] = useState('');
 
@@ -574,22 +766,6 @@ function ConfigForm({
   }, [trainedSessions, modelSearch]);
 
   const selectedSession = trainedSessions.find((s) => s.session_id === selectedSessionId) ?? null;
-
-  // Auto-compute recommended payment: base rate × steps × workers × ZK overhead
-  const recommendedPayment = useMemo(() => {
-    const zkMult = zkMode === 'always' ? 1.75 : zkMode === 'risk' ? 1.25 : 1.0;
-    return parseFloat((0.0000001 * numSteps * minWorkers * zkMult).toFixed(6));
-  }, [numSteps, minWorkers, zkMode]);
-
-  const effectivePayment = autoPropose ? recommendedPayment : paymentEth;
-
-  const paymentColor = (() => {
-    if (recommendedPayment <= 0) return 'green' as const;
-    const ratio = effectivePayment / recommendedPayment;
-    if (ratio >= 0.9) return 'green' as const;
-    if (ratio >= 0.6) return 'yellow' as const;
-    return 'red' as const;
-  })();
 
   const handleToggleAutoPropose = () => {
     if (autoPropose) setPaymentEth(recommendedPayment);
@@ -620,7 +796,7 @@ function ConfigForm({
       checkpoint_freq: checkpointFreq,
       mac_interval: 0,
       zk_mode: zkMode,
-      zk_checkpoint_freq: zkCheckpointFreq,
+      zk_checkpoint_freq: 1,
       min_workers_for_mpc: minWorkersForMpc,
       train_size: 5000,
       test_size: 500,
@@ -646,7 +822,32 @@ function ConfigForm({
   const isNotModelOwner = modelMode === 'existing'
     && selectedModel !== null
     && !!userAddress
-    && selectedModel.creator.toLowerCase() !== userAddress.toLowerCase();
+    && selectedModel.owner.toLowerCase() !== userAddress.toLowerCase();
+
+  // Derive model commission: non-zero when training another owner's model.
+  // Show commission in estimator even before wallet connect (assume non-owner if address unknown).
+  const selectedModelFeeBps = (modelMode === 'existing' && selectedModel)
+    ? ((!userAddress || selectedModel.owner.toLowerCase() !== userAddress.toLowerCase())
+        ? selectedModel.inferenceFee
+        : 0)
+    : 0;
+
+  // Full cost estimate: compute + gas + commission
+  const costEstimate = useMemo(
+    () => estimateCost(minWorkers, numSteps, checkpointFreq, zkMode, gasPriceGwei, selectedModelFeeBps, stakePerWorkerEth),
+    [minWorkers, numSteps, checkpointFreq, zkMode, gasPriceGwei, selectedModelFeeBps, stakePerWorkerEth],
+  );
+
+  const recommendedPayment = costEstimate.recommendedPayment;
+  const effectivePayment = autoPropose ? recommendedPayment : paymentEth;
+
+  const paymentColor = (() => {
+    if (recommendedPayment <= 0) return 'green' as const;
+    const ratio = effectivePayment / recommendedPayment;
+    if (ratio >= 0.9) return 'green' as const;
+    if (ratio >= 0.6) return 'yellow' as const;
+    return 'red' as const;
+  })();
 
   const canStart = !isStarting && !isWalletPrompting && !isConfirmingPayment
     && !versionError && !isFetchingWeights && walletConnected && !isNotModelOwner
@@ -903,12 +1104,12 @@ function ConfigForm({
         {/* ── RIGHT COLUMN ─────────────────────────────────────── */}
         <div className="flex flex-col gap-5">
 
-          {/* Payment + Start — Cash App style, connected */}
+          {/* Cost Estimator + Start — Cash App style, connected */}
           <div className="rounded-2xl bg-helix-surface border border-helix-border overflow-hidden">
             <div className="p-6">
               {/* Header with auto toggle */}
               <div className="flex items-center justify-between mb-5">
-                <span className="text-base font-medium text-helix-text2">Payment</span>
+                <span className="text-base font-medium text-helix-text2">Cost Estimator</span>
                 <div className="flex items-center gap-2.5">
                   <span className="text-sm text-helix-dim">Auto</span>
                   <Toggle on={autoPropose} onToggle={handleToggleAutoPropose} />
@@ -925,7 +1126,7 @@ function ConfigForm({
                 />
               </div>
 
-              {/* Footer — fixed height, breakdown slides horizontally, rec fades in */}
+              {/* Formula hint */}
               <div className="relative h-5 mt-4">
                 <motion.span
                   className="absolute top-0 text-sm text-helix-dim whitespace-nowrap"
@@ -934,6 +1135,7 @@ function ConfigForm({
                 >
                   {minWorkers} workers × {numSteps} steps
                   {zkMode !== 'off' && ` × ${zkMode === 'always' ? '1.75' : '1.25'}× ZK`}
+                  {selectedModelFeeBps > 0 && ` + ${(selectedModelFeeBps / 100).toFixed(1)}% license`}
                 </motion.span>
                 <AnimatePresence>
                   {!autoPropose && (
@@ -944,11 +1146,18 @@ function ConfigForm({
                       transition={{ duration: 0.2 }}
                       className="absolute top-0 right-0 text-sm text-helix-dim whitespace-nowrap"
                     >
-                      Rec: {recommendedPayment.toFixed(4)} ADI
+                      Recommended: {recommendedPayment.toFixed(4)} ADI
                     </motion.span>
                   )}
                 </AnimatePresence>
               </div>
+
+              {/* Detailed cost breakdown */}
+              <CostBreakdownPanel
+                estimate={costEstimate}
+                gasPriceGwei={gasPriceGwei}
+                isLiveGas={isLiveGas}
+              />
             </div>
 
             {/* Start button — attached to payment card */}
@@ -1007,15 +1216,13 @@ function ConfigForm({
             <AnimatePresence>
               {zkMode === 'always' && (
                 <motion.div
-                  initial={{ opacity: 0, height: 0 }}
-                  animate={{ opacity: 1, height: 'auto' }}
-                  exit={{ opacity: 0, height: 0 }}
-                  className="overflow-hidden"
+                  initial={{ height: 0, opacity: 0 }}
+                  animate={{ height: 'auto', opacity: 1 }}
+                  exit={{ height: 0, opacity: 0 }}
                 >
-                  <div className="flex items-center justify-between py-3.5 px-4 bg-helix-surface border border-helix-border rounded-xl">
-                    <span className="text-base text-helix-text2">ZK Checkpoint Freq</span>
-                    <NumberInput value={zkCheckpointFreq} onChange={setZkCheckpointFreq} min={1} max={100} />
-                  </div>
+                  <p className="text-sm text-helix-muted px-1">
+                    ZK proof generated at every checkpoint (frequency = checkpoint interval)
+                  </p>
                 </motion.div>
               )}
               {zkMode === 'risk' && (
@@ -1955,368 +2162,368 @@ function ResultsActions({ session, version, onDownloadModel, onStoreOnZeroG, isS
 
 
 // ============================================================================
-// History Card Grid — responsive grid of past training sessions
+// History Two-Column Layout (mirrors inference page pattern)
 // ============================================================================
 
-function AccuracyRing({ accuracy, id }: { accuracy: number | null; id: string }) {
-  const r = 46;
-  const stroke = 5;
-  const size = 2 * (r + stroke + 2);
-  const c = 2 * Math.PI * r;
-  const pct = accuracy != null ? accuracy : 0;
-  const offset = c * (1 - pct);
-  const gradId = `ring-${id}`;
-  const glowId = `glow-${id}`;
+type HistoryFilter = 'all' | 'complete' | 'failed';
 
-  return (
-    <div className="relative">
-      {/* Subtle glow behind the ring */}
-      {accuracy != null && accuracy > 0.5 && (
-        <div
-          className="absolute inset-0 rounded-full blur-2xl opacity-20"
-          style={{
-            background: `radial-gradient(circle, ${accuracy > 0.9 ? '#34d399' : accuracy > 0.7 ? '#fbbf24' : '#60a5fa'} 0%, transparent 70%)`,
-          }}
-        />
-      )}
-      <svg width={size} height={size} className="-rotate-90">
-        <defs>
-          <linearGradient id={gradId} x1="0%" y1="0%" x2="100%" y2="100%">
-            <stop offset="0%" stopColor={pct > 0.9 ? '#34d399' : pct > 0.7 ? '#fbbf24' : '#60a5fa'} />
-            <stop offset="100%" stopColor="rgba(255,255,255,0.9)" />
-          </linearGradient>
-          <filter id={glowId}>
-            <feGaussianBlur stdDeviation="2" result="blur" />
-            <feMerge>
-              <feMergeNode in="blur" />
-              <feMergeNode in="SourceGraphic" />
-            </feMerge>
-          </filter>
-        </defs>
-        <circle cx={size / 2} cy={size / 2} r={r} fill="none" stroke="rgba(255,255,255,0.05)" strokeWidth={stroke} />
-        {accuracy != null && (
-          <circle
-            cx={size / 2} cy={size / 2} r={r}
-            fill="none"
-            stroke={`url(#${gradId})`}
-            strokeWidth={stroke}
-            strokeLinecap="round"
-            strokeDasharray={c}
-            strokeDashoffset={offset}
-            filter={`url(#${glowId})`}
-            className="transition-all duration-700"
-          />
-        )}
-      </svg>
-      <div className="absolute inset-0 flex items-center justify-center">
-        {accuracy != null ? (
-          <div className="text-center">
-            <p className="text-[28px] font-bold text-white tabular-nums tracking-tighter leading-none">
-              {(accuracy * 100).toFixed(1)}
-              <span className="text-sm text-white/40 font-medium">%</span>
-            </p>
-            <p className="text-[10px] text-white/30 mt-1 uppercase tracking-widest">Accuracy</p>
-          </div>
-        ) : (
-          <p className="text-xl font-bold text-white/20">—</p>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function HistoryCardGrid({ sessions, onSelect }: {
+function HistoryView({ sessions, isLoading }: {
   sessions: TrainingSessionState[];
-  onSelect: (s: TrainingSessionState) => void;
+  isLoading: boolean;
 }) {
-  if (sessions.length === 0) {
-    return (
-      <div className="text-center py-16 text-helix-dim">
-        <History size={32} className="mx-auto mb-3 opacity-40" />
-        <p>No training sessions yet</p>
-      </div>
-    );
-  }
+  const [historySearch, setHistorySearch] = useState('');
+  const [historyFilter, setHistoryFilter] = useState<HistoryFilter>('all');
+  const [selectedSession, setSelectedSession] = useState<TrainingSessionState | null>(null);
+
+  const filteredSessions = useMemo(() => {
+    let list = sessions;
+    if (historyFilter === 'complete') {
+      list = list.filter((s) => s.status === 'complete');
+    } else if (historyFilter === 'failed') {
+      list = list.filter((s) => s.status === 'failed');
+    }
+    if (historySearch.trim()) {
+      const q = historySearch.toLowerCase();
+      list = list.filter((s) =>
+        (s.model_name ?? '').toLowerCase().includes(q) ||
+        s.session_id.toLowerCase().includes(q),
+      );
+    }
+    return list;
+  }, [sessions, historyFilter, historySearch]);
 
   return (
-    <div className="grid grid-cols-2 md:grid-cols-3 gap-5">
-      {sessions.map((s) => {
-        const finalAcc = s.accuracy != null ? s.accuracy : null;
-        const finalLoss = s.losses.length > 0 ? s.losses[s.losses.length - 1] : s.current_loss;
-        const date = new Date(s.started_at * 1000);
-        const completion = s.total_steps > 0 ? s.current_step / s.total_steps : 0;
-        const isComplete = completion >= 1;
+    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
 
-        return (
-          <button
-            key={s.session_id}
-            type="button"
-            onClick={() => onSelect(s)}
-            className="group text-left flex flex-col rounded-3xl bg-helix-surface border border-helix-border hover:border-white/20 hover:bg-white/[0.03] transition-all duration-300 p-7 min-h-[380px]"
-          >
-            {/* Header */}
-            <div className="flex items-start justify-between gap-3 mb-2">
-              <p className="text-base font-semibold text-white truncate tracking-tight leading-tight">
-                {s.model_name || 'Unnamed Model'}
+      {/* ── LEFT COLUMN: Session Discovery ──────────────────────── */}
+      <div className="flex flex-col gap-5">
+
+        {/* Search bar */}
+        <div className="relative">
+          <Search size={16} className="absolute left-4 top-1/2 -translate-y-1/2 text-helix-muted pointer-events-none" />
+          <input
+            type="text"
+            value={historySearch}
+            onChange={(e) => setHistorySearch(e.target.value)}
+            placeholder="Search sessions..."
+            className="w-full pl-11 pr-4 py-3.5 bg-helix-surface border border-helix-border rounded-2xl text-base text-white placeholder:text-helix-dim focus:outline-none focus:border-helix-border2 transition-colors"
+          />
+          {historySearch && (
+            <button
+              type="button"
+              onClick={() => setHistorySearch('')}
+              className="absolute right-4 top-1/2 -translate-y-1/2 text-helix-muted hover:text-white"
+            >
+              <XCircle size={14} />
+            </button>
+          )}
+        </div>
+
+        {/* Filter tabs */}
+        <div className="grid grid-cols-3 gap-2">
+          {(['all', 'complete', 'failed'] as const).map((f) => (
+            <button
+              key={f}
+              type="button"
+              onClick={() => setHistoryFilter(f)}
+              className={cn(
+                'py-2.5 rounded-xl text-base font-medium transition-all',
+                historyFilter === f
+                  ? 'bg-white text-black shadow-lg shadow-white/5'
+                  : 'bg-helix-surface border border-helix-border text-helix-muted hover:text-white hover:border-helix-border2',
+              )}
+            >
+              {f === 'all' ? 'All' : f === 'complete' ? 'Complete' : 'Failed'}
+            </button>
+          ))}
+        </div>
+
+        {/* Session list */}
+        <div className="space-y-2 max-h-[520px] overflow-y-auto pr-1">
+          {isLoading ? (
+            <div className="flex items-center justify-center py-12">
+              <Loader2 size={20} className="animate-spin text-helix-muted" />
+            </div>
+          ) : filteredSessions.length === 0 ? (
+            <div className="flex flex-col items-center justify-center py-12 rounded-2xl bg-helix-surface border border-helix-border">
+              <History size={20} className="text-helix-dim mb-2" />
+              <p className="text-sm text-helix-text2">
+                {sessions.length === 0 ? 'No training sessions yet' : 'No sessions match your search'}
               </p>
-              <span className="text-[11px] text-white/25 shrink-0 mt-0.5 tabular-nums">
-                {date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
-              </span>
             </div>
+          ) : (
+            filteredSessions.map((s) => {
+              const isSelected = selectedSession?.session_id === s.session_id;
+              const isComplete = s.total_steps > 0 && s.current_step >= s.total_steps;
+              const date = new Date(s.started_at * 1000);
 
-            {/* Status pill */}
-            <div className="mb-1">
-              <span className={`inline-flex items-center gap-1.5 text-[11px] font-medium px-2.5 py-1 rounded-full ${
-                isComplete
-                  ? 'bg-emerald-500/10 text-emerald-400/90'
-                  : 'bg-amber-500/10 text-amber-400/80'
-              }`}>
-                <span className={`w-1.5 h-1.5 rounded-full ${isComplete ? 'bg-emerald-400' : 'bg-amber-400 animate-pulse'}`} />
-                {isComplete ? 'Complete' : 'In Progress'}
-              </span>
-            </div>
+              return (
+                <button
+                  key={s.session_id}
+                  type="button"
+                  onClick={() => setSelectedSession(isSelected ? null : s)}
+                  className={cn(
+                    'w-full text-left rounded-2xl transition-all',
+                    isSelected
+                      ? 'bg-white/[0.07] ring-1 ring-white/20 px-6 py-5'
+                      : 'bg-helix-surface border border-helix-border hover:border-helix-border2 px-5 py-4',
+                  )}
+                >
+                  <div className="flex items-baseline justify-between gap-4">
+                    <h3 className={cn(
+                      'font-semibold text-white truncate tracking-tight',
+                      isSelected ? 'text-xl' : 'text-[15px]',
+                    )}>
+                      {s.model_name || 'Unnamed Model'}
+                    </h3>
+                    {s.accuracy != null && (
+                      <span className={cn(
+                        'font-mono tabular-nums text-white shrink-0',
+                        isSelected ? 'text-xl font-semibold' : 'text-sm font-medium text-white/60',
+                      )}>
+                        {(s.accuracy * 100).toFixed(1)}%
+                      </span>
+                    )}
+                  </div>
 
-            {/* Accuracy Ring — centered hero */}
-            <div className="flex-1 flex items-center justify-center py-3">
-              <AccuracyRing accuracy={finalAcc} id={s.session_id} />
-            </div>
+                  {/* Expanded details when selected */}
+                  {isSelected && (
+                    <div className="mt-3 flex items-center gap-3 flex-wrap">
+                      <span className={cn(
+                        'inline-flex items-center gap-1.5 text-[11px] font-medium px-2.5 py-1 rounded-full',
+                        isComplete ? 'bg-emerald-500/10 text-emerald-400/90' : 'bg-red-500/10 text-red-400/80',
+                      )}>
+                        <span className={cn('w-1.5 h-1.5 rounded-full', isComplete ? 'bg-emerald-400' : 'bg-red-400')} />
+                        {s.status === 'complete' ? 'Complete' : 'Failed'}
+                      </span>
+                      <span className="text-xs text-helix-dim">
+                        {date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}
+                      </span>
+                      <span className="text-xs text-helix-dim font-mono">
+                        {formatDuration(Math.round(s.elapsed_secs))}
+                      </span>
+                    </div>
+                  )}
 
-            {/* Training progress bar */}
-            <div className="mb-5">
-              <div className="flex justify-between mb-1.5">
-                <span className="text-[11px] text-white/35 uppercase tracking-wider font-medium">Progress</span>
-                <span className="text-[11px] text-white/50 tabular-nums font-medium">{s.current_step}/{s.total_steps}</span>
-              </div>
-              <div className="h-1.5 rounded-full bg-white/[0.06] overflow-hidden">
-                <div
-                  className="h-full rounded-full transition-all duration-500"
-                  style={{
-                    width: `${Math.min(completion * 100, 100)}%`,
-                    background: isComplete
-                      ? 'linear-gradient(90deg, #34d399, #6ee7b7)'
-                      : 'linear-gradient(90deg, rgba(255,255,255,0.3), rgba(255,255,255,0.6))',
-                  }}
-                />
-              </div>
-            </div>
+                  {/* Compact info when not selected */}
+                  {!isSelected && (
+                    <div className="flex items-center gap-3 mt-1.5">
+                      <span className={cn(
+                        'inline-flex items-center gap-1 text-[10px] font-medium px-2 py-0.5 rounded-full',
+                        isComplete ? 'bg-emerald-500/10 text-emerald-400/80' : 'bg-red-500/10 text-red-400/70',
+                      )}>
+                        <span className={cn('w-1 h-1 rounded-full', isComplete ? 'bg-emerald-400' : 'bg-red-400')} />
+                        {s.status === 'complete' ? 'Complete' : 'Failed'}
+                      </span>
+                      <span className="text-[11px] text-helix-dim tabular-nums">
+                        {date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+                      </span>
+                      <span className="text-[11px] text-helix-dim tabular-nums ml-auto">
+                        {s.current_step}/{s.total_steps} steps
+                      </span>
+                    </div>
+                  )}
+                </button>
+              );
+            })
+          )}
+        </div>
+      </div>
 
-            {/* Stats grid */}
-            <div className="grid grid-cols-2 gap-x-4 gap-y-2.5 pt-4 border-t border-white/[0.06]">
-              <div>
-                <p className="text-[11px] text-white/30 uppercase tracking-wider mb-0.5">Loss</p>
-                <p className="text-[13px] text-white font-medium tabular-nums">{finalLoss.toFixed(4)}</p>
-              </div>
-              <div>
-                <p className="text-[11px] text-white/30 uppercase tracking-wider mb-0.5">Duration</p>
-                <p className="text-[13px] text-white font-medium">{formatDuration(Math.round(s.elapsed_secs))}</p>
-              </div>
-              {(s.workers_active ?? 0) > 0 && (
-                <div>
-                  <p className="text-[11px] text-white/30 uppercase tracking-wider mb-0.5">Workers</p>
-                  <p className="text-[13px] text-white font-medium tabular-nums">{s.workers_active}</p>
-                </div>
-              )}
-              {(s.mac_checks_passed ?? 0) > 0 && (
-                <div>
-                  <p className="text-[11px] text-white/30 uppercase tracking-wider mb-0.5">Verified</p>
-                  <p className="text-[13px] text-emerald-400/80 font-medium tabular-nums">{s.mac_checks_passed} MAC</p>
-                </div>
-              )}
-              {(s.checkpoints_submitted ?? 0) > 0 && (
-                <div>
-                  <p className="text-[11px] text-white/30 uppercase tracking-wider mb-0.5">Checkpts</p>
-                  <p className="text-[13px] text-white font-medium tabular-nums">{s.checkpoints_submitted}</p>
-                </div>
-              )}
+      {/* ── RIGHT COLUMN: Session Details ────────────────────────── */}
+      <div className="flex flex-col gap-5">
+        {selectedSession ? (
+          <HistoryDetailPanel session={selectedSession} />
+        ) : (
+          <div className="rounded-2xl bg-helix-surface border border-helix-border p-5">
+            <div className="flex flex-col items-center justify-center py-16">
+              <History size={24} className="text-helix-dim mb-3" />
+              <p className="text-base text-helix-text2">Select a session to view details</p>
+              <p className="text-sm text-helix-muted mt-1">
+                {sessions.length} training session{sessions.length !== 1 ? 's' : ''} recorded
+              </p>
             </div>
-          </button>
-        );
-      })}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
 
 // ============================================================================
-// History Detail Modal — full-screen overlay with session details
+// History Detail Panel — inline detail view (replaces modal)
 // ============================================================================
 
-function HistoryDetailModal({ session, onClose }: {
-  session: TrainingSessionState;
-  onClose: () => void;
-}) {
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
-  }, [onClose]);
-
+function HistoryDetailPanel({ session }: { session: TrainingSessionState }) {
   const lossData = session.losses.map((l, i) => ({ step: i + 1, loss: l }));
+  const completion = session.total_steps > 0 ? session.current_step / session.total_steps : 0;
 
   return (
-    <AnimatePresence>
-      <motion.div
-        initial={{ opacity: 0 }}
-        animate={{ opacity: 1 }}
-        exit={{ opacity: 0 }}
-        className="fixed inset-0 z-50 flex items-center justify-center p-4"
-        onClick={onClose}
-      >
-        <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" />
-
-        <motion.div
-          initial={{ scale: 0.95, opacity: 0 }}
-          animate={{ scale: 1, opacity: 1 }}
-          exit={{ scale: 0.95, opacity: 0 }}
-          transition={{ duration: 0.2 }}
-          className="relative w-full max-w-5xl max-h-[90vh] overflow-y-auto rounded-3xl bg-[#0a0a0a] border border-helix-border p-8"
-          onClick={(e) => e.stopPropagation()}
-        >
-          {/* Close button */}
-          <button
-            type="button"
-            onClick={onClose}
-            className="absolute top-4 right-4 p-2 rounded-xl text-helix-dim hover:text-white hover:bg-helix-surface transition-colors"
-          >
-            <XCircle size={20} />
-          </button>
-
-          {/* Header */}
-          <div className="flex items-center gap-3 mb-6">
-            <h2 className="text-xl font-semibold text-white">
-              {session.model_name || 'Training Session'}
-            </h2>
-            <span className={cn(
-              'text-xs px-2 py-0.5 rounded-full',
-              session.status === 'complete' ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'
-            )}>
-              {session.status}
-            </span>
-            <span className="text-sm text-helix-dim ml-auto font-mono">
-              {session.session_id.slice(0, 8)}
-            </span>
-          </div>
-
-          {/* Two-column layout */}
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            {/* LEFT: Hero metric + loss curve */}
-            <div className="space-y-4">
-              <div className="p-6 rounded-2xl bg-helix-surface border border-helix-border text-center">
-                {session.status === 'complete' && session.accuracy !== null ? (
-                  <>
-                    <p className="text-5xl font-bold text-white tabular-nums">
-                      {(session.accuracy! * 100).toFixed(1)}
-                      <span className="text-2xl text-helix-dim">%</span>
-                    </p>
-                    <p className="text-sm text-helix-dim mt-1">Final Accuracy</p>
-                  </>
-                ) : (
-                  <>
-                    <p className="text-5xl font-bold text-white tabular-nums">
-                      {session.current_loss.toFixed(4)}
-                    </p>
-                    <p className="text-sm text-helix-dim mt-1">Final Loss</p>
-                  </>
-                )}
-              </div>
-
-              {lossData.length > 1 && (
-                <div className="h-64">
-                  <LossCurve data={lossData} />
-                </div>
-              )}
+    <motion.div
+      key={session.session_id}
+      initial={{ opacity: 0, y: 8 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.25 }}
+      className="flex flex-col gap-5"
+    >
+      {/* Hero metric card */}
+      <div className="rounded-2xl bg-helix-surface border border-helix-border overflow-hidden">
+        <div className="p-6">
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center gap-2">
+              <Shield size={14} className="text-green-400" />
+              <h3 className="text-base font-medium text-white">
+                {session.model_name || 'Training Session'}
+              </h3>
             </div>
-
-            {/* RIGHT: Stats + metadata */}
-            <div className="space-y-4">
-              {/* Progress bar */}
-              <div>
-                <div className="h-1.5 rounded-full bg-helix-border overflow-hidden">
-                  <div
-                    className="h-full rounded-full bg-white"
-                    style={{ width: `${(session.current_step / Math.max(session.total_steps, 1)) * 100}%` }}
-                  />
-                </div>
-                <p className="text-sm text-helix-dim mt-1 tabular-nums">
-                  Step {session.current_step} / {session.total_steps}
-                </p>
-              </div>
-
-              {/* Stats grid */}
-              <div className="grid grid-cols-2 gap-3">
-                <StatCard label="MAC Checks" value={session.mac_checks_passed} icon={<Shield size={14} />} />
-                <StatCard label="Checkpoints" value={session.checkpoints_submitted} icon={<Zap size={14} />} />
-                <StatCard label="ZK Proofs" value={session.zk_proofs_generated} icon={<Activity size={14} />} />
-                <StatCard label="Elapsed" value={formatDuration(Math.round(session.elapsed_secs))} icon={<Clock size={14} />} />
-              </div>
-
-              {/* Cheater alert */}
-              {session.cheater_detected && (
-                <div className="p-4 rounded-xl bg-red-500/10 border border-red-500/30 text-sm space-y-1.5">
-                  <div className="text-red-400">
-                    <strong>
-                      {session.cheater_detected.recovered
-                        ? 'Cheater Removed & Recovered'
-                        : session.cheater_detected.slashed
-                          ? 'Cheater Slashed'
-                          : 'Cheater Detected'}
-                    </strong>
-                    <span className="ml-2 text-red-300/70">Worker {session.cheater_detected.party_index} at step {session.cheater_detected.step}</span>
-                  </div>
-                  {session.cheater_detected.slashed && (
-                    <div className="text-green-400/80 text-xs flex items-center gap-1">
-                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M20 6L9 17l-5-5"/></svg>
-                      Stake slashed on ADI Chain
-                      {session.cheater_detected.slash_tx_hash && (
-                        <a
-                          href={`https://explorer.ab.testnet.adifoundation.ai/tx/${session.cheater_detected.slash_tx_hash}`}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="ml-1 text-orange-400/70 hover:text-orange-300 font-mono"
-                        >
-                          ({session.cheater_detected.slash_tx_hash.slice(0, 8)}...)
-                        </a>
-                      )}
-                    </div>
-                  )}
-                  {session.cheater_detected.recovered && (
-                    <div className="text-green-400/80 text-xs flex items-center gap-1">
-                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M20 6L9 17l-5-5"/></svg>
-                      Training recovered with {session.cheater_detected.recovery_workers} honest workers
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {/* Session metadata */}
-              <div className="p-4 rounded-xl bg-helix-surface border border-helix-border space-y-2 text-sm">
-                <div className="flex justify-between">
-                  <span className="text-helix-dim">Session ID</span>
-                  <span className="text-helix-text2 font-mono">{session.session_id.slice(0, 16)}...</span>
-                </div>
-                {session.coordinator_address && (
-                  <div className="flex justify-between">
-                    <span className="text-helix-dim">Coordinator</span>
-                    <span className="text-helix-text2 font-mono">{session.coordinator_address.slice(0, 10)}...</span>
-                  </div>
-                )}
-                {session.job_id > 0 && (
-                  <div className="flex justify-between">
-                    <span className="text-helix-dim">Job ID</span>
-                    <span className="text-helix-text2 font-mono">{session.job_id}</span>
-                  </div>
-                )}
-                <div className="flex justify-between">
-                  <span className="text-helix-dim">Started</span>
-                  <span className="text-helix-text2">
-                    {new Date(session.started_at * 1000).toLocaleString()}
-                  </span>
-                </div>
-              </div>
+            <div className="flex items-center gap-2">
+              <span className={cn(
+                'inline-flex items-center gap-1.5 text-[11px] font-medium px-2.5 py-1 rounded-full',
+                session.status === 'complete'
+                  ? 'bg-emerald-500/10 text-emerald-400/90'
+                  : 'bg-red-500/10 text-red-400/80',
+              )}>
+                <span className={cn('w-1.5 h-1.5 rounded-full', session.status === 'complete' ? 'bg-emerald-400' : 'bg-red-400')} />
+                {session.status}
+              </span>
+              <Badge variant="default" className="text-helix-text2">
+                <Clock size={10} /> {formatDuration(Math.round(session.elapsed_secs))}
+              </Badge>
             </div>
           </div>
-        </motion.div>
-      </motion.div>
-    </AnimatePresence>
+
+          {/* Big metric */}
+          <div className="flex items-baseline justify-center gap-4 py-2">
+            {session.status === 'complete' && session.accuracy !== null ? (
+              <>
+                <span className="text-5xl font-bold tracking-tighter tabular-nums text-white">
+                  {(session.accuracy! * 100).toFixed(1)}
+                </span>
+                <span className="text-xl font-semibold text-helix-text2">% accuracy</span>
+              </>
+            ) : (
+              <>
+                <span className="text-5xl font-bold tracking-tighter tabular-nums text-white">
+                  {session.current_loss.toFixed(4)}
+                </span>
+                <span className="text-xl font-semibold text-helix-text2">loss</span>
+              </>
+            )}
+          </div>
+
+          {/* Progress */}
+          <div className="flex items-center justify-center gap-4 mt-3 text-sm text-helix-dim">
+            <span>Step {session.current_step} / {session.total_steps}</span>
+            {(session.workers_active ?? 0) > 0 && (
+              <>
+                <span>·</span>
+                <span>{session.workers_active} workers</span>
+              </>
+            )}
+          </div>
+        </div>
+
+        {/* Progress bar */}
+        <div className="px-6 pb-5">
+          <div className="h-1.5 rounded-full bg-white/[0.06] overflow-hidden">
+            <div
+              className="h-full rounded-full transition-all duration-500"
+              style={{
+                width: `${Math.min(completion * 100, 100)}%`,
+                background: completion >= 1
+                  ? 'linear-gradient(90deg, #34d399, #6ee7b7)'
+                  : 'linear-gradient(90deg, rgba(255,255,255,0.3), rgba(255,255,255,0.6))',
+              }}
+            />
+          </div>
+        </div>
+      </div>
+
+      {/* Loss curve */}
+      {lossData.length > 1 && (
+        <LossCurve data={lossData} />
+      )}
+
+      {/* Stats grid */}
+      <div className="grid grid-cols-2 gap-3">
+        <StatCard label="MAC Checks" value={session.mac_checks_passed} icon={<Shield size={14} />} />
+        <StatCard label="Checkpoints" value={session.checkpoints_submitted} icon={<Zap size={14} />} />
+        <StatCard label="ZK Proofs" value={session.zk_proofs_generated} icon={<Activity size={14} />} />
+        <StatCard label="Elapsed" value={formatDuration(Math.round(session.elapsed_secs))} icon={<Clock size={14} />} />
+      </div>
+
+      {/* ZK activated by risk indicator */}
+      {session.zk_activated_by_risk && (
+        <div className="flex items-center gap-2 px-3 py-2 rounded-xl bg-amber-500/10 border border-amber-500/20">
+          <Shield size={14} className="text-amber-400" />
+          <span className="text-sm text-amber-300 font-medium">ZK Activated by Risk — proofs being generated</span>
+        </div>
+      )}
+
+      {/* Cheater alert */}
+      {session.cheater_detected && (
+        <div className="p-4 rounded-xl bg-red-500/10 border border-red-500/30 text-sm space-y-1.5">
+          <div className="text-red-400">
+            <strong>
+              {session.cheater_detected.recovered
+                ? 'Cheater Removed & Recovered'
+                : session.cheater_detected.slashed
+                  ? 'Cheater Slashed'
+                  : 'Cheater Detected'}
+            </strong>
+            <span className="ml-2 text-red-300/70">Worker {session.cheater_detected.party_index} at step {session.cheater_detected.step}</span>
+          </div>
+          {session.cheater_detected.slashed && (
+            <div className="text-green-400/80 text-xs flex items-center gap-1">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M20 6L9 17l-5-5"/></svg>
+              Stake slashed on ADI Chain
+              {session.cheater_detected.slash_tx_hash && (
+                <a
+                  href={`https://explorer.ab.testnet.adifoundation.ai/tx/${session.cheater_detected.slash_tx_hash}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="ml-1 text-orange-400/70 hover:text-orange-300 font-mono"
+                >
+                  ({session.cheater_detected.slash_tx_hash.slice(0, 8)}...)
+                </a>
+              )}
+            </div>
+          )}
+          {session.cheater_detected.recovered && (
+            <div className="text-green-400/80 text-xs flex items-center gap-1">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M20 6L9 17l-5-5"/></svg>
+              Training recovered with {session.cheater_detected.recovery_workers} honest workers
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Session metadata */}
+      <div className="p-4 rounded-xl bg-helix-surface border border-helix-border space-y-2 text-sm">
+        <div className="flex justify-between">
+          <span className="text-helix-dim">Session ID</span>
+          <span className="text-helix-text2 font-mono">{session.session_id.slice(0, 16)}...</span>
+        </div>
+        {session.coordinator_address && (
+          <div className="flex justify-between">
+            <span className="text-helix-dim">Coordinator</span>
+            <span className="text-helix-text2 font-mono">{session.coordinator_address.slice(0, 10)}...</span>
+          </div>
+        )}
+        {session.job_id > 0 && (
+          <div className="flex justify-between">
+            <span className="text-helix-dim">Job ID</span>
+            <span className="text-helix-text2 font-mono">{session.job_id}</span>
+          </div>
+        )}
+        <div className="flex justify-between">
+          <span className="text-helix-dim">Started</span>
+          <span className="text-helix-text2">
+            {new Date(session.started_at * 1000).toLocaleString()}
+          </span>
+        </div>
+      </div>
+    </motion.div>
   );
 }
 
@@ -2328,6 +2535,7 @@ function HistoryDetailModal({ session, onClose }: {
 function TrainPageInner() {
   const searchParams = useSearchParams();
   const queryModelId = searchParams.get('model');
+  const querySessionId = searchParams.get('session');
 
   const {
     startTraining, uploadData, uploadWeights, downloadModel, storeOnZeroG,
@@ -2355,6 +2563,30 @@ function TrainPageInner() {
   const [operatorAddress, setOperatorAddress] = useState<string | null>(null);
   const [walletPaymentError, setWalletPaymentError] = useState<string | null>(null);
   const pendingConfigRef = useRef<{ config: TrainingJobConfig; opts: { storeOn0G: boolean; version: string; modelName: string; modelSlug: string } } | null>(null);
+
+  // Live gas price for cost estimator
+  const [gasPriceGwei, setGasPriceGwei] = useState<number>(COST.DEFAULT_GAS_GWEI);
+  const [isLiveGas, setIsLiveGas] = useState(false);
+
+  useEffect(() => {
+    if (!publicClient) return;
+    let cancelled = false;
+    const fetchGas = async () => {
+      try {
+        const priceWei = await publicClient.getGasPrice();
+        if (!cancelled) {
+          const gwei = Number(priceWei) / 1e9;
+          setGasPriceGwei(gwei > 0 ? gwei : COST.DEFAULT_GAS_GWEI);
+          setIsLiveGas(true);
+        }
+      } catch {
+        // keep default
+      }
+    };
+    fetchGas();
+    const interval = setInterval(fetchGas, 30_000);
+    return () => { cancelled = true; clearInterval(interval); };
+  }, [publicClient]);
 
   // Fetch operator address from backend on mount
   useEffect(() => {
@@ -2417,7 +2649,6 @@ function TrainPageInner() {
 
   const hasSession = session !== null;
   const [viewMode, setViewMode] = useState<'live' | 'history'>('live');
-  const [selectedHistorySession, setSelectedHistorySession] = useState<TrainingSessionState | null>(null);
   const [wantsStoreOn0G, setWantsStoreOn0G] = useState(false);
   const [currentVersion, setCurrentVersion] = useState('1.0.0');
   const [currentModelName, setCurrentModelName] = useState('');
@@ -2597,6 +2828,17 @@ function TrainPageInner() {
     doFetch();
   }, [trainedSessions, uploadWeights]);
 
+  // Auto-select session from query param
+  useEffect(() => {
+    if (autoSelectAppliedRef.current) return;
+    if (!querySessionId || trainedSessions.length === 0) return;
+    const found = trainedSessions.find((s) => s.session_id === querySessionId);
+    if (found) {
+      autoSelectAppliedRef.current = true;
+      handleSelectSession(querySessionId);
+    }
+  }, [querySessionId, trainedSessions, handleSelectSession]);
+
   const handleStart = async (config: TrainingJobConfig, opts: { storeOn0G: boolean; version: string; modelName: string; modelSlug: string }) => {
     pendingConfigRef.current = { config, opts };
     setWalletPaymentError(null);
@@ -2660,7 +2902,7 @@ function TrainPageInner() {
         BigInt(config.num_steps),
         paymentWei,
         config.zk_mode === 'always',
-        BigInt(config.zk_checkpoint_freq),
+        BigInt(1), // ZK at every checkpoint (frequency = checkpoint interval)
         config.zk_mode === 'risk',
         BigInt(config.min_workers_for_mpc),
         (operatorAddress ?? '0x0000000000000000000000000000000000000000') as `0x${string}`,
@@ -3010,6 +3252,8 @@ function TrainPageInner() {
               isConfirmingPayment={isConfirmingPayment}
               walletConnected={!!address}
               userAddress={address}
+              gasPriceGwei={gasPriceGwei}
+              isLiveGas={isLiveGas}
             />
           ) : (
             <LiveProgress
@@ -3030,17 +3274,9 @@ function TrainPageInner() {
           )}
         </>
       ) : (
-        <HistoryCardGrid
+        <HistoryView
           sessions={history}
-          onSelect={setSelectedHistorySession}
-        />
-      )}
-
-      {/* Detail modal */}
-      {selectedHistorySession && (
-        <HistoryDetailModal
-          session={selectedHistorySession}
-          onClose={() => setSelectedHistorySession(null)}
+          isLoading={isLoadingHistory}
         />
       )}
     </motion.div>
