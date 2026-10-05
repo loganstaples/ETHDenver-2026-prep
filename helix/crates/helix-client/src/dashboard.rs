@@ -1954,6 +1954,17 @@ async fn run_training_session(
                     session.coordinator_address = result.coordinator_address.clone();
                     session.zk_proofs_generated = result.zk_proofs_generated;
                     session.final_weights = weights_json;
+
+                    // Persist cheater detection info so REST polling sees it
+                    if let Some(ref cheater) = result.cheater_detected {
+                        session.cheater_detected = Some(serde_json::json!({
+                            "party_index": cheater.party_index,
+                            "step": cheater.detected_at_step,
+                            "slashed": cheater.slashed,
+                            "slash_tx_hash": cheater.slash_tx_hash,
+                            "recovered": true,
+                        }));
+                    }
                 }
 
                 // Update reputation for all workers on successful training completion

@@ -267,22 +267,28 @@ export function useMpcTraining(): UseMpcTrainingReturn {
           if (evt.type === 'training_step') {
             const step = evt.step as number;
             const loss = evt.loss as number;
-            const accuracy = evt.accuracy as number | undefined;
+            const rawAccuracy = evt.accuracy as number | undefined;
             const macOk = evt.mac_ok as boolean;
 
             setSession((prev) => {
               if (!prev) return prev;
+              // Smooth the per-batch accuracy estimate with an EMA to avoid
+              // wild oscillations (exp(-loss) on a single batch is very noisy).
+              const alpha = 0.05; // smoothing factor — lower = smoother
+              const smoothed = (rawAccuracy != null && prev.accuracy != null)
+                ? prev.accuracy * (1 - alpha) + rawAccuracy * alpha
+                : rawAccuracy ?? prev.accuracy;
               return {
                 ...prev,
                 current_step: step,
                 current_loss: loss,
-                accuracy: accuracy ?? prev.accuracy,
+                accuracy: smoothed,
                 phase_description: `Training step ${step}/${prev.total_steps} — loss: ${loss.toFixed(4)}`,
                 mac_checks_passed: macOk ? prev.mac_checks_passed + 1 : prev.mac_checks_passed,
               };
             });
 
-            setLosses((prev) => [...prev, { step, loss, accuracy: accuracy ?? undefined }]);
+            setLosses((prev) => [...prev, { step, loss, accuracy: rawAccuracy ?? undefined }]);
           }
 
           // Handle sub-step events (real-time operation status)
@@ -313,7 +319,8 @@ export function useMpcTraining(): UseMpcTrainingReturn {
                 return {
                   ...prev,
                   phase,
-                  phase_description: description || prev.phase_description,
+                  phase_description: description || '',
+                  sub_step: null,
                   status: 'running',
                 };
               });
@@ -436,6 +443,9 @@ export function useMpcTraining(): UseMpcTrainingReturn {
               return {
                 ...prev,
                 status: 'complete',
+                phase: 13,
+                phase_description: 'Complete',
+                sub_step: null,
                 accuracy: accuracy ?? prev.accuracy,
               };
             });
@@ -548,13 +558,18 @@ export function useMpcTraining(): UseMpcTrainingReturn {
               const cheater = prev.cheater_detected && (!data.cheater_detected?.slashed && prev.cheater_detected.slashed)
                 ? prev.cheater_detected
                 : data.cheater_detected;
-              return { ...data, cheater_detected: cheater, checkpoint_freq: prev.checkpoint_freq || data.checkpoint_freq };
+              // If phase advanced, clear stale sub_step from previous phase
+              const sub_step = data.phase !== prev.phase ? null : (data.sub_step ?? prev.sub_step);
+              return { ...data, cheater_detected: cheater, checkpoint_freq: prev.checkpoint_freq || data.checkpoint_freq, sub_step };
             }
             return {
               ...prev,
               coordinator_address: data.coordinator_address || prev.coordinator_address,
               job_id: data.job_id || prev.job_id,
               workers_active: data.workers_active ?? prev.workers_active,
+              phase: data.phase > prev.phase ? data.phase : prev.phase,
+              phase_description: data.phase > prev.phase ? (data.phase_description || '') : prev.phase_description,
+              sub_step: data.phase > prev.phase ? null : prev.sub_step,
               status: prev.status,
             };
           });

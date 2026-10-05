@@ -103,18 +103,18 @@ const TOTAL_PHASES = 13;
 // ============================================================================
 
 const COST = {
-  /** Base compute fee per step per worker (ADI) — testing: slashed 100x */
-  PER_STEP_FEE: 0.00001,
-  /** Gas units for a checkpoint submission tx (~80K on ADI testnet) */
-  CHECKPOINT_GAS: 80_000,
-  /** Gas units for job registration tx */
-  REGISTER_GAS: 200_000,
-  /** Gas units for each worker's stake tx */
-  STAKE_GAS: 120_000,
+  /** Base compute fee per step per worker (ADI) — demo: minimal to preserve testnet funds */
+  PER_STEP_FEE: 0.0000001,
+  /** Gas units for a checkpoint submission tx (slashed for testnet demo) */
+  CHECKPOINT_GAS: 800,
+  /** Gas units for job registration tx (slashed for testnet demo) */
+  REGISTER_GAS: 2_000,
+  /** Gas units for each worker's stake tx (slashed for testnet demo) */
+  STAKE_GAS: 1_200,
   /** Flat protocol fee per training job (ADI). Currently 0 — no protocol cut. */
   PROTOCOL_FEE: 0,
-  /** Default gas price in gwei when network query fails (ADI testnet ~550 gwei) */
-  DEFAULT_GAS_GWEI: 550,
+  /** Default gas price in gwei when network query fails */
+  DEFAULT_GAS_GWEI: 5,
   /** Safety cap to prevent display/payment overflow */
   MAX_COST: 1_000_000,
 } as const;
@@ -268,12 +268,16 @@ function PhaseRing({ phase, totalPhases, size = 180 }: { phase: number; totalPha
 
 function SubStatusTicker({ session }: { session: TrainingSessionState }) {
   const text = useMemo(() => {
-    // Non-training phases: show phase description
-    if (session.phase !== 8 || session.current_step === 0) {
-      return session.phase_description || 'Processing...';
+    // Completion / terminal states always win
+    if (session.status === 'complete') {
+      return session.accuracy != null
+        ? `Accuracy: ${(session.accuracy * 100).toFixed(1)}%`
+        : 'Training complete';
     }
+    if (session.status === 'failed') return 'Session failed';
+    if (session.status === 'stopped') return 'Session stopped';
 
-    // Cheater detection takes priority
+    // Cheater detection takes priority (applies to any phase)
     if (session.cheater_detected) {
       if (session.cheater_detected.recovered) {
         return `Recovered — training with ${session.cheater_detected.recovery_workers} honest workers`;
@@ -284,7 +288,17 @@ function SubStatusTicker({ session }: { session: TrainingSessionState }) {
       return `Cheater detected — worker ${session.cheater_detected.party_index} at step ${session.cheater_detected.step}`;
     }
 
-    // Use real sub-step data from backend when available
+    // Non-training phases: use sub_step if fresh, otherwise phase-appropriate text
+    if (session.phase !== 8 || session.current_step === 0) {
+      if (session.sub_step) return session.sub_step;
+      // Only show phase_description if it's not stale training-step text from phase 8
+      if (session.phase_description && !/^Training step \d/.test(session.phase_description)) {
+        return session.phase_description;
+      }
+      return PHASE_DESCRIPTIONS[session.phase] || 'Processing...';
+    }
+
+    // Phase 8 (MPC training): use real sub-step data when available
     if (session.sub_step) {
       const workers = session.workers_active ?? 3;
       return `${session.sub_step} — ${workers} workers`;
@@ -292,8 +306,9 @@ function SubStatusTicker({ session }: { session: TrainingSessionState }) {
 
     // Fallback to phase description
     return session.phase_description || 'MPC training in progress...';
-  }, [session.phase, session.current_step, session.phase_description,
-      session.cheater_detected, session.sub_step, session.workers_active]);
+  }, [session.status, session.accuracy, session.phase, session.current_step,
+      session.phase_description, session.cheater_detected, session.sub_step,
+      session.workers_active]);
 
   return (
     <AnimatePresence mode="wait">
@@ -707,8 +722,8 @@ function ConfigForm({
   const [zkMode, setZkMode] = useState<'off' | 'always' | 'risk'>('off');
 
   const [minWorkersForMpc, setMinWorkersForMpc] = useState(2);
-  const [paymentEth, setPaymentEth] = useState(0.005);
-  const [stakePerWorkerEth, setStakePerWorkerEth] = useState(0.0001);
+  const [paymentEth, setPaymentEth] = useState(0.00005);
+  const [stakePerWorkerEth, setStakePerWorkerEth] = useState(0.000001);
   const [version, setVersion] = useState(defaultVersion);
   const [versionError, setVersionError] = useState<string | null>(null);
   const [autoPropose, setAutoPropose] = useState(true);
@@ -780,8 +795,8 @@ function ConfigForm({
       payment_eth: effectivePayment,
       stake_per_worker_eth: stakePerWorkerEth,
       simulate_cheater: simulateCheater,
-      cheater_party: simulateCheater ? cheaterParty : undefined,
-      cheater_step: simulateCheater ? cheaterStep : undefined,
+      cheater_party: simulateCheater ? (cheaterParty ?? (workersOnline > 0 ? workersOnline - 1 : 2)) : undefined,
+      cheater_step: simulateCheater ? (cheaterStep ?? Math.floor(numSteps / 2)) : undefined,
       seed: 42,
       model_name: effectiveModelName || undefined,
       model_slug: effectiveModelSlug || undefined,
@@ -1480,36 +1495,47 @@ function LiveProgress({ session, losses, isConnected, error, version, modelName,
         </motion.div>
       )}
 
-      {/* Live Cost Panel */}
-      {session.status === 'running' && session.phase >= 8 && (
-        <div className="bg-helix-surface border border-helix-border rounded-2xl p-4">
-          <h4 className="text-xs text-helix-muted mb-3">Costs So Far</h4>
-          <div className="space-y-2 text-sm">
-            <div className="flex justify-between">
-              <span className="text-helix-dim">Worker compute</span>
-              <span className="text-zinc-300">{(session.cost_worker_fees_adi ?? 0).toFixed(6)} ADI</span>
-            </div>
-            <div className="flex justify-between">
-              <span className="text-helix-dim">Gas spent</span>
-              <span className="text-zinc-300">{((session.cost_gas_spent_wei ?? 0) / 1e18).toFixed(6)} ETH</span>
-            </div>
-            <div className="border-t border-helix-border pt-2 flex justify-between font-medium">
-              <span className="text-helix-muted">Deposit remaining</span>
-              <span className="text-green-400">
-                {((session.cost_deposit_adi ?? 0) - (session.cost_worker_fees_adi ?? 0)).toFixed(4)} ADI
-              </span>
-            </div>
-            {(session.cost_deposit_adi ?? 0) > 0 && (
-              <div className="w-full bg-helix-border rounded-full h-1.5 mt-2">
-                <div
-                  className="bg-green-500 h-1.5 rounded-full transition-all"
-                  style={{ width: `${Math.min(100, ((session.cost_worker_fees_adi ?? 0) / (session.cost_deposit_adi ?? 1)) * 100)}%` }}
-                />
+      {/* Live Cost Panel — computed client-side from session progress */}
+      {session.status === 'running' && session.phase >= 8 && (() => {
+        const workers = session.workers_active ?? 3;
+        const workerFees = session.cost_worker_fees_adi ?? (session.current_step * workers * COST.PER_STEP_FEE);
+        const checkpointGasWei = (session.checkpoints_submitted ?? 0) * COST.CHECKPOINT_GAS * COST.DEFAULT_GAS_GWEI * 1e9;
+        const registerGasWei = COST.REGISTER_GAS * COST.DEFAULT_GAS_GWEI * 1e9;
+        const stakeGasWei = workers * COST.STAKE_GAS * COST.DEFAULT_GAS_GWEI * 1e9;
+        const gasSpentWei = session.cost_gas_spent_wei ?? (checkpointGasWei + registerGasWei + stakeGasWei);
+        const depositAdi = session.cost_deposit_adi ?? (session.total_steps * workers * COST.PER_STEP_FEE * 1.1);
+        const remaining = Math.max(0, depositAdi - workerFees);
+
+        return (
+          <div className="bg-helix-surface border border-helix-border rounded-2xl p-4">
+            <h4 className="text-xs text-helix-muted mb-3">Costs So Far</h4>
+            <div className="space-y-2 text-sm">
+              <div className="flex justify-between">
+                <span className="text-helix-dim">Worker compute</span>
+                <span className="text-zinc-300">{workerFees.toFixed(6)} ADI</span>
               </div>
-            )}
+              <div className="flex justify-between">
+                <span className="text-helix-dim">Gas spent</span>
+                <span className="text-zinc-300">{(gasSpentWei / 1e18).toFixed(6)} ETH</span>
+              </div>
+              <div className="border-t border-helix-border pt-2 flex justify-between font-medium">
+                <span className="text-helix-muted">Deposit remaining</span>
+                <span className="text-green-400">
+                  {remaining.toFixed(4)} ADI
+                </span>
+              </div>
+              {depositAdi > 0 && (
+                <div className="w-full bg-helix-border rounded-full h-1.5 mt-2">
+                  <div
+                    className="bg-green-500 h-1.5 rounded-full transition-all"
+                    style={{ width: `${Math.min(100, (workerFees / depositAdi) * 100)}%` }}
+                  />
+                </div>
+              )}
+            </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* Paused State UI */}
       {session.status === 'paused' && (

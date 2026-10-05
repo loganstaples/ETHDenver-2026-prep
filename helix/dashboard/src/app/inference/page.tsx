@@ -1424,21 +1424,28 @@ function InferencePageInner() {
     setResult(null);
 
     try {
-      if (!selectedModel) {
+      if (!selectedModel && !activeSessionId) {
         setError('No model selected');
         setPhase('error');
         return;
       }
-      const body = {
-        model_token_id: selectedModel.tokenId,
-        model_version_index: selectedVersionIndex,
-        pixels,
-        num_parties: 3,
-        wallet_address: address || undefined,
-        payment_tx: paymentTxHash,
-        trusted_nodes: trustedNodes.length > 0 ? trustedNodes : undefined,
-      };
-      console.log('[Inference] Sending request', { modelId: selectedModel.tokenId, pixelsSample: pixels.slice(0, 5) });
+      const body = selectedModel
+        ? {
+            model_token_id: selectedModel.tokenId,
+            model_version_index: selectedVersionIndex,
+            pixels,
+            num_parties: 3,
+            wallet_address: address || undefined,
+            payment_tx: paymentTxHash,
+            trusted_nodes: trustedNodes.length > 0 ? trustedNodes : undefined,
+          }
+        : {
+            session_id: activeSessionId,
+            pixels,
+            num_parties: 3,
+            trusted_nodes: trustedNodes.length > 0 ? trustedNodes : undefined,
+          };
+      console.log('[Inference] Sending request', { modelId: selectedModel?.tokenId ?? null, sessionId: activeSessionId, pixelsSample: pixels.slice(0, 5) });
 
       const res = await fetch('/api/inference', {
         method: 'POST',

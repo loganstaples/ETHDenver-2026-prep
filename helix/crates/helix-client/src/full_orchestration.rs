@@ -724,7 +724,11 @@ impl FullOrchestrator {
         info!("Phase 8: Running MPC training");
         let phase8_start = Instant::now();
 
-        let mpc_training_result = if self.config.distributed {
+        // Force local mode when simulating cheater — distributed workers don't support
+        // cheater injection (the corruption happens inside the MPC loop, not over the wire).
+        let use_distributed = self.config.distributed && !self.config.simulate_cheater;
+
+        let mpc_training_result = if use_distributed {
             // Distributed mode: workers run the MPC training loop themselves.
             // The orchestrator distributes shares + training config to each worker
             // over the data channel. Workers create TcpTransport meshes, run

@@ -831,8 +831,8 @@ async fn run_with_tcp_cheater(
     capture_checkpoint_weights: bool,
     on_step: Option<std::sync::Arc<dyn Fn(usize, usize, f64, f64, bool) + Send + Sync>>,
     on_sub_step: Option<crate::mpc_trainer::SubStepCallback>,
-    _on_cheater_detected: Option<std::sync::Arc<dyn Fn(usize, u64) + Send + Sync>>,
-    _on_recovery_completed: Option<std::sync::Arc<dyn Fn(usize, usize, usize) + Send + Sync>>,
+    on_cheater_detected: Option<std::sync::Arc<dyn Fn(usize, u64) + Send + Sync>>,
+    on_recovery_completed: Option<std::sync::Arc<dyn Fn(usize, usize, usize) + Send + Sync>>,
 ) -> Result<MPCIntegrationResult, anyhow::Error> {
     use std::collections::HashMap;
     use std::net::SocketAddr;
@@ -937,7 +937,191 @@ async fn run_with_tcp_cheater(
         handles.push(handle);
     }
 
-    collect_results(handles, num_workers, num_steps, start, Some(owner_secret), Some(initial_commitment)).await
+    // Gather Phase 1 party results directly (mirroring run_with_cheater).
+    let mut phase1_party_results: Vec<PartyResult> = Vec::with_capacity(num_workers);
+    for handle in handles {
+        let result = handle.await
+            .map_err(|e| anyhow::anyhow!("party task panicked: {}", e))?
+            .map_err(|e| anyhow::anyhow!("party training failed: {}", e))?;
+        phase1_party_results.push(result);
+    }
+    phase1_party_results.sort_by_key(|r| r.party_index);
+
+    let cheater_detected = phase1_party_results.iter()
+        .find_map(|pr| pr.cheater_detected.clone());
+    let phase1_steps = phase1_party_results[0].steps_completed;
+    let phase1_losses = phase1_party_results[0].losses.clone();
+    let phase1_mac_checks = phase1_party_results[0].mac_checks_passed;
+
+    if let Some(ref cheater_record) = cheater_detected {
+        // Fire CheaterDetected callback immediately.
+        if let Some(ref cb) = on_cheater_detected {
+            cb(cheater_record.party_index, cheater_record.detected_at_step);
+        }
+
+        let checkpoint_step = phase1_party_results[0].checkpoint_step as usize;
+        let remaining_steps = num_steps.saturating_sub(checkpoint_step);
+
+        if remaining_steps > 0 && num_workers > 2 && checkpoint_step > 0 {
+            info!(
+                cheater = cheater_record.party_index,
+                checkpoint_step = checkpoint_step,
+                remaining_steps = remaining_steps,
+                "TCP cheater: Starting Phase 2 recovery with honest parties"
+            );
+
+            // Reconstruct weights from all parties' checkpoint shares.
+            let w1_len = phase1_party_results[0].checkpoint_w1.len();
+            let b1_len = phase1_party_results[0].checkpoint_b1.len();
+            let w2_len = phase1_party_results[0].checkpoint_w2.len();
+            let b2_len = phase1_party_results[0].checkpoint_b2.len();
+
+            let mut w1_sum = vec![Fr::ZERO; w1_len];
+            let mut b1_sum = vec![Fr::ZERO; b1_len];
+            let mut w2_sum = vec![Fr::ZERO; w2_len];
+            let mut b2_sum = vec![Fr::ZERO; b2_len];
+
+            for pr in &phase1_party_results {
+                for (s, v) in w1_sum.iter_mut().zip(pr.checkpoint_w1.iter()) { *s += *v; }
+                for (s, v) in b1_sum.iter_mut().zip(pr.checkpoint_b1.iter()) { *s += *v; }
+                for (s, v) in w2_sum.iter_mut().zip(pr.checkpoint_w2.iter()) { *s += *v; }
+                for (s, v) in b2_sum.iter_mut().zip(pr.checkpoint_b2.iter()) { *s += *v; }
+            }
+
+            let recovery_weights = ModelWeights { w1: w1_sum, b1: b1_sum, w2: w2_sum, b2: b2_sum };
+            let honest_count = num_workers - 1;
+            let honest_parties: Vec<PartyId> = (0..honest_count).map(PartyId::from_index).collect();
+            let recovery_transports = LocalTransport::create_mesh(&honest_parties);
+
+            let recovery_config = MPCTrainerConfig {
+                num_parties: honest_count,
+                ..trainer_config.clone()
+            };
+
+            let (recovery_owner_secret, _recovery_commitment, recovery_bundles) =
+                prepare_encrypted_shares(
+                    &recovery_config,
+                    &Some(recovery_weights),
+                    &honest_parties,
+                    seed.wrapping_add(0xBEC0_BEC0),
+                )?;
+
+            let mut recovery_handles = Vec::new();
+            for (i, (transport, bundle)) in recovery_transports.into_iter().zip(recovery_bundles.into_iter()).enumerate() {
+                let cfg = recovery_config.clone();
+                let data = training_data.clone();
+                let step_cb = if i == 0 { on_step.clone() } else { None };
+                let sub_step_cb = if i == 0 { on_sub_step.clone() } else { None };
+
+                let handle = tokio::task::spawn_blocking(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("failed to build per-worker tokio runtime");
+                    rt.block_on(run_party_training(
+                        cfg, transport, i, None, data,
+                        num_steps, checkpoint_interval, seed.wrapping_add(0xBEC0_BEC0),
+                        None, 0,
+                        Some(bundle),
+                        capture_checkpoint_weights,
+                        step_cb,
+                        sub_step_cb,
+                        None,
+                        checkpoint_step,
+                    ))
+                });
+                recovery_handles.push(handle);
+            }
+
+            match collect_results(
+                recovery_handles, honest_count, remaining_steps,
+                Instant::now(), Some(recovery_owner_secret), None,
+            ).await {
+                Ok(recovery_result) => {
+                    if let Some(ref cb) = on_recovery_completed {
+                        cb(honest_count, checkpoint_step, recovery_result.steps_completed);
+                    }
+
+                    let mut all_losses = phase1_losses;
+                    all_losses.extend(recovery_result.losses.iter());
+                    let final_loss = all_losses.last().copied().unwrap_or(0.0);
+
+                    let outcome = if let Some(ref cd) = cheater_detected {
+                        TrainingOutcome::CheaterDetected { record: cd.clone() }
+                    } else {
+                        TrainingOutcome::Completed
+                    };
+                    return Ok(MPCIntegrationResult {
+                        outcome,
+                        steps_completed: checkpoint_step + recovery_result.steps_completed,
+                        final_loss,
+                        losses: all_losses,
+                        checkpoints: Vec::new(),
+                        mac_checks_passed: phase1_mac_checks + recovery_result.mac_checks_passed,
+                        cheater_detected,
+                        training_time_ms: start.elapsed().as_millis(),
+                        final_weights: recovery_result.final_weights,
+                        initial_commitment: Some(initial_commitment),
+                        encrypted_distribution: true,
+                        recovery_completed: true,
+                        post_recovery_losses: recovery_result.losses,
+                        post_recovery_steps: recovery_result.steps_completed,
+                    });
+                }
+                Err(e) => {
+                    warn!(error = %e, "TCP Phase 2 recovery failed, returning Phase 1 results only");
+                }
+            }
+        }
+    }
+
+    // Fallback: return Phase 1 results without recovery.
+    let w1_len = phase1_party_results[0].final_w1.len();
+    let b1_len = phase1_party_results[0].final_b1.len();
+    let w2_len = phase1_party_results[0].final_w2.len();
+    let b2_len = phase1_party_results[0].final_b2.len();
+
+    let mut w1_sum = vec![Fr::ZERO; w1_len];
+    let mut b1_sum = vec![Fr::ZERO; b1_len];
+    let mut w2_sum = vec![Fr::ZERO; w2_len];
+    let mut b2_sum = vec![Fr::ZERO; b2_len];
+
+    for pr in &phase1_party_results {
+        for i in 0..w1_len { w1_sum[i] = Fr::add(&w1_sum[i], &pr.final_w1[i]); }
+        for i in 0..b1_len { b1_sum[i] = Fr::add(&b1_sum[i], &pr.final_b1[i]); }
+        for i in 0..w2_len { w2_sum[i] = Fr::add(&w2_sum[i], &pr.final_w2[i]); }
+        for i in 0..b2_len { b2_sum[i] = Fr::add(&b2_sum[i], &pr.final_b2[i]); }
+    }
+
+    let final_weights = FinalWeights {
+        w1: w1_sum.iter().map(|fr| fr.to_f64()).collect(),
+        b1: b1_sum.iter().map(|fr| fr.to_f64()).collect(),
+        w2: w2_sum.iter().map(|fr| fr.to_f64()).collect(),
+        b2: b2_sum.iter().map(|fr| fr.to_f64()).collect(),
+    };
+
+    let outcome = if let Some(ref cd) = cheater_detected {
+        TrainingOutcome::CheaterDetected { record: cd.clone() }
+    } else {
+        TrainingOutcome::Completed
+    };
+
+    Ok(MPCIntegrationResult {
+        outcome,
+        steps_completed: phase1_steps,
+        final_loss: phase1_losses.last().copied().unwrap_or(0.0),
+        losses: phase1_losses,
+        checkpoints: Vec::new(),
+        mac_checks_passed: phase1_mac_checks,
+        cheater_detected,
+        training_time_ms: start.elapsed().as_millis(),
+        final_weights,
+        initial_commitment: Some(initial_commitment),
+        encrypted_distribution: true,
+        recovery_completed: false,
+        post_recovery_losses: Vec::new(),
+        post_recovery_steps: 0,
+    })
 }
 
 async fn run_with_cheater(
