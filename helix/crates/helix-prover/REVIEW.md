@@ -1,7 +1,6 @@
 # helix-prover Technical Review
 
 **Reviewed**: 2026-02-04
-**Reviewer**: Claude Code (Opus 4.5)
 **Files Analyzed**: 61 Rust source files (~25,000 lines)
 
 ---

@@ -1,7 +1,5 @@
 # Training Status Redesign — Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Make the training status indicator bigger, more detailed, animated, and live-updating on both the train page and dashboard — CashApp/Apple meets Bloomberg terminal aesthetic.
 
 **Architecture:** Fix the root cause (polling overwrites WS data) in both hooks, then rebuild the `LiveProgress` component as a hero status card with phase ring, sub-status ticker, animated step counter, and inline stat row with deltas. Dashboard gets the same live-data fixes.

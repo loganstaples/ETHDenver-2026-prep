@@ -1,7 +1,6 @@
 # helix-client Code Review
 
 **Date:** 2026-02-11
-**Reviewer:** Claude (automated deep review)
 **Scope:** All files in `crates/helix-client/` (~32,500 lines across ~40 .rs files)
 **Verdict:** A- (88%) — Production-ready CLI with real RPC integration, real ZK benchmarks, hardened security, and comprehensive wallet/chain support
 

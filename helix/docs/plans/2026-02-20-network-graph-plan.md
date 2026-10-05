@@ -1,7 +1,5 @@
 # Network Graph Redesign Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Replace the Activity page with a real-time ring-topology network graph on the Network page, wired into backend WebSocket events for live worker-model assignments.
 
 **Architecture:** Pure-geometry canvas renderer (no D3 physics). Backend emits `worker_assigned`, `worker_removed`, `model_activity_changed` events via WebSocket. Frontend hook (`useActiveTopology`) manages live state. Network page = graph hero + existing worker table.

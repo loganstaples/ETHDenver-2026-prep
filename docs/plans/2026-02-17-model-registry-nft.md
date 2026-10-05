@@ -1,7 +1,5 @@
 # ERC-721 Model Registry Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Replace the flat HelixModelStore with an ERC-721 NFT-based model registry where each model is an NFT with version history, encrypted weight storage on 0G, and owner-only access control.
 
 **Architecture:** Each model = ERC-721 token. On-chain: model metadata (slug, name, description, creator) + version array (semver, encrypted 0G rootHash, accuracy). Off-chain: AES-256-GCM encrypted weights on 0G storage, decryption key derived from wallet signature. Dashboard reads NFTs owned by connected wallet.

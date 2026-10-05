@@ -1,7 +1,5 @@
 # Desktop App Revamp Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Complete frontend rebuild of the HELIX desktop app — single-view architecture with orb launch animation, expandable metric cards, monochrome + emerald palette, spring animations.
 
 **Architecture:** Keep entire Tauri Rust backend, all TypeScript types/wrappers/hooks. Rebuild all React components from scratch. Single-view (no routing). Two app states: Idle (orb) and Active (dashboard). Progressive disclosure via click-to-expand cards.

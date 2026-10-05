@@ -1,7 +1,5 @@
 # Live Dashboard Updates Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Make the dashboard's loss/accuracy curves, step counter, and status indicator update in real-time during MPC training, with real sub-operation status from the backend.
 
 **Architecture:** Fix the `try_write()` contention bug by replacing it with an mpsc channel + dedicated writer task. Add `SubStep` events from within `MPCTrainer` at natural communication boundaries. Wire them through the existing ProgressEvent → WebSocket → frontend pipeline.

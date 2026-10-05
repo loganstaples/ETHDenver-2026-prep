@@ -1,7 +1,5 @@
 # ZK Proof End-to-End Integration Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Wire real Halo2 ZK proofs end-to-end through MPC training, on-chain settlement, and dashboard for all three modes (off, always, risk-based).
 
 **Architecture:** Capture weight shares at checkpoint time in the MPC integration layer, reconstruct in the trusted operator context after training, generate StateTransitionCircuit proofs, and submit via `submitCheckpointWithProof` on-chain. Risk assessment evaluates post-training results to decide which checkpoints need proofs. ZK checkpoint frequency equals the regular checkpoint frequency (one knob).

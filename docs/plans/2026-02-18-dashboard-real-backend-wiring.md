@@ -1,7 +1,5 @@
 # Dashboard Real Backend Wiring Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Remove useless marketplace stats, wire all frontend to real backend data, rewrite Activity page with clique subgraphs grouped by inference request on user-owned models, add worker panel with reputation scores on Dashboard page.
 
 **Architecture:** Backend-first approach — create a `useBackendApi` hook as a unified REST client that wraps all Rust backend calls. Each page feature gets a dedicated hook calling real endpoints. The Activity page network graph uses actual inference request data grouped into force-directed cliques per request.

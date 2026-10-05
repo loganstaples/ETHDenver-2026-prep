@@ -1,7 +1,5 @@
 # ETHDenver Demo Backend Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Get the HELIX backend fully working end-to-end: user submits training data from web dashboard → MPC training with real secret sharing → model returned, all on-chain.
 
 **Architecture:** Dashboard (Next.js :3000) → Rust API server (Axum :3001) → FullOrchestrator spawns MPC parties as tokio tasks with TCP transport → V4 contract on Anvil (:8545). Workers are real MPC parties communicating over real TCP with real SPDZ MACs and Beaver triples. The user does zero computation.

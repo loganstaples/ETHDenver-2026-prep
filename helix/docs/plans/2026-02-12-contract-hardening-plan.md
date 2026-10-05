@@ -1,7 +1,5 @@
 # Smart Contract Hardening Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Harden HELIX V3 contracts for real multi-model, multi-round training with compute-first economics.
 
 **Architecture:** Extend HelixCoordinatorV3, Rewards, and ModelRegistry. Add training job deposits. Fix DAO bug. All 482 existing tests must continue passing.

@@ -1,7 +1,5 @@
 # 0G AI Config Assistant Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Add a toggle on the training page that opens a modal where users describe their training goals, pay a small ADI fee, and get training config auto-filled by an AI model running on 0G Compute's decentralized GPU network.
 
 **Architecture:** Server-side 0G broker (already exists at `/api/0g-compute/route.ts`) handles inference. New `/api/0g-compute/config-assist/route.ts` endpoint sends a system prompt for config generation. Frontend `AIConfigModal` handles the UX: text input, one wagmi native transfer for payment, loading state, and animated config apply. The modal reuses the existing `Modal` component and matches the glassmorphic dark theme.

@@ -1,7 +1,5 @@
 # Live Dashboard Updates & Training History — Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Make all dashboard stats, graphs, and metrics update in real-time during MPC training, persist training sessions to SQLite, and add a training history UI with detail modals.
 
 **Architecture:** Thread a progress callback from the orchestrator into the MPC training loop so per-step events emit live (not batched at end). Add a SQLite persistence layer for sessions. Replace localStorage-based history with server-fetched history and add a full-screen detail modal.

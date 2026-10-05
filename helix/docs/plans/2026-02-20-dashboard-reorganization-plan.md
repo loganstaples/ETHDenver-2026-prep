@@ -1,7 +1,5 @@
 # Dashboard Reorganization Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Reorganize the Helix dashboard from a scattered layout into a portfolio-focused dashboard for logged-in users, a public marketplace for logged-out users, a merged smart model detail page, and a public worker directory on the Network page.
 
 **Architecture:** Next.js App Router pages. Hooks abstract contract/API data. Pages are `'use client'` components. Framer Motion for animations. Tailwind + custom helix-* CSS vars for styling. The reorganization touches 6 pages and the sidebar but keeps all existing hooks intact.

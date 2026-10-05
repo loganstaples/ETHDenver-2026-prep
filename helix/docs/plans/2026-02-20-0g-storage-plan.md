@@ -1,7 +1,5 @@
 # 0G Storage Integration Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Integrate 0G decentralized storage for encrypted model weights with escrow transfers, inference caching, and owner-only access control.
 
 **Architecture:** Wallet-derived AES-GCM encryption (existing `model-encryption.ts`). Weights encrypted client-side, uploaded to 0G. Only the NFT owner can decrypt. Public models use a server-side in-memory cache for inference without exposing weights. NFT sales use a two-step escrow with re-encryption + re-upload.

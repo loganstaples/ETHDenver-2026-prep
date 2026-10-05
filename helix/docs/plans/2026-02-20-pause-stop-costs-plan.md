@@ -1,7 +1,5 @@
 # Pause/Stop Training, Weight Storage & Live Cost Tracker — Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Add pause/stop training controls, live cost tracking, weight storage options (IndexedDB/0G), and deposit refund mechanics to the HELIX protocol.
 
 **Architecture:** Contract-level state machine (`Active→Paused→Stopped/Active`, `Active→Stopped/Completed`) in `HelixCoordinatorV4`, with `tokio::sync::watch` signal channels in the Rust MPC training loop, and new dashboard UI for controls, cost display, and weight management.

@@ -1,6 +1,5 @@
 # helix-circuits -- Code Review
 
-**Reviewer**: Claude Opus 4.6 automated audit
 **Date**: 2026-02-11 (updated; original 2026-02-10)
 **Scope**: Every file in `crates/helix-circuits/` (~45 Rust files, ~30,700 LOC, 318 tests)
 **Health Score**: **A- (92%)** -- improved from C+ (68%) after transformer verification, PI[5] direct constraint, error accumulation copy constraints, ReLU fix, and documentation overhaul
