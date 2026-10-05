@@ -66,4 +66,4 @@ cargo bench -p helix-circuits          # Run benchmarks
 4. **Model architecture** limited to 2-layer MLP in training_step_v2. Transformer circuit handles full blocks.
 5. **Poseidon constants** use SHA-256-derived round constants (not standard Grain LFSR).
 
-See [SECURITY.md](SECURITY.md) for the full security model and [REVIEW.md](REVIEW.md) for the code audit.
+See [SECURITY.md](SECURITY.md) for the full security model.
