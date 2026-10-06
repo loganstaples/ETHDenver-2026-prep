@@ -6,6 +6,8 @@
 
 [**▶ Watch the demo**](#demo) · [How it works](#how-it-works) · [Product decisions](#key-product-decisions) · [Run it locally](#run-it-locally) · [Technical deep dive](helix/docs/TECHNICAL_OVERVIEW.md)
 
+![HELIX demo: training privately across 6 workers, catching a cheater, using the model, and selling it as an NFT](docs/assets/helix-demo.gif)
+
 ---
 
 ## TL;DR
@@ -16,14 +18,19 @@
 
 ## Demo
 
-> 🎥 **Video coming soon.** *(Replace this line with the video once recorded. See [Adding the video](#adding-the-demo-video).)*
+<!-- 75-second demo video goes here -->
 
-What the demo shows:
+What the 75-second demo shows:
 
 1. **Launch a training job:** pick settings, see the cost estimate, and optionally turn on "Simulate Cheater."
 2. **Watch it train live:** 6 workers train together on a model none of them can see. Every step is verified.
 3. **Catch the cheater:** halfway through, one worker starts tampering. HELIX flags it within a few steps, names the exact worker, removes it, and the remaining 5 keep training.
 4. **Use the model:** draw a digit in the browser and the trained model classifies it.
+5. **Own it and earn from it:** the trained model is minted as an NFT. The owner sets a per-use fee, lists the model for sale, and a second wallet buys it through escrow.
+
+| Training finished after removing the cheater | Drawing a digit and running the model |
+|---|---|
+| ![Training complete at 80.8%](docs/assets/training-complete.png) | ![Inference: 7 at 99.2% confidence](docs/assets/inference.png) |
 
 ## The problem
 
@@ -56,6 +63,7 @@ flowchart LR
 3. **Verify:** Every value carries a tamper-evident tag. If a worker changes anything, the tags stop adding up, and a quick round of pairwise checks shows exactly which worker it was.
 4. **Settle:** Workers stake money to join. A smart contract records progress, pays honest workers, and can slash (confiscate) a cheater's stake.
 5. **Reassemble:** At the end, workers hand their pieces back and only the owner can rebuild the trained model.
+6. **Own and earn:** The trained model is minted as an NFT (ERC-721), so ownership and version history are public and verifiable. The owner can make it public and charge a fee (0–50%) on every paid inference, or list the model itself for sale on the marketplace.
 
 ## Key product decisions
 
@@ -65,7 +73,9 @@ flowchart LR
 
 **3. Punish the cheater, not the group.** "Someone cheated, restart everything" is unfair to honest workers and wasteful for the customer. HELIX identifies the specific worker, removes only them, and resumes training from the last checkpoint. That keeps honest workers willing to participate.
 
-**4. Designed for a 3-minute judge demo.** The core value (privacy plus cheater detection) is invisible by nature, so I built a **Simulate Cheater** toggle, a live phase tracker, and a cost estimator into the dashboard. A judge can see the whole story, including the failure case, in one run.
+**4. Made the trained model a sellable asset, with escrow.** A model is only worth paying for if you can prove you own it and turn it into money. Minting it as an NFT handles ownership. Selling is harder: transferring the NFT alone doesn't hand over the encrypted weights, so either side could get burned. So a purchase puts the buyer's payment in escrow. The seller re-encrypts the weights for the buyer, and the NFT and payment then swap in a single transaction. If the seller never delivers, the buyer can take the money back after 24 hours.
+
+**5. Designed for a 3-minute judge demo.** The core value (privacy plus cheater detection) is invisible by nature, so I built a **Simulate Cheater** toggle, a live phase tracker, and a cost estimator into the dashboard. A judge can see the whole story, including the failure case, in one run.
 
 ## Results
 
@@ -113,7 +123,7 @@ TESTNET_PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4
 ./start-local.sh stop   # shut everything down
 ```
 
-The key above is Anvil's public, well-known test account, not a real wallet. Because of the job-ID-0 issue (see [Limitations](#limitations-and-what-id-do-next)), register one throwaway job right after startup so your real jobs settle on-chain:
+The key above is Anvil's public, well-known test account, not a real wallet. Because of the job-ID-0 issue (see [Limitations](#limitations-and-what-id-do-next)), register one throwaway job right after startup so jobs started through the API or CLI settle on-chain. (Jobs launched from the web app on a local chain intentionally skip the on-chain payment and train off-chain; on the ADI testnet the web app registers and pays for the job on-chain.)
 
 ```bash
 cast send 0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512 \
@@ -135,10 +145,6 @@ helix/
 ```
 
 For the full protocol (secret sharing, tamper-evident tags, how the cheater is pinpointed, contract design), see the **[technical deep dive](helix/docs/TECHNICAL_OVERVIEW.md)** and **[system design](helix/docs/SYSTEM_DESIGN.md)**.
-
-## Adding the demo video
-
-On github.com, open this README, click the ✏️ edit button, and drag the `.mp4` file into the editor where the "Video coming soon" line is. GitHub uploads it and embeds a player (files up to 100 MB). Or upload it to YouTube and link it there.
 
 ---
 

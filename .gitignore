@@ -1,5 +1,6 @@
 # Screenshots and debug images
 *.png
+!docs/assets/*.png
 
 # Playwright MCP logs
 .playwright-mcp/
