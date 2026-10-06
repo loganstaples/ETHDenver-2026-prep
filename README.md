@@ -18,7 +18,7 @@
 
 ## Demo
 
-<!-- 75-second demo video goes here -->
+https://github.com/user-attachments/assets/be1d1840-c32e-4be5-b321-f44fd48d424b
 
 What the 75-second demo shows:
 
